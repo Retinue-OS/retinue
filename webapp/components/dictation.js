@@ -26,6 +26,12 @@
 //                               says it did; `unsent` ('failed' | 'maybe')
 //                               that it tried and it did not, or may not,
 //                               have gone. Neither: the page sends it.
+//                               `call` ({number, name}), with `send`: the
+//                               call this take cancelled (conversation.js,
+//                               CANCELLED_CALLS), which the worker's send
+//                               carries as `cancelled_call`, as the page's
+//                               own would, while the take is fresh (sw.js,
+//                               DICT_CALL_FRESH_MS).
 //   handOff(key, blob, url)     the page is going (pagehide) with the mic
 //                               live: the audio so far is sent off as it is,
 //                               and nothing waits here for the answer.
@@ -37,11 +43,16 @@
 //                               back-forward cache, a worker restarted under
 //                               a running job) arrive the same way. With
 //                               `outcome`, the promise resolves to {text,
-//                               sent, unsent, send} as for a sent
-//                               transcribe(); `send` with neither of the
-//                               others is a sent dictation whose page went
-//                               after it had the text but before it could
-//                               send it — the adopter's to send.
+//                               sent, unsent, send, at, textAt, call?} as
+//                               for a sent transcribe(); `send` with neither
+//                               of the others is a sent dictation whose page
+//                               went after it had the text but before it
+//                               could send it — the adopter's to send, with
+//                               the cancelled `call` it was recorded with, if
+//                               any.
+//                               `at` is when the job was started, `textAt`
+//                               when its transcript came (0 when the worker
+//                               restarted it, or never said).
 //
 // A promise rejects with Error('elsewhere') when the job is gone from the
 // worker without this page having taken it: the page was frozen (the
@@ -111,16 +122,28 @@ async function fetchText(blob, url) {
   return ((data && data.text) || '').trim();
 }
 
+// The call a sent take cancelled, as the worker keeps it: {number, name}
+// strings, or null. The gateway checks the number itself
+// (_cancelled_call_context); this only keeps the shape.
+function callOf(call) {
+  if (!call || typeof call !== 'object' || typeof call.number !== 'string' || !call.number) return null;
+  return { number: call.number.slice(0, 32), name: typeof call.name === 'string' ? call.name.slice(0, 80) : '' };
+}
+
 // Settle the job `id` this page waits on, and tell the worker it was taken —
 // a task later, once the host's continuation (which writes the text into the
 // draft, synchronously) has run.
-function settle(id, text, error, sent, unsent, send, at) {
+function settle(id, text, error, sent, unsent, send, at, call, textAt) {
   const w = drop(id);
   if (!w) return;
   SETTLED.add(id);
   const t = String(text || '').trim();
   if (error) w.reject(new Error(String(error)));
-  else if (w.outcome) w.resolve({ text: t, sent: !!sent, unsent: String(unsent || ''), send: !!send, at: Number(at) || 0 });
+  else if (w.outcome) {
+    const c = callOf(call);
+    w.resolve({ text: t, sent: !!sent, unsent: String(unsent || ''), send: !!send, at: Number(at) || 0,
+      textAt: Number(textAt) || 0, ...(c ? { call: c } : {}) });
+  }
   else w.resolve(t);
   setTimeout(() => post({ type: 'dictation-taken', id }), 0);
 }
@@ -155,7 +178,7 @@ function listen() {
   c.addEventListener('message', (e) => {
     const d = e && e.data;
     if (!d) return;
-    if (d.type === 'dictation-done') settle(d.id, d.text, d.error, d.sent, d.unsent, d.send, d.at);
+    if (d.type === 'dictation-done') settle(d.id, d.text, d.error, d.sent, d.unsent, d.send, d.at, d.call, d.textAt);
     else if (d.type === 'dictation-started' && WAITING.has(d.id)) WAITING.get(d.id).acked = true;
   });
   // Leaving: what this page owns is anybody's who shows the place next. A
@@ -233,10 +256,10 @@ function take(job) {
     WAITING.get(job.id).acked = true;  // the worker has it: it said so
     try { onJob(p); } catch (_e) { /* the host's problem; the job still settles */ }
   }
-  if (job.state === 'done') settle(job.id, job.text, job.error, job.sent, job.unsent, job.send, job.at);
+  if (job.state === 'done') settle(job.id, job.text, job.error, job.sent, job.unsent, job.send, job.at, job.call, job.textAt);
 }
 
-export function transcribe(key, blob, url, { send = '' } = {}) {
+export function transcribe(key, blob, url, { send = '', call = null } = {}) {
   // The page's own fetch has no worker to send for it: the page sends.
   const own = () => (send
     ? fetchText(blob, url).then((text) => ({ text, sent: false, unsent: '', send: true, at: Date.now() }))
@@ -247,6 +270,7 @@ export function transcribe(key, blob, url, { send = '' } = {}) {
   const p = wait(id, key, !!send);
   const msg = { type: 'dictation', id, key, url, blob };
   if (send) msg.send = send;
+  if (send && callOf(call)) msg.call = callOf(call);
   if (!post(msg)) {
     drop(id);
     return own();

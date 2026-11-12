@@ -66,6 +66,16 @@ Projects (dashboard project pages):
                                          and {context: "..."}. A non-quiet append
                                          un-archives the thread unless it is
                                          muted.
+  POST /conversations/<id>/shell-actions/<action id>/outcome
+                                      -> the dashboard reports what became of
+                                         a shell action (body {state, error?}),
+                                         stored on it for Ara's later turns; a
+                                         sensitive text reported typed is
+                                         deleted from the stored reply at once.
+  POST /internal/conversations/<id>/redact
+                                      -> a retinue agent redacts one of the
+                                         user's messages (body {message_id}),
+                                         on the user's request. Same token gate.
   POST /internal/conversations/<id>/flags
                                       -> a retinue agent sets {archived, muted}
                                          (either or both). Same token gate. The
@@ -304,6 +314,7 @@ import email_client as ec
 import send_origin
 import inbound_store
 import session_env
+import shell_actions
 import gateway_auth
 import instance_branding
 import letterbox
@@ -1386,6 +1397,9 @@ _CONV_READ_RE = re.compile(r"^/conversations/([0-9a-f]{32})/read/?$")
 _CONV_ARCHIVE_RE = re.compile(r"^/conversations/([0-9a-f]{32})/archive/?$")
 _CONV_UNARCHIVE_RE = re.compile(r"^/conversations/([0-9a-f]{32})/unarchive/?$")
 _CONV_MODEL_RE = re.compile(r"^/conversations/([0-9a-f]{32})/model/?$")
+_CONV_SHELL_OUTCOME_RE = re.compile(
+    r"^/conversations/([0-9a-f]{32})/shell-actions/([0-9a-f]{32})/outcome/?$")
+_INTERNAL_CONV_REDACT_RE = re.compile(r"^/internal/conversations/([0-9a-f]{32})/redact/?$")
 # The attention model's writes: the mode, the rules, and the actions on one
 # item (its id travels in the body — chat ids and project URIs carry
 # characters no path segment should).
@@ -2023,15 +2037,93 @@ _erased_session_keys: dict[str, float] = {}
 _ERASED_SESSION_KEYS_MAX = 1000
 
 
-def _update_session_entry(session_key: str, entry: dict) -> None:
+# Session keys whose session a running turn must not record: the thread was
+# reset (_reset_session) while that turn was under way — the user had a
+# message redacted from inside it. One-shot: the turn's late write is refused
+# and its transcript erased, and the key is cleared when the turn's worker
+# ends (_conv_worker), so the next session records normally.
+_reset_session_keys: set[str] = set()
+
+
+# How many earlier session ids an entry remembers (_entry_session_ids): every
+# session a key has used, so a reset can erase all their transcripts, not only
+# the current one — a session replaced after the idle window still holds what
+# was said in it.
+_SESSION_HISTORY_MAX = 100
+
+
+def _entry_session_ids(entry: dict | None) -> list[str]:
+    """Every Claude session id a state entry knows: its current one and those
+    it replaced (`previous_session_ids`)."""
+    if not isinstance(entry, dict):
+        return []
+    ids = [str(x) for x in entry.get("previous_session_ids") or [] if x]
+    if entry.get("session_id"):
+        ids.append(str(entry["session_id"]))
+    return list(dict.fromkeys(ids))
+
+
+def _record_turn_session(session_key: str, entry: dict, *, drop: bool = False,
+                         also_forget: "list[str] | tuple[str, ...]" = ()) -> bool:
+    """Record the session a turn ended in — or, with `drop`, never resume it.
+
+    The one place a turn's session is written to the state file, under the
+    session lock its turn holds (send_message), so no later turn of the key
+    can resume it in between. `drop` (the turn typed a sensitive text): the
+    key's entry goes with every session id it ever had, and their transcripts
+    are erased; so does a key reset while the turn ran (_reset_session_keys,
+    one-shot) or erased for good (_erased_session_keys). `also_forget`: further
+    session ids the turn produced and nobody resumes (an escalated junior's
+    fresh session). Returns whether the entry was recorded."""
+    forget = [str(x) for x in also_forget if x]
     with _state_lock:
         erased = session_key in _erased_session_keys
-        if not erased:
-            state = _load_state()
-            state[session_key] = entry
+        reset = session_key in _reset_session_keys
+        _reset_session_keys.discard(session_key)
+        state = _load_state()
+        previous = state.get(session_key)
+        if erased or reset or drop:
+            forget += _entry_session_ids(previous) + _entry_session_ids(entry)
+            if state.pop(session_key, None) is not None:
+                _save_state(state)
+            recorded = False
+        else:
+            history = _entry_session_ids(previous)
+            current = str(entry.get("session_id") or "")
+            history = [x for x in history if x != current][-_SESSION_HISTORY_MAX:]
+            stored = dict(entry)
+            if history:
+                stored["previous_session_ids"] = history
+            state[session_key] = stored
             _save_state(state)
-    if erased:
-        _forget_claude_session(str((entry or {}).get("session_id") or ""))
+            recorded = True
+    for session_id in dict.fromkeys(forget):
+        _forget_claude_session(session_id)
+    return recorded
+
+
+def _update_session_entry(session_key: str, entry: dict) -> None:
+    _record_turn_session(session_key, entry)
+
+
+def _reset_session(session_key: str, *, running: bool = False) -> None:
+    """Never resume any Claude session of the key again, and erase their
+    transcripts — the current one and every one it replaced.
+
+    For a thread whose sessions hold a text they must not keep: a message the
+    user had redacted. The next turn starts a fresh session and is shown the
+    thread as stored, where that text is gone. `running`: a turn of this
+    thread is under way and records its session only after this returns —
+    refuse that write once as well (_reset_session_keys)."""
+    with _state_lock:
+        if running:
+            _reset_session_keys.add(session_key)
+        state = _load_state()
+        entry = state.pop(session_key, None)
+        if entry is not None:
+            _save_state(state)
+    for session_id in _entry_session_ids(entry):
+        _forget_claude_session(session_id)
 
 
 def _session_lock_for(session_key: str) -> threading.Lock:
@@ -2155,23 +2247,49 @@ def _save_conversation(entries: list[dict], date_str: str) -> None:
         json.dump(entries, f, ensure_ascii=False)
 
 
-def _append_entry(question: str, answer: str) -> tuple[str, str]:
+# Thread messages the user had redacted (_conv_redact_message), by (thread id,
+# message id): a turn that was already running — or queued — when the
+# redaction landed logs its question only when it ends, from a copy taken when
+# it started; the log entry gets REDACTED_TEXT instead. Keyed by message, not
+# by text, so another "yes" elsewhere is left alone. In memory: a turn does
+# not outlive the process.
+_redacted_messages: dict[tuple[str, str], float] = {}
+_REDACTED_MESSAGES_MAX = 1000
+
+
+def _note_redacted(thread_id: str, message_id: str) -> None:
+    with _conversation_lock:
+        _redacted_messages[(thread_id, message_id)] = time.time()
+        while len(_redacted_messages) > _REDACTED_MESSAGES_MAX:
+            _redacted_messages.pop(next(iter(_redacted_messages)))
+
+
+def _append_entry(question: str, answer: str, *, thread_id: str | None = None,
+                  message_id: str | None = None) -> tuple[str, str]:
     """Append one Q&A entry and return (date_str, anchor).
 
     Guarded by `_conversation_lock` so parallel sessions don't lose entries when
-    appending to the same per-day file concurrently.
+    appending to the same per-day file concurrently. A dashboard turn names the
+    thread message its question is (`thread`, `message`), so a redaction finds
+    exactly that entry; one the user had redacted meanwhile is logged as
+    REDACTED_TEXT (_note_redacted).
     """
     with _conversation_lock:
+        if thread_id and message_id and (thread_id, message_id) in _redacted_messages:
+            question = REDACTED_TEXT
         date_str = _today()
         entries = _load_conversation(date_str)
         ts_ms = int(_now_ts() * 1000)
         anchor = f"entry-{ts_ms}"
-        entries.append({
+        entry = {
             "anchor": anchor,
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "question": question,
             "answer": answer,
-        })
+        }
+        if thread_id and message_id:
+            entry["thread"], entry["message"] = thread_id, message_id
+        entries.append(entry)
         _save_conversation(entries, date_str)
         return date_str, anchor
 
@@ -2320,6 +2438,121 @@ def _derive_title(text: str) -> str:
 
 
 def _load_conv(cid: str) -> dict | None:
+    """A thread as stored, with every expired sensitive shell-action text
+    already gone (_conv_purge_sensitive): whatever reads a thread — the
+    dashboard, a replay to Ara, a write that saves it back — never sees a
+    sensitive text older than shell_actions.SENSITIVE_TTL_SECONDS, whether or
+    not the file has been rewritten yet."""
+    conv = _load_conv_raw(cid)
+    if conv is not None:
+        _conv_purge_sensitive(conv)
+    return conv
+
+
+def _conv_purge_sensitive(conv: dict, ids: "set[str] | None" = None) -> bool:
+    """Delete sensitive shell-action texts from `conv` in place: the expired
+    ones, or exactly `ids`. True when anything went (scripts/shell_actions.py)."""
+    now = time.time()
+    changed = False
+    for m in conv.get("messages") or []:
+        if isinstance(m, dict) and m.get("shell_actions"):
+            changed = shell_actions.purge_sensitive(m, now, ids=ids) or changed
+    return changed
+
+
+def _conv_persist_purge(cid: str, ids: "set[str] | None" = None) -> dict | None:
+    """Purge sensitive texts (expired, or `ids`) from the stored file too.
+    Returns the thread, or None when there is none."""
+    with _conversations_lock:
+        conv = _load_conv_raw(cid)
+        if conv is None:
+            return None
+        changed = _conv_purge_sensitive(conv)
+        if ids:
+            changed = _conv_purge_sensitive(conv, ids) or changed
+        if changed:
+            _save_conv(conv)
+        return conv
+
+
+def _conv_schedule_purge(cid: str, delay: float) -> None:
+    """Rewrite thread `cid` without its expired sensitive texts in `delay`
+    seconds (a second's margin added), and again for the next one due
+    (_conv_purge_and_reschedule)."""
+    t = threading.Timer(max(0.0, delay) + 1, _conv_purge_and_reschedule, args=(cid,))
+    t.daemon = True
+    t.start()
+
+
+def _conv_next_expiry(conv: dict, now: float) -> float | None:
+    """Seconds until the thread's next sensitive text expires, or None."""
+    soonest = None
+    for m in conv.get("messages") or []:
+        if not isinstance(m, dict):
+            continue
+        for a in m.get("shell_actions") or []:
+            if (isinstance(a, dict) and a.get("sensitive")
+                    and a.get("text") is not None):
+                left = (shell_actions.SENSITIVE_TTL_SECONDS
+                        - shell_actions.age_seconds(m.get("ts"), now))
+                soonest = left if soonest is None else min(soonest, left)
+    return soonest
+
+
+def _conv_purge_and_reschedule(cid: str) -> bool:
+    """Delete the thread's expired sensitive texts from its file, and schedule
+    the next deletion while one is still due. True when one is."""
+    conv = _conv_persist_purge(cid)
+    if conv is None:
+        return False
+    left = _conv_next_expiry(conv, time.time())
+    if left is None:
+        return False
+    _conv_schedule_purge(cid, left)
+    return True
+
+
+def _conv_sensitive_sweep() -> int:
+    """At startup: delete every expired sensitive text from the stored
+    threads, and schedule the deletion of those not yet expired — the timers
+    of the process before a restart are gone. Returns how many threads still
+    hold one."""
+    waiting = 0
+    for path in CONVERSATIONS_DIR.glob("*.json"):
+        if _CONV_ID_RE.fullmatch(path.stem) and _conv_purge_and_reschedule(path.stem):
+            waiting += 1
+    return waiting
+
+
+def _conv_record_shell_outcome(cid: str, action_id: str,
+                               outcome: dict) -> tuple[dict | None, bool]:
+    """Store `outcome` (shell_actions.normalize_outcome) on the shell action
+    `action_id` of thread `cid`, and delete its text if it was a sensitive
+    one reported typed. An action already typed keeps that outcome when a
+    later Retype does not type (shell_actions.record_outcome). Returns
+    (thread, whether the action exists); the thread is None when there is
+    none."""
+    with _conversations_lock:
+        conv = _load_conv_raw(cid)
+        if conv is None:
+            return None, False
+        _conv_purge_sensitive(conv)
+        found = False
+        for m in conv.get("messages") or []:
+            for a in (m.get("shell_actions") or []) if isinstance(m, dict) else []:
+                if isinstance(a, dict) and a.get("id") == action_id:
+                    shell_actions.record_outcome(
+                        a, outcome, datetime.now(timezone.utc).isoformat())
+                    found = True
+        if not found:
+            return conv, False
+        if outcome["state"] == "typed":
+            _conv_purge_sensitive(conv, {action_id})
+        _save_conv(conv)
+        return conv, True
+
+
+def _load_conv_raw(cid: str) -> dict | None:
     # Re-validate here so the path guard dominates the open() in this scope.
     if not _CONV_ID_RE.fullmatch(cid):
         return None
@@ -2391,7 +2624,9 @@ def _conv_summary(conv: dict) -> dict:
         "pending_since": conv.get("pending_since"),
         "pending_status": conv.get("pending_status"),
         "message_count": len(messages),
-        "last_preview": _derive_title(last.get("text", "")),
+        # The conversation list's row shows words, as the attention row and
+        # the push do: a call directive as its name, never markup and number.
+        "last_preview": _derive_title(attention_store.markup_words(last.get("text", ""))),
     }
 
 
@@ -2580,6 +2815,105 @@ def _read_reply_manifest(path: Path | None) -> list[str]:
     finally:
         path.unlink(missing_ok=True)
     return [line.strip() for line in raw.splitlines() if line.strip()]
+
+
+def _read_reply_shell_actions(path: Path | None, cid: str = "") -> list[dict]:
+    """The shell actions a session attached to its own reply, and the manifest gone.
+
+    The sibling of _read_reply_manifest for scripts/shell-type.py: one JSON
+    action per line at RETINUE_REPLY_SHELL_ACTIONS_FILE, consumed exactly once
+    and read like any session-controlled path. Every line is validated again
+    here (shell_actions.normalize — the CLI's own check, so a hand-written
+    line gets no further than the CLI would); a bad line costs that action,
+    never the reply."""
+    if path is None:
+        return []
+    try:
+        raw = _read_regular_file(path, shell_actions.MAX_MANIFEST_BYTES,
+                                 follow=False).decode("utf-8", errors="replace")
+    except FileNotFoundError:
+        return []
+    except OSError as exc:
+        print(f"[web-gateway] shell action manifest {path} unreadable: {exc}",
+              flush=True)
+        return []
+    finally:
+        path.unlink(missing_ok=True)
+    actions, problems = shell_actions.parse_manifest(raw)
+    for problem in problems:
+        print(f"[web-gateway] {cid or 'reply'}: shell action dropped — {problem}",
+              flush=True)
+    return actions
+
+
+_SHELL_MANIFEST_PREFIX = "retinue-reply-shell-actions-"
+
+
+def _session_key_tag(session_key: str) -> str:
+    return hashlib.sha256(session_key.encode("utf-8")).hexdigest()[:16]
+
+
+def _sweep_stale_shell_manifests() -> int:
+    """At startup, before any turn runs: shell-action manifests a restart left
+    behind. One holding a sensitive text belongs to a turn that typed it in a
+    session this gateway would resume — that key's sessions are dropped, like
+    a completed turn's (_record_turn_session) — and every one is deleted.
+    Returns how many keys were dropped.
+
+    Every key is dropped before anything is deleted, and each entry is dealt
+    with on its own: an entry with a manifest's name that cannot be read or
+    deleted (a directory, another user's file) must not stop the sweep, nor
+    leave resumable the session of a real manifest beside it."""
+    tmp = Path(tempfile.gettempdir())
+    by_tag = {_session_key_tag(k): k for k in _load_state()}
+    paths = list(tmp.glob(_SHELL_MANIFEST_PREFIX + "*"))
+    dropped = 0
+    for path in paths:
+        rest = path.name[len(_SHELL_MANIFEST_PREFIX):]
+        tag = rest.split("-", 1)[0]
+        try:
+            if _manifest_has_sensitive(path) and tag in by_tag:
+                _record_turn_session(by_tag[tag], {}, drop=True)
+                dropped += 1
+        except OSError as exc:
+            print(f"[web-gateway] stale shell manifest {path} not checked: {exc}",
+                  flush=True)
+    for path in paths:
+        try:
+            path.unlink(missing_ok=True)
+        except OSError as exc:
+            print(f"[web-gateway] stale shell manifest {path} not deleted: {exc}",
+                  flush=True)
+    return dropped
+
+
+def _manifest_has_sensitive(path: Path | None) -> bool:
+    """Whether a shell-action manifest lists a sensitive text — read for that
+    only, from a run whose reply is discarded (an escalated junior's)."""
+    if path is None:
+        return False
+    try:
+        raw = _read_regular_file(path, shell_actions.MAX_MANIFEST_BYTES,
+                                 follow=False).decode("utf-8", errors="replace")
+    except OSError:
+        return False
+    actions, _ = shell_actions.parse_manifest(raw)
+    return any(a.get("sensitive") for a in actions)
+
+
+def _session_id_of(result) -> str:
+    """The session id a `claude -p --output-format=json` run reported, or ""."""
+    try:
+        data = json.loads(getattr(result, "stdout", "") or "")
+    except (TypeError, ValueError):
+        return ""
+    sid = data.get("session_id") if isinstance(data, dict) else None
+    return str(sid) if sid else ""
+
+
+def _session_was_reset(session_key: str) -> bool:
+    with _state_lock:
+        return session_key in _reset_session_keys or session_key in _erased_session_keys
 
 
 def _store_reply_files(cid: str, paths: list[str]) -> list[dict]:
@@ -2945,10 +3279,17 @@ def _new_conv(initiator: str, owner: str, title: str | None,
               model: str | None = None,
               agent: str | None = None,
               context: str | None = None,
-              chat: str | None = None) -> dict:
+              chat: str | None = None,
+              via_edge: bool = False) -> dict:
     now = datetime.now(timezone.utc).isoformat()
     cid = uuid.uuid4().hex
-    first_msg = {"role": first_role, "text": first_text, "ts": now}
+    first_msg = {"role": first_role, "text": first_text, "ts": now,
+                 "id": uuid.uuid4().hex[:12]}
+    if via_edge:
+        # Written by the user through the reverse proxy (the dashboard), not
+        # by an in-container caller: only such a message may start a turn
+        # that types on their device (_conv_turn_may_type).
+        first_msg["via_edge"] = True
     atts = _store_attachments(cid, first_attachments or [])
     if atts:
         first_msg["attachments"] = atts
@@ -3025,7 +3366,11 @@ def _conv_add_message(cid: str, role: str, text: str, *,
                       cost_usd: float | None = None,
                       agent: str | None = None,
                       context: str | None = None,
-                      wake: bool = False) -> dict | None:
+                      shell_actions_: list[dict] | None = None,
+                      reply_to: str | None = None,
+                      via_edge: bool = False,
+                      wake: bool = False,
+                      arrival: bool = False) -> dict | None:
     """Append a message to a thread and update its flags. Returns the thread.
 
     `model_name`/`cost_usd` carry the answering turn's metadata (short model
@@ -3036,7 +3381,22 @@ def _conv_add_message(cid: str, role: str, text: str, *,
     stored with the message and replayed to Ara's sessions, never rendered to
     the user — see _conv_context_note. `stored_attachments` is metadata of
     files already written to the thread's store (_store_reply_files), appended
-    after whatever `attachments` stores.
+    after whatever `attachments` stores. `shell_actions_` are the validated
+    shell actions (text for the user's paired keyboard device) Ara's reply
+    carries — scripts/shell_actions.py; the dashboard hands them to the
+    Android app. `reply_to` is the id of the user message such a reply
+    answers: when any user message stands after it by the time the reply is
+    stored, the user wrote again while the turn ran ("no, don't type that"),
+    so none of the actions runs without a tap (`auto` False). That is
+    checked here, under the lock, so no message can land between the check
+    and the append.
+
+    `arrival` marks Ara's reply to a turn nobody in the thread asked for: a
+    chat message that arrived in a companion thread's chat (_conv_worker's
+    `arrival`). The dashboard's voice loop takes only a reply without it as
+    the answer to the user's spoken turn, so a call directive that a
+    correspondent's text steered into such a reply is never placed
+    (webapp/components/conversation.js, _maybeAutoplay).
 
     `wake` marks an append that carries something new for the user (an agent
     filing an inbound message into an existing thread). Such an append
@@ -3053,7 +3413,10 @@ def _conv_add_message(cid: str, role: str, text: str, *,
         conv = _load_conv(cid)
         if conv is None:
             return None
-        message = {"role": role, "text": text, "ts": now}
+        message = {"role": role, "text": text, "ts": now,
+                   "id": uuid.uuid4().hex[:12]}
+        if via_edge:
+            message["via_edge"] = True   # see _new_conv
         lang = _detect_lang(text)
         if lang:
             message["lang"] = lang
@@ -3067,6 +3430,24 @@ def _conv_add_message(cid: str, role: str, text: str, *,
             message["agent"] = agent
         if context:
             message["context"] = context
+        if shell_actions_:
+            message["shell_actions"] = list(shell_actions_)
+            if reply_to is not None:
+                thread = [m for m in conv.get("messages", []) if isinstance(m, dict)]
+                ids = [_conv_message_id(m) for m in thread]
+                # A message the reply answers that is no longer found leaves
+                # nothing to tell the newer ones by, so all of them count.
+                later = thread[ids.index(reply_to) + 1:] if reply_to in ids else thread
+                if any(m.get("role") == "user" for m in later):
+                    message["shell_actions"] = [dict(a, auto=False)
+                                                for a in shell_actions_]
+            if any(a.get("sensitive") for a in shell_actions_):
+                # The file loses the text by itself even if nobody reads the
+                # thread again; a restart in between is covered by
+                # _conv_sensitive_sweep at startup.
+                _conv_schedule_purge(cid, shell_actions.SENSITIVE_TTL_SECONDS)
+        if arrival:
+            message["arrival"] = True
         conv.setdefault("messages", []).append(message)
         conv["updated"] = now
         if wake and conv.get("archived") and not conv.get("muted"):
@@ -3083,6 +3464,116 @@ def _conv_add_message(cid: str, role: str, text: str, *,
                 conv.pop("pending_error", None)
         _save_conv(conv)
         return conv
+
+
+REDACTED_TEXT = "[deleted by request]"
+
+
+def _conv_redact_message(cid: str, message_id: str) -> tuple[dict | None, int, str]:
+    """Replace one user message's text with REDACTED_TEXT, for good.
+
+    For a message in which the user dictated a password Ara then typed on
+    their device: the text, its language tag and its attachments (metadata
+    and files) go; the message stays in place, so the thread still reads in
+    order. Every other copy the system keeps goes with it: a thread title
+    derived from that text, the session-log entry whose question it was
+    (_redact_session_log), and the thread's Claude session, whose transcript
+    holds it verbatim (_reset_session — the next turn replays the redacted
+    thread instead). Only user messages, and only by the id the transcript
+    shows. Returns (thread, 200, "") or (None, HTTP status, reason)."""
+    with _conversations_lock:
+        conv = _load_conv(cid)
+        if conv is None:
+            return None, 404, "not found"
+        target = next((m for m in conv.get("messages") or []
+                       if isinstance(m, dict) and _conv_message_id(m) == message_id), None)
+        if target is None:
+            return None, 404, "no such message"
+        if target.get("role") != "user":
+            return None, 400, "only the user's own messages can be redacted"
+        original = str(target.get("text") or "")
+        atts = target.get("attachments") or []
+        target["id"] = message_id   # a derived id becomes the stored one
+        target["text"] = REDACTED_TEXT
+        target["redacted"] = True
+        for key in ("lang", "attachments", "context"):
+            target.pop(key, None)
+        if original and conv.get("title") == _derive_title(original):
+            conv["title"] = _derive_title(REDACTED_TEXT)
+        _save_conv(conv)
+    _delete_attachment_files(cid, atts)
+    _redact_session_log(cid, message_id, target.get("ts"))
+    with _conv_pending_lock:
+        running = _conv_pending_turns.get(cid, 0) > 0
+    _reset_session(CONV_SESSION_KEY_PREFIX + cid, running=running)
+    return conv, 200, ""
+
+
+def _conv_redaction_refused(cid: str, message_id: str) -> str:
+    """Why an agent may not redact `message_id` now, or "" when it may: only
+    from inside a turn of this thread that the user started from the dashboard
+    after that message — the turn answering their "yes, delete it". That the
+    user approved stays the prompt's rule; this keeps a redaction from coming
+    out of nowhere (another thread's turn, a scheduled job, a script)."""
+    with _conv_pending_lock:
+        running = _conv_pending_turns.get(cid, 0) > 0
+    if not running:
+        return "a redaction is made from inside a turn of this thread"
+    conv = _load_conv(cid)
+    if conv is None:
+        return "not found"
+    messages = [m for m in conv.get("messages") or [] if isinstance(m, dict)]
+    ids = [_conv_message_id(m) for m in messages]
+    if message_id not in ids:
+        return "no such message"
+    latest = _conv_latest_user_message(messages)
+    if latest is None or latest.get("via_edge") is not True:
+        return "the turn was not started by the user from the dashboard"
+    if ids.index(_conv_message_id(latest)) <= ids.index(message_id):
+        return "the user has written nothing since that message"
+    return ""
+
+
+def _delete_attachment_files(cid: str, atts: list) -> None:
+    """Delete the stored files behind attachment metadata of thread `cid`."""
+    for att in atts if isinstance(atts, list) else []:
+        if not isinstance(att, dict):
+            continue
+        att_id, suffix = str(att.get("id") or ""), str(att.get("suffix") or "")
+        if not re.fullmatch(r"[0-9a-f]{32}", att_id) or \
+                not re.fullmatch(r"(\.[A-Za-z0-9]{1,8})?", suffix):
+            continue
+        (CONVERSATION_ATTACHMENTS_DIR / cid / f"{att_id}{suffix}").unlink(missing_ok=True)
+
+
+def _redact_session_log(thread_id: str, message_id: str, ts: object) -> int:
+    """Replace the question of the session-log entries (/conversation/<day>)
+    that are message `message_id` of thread `thread_id` with REDACTED_TEXT —
+    a dashboard turn logs the message it answers so (_append_entry), and one
+    still running logs it redacted (_note_redacted). The entry is written when
+    the turn ends, so the message's own UTC day and the next one are searched.
+    Entries written before entries named their message are left alone.
+    Returns how many entries changed."""
+    try:
+        day = datetime.fromisoformat(str(ts).replace("Z", "+00:00")).astimezone(timezone.utc)
+        days = [day.strftime("%Y-%m-%d"), (day + timedelta(days=1)).strftime("%Y-%m-%d")]
+    except (TypeError, ValueError):
+        days = [_today()]
+    _note_redacted(thread_id, message_id)
+    changed = 0
+    with _conversation_lock:
+        for date_str in days:
+            entries = _load_conversation(date_str)
+            hit = 0
+            for entry in entries:
+                if (isinstance(entry, dict) and entry.get("thread") == thread_id
+                        and entry.get("message") == message_id):
+                    entry["question"] = REDACTED_TEXT
+                    hit += 1
+            if hit:
+                _save_conversation(entries, date_str)
+                changed += hit
+    return changed
 
 
 def _valid_model_id(model: str | None, refresh: bool = False) -> str | None:
@@ -3337,6 +3828,87 @@ def _conv_context_note(msg: dict) -> str:
             "not shown to the user:\n" + ctx + "]")
 
 
+def _conv_shell_actions_note(msg: dict) -> str:
+    """The shell actions a reply carried (scripts/shell-type.py), for Ara's
+    transcript, so a later turn knows what was handed to the user's keyboard
+    device. Never the text of a sensitive action (shell_actions.describe), and
+    a password-manager action carries only its label."""
+    lines = [line for line in (shell_actions.describe(a)
+                               for a in msg.get("shell_actions") or []
+                               if isinstance(a, dict)) if line]
+    if not lines:
+        return ""
+    return ("\n\n[This reply carried shell actions for the user's paired keyboard "
+            "device (scripts/shell-type.py):\n" + "\n".join(lines) + "]")
+
+
+def _conv_shell_outcome_note(messages: list) -> str:
+    """For a resumed session: what became of the shell actions its own last
+    reply carried, which it has not been told — the page reports outcomes
+    after the reply (shell_actions.describe; never a sensitive text)."""
+    for m in reversed(messages):
+        if isinstance(m, dict) and m.get("role") == "assistant":
+            lines = [line for line in (shell_actions.describe(a)
+                                       for a in m.get("shell_actions") or []
+                                       if isinstance(a, dict)) if line]
+            if not lines:
+                return ""
+            return ("\n\n[What became of the shell actions your last reply carried:\n"
+                    + "\n".join(lines) + "]")
+    return ""
+
+
+def _conv_message_id(msg: dict) -> str:
+    """A message's id: the one it was stored with, or — for a message stored
+    before messages had ids — one derived from its time and role, which
+    never change (so it is the same on every read)."""
+    mid = msg.get("id") if isinstance(msg, dict) else None
+    if isinstance(mid, str) and re.fullmatch(r"[0-9a-f]{12,32}", mid):
+        return mid
+    seed = f"{msg.get('ts', '')}|{msg.get('role', '')}" if isinstance(msg, dict) else ""
+    return hashlib.sha256(seed.encode("utf-8")).hexdigest()[:12]
+
+
+def _conv_message_id_note(msg: dict) -> str:
+    """A user message's id, so Ara can redact it on request
+    (conversation-push.py --thread <id> --redact-message <message id>)."""
+    if msg.get("role") != "user" or msg.get("redacted"):
+        return ""
+    return f" [message id: {_conv_message_id(msg)}]"
+
+
+_CANCELLED_CALL_NUMBER_RE = re.compile(r"\+?[0-9*#]{3,24}")
+
+
+def _cancelled_call_context(value) -> str | None:
+    """The note for a voice take that cancelled a call by being spoken.
+
+    In the phone shell's voice conversation a call Ara placed waits 5 s with
+    the mic open, and any speech cancels it (webapp/components/conversation.js,
+    CANCELLED_CALLS); the take that did is sent in any case, carrying
+    `cancelled_call: {number, name}`. Only its words can tell whether the user
+    meant to stop the call, so Ara is told — in wording fixed here, the
+    client supplying nothing but a validated number and a short name."""
+    if not isinstance(value, dict):
+        return None
+    number = str(value.get("number") or "").strip()
+    if not _CANCELLED_CALL_NUMBER_RE.fullmatch(number):
+        return None
+    name = " ".join(str(value.get("name") or "").replace("|", " ").replace("]", " ").split())[:80]
+    who = f"{name} ({number})" if name else number
+    return (
+        f"This voice take cancelled the call to {who}: it was heard while the "
+        "call waited to be placed, so the call was NOT made. Judge from the "
+        "words whether the user meant to stop it. If not — background noise, a "
+        "word to someone else, an affirmation, or a request that still wants "
+        "the call — place it again at once without asking: this is a second "
+        "attempt, so end your reply with "
+        f"[[call: {number} | {name} | no-voice-cancel]] and say it cannot be "
+        "stopped by voice this time. If they did mean to stop it (or asked for "
+        "something else instead), do not call; act on what they said."
+    )
+
+
 # How a message's author is named when a transcript is replayed to Ara.
 _CONV_ROLE_LABEL = {"user": "User", "assistant": "You (Ara)", "agent": "Retinue agent"}
 
@@ -3347,6 +3919,7 @@ def _conv_render_messages(conv: dict, messages: list) -> str:
     return "\n".join(
         f"{_CONV_ROLE_LABEL.get(m.get('role'), m.get('role'))}: "
         f"{m.get('text', '')}{_conv_attachment_note(conv, m)}{_conv_context_note(m)}"
+        f"{_conv_shell_actions_note(m)}{_conv_message_id_note(m)}"
         for m in messages
     )
 
@@ -3627,8 +4200,10 @@ def _conv_engage_prompt(conv: dict, fresh: bool,
         )
     if fresh:
         unseen = _conv_unseen_messages(messages)
+        outcome_note = _conv_shell_outcome_note(messages)
         if len(unseen) <= 1:
-            return ((latest + note + _conv_context_note(latest_msg) + chat_note)
+            return ((latest + note + _conv_context_note(latest_msg)
+                     + _conv_message_id_note(latest_msg) + outcome_note + chat_note)
                     or latest)
         return (
             "These messages arrived in this thread since your last reply, "
@@ -3637,7 +4212,7 @@ def _conv_engage_prompt(conv: dict, fresh: bool,
             "Reply to the user's latest message in your own voice, taking the "
             "others into account. If they approve a concrete action, carry it "
             "out with your tools and confirm what you did."
-            + chat_note
+            + outcome_note + chat_note
         )
     # The transcript already carries each message's own attachment note, so the
     # latest message's files need no second mention here.
@@ -3650,9 +4225,6 @@ def _conv_engage_prompt(conv: dict, fresh: bool,
         "invitation), carry it out with your tools and confirm what you did."
         + _conv_project_note(conv) + chat_note
     )
-
-
-_CHIP_MARKUP_RE = re.compile(r"\[\[chip:[^\]]*\]\]\s*(?:·\s*)?")
 
 
 def _push_conv_notification(conv: dict, text: str, urgency: str | None = None) -> int:
@@ -3679,8 +4251,9 @@ def _push_conv_notification(conv: dict, text: str, urgency: str | None = None) -
               "notifies nobody", flush=True)
         return 0
     title = conv.get("title") or instance_branding.display_name()
-    # The notification shows words, not the chip markup the thread renders.
-    body = " ".join(_CHIP_MARKUP_RE.sub("", str(text or "")).split())
+    # The notification shows words, not the chip and call markup the thread
+    # renders (attention_store.markup_words, as the row's preview does).
+    body = " ".join(attention_store.markup_words(text).split())
     if len(body) > 160:
         body = body[:157].rstrip() + "…"
     push_notify.notify_async(title, body, url=f"/#conversation-{cid}", tag=cid,
@@ -3708,7 +4281,10 @@ def _conv_worker(cid: str, session_key: str, *, arrival: str | None = None,
     whether the gateway may flip the message's `delivered` flag.
     """
     ok = False
+    skipped = False
     reply_atts: list[dict] = []
+    reply_actions: list[dict] = []
+    reply_to: str | None = None
     with _conv_pending_lock:
         _conv_pending_turns[cid] = _conv_pending_turns.get(cid, 0) + 1
     try:
@@ -3717,17 +4293,19 @@ def _conv_worker(cid: str, session_key: str, *, arrival: str | None = None,
         if conv is None:
             return False
         messages = conv.get("messages", [])
+        # The user message this turn was started for (none for an arrival).
+        target = None if arrival else _conv_latest_user_message(messages)
+        target_id = _conv_message_id(target) if target else None
         latest = (ARRIVAL_QUESTION if arrival
-                  else (messages[-1]["text"] if messages else ""))
+                  else _conv_display_question(target or (messages[-1] if messages else {})))
         resume = (CHAT_COMPANION_RESUME
                   or (conv.get("kind") or "chat") != "companion")
         fresh = resume and _session_is_fresh(_get_session_entry(session_key),
                                              session_key)
+        # What a stand-in for send_message sees; the real one builds the
+        # prompt again under the session lock (build_prompt below), with the
+        # whole thread for a session that turns out not to be resumable.
         prompt = _conv_engage_prompt(conv, fresh, arrival)
-        # The resumed prompt sends only what the session has not seen, so if the
-        # resume is refused the turn must fall back to the full transcript — not
-        # to a fragment whose context is missing.
-        restart = _conv_engage_prompt(conv, False, arrival) if fresh else None
         # An explicit per-thread choice wins; an escalated thread without one
         # stays with Ara senior (the frontier tier) rather than re-paying a
         # junior turn plus an escalation on every message. Otherwise the
@@ -3739,13 +4317,68 @@ def _conv_worker(cid: str, session_key: str, *, arrival: str | None = None,
             chosen = FRONTIER_MODEL
         elif chosen is None and DASHBOARD_MODEL:
             chosen = _default_thread_model()
+        may_type = _conv_turn_may_type(messages, arrival)
+        # Whether the turn may still type once it holds the session lock
+        # (build_prompt below): the prompt it is then sent ends with the
+        # newest message of the thread, which need not be the one it was
+        # started for. Once False it stays False.
+        typing_ok = [may_type]
+
+        covered: list = [None]
+
+        def build_prompt(fresh_now: bool) -> str | None:
+            # Read again once the turn holds the session lock: what it waited
+            # behind may have answered this turn's message already, redacted
+            # one, reset the session — or deleted the thread.
+            current = _load_conv(cid)
+            if current is None:
+                return None
+            msgs = current.get("messages", [])
+            if target_id and _conv_is_covered(cid, msgs, target_id, may_type):
+                return None
+            # The prompt reaches the end of the thread, so this turn answers
+            # the newest user message of its own kind — the kind that decided
+            # may_type — and every one of that kind before it. A message of
+            # the other kind keeps its own turn: one sent from the dashboard
+            # must still be answered by a turn that may type, an in-container
+            # one by a turn that may not. An arrival answers no user message.
+            same = [m for m in msgs if isinstance(m, dict) and m.get("role") == "user"
+                    and (m.get("via_edge") is True) == may_type]
+            covered[0] = (_conv_message_id(same[-1])
+                          if same and not arrival else None)
+            # Another turn replied after this turn's message without answering
+            # it (it was of the other kind, or it failed): a resumed session's
+            # "what is new since your last reply" would then be that reply, so
+            # the session is shown the whole thread instead.
+            if fresh_now and target_id and _conv_replied_after(msgs, target_id):
+                fresh_now = False
+            # The prompt asks Ara to reply to the newest user message. One a
+            # caller inside the container posted while this turn waited is not
+            # the user's, yet it would be the one answered: such a turn may no
+            # longer type, though the dashboard message it started for is
+            # still covered (and answered, without typing).
+            typing_ok[0] = typing_ok[0] and _conv_turn_may_type(msgs, arrival)
+            return _conv_engage_prompt(current, fresh_now, arrival)
+
         result = send_message(prompt, display_question=latest, session_key=session_key,
-                              model=chosen, restart_message=restart,
+                              model=chosen, restart_message=None,
                               resume=resume,
-                              reply_attachments=True, thread_id=cid)
+                              reply_attachments=True,
+                              # Only a turn the user started, from the
+                              # dashboard, may type on their paired device —
+                              # asked once the prompt is built, as it is then.
+                              reply_shell_actions=lambda: may_type and typing_ok[0],
+                              thread_id=cid, prompt_builder=build_prompt,
+                              display_message_id=target_id)
+        if result.get("skipped"):
+            skipped = True
+        elif "error" not in result and covered[0]:
+            _conv_note_covered(cid, covered[0], may_type)
         if result.get("escalated"):
             _conv_set_flags(cid, escalated=True)
-        if "error" in result:
+        if skipped:
+            reply = None
+        elif "error" in result:
             reply = ("Sorry, I couldn't reply just now "
                      f"({result['error']}). Please try again.")
         else:
@@ -3753,6 +4386,43 @@ def _conv_worker(cid: str, session_key: str, *, arrival: str | None = None,
             # Files the session attached to its own reply (conversation-push.py
             # --reply-attach) ride on this very message.
             reply_atts = _store_reply_files(cid, result.get("reply_files") or [])
+            # And the shell actions (scripts/shell-type.py): text the user's
+            # phone types on the device it is paired with as a keyboard.
+            reply_actions = list(result.get("reply_shell_actions") or [])
+            if not (may_type and typing_ok[0]) and reply_actions:
+                print(f"[web-gateway] conversation {cid}: {len(reply_actions)} shell "
+                      "action(s) of a turn that may not type dropped", flush=True)
+                reply_actions = []
+            # Whether the page may run each without a tap is decided here,
+            # once (the page runs by itself only what carries auto: true):
+            # never in a thread where other people's words reach the turn.
+            # What the user has seen is the thread as it stood when the turn
+            # started, up to the message it answers: whatever the turn itself
+            # posted meanwhile (a "user" message from inside the container, a
+            # push) came out of what Ara read, not from the user's screen. And
+            # only a reply's first action can run by itself, so no text can be
+            # put together from pieces that each stand somewhere in the
+            # thread, and none is typed ahead of an earlier action that waits
+            # for a tap: the device would take them in the wrong order, and an
+            # Enter the user confirms later would run a line they never saw.
+            thread_auto = _conv_allows_auto_run(conv)
+            upto = next((i for i, m in enumerate(messages) if m is target), -1)
+            shown = messages[:upto + 1]
+            for i, action in enumerate(reply_actions):
+                action["auto"] = bool(i == 0 and thread_auto
+                                      and shell_actions.runs_by_itself(action)
+                                      and _conv_text_was_shown(shown, action.get("text")))
+            # Those marks were decided on the thread as the turn found it. A
+            # user message that lands after the one this turn answered (the
+            # newest it covered, else the one it was started for) is a word
+            # the reply never read, perhaps "no, don't type that":
+            # _conv_add_message then holds every action for a tap, checked
+            # under the lock it appends with.
+            reply_to = covered[0] or target_id
+            if any(a.get("sensitive") for a in reply_actions):
+                # A title derived from the user's message may carry the very
+                # text typed; it reaches the thread list and every push.
+                _conv_neutral_title(cid)
             # The lint enforces the dashboard-composing form (chips for
             # options, no bare URLs) on the way out — the net under whichever
             # model composed the reply. Error replies above skip it: they are
@@ -3761,7 +4431,7 @@ def _conv_worker(cid: str, session_key: str, *, arrival: str | None = None,
             text = result.get("response") or ""
             reply = (_lint_presentation(text or "(no reply)",
                                         kind=conv.get("kind") or "chat")
-                     if text or not reply_atts else "")
+                     if text or not (reply_atts or reply_actions) else "")
     except Exception as exc:  # noqa: BLE001 - always surface a turn back to the UI
         print(f"[web-gateway] conversation {cid} worker failed: {exc!r}", flush=True)
         reply = f"Sorry, an error occurred: {exc}"
@@ -3778,20 +4448,173 @@ def _conv_worker(cid: str, session_key: str, *, arrival: str | None = None,
             _conv_pending_turns[cid] = still_running
         else:
             _conv_pending_turns.pop(cid, None)
+    if skipped:
+        # The turn before answered this turn's message too (or the thread
+        # went): no reply of its own, and no "(no reply)" either.
+        _conv_set_flags(cid, pending=bool(still_running))
+        return True
     conv = _conv_add_message(cid, "assistant", reply, unread=True,
                              pending=bool(still_running),
                              stored_attachments=reply_atts,
+                             shell_actions_=reply_actions,
+                             reply_to=reply_to,
                              model_name=result.get("model_name"),
-                             cost_usd=result.get("cost_usd"))
+                             cost_usd=result.get("cost_usd"),
+                             arrival=bool(arrival))
+    if not still_running:
+        # A reset asked for while this turn ran (a redaction) is consumed by
+        # the turn's session write (_record_turn_session); a turn that wrote
+        # none leaves it here. A sensitive text's session was already dropped
+        # inside send_message, under the session lock.
+        with _state_lock:
+            _reset_session_keys.discard(session_key)
     if conv is None:
         # Nothing was stored, so nothing has accounted for whatever prompted
         # this turn. Saying otherwise would let a gateway mark an inbound
         # message delivered against a reply that does not exist.
         return False
     if push:
+        # A reply that is only shell actions still says something: a fixed
+        # phrase, never the text to type, which may be a sensitive one and must
+        # not reach a push.
         _push_conv_notification(
-            conv, reply or ", ".join(a["filename"] for a in reply_atts))
+            conv, reply or ", ".join(a["filename"] for a in reply_atts)
+            or ("Ready to type on your device" if reply_actions else ""))
     return ok
+
+
+def _conv_latest_user_message(messages: list) -> dict | None:
+    for m in reversed(messages or []):
+        if isinstance(m, dict) and m.get("role") == "user":
+            return m
+    return None
+
+
+def _conv_display_question(msg: dict) -> str:
+    """What the session log records as a turn's question: the message's text,
+    or what it carried when it has none — never the prompt, which for a
+    replayed thread holds everything said in it."""
+    text = str((msg or {}).get("text") or "").strip()
+    if text:
+        return text
+    # A stored name is what the file was called where it came from, so it is
+    # read again here as at every other use (_attachment_name): a base name
+    # on one line, also for metadata stored before names were cleaned.
+    names = [_attachment_name(a.get("filename")) for a in (msg or {}).get("attachments") or []
+             if isinstance(a, dict)]
+    return f"[attachment: {', '.join(names)}]" if names else "[no text]"
+
+
+# Per thread and kind of turn — one that may type (its message came from the
+# dashboard) or one that may not — the newest user message of that kind a
+# completed turn's prompt covered: a turn of the same kind queued behind it
+# whose own message is no newer has nothing left to answer (it would
+# otherwise answer it twice, or be sent Ara's own reply as "what is new").
+# Kept apart by kind, since a position in the thread covers every message
+# before it: a turn that may not type must never answer away a dashboard
+# message whose own turn would have typed, nor the reverse. In memory: a
+# queued turn does not outlive the process.
+_conv_covered: dict[tuple[str, bool], str] = {}
+_conv_covered_lock = threading.Lock()
+_CONV_COVERED_MAX = 2000
+
+
+def _conv_note_covered(cid: str, message_id: str, may_type: bool) -> None:
+    key = (cid, bool(may_type))
+    with _conv_covered_lock:
+        _conv_covered.pop(key, None)
+        _conv_covered[key] = message_id
+        while len(_conv_covered) > _CONV_COVERED_MAX:
+            _conv_covered.pop(next(iter(_conv_covered)))
+
+
+def _conv_is_covered(cid: str, messages: list, target_id: str,
+                     may_type: bool) -> bool:
+    """Whether a completed turn of the same kind already answered the
+    message `target_id`."""
+    with _conv_covered_lock:
+        covered = _conv_covered.get((cid, bool(may_type)))
+    if not covered:
+        return False
+    ids = [_conv_message_id(m) for m in messages or [] if isinstance(m, dict)]
+    if target_id not in ids or covered not in ids:
+        return False
+    return ids.index(target_id) <= ids.index(covered)
+
+
+def _conv_replied_after(messages: list, target_id: str) -> bool:
+    """Whether a reply of Ara's stands after the message `target_id`."""
+    ids = [_conv_message_id(m) for m in messages or [] if isinstance(m, dict)]
+    if target_id not in ids:
+        return False
+    later = [m for m in messages if isinstance(m, dict)][ids.index(target_id) + 1:]
+    return any(m.get("role") == "assistant" for m in later)
+
+
+def _conv_turn_may_type(messages: list, arrival: str | None) -> bool:
+    """Whether this turn may attach shell actions: one the user started, by a
+    message that reached the gateway through the reverse proxy (`via_edge`,
+    set by the dashboard's own endpoints) — not a chat arrival, and not a
+    "user" message an in-container agent posted."""
+    if arrival:
+        return False
+    # The user message the turn answers: the latest one — an agent's push or
+    # an arrival's reply may have landed after it.
+    m = _conv_latest_user_message(messages)
+    return bool(m) and m.get("via_edge") is True
+
+
+def _conv_allows_auto_run(conv: dict) -> bool:
+    """Whether actions in this thread may run without a tap at all: only in a
+    plain chat the user opened. A companion thread carries a correspondent's
+    messages into every turn, an agent's thread (triage, an alert) the words
+    it was opened with — text that must never type by itself."""
+    return ((conv.get("kind") or "chat") == "chat"
+            and conv.get("initiator", "user") == "user")
+
+
+def _conv_text_was_shown(messages: list, text: object) -> bool:
+    """Whether `text` stands verbatim, as a whole line, in `messages` — the
+    thread as the user saw it before this turn: their own messages sent from
+    the dashboard (`via_edge`) or Ara's earlier replies. A text that runs
+    without a tap must be one the user could have read ("type the text
+    above"), not one that came out of something Ara read meanwhile; a "user"
+    message posted from inside the container is not the user's. A whole line
+    (its edge whitespace aside), not any piece of one: otherwise a single
+    letter — an app's shortcut on the device — or a command cut out of a
+    sentence would count as seen."""
+    if not isinstance(text, str) or not text.strip():
+        return False
+    text = text.strip()
+    for m in messages or []:
+        if not isinstance(m, dict):
+            continue
+        if m.get("role") == "user" and m.get("via_edge") is not True:
+            continue
+        if m.get("role") not in ("user", "assistant"):
+            continue
+        lines = re.split(r"\r\n|\r|\n", str(m.get("text") or ""))
+        if any(line.strip() == text for line in lines):
+            return True
+    return False
+
+
+SENSITIVE_THREAD_TITLE = "Typing on a paired device"
+
+
+def _conv_neutral_title(cid: str) -> None:
+    """Replace a thread title derived from one of the user's messages — it may
+    carry a password typed in this thread — with SENSITIVE_THREAD_TITLE."""
+    with _conversations_lock:
+        conv = _load_conv(cid)
+        if conv is None:
+            return
+        derived = {_derive_title(str(m.get("text") or ""))
+                   for m in conv.get("messages") or []
+                   if isinstance(m, dict) and m.get("role") == "user"}
+        if conv.get("title") in derived:
+            conv["title"] = SENSITIVE_THREAD_TITLE
+            _save_conv(conv)
 
 
 def _start_conv_turn(cid: str) -> None:
@@ -5072,8 +5895,23 @@ def send_message(message: str, display_question: str | None = None,
                  restart_message: str | None = None,
                  resume: bool = True,
                  reply_attachments: bool = False,
-                 thread_id: str | None = None) -> dict:
+                 reply_shell_actions=None,
+                 thread_id: str | None = None,
+                 prompt_builder=None,
+                 display_message_id: str | None = None) -> dict:
     """Send message to the session for `session_key` (resume or new) and return result.
+
+    `prompt_builder(fresh)` (a dashboard thread's), when given, builds the
+    prompt once this key's session lock is held — from the thread as it is
+    then, for a session that is still `fresh` (resumable) or not — and so
+    replaces `message`/`restart_message`. A turn queued behind another must
+    not send what it read before waiting: a message redacted meanwhile, or a
+    resumed session's fragment where the session has since gone. It returns
+    None when nothing is left to answer (the turn before answered this
+    turn's message too, or the thread is gone); the result is then
+    {"skipped": True} and no model runs.
+    `display_message_id` names the thread message `display_question` is, so
+    the session log can be redacted by message, not by text.
 
     `resume=False` starts a new session even when the stored one is still
     fresh (a companion thread's turn — see CHAT_COMPANION_RESUME).
@@ -5111,7 +5949,16 @@ def send_message(message: str, display_question: str | None = None,
     --reply-attach appends to it), and the paths the run whose reply is kept
     listed come back as "reply_files". Fresh per spawn, so a run whose reply is
     discarded — junior's before an escalation, a refused resume — takes its
-    files with it.
+    files with it. The same turn gets a second manifest,
+    RETINUE_REPLY_SHELL_ACTIONS_FILE (scripts/shell-type.py), under the same
+    rules; its validated actions come back as "reply_shell_actions".
+    `reply_shell_actions` (default: as `reply_attachments`) withholds that
+    second manifest alone: a turn nobody asked for — a chat arrival — gets
+    none, so nothing it read can make the user's phone type
+    (_conv_worker). It may be a callable, asked once `prompt_builder` has
+    built the prompt: whether a turn may type can change while it waits for
+    the lock, since the prompt then ends with whatever reached the thread
+    meanwhile.
 
     `thread_id` is the dashboard thread the turn answers, handed to every
     spawn as RETINUE_THREAD_ID: the push CLIs stamp it on the sends they
@@ -5122,6 +5969,16 @@ def send_message(message: str, display_question: str | None = None,
     # and queued requests don't occupy a worker slot), then acquire a worker slot
     # to bound the number of concurrent `claude` subprocesses.
     with _session_lock_for(session_key):
+        if prompt_builder is not None:
+            # Built once the lock is held but before a worker slot is taken
+            # (the build reads files; the slot bounds `claude` processes).
+            # None: nothing is left for this turn to answer.
+            fresh_now = resume and _session_is_fresh(_get_session_entry(session_key),
+                                                     session_key)
+            message = prompt_builder(fresh_now)
+            if message is None:
+                return {"skipped": True}
+            restart_message = prompt_builder(False) if fresh_now else None
         with _worker_pool:
             state = _get_session_entry(session_key)
 
@@ -5185,6 +6042,11 @@ def send_message(message: str, display_question: str | None = None,
             # Every spawn's manifest, so all of them are cleaned up; the last
             # one belongs to the run whose reply is kept.
             manifests: list[Path] = []
+            action_manifests: list[Path] = []
+            if callable(reply_shell_actions):
+                reply_shell_actions = bool(reply_shell_actions())
+            want_shell_actions = (reply_attachments if reply_shell_actions is None
+                                  else reply_shell_actions)
 
             def _spawn(cmd: list[str], run_model: str):
                 # The session's environment is built from the allowlist in
@@ -5198,19 +6060,33 @@ def send_message(message: str, display_question: str | None = None,
                 # below the frontier tier — senior has nobody to escalate to.
                 offer_flag = (escalate_flag is not None
                               and not _same_model(run_model, FRONTIER_MODEL))
-                manifest = None
+                manifest = action_manifest = None
                 if reply_attachments:
                     manifest = (Path(tempfile.gettempdir())
                                 / f"retinue-reply-attachments-{uuid.uuid4().hex}")
                     manifests.append(manifest)
+                if want_shell_actions:
+                    # Named with its key's tag, so a restart that cut the turn
+                    # short can still tell whose session it tainted
+                    # (_sweep_stale_shell_manifests).
+                    action_manifest = (Path(tempfile.gettempdir())
+                                       / f"{_SHELL_MANIFEST_PREFIX}{_session_key_tag(session_key)}"
+                                         f"-{uuid.uuid4().hex}")
+                    action_manifests.append(action_manifest)
                 env = session_env.build(
                     model=run_model,
                     escalate_file=escalate_flag if offer_flag else None,
                     reply_attachments_file=manifest,
+                    reply_shell_actions_file=action_manifest,
                     thread_id=thread_id)
                 return _run_claude(cmd, capture_output=True, text=True,
                                    cwd="/workspace", env=env)
 
+            # Known before the spawns, so the finally below can act on them
+            # whatever raises in between.
+            orphaned: list[str] = []
+            tainted = False
+            completed = False
             try:
                 # Remember the resume point and prompt the final first-pass run
                 # used, so an escalated re-run replays exactly that turn on the
@@ -5233,8 +6109,13 @@ def send_message(message: str, display_question: str | None = None,
                         result = _spawn(_build_cmd(run_resume, run_prompt, effective_model),
                                         effective_model)
                 else:
+                    # A new session — none stored, or the stored one went
+                    # (expired, or reset by another turn while this one waited
+                    # for the lock): it has seen nothing, so it gets the whole
+                    # thread when the caller has one, not a resumed session's
+                    # "what is new" fragment.
                     session_action = "new"
-                    run_resume, run_prompt = None, message
+                    run_resume, run_prompt = None, restart_message or message
                     result = _spawn(_build_cmd(run_resume, run_prompt, effective_model),
                                     effective_model)
 
@@ -5243,23 +6124,52 @@ def send_message(message: str, display_question: str | None = None,
                     escalate_flag.unlink(missing_ok=True)
                     if result.returncode == 0:
                         escalated = True
+                        junior_session = _session_id_of(result)
+                        if junior_session and junior_session != run_resume:
+                            # Junior's own fresh session: discarded with her
+                            # reply, so its transcript goes too.
+                            orphaned.append(junior_session)
                         print(f"[web-gateway] {session_key}: junior escalated — "
                               f"re-running on {FRONTIER_MODEL}", flush=True)
                         result = _spawn(
                             _build_cmd(run_resume, run_prompt, FRONTIER_MODEL),
                             FRONTIER_MODEL)
 
-                # Only the kept run's manifest is read; the discarded runs' ones
-                # are dropped unread. A failed run's files go with its reply.
+                # Only the kept run's manifest is read for its contents; the
+                # discarded runs' ones are dropped. A failed run's files go
+                # with its reply. Every run's shell actions are checked for a
+                # sensitive text, though, failed and discarded ones included:
+                # a session that had one holds it verbatim, and is never
+                # resumed (below).
                 reply_files = (_read_reply_manifest(manifests[-1])
                                if manifests and result.returncode == 0 else [])
+                kept_actions = (_read_reply_shell_actions(action_manifests[-1],
+                                                          session_key)
+                                if action_manifests else [])
+                tainted = (any(a.get("sensitive") for a in kept_actions)
+                           or any(_manifest_has_sensitive(path)
+                                  for path in action_manifests[:-1]))
+                reply_actions = kept_actions if result.returncode == 0 else []
+                completed = True
             finally:
+                # A spawn that raised (the senior re-run, say) leaves no reply
+                # — but a run before it may have typed a sensitive text, in a
+                # session this key would resume: dropped all the same.
+                if not completed and (tainted or any(
+                        _manifest_has_sensitive(path) for path in action_manifests)):
+                    _record_turn_session(session_key, {}, drop=True, also_forget=orphaned)
                 # Every spawn's manifest goes, whatever happened — a spawn
                 # that raised included.
-                for stale in manifests:
+                for stale in manifests + action_manifests:
                     stale.unlink(missing_ok=True)
 
             if result.returncode != 0:
+                # A failed run records no session; but one that typed a
+                # sensitive text, or whose key a redaction reset meanwhile,
+                # must not leave a resumable session or transcript behind.
+                if tainted or _session_was_reset(session_key):
+                    _record_turn_session(session_key, {}, drop=True,
+                                         also_forget=orphaned + [_session_id_of(result)])
                 err_detail = result.stderr.strip()
                 # Claude often writes the real failure (e.g. OAuth expiry)
                 # to stdout as JSON even though it exits non-zero.
@@ -5289,6 +6199,9 @@ def send_message(message: str, display_question: str | None = None,
             try:
                 data = json.loads(result.stdout)
             except json.JSONDecodeError:
+                if tainted:
+                    _record_turn_session(session_key, {}, drop=True,
+                                         also_forget=orphaned)
                 return {
                     "error": "could not parse claude output",
                     "raw": result.stdout[:500],
@@ -5300,7 +6213,12 @@ def send_message(message: str, display_question: str | None = None,
                 "last_activity": _now_ts(),
                 "usage": _usage_snapshot(data),
             }
-            _update_session_entry(session_key, new_state)
+            # Recorded (or dropped) here, under this key's session lock: a
+            # turn queued behind this one cannot resume a session that typed
+            # a sensitive text, because it never sees it recorded.
+            _record_turn_session(
+                session_key, new_state, drop=tainted,
+                also_forget=[x for x in orphaned if x != new_state["session_id"]])
             # A resumed session reports usage summed over all its turns; the
             # bubble gets only this turn's share (an escalated re-run resumes
             # from the same point, so the same baseline applies).
@@ -5324,12 +6242,18 @@ def send_message(message: str, display_question: str | None = None,
             }
             if escalated:
                 out["escalated"] = True
+            if tainted:
+                out["session_reset"] = True
             if reply_files:
                 out["reply_files"] = reply_files
+            if reply_actions:
+                out["reply_shell_actions"] = reply_actions
 
             if response_text:
                 shown_question = display_question or message
-                date_str, anchor = _append_entry(shown_question, response_text)
+                date_str, anchor = _append_entry(shown_question, response_text,
+                                                 thread_id=thread_id,
+                                                 message_id=display_message_id)
                 if CONVERSATION_BASE_URL:
                     out["entry_url"] = f"{CONVERSATION_BASE_URL}/conversation/{date_str}#{anchor}"
 
@@ -5396,6 +6320,9 @@ def _cleanup_transcript(raw: str, thread_id: str = "") -> str:
     cmd = [
         "claude", "-p", "--output-format=json",
         "--model", TRANSCRIPT_CLEANUP_MODEL,
+        # One-shot: nothing resumes it, so no transcript is kept — it would
+        # hold what the user dictated (a password, say) and the thread context where no redaction reaches it.
+        "--no-session-persistence",
         # A correction pass needs no tools, no MCP servers and no project
         # context — excluding them is what keeps it cheap and fast.
         "--allowed-tools", "",
@@ -5438,7 +6365,9 @@ _LINT_SYSTEM_PROMPT = (
     "phone dashboard. The dashboard renders Markdown plus one extra "
     "affordance, the reply chip: [[chip: Label | prefill text]] — an inline "
     "click-to-fill button; clicking it drops the prefill into the composer "
-    "for the user to review and send themselves, it never auto-sends.\n\n"
+    "for the user to review and send themselves, it never auto-sends. A "
+    "[[call: number | name]] token is a phone call the assistant places; "
+    "never add, change or remove one.\n\n"
     "Return the message below with ONLY these presentation rules enforced, "
     "changing nothing else:\n\n"
     "1. Options get chips. When the message asks the user to choose, confirm "
@@ -5470,6 +6399,120 @@ _LINT_SYSTEM_PROMPT = (
 # unchanged), or a `/path` token (relative URLs like /sends).
 _LINT_URLISH_RE = re.compile(r"https?://|\w\.\w|/\w")
 
+# The thread's renderer (webapp/components/markdown.js), as far as it decides
+# which call directives become call links: its fence lines (FENCE_RE), the
+# lines that open a block of their own rather than a table (HEADING_RE,
+# QUOTE_RE, LIST_RE, HR_RE), a table's separator row (TABLE_SEP_RE), and the
+# inline patterns of renderInline that run before the call link — the two
+# chip forms, each skipping a code span met first — and CALL_RE itself.
+# Its regular expressions are JavaScript's, whose \s, trim() and `.` differ
+# from Python's: \s and trim() hold U+00A0 and U+FEFF but not \x1c-\x1f or
+# \x85, and `.` stops at \r, U+2028 and U+2029 as well as \n. A copy that
+# read any of these otherwise would let a lint result through whose quoted
+# directive the bubble shows as a call, so the copy spells them out
+# (_JS_S, _JS_DOT, _js_trim). Its case-blind matching folds ASCII only, as
+# JavaScript's does without the u flag, where Python's would also fold a
+# dotless i into the i of "chip".
+_JS_SPACE = ("\t\n\v\f\r \u00a0\u1680" + "".join(map(chr, range(0x2000, 0x200b)))
+             + "\u2028\u2029\u202f\u205f\u3000\ufeff")
+_JS_S = r"[\t\n\v\f\r \u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000\ufeff]"
+_JS_DOT = r"[^\n\r\u2028\u2029]"
+
+
+def _js_re(pattern: str, flags: int = 0):
+    """`pattern`, written with JavaScript's \\s, compiled to match as there."""
+    return re.compile(pattern.replace(r"\s", _JS_S), flags | re.ASCII)
+
+
+def _js_trim(s: str) -> str:
+    """String.prototype.trim()."""
+    return s.strip(_JS_SPACE)
+
+
+_LINT_FENCE_RE = _js_re(r"^(?:```|~~~)\s*([A-Za-z0-9_.+-]*)\s*$")
+_LINT_OWN_BLOCK_RE = _js_re(
+    r"^(?:#{1,6}\s+|>|\s*(?:[-*+]|[0-9]+[.)])\s+|\s*(?:-{3,}|\*{3,}|_{3,})\s*$)")
+_LINT_TABLE_SEP_RE = _js_re(r"^\s*\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)+\|?\s*$")
+_LINT_CODE = r"(`[^`]+`)|"
+_LINT_CHIP_RES = (
+    _js_re(_LINT_CODE + r"\[\[chip:\s*([^|\]]+?)\s*\|\s*(" + _JS_DOT + r"+?)\s*\]\]", re.I),
+    _js_re(_LINT_CODE + r"\[\[chip:\s*([^|\]]+?)\s*\]\]", re.I),
+)
+_LINT_CALL_RE = _js_re(
+    _LINT_CODE + r"\[\[call:\s*([+0-9*#][0-9*# ().\/-]*?)\s*(?:\|\s*([^|\]]*?)\s*)?"
+    r"(?:\|\s*(no-voice-cancel)\s*)?\]\]", re.I)
+# The lines a lint result must leave exactly as they were whenever the
+# message holds a call directive (_call_frame): each line with one, and each
+# that is, or could be read as, a fence or a table's separator — drawn wider
+# than the renderer draws them, so that a future difference between it and
+# the copy above cannot make a quoted directive a call either.
+_LOOSE_SEP_RE = re.compile(r"[\s\ufeff|:-]*--[\s\ufeff|:-]*")
+
+
+def _table_cells(line: str) -> list:
+    """A table row's cells, split as splitTableRow() splits them."""
+    s = _js_trim(line)
+    s = s[1:] if s.startswith("|") else s
+    s = s[:-1] if s.endswith("|") else s
+    return [_js_trim(c.replace("\\|", "|")) for c in re.split(r"(?<!\\)\|", s)]
+
+
+def _inline_segments(text: str) -> list:
+    """The pieces of a message the thread renders inline, each on its own:
+    every line outside a fence (a fence runs from an opening ``` or ~~~ line
+    to the next fence line of either kind, or to the end of the text), and in
+    a table each cell the table shows. A message keeps its line breaks, so no
+    inline markup — a code span, a directive — reaches across one."""
+    lines, out, i = text.split("\n"), [], 0
+    while i < len(lines):
+        line = lines[i]
+        if _LINT_FENCE_RE.match(line):
+            i += 1
+            while i < len(lines) and not _LINT_FENCE_RE.match(lines[i]):
+                i += 1
+            i += 1
+        elif ("|" in line and not _LINT_OWN_BLOCK_RE.match(line)
+                and i + 1 < len(lines) and _LINT_TABLE_SEP_RE.match(lines[i + 1])):
+            head = _table_cells(line)
+            out.extend(head)
+            i += 2
+            while i < len(lines) and "|" in lines[i] and _js_trim(lines[i]):
+                # A row's cells beyond the header's are not shown.
+                out.extend(_table_cells(lines[i])[:len(head)])
+                i += 1
+        else:
+            out.append(line)
+            i += 1
+    return out
+
+
+def _live_call_directives(text: str) -> list:
+    """The call directives in `text` that the thread would act on, in order:
+    those its renderer turns into call links, which callOf()
+    (webapp/components/markdown.js) collects. Each line, or table cell, is
+    rendered on its own; in it the chips go first, then a directive counts
+    unless a code span met first holds it. One quoted as code, split across
+    lines or cut apart by a table's cells is an example or debris the bubble
+    shows literally rather than a call. An invalid number counts all the
+    same: it changes no other directive's standing, and a lint that alters
+    one is refused rather than delivered."""
+    found = []
+    for seg in _inline_segments(text):
+        for chip_re in _LINT_CHIP_RES:
+            seg = chip_re.sub(lambda m: m.group(0) if m.group(1) else "\x01", seg)
+        found.extend(m.group(0) for m in _LINT_CALL_RE.finditer(seg) if not m.group(1))
+    return found
+
+
+def _call_frame(text: str) -> list:
+    """The lines of `text` a lint may not change beside a call directive, in
+    order: those that hold one, and every fence-like or separator-like line
+    (_LOOSE_SEP_RE)."""
+    return [line for line in text.split("\n")
+            if "[[call:" in line.lower() or "```" in line or "~~~" in line
+            or _LOOSE_SEP_RE.fullmatch(line)]
+
+
 def _lint_presentation(text: str, *, kind: str = "chat") -> str:
     """Enforce the dashboard-composing form on an agent→user message.
 
@@ -5494,6 +6537,9 @@ def _lint_presentation(text: str, *, kind: str = "chat") -> str:
     cmd = [
         "claude", "-p", "--output-format=json",
         "--model", PRESENTATION_LINT_MODEL,
+        # One-shot: nothing resumes it, so no transcript is kept — it would
+        # hold Ara's reply where no redaction reaches it.
+        "--no-session-persistence",
         # A lint pass needs no tools, no MCP servers and no project context —
         # excluding them is what keeps it cheap and fast.
         "--allowed-tools", "",
@@ -5535,6 +6581,26 @@ def _lint_presentation(text: str, *, kind: str = "chat") -> str:
     if (not linted
             or len(linted) < len(raw) * PRESENTATION_LINT_MIN_KEEP
             or len(linted) > len(raw) * PRESENTATION_LINT_MAX_GROWTH + 200):
+        return text
+    # A call directive is a phone call the voice loop places, and the lint
+    # reads the reply raw, quoted mail or web text included. That it never
+    # adds, changes or removes one is therefore not left to its prompt: a
+    # result whose directives differ from the original's in any way is not
+    # delivered. The directives compared are the live ones, outside code: the
+    # text of a quoted directive survives a lint that only drops its
+    # backticks or fence lines, and the call it then becomes would be placed.
+    # The count of all of them, quoted ones included, is compared as well, so
+    # the lint cannot add or drop a quoted one either. And whatever the copy
+    # of the renderer makes of a message, the lint may change no line that
+    # holds a directive, nor any fence or separator line, in one that holds
+    # any (_call_frame).
+    has_call = "[[call:" in raw.lower() or "[[call:" in linted.lower()
+    if (_live_call_directives(raw) != _live_call_directives(linted)
+            or len(attention_store.CALL_MARKUP_RE.findall(raw))
+            != len(attention_store.CALL_MARKUP_RE.findall(linted))
+            or (has_call and _call_frame(raw) != _call_frame(linted))):
+        print("[web-gateway] presentation lint changed a call directive — "
+              "delivering the text unchanged", flush=True)
         return text
     return linted
 
@@ -7935,8 +9001,7 @@ def _delete_conversation(cid: str) -> bool:
         entry = state.pop(session_key, None)
         if entry is not None:
             _save_state(state)
-    session_id = str((entry or {}).get("session_id") or "")
-    if session_id:
+    for session_id in _entry_session_ids(entry):
         _forget_claude_session(session_id)
     return existed
 
@@ -10151,6 +11216,10 @@ class Handler(BaseHTTPRequestHandler):
         if internal_flags_match:
             self._handle_agent_conversation_flags(internal_flags_match.group(1))
             return
+        internal_redact_match = _INTERNAL_CONV_REDACT_RE.match(self.path)
+        if internal_redact_match:
+            self._handle_agent_conversation_redact(internal_redact_match.group(1))
+            return
         if self.path.split("?", 1)[0].rstrip("/") == "/push/subscribe":
             self._handle_push_subscribe()
             return
@@ -10211,6 +11280,11 @@ class Handler(BaseHTTPRequestHandler):
         if model_match:
             self._handle_conversation_model(model_match.group(1))
             return
+        shell_outcome_match = _CONV_SHELL_OUTCOME_RE.match(self.path)
+        if shell_outcome_match:
+            self._handle_conversation_shell_outcome(shell_outcome_match.group(1),
+                                                    shell_outcome_match.group(2))
+            return
         action = _SEND_ACTION_RE.match(self.path)
         if action:
             self._handle_send_action(action.group(1), action.group(2), action.group(3))
@@ -10269,7 +11343,12 @@ class Handler(BaseHTTPRequestHandler):
         POST .../approve here would simply queue its own send and then approve
         it, which would leave the send gate closing nothing at all. Reject is
         gated too — it cannot cause a send, but suppressing a message the user
-        meant to allow is equally not an agent's call."""
+        meant to allow is equally not an agent's call. Another site's page
+        is refused before that: it reaches here through the proxy with the
+        user's credentials, so the edge gate alone would let it decide."""
+        if not self._claude_auth_same_origin():
+            self._send_json(403, {"error": "cross-site request rejected"})
+            return
         ok, reason = self._request_from_edge(
             f"{verb} of pending send {account}/{request_id}")
         if not ok:
@@ -10563,6 +11642,24 @@ class Handler(BaseHTTPRequestHandler):
     # Dashboard-side routes sit behind the edge auth like /conversations; the
     # two /internal/chats/* routes are for in-container callers (the gateways'
     # rail, agent draft staging).
+
+    def _via_edge(self) -> bool:
+        """Whether this request came through the reverse proxy — quietly, for
+        marking what it writes (see _request_from_edge for the refusing gate
+        and what the distinction is worth). A request another site's page
+        made the browser send also passes the reverse proxy, with the user's
+        credentials, but its words are not the user's: it is never marked."""
+        if not self._claude_auth_same_origin():
+            return False
+        try:
+            peer = self.client_address[0]
+        except Exception:  # noqa: BLE001
+            peer = None
+        try:
+            local = self.connection.getsockname()[0]
+        except Exception:  # noqa: BLE001
+            local = None
+        return _classify_request_origin(peer, local)[0]
 
     def _request_from_edge(self, what: str) -> tuple[bool, str]:
         """Gate for the endpoints that act with the user's own authority.
@@ -10932,7 +12029,11 @@ class Handler(BaseHTTPRequestHandler):
         if chat_id is None:
             return
         # Erasure is the user's own act, like a send: an agent can archive or
-        # mute, never destroy. Same edge-origin gate as POST /chats/<id>/send.
+        # mute, never destroy. Same gates as POST /chats/<id>/send, the
+        # cross-site one included.
+        if not self._claude_auth_same_origin():
+            self._send_json(403, {"error": "cross-site request rejected"})
+            return
         ok, reason = self._request_from_edge(f"chat delete of {chat_id}")
         if not ok:
             self._send_json(403, {
@@ -11107,6 +12208,13 @@ class Handler(BaseHTTPRequestHandler):
         it without waiting for the store."""
         chat_id = self._chat_id_or_404(raw_id)
         if chat_id is None:
+            return
+        # Another site's page can make the browser POST here through the proxy
+        # with the user's credentials (a text/plain form body that is valid
+        # JSON needs no preflight), and its peer is then the proxy's: the edge
+        # gate below cannot tell it from the send press.
+        if not self._claude_auth_same_origin():
+            self._send_json(403, {"error": "cross-site request rejected"})
             return
         ok, reason = self._request_from_edge(f"chat send to {chat_id}")
         if not ok:
@@ -12149,6 +13257,11 @@ class Handler(BaseHTTPRequestHandler):
 
     def _handle_conversation_create(self) -> None:
         """User opens a new thread from the dashboard and Ara replies (async)."""
+        # Another site's page could otherwise post words in the user's name
+        # (a text/plain form body that is valid JSON needs no preflight).
+        if not self._claude_auth_same_origin():
+            self._send_json(403, {"error": "cross-site request rejected"})
+            return
         payload = self._read_json_body()
         if payload is None:
             self._send_json(400, {"error": "invalid JSON"})
@@ -12188,12 +13301,15 @@ class Handler(BaseHTTPRequestHandler):
         conv = _new_conv("user", owner, title, "user", message,
                          first_attachments=attachments, kind=kind,
                          project=project, project_title=project_title,
-                         model=model)
+                         model=model, via_edge=self._via_edge())
         _start_conv_turn(conv["id"])
         self._send_json(201, _conv_set_flags(conv["id"], pending=True) or conv)
 
     def _handle_conversation_reply(self, cid: str) -> None:
         """User replies within an existing thread; Ara answers (async)."""
+        if not self._claude_auth_same_origin():   # see _handle_conversation_create
+            self._send_json(403, {"error": "cross-site request rejected"})
+            return
         payload = self._read_json_body()
         if payload is None:
             self._send_json(400, {"error": "invalid JSON"})
@@ -12204,7 +13320,9 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(400, {"error": "empty message"})
             return
         conv = _conv_add_message(cid, "user", message, unread=False,
-                                 attachments=attachments)
+                                 attachments=attachments,
+                                 context=_cancelled_call_context(payload.get("cancelled_call")),
+                                 via_edge=self._via_edge())
         if conv is None:
             self._send_json(404, {"error": "not found"})
             return
@@ -12217,6 +13335,40 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(404, {"error": "not found"})
             return
         self._send_json(200, conv)
+
+    def _handle_conversation_shell_outcome(self, cid: str, action_id: str) -> None:
+        """The dashboard reports what became of a shell action on the paired
+        device: body {"state": "typed" | "error" | "secret-typed" |
+        "secret-cancelled", "error": <the shell's error key>}.
+
+        The outcome is stored on the action, so Ara's later turns learn it
+        (shell_actions.describe). A sensitive text (shell-type.py --sensitive)
+        reported typed is deleted from the stored reply at once; the action
+        keeps its kind, id and marks, so the page can say "Text deleted" and
+        nothing can type it again. Behind the dashboard's own auth like every
+        /conversations/ call, and only through the reverse proxy: what the
+        page saw happen is the page's to say, not an in-container caller's,
+        nor another site's page (it could purge a code before it is typed)."""
+        if not self._claude_auth_same_origin():
+            self._send_json(403, {"error": "cross-site request rejected"})
+            return
+        ok, reason = self._request_from_edge(f"shell-action outcome for {cid}")
+        if not ok:
+            self._send_json(403, {"error": "forbidden", "reason": reason})
+            return
+        payload = self._read_json_body()
+        if payload is None:
+            self._send_json(400, {"error": "invalid JSON"})
+            return
+        outcome = shell_actions.normalize_outcome(payload)
+        if outcome is None:
+            self._send_json(400, {"error": "invalid outcome"})
+            return
+        conv, found = _conv_record_shell_outcome(cid, action_id, outcome)
+        if conv is None or not found:
+            self._send_json(404, {"error": "not found"})
+            return
+        self._send_json(200, {"status": "ok"})
 
     def _handle_conversation_model(self, cid: str) -> None:
         """Switch a thread's model mid-conversation; takes effect next turn.
@@ -12296,6 +13448,27 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(404, {"error": "not found"})
             return
         self._send_json(200, _conv_summary(conv))
+
+    def _handle_agent_conversation_redact(self, cid: str) -> None:
+        """A retinue agent redacts one of the user's messages — on the user's
+        request, e.g. the message in which they dictated a password Ara typed
+        (conversation-push.py --redact-message). Body {"message_id"}."""
+        payload = self._agent_conversation_payload()
+        if payload is None:
+            return
+        mid = str(payload.get("message_id") or "")
+        if not re.fullmatch(r"[0-9a-f]{12,32}", mid):
+            self._send_json(400, {"error": "invalid message_id"})
+            return
+        why_not = _conv_redaction_refused(cid, mid)
+        if why_not:
+            self._send_json(409, {"error": why_not})
+            return
+        conv, status, reason = _conv_redact_message(cid, mid)
+        if conv is None:
+            self._send_json(status, {"error": reason})
+            return
+        self._send_json(200, {"status": "redacted", "message_id": mid})
 
     def _agent_conversation_payload(self) -> dict | None:
         """Authorize an agent conversation call and return its JSON body.
@@ -12949,13 +14122,17 @@ class Handler(BaseHTTPRequestHandler):
         self._send_json(200, body)
 
     def _claude_auth_same_origin(self) -> bool:
-        """CSRF guard for the sign-in endpoints. The dashboard's basic-auth
+        """CSRF guard for the sign-in endpoints, for the conversation
+        endpoints whose messages count as the user's own (`via_edge`, which
+        lets a turn type on the paired device), and for the endpoints that act
+        with the user's own authority (a chat send or delete, a pending send's
+        approve or reject; see _request_from_edge). The dashboard's basic-auth
         credential is ambient — the browser attaches it to cross-site requests
-        too — and these POSTs change authentication state and can restart the
-        container. Every current browser stamps Sec-Fetch-Site; when the
-        header is absent (curl, older engines) we allow, which is the status
-        quo of the other POST routes."""
-        site = self.headers.get("Sec-Fetch-Site", "")
+        too — and these POSTs change authentication state, can restart the
+        container, or speak for the user. Every current browser stamps
+        Sec-Fetch-Site; when the header is absent (curl, older engines) we
+        allow, which is the status quo of the other POST routes."""
+        site = (self.headers.get("Sec-Fetch-Site") or "").strip().lower()
         return site in ("", "same-origin", "none")
 
     def _handle_claude_login_start(self) -> None:
@@ -13079,6 +14256,19 @@ if __name__ == "__main__":
     # The attention model's clock: breakpoints (digest times, scheduled mode
     # changes) and the half-hourly sweep run here, with no browser open.
     threading.Thread(target=_attention_tick_loop, name="attention-tick", daemon=True).start()
+    # Sensitive shell-action texts outlive no restart (scripts/shell_actions.py).
+    # In the background: until it is through, every read purges by itself.
+    def _sweep_sensitive() -> None:
+        try:
+            _conv_sensitive_sweep()
+        except Exception as exc:  # noqa: BLE001
+            print(f"[web-gateway] sensitive-text sweep skipped: {exc}", flush=True)
+    threading.Thread(target=_sweep_sensitive, name="sensitive-sweep", daemon=True).start()
+    # Before serving, so it never meets a manifest of a turn of this process.
+    try:
+        _sweep_stale_shell_manifests()
+    except Exception as exc:  # noqa: BLE001
+        print(f"[web-gateway] stale shell-manifest sweep skipped: {exc}", flush=True)
     _warn_if_arrival_turns_are_open()
     server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
     print(f"[web-gateway] listening on port {PORT} (max concurrency {MAX_CONCURRENCY}; "

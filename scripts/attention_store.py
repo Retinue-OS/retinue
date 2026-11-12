@@ -212,6 +212,22 @@ def _last_message(conv: dict) -> dict:
 # A thread's reply chips belong to the thread; a one-line preview — the row,
 # the push, the digest line — shows the words ([[chip: Send it]] · [[chip: …]]).
 _CHIP_RE = re.compile(r"\[\[chip:[^\]]*\]\]\s*(?:·\s*)?")
+# A call directive ([[call: <number> | <name> | no-voice-cancel]],
+# webapp/components/markdown.js) shows as its name, or as the number when it
+# has none, which is how the thread labels its tap-to-dial link. The flag
+# written in the name's place, with no name, is the flag there, not a name.
+CALL_MARKUP_RE = re.compile(r"\[\[call:\s*([^|\]]*?)\s*(?:\|\s*([^|\]]*?)\s*)?(?:\|[^\]]*)?\]\]", re.I)
+_CALL_FLAG = "no-voice-cancel"
+
+
+def markup_words(text) -> str:
+    """A message's words without the dashboard's own markup: chips dropped,
+    a call as its name (or number). Shared with the gateway's push, so the
+    row, the digest line and the notification read alike."""
+    def label(m):
+        name = m.group(2)
+        return name if name and name.lower() != _CALL_FLAG else m.group(1)
+    return CALL_MARKUP_RE.sub(label, _CHIP_RE.sub("", str(text or "")))
 
 
 def _one_line(text: str, limit: int = 160) -> str:
@@ -265,7 +281,7 @@ def thread_item(conv: dict, profile: dict) -> dict:
         "project": project,
         "project_title": conv.get("project_title") if project else None,
         "project_href": ("/project.html?" + urllib.parse.urlencode({"id": project})) if project else None,
-        "preview": _one_line(_CHIP_RE.sub("", preview_msg.get("text") or "")
+        "preview": _one_line(markup_words(preview_msg.get("text"))
                              or ("Sent you a file" if preview_msg.get("attachments") else "")),
         "agent": agent,
         "unread": bool(conv.get("unread")),
