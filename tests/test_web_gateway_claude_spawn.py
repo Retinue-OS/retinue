@@ -420,10 +420,16 @@ def test_only_a_dashboard_turn_can_type(wg):
     seen = []
     plain = {"kind": "keyboard-type", "id": "a" * 32, "text": "hello", "enter": False}
     tab = {"kind": "keyboard-type", "id": "b" * 32, "text": "me@x.org\t ", "enter": False}
+    # A tab inside a line the user has seen, with no whitespace at an edge:
+    # only the tab itself keeps it from running by itself. It comes first, so
+    # it would take the reply's one auto-run if the rule let it.
+    inner_tab = {"kind": "keyboard-type", "id": "c" * 32, "text": "user\tpass",
+                 "enter": False}
 
     def stub(*a, **k):
         seen.append(k.get("reply_shell_actions"))
-        return {"response": "Noted.", "reply_shell_actions": [dict(plain), dict(tab)]}
+        return {"response": "Noted.",
+                "reply_shell_actions": [dict(inner_tab), dict(plain), dict(tab)]}
 
     real = wg.send_message
     wg.send_message = stub
@@ -431,7 +437,8 @@ def test_only_a_dashboard_turn_can_type(wg):
         with _daemon_environment():
             # The text on a line of its own, as auto-running needs it
             # (_conv_text_was_shown).
-            dash = wg._new_conv("user", "reto", "t", "user", "type this:\nhello", via_edge=True)
+            dash = wg._new_conv("user", "reto", "t", "user", "type this:\nhello\nuser\tpass",
+                                via_edge=True)
             assert wg._conv_worker(dash["id"], f"conv:{dash['id']}",
                                    arrival="A chat message arrived.", push=False)
             assert wg._conv_worker(dash["id"], f"conv:{dash['id']}", push=False)
@@ -445,12 +452,13 @@ def test_only_a_dashboard_turn_can_type(wg):
     assert seen == [False, True, False, True], seen
     replies = [m for m in wg._load_conv(dash["id"])["messages"] if m["role"] == "assistant"]
     assert "shell_actions" not in replies[0], "an arrival turn's actions are dropped"
-    assert replies[1]["shell_actions"] == [dict(plain, auto=True), dict(tab, auto=False)], \
+    assert replies[1]["shell_actions"] == [dict(inner_tab, auto=False), dict(plain, auto=True),
+                                           dict(tab, auto=False)], \
         replies[1]["shell_actions"]
     inside_reply = wg._load_conv(inside["id"])["messages"][-1]
     assert "shell_actions" not in inside_reply, "an in-container user message cannot type"
     agent_reply = wg._load_conv(agent["id"])["messages"][-1]
-    assert [a["auto"] for a in agent_reply["shell_actions"]] == [False, False], \
+    assert [a["auto"] for a in agent_reply["shell_actions"]] == [False, False, False], \
         "in a thread an agent opened, nothing runs without a tap"
     print("ok: only a dashboard turn can type, and only a plain chat runs text by itself")
 

@@ -1119,7 +1119,11 @@ phone types it there.
     tag) that holds a sensitive text drops that key's sessions
     (`_sweep_stale_shell_manifests`). A turn queued behind another builds its
     prompt only once it holds the session lock, for the user message it was
-    started for — and is skipped when the turn before already answered it. Ara never repeats such a text in her
+    started for — and is skipped when a turn before it of the same kind
+    (one that may type, or one that may not) already answered it; an arrival
+    answers no user message, so a dashboard message that landed meanwhile
+    keeps its own turn, manifest and all. A turn whose message another
+    turn's reply already follows is shown the whole thread. Ara never repeats such a text in her
     reply. When the user dictated it, she offers to **redact** that message:
     `conversation-push.py --thread <id> --redact-message <message id>` (every
     user message shows its `[message id: …]` to Ara — one stored before

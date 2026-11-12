@@ -120,6 +120,8 @@ await ok('only plain one-line text the gateway marked auto runs by itself', () =
     ['a line break', { ...typeA, text: 'ls\nrm -rf ~' }],
     ['a carriage return', { ...typeA, text: 'a\rb' }],
     ['a tab (to a form button)', { ...typeA, text: 'me@x.org\t\t ' }],
+    // With no whitespace at an edge, only the tab itself makes it wait.
+    ['an inner tab', { ...typeA, text: 'a\tb' }],
     ['a sensitive text', { ...typeA, sensitive: true }],
     ['the Enter key', { ...keyB, auto: true }],
     ['the Tab key', keyTab],

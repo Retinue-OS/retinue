@@ -3793,10 +3793,24 @@ def _conv_worker(cid: str, session_key: str, *, arrival: str | None = None,
             if current is None:
                 return None
             msgs = current.get("messages", [])
-            if target_id and _conv_is_covered(cid, msgs, target_id):
+            if target_id and _conv_is_covered(cid, msgs, target_id, may_type):
                 return None
-            newest = _conv_latest_user_message(msgs)
-            covered[0] = _conv_message_id(newest) if newest else None
+            # The prompt reaches the end of the thread, so this turn answers
+            # the newest user message of its own kind — the kind that decided
+            # may_type — and every one of that kind before it. A message of
+            # the other kind keeps its own turn: one sent from the dashboard
+            # must still be answered by a turn that may type, an in-container
+            # one by a turn that may not. An arrival answers no user message.
+            same = [m for m in msgs if isinstance(m, dict) and m.get("role") == "user"
+                    and (m.get("via_edge") is True) == may_type]
+            covered[0] = (_conv_message_id(same[-1])
+                          if same and not arrival else None)
+            # Another turn replied after this turn's message without answering
+            # it (it was of the other kind, or it failed): a resumed session's
+            # "what is new since your last reply" would then be that reply, so
+            # the session is shown the whole thread instead.
+            if fresh_now and target_id and _conv_replied_after(msgs, target_id):
+                fresh_now = False
             return _conv_engage_prompt(current, fresh_now, arrival)
 
         result = send_message(prompt, display_question=latest, session_key=session_key,
@@ -3811,7 +3825,7 @@ def _conv_worker(cid: str, session_key: str, *, arrival: str | None = None,
         if result.get("skipped"):
             skipped = True
         elif "error" not in result and covered[0]:
-            _conv_note_covered(cid, covered[0])
+            _conv_note_covered(cid, covered[0], may_type)
         if result.get("escalated"):
             _conv_set_flags(cid, escalated=True)
         if skipped:
@@ -3926,33 +3940,50 @@ def _conv_display_question(msg: dict) -> str:
     return f"[attachment: {', '.join(names)}]" if names else "[no text]"
 
 
-# Per thread, the newest user message a completed turn's prompt covered: a
-# turn queued behind it whose own message is no newer has nothing left to
-# answer (it would otherwise answer it twice, or be sent Ara's own reply as
-# "what is new"). In memory: a queued turn does not outlive the process.
-_conv_covered: dict[str, str] = {}
+# Per thread and kind of turn — one that may type (its message came from the
+# dashboard) or one that may not — the newest user message of that kind a
+# completed turn's prompt covered: a turn of the same kind queued behind it
+# whose own message is no newer has nothing left to answer (it would
+# otherwise answer it twice, or be sent Ara's own reply as "what is new").
+# Kept apart by kind, since a position in the thread covers every message
+# before it: a turn that may not type must never answer away a dashboard
+# message whose own turn would have typed, nor the reverse. In memory: a
+# queued turn does not outlive the process.
+_conv_covered: dict[tuple[str, bool], str] = {}
 _conv_covered_lock = threading.Lock()
 _CONV_COVERED_MAX = 2000
 
 
-def _conv_note_covered(cid: str, message_id: str) -> None:
+def _conv_note_covered(cid: str, message_id: str, may_type: bool) -> None:
+    key = (cid, bool(may_type))
     with _conv_covered_lock:
-        _conv_covered.pop(cid, None)
-        _conv_covered[cid] = message_id
+        _conv_covered.pop(key, None)
+        _conv_covered[key] = message_id
         while len(_conv_covered) > _CONV_COVERED_MAX:
             _conv_covered.pop(next(iter(_conv_covered)))
 
 
-def _conv_is_covered(cid: str, messages: list, target_id: str) -> bool:
-    """Whether a completed turn already answered the message `target_id`."""
+def _conv_is_covered(cid: str, messages: list, target_id: str,
+                     may_type: bool) -> bool:
+    """Whether a completed turn of the same kind already answered the
+    message `target_id`."""
     with _conv_covered_lock:
-        covered = _conv_covered.get(cid)
+        covered = _conv_covered.get((cid, bool(may_type)))
     if not covered:
         return False
     ids = [_conv_message_id(m) for m in messages or [] if isinstance(m, dict)]
     if target_id not in ids or covered not in ids:
         return False
     return ids.index(target_id) <= ids.index(covered)
+
+
+def _conv_replied_after(messages: list, target_id: str) -> bool:
+    """Whether a reply of Ara's stands after the message `target_id`."""
+    ids = [_conv_message_id(m) for m in messages or [] if isinstance(m, dict)]
+    if target_id not in ids:
+        return False
+    later = [m for m in messages if isinstance(m, dict)][ids.index(target_id) + 1:]
+    return any(m.get("role") == "assistant" for m in later)
 
 
 def _conv_turn_may_type(messages: list, arrival: str | None) -> bool:

@@ -78,6 +78,87 @@ def test_queued_turn_answers_its_own_message_or_nothing(wg):
     print("ok: a queued turn answers its own message, or is skipped")
 
 
+def _turn_while_message_lands(wg, cid: str, land=None, **worker_kw):
+    """Run one turn of thread `cid`, with `land(cid)` adding a message after
+    the turn started but before it takes the session lock — as when it waits
+    behind another turn. Returns whether the turn was started with a
+    shell-action manifest, and the prompts its model runs were sent."""
+    spawns = base._capture_spawns(wg, json.dumps({"result": "Done.", "session_id": "s-k"}))
+    wg._lint_presentation = lambda text, **kw: text
+    real = wg.send_message
+    seen = []
+
+    def queued(*a, **k):
+        seen.append(k.get("reply_shell_actions"))
+        if land:
+            land(cid)
+        return real(*a, **k)
+
+    wg.send_message = queued
+    try:
+        with base._daemon_environment():
+            assert wg._conv_worker(cid, f"conv:{cid}", push=False, **worker_kw)
+    finally:
+        wg.send_message = real
+    return seen[0], [cmd[-1] for cmd, _ in spawns]
+
+
+def test_a_turn_covers_only_what_it_may_answer(wg):
+    """A turn that may not type — a chat arrival, or one started by a "user"
+    message from inside the container — must not mark as answered a message
+    the user sent from the dashboard meanwhile: that message's own turn still
+    runs, with its manifest. Nor the reverse: a dashboard turn does not answer
+    away an in-container message that landed while it waited. And the turn
+    that runs after another turn's reply answers its own message, not that
+    reply."""
+    def dash(text):
+        return lambda cid: wg._conv_add_message(cid, "user", text, via_edge=True)
+
+    def inside(text):
+        return lambda cid: wg._conv_add_message(cid, "user", text)
+
+    # An arrival turn, then the dashboard message that landed while it waited.
+    conv = wg._new_conv("user", "reto", "t", "user", "Hello", via_edge=True)
+    cid = conv["id"]
+    wg._conv_add_message(cid, "assistant", "Hi.")
+    may, _ = _turn_while_message_lands(wg, cid, dash("type the greeting"),
+                                       arrival="A chat message arrived.")
+    assert may is False, "an arrival turn never types"
+    may, prompts = _turn_while_message_lands(wg, cid)
+    assert may is True, "the dashboard turn keeps its manifest"
+    assert len(prompts) == 1, "the dashboard turn was skipped"
+    assert "type the greeting" in prompts[0] and prompts[0] != "Done.", prompts[0][:200]
+
+    # An in-container "user" message's turn, then the dashboard message.
+    conv = wg._new_conv("user", "reto", "t", "user", "Hello", via_edge=True)
+    cid = conv["id"]
+    wg._conv_add_message(cid, "assistant", "Hi.")
+    wg._conv_add_message(cid, "user", "a note from inside")
+    may, _ = _turn_while_message_lands(wg, cid, dash("type the greeting"))
+    assert may is False, "an in-container message's turn never types"
+    may, prompts = _turn_while_message_lands(wg, cid)
+    assert may is True and len(prompts) == 1, "the dashboard turn was skipped"
+    assert "type the greeting" in prompts[0] and prompts[0] != "Done.", prompts[0][:200]
+
+    # The reverse: a dashboard turn builds after an in-container message landed.
+    conv = wg._new_conv("user", "reto", "t", "user", "Hello", via_edge=True)
+    cid = conv["id"]
+    wg._conv_add_message(cid, "assistant", "Hi.")
+    wg._conv_add_message(cid, "user", "type the greeting", via_edge=True)
+    may, _ = _turn_while_message_lands(wg, cid, inside("a note from inside"))
+    assert may is True
+    may, prompts = _turn_while_message_lands(wg, cid)
+    assert may is False and len(prompts) == 1, "the in-container message's turn was skipped"
+    assert "a note from inside" in prompts[0] and prompts[0] != "Done.", prompts[0][:200]
+
+    # Turns of the same kind still answer each other's messages once.
+    wg._conv_add_message(cid, "user", "and again", via_edge=True)
+    _turn_while_message_lands(wg, cid, dash("and once more"))
+    may, prompts = _turn_while_message_lands(wg, cid)
+    assert may is True and prompts == [], "a message already answered is answered again"
+    print("ok: a turn covers only the messages it may answer")
+
+
 def test_session_log_never_records_a_prompt(wg):
     msg = {"role": "user", "text": "", "attachments": [{"filename": "photo.jpg"}]}
     assert wg._conv_display_question(msg) == "[attachment: photo.jpg]"
@@ -328,6 +409,7 @@ def main():
         tmp = Path(td)
         wg = base._load_gateway(tmp / "a", {})
         test_queued_turn_answers_its_own_message_or_nothing(wg)
+        test_a_turn_covers_only_what_it_may_answer(wg)
         test_session_log_never_records_a_prompt(wg)
         test_restart_sweeps_stale_manifests(wg, tmp)
         test_auto_needs_a_text_the_user_has_seen(wg)

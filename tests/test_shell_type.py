@@ -152,6 +152,9 @@ def test_outcome_and_auto_run():
         "a line break is Shift+Enter: waits for a tap"
     assert not sa.runs_by_itself(dict(t, text="me@x.org\t\t ")), \
         "a tab moves to a form's button: waits for a tap"
+    # A tab inside the text, with no whitespace at an edge to catch it as well.
+    assert not sa.runs_by_itself(dict(t, text="user\tpass")), \
+        "an inner tab moves to the next field: waits for a tap"
     assert not sa.runs_by_itself(dict(t, sensitive=True)), "a sensitive text waits for a tap"
     for key in sa.KEYS:
         assert not sa.runs_by_itself({"kind": "keyboard-key", "id": "b" * 32, "key": key}), key
