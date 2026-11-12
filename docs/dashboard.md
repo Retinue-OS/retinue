@@ -1062,7 +1062,10 @@ phone types it there.
   and a line `EOF` ends a `<<'EOF'` heredoc early, after which the text's
   remaining lines run as commands with the agent's tokens — a passage from an
   e-mail or a page can be written to do just that. So the docs offer only
-  `--file`. With `--sensitive` the CLI deletes the file when it ends, also
+  `--file`, and `--sensitive` refuses a text on the command line (exit 2,
+  nothing written, the text not echoed): it would be in the process list and
+  the transcript, so a sensitive text comes from `--file` or `-` (stdin).
+  With `--sensitive` the CLI deletes the file when it ends, also
   when it refuses the call (outside a turn, a bad combination of flags, a
   file that is no text), so the code does not stay in the container.
   It is the sibling of `conversation-push.py --reply-attach`

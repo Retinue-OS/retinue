@@ -20,8 +20,11 @@ command line, in quotes or in a heredoc: the text itself can end any of them
 — a `$` or backtick inside "...", an apostrophe inside '...', a line `EOF`
 inside <<'EOF' — and what follows is then typed wrong or runs as commands in
 the container, with the agent's tokens. With `--sensitive` the file is
-deleted when the call ends, also when it is refused. (`-` reads the text
-from stdin, for another program's output.)
+deleted when the call ends, also when it is refused; a `--sensitive` text
+given on the command line is refused outright (exit 2, nothing written, the
+text not echoed), as it would show in the process list and the transcript.
+(`-` reads the text from stdin, for another program's output; with
+`--sensitive` it is the only alternative to `--file`.)
 
 Rules (CLAUDE.md, "Dashboard"):
 - Only on the user's explicit request ("type the text above", "type: …").
@@ -78,18 +81,23 @@ def main(argv: list[str] | None = None) -> int:
         description="Type on the user's paired device through the Ara Android app.")
     parser.add_argument("text", nargs="?", default=None,
                         help="the text to type (- reads it from stdin); a text from "
-                             "anywhere else goes in a file, with --file")
+                             "anywhere else goes in a file, with --file; with "
+                             "--sensitive only - (stdin) is accepted, never a text "
+                             "on the command line")
     parser.add_argument("--file", metavar="PATH",
                         help="type the text this file holds, as written (one trailing "
                              "line break dropped); with --sensitive the file is "
-                             "deleted, also when the call is refused")
+                             "deleted, also when the call is refused (a sensitive text "
+                             "comes from --file or stdin, never from TEXT)")
     parser.add_argument("--enter", action="store_true",
                         help="press Enter after the text or secret (only when asked)")
     parser.add_argument("--key", choices=shell_actions.KEYS,
                         help="press one named key instead of typing text")
     parser.add_argument("--sensitive", action="store_true",
                         help="the text is a password, PIN or code: shown masked, never "
-                             "replayed, deleted once typed (at the latest after 2 min)")
+                             "replayed, deleted once typed (at the latest after 2 min); "
+                             "goes with --file PATH or - (stdin), a text on the command "
+                             "line is refused")
     parser.add_argument("--secret", metavar="LABEL",
                         help="open the phone's password field for LABEL (e.g. 'Meta "
                              "account'), filled by the user's password manager; the "
@@ -122,7 +130,19 @@ def _attach(args: argparse.Namespace) -> int:
               file=sys.stderr)
         return 2
     if args.sensitive and args.text is None and args.file is None:
-        print("shell-type: --sensitive goes with --file or TEXT", file=sys.stderr)
+        print("shell-type: --sensitive goes with --file (or TEXT given as - for stdin)",
+              file=sys.stderr)
+        return 2
+    if args.sensitive and args.text is not None and args.text != "-":
+        # A text on the command line is in the process list and in the tool
+        # transcript, which is what --sensitive is there to avoid. Refused
+        # before anything is read or written, and the text is not echoed.
+        # There is no file to delete on this path (main() only deletes one
+        # that --file names).
+        print("shell-type: a --sensitive text does not go on the command line (it "
+              "would show in the process list and the transcript): write it to a "
+              "file and pass --file PATH, or pipe it in with - on stdin",
+              file=sys.stderr)
         return 2
     if args.key and args.enter:
         print("shell-type: --enter goes with --file, TEXT or --secret; for a lone Enter "

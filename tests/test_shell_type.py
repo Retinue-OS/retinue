@@ -95,21 +95,47 @@ def test_bad_input_writes_nothing(tmp: Path):
 
 def test_sensitive(tmp: Path):
     m = tmp / "m3"
-    r = _run(["--sensitive", "--enter", "4711"], m)
+    pin = tmp / "pin3.txt"
+
+    def pin_file(text="4711\n"):
+        pin.write_text(text, encoding="utf-8")
+        return str(pin)
+
+    r = _run(["--sensitive", "--enter", "--file", pin_file()], m)
     assert r.returncode == 0, r.stderr
     assert "4711" not in r.stdout + r.stderr, "the CLI never echoes a sensitive text"
     assert "do not repeat it" in r.stdout, r.stdout
     got = _lines(m)
     assert got[0]["sensitive"] is True and got[0]["text"] == "4711" and got[0]["enter"] is True
+    # Through stdin it works the same.
+    r = _run(["--sensitive", "-"], m, stdin="0815\n")
+    assert r.returncode == 0, r.stderr
+    assert "0815" not in r.stdout + r.stderr
+    assert _lines(m)[-1]["text"] == "0815" and _lines(m)[-1]["sensitive"] is True
     assert _run(["--sensitive", "--key", "enter"], tmp / "m4").returncode == 2
     assert _run(["--sensitive", "--secret", "Wi-Fi"], tmp / "m4").returncode == 2
     assert not (tmp / "m4").exists()
+    # A sensitive text on the command line is refused: it would be in the
+    # process list and the transcript. Nothing is written, the text is not
+    # echoed, and the message says where it goes.
+    for args in (["--sensitive", "4711"], ["--sensitive", "--enter", "4711"],
+                 ["4711", "--sensitive"]):
+        r = _run(args, tmp / "m-cli")
+        assert r.returncode == 2, (args, r.returncode, r.stderr)
+        assert "4711" not in r.stdout + r.stderr, (args, r.stdout, r.stderr)
+        assert "--file" in r.stderr and "stdin" in r.stderr, r.stderr
+        assert not (tmp / "m-cli").exists(), "a refused call must not write"
+    # Also with a manifest that is not set (the refusal does not depend on it).
+    r = _run(["--sensitive", "4711"])
+    assert r.returncode == 2 and "4711" not in r.stdout + r.stderr, r.stderr
+    # A plain text on the command line stays as it was.
+    assert _run(["4711"], tmp / "m-plain").returncode == 0
     # The manifest holds the text in clear until the turn ends, in the shared
     # temp directory: nobody but its owner may read it, whatever the umask.
     old_umask = os.umask(0o022)
     try:
         m5 = tmp / "m5"
-        assert _run(["--sensitive", "1234"], m5).returncode == 0
+        assert _run(["--sensitive", "--file", pin_file("1234")], m5).returncode == 0
     finally:
         os.umask(old_umask)
     assert m5.stat().st_mode & 0o077 == 0, oct(m5.stat().st_mode)
@@ -117,12 +143,12 @@ def test_sensitive(tmp: Path):
     target = tmp / "elsewhere"
     target.write_text("")
     (tmp / "m6").symlink_to(target)
-    r = _run(["--sensitive", "1234"], tmp / "m6")
+    r = _run(["--sensitive", "--file", pin_file("1234")], tmp / "m6")
     assert r.returncode == 2 and "1234" not in r.stdout + r.stderr, r.stderr
     assert target.read_text() == "", "a symlinked manifest must not be written through"
     # A plain action stays as it was: no `sensitive` key at all.
     assert "sensitive" not in sa.normalize({"kind": "keyboard-type", "id": "e" * 32, "text": "x"})
-    print("ok: --sensitive marks a typing action, goes with TEXT only, is never echoed")
+    print("ok: --sensitive marks a typing action, takes its text from --file or stdin, never the command line, and is never echoed")
 
 
 def test_purge_and_describe():
