@@ -7,7 +7,8 @@ nothing runs outside the shell; only plain one-line text runs by itself, and
 only live, young and once; a secret never runs by itself and its text never
 exists on the page; actions run one at a time, every outcome is reported, and
 Stop drops what waits, as does a confirmation on the phone declined or not
-answered; a sensitive text is gone from the page after two
+answered, or a password dialog cancelled there; a sensitive text is gone
+from the page after two
 minutes; the shell members are called with the contract's arguments; and the
 outcome wording.
 
@@ -427,6 +428,39 @@ await ok('Stop closes an open password dialog, and the queue moves on', async ()
   assert.deepEqual(calls.at(-1), ['cancel']);
   event('secret-cancelled', secretC.id);
   assert.equal(kbd.isRunning(), false, 'what waited was dropped, the dialog answered');
+});
+
+await ok('a password dialog cancelled on the phone drops the rest too', async () => {
+  // Ara's password, then a Tab (or a text) meant to follow it. The user
+  // closes the native dialog on the phone (Cancel, back, or the dialog's own
+  // ten-minute close, which the shell answers the same way): the password
+  // field on the device is still empty, so nothing that waited may run.
+  for (const next of [keyTab, typeA]) {
+    kbd._reset();
+    posted.length = 0;
+    const calls = installShell();
+    const rows = new Map();
+    const onState = (id) => (out) => rows.set(id, out);
+    kbd.run(secretC, { threadId: tid, onState: onState(secretC.id) });
+    kbd.run(next, { threadId: tid, onState: onState(next.id) });
+    assert.deepEqual(rows.get(next.id), { state: 'queued' }, next.kind);
+    event('secret-cancelled', secretC.id);
+    assert.deepEqual(calls.map((c) => c[0]), ['secret'], `${next.kind}: no further shell call`);
+    assert.deepEqual(rows.get(next.id), { state: 'error', error: 'cancelled' }, next.kind);
+    assert.equal(kbd.isRunning(), false, next.kind);
+    await tick();
+    assert.deepEqual(posted.map(([url, body]) => [url.split('/')[4], body]).sort(), [
+      [secretC.id, { state: 'secret-cancelled' }],
+      [next.id, { state: 'error', error: 'cancelled' }],
+    ].sort(), next.kind);
+  }
+  // A password typed lets the next one run, as it was meant to.
+  kbd._reset();
+  const calls = installShell();
+  kbd.run(secretC, { threadId: tid });
+  kbd.run(keyTab, { threadId: tid });
+  event('secret-typed', secretC.id);
+  assert.deepEqual(calls.at(-1), ['key', 'tab', { id: keyTab.id }]);
 });
 
 await ok('a throwing shell counts as no call', () => {

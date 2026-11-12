@@ -3945,8 +3945,12 @@ def _conv_worker(cid: str, session_key: str, *, arrival: str | None = None,
         # message delivered against a reply that does not exist.
         return False
     if push:
+        # A reply that is only shell actions still says something: a fixed
+        # phrase, never the text to type, which may be a sensitive one and must
+        # not reach a push.
         _push_conv_notification(
-            conv, reply or ", ".join(a["filename"] for a in reply_atts))
+            conv, reply or ", ".join(a["filename"] for a in reply_atts)
+            or ("Ready to type on your device" if reply_actions else ""))
     return ok
 
 

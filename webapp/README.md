@@ -786,9 +786,10 @@ cannot do — the home-screen role, a wake phrase, native speech output, the
 client certificate. Everything that is Retinue stays here, so it behaves the
 same in the shell, in Chrome and on a desktop. The contract between them:
 
-- **User agent**: the shell appends ` RetinueShell/4 (Android)` (`/3` before
-  the app's own settings page and the per-device preferences, `/2` before the
-  endpoint members, `/1` before the Health Connect members below).
+- **User agent**: the shell appends ` RetinueShell/5 (Android)` (`/4` before
+  the keyboard members, `/3` before the app's own settings page and the
+  per-device preferences, `/2` before the endpoint members, `/1` before the
+  Health Connect members below).
 - **`window.RetinueShell`**, installed at document start on the configured
   origin only: `platform`, `version`, `setVoiceActive(bool)` and
   `openSettings(section?)`. `setVoiceActive(true)` means "a voice conversation is
@@ -821,7 +822,8 @@ same in the shell, in Chrome and on a desktop. The contract between them:
   changed while the page is open.
 - **Shell → page**: `window.dispatchEvent(new CustomEvent('retinue-shell',
   {detail: {type}}))` with `type` `wake` (the wake phrase) or `home` (a Home
-  press while the shell is in front). The home answers both in place: a wake
+  press while the shell is in front); `keyboard` (RetinueShell/5) carries the
+  outcome of a keyboard request, information only (see the bullet below). The home answers both in place: a wake
   opens continuous conversation (above), a home press closes an open thread or
   sheet back to `/` (every view entry unwound, not just one) and scrolls the
   list to its top. Any other page of the web app answers by loading
@@ -852,6 +854,17 @@ same in the shell, in Chrome and on a desktop. The contract between them:
   the shell's endpoint editor instead of the controls, and a sync asked for is
   `skipped` with reason `disabled`. `components/shell.js` wraps all of it,
   feature-detected.
+- **Keyboard** (RetinueShell/5): the shell can be paired with another device
+  as a Bluetooth keyboard and type into it. `keyboardStatus()`,
+  `keyboardType(text, opts)`, `keyboardKey(name, opts)`,
+  `keyboardSecret(opts)` (a native field the user's password manager fills;
+  the secret never reaches the page), `keyboardOpen()` and
+  `keyboardCancel()`, with `keyboard` events for each request's outcome. The
+  phone asks itself before anything that can act on the device. What drives
+  them is a reply's shell actions, through `components/shell-keyboard.js`
+  and `components/shell.js`; the contract and the policy are in
+  `docs/dashboard.md` (the "Keyboard (RetinueShell/5)" row and "Shell
+  actions: typing on a paired device").
 - **Speech output**: Android's WebView has no Web Speech API, so the shell
   installs a `speechSynthesis` / `SpeechSynthesisUtterance` stand-in backed by
   the native TTS where the page has none. `components/speech.js` is unchanged;

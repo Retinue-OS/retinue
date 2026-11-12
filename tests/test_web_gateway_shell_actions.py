@@ -3,7 +3,8 @@
 answers its own message (or nothing), the session log never records a prompt,
 a raising spawn or a restart leaves no resumable session that typed a
 password (an undeletable leftover entry included), `auto` needs a text the
-user has seen — and over HTTP: which user messages count as the dashboard's
+user has seen, a reply that is only actions pushes a neutral line — and over
+HTTP: which user messages count as the dashboard's
 (`via_edge`), the outcome endpoint only through the reverse proxy, the redact
 endpoint only from inside a turn the user started after that message.
 
@@ -369,6 +370,31 @@ def test_auto_needs_a_whole_line_and_is_one_per_reply(wg):
     print("ok: a text runs by itself only as a whole line seen before, and only first")
 
 
+def test_actions_only_reply_pushes_words_not_the_text(wg):
+    """A reply that is only shell actions (no text, no file) still notifies
+    the user with words of its own, never with what is to be typed, which may
+    be a sensitive text and must not reach a push."""
+    conv = wg._new_conv("user", "reto", "t", "user", "type my PIN", via_edge=True)
+    cid = conv["id"]
+    actions = [dict(SENS, id="f" * 32), _plain(50, "Good morning, team")]
+    real_send, real_push = wg.send_message, wg._push_conv_notification
+    pushed = []
+    wg.send_message = lambda *a, **k: {"response": "",
+                                       "reply_shell_actions": [dict(x) for x in actions]}
+    wg._push_conv_notification = lambda c, text, *a, **k: pushed.append(text) or 1
+    wg._lint_presentation = lambda text, **kw: text
+    try:
+        with base._daemon_environment():
+            assert wg._conv_worker(cid, f"conv:{cid}")
+    finally:
+        wg.send_message, wg._push_conv_notification = real_send, real_push
+    last = wg._load_conv(cid)["messages"][-1]
+    assert last["text"] == "" and len(last["shell_actions"]) == 2, last
+    assert len(pushed) == 1 and pushed[0].strip(), pushed
+    assert "4711" not in pushed[0] and "Good morning" not in pushed[0], pushed
+    print("ok: an actions-only reply pushes a neutral line, not the text to type")
+
+
 def _http(base_url: str, method: str, path: str, body=None, headers=None):
     req = urllib.request.Request(base_url + path, method=method,
                                  data=None if body is None else json.dumps(body).encode(),
@@ -502,6 +528,7 @@ def main():
         test_auto_needs_a_text_the_user_has_seen(wg)
         test_auto_counts_only_what_the_user_saw_before_the_turn(wg)
         test_auto_needs_a_whole_line_and_is_one_per_reply(wg)
+        test_actions_only_reply_pushes_words_not_the_text(wg)
         test_a_typed_action_stays_typed(wg)
         test_http_edge_outcome_and_redact(wg)
         wg_tiered = base._load_gateway(tmp / "c", {"RETINUE_ROUTER_MODEL": "haiku",

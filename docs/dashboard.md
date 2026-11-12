@@ -1130,7 +1130,9 @@ phone types it there.
     `id`, `enter`, `sensitive` and gets `purged: true`, `text: null`; the row
     says *Text deleted* and nothing can retype it. A thread title derived
     from one of the user's messages becomes *Typing on a paired device*, so
-    the thread list and pushes do not carry it.
+    the thread list and pushes do not carry it. A reply that is only shell
+    actions (no text, no file) is pushed as *Ready to type on your device*,
+    never with what it types.
   - The turn's Claude session holds the text verbatim (the user's message,
     Ara's own command), so it is **never resumed**: `send_message` decides
     so under the thread's session lock, before any queued turn can resume it
@@ -1210,10 +1212,12 @@ phone types it there.
   text being typed, or an open password dialog — never a password being
   typed) and drops the rest. A confirmation on the phone declined or not
   answered in time (`cancelled`) drops the rest too, as do `not-enabled`,
-  `not-in-front` and `not-connected`: what waited was meant to follow the
-  action that did not run (a text after a Tab is for the field the Tab moves
-  to), so it is reported `cancelled` rather than typed into whatever has
-  focus. The outcomes are reported to the gateway from the module,
+  `not-in-front` and `not-connected`, and a password dialog closed on the
+  phone without a password (`secret-cancelled`: Cancel, back, or its own
+  close after ten minutes): what waited was meant to follow the action that
+  did not run (a text after a Tab is for the field the Tab moves to, a Tab
+  after a password for the field after it), so it is reported `cancelled`
+  rather than typed into whatever has focus. The outcomes are reported to the gateway from the module,
   not the thread view, so leaving the thread mid-text loses none. A
   `keyboard-type` action runs **by itself once**: only when the gateway
   marked it `auto`, only when its message arrives live in the thread open
