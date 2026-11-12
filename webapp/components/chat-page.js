@@ -96,28 +96,44 @@ const TITLE_BRAND = (() => {
 // media proxy (/chats/media/<slug>/<media-id>) for a file a gateway holds, or
 // an absolute http(s) URL (webLink); a reference that is neither is text from
 // outside and never becomes an href or a src, so such an attachment is shown
-// by its name alone. Two exceptions are taken, never for a link: this page's
-// own object URLs, with which the bubble it shows while a send is on its way
-// previews the user's staged images (only the attachments it built for that
-// bubble are in OWN_PREVIEWS), and a data: URL of a medium (DATA_MEDIA_RE
-// below), for the element of its own kind and an image's lightbox.
+// by its name alone. Only the proxy's URL is loaded as media (an <img>, an
+// <audio>, a <video>, the lightbox): a web link is a link to open, never
+// loaded into this page, which is what the origin's Content-Security-Policy
+// holds to as well (img-src and media-src name this origin only,
+// scripts/content_policy.py). Two exceptions are taken for media, never for
+// a link: this page's own object URLs, with which the bubble it shows while
+// a send is on its way previews the user's staged images (only the
+// attachments it built for that bubble are in OWN_PREVIEWS), and a data: URL
+// of a medium (DATA_MEDIA_RE below), for the element of its own kind and an
+// image's lightbox.
 const MEDIA_PROXY_RE = /^\/chats\/media\/[A-Za-z0-9_-][A-Za-z0-9._-]*\/[0-9a-f]{32}$/;
 const OWN_PREVIEWS = new WeakSet();
 
 // A data: URL carries its bytes in itself. Inside an <img>, <audio> or <video>
-// nothing in it runs, so the reference documents under data/chats/, which
-// use such URLs, still show their media. It is taken only for the element
-// its own kind picks (and, for an image, the lightbox, which shows it in an
-// <img> as well), never for a file row, whose link would open it as a
+// nothing in it runs. The gateway never passes one on (_shape_chat_attachments),
+// and the origin's policy allows no data: media on this page; the reference
+// documents under data/chats/, a test corpus that uses such URLs, show their
+// media only where they are served without it. It is taken only for the
+// element its own kind picks (and, for an image, the lightbox, which shows it
+// in an <img> as well), never for a file row, whose link would open it as a
 // document.
 const DATA_MEDIA_RE = /^data:(image|audio|video)\/[a-z0-9.+-]+[;,]/;
 
-function attachmentUrl(a) {
+// What an image, audio or video attachment is loaded from, or '' (then it is
+// a link, or its name, _attachmentHtml).
+function mediaUrl(a) {
   const url = typeof a.url === 'string' ? a.url : '';
   if (OWN_PREVIEWS.has(a) && url.startsWith('blob:')) return url;
   if (MEDIA_PROXY_RE.test(url)) return url;
   const data = DATA_MEDIA_RE.exec(url);
   if (data) return String(a.type || '').startsWith(`${data[1]}/`) ? url : '';
+  return '';
+}
+
+// Where a file row's link leads, or '' (then the row is the name alone).
+function linkUrl(a) {
+  const url = typeof a.url === 'string' ? a.url : '';
+  if (MEDIA_PROXY_RE.test(url)) return url;
   return webLink(url);
 }
 
@@ -1524,8 +1540,7 @@ class RetinueChatPage extends HTMLElement {
 
   // The attachment the bubble of a send on its way shows for one of the
   // user's staged images: its preview's object URL, which this page created,
-  // so it is taken although it is neither the proxy's nor a web link
-  // (attachmentUrl).
+  // so it is taken for the image although it is not the proxy's (mediaUrl).
   _ownPreview(im, i) {
     const att = {
       id: `local-att-${this._localSeq}-${i}`,
@@ -1550,21 +1565,28 @@ class RetinueChatPage extends HTMLElement {
   // that link does is the media proxy's decision, not this page's: a PDF or
   // plain text opens in the browser, anything else is saved (docs/dashboard.md,
   // "Attachments"). The same holds for an image opened by itself: only the
-  // inline-safe types are shown, an SVG is a download. An attachment whose url
-  // is neither the proxy's nor a web link, nor one of the two exceptions
-  // attachmentUrl takes for media (the page's own previews, a data: URL of
-  // the attachment's kind), is its name as text, whatever its type: there is
-  // nothing it may be loaded from.
+  // inline-safe types are shown, an SVG is a download. An image, voice note
+  // or video is shown in place only from what mediaUrl takes (the proxy, the
+  // page's own previews, a data: URL of its kind); one that is a web link is
+  // a file row as well, a link to open rather than a medium loaded here. An
+  // attachment with neither is its name as text, whatever its type: there is
+  // nothing it may be loaded from or lead to.
   _attachmentHtml(a) {
     const type = String(a.type || '');
-    const url = attachmentUrl(a);
+    const kind = ['image', 'audio', 'video'].find((k) => type.startsWith(`${k}/`)) || '';
+    const label = a.name || { image: 'Image', audio: 'Voice message', video: 'Video' }[kind]
+      || 'Attachment';
+    const size = fmtBytes(Number(a.size));
+    const sizeHtml = size ? ` <span class="att-size">${esc(size)}</span>` : '';
+    const url = kind ? mediaUrl(a) : '';
     if (!url) {
-      const size = fmtBytes(Number(a.size));
-      const label = a.name || (type.startsWith('image/') ? 'Image'
-        : type.startsWith('audio/') ? 'Voice message'
-          : type.startsWith('video/') ? 'Video' : 'Attachment');
-      return `<span class="att-file att-nolink">&#128206; <span class="att-name">` +
-        `${esc(label)}</span>${size ? ` <span class="att-size">${esc(size)}</span>` : ''}</span>`;
+      const link = linkUrl(a);
+      if (!link) {
+        return `<span class="att-file att-nolink">&#128206; <span class="att-name">` +
+          `${esc(label)}</span>${sizeHtml}</span>`;
+      }
+      return `<a class="att-file" href="${esc(link)}" target="_blank" rel="noopener" ` +
+        `title="${esc(label)}">&#128206; <span class="att-name">${esc(label)}</span>${sizeHtml}</a>`;
     }
     const w = Number(a.width);
     const h = Number(a.height);
@@ -1580,24 +1602,18 @@ class RetinueChatPage extends HTMLElement {
     // via max-width:100% with the height following the ratio.
     const sized = (cap) => (hasDims
       ? ` style="aspect-ratio: ${w} / ${h}; width: min(${cap}px, ${w}px)"` : '');
-    if (type.startsWith('image/')) {
+    if (kind === 'image') {
       return `<button type="button" class="att-imgbtn" data-lightbox="${esc(url)}" ` +
         `data-alt="${esc(a.name || 'Image')}" aria-label="View image full screen">` +
         `<img class="att-img${hasDims ? '' : ' no-dims'}" src="${esc(url)}" ` +
         `alt="${esc(a.name || 'image')}"${dims}${sized(280)} loading="lazy"></button>`;
     }
-    if (type.startsWith('audio/')) {
+    if (kind === 'audio') {
       return `<audio class="att-audio" controls preload="none" src="${esc(url)}" ` +
         `title="${esc(a.name || 'Voice message')}"></audio>`;
     }
-    if (type.startsWith('video/')) {
-      return `<video class="att-video${hasDims ? '' : ' no-dims'}" controls preload="metadata" ` +
-        `playsinline src="${esc(url)}"${dims}${sized(280)}></video>`;
-    }
-    const size = fmtBytes(Number(a.size));
-    return `<a class="att-file" href="${esc(url)}" target="_blank" rel="noopener" ` +
-      `title="${esc(a.name || 'Attachment')}">&#128206; <span class="att-name">` +
-      `${esc(a.name || 'Attachment')}</span>${size ? ` <span class="att-size">${esc(size)}</span>` : ''}</a>`;
+    return `<video class="att-video${hasDims ? '' : ' no-dims'}" controls preload="metadata" ` +
+      `playsinline src="${esc(url)}"${dims}${sized(280)}></video>`;
   }
 
   // ── The shelf (shelf-store.js, issue #282) ─────────────────────────────────

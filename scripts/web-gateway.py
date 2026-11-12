@@ -9621,7 +9621,9 @@ class Handler(BaseHTTPRequestHandler):
     # download that happens to be HTML, and http.server's own error pages
     # (send_error). So it is added where the headers end rather than by each
     # page's code, which could forget it. A response that is not a page needs
-    # none: a policy governs the document it arrives with.
+    # none: a policy governs the document it arrives with. A page of webapp/
+    # that needs more than the others (content_policy.PAGE_SOURCES: /sparql)
+    # is named by _serve_static_file, which serves it under either path.
 
     def send_header(self, keyword, value):
         if keyword.lower() == "content-type":
@@ -9629,9 +9631,10 @@ class Handler(BaseHTTPRequestHandler):
         super().send_header(keyword, value)
 
     def end_headers(self):
+        page, self._csp_for = getattr(self, "_csp_for", None), None
         if getattr(self, "_csp_page", False):
             self._csp_page = False
-            for name, value in content_policy.headers():
+            for name, value in content_policy.headers(page):
                 super().send_header(name, value)
         super().end_headers()
 
@@ -9704,6 +9707,8 @@ class Handler(BaseHTTPRequestHandler):
             return False
         if transform is not None:
             data = transform(data)
+        # Which page of webapp/ this is, for its policy (end_headers).
+        self._csp_for = full.name if full.parent == WEBAPP_DIR.resolve() else None
         headers = dict(headers or {})
         if types is None:
             ctype = _STATIC_CONTENT_TYPES.get(full.suffix.lower(), "application/octet-stream")

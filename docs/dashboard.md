@@ -107,7 +107,7 @@ no code path can forget it. The policy is built in one place,
 
 ```
 default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline';
-img-src 'self' data: blob:; media-src 'self' data:; font-src 'none';
+img-src 'self' blob:; media-src 'self'; font-src 'none';
 connect-src 'self'; frame-src 'self'; object-src 'none'; base-uri 'self';
 form-action 'self'; worker-src 'self'; manifest-src 'self';
 report-uri /csp-report
@@ -115,11 +115,15 @@ report-uri /csp-report
 
 Scripts come from this origin only: no inline script, no handler attribute,
 no `javascript:` URL, no `eval`. Styles stay open (the components set style
-attributes; restricting styles is not the aim). `data:` images and media are
-the chat page's reference documents (`webapp/data/chats/`) and the icons in
-YASGUI's stylesheet (`/sparql`); `blob:` images are the chat page's previews
-of images about to be sent; the one frame is the file viewer's; no page loads
-a font. `/sparql` needs nothing more: the vendored YASGUI compiles no strings.
+attributes; restricting styles is not the aim). Images and media come from
+this origin; `blob:` images are the chat page's previews of images about to
+be sent. No image or medium is loaded from another origin: the chat page
+shows an attachment that is a web link as a link to open (see
+"Attachments"). The one frame is the file viewer's; no page loads a font.
+One page gets more, for itself alone (`PAGE_SOURCES` in the module):
+`/sparql` (also served as `/sparql.html`) adds `data:` to `img-src`, for the
+icons in YASGUI's stylesheet. It needs nothing else: the vendored YASGUI
+compiles no strings.
 Two other policies stay as they were, separate and always enforced:
 `/settings-instance.html`'s `frame-ancestors` (who may frame it, see "The
 settings page") and the file viewer's own `frame-src 'self'`. Inside the
@@ -166,8 +170,8 @@ included. Then read `GET /csp-report`:
   new worker on their next visit;
 - an entry on a dashboard page that the page needs (a script it runs, a kind
   of image it shows): fix the page, or add the source to
-  `scripts/content_policy.py` with the page that needs it, deploy, and give
-  it another few days.
+  `scripts/content_policy.py` with the page that needs it (to `PAGE_SOURCES`
+  when only that page needs it), deploy, and give it another few days.
 
 Keep reading it after the switch: in `enforce` mode the browser still reports
 what it blocked.
@@ -180,7 +184,8 @@ attributes (`onclick=`, `onload=`, …) in pages or in what the components
 render: listeners are added in script. No `javascript:` URLs, no `eval`,
 `new Function` or string timers, nothing from another origin. A page that
 cannot work without more gets it for that page alone, stated in
-`scripts/content_policy.py`, rather than a weaker policy for every page.
+`PAGE_SOURCES` of `scripts/content_policy.py` (as `/sparql`'s `data:`
+images are), rather than a weaker policy for every page.
 `tests/test_webapp_no_inline_script.py` checks the pages, the components'
 markup and every page the gateway builds; `tests/test_web_gateway_csp.py`
 the header on every page in each mode.
@@ -849,15 +854,20 @@ reference on only when it is an absolute `http(s)` URL with a host
 (`news_store.web_link`, the rule news links follow), and leaves the
 attachment without a URL otherwise (`_shape_chat_attachments`). The chat page
 holds to the same rule on its own: it renders a link, an image, a player or
-the lightbox only for a URL of the proxy (`/chats/media/<slug>/<media-id>`)
-or a web link, and the file's name as plain text for anything else, so a
-reference from outside never becomes script or a link of another scheme. Two
-further kinds of URL are rendered, neither of them ever as a link: the bubble
-of a send on its way previews the user's staged images from object URLs the
-page created, and a `data:image/…`, `data:audio/…` or `data:video/…` URL (the
-reference documents under `data/chats/` use them) is taken for the `<img>`,
-`<audio>` or `<video>` of its own kind, and for an image's lightbox, when the
-attachment's type is of that kind as well.
+the lightbox only for a URL of the proxy (`/chats/media/<slug>/<media-id>`),
+a link for the proxy's URL or a web link, and the file's name as plain text
+for anything else, so a reference from outside never becomes script or a
+link of another scheme. A web link is only ever a link, whatever the
+attachment's type: an image, a voice note or a video there is a file row to
+open, never loaded into the page (the origin's Content-Security-Policy allows
+images and media from this origin only). Two further kinds of URL are
+rendered, neither of them ever as a link: the bubble of a send on its way
+previews the user's staged images from object URLs the page created, and a
+`data:image/…`, `data:audio/…` or `data:video/…` URL is taken for the
+`<img>`, `<audio>` or `<video>` of its own kind, and for an image's
+lightbox, when the attachment's type is of that kind as well. The gateway
+passes no `data:` URL on, and the policy allows none on the chat page; only
+the reference documents under `data/chats/`, a test corpus, use them.
 
 ## Push notifications
 

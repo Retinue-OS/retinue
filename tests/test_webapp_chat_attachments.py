@@ -8,8 +8,12 @@ callers wrote, and the web gateway passes on only the media proxy's URL or an
 absolute http(s) URL (_shape_chat_attachments). The page holds to the same
 rule on its own, under Node with a scripted DOM:
 
-- a url of the media proxy (/chats/media/<slug>/<media-id>) or an absolute
-  http(s) URL renders the element its type calls for, as before;
+- a url of the media proxy (/chats/media/<slug>/<media-id>) renders the
+  element its type calls for, as before;
+- an absolute http(s) URL is a file row, a link to open, whatever its type:
+  an image, a voice note or a video is never loaded from another origin into
+  the page (the origin's Content-Security-Policy allows media from this
+  origin only, scripts/content_policy.py);
 - anything else (another scheme, a reference into the dashboard, a proxy path
   with a path step in it, a control character, no url at all) renders the
   attachment's name as text: no href, no src, no lightbox, save the two
@@ -86,9 +90,8 @@ const urlsIn = (html) => [...html.matchAll(/(?:href|src|data-lightbox)="([^"]*)"
 const TYPES = ['image/jpeg', 'audio/ogg', 'video/mp4', 'application/pdf', ''];
 const MID = 'ab'.repeat(16);
 
-ok('the media proxy and web links render the element their type calls for', () => {
-  for (const url of [`/chats/media/signal-gateway/${MID}`, `/chats/media/127.0.0.1/${MID}`,
-                     'https://example.org/pic.jpg', 'http://example.org/a?b=1&c=2']) {
+ok('the media proxy renders the element its type calls for', () => {
+  for (const url of [`/chats/media/signal-gateway/${MID}`, `/chats/media/127.0.0.1/${MID}`]) {
     const img = el._attachmentHtml({ url, type: 'image/jpeg', name: 'p.jpg' });
     assert.ok(img.includes('<img class="att-img'), img);
     assert.deepEqual(urlsIn(img), [url, url], img);
@@ -101,6 +104,23 @@ ok('the media proxy and web links render the element their type calls for', () =
     const file = el._attachmentHtml({ url, type: 'application/pdf', name: 'a.pdf', size: 2048 });
     assert.ok(file.startsWith('<a class="att-file" href='), file);
     assert.deepEqual(urlsIn(file), [url]);
+  }
+});
+
+ok('a web link is a file row whatever its type, never a medium loaded into the page', () => {
+  for (const url of ['https://example.org/pic.jpg', 'http://example.org/a?b=1&c=2']) {
+    for (const [type, label] of [['image/jpeg', 'Image'], ['audio/ogg', 'Voice message'],
+                                 ['video/mp4', 'Video'], ['application/pdf', 'Attachment'], ['', 'Attachment']]) {
+      const html = el._attachmentHtml({ url, type, size: 2048 });
+      assert.ok(html.startsWith('<a class="att-file" href='), `${type}: ${html}`);
+      assert.deepEqual(urlsIn(html), [url], html);
+      assert.ok(!/<(img|audio|video|button)[\s>]/.test(html), html);
+      assert.ok(!html.includes('data-lightbox'), html);
+      assert.ok(html.includes(`<span class="att-name">${label}</span>`), html);
+      assert.ok(html.includes('<span class="att-size">2 KB</span>'), html);
+      const named = el._attachmentHtml({ url, type, name: 'Bild <1>.jpg' });
+      assert.ok(named.includes('<span class="att-name">Bild &lt;1&gt;.jpg</span>'), named);
+    }
   }
 });
 

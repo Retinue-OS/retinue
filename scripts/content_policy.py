@@ -71,16 +71,19 @@ DIRECTIVES = (
     # pages carry theirs inline.
     ("style-src", ("'self'", "'unsafe-inline'")),
     # Images: this origin (icons, thread attachments, messenger media through
-    # the media proxy, the pairing codes on /gateways); data: for the
-    # reference documents under webapp/data/chats/, which the chat page shows
-    # as data: images, and for the icons YASGUI's stylesheet carries (/sparql);
-    # blob: for the chat page's previews of the images the user is about to
-    # send (object URLs the page makes itself).
-    ("img-src", ("'self'", "data:", "blob:")),
-    # Audio and video: this origin (messenger media through the media proxy,
-    # the briefing card's audio); data: for the reference documents' data:
-    # audio and video on the chat page.
-    ("media-src", ("'self'", "data:")),
+    # the media proxy, the pairing codes on /gateways); blob: for the chat
+    # page's previews of the images the user is about to send (object URLs
+    # the page makes itself). No data: here: /sparql alone needs it
+    # (PAGE_SOURCES). The chat page's records carry no data: URL: the
+    # gateway passes on the media proxy's URL, a web link or none
+    # (_shape_chat_attachments); the data: media of webapp/data/chats/ are a
+    # test corpus, never served as records. Nor is a web link loaded: the
+    # chat page shows a remote attachment as a link to open, never as an
+    # image or a player (chat-page.js, mediaUrl).
+    ("img-src", ("'self'", "blob:")),
+    # Audio and video: this origin only (messenger media through the media
+    # proxy, the briefing card's audio).
+    ("media-src", ("'self'",)),
     # No page loads a font: the dashboard uses the system's.
     ("font-src", ("'none'",)),
     # fetch() and the like go to this origin's API only; the dashboard makes
@@ -99,6 +102,16 @@ DIRECTIVES = (
     ("manifest-src", ("'self'",)),
 )
 
+# What a single page needs beyond DIRECTIVES, by the file of webapp/ it is,
+# for that page alone, so the others do not carry it. A source named here is
+# added to the directive's sources above.
+PAGE_SOURCES = {
+    # /sparql (webapp/sparql.html, also served as /sparql.html): the stylesheet
+    # of the vendored YASGUI (scripts/vendor-yasgui.sh) carries its icons as
+    # data: images.
+    "sparql.html": {"img-src": ("data:",)},
+}
+
 _warned: set = set()
 
 
@@ -116,9 +129,14 @@ def mode() -> str:
     return DEFAULT_MODE
 
 
-def policy() -> str:
-    """The policy as it is sent: the directives, then where reports go."""
-    parts = [f"{name} {' '.join(sources)}" for name, sources in DIRECTIVES]
+def policy(page: str | None = None) -> str:
+    """The policy as it is sent: the directives, then where reports go.
+    ``page`` names a file of webapp/ (``"sparql.html"``); a page with an
+    entry in PAGE_SOURCES gets that entry's sources as well, any other page
+    (and None) the policy every page has."""
+    extra = PAGE_SOURCES.get(page or "", {})
+    parts = [f"{name} {' '.join(sources + tuple(extra.get(name, ())))}"
+             for name, sources in DIRECTIVES]
     parts.append(f"report-uri {REPORT_PATH}")
     return "; ".join(parts)
 
@@ -133,9 +151,9 @@ def header_name(current: str | None = None) -> str | None:
     return None
 
 
-def headers() -> list[tuple[str, str]]:
-    """The headers an HTML response carries: the policy in the mode in force.
-    Empty when off.
+def headers(page: str | None = None) -> list[tuple[str, str]]:
+    """The headers an HTML response carries: the policy in the mode in force,
+    for ``page`` (policy()). Empty when off.
 
     The policy is a header of its own beside any other a page carries: the
     instance settings page's framing policy (frame-ancestors) stays a
@@ -144,7 +162,7 @@ def headers() -> list[tuple[str, str]]:
     name = header_name()
     if name is None:
         return []
-    return [(name, policy())]
+    return [(name, policy(page))]
 
 
 def signature() -> str:
@@ -153,7 +171,8 @@ def signature() -> str:
     and all, so a page keeps the policy it was cached with until the worker
     is replaced; a changed mode or policy has to replace it, as a changed file
     does."""
-    return f"{mode()}:{policy()}"
+    pages = "".join(f"\n{page}:{policy(page)}" for page in sorted(PAGE_SOURCES))
+    return f"{mode()}:{policy()}{pages}"
 
 
 # ── The reports ───────────────────────────────────────────────────────────────
@@ -236,9 +255,12 @@ def parse_reports(content_type, body: bytes) -> list[dict] | None:
     fmt = report_format(content_type)
     if fmt is None:
         return None
+    # A body nested deeper than the parser's recursion limit (a few thousand
+    # brackets fit in the size cap) raises RecursionError rather than a
+    # ValueError; it is no report either, and must not cost the connection.
     try:
         doc = json.loads(body.decode("utf-8"))
-    except (UnicodeDecodeError, ValueError):
+    except (UnicodeDecodeError, ValueError, RecursionError):
         return None
     out = []
     if fmt == "application/csp-report":

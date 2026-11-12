@@ -17,8 +17,10 @@ http.server's own error page. In each of the three modes:
 and in every mode the instance settings page keeps its framing policy as a
 separate, enforced header, a response that is no page (JSON, a script, an
 image) carries no policy, and the policy itself is what the decision says:
-scripts from this origin only, no inline script, no eval. A change of mode
-moves the service worker's shell hash, so installed clients pick it up.
+scripts from this origin only, no inline script, no eval, images and media
+from this origin (and the chat page's own blob: previews), with data: images
+on /sparql alone, which gets that policy under both its paths. A change of
+mode moves the service worker's shell hash, so installed clients pick it up.
 
     python3 tests/test_web_gateway_csp.py
 """
@@ -106,6 +108,7 @@ PAGES = [
     ("GET", "/sync-health", {}),
     ("GET", "/sync-health.html", {}),
     ("GET", "/sparql", {"Accept": "text/html"}),
+    ("GET", "/sparql.html", {}),
     ("GET", "/sends", {}),
     ("GET", "/sends/next", {}),
     ("GET", "/sends/nobody/" + "a" * 32, {}),
@@ -130,13 +133,22 @@ NOT_PAGES = [
 ]
 
 
-def check_policy_text(cp) -> None:
-    policy = cp.policy()
+# The pages that get more than the policy every page has, by path, with the
+# file of webapp/ that names their entry in content_policy.PAGE_SOURCES.
+PAGE_POLICY = {"/sparql": "sparql.html", "/sparql.html": "sparql.html"}
+
+
+def _directives(policy: str) -> dict:
     directives = {}
     for part in policy.split(";"):
         name, *sources = part.split()
         assert name not in directives, f"{name} twice"
         directives[name] = sources
+    return directives
+
+
+def check_policy_text(cp) -> None:
+    directives = _directives(cp.policy())
     assert directives["script-src"] == ["'self'"], directives["script-src"]
     assert directives["default-src"] == ["'self'"]
     assert directives["object-src"] == ["'none'"]
@@ -159,6 +171,22 @@ def check_policy_text(cp) -> None:
     assert not any("eval" in s for v in directives.values() for s in v)
     assert "frame-ancestors" not in directives, "the framing policy is the embed page's own"
     print("ok: the policy runs scripts from this origin only, with no inline script and no eval")
+    # Images and media: what the pages load, and no more. No data: on any
+    # page but /sparql, and no remote media: the chat page links a remote
+    # attachment rather than load it.
+    assert directives["img-src"] == ["'self'", "blob:"], directives["img-src"]
+    assert directives["media-src"] == ["'self'"], directives["media-src"]
+    assert directives["font-src"] == ["'none'"]
+    assert directives["connect-src"] == ["'self'"]
+    assert directives["frame-src"] == ["'self'"]
+    assert cp.policy("chat.html") == cp.policy() == cp.policy(None)
+    # /sparql: YASGUI's stylesheet icons, data: images, for that page alone.
+    sparql = _directives(cp.policy("sparql.html"))
+    assert sparql.pop("img-src") == ["'self'", "blob:", "data:"], cp.policy("sparql.html")
+    assert sparql.pop("report-uri") == ["/csp-report"]
+    directives.pop("img-src")
+    assert sparql == directives, "the /sparql policy differs from the others in img-src alone"
+    print("ok: data: images on /sparql alone, data: media and remote media nowhere")
 
 
 def main() -> int:
@@ -205,10 +233,11 @@ def main() -> int:
                             failures.append(f"{mode}: the embed page lost its framing policy: {framing}")
                     elif framing:
                         failures.append(f"{mode}: {path} carries a framing policy")
+                    expect = cp.policy(PAGE_POLICY.get(path.split("?", 1)[0]))
                     if in_force == "report":
-                        ok = reported == [cp.policy()] and not enforced
+                        ok = reported == [expect] and not enforced
                     elif in_force == "enforce":
-                        ok = enforced == [cp.policy()] and not reported
+                        ok = enforced == [expect] and not reported
                     else:
                         ok = not enforced and not reported
                     if not ok:

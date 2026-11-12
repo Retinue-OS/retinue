@@ -130,11 +130,22 @@ def check_static_pages() -> list[str]:
 
 
 # Markup in a component is a string or a template: a handler attribute there
-# is `on<event>=` followed by a quote or a substitution. A property set in
-# code (`img.onload = () => …`) is no attribute and passes.
+# is `on<event>=` followed by a quote or a substitution, or, unquoted, by the
+# value itself (`<button onclick=go()>`). A property set in code
+# (`img.onload = () => …`) is no attribute and passes: it follows a dot, not a
+# blank or a quote, and an unquoted value is looked for only on a line that
+# opens a tag, so a local variable (`const onKey = (e) => …`) passes as well.
 HANDLER_IN_MARKUP = re.compile(r"""\son[a-z]{3,}\s*=\s*(?:["'`]|\\["']|\$\{)""")
+HANDLER_UNQUOTED = re.compile(r"""[\s"'`]on[a-z]{3,}\s*=\s*[^\s=>]""", re.I)
 HANDLER_SET_ATTRIBUTE = re.compile(r"""setAttribute\(\s*['"`]on""")
 COMMENT_LINE = re.compile(r"^\s*(?://|/\*|\*)")
+
+
+def handler_in_markup(line: str) -> bool:
+    """Whether a line of a component's source writes a handler attribute."""
+    if HANDLER_IN_MARKUP.search(line) or HANDLER_SET_ATTRIBUTE.search(line):
+        return True
+    return "<" in line and bool(HANDLER_UNQUOTED.search(line))
 
 
 def check_component_sources() -> list[str]:
@@ -146,7 +157,7 @@ def check_component_sources() -> list[str]:
         for no, line in enumerate(src.read_text(encoding="utf-8").splitlines(), 1):
             if COMMENT_LINE.match(line):
                 continue
-            if HANDLER_IN_MARKUP.search(line) or HANDLER_SET_ATTRIBUTE.search(line):
+            if handler_in_markup(line):
                 failures.append(f"{rel}:{no}: handler attribute in rendered markup")
             if "javascript:" in line.lower():
                 failures.append(f"{rel}:{no}: javascript: URL")
@@ -272,10 +283,16 @@ def check_the_checker() -> list[str]:
         found = len(problems_in(markup))
         if found != expected:
             failures.append(f"checker: {markup!r} gave {found} problems, expected {expected}")
-    if not HANDLER_IN_MARKUP.search('`<img src="${u}" onload="x()">`'):
-        failures.append("checker: missed a handler attribute in a template")
-    if HANDLER_IN_MARKUP.search("    js.onload = () => resolve();"):
-        failures.append("checker: took a property assignment for an attribute")
+    for line in ('`<img src="${u}" onload="x()">`', "  `<button onclick=go()>x</button>`",
+                 "  html += '<img src=x onerror=alert(1)>';", "`<div onMouseOver=${fn}>`",
+                 "  `<a href=\"/x\"`, ` onfocus=\"x()\">`", "el.setAttribute('onclick', 'x()');"):
+        if not handler_in_markup(line):
+            failures.append(f"checker: missed a handler attribute in {line!r}")
+    for line in ("    js.onload = () => resolve();", "    img.onerror = () => { this.x = 1; };",
+                 "  const onKey = (e) => { if (e.key === 'Escape') close(); };",
+                 "  if (a < b) img.onload = done;", "const ONTOLOGY = 'ontology';"):
+        if handler_in_markup(line):
+            failures.append(f"checker: took {line!r} for a handler attribute")
     print("ok: the scan finds inline scripts, handler attributes and javascript: URLs")
     return failures
 

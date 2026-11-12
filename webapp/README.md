@@ -422,13 +422,17 @@ The API, as the components consume it:
   only as an inline-safe image, audio, video, PDF or plain text and as a
   download otherwise (`docs/dashboard.md`, "Attachments"). A reference that
   names no blob is passed on as the `url` only when it is an absolute http(s)
-  URL, and the attachment has no `url` otherwise; the page renders a link, an
-  image, a player or the lightbox only for a proxy URL or an http(s) URL, and
-  the name as plain text for anything else, so a reference from outside never
-  becomes an `href` or a `src` of another kind. The page also takes a
-  `data:image/…`, `data:audio/…` or `data:video/…` URL (the reference
-  documents' media), only for the `<img>`, `<audio>` or `<video>` of its own
-  kind (and an image's lightbox), never for a link. Type, size and name are what
+  URL, and the attachment has no `url` otherwise; the page renders an image,
+  a player or the lightbox only for a proxy URL, a link only for a proxy URL
+  or an http(s) URL, and the name as plain text for anything else, so a
+  reference from outside never becomes an `href` or a `src` of another kind.
+  An http(s) URL is a link to open whatever the type, never loaded as an
+  image or a player: the origin's Content-Security-Policy allows media from
+  this origin only (`docs/dashboard.md`, "The Content-Security-Policy"). The
+  page also takes a `data:image/…`, `data:audio/…` or `data:video/…` URL (the
+  reference documents' media; the gateway passes none on, and the policy
+  allows none on the chat page), only for the `<img>`, `<audio>` or `<video>`
+  of its own kind (and an image's lightbox), never for a link. Type, size and name are what
   the storing gateway stated about the blob in its ledger record (absent on
   records older than that statement). `width`/`height` are the medium's real intrinsic size, sniffed
   at ingest — when present the client reserves the true aspect box before the
@@ -525,7 +529,10 @@ attachments with intrinsic dimensions, a voice note (`audio/*` with the
 transcript as the message text) and a video (`video/*` with dimensions), all
 with `data:` URLs, which the page takes only for an `<img>`, `<audio>` or
 `<video>` of the same kind and for an image's lightbox, never for a link (a
-link's url is the proxy's or an http(s) URL), and both companion states: one chat names an
+link's url is the proxy's or an http(s) URL); the origin's
+Content-Security-Policy allows no `data:` media on the chat page, since no
+record the gateway serves carries one, so the corpus shows its media only
+where it is served without that policy. It covers both companion states: one chat names an
 existing thread, the rest carry `companion: null`. Companion messages
 themselves are conversation documents, not chat ones, so the corpus holds
 none — the suite mocks `/conversations/<id>` for those.

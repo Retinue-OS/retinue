@@ -12,7 +12,8 @@ Runs the gateway's real request handler on a loopback port and pins:
   seen; each new one is logged once, on one line;
 - no more than the limit of distinct violations is kept, the rest counted;
 - an oversized body, a body without a length, another content type and junk
-  are refused with a fixed answer and keep nothing;
+  (malformed JSON, nesting past the parser's recursion limit, no report in
+  it) are refused with a fixed answer and keep nothing;
 - no answer reflects what was posted;
 - GET /csp-report lists what was kept, with the mode and the policy;
 - the policy names the endpoint (report-uri, and not report-to, which would
@@ -191,6 +192,10 @@ def main() -> int:
                 (client.post("application/csp-report", legacy("https://d/x", "<script>" + MARK, "x")), 400),
                 (client.post("application/reports+json", {"type": "csp-violation"}), 400),
                 (client.post("application/csp-report", b"\xff\xfe" + MARK.encode()), 400),
+                # Nesting past the parser's recursion limit is junk like any other.
+                (client.post("application/reports+json", b"[" * 60000), 400),
+                (client.post("application/csp-report",
+                             b'{"csp-report": {"document-uri": ' + b"[" * 60000 + b"}}"), 400),
                 (client.post("application/json", legacy("https://d/x", "script-src", MARK)), 415),
                 (client.post("text/plain", MARK.encode()), 415),
                 (client.post("application/csp-report",
