@@ -395,7 +395,7 @@ def _default_thread_model() -> str:
 # Each turn is its own `claude -p` process — a resumed one keeps the transcript,
 # not a model — so which model answers a thread is a free per-turn choice:
 # pickable at creation and switchable mid-thread, effective from the next turn. The picker governs Ara's OWN turn only: dispatched subagents (Coach,
-# Medic, Archivist, Ari) run on their own hard-wired models regardless.
+# Archivist, chamber subagents) run on their own hard-wired models regardless.
 #
 # The list of offered models comes from LiteLLM when the deployment routes
 # through it: the gateway reads GET <RETINUE_LITELLM_URL>/model/info (default:
@@ -1384,6 +1384,12 @@ def _news_ingest_authorized(provided: str) -> bool:
 # Recoloured icons, keyed by (path, colour): the recolouring is a pure-Python
 # pixel pass, so it runs once per icon per configured colour, not per request.
 _BRANDED_ICON_CACHE: dict[tuple[str, str], bytes] = {}
+
+# Where the Android app serves its own settings page from (a reserved address
+# the app answers itself, inside its WebView; ara-android's settings/AppPage).
+# That page embeds settings-instance.html, so it is the one other origin
+# allowed to frame it.
+APP_SETTINGS_ORIGIN = "https://appassets.androidplatform.net"
 
 
 def _branding_transform(rel: str):
@@ -3537,7 +3543,7 @@ def _render_send_single_html(detail: dict, account: str, next_url: str | None) -
     acc = html.escape(account)
     rid = html.escape(detail.get("request_id", ""))
     subj = html.escape(detail.get("subject") or "(no subject)")
-    # Which identity sends this mail (e.g. "Your Name <you@…>" vs Ari's mailbox).
+    # Which identity sends this mail (e.g. "Your Name <you@…>" vs an agent persona's own mailbox).
     # It matters whether a message goes out as the user's business address or as
     # an agent persona, so surface it prominently at the top of the approval card.
     frm = html.escape(detail.get("from") or account)
@@ -5191,8 +5197,10 @@ _LINT_SYSTEM_PROMPT = (
     "already carries chips for its options, leave them exactly as they are.\n"
     "2. No bare URLs. Every URL becomes [short label](url) with a meaningful "
     "label. A bare domain (example.ch) becomes [example.ch](https://example.ch). "
-    "A relative path (/sends, /gateways) becomes an absolute link using the "
-    "base URL given above, linked by name.\n"
+    "A bare relative path (/sends, /gateways) becomes a link by name with "
+    "that same root-relative target, e.g. [the gateways page](/gateways); a "
+    "Markdown link whose target already starts with a single / is fine as "
+    "it is.\n"
     "3. Never invent a URL or a fact. If the message tells the user to act "
     "somewhere but carries no URL for it, leave that sentence unchanged.\n\n"
     "Keep the message's language, wording, structure and content exactly — do "
@@ -5226,11 +5234,9 @@ def _lint_presentation(text: str, *, kind: str = "chat") -> str:
     # no scheme, no bare domain, no relative path — has nothing to lint.
     if len(raw) < 40 and not _LINT_URLISH_RE.search(raw):
         return text
-    parts = []
-    if CONVERSATION_BASE_URL:
-        parts.append("Dashboard base URL for relative paths: "
-                     + CONVERSATION_BASE_URL)
-    parts.append("Message to lint:\n" + raw)
+    # No base URL is handed over: the renderer links a root-relative target
+    # in place, so relative dashboard paths stay relative.
+    parts = ["Message to lint:\n" + raw]
     cmd = [
         "claude", "-p", "--output-format=json",
         "--model", PRESENTATION_LINT_MODEL,
@@ -5304,7 +5310,7 @@ _OWNER_ACTOR = os.environ.get("RETINUE_OWNER_ACTOR", "").strip() or "urn:retinue
 # (chambers/_generated/attention/items.nt) states currentActor, importance,
 # sphere and tag for the same project IRI, derived from this very query; read
 # back, it gave a project two actors, the fold below kept whichever binding
-# came first, and a humanized label ("Reto") written out as an actor IRI
+# came first, and a humanized label (the owner's name) written out as an actor IRI
 # re-entered as the actor and was emitted again — a loop that pinned projects
 # to "waiting on" their own owner. agent-self-review.py scopes the same way.
 _PROJECTS_SPARQL = """
@@ -9385,11 +9391,12 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def _serve_static_file(self, path: Path, base: Path, cache: str = "no-cache",
-                           transform=None) -> bool:
+                           transform=None, headers: dict | None = None) -> bool:
         """Serve a file from within ``base``, guarding against path traversal.
 
         ``transform`` rewrites the bytes on the response only (the instance
-        branding); the file on disk is never touched.
+        branding); the file on disk is never touched. ``headers`` are sent
+        as well (a page's framing policy).
         Returns True if a file was sent, False otherwise (caller emits 404)."""
         try:
             full = path.resolve()
@@ -9408,6 +9415,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Cache-Control", cache)
+        for name, value in (headers or {}).items():
+            self.send_header(name, value)
         self.end_headers()
         self.wfile.write(data)
         return True
@@ -9493,6 +9502,15 @@ class Handler(BaseHTTPRequestHandler):
             # state; inside the shell the page's own script starts the sync.
             return self._serve_static_file(WEBAPP_DIR / "sync-health.html", WEBAPP_DIR,
                                            transform=instance_branding.brand_html)
+        if path == "/settings-instance.html":
+            # This instance's settings on their own, for the Android app to
+            # embed in its settings page (docs/dashboard.md, "Inside the
+            # Android shell"). Only this origin and the app's own page, served
+            # by the app at a reserved address, may frame it.
+            return self._serve_static_file(
+                WEBAPP_DIR / "settings-instance.html", WEBAPP_DIR,
+                transform=instance_branding.brand_html,
+                headers={"Content-Security-Policy": f"frame-ancestors 'self' {APP_SETTINGS_ORIGIN}"})
         if path.startswith("/data/"):
             rel = path[len("/data/"):]
             return self._serve_static_file(DASHBOARD_DATA_DIR / rel, DASHBOARD_DATA_DIR, cache="no-store")
@@ -9762,6 +9780,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if self.path.split("?", 1)[0].rstrip("/") == "/agent-models":
             self._handle_agent_models_write()
+            return
+        if self.path.split("?", 1)[0].rstrip("/") == "/instance":
+            self._handle_instance_write()
             return
         attention_match = _ATTENTION_POST_RE.match(self.path)
         if attention_match:
@@ -11567,6 +11588,41 @@ class Handler(BaseHTTPRequestHandler):
         self._send_json(200, {"agents": agent_models.status(),
                               "models": _conversation_models()})
 
+    def _handle_instance_write(self) -> None:
+        """Settings › Instance: the instance's name and accent colour.
+
+        Body {name?, color?}: a key given is stored ("" clears it, so the
+        deployment default — RETINUE_INSTANCE_NAME / _COLOR — is in force
+        again), a key left out is left alone. Server-side and shared by every
+        device: the manifest, the page titles, the icons and the dashboard
+        accent follow on the next response (scripts/instance_branding.py), the
+        service worker's shell hash moves with them, and the Android shell
+        reads the new name from the manifest for its endpoint menu."""
+        payload = self._read_json_body()
+        if payload is None:
+            self._send_json(400, {"error": "invalid JSON"})
+            return
+        name = payload.get("name")
+        color = payload.get("color")
+        if name is None and color is None:
+            self._send_json(400, {"error": "name or color is required"})
+            return
+        if (name is not None and not isinstance(name, str)) or (color is not None and not isinstance(color, str)):
+            self._send_json(400, {"error": "name and color are strings"})
+            return
+        try:
+            result = instance_branding.write_setting(name=name, color=color)
+        except ValueError as exc:
+            self._send_json(400, {"error": str(exc)})
+            return
+        except OSError as exc:
+            self._send_json(500, {"error": "could not save the instance settings",
+                                  "detail": str(exc)})
+            return
+        # Recoloured icons are keyed by colour; the old colour's are not coming back.
+        _BRANDED_ICON_CACHE.clear()
+        self._send_json(200, result)
+
     def _handle_transcribe(self) -> None:
         """Voice input: proxy uploaded audio to the shared STT service.
 
@@ -12159,6 +12215,11 @@ class Handler(BaseHTTPRequestHandler):
             # list the thread picker offers (scripts/agent_models.py).
             self._send_json(200, {"agents": agent_models.status(),
                                   "models": _conversation_models()})
+            return
+        if conv_path in ("/instance", "/instance/"):
+            # Settings › Instance: the name and colour stored by the dashboard,
+            # the deployment defaults, and what is in force (scripts/instance_branding.py).
+            self._send_json(200, instance_branding.status())
             return
         if conv_path in ("/attention", "/attention/"):
             self._handle_attention_get()

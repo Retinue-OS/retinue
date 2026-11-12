@@ -13,9 +13,11 @@
 //           [[chip: …]] (click-to-fill) and [[call: …]] (tap-to-dial)
 //
 // Safety: the input is HTML-escaped before any markup is generated, and only
-// http(s)/mailto/tel URLs ever become links (never javascript:). The output is
-// therefore safe to assign to innerHTML. Links to the dashboard's own origin
-// open in place; every other web link opens in a new tab (see anchor()).
+// http(s)/mailto/tel URLs and root-relative paths (/sends/…, never //host)
+// ever become links (never javascript:). The output is therefore safe to
+// assign to innerHTML. Links to the dashboard's own origin — a root-relative
+// path always is one — open in place; every other web link opens in a new tab
+// (see anchor()).
 //
 // Rendering hooks let a host specialize without forking the renderer: the
 // conversations card passes a `quote` hook that adds its copy-to-clipboard
@@ -160,8 +162,12 @@ export function renderInline(text) {
   // ![alt](url) — no remote fetches from rendered content; show it as a link.
   s = s.replace(/!\[([^\]]*)\]\(((?:https?:\/\/)[^\s)]+)\)/gi,
     (_m, alt, url) => stash(anchor(url, alt || url)));
-  // [label](url)
-  s = s.replace(/\[([^\]]+)\]\(((?:https?:\/\/|mailto:|tel:)[^\s)]+)\)/gi,
+  // [label](url). A root-relative target (/sends/default/752) is a link into
+  // the dashboard itself: the browser resolves it against the page's own
+  // origin, so it can neither run script nor leave the site. A second slash
+  // (//host/…) would be protocol-relative — another origin — and a backslash
+  // is read as a slash by browsers, so both are refused right after the first.
+  s = s.replace(/\[([^\]]+)\]\(((?:https?:\/\/|mailto:|tel:|\/(?![\/\\]))[^\s)]*)\)/gi,
     (_m, label, url) => stash(anchor(url, label)));
   // Bare URLs; keep any trailing punctuation (URL_TAIL_RE) outside the link,
   // and stop at a stash placeholder (\x01 is SEP) so a code span right after a

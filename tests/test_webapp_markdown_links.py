@@ -6,6 +6,8 @@ handed to a browsing context outside the app window, so a link Ara gives to
 another thread used to open the browser instead of the app. This pins the
 rule: a link to the dashboard's own origin navigates in place (no target),
 every other web link opens in a new tab, mailto:/tel: never carry a target,
+a root-relative [label](/path) is a dashboard link (while //host, a
+backslash and path-relative targets stay text),
 and without a `location` (rendering outside a page) every web link counts as
 external. An in-place link may unload the page, which costs nothing unsent —
 it waits in its field (tests/test_webapp_unsent.py) — so, like a tab of the
@@ -79,6 +81,28 @@ ok('mailto and tel never carry a target', () => {
   assert.equal(renderInline('[t](tel:+41441234567)'), '<a href="tel:+41441234567">t</a>');
 });
 
+ok('a root-relative link is a dashboard link and opens in place', () => {
+  assert.equal(renderInline('[approve](/sends/default/752)'),
+    '<a href="/sends/default/752">approve</a>');
+  assert.equal(renderInline('[home](/)'), '<a href="/">home</a>');
+  assert.equal(renderInline('[t](/#conversation-bbbb)'),
+    '<a href="/#conversation-bbbb">t</a>');
+  assert.equal(renderInline('[p](/project.html?id=x&y=1)'),
+    '<a href="/project.html?id=x&amp;y=1">p</a>');
+});
+
+ok('protocol-relative, backslash, path-relative and script targets stay text', () => {
+  for (const u of ['//evil.example.com/x', '/\\evil.example.com/x',
+                   'sends/default/752', './x', '../x', 'javascript:alert(1)']) {
+    const out = renderInline(`[x](${u})`);
+    assert.ok(!out.includes('<a '), `${u} -> ${out}`);
+  }
+});
+
+ok('a bare relative path is not auto-linked', () => {
+  assert.equal(renderInline('see /gateways'), 'see /gateways');
+});
+
 ok('no press on a link is held: nothing listens on the document', () => {
   assert.deepEqual(listeners, []);
 });
@@ -93,7 +117,7 @@ def main() -> int:
         print("SKIP: node is not installed; the Markdown link test needs it")
         return 0
     with tempfile.TemporaryDirectory() as tmp:
-        for name in ("base.js", "markdown.js"):
+        for name in ("base.js", "device-store.js", "markdown.js"):
             shutil.copy(os.path.join(COMPONENTS, name), os.path.join(tmp, name))
         with open(os.path.join(tmp, "package.json"), "w", encoding="utf-8") as fh:
             fh.write('{"type":"module"}')

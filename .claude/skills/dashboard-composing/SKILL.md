@@ -115,11 +115,15 @@ don't rely on that. Always write `[label](url)` with a short human label:
 - Applies everywhere the dashboard renders Markdown: conversation messages,
   pushed threads, project pages, news notes.
 
-**Relative** URLs — `/gateways`, `/sends` — are covered too, and there it
-matters most: the renderer auto-links a bare absolute URL, but not a relative
-one, so it arrives as inert text the user cannot tap at all. Resolve the host
-(`CONVERSATION_BASE_URL`) and link it by name — `Open [the gateways page](…)`,
-not `Open /gateways`.
+**Relative** URLs — `/gateways`, `/sends/default/752` — are dashboard links.
+In a dashboard surface write them as a Markdown link with a root-relative
+target: `Open [the gateways page](/gateways)`, `[approve the reply](/sends/default/752)`.
+The renderer links a target starting with a single `/` and opens it in place,
+in the app; it does **not** auto-link a bare `/gateways`, which arrives as
+inert text. Path-relative (`sends/…`) and protocol-relative (`//host/…`)
+targets are never linked. Text that leaves the dashboard — a Signal or e-mail
+push, an outbound message — has no page to resolve against: there, resolve the
+host (`CONVERSATION_BASE_URL`) and link the absolute URL.
 
 ## 5. Anything you ask the user to do elsewhere carries its link
 

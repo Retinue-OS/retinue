@@ -126,6 +126,15 @@ main.settings { max-width: 640px; height: auto; }
 .scard h2 { font-size: .82rem; font-weight: 600; letter-spacing: .04em;
             text-transform: uppercase; color: var(--muted); margin: 0 0 10px; }
 .scard .hint { color: var(--muted); font-size: .85rem; margin: 0 0 10px; }
+/* The page's groups: This app, This browser, This instance. */
+.settings-group { font-size: .95rem; font-weight: 600; color: var(--fg);
+                  margin: 12px 4px 0; }
+.settings-group[hidden] { display: none; }
+/* settings-instance.html, inside the Android app's own settings page: the
+   frame is sized to the content, so the page has no frame rules of its own. */
+main.settings-embedded { min-height: 0; padding: 0; gap: 10px; }
+main.settings-embedded retinue-instance-settings { display: flex; flex-direction: column; gap: 10px; }
+retinue-instance-settings { display: contents; }
 .linklist { list-style: none; margin: 0; padding: 0;
             display: flex; flex-direction: column; gap: 8px; }
 .linklist a { display: block; padding: 10px 12px; border-radius: 10px;
@@ -182,6 +191,18 @@ retinue-sparql-workbench .yasgui .controlbar { display: none; }
 .setting-btn:disabled { opacity: .55; cursor: default; }
 .setting-btn:disabled:hover { background: var(--card-2); color: var(--fg); }
 .num-setting input[type="checkbox"] { width: 22px; min-height: 22px; padding: 0; accent-color: var(--accent); }
+/* The Phone shell card: the endpoint menu (the shell's list) and its buttons;
+   the Instance card's name and colour fields share the control styling. */
+.endpoint-pick select, .instance-name input[type="text"] { max-width: 60%; min-height: 40px; padding: 0 10px;
+                      border-radius: 10px; border: 1px solid var(--line); background: var(--card-2);
+                      color: var(--fg); font: inherit; }
+.endpoint-pick select:disabled { opacity: .55; }
+.instance-name input[type="text"] { width: 60%; }
+.instance-color input[type="color"] { width: 56px; min-height: 40px; padding: 2px; border-radius: 10px;
+                                      border: 1px solid var(--line); background: var(--card-2); }
+.shell-actions { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 10px; }
+.shell-actions [hidden] { display: none; }
+.scard label.num-setting + .shell-actions, .scard .num-setting + .num-setting.instance-color { margin-top: 8px; }
 /* The Health Connect block on the Phone shell card, and the /sync-health page. */
 .health-sync { margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--line); }
 .health-sync .setting-btn + .num-setting, .health-sync .health-sync-line + .num-setting { margin-top: 10px; }

@@ -198,7 +198,7 @@ not create `MEMORY.md`-style files.
 
 ## Data refresh and scheduled tasks
 
-**Before accessing a time-sensitive data source** (e.g. Garmin), run
+**Before accessing a time-sensitive data source** (one a chamber's `.refresh.json` declares), run
 
 ```bash
 python3 /workspace/scripts/refresh.py --data-dir /workspace/chambers/<chamber> --ensure <source-id>

@@ -14,11 +14,15 @@
 // Nothing here knows a language: the detector listens for energy, not words,
 // so it works the same whatever the user speaks.
 
+import { deviceGet, deviceSet } from './device-store.js';
+
 // ── Per-device settings (Settings → Voice) ───────────────────────────────────
 // How long a pause ends a take, and how long the open mic waits for speech
 // before it closes again. Per device, like every other voice preference: a
 // quiet desk and a car want different values, and neither belongs to the
-// account.
+// account. Inside the Android app they are the app's, for every endpoint it
+// shows (components/device-store.js); its settings page sets them, with the
+// same bounds and defaults as here.
 export const SILENCE_KEY = 'retinue-voice-silence-ms';
 export const NO_SPEECH_KEY = 'retinue-voice-nospeech-ms';
 export const DEFAULT_SILENCE_MS = 1500;
@@ -39,12 +43,11 @@ function clampMs(value, [lo, hi], fallback) {
 }
 
 export function voiceTimeouts() {
-  const s = storage();
   let silence = null;
   let noSpeech = null;
   try {
-    silence = s && s.getItem(SILENCE_KEY);
-    noSpeech = s && s.getItem(NO_SPEECH_KEY);
+    silence = deviceGet(SILENCE_KEY);
+    noSpeech = deviceGet(NO_SPEECH_KEY);
   } catch (_e) { /* blocked storage: defaults */ }
   return {
     silenceMs: clampMs(silence, SILENCE_RANGE, DEFAULT_SILENCE_MS),
@@ -55,13 +58,12 @@ export function voiceTimeouts() {
 // Store either timeout (milliseconds); returns what is in force afterwards,
 // clamped, so the settings field can show the value actually used.
 export function setVoiceTimeouts({ silenceMs, noSpeechMs } = {}) {
-  const s = storage();
   try {
-    if (s && silenceMs !== undefined) {
-      s.setItem(SILENCE_KEY, String(clampMs(silenceMs, SILENCE_RANGE, DEFAULT_SILENCE_MS)));
+    if (silenceMs !== undefined) {
+      deviceSet(SILENCE_KEY, String(clampMs(silenceMs, SILENCE_RANGE, DEFAULT_SILENCE_MS)));
     }
-    if (s && noSpeechMs !== undefined) {
-      s.setItem(NO_SPEECH_KEY, String(clampMs(noSpeechMs, NO_SPEECH_RANGE, DEFAULT_NO_SPEECH_MS)));
+    if (noSpeechMs !== undefined) {
+      deviceSet(NO_SPEECH_KEY, String(clampMs(noSpeechMs, NO_SPEECH_RANGE, DEFAULT_NO_SPEECH_MS)));
     }
   } catch (_e) { /* not kept: the defaults go on applying */ }
   return voiceTimeouts();

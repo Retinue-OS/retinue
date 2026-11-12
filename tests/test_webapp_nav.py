@@ -50,7 +50,8 @@ class FakeShadow {
   constructor() { this.innerHTML = ''; this._stubs = new Map(); }
   querySelector(sel) {
     const present = sel === 'nav' ? this.innerHTML.includes('<nav')
-      : sel === '[data-back]' ? this.innerHTML.includes('data-back') : false;
+      : sel === '[data-back]' ? this.innerHTML.includes('data-back')
+      : sel === 'a[href="/settings.html"]' ? this.innerHTML.includes('href="/settings.html"') : false;
     if (!present) return null;
     if (!this._stubs.has(sel)) this._stubs.set(sel, new Stub());
     return this._stubs.get(sel);
@@ -278,6 +279,33 @@ await ok('a deep-linked thread closes in place, without leaving the page', () =>
   assert.ok(!navOnPage.hasAttribute('back'), 'the list: no back');
   card.disconnectedCallback();
   navOnPage = null;
+});
+
+await ok("the gear opens the app's own settings page inside the app, and is a plain link elsewhere", () => {
+  const gearOf = (nav) => nav.shadowRoot.querySelector('a[href="/settings.html"]');
+  // A browser, or an app without a page of its own: the link follows.
+  let opened = [];
+  delete window.RetinueShell;
+  let ev = press();
+  gearOf(mountNav({ current: 'home' })).fire('click', ev);
+  assert.ok(!ev.prevented, 'a browser follows the link');
+  window.RetinueShell = { platform: 'android', openSettings: (s) => { opened.push(s); } };
+  ev = press();
+  gearOf(mountNav({ current: 'home' })).fire('click', ev);
+  assert.ok(!ev.prevented, 'RetinueShell/3: the dashboard page still');
+  assert.deepEqual(opened, []);
+  // RetinueShell/4: the app's page opens and the link does not follow.
+  window.RetinueShell.settingsPage = true;
+  ev = press();
+  gearOf(mountNav({ current: 'home' })).fire('click', ev);
+  assert.ok(ev.prevented, 'the app opens its page');
+  assert.deepEqual(opened, [undefined]);
+  // A modified press is the link's, as anywhere.
+  ev = press({ ctrlKey: true });
+  gearOf(mountNav({ current: 'home' })).fire('click', ev);
+  assert.ok(!ev.prevented);
+  assert.equal(opened.length, 1);
+  delete window.RetinueShell;
 });
 
 console.log(`${passed} checks passed`);

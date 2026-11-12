@@ -72,6 +72,30 @@ The repositories at a glance:
 | framework — `retinue-os/retinue` (formerly `health-agents`) | baked into the image as `/workspace`; live checkout also RW-mounted — at `/workspace/deployment` (bare-framework layout) or `/workspace/deployment/retinue` (nested-deployment layout, where the deployment repo owns `/workspace/deployment`); if neither gitdir is reachable (submodule mount without its parent's `.git`), fall back to a `/tmp` clone | Infrastructure: core agents, skills, scripts, settings, Dockerfile, repo/plugin manifests |
 | each chamber — its own git repo | cloned or linked at startup as `/workspace/chambers/<name>` | That chamber's data, plus its `.retinue/` plugin (subagents, skills) and its `INSTRUCTIONS.md` |
 
+## No owner specifics in the framework
+
+The framework is content-neutral: it never names the owner, their accounts,
+mailbox folders, contacts, chambers, hosts or the agents a chamber provides.
+Any of those is **chamber or deployment configuration**:
+
+- A data source, its fetch script and its quirks (where a passcode mail
+  lands, which folder a server rule files it in) belong to the chamber that
+  consumes the data — `.retinue/scripts/`, declared in its `.refresh.json` or
+  `.schedule.json`, documented in its `INSTRUCTIONS.md`.
+- A credential such a script needs is passed by the deployment's
+  `docker-compose.override.yml` and named in `RETINUE_SESSION_ENV_EXTRA`
+  (see "Session environment" below) — never added to the framework's compose
+  file, `.env.example` or the session allowlist.
+- A setting with a sensible general default (a folder, a sender) is a
+  parameter with that default, never the owner's value hard-coded.
+- Examples, comments, prompts and test fixtures use placeholders — "the
+  owner", "an agent persona", `owner@owner.example`, `<chamber>` — not real
+  names, addresses or chamber names. Invented demo data (`webapp/data/`) and
+  copyright notices are exempt.
+
+When a framework file has to know something about one chamber to work, the
+knowledge is in the wrong repository: move it there and leave a generic hook.
+
 ## Language convention — the rationale
 
 The rule itself is in `CLAUDE.md`: all non-user-facing natural language
@@ -223,15 +247,16 @@ gateway-spawned sessions run in API-key mode), `CLAUDE_*`, `RETINUE_*` (minus
 capability tokens with their service URLs (`EMAIL_BACKEND_*`,
 `CONVERSATION_BACKEND_*`, `NEWS_INGEST_*`, `CHATS_INGEST_*`, `UPDATER_*`), the
 messenger and calendar gateways' client side (`*_GATEWAY_TOKEN`,
-`*_GATEWAY_BASE_URL`, `*_GATEWAY_SEND_URL`, `*_DEFAULT_RECIPIENT`, …) and, for
-now, `GARMIN_EMAIL`/`GARMIN_PASSWORD` (`refresh.py --ensure` runs the fetch in
-the agent's own process). Everything else is dropped — `EMAIL_PASS*`,
+`*_GATEWAY_BASE_URL`, `*_GATEWAY_SEND_URL`, `*_DEFAULT_RECIPIENT`, …).
+Everything else is dropped — `EMAIL_PASS*`,
 `LITELLM_*`, `OPENROUTER_API_KEY`, `TRAEFIK_BASIC_AUTH_USERS`, `GITHUB_TOKEN`
 (`git` keeps working through the credential helper the entrypoint configures;
 `gh` is unauthenticated in a spawned session, while the remote-control main
-session still carries the token) and any secret nobody has named yet. Two
-credentials pass on purpose: the model credential in `ANTHROPIC_*`, without
-which a spawned session cannot run, and Garmin's. `RETINUE_SESSION_MODEL`
+session still carries the token) and any secret nobody has named yet. One
+credential passes on purpose: the model credential in `ANTHROPIC_*`, without
+which a spawned session cannot run. A chamber's own credentials (a data
+source's login for its `.refresh.json` fetch, say) pass only when the
+deployment names them, below. `RETINUE_SESSION_MODEL`
 and `RETINUE_ESCALATE_FILE` are set per spawn, never inherited, and
 `EMAIL_BACKEND_URL` is pointed at the gateway's backend whenever the spawner
 holds the token, so `email_client.py` proxies in every session.

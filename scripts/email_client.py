@@ -22,7 +22,7 @@ that way is readable by the agent, bypasses the isolation, and gives it direct
 SMTP/IMAP access — circumventing the send-control policy.
 
     EMAIL_USER        full address / login
-    EMAIL_FROM_NAME   optional display name (e.g. "Ari der Allerbeste")
+    EMAIL_FROM_NAME   optional display name (e.g. "Assistant of Your Name")
     EMAIL_PASS        app-password (never the normal account password)
     IMAP_HOST         e.g. imap.gmail.com / imap.zoho.eu
     IMAP_PORT         default 993 (implicit TLS)
@@ -709,9 +709,9 @@ def _imap_date(iso):
 def _search_sent_to(M, address, since_iso):
     """UIDs of messages sent to *address* (To, Cc or Bcc) on or after *since_iso*.
 
-    The second dedup signal, and the one that actually matters: Ari's runaway
-    replies to Mara carried no In-Reply-To at all, so a header-only test
-    declares her message unanswered and would answer it an 82nd time. A reply
+    The second dedup signal, and the one that actually matters: an agent's
+    runaway replies once carried no In-Reply-To at all, so a header-only test
+    declares the message unanswered and would answer it an 82nd time. A reply
     that does not thread is still a reply. All three recipient headers, since
     a reply-all that reaches the sender via Cc is no less an answer -- and
     `_reply_matches_anchor` checks the address exactly afterwards, so the
@@ -1369,7 +1369,7 @@ def _uid_by_message_id(M, folder, message_id):
 #            the web interface — the CLI holds no approve command.
 #   trust  — sent directly only when the model passes --user-approved; otherwise
 #            it falls back to the verify flow.
-#   allow  — sent directly, no confirmation (e.g. Ari's own mailbox).
+#   allow  — sent directly, no confirmation (e.g. an agent persona's own mailbox).
 #
 # Addresses not listed fall back to the "*" wildcard entry, or — absent that — to
 # DEFAULT_SEND_CATEGORY ("verify", the fail-safe choice).

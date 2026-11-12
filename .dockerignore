@@ -15,7 +15,6 @@ __pycache__/
 .devcontainer/
 
 # Session caches
-.garmin_session
 
 # The YASGUI a checkout fetches to serve itself directly. The image vendors
 # its own, pinned and checksummed (scripts/vendor-yasgui.sh); COPY webapp/

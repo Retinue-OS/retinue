@@ -63,6 +63,9 @@ a Progressive Web App on the phone home screen.
 - `/docs/<name>.md`     → `DOCS_DIR/<name>.md`, the framework docs that page renders
 - `/sync-health`        → `sync-health.html`, the target of "update your health
                           data" links (see "Inside the Android shell")
+- `/instance`           → GET/POST, the instance's name and accent colour the
+                          Settings page stores (`scripts/instance_branding.py`,
+                          docs/dashboard.md "Several instances")
 - `/inbox/…`            → the letterbox's WebDAV share (`scripts/webdav_share.py`),
                           not a page — see `docs/dashboard.md`
 - everything else       → `WEBAPP_DIR/<path>` (shell assets)
@@ -156,16 +159,20 @@ The wide layout itself is resizable, VS Code style (`layout.js`): the
 boundaries between conversations, news and the projects column are draggable
 splitters — double-click resets one, dragging news fully down closes it — and
 each card's header toggles between list and card view. Both preferences
-persist per device in localStorage. Every page opens with the
+persist per device (`components/device-store.js`: `localStorage` in a browser,
+the app inside the Android shell). Every page opens with the
 navigation row (`components/nav.js`: Home · Chats · Threads · Projects · News
 · Contacts, then the pending-sends outbox icon and the settings gear), pinned
 while a list page scrolls. On a drill-down (a chat, a project, an open
 thread) it starts with the back button: `<retinue-nav back>` dispatches
 `retinue-back` and the page listening on the row decides where back goes.
-Device-level settings (notifications, the voice timeouts, the running shell
-version with a manual update check, and — inside
-the Android shell only — a button into the shell's own settings) live on
-`settings.html`, reached via that gear. The address book (`contacts.html`,
+The settings live on `settings.html`, reached via that gear: *This browser*
+(notifications, the voice timeouts, the layout, the shelf size, the running
+shell version with a manual update check) and *This instance*
+(`components/instance-settings.js`: name and colour, agent models, system
+pages). Inside the Android shell from RetinueShell/4 the gear opens the app's
+own settings page instead, which embeds *This instance* from
+`settings-instance.html` (docs/dashboard.md, "The settings page"). The address book (`contacts.html`,
 `components/contacts.js`; docs/contacts.md) is the *Contacts* tab — people,
 their handles on every channel, their attention settings, the VIP flag and
 the instruction their messages are worked by — over the live `/contacts` API. The outbox icon opens the gateway's `/sends`
@@ -259,7 +266,21 @@ docstring). Pieces:
   and a standing instruction's report (its flags first) share a region capped
   at a fifth of the pane that scrolls inside and steps aside while the
   keyboard is up, and the field grows to at most 30% of the pane; the thread
-  gives way before the send row does. A draft longer than its box shows an
+  gives way before the send row does. A **grip** on the line between the
+  thread and the composer hands that split to the user: dragged up, the
+  composer takes the height it is given — the chips and the report stay in
+  view even with the keyboard up (snapping in once the drag is nearer the
+  composer with them than without), the field fills what is left, and the
+  thread keeps a strip of at least one message wherever the composer's own
+  contents leave room for it; dragged back down to the composer's own
+  height, or tapped twice (Enter from the keyboard, arrows to step), it is
+  the composer it was. The keyboard-up and keyboard-down frames each keep
+  their own position, per device beside the splitter's. A press on the grip
+  leaves the focus where it was, so the phone keyboard stays up through a
+  drag, and a press that dragged is never also a tap on whatever has moved
+  under the finger. The grip is a separator with a value (the composer's
+  share of the pane), stepped and reset from the keyboard as above. A draft
+  longer than its box shows an
   expand control in the field's top-right corner: the field then takes the
   whole pane at its full width (the thread and the chips step aside, the mic
   and send sit under its corners) until the control is pressed again, Escape
@@ -524,7 +545,10 @@ key (`thread:<id>` · `chat:<id>` · `project:<uri>`) with independent membershi
   through `sessionStorage`.
 
 The shelf is per device and browser: `localStorage`, shared by all tabs, which
-follow each other's changes through the `storage` event. It is event-driven
+follow each other's changes through the `storage` event. Its size is a
+per-device preference (`components/device-store.js`): inside the Android
+shell the app holds it, one size for every endpoint, and a change made on the
+app's settings page reaches an open page as a `device-settings` event. It is event-driven
 first — a page showing an item (`<retinue-conversation shelf-key=…>`, the chat
 page, the project page) feeds its facts as it reads and marks the key as the
 current page — and reads only the items no page in the tab is showing
@@ -748,7 +772,8 @@ Threads can be spoken as well as typed, with no streaming and split by direction
   is dropped). Where the page cannot hear the stream, plain timers stand in
   for the detector. A listen wanted while the page is hidden waits up to 60 s
   for it to return. The recording row keeps its ✕/✓/➤ throughout. Both
-  timeouts are per-device settings (Settings → Voice). Opening it: the
+  timeouts are per-device settings (Settings → Voice; in the Android shell,
+  the app's settings page, one pair for every endpoint). Opening it: the
   toggle; `#new?voice=1`, the composer in the mode, whose first take opens
   the thread that then goes on in it; and a wake (`/?wake=1`, or the shell's
   `wake` event), which reopens the thread used in the mode within the last
@@ -784,18 +809,39 @@ cannot do — the home-screen role, a wake phrase, native speech output, the
 client certificate. Everything that is Retinue stays here, so it behaves the
 same in the shell, in Chrome and on a desktop. The contract between them:
 
-- **User agent**: the shell appends ` RetinueShell/2 (Android)` (`/1` before
-  the Health Connect members below).
+- **User agent**: the shell appends ` RetinueShell/4 (Android)` (`/3` before
+  the app's own settings page and the per-device preferences, `/2` before the
+  endpoint members, `/1` before the Health Connect members below).
 - **`window.RetinueShell`**, installed at document start on the configured
   origin only: `platform`, `version`, `setVoiceActive(bool)` and
-  `openSettings()`. `setVoiceActive(true)` means "a voice conversation is
+  `openSettings(section?)`. `setVoiceActive(true)` means "a voice conversation is
   engaged: keep the screen on, pause the wake phrase". The page asserts it
   before asking for the mic (so the wake detector lets go of it first) and
   holds it for as long as a continuous conversation is engaged — Ara's
   thinking and reading time included — then sends `false` once the loop
-  stops (mode off, no speech, leaving, an error). Settings → Phone shell —
-  shown only when the object exists — calls `openSettings()`.
-  `components/shell.js` wraps both.
+  stops (mode off, no speech, leaving, an error). `components/shell.js` wraps
+  both.
+- **Settings** (RetinueShell/4): `settingsPage: true` — the app has a settings
+  page of its own, and the gear opens it (`openSettings()`); `settings.html`,
+  reached anyway, shows a card leading there instead of the browser part. With
+  RetinueShell/3, Settings → Phone shell — shown only when the object exists,
+  and first on the page there — calls `openSettings()`.
+- **Per-device preferences** (RetinueShell/4): `deviceSettings()` → a JSON
+  string `{key: value}`, `setDeviceSetting(key, value)` and `device-settings`
+  events with the `keys` that changed: the app holds the voice timeouts, the
+  shelf size and the layout for every endpoint. `components/device-store.js`
+  is the only caller (`deviceGet`, `deviceSet`, `onDeviceChange`); in a
+  browser it is plain `localStorage`.
+- **Endpoints** (RetinueShell/3): the shell keeps a list of Retinue servers
+  and shows one. `endpoints()` → `[{id, label, current}]` as a JSON string,
+  the label being the instance's own name (its manifest `short_name`, which
+  Settings › Instance sets); `selectEndpoint(id)` switches (the page is left
+  for the other dashboard); `openSettings('endpoints')` opens the shell's
+  endpoint list or, with one endpoint, its editor. With RetinueShell/3 the
+  Phone shell card shows the menu and *Edit endpoints*; from RetinueShell/4
+  the app's own settings page has them. The page never writes an address,
+  certificate or password — those stay in the shell. An `endpoints` event says the list
+  changed while the page is open.
 - **Shell → page**: `window.dispatchEvent(new CustomEvent('retinue-shell',
   {detail: {type}}))` with `type` `wake` (the wake phrase) or `home` (a Home
   press while the shell is in front). The home answers both in place: a wake
@@ -817,12 +863,18 @@ same in the shell, in Chrome and on a desktop. The contract between them:
   its URL.
 - **Health Connect** (RetinueShell/2): `healthConnectAvailable()`,
   `healthSync()`, `healthSyncStatus()`, `setHealthSyncInterval(minutes)`,
-  `setHealthAutoSync(bool)` and `health-sync` events. Settings → Phone shell
-  shows "Update health data now", the last result, the auto-sync toggle and
-  interval when the shell reports Health Connect available; `sync-health.html`
+  `setHealthAutoSync(bool)` and `health-sync` events. With RetinueShell/3,
+  Settings → Phone shell shows "Update health data now", the last result, the
+  auto-sync toggle and interval when the shell reports Health Connect
+  available (from RetinueShell/4 the app's settings page does, beside the
+  endpoint's switch); `sync-health.html`
   (`/sync-health`, `#sync` starts a sync) is the link target for threads. The
   shell uploads by WebDAV `PUT` to `/inbox/` — the page never handles the
-  data. `components/shell.js` wraps all of it, feature-detected.
+  data. From RetinueShell/3 the status carries `enabled`, the current
+  endpoint's own health switch: off, both pages show one line and the way to
+  the shell's endpoint editor instead of the controls, and a sync asked for is
+  `skipped` with reason `disabled`. `components/shell.js` wraps all of it,
+  feature-detected.
 - **Speech output**: Android's WebView has no Web Speech API, so the shell
   installs a `speechSynthesis` / `SpeechSynthesisUtterance` stand-in backed by
   the native TTS where the page has none. `components/speech.js` is unchanged;

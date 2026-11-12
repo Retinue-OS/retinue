@@ -45,7 +45,7 @@ persistent, multi-channel personal agent system:
   as the interactive session; every dashboard message and scheduled job spawns
   a fresh `claude -p` subprocess. Ara (the coordinator persona) routes work to
   in-context personas (Secretary, Academic, Publisher) and isolated subagents
-  (Archivist, plus chamber-provided ones like Medic, Coach, Ari).
+  (Archivist, plus the subagents mounted chambers provide).
 - **Chambers** — mounted git repositories carrying both *data* and *agents*
   (as Claude Code plugins under `.retinue/`). The framework is content-neutral;
   a deployment declares its chambers in `chambers.json`.

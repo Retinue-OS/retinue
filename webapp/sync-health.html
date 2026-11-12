@@ -49,7 +49,7 @@
   <script type="module">
     import {
       inShell, healthConnectAvailable, healthSync, healthSyncStatus, onHealthSync,
-      describeHealthSync, describeHealthSyncEvent,
+      describeHealthSync, describeHealthSyncEvent, healthUploadEnabled,
     } from '/components/shell.js';
 
     // The Ara app's applicationId (ara-android, app/build.gradle.kts): the
@@ -89,6 +89,12 @@
       } else if (!healthConnectAvailable()) {
         explain.textContent = 'Health Connect is not available on this phone, so the Ara '
           + 'app has no health data to send.';
+      } else if (!healthUploadEnabled(healthSyncStatus())) {
+        // The endpoint's own switch (RetinueShell/3): nothing is read or sent
+        // for this server until it is turned on in the app's endpoint editor.
+        explain.textContent = 'Health data is not uploaded to this Retinue: the switch for this '
+          + 'endpoint is off in the Ara app. Turn it on there (Settings \u203a Phone shell \u203a '
+          + 'Edit endpoints) and come back.';
       } else {
         let timer = null;
         let settled = false;
