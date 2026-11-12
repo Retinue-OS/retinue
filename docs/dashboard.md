@@ -1047,20 +1047,23 @@ phone types it there.
   attaches an action to the reply being written — a text (`--enter` to press
   Enter after it), `--key <name>`, or `--secret "<label>"` — by appending one
   ASCII JSON line to the turn's manifest, `RETINUE_REPLY_SHELL_ACTIONS_FILE`.
-  A text goes on stdin, in a quoted heredoc, so the shell passes it as
-  written (a text from stdin loses the one trailing line break a heredoc or
-  `echo` adds):
+  A text goes in a file Ara writes with her Write tool, exactly as it is to
+  be typed, so no shell ever parses it (the one trailing line break a file
+  usually ends with is dropped; `-` reads stdin the same way, for another
+  program's output):
 
   ```sh
-  scripts/shell-type.py [--sensitive] [--enter] - <<'EOF'
-  the text
-  EOF
+  scripts/shell-type.py [--sensitive] [--enter] --file /tmp/type-<thread id>.txt
   ```
 
-  Inside `"…"` bash expands `$`, backticks and `\` before the CLI sees the
-  text — `Pa$$w0rd!` would be typed with the shell's PID in it, `$(…)` would
-  run in the container — so a text in `"…"` is only for one with no `$`,
-  backtick, `\` or `"`; anything else takes single quotes or the heredoc.
+  On the command line every quoting can be ended by the text itself: inside
+  `"…"` bash expands `$`, backticks and `\` (`Pa$$w0rd!` typed with the
+  shell's PID in it, `$(…)` run in the container), an apostrophe ends `'…'`,
+  and a line `EOF` ends a `<<'EOF'` heredoc early, after which the text's
+  remaining lines run as commands with the agent's tokens — a passage from an
+  e-mail or a page can be written to do just that. So the docs offer only
+  `--file`. With `--sensitive` the CLI deletes the file once read, so the
+  code does not stay in the container.
   It is the sibling of `conversation-push.py --reply-attach`
   (RETINUE_REPLY_ATTACHMENTS_FILE) and follows the same rules: a fresh
   manifest per spawn, only the kept run's is read, so an escalated junior's
@@ -1109,8 +1112,9 @@ phone types it there.
   phone's confirmation (Keyboard, above) end the same way, so it never
   reads as the user's refusal.
 - **Passwords, PINs and codes** can be typed two ways:
-  - `shell-type.py --sensitive - <<'EOF'` (the text, then `EOF`) — one the
-    user dictated, or one Ara fetched (an SMS code). The text reaches the
+  - `shell-type.py --sensitive --file <path>` (a file holding the code, which
+    the CLI deletes once read) — one the user dictated, or one Ara fetched
+    (an SMS code). The text reaches the
     phone, but the dashboard shows it only as `••••••` (no reveal) and types
     it only on the user's tap, a replayed transcript never carries it
     (`shell_actions.describe`), and it is **deleted from the stored reply** as soon as the page reports

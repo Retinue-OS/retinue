@@ -6,24 +6,22 @@ headset, a TV, a computer — that cannot run Retinue itself. Inside a
 dashboard thread's turn, this attaches a *shell action* to the reply you are
 writing; when the reply reaches the user's phone, the app types it there.
 
-    shell-type.py - <<'EOF'                 # type the text, no Enter
-    text to type
-    EOF
-    shell-type.py --enter - <<'EOF'         # type it, then press Enter
-    search terms
-    EOF
-    shell-type.py --sensitive - <<'EOF'     # a password, PIN or code: see below
-    <PIN>
-    EOF
+    shell-type.py --file PATH               # type the text PATH holds, no Enter
+    shell-type.py --enter --file PATH       # type it, then press Enter
+    shell-type.py --sensitive --file PATH   # a password, PIN or code: see below
     shell-type.py --key enter               # press one key
     shell-type.py --secret "Meta account"   # a password from the user's manager
 
-A text goes on stdin (`-`) in a quoted heredoc (<<'EOF'), which passes it as
-written; the one trailing line break the heredoc adds is dropped. Inside
-"..." the shell expands $, backticks and backslashes before this script sees
-the text — a password typed wrong, a command run in the container — so a text
-in "..." is only for one with none of $, a backtick, a backslash or a double
-quote; anything else takes single quotes or the heredoc.
+A text goes in a file: write it with the Write tool, exactly as it is to be
+typed, to a file of its own (e.g. /tmp/type-<thread id>.txt), then pass it
+with `--file`; the one trailing line break a file usually ends with is
+dropped. The shell never sees the text that way. Never put a text on the
+command line, in quotes or in a heredoc: the text itself can end any of them
+— a `$` or backtick inside "...", an apostrophe inside '...', a line `EOF`
+inside <<'EOF' — and what follows is then typed wrong or runs as commands in
+the container, with the agent's tokens. With `--sensitive` the file is
+deleted once read. (`-` reads the text from stdin, for another program's
+output.)
 
 Rules (CLAUDE.md, "Dashboard"):
 - Only on the user's explicit request ("type the text above", "type: …").
@@ -79,7 +77,12 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Type on the user's paired device through the Ara Android app.")
     parser.add_argument("text", nargs="?", default=None,
-                        help="the text to type (- reads it from stdin)")
+                        help="the text to type (- reads it from stdin); a text from "
+                             "anywhere else goes in a file, with --file")
+    parser.add_argument("--file", metavar="PATH",
+                        help="type the text this file holds, as written (one trailing "
+                             "line break dropped); with --sensitive the file is "
+                             "deleted once read")
     parser.add_argument("--enter", action="store_true",
                         help="press Enter after the text or secret (only when asked)")
     parser.add_argument("--key", choices=shell_actions.KEYS,
@@ -93,16 +96,17 @@ def main(argv: list[str] | None = None) -> int:
                              "password never passes through here")
     args = parser.parse_args(argv)
 
-    given = [m for m in (args.text is not None, args.key is not None,
-                         args.secret is not None) if m]
+    given = [m for m in (args.text is not None, args.file is not None,
+                         args.key is not None, args.secret is not None) if m]
     if len(given) != 1:
-        print("shell-type: give exactly one of TEXT, --key or --secret", file=sys.stderr)
+        print("shell-type: give exactly one of --file, TEXT, --key or --secret",
+              file=sys.stderr)
         return 2
-    if args.sensitive and args.text is None:
-        print("shell-type: --sensitive goes with TEXT", file=sys.stderr)
+    if args.sensitive and args.text is None and args.file is None:
+        print("shell-type: --sensitive goes with --file or TEXT", file=sys.stderr)
         return 2
     if args.key and args.enter:
-        print("shell-type: --enter goes with TEXT or --secret; for a lone Enter "
+        print("shell-type: --enter goes with --file, TEXT or --secret; for a lone Enter "
               "use --key enter", file=sys.stderr)
         return 2
 
@@ -113,12 +117,37 @@ def main(argv: list[str] | None = None) -> int:
               file=sys.stderr)
         return 2
 
-    if args.text is not None:
-        text = args.text
-        if text == "-":
-            text = sys.stdin.read()
-            # `echo` ends what it pipes with a line break; typed, it would be
-            # an Enter nobody asked for (--enter is how to ask).
+    if args.text is not None or args.file is not None:
+        if args.file is not None:
+            # The text comes from a file Ara wrote with her Write tool, so no
+            # shell parses it: no quote, `$` or heredoc end marker inside it
+            # can cut it short and run the rest as commands. Line ends are
+            # read untranslated, as written (normalize decides on them). A
+            # little more than MAX_TEXT is read, so an oversized file is
+            # refused below without being read whole.
+            try:
+                with open(args.file, encoding="utf-8", newline="") as fh:
+                    text = fh.read(shell_actions.MAX_TEXT + 3)
+            except (OSError, UnicodeDecodeError) as exc:
+                reason = exc.strerror if isinstance(exc, OSError) else "not UTF-8 text"
+                print(f"shell-type: cannot read {args.file}: {reason}", file=sys.stderr)
+                return 2
+            if args.sensitive:
+                # A password must not stay in the container once it rides on
+                # the reply; the file was written for this call alone.
+                try:
+                    os.unlink(args.file)
+                except OSError as exc:
+                    print(f"shell-type: could not delete {args.file} "
+                          f"({exc.strerror}); delete it yourself", file=sys.stderr)
+        else:
+            text = args.text
+            if text == "-":
+                text = sys.stdin.read()
+        if args.file is not None or args.text == "-":
+            # `echo` ends what it pipes with a line break, and a file usually
+            # ends with one; typed, it would be an Enter nobody asked for
+            # (--enter is how to ask).
             for end in ("\r\n", "\n"):
                 if text.endswith(end):
                     text = text[: -len(end)]

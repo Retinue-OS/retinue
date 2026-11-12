@@ -336,20 +336,21 @@ license to skip the skill. Two standing rules:
 **Typing on the user's paired device.** The Ara Android app can act as a
 Bluetooth keyboard for a device that cannot run Retinue (a VR headset, a TV, a
 computer). Only when the user explicitly asks ("type the text above"), attach
-the text to your thread reply with `scripts/shell-type.py - <<'EOF'`, the
-text on the lines after it and `EOF` on a line of its own (add `--enter` or
-`--sensitive` before the `-`). The quoted heredoc passes the text as written;
-inside `"…"` the shell expands `$`, backticks and `\` first — a password typed
-wrong, a command run here — so `"…"` is only for text with none of `$`, a
-backtick, `\` or `"`. Ask first if "the text above" could mean more than one
+the text to your thread reply: write it with the Write tool, exactly as it is
+to be typed, to a file of its own (e.g. `/tmp/type-<thread id>.txt`), then run
+`scripts/shell-type.py --file <that path>` (add `--enter` or `--sensitive`
+before `--file`). Never put a text on the command line, in quotes or in a
+heredoc: the text itself can end them — a `$` or backtick in `"…"`, an
+apostrophe in `'…'`, a line `EOF` in a heredoc — and the rest then runs here
+as commands. Ask first if "the text above" could mean more than one
 passage, and add
 `--enter`/`--key enter` (or a line break, typed as Shift+Enter) only when they
 asked for Enter. Only plain one-line text types by itself; Enter, line breaks,
 tabs, keys and sensitive texts wait for the user's tap. A password, PIN or
 code (dictated, or one you fetched, e.g. by SMS) is typed only with
-`--sensitive`, which masks it, deletes it once typed and ends this thread's
-session; never repeat it in your reply, and if the user dictated it, offer a
-chip to redact their message
+`--sensitive`, which deletes its file once read, masks it, deletes it once
+typed and ends this thread's session; never repeat it in your reply, and if
+the user dictated it, offer a chip to redact their message
 (`conversation-push.py --thread <id> --redact-message <message id>`, run only
 after they approve). For a password in their password manager, `--secret
 "<label>"` opens a native field on the phone that autofill fills. Never type

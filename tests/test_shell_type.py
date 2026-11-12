@@ -10,8 +10,10 @@ Covers: each kind writes its canonical action; calls accumulate; Enter is off
 unless asked; the call fails outside a thread turn; bad input (two modes,
 --enter with --key, oversized or control-character text, unknown key) writes
 nothing; and the gateway-side parser keeps valid lines, drops bad ones and
-duplicate ids, and caps the count; the documented heredoc form passes a text
-as written, and no example puts one in double quotes.
+duplicate ids, and caps the count; the documented --file form passes a text
+as written (a line `EOF` and quotes included), and no example puts one in
+quotes or a heredoc; --file refuses what it cannot read or combine and
+deletes a sensitive text's file once read.
 
     python3 tests/test_shell_type.py
 """
@@ -270,30 +272,96 @@ def test_parse_manifest():
           "and never carries text on a secret")
 
 
-def test_heredoc_is_the_documented_form(tmp: Path):
-    """The documented form passes the text to the CLI as written: through a
-    quoted heredoc, bash expands nothing. In "..." it would expand `$$` (a
-    password typed with the shell's PID in it) and run `$(...)` and
-    backticks in the container, so the docs never show a text in "..."."""
-    m = tmp / "m-heredoc"
-    text = "Pa$$w0rd! $HOME $(echo run) `echo run` \\n \"q\""
-    script = (f"{sys.executable!s} {str(SCRIPT)!s} --sensitive - <<'EOF'\n"
-              f"{text}\nEOF\n")
-    env = dict(os.environ, **{sa.MANIFEST_VAR: str(m)})
-    r = subprocess.run(["bash", "-c", script], env=env, capture_output=True,
-                       text=True, timeout=30)
+def test_file_is_the_documented_form(tmp: Path):
+    """The documented form passes the text to the CLI as written: Ara writes
+    it to a file with her Write tool and passes `--file`, so the shell never
+    parses it. On the command line any quoting can be ended by the text
+    itself: in "..." bash expands `$$` (a password typed with the shell's PID
+    in it) and runs `$(...)` and backticks, an apostrophe ends '...', and a
+    line `EOF` ends a heredoc early, after which the text's next lines run as
+    commands in the container. So the docs show neither."""
+    marker = tmp / "ran"
+    text = ("Pa$$w0rd! $HOME $(echo run) `echo run` \\n \"q\" it's\n"
+            f"EOF\ntouch {marker}\n'\nEOF")
+    env = dict(os.environ, **{sa.MANIFEST_VAR: str(tmp / "m-heredoc")})
+    # Why the heredoc is no longer the form: a line `EOF` in the text ends
+    # it, and the line after it runs.
+    script = f"{sys.executable!s} {str(SCRIPT)!s} - <<'EOF'\n{text}\nEOF\n"
+    subprocess.run(["bash", "-c", script], env=env, capture_output=True,
+                   text=True, timeout=30)
+    assert marker.exists(), "the heredoc hazard this test guards against is gone?"
+    marker.unlink()
+    # The file form: what the file holds is the text, whatever it holds.
+    m = tmp / "m-file"
+    src = tmp / "text-to-type.txt"
+    src.write_text(text + "\n", encoding="utf-8")
+    env[sa.MANIFEST_VAR] = str(m)
+    r = subprocess.run(["bash", "-c", f"{sys.executable!s} {str(SCRIPT)!s} --enter "
+                                      f"--file {str(src)!s}"],
+                       env=env, capture_output=True, text=True, timeout=30)
     assert r.returncode == 0, r.stderr
+    assert not marker.exists(), "nothing in a text read from a file runs"
     got = _lines(m)
-    assert got[0]["text"] == text and got[0]["sensitive"] is True, got
-    # Every documented example of a text uses stdin; a text in "..." after
-    # the script's name or a text flag is the form that expands.
-    bad = re.compile(r'shell-type\.py(?:\s+--(?:sensitive|enter))*\s+"')
+    assert got[0]["text"] == text and got[0]["enter"] is True, got
+    assert src.exists(), "a plain text's file is the caller's: left in place"
+    # Every documented example of a text uses --file: none puts one in quotes
+    # after the script's name or a text flag, nor in a heredoc.
+    bad = re.compile(r'shell-type\.py(?:\s+--(?:sensitive|enter))*\s+["\']'
+                     r'|shell-type\.py[^\n`]*<<')
     for doc in (REPO_ROOT / "CLAUDE.md", REPO_ROOT / "docs" / "dashboard.md", SCRIPT):
-        hits = [line for line in doc.read_text(encoding="utf-8").splitlines()
-                if bad.search(line)]
+        body = doc.read_text(encoding="utf-8")
+        hits = [line for line in body.splitlines() if bad.search(line)]
         assert not hits, (doc.name, hits)
-    print("ok: the documented heredoc passes a text as written; no example puts "
-          "one in double quotes")
+        assert re.search(r"shell-type\.py(?: \[?--(?:sensitive|enter)\]?)* --file", body), \
+            doc.name
+    print("ok: the documented --file form passes a text as written, a line EOF "
+          "and quotes included; no example puts one in quotes or a heredoc")
+
+
+def test_file_option(tmp: Path):
+    """--file reads the text from a file: one trailing line break is dropped
+    (an editor ends a file with one; --enter is how to ask for Enter), it
+    goes with --sensitive and --enter but not with TEXT, --key or --secret,
+    an unreadable file writes nothing, and with --sensitive the file is
+    deleted once read, so a password does not stay in the container."""
+    m = tmp / "m-file2"
+    f = tmp / "plain.txt"
+    f.write_text("hello Quest\n", encoding="utf-8")
+    assert _run(["--file", str(f)], m).returncode == 0
+    f.write_text("two\r\n\n", encoding="utf-8", newline="")
+    assert _run(["--file", str(f)], m).returncode == 0
+    got = _lines(m)
+    assert got[0]["text"] == "hello Quest" and got[0]["enter"] is False, got
+    assert got[1]["text"] == "two\n", got
+    assert sa.runs_by_itself(got[0]), "a one-line text from a file is a plain text"
+    assert f.exists()
+    refused = tmp / "m-file-refused"
+    f.write_text("x", encoding="utf-8")
+    for args in (["--file", str(f), "x"], ["--file", str(f), "-"],
+                 ["--file", str(f), "--key", "enter"],
+                 ["--file", str(f), "--secret", "Wi-Fi"],
+                 ["--file", str(tmp / "missing.txt")],
+                 ["--file", str(tmp)]):
+        r = _run(args, refused)
+        assert r.returncode == 2, (args, r.returncode, r.stderr)
+    (tmp / "latin1.txt").write_bytes(b"caf\xe9")
+    assert _run(["--file", str(tmp / "latin1.txt")], refused).returncode == 2
+    (tmp / "empty.txt").write_text("\n", encoding="utf-8")
+    assert _run(["--file", str(tmp / "empty.txt")], refused).returncode == 2
+    (tmp / "long.txt").write_text("x" * (sa.MAX_TEXT + 1), encoding="utf-8")
+    assert _run(["--file", str(tmp / "long.txt")], refused).returncode == 2
+    assert not refused.exists(), "a refused call must not write"
+    assert f.exists(), "a refused call leaves the file"
+    secret = tmp / "pin.txt"
+    secret.write_text("4711\n", encoding="utf-8")
+    r = _run(["--sensitive", "--file", str(secret)], m)
+    assert r.returncode == 0, r.stderr
+    assert "4711" not in r.stdout + r.stderr
+    assert not secret.exists(), "a sensitive text's file is deleted once read"
+    last = _lines(m)[-1]
+    assert last["text"] == "4711" and last["sensitive"] is True, last
+    print("ok: --file reads a text as written, refuses what it cannot read or "
+          "combine, and deletes a sensitive text's file once read")
 
 
 def main():
@@ -307,7 +375,8 @@ def main():
         test_purge_and_describe()
         test_outcome_and_auto_run()
         test_separators_and_labels(tmp)
-        test_heredoc_is_the_documented_form(tmp)
+        test_file_is_the_documented_form(tmp)
+        test_file_option(tmp)
     print("all shell-type tests passed")
 
 
