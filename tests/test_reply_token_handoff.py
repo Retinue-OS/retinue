@@ -188,7 +188,11 @@ def test_no_context_prompts_stay_identical():
         wg._conv_add_message(conv["id"], "assistant", "hello")
         wg._conv_add_message(conv["id"], "user", "what about tomorrow?")
         conv = wg._load_conv(conv["id"])
-        assert wg._conv_engage_prompt(conv, fresh=True) == "what about tomorrow?"
+        # Only the message itself — and its id, by which Ara can redact it
+        # on the user's request (conversation-push.py --redact-message).
+        mid = conv["messages"][-1]["id"]
+        assert wg._conv_engage_prompt(conv, fresh=True) == \
+            f"what about tomorrow? [message id: {mid}]"
         assert "Agent context" not in wg._conv_engage_prompt(conv, fresh=False)
     print("ok: threads without context keep byte-identical prompts")
 

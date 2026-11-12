@@ -63,22 +63,30 @@ class _FakeConnection:
 
 class _FakeSendHandler:
     """Just enough of the request handler for _handle_send_action: it only
-    ever calls self._send_html() (on error) or self._redirect() (on
-    success), so those are stand-ins rather than the real socket-backed ones.
+    ever calls self._send_html() (on error), self._send_json() (refusing
+    another site's request) or self._redirect() (on success), so those are
+    stand-ins rather than the real socket-backed ones.
 
-    The addresses are real, though: approving a pending send is the user's own
-    decision, so the handler runs the origin check first, and these tests drive
-    the genuine one rather than stubbing it out. Default is a proxy-shaped
-    peer; pass loopback for the in-container caller."""
+    The addresses and headers are real, though: approving a pending send is
+    the user's own decision, so the handler runs the cross-site and origin
+    checks first, and these tests drive the genuine ones rather than stubbing
+    them out. Default is a proxy-shaped peer from the dashboard's own page;
+    pass loopback for the in-container caller, a Sec-Fetch-Site for another
+    site's page."""
 
-    def __init__(self, peer="172.19.0.4", local="172.19.0.9"):
+    def __init__(self, peer="172.19.0.4", local="172.19.0.9", headers=None):
         self.html = None
+        self.json = None
         self.redirected_to = None
         self.client_address = (peer, 51234)
         self.connection = _FakeConnection(local)
+        self.headers = headers or {}
 
     def _send_html(self, status, body):
         self.html = (status, body)
+
+    def _send_json(self, status, payload):
+        self.json = (status, payload)
 
     def _redirect(self, location):
         self.redirected_to = location
@@ -88,6 +96,7 @@ def _bind_real_gate(wg):
     """Run the handler's own origin check against the fake, unbound — the
     point is to exercise the gate, not to stub it away."""
     _FakeSendHandler._request_from_edge = wg.Handler._request_from_edge
+    _FakeSendHandler._claude_auth_same_origin = wg.Handler._claude_auth_same_origin
 
 
 def test_in_container_caller_cannot_approve(wg):
@@ -102,6 +111,21 @@ def test_in_container_caller_cannot_approve(wg):
     assert fake.redirected_to is None
     assert fake.html and fake.html[0] == 403, fake.html
     assert "REFUSED" in buf.getvalue(), buf.getvalue()
+
+
+def test_another_site_cannot_approve(wg):
+    """Another site's page reaches this handler through the proxy with the
+    user's credentials, so its peer passes the origin check; the browser's
+    Sec-Fetch-Site still tells it apart, and nothing is released or dropped."""
+    for verb in ("approve", "reject"):
+        fake = _FakeSendHandler(headers={"Sec-Fetch-Site": "cross-site"})
+        with patch.object(wg.ec, "approve_pending_send") as approve, \
+                patch.object(wg.ec, "delete_pending_draft") as reject:
+            wg.Handler._handle_send_action(fake, "default", "42", verb)
+        approve.assert_not_called()
+        reject.assert_not_called()
+        assert fake.redirected_to is None and fake.html is None
+        assert fake.json == (403, {"error": "cross-site request rejected"}), fake.json
 
 
 def test_approve_logs_stripped_headers(wg):
@@ -171,6 +195,7 @@ def main():
         wg = _load_gateway(Path(td))
         _bind_real_gate(wg)
         test_in_container_caller_cannot_approve(wg)
+        test_another_site_cannot_approve(wg)
         test_approve_logs_stripped_headers(wg)
         test_approve_silent_when_nothing_stripped(wg)
         test_approved_email_lands_on_its_outcome_page(wg)
