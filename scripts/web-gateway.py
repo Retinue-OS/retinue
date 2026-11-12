@@ -2468,8 +2468,10 @@ def _store_message_files(raw_files) -> list[dict]:
     MESSAGE_FILES_DIR with a server-generated name, so an untrusted filename
     never becomes a path component; only a plain short extension (derived from
     the filename, else the content type) survives, since a file extension is
-    what lets the reading session type the file. Malformed or oversized items
-    are skipped. Returns ``[{"path", "content_type", "size"}, ...]``."""
+    what lets the reading session type the file. The content type is kept as
+    one media type (_stated_media_type), application/octet-stream when the
+    stated text is none. Malformed or oversized items are skipped. Returns
+    ``[{"path", "content_type", "size"}, ...]``."""
     stored: list[dict] = []
     if not isinstance(raw_files, list):
         return stored
@@ -2482,7 +2484,10 @@ def _store_message_files(raw_files) -> list[dict]:
             continue
         if not blob or len(blob) > MAX_ATTACHMENT_BYTES:
             continue
-        content_type = str(item.get("content_type") or "application/octet-stream")
+        # The type is what the sender's client declared, passed on by the
+        # messenger gateway as it came, and the note below puts it into the
+        # answering session's prompt: it is kept only as one media type.
+        content_type = _stated_media_type(item.get("content_type"))
         suffix = Path(os.path.basename(str(item.get("filename") or ""))).suffix
         if not re.fullmatch(r"\.[A-Za-z0-9]{1,8}", suffix):
             suffix = mimetypes.guess_extension(content_type) or ""
@@ -2498,7 +2503,10 @@ def _message_files_note(stored: list[dict]) -> str:
     """A note listing the files a /message request carried, with their on-disk
     paths — the counterpart of _conv_attachment_note for gateway-forwarded
     files. The untrusted original filename is deliberately absent: the reading
-    session needs only the server-named path, type and size."""
+    session needs only the server-named path, type and size. The note is part
+    of the session's prompt, so nothing from outside may reach it as text of
+    its own: the path is the server's, the type was read as one media type
+    when the file was stored (_store_message_files), the size is a number."""
     if not stored:
         return ""
     lines = [
@@ -2630,6 +2638,17 @@ def _media_type_header(essence: str, params: dict) -> str:
             value = '"' + re.sub(r'([\\"])', r"\\\1", value) + '"'
         out += f"; {name}={value}"
     return out
+
+
+def _stated_media_type(stated) -> str:
+    """A stated content type as one media type, or application/octet-stream.
+
+    For a type that came from outside and is kept, shown or handed on as
+    text: read strictly (_parse_media_type) and written back from what was
+    read (_media_type_header), so the result is one line of a type's own
+    characters, whatever was declared."""
+    parsed = _parse_media_type(stated)
+    return _media_type_header(*parsed) if parsed else "application/octet-stream"
 
 
 def _chat_media_headers(stated) -> dict:

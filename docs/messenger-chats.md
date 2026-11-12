@@ -456,7 +456,13 @@ and what a model turn is *for*:
      them, so `delivered` is never set for a VIP's message no turn saw.
    - **What the message carried travels with it.** Attachments ride the rail in
      the `POST /message` shape and are materialized in the retinue container,
-     so a turn opens the photo rather than answering one it never saw.
+     so a turn opens the photo rather than answering one it never saw. The
+     note that tells the turn about them names each file by the path the
+     gateway gave it, its type and its size, never by the sender's file name.
+     The type is the one the sender's client declared, so it is kept only as
+     one media type, written back from what was read, and as
+     `application/octet-stream` otherwise: text from outside never reads as
+     the framework's own words in a prompt.
    - **One message, one notification.** The arrival's own Web Push already
      fired, deterministically and at once; the turn's note lands in the
      companion thread without pushing again.
