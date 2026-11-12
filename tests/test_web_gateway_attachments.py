@@ -300,14 +300,25 @@ def test_stored_name_and_type_are_one_line(wg):
          "data": _b64(b"z")},
         {"filename": "Rechnung März.pdf", "content_type": "application/pdf; charset=binary",
          "data": _b64(b"%PDF z")},
+        {"filename": "..\\evil\\Bericht.pdf", "content_type": "application/pdf",
+         "data": _b64(b"%PDF w")},
+        {"filename": "C:\\Users\\x\\..", "content_type": "application/pdf",
+         "data": _b64(b"%PDF v")},
     ])
     # The name is a base name first: what follows its last "/" (here the one
-    # in "Path=/").
+    # in "Path=/") or backslash, which a client saving the file may take for
+    # a separator too; a name that is only dots is no name.
     assert [a["filename"] for a in stored] == [
-        "X-x: y", "abc.pdf", "attachment", "Rechnung März.pdf"], stored
+        "X-x: y", "abc.pdf", "attachment", "Rechnung März.pdf", "Bericht.pdf",
+        "attachment"], stored
     assert [a["content_type"] for a in stored] == [
         "application/octet-stream", "application/pdf", "application/octet-stream",
-        "application/pdf; charset=binary"], stored
+        "application/pdf; charset=binary", "application/pdf", "application/pdf"], stored
+    # And where a name stored before this is used: the header carries the base name.
+    assert wg._content_disposition("..\\evil\\Bericht.pdf").startswith(
+        'attachment; filename="Bericht.pdf"; filename*=')
+    assert wg._content_disposition("a/b/c.txt").startswith('attachment; filename="c.txt";')
+    assert wg._content_disposition("..").startswith('attachment; filename="attachment";')
     wg._save_conv({"id": cid, "messages": [{"attachments": stored}]})
     for att in stored:
         _assert_clean_headers(_serve(wg, cid, att["id"]))
@@ -342,7 +353,7 @@ def test_stored_metadata_from_before_is_served_clean(wg):
     _assert_clean_headers(fake)
     assert fake.headers["Content-Type"] == "application/octet-stream"
     assert fake.headers["Content-Disposition"].startswith(
-        "attachment; filename=\"report.pdfSet-Cookie: sid=evil; Path=/X-x: y\"; filename*="), \
+        "attachment; filename=\"X-x: y\"; filename*="), \
         fake.headers["Content-Disposition"]
     # A type that is not exactly one media type is a download, even when it
     # starts like an inline-safe one.

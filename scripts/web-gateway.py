@@ -2453,7 +2453,7 @@ def _store_attachment_blob(cid: str, blob: bytes, filename, content_type) -> dic
     conv_dir = CONVERSATION_ATTACHMENTS_DIR / cid
     conv_dir.mkdir(parents=True, exist_ok=True)
     (conv_dir / f"{att_id}{suffix}").write_bytes(blob)
-    filename = _attachment_name(os.path.basename(str(filename or "")))
+    filename = _attachment_name(filename)
     meta = {
         "id": att_id,
         "filename": filename,
@@ -2681,11 +2681,16 @@ def _attachment_name(filename) -> str:
     The name is whatever the file was called where it came from — for a mail
     attachment, what its sender declared — and it is written into the
     download's Content-Disposition and listed in the note of Ara's turn, each
-    one line. Control characters are dropped; "attachment" when nothing is
-    left. Applied where a name is stored and again where it is used, so a name
-    stored before this keeps to it too."""
-    name = _NAME_CONTROL_RE.sub("", str(filename or "")).strip()
-    return name or "attachment"
+    one line. It is a base name: what stands before the last slash is a path
+    of the place it came from, and a backslash counts as a slash, since the
+    client that saves the download may take it for one (as
+    inbound_store.safe_file_name does for a messenger file). Control
+    characters are dropped; "attachment" when nothing usable is left. Applied
+    where a name is stored and again where it is used, so a name stored
+    before this keeps to it too."""
+    name = str(filename or "").replace("\\", "/").rsplit("/", 1)[-1]
+    name = _NAME_CONTROL_RE.sub("", name).strip()
+    return "attachment" if name in ("", ".", "..") else name
 
 
 def _content_disposition(filename: str, inline: bool = False) -> str:
