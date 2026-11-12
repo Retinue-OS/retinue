@@ -677,6 +677,37 @@ her engage prompt — so she can actually open a file the user sends (a PDF, a
 CSV) rather than only knowing one exists. A message may be text, files, or both.
 The chat page's composer takes pasted images the same way (see `webapp/README.md`).
 
+**Media in a messenger chat** is another store under the same rule. A file a
+contact sends stays with the gateway that received it, together with the
+content type the sender's client declared, and the chat page loads it through
+the gateway's authenticated proxy, `GET /chats/media/<slug>/<media-id>`
+(docs/messenger-chats.md). That type comes from outside, as the bytes do, so
+the proxy reads it strictly and writes its own headers from it
+(`_chat_media_headers`):
+
+- **In place**: the images of `_INLINE_SAFE_TYPES`, which a bubble shows
+  through `<img>`; `audio/*` and `video/*`, which the chat's players load
+  (an XML type, `…+xml`, excepted); and a PDF or plain text, which a file row
+  opens in the browser's own viewer.
+- **As a download** (`Content-Disposition: attachment` and the letterbox
+  share's sandboxing `Content-Security-Policy`): everything else, so a file
+  from outside never becomes a page or a script of the dashboard. An image of
+  another type (SVG, TIFF, HEIC) still shows in the bubble, since `<img>` runs
+  nothing in it, and is saved when opened by itself; an HTML or XML file, a
+  script, an office document or an archive is a file row that saves it. Such
+  a file keeps its stated type, because the browser and the Android shell
+  take the saved file's extension, and the app that opens it, from the type.
+
+A stated type that does not read as exactly one media type counts as
+`application/octet-stream`. The type sent is written from what was read (lower
+case, with its `charset` or `codecs` parameter and no other), never relayed as
+it came, and every answer, a relayed error included, carries
+`X-Content-Type-Options: nosniff`. The proxy does not know the name the sender
+gave the file, so a download is named after its URL and type
+(`<media-id>.docx`). The gateways' store keeps the stated type as one line of
+printable ASCII (`inbound_store.clean_content_type`), so it is exactly one
+header of their own `GET /media/<id>`, whatever was declared.
+
 ## Push notifications
 
 The unread badge only exists while the dashboard is

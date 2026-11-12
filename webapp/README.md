@@ -409,7 +409,9 @@ The API, as the components consume it:
   direction, author? (out: user|agent|device, plus agent name),
   sender?/sender_name? (in), text, lang?, ts, attachments?: [{id, url,
   type?, size?, width?, height?, name?}]}`. Attachment URLs are the web-gateway's
-  authenticated media proxy (`/chats/media/…`); type, size and name are what
+  authenticated media proxy (`/chats/media/…`), which serves a file in place
+  only as an inline-safe image, audio, video, PDF or plain text and as a
+  download otherwise (`docs/dashboard.md`, "Attachments"); type, size and name are what
   the storing gateway stated about the blob in its ledger record (absent on
   records older than that statement). `width`/`height` are the medium's real intrinsic size, sniffed
   at ingest — when present the client reserves the true aspect box before the
@@ -421,7 +423,8 @@ The API, as the components consume it:
   above the transcript, which is already the message `text`; `video/*` is an
   inline player (`preload=metadata`, box-reserved the same way); anything
   else (a document, an animated sticker) is a file row showing the stated
-  `name` and `size` that opens the file in a new tab. Reactions and quoted replies (issue #130) will
+  `name` and `size` that links the file: a PDF or plain text opens in a new
+  tab, anything else is saved, as the proxy serves it. Reactions and quoted replies (issue #130) will
   decorate these records later. The companion thread is not in this payload:
   it is an ordinary conversation, named by the summary's `companion` id and
   read through `/conversations`.
@@ -694,8 +697,12 @@ then leave the feed). There is no data file and no stored ordering: the feed
 changes because the clock moved. The service worker deliberately does **not**
 cache `/news`, only the `news.html` shell.
 
-Every headline links out to the source (`target=_blank`) — items are references,
-never copies. The three per-item buttons plus the page's free-text note are the
+A headline links out to the source (`target=_blank`) — items are references,
+never copies. An item's link is an absolute `http(s)` URL or the item has
+none: the gateway serves nothing else as `url`, and the page puts nothing else
+into an `href` (`webLink`, the rule of `news_store.web_link`; `docs/news.md`,
+"The item"). An item without a link, a channel post that carried none, shows
+its headline as text. The three per-item buttons plus the page's free-text note are the
 user's half of the learning loop:
 
 - `POST /news/feedback` — `{id?, signal, note?}` with signal

@@ -148,6 +148,57 @@ def test_feedback_nudges_and_logs(store):
     print("ok: feedback nudges the item, logs it, and the cursor consumes it")
 
 
+def test_a_link_is_a_web_link_or_none(store):
+    """An item's link is where its headline on the news page leads, and it is
+    text from outside. One rule for every producer and for the feed's reader:
+    an absolute http(s) URL with a host is a link, anything else is none."""
+    link = store.web_link
+    # Kept as given, bar surrounding whitespace: item ids derive from the link.
+    for url in ("https://example.invalid/a", "http://example.invalid",
+                "HTTPS://Example.invalid/A?b=1#c", "https://user@example.invalid:8443/x",
+                "https://[2001:db8::1]/x", "https://example.invalid/a b",
+                "https://zürich.example/straße"):
+        assert link(url) == url, url
+        assert link(f"  {url}\n") == url, url
+    for none in (None, "", "   ", 7, [], {"url": "https://example.invalid/"}, b"https://x/",
+                 # relative to wherever it is shown
+                 "/sends/default/1", "news.html", "../x", "?scope=all", "#new",
+                 "//example.invalid/x", "example.invalid/x", "www.example.invalid",
+                 "https:example.invalid", "https:/example.invalid", "http:x",
+                 "https:\\\\example.invalid", "https://example.invalid\\@other.invalid/",
+                 # no host
+                 "https://", "https:///x", "https://?x", "https://:80/", "https://@/x",
+                 "https://example.invalid:port/", "https://example.invalid:99999/",
+                 "https://exa mple.invalid/",
+                 # another kind of address
+                 "javascript:alert(1)", "JAVASCRIPT:alert(1)", "data:text/html,x",
+                 "file:///etc/hosts", "ftp://example.invalid/x", "mailto:a@example.invalid",
+                 "tel:+41441234567", "intent://x#Intent;scheme=https;end", "about:blank",
+                 # a control character inside
+                 "https://example.invalid/\nx", "https://exa\tmple.invalid/",
+                 "ht\ntps://example.invalid/", "java\tscript:alert(1)",
+                 "\x00https://example.invalid/", "https://example.invalid/\x7f"):
+        assert link(none) == "", repr(none)
+
+    # A feed may write its links relative to itself: resolved against the
+    # feed's own URL, as a reader of the feed would.
+    feed = "https://feed.invalid/blog/rss.xml"
+    assert link("/2026/fest", feed) == "https://feed.invalid/2026/fest"
+    assert link("fest.html", feed) == "https://feed.invalid/blog/fest.html"
+    assert link("../fest", feed) == "https://feed.invalid/fest"
+    assert link("?p=12", feed) == "https://feed.invalid/blog/rss.xml?p=12"
+    assert link("//other.invalid/x", feed) == "https://other.invalid/x"
+    # A web link is not touched by the base, and nothing else becomes one.
+    assert link("http://Other.invalid/x", feed) == "http://Other.invalid/x"
+    for none in ("javascript:alert(1)", "data:text/html,x", "mailto:a@example.invalid",
+                 "/a\nb", "", "   ", None):
+        assert link(none, feed) == "", repr(none)
+    # A base that is no web address gives no web link.
+    assert link("/x", "file:///srv/feed.xml") == ""
+    assert link("/x", "") == "" and link("/x", "not a url") == ""
+    print("ok: a link is an absolute http(s) URL with a host, or none")
+
+
 def test_unknown_item_feedback_raises(store):
     try:
         store.record_feedback("nope", "up")
