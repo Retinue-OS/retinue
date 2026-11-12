@@ -214,15 +214,20 @@ def _last_message(conv: dict) -> dict:
 _CHIP_RE = re.compile(r"\[\[chip:[^\]]*\]\]\s*(?:·\s*)?")
 # A call directive ([[call: <number> | <name> | no-voice-cancel]],
 # webapp/components/markdown.js) shows as its name, or as the number when it
-# has none, which is how the thread labels its tap-to-dial link.
+# has none, which is how the thread labels its tap-to-dial link. The flag
+# written in the name's place, with no name, is the flag there, not a name.
 CALL_MARKUP_RE = re.compile(r"\[\[call:\s*([^|\]]*?)\s*(?:\|\s*([^|\]]*?)\s*)?(?:\|[^\]]*)?\]\]", re.I)
+_CALL_FLAG = "no-voice-cancel"
 
 
 def markup_words(text) -> str:
     """A message's words without the dashboard's own markup: chips dropped,
     a call as its name (or number). Shared with the gateway's push, so the
     row, the digest line and the notification read alike."""
-    return CALL_MARKUP_RE.sub(lambda m: m.group(2) or m.group(1), _CHIP_RE.sub("", str(text or "")))
+    def label(m):
+        name = m.group(2)
+        return name if name and name.lower() != _CALL_FLAG else m.group(1)
+    return CALL_MARKUP_RE.sub(label, _CHIP_RE.sub("", str(text or "")))
 
 
 def _one_line(text: str, limit: int = 160) -> str:

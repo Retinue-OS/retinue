@@ -161,10 +161,16 @@ export function renderInline(text) {
   // phone shell's voice conversation the thread places the call itself. The
   // label is the name (the number when there is none) behind a phone glyph,
   // no words, so it reads the same in whatever language the message is in.
-  s = s.replace(chip(CALL_RE), (m, code, raw, name, flag) => {
+  s = s.replace(chip(CALL_RE), (m, code, raw, written, third) => {
     if (code) return m;
     const num = callNumber(raw);
     if (!num) return m;
+    // The flag written where the name goes, with no name before it, is the
+    // flag all the same: no contact is called "no-voice-cancel", and read as
+    // a name it would be shown and spoken as one while the flag went unheard.
+    const bare = !third && /^no-voice-cancel$/i.test(written || '');
+    const name = bare ? '' : written;
+    const flag = bare || third;
     // callOf's collection: the name as written, since the text here is
     // escaped and may hold a stashed chip's placeholder.
     if (callSink) {

@@ -692,13 +692,14 @@ function fmtClock(iso) {
 // Strip Markdown so the synthesizer reads clean prose: no code fences,
 // backticks, emphasis marks, quote markers, list bullets or table rules;
 // links and chips read as their labels, a call as its name (or number), a raw
-// URL as its host.
+// URL as its host. A call's no-voice-cancel written in the name's place is
+// its flag, not a name (markdown.js), so the number is read instead.
 function plainForSpeech(text) {
   return String(text == null ? '' : text)
     .replace(/```[\s\S]*?```/g, ' ')
     .replace(/`([^`]+)`/g, '$1')
     .replace(/\[\[chip:\s*([^|\]]+?)\s*(?:\|[^\]]*)?\]\]/gi, '$1')
-    .replace(/\[\[call:\s*([^|\]]*?)\s*(?:\|\s*([^|\]]*?)\s*)?(?:\|[^\]]*)?\]\]/gi, (_m, num, name) => name || num)
+    .replace(/\[\[call:\s*([^|\]]*?)\s*(?:\|\s*([^|\]]*?)\s*)?(?:\|[^\]]*)?\]\]/gi, (_m, num, name) => (name && !/^no-voice-cancel$/i.test(name) ? name : num))
     .replace(/!\[([^\]]*)\]\([^)]*\)/g, '$1')
     .replace(/\[([^\]]+)\]\((?:[^)]+)\)/g, '$1')
     .replace(/\bhttps?:\/\/([^\s/)]+)[^\s)]*/g, '$1')
@@ -2485,6 +2486,14 @@ class RetinueConversation extends HTMLElement {
     if (wasTake) {
       const goes = !aborted && intent === 'send' && chunks.length;
       const here = this.isConnected && this._key() === key;
+      // A take sent by touch (➤) while a call waits is the user answering
+      // it, heard by the detector or not: it cancels the call as speech
+      // does, and its transcript decides, as for speech (an empty one lets
+      // the call go ahead, _contResumeCall).
+      if (goes && here && this._calling) {
+        CANCELLED_CALLS.set(key, { number: this._calling.number, name: this._calling.name });
+        this._contCallCancel();
+      }
       if (goes && here) this._contEngage();
       else if (this._placingCall && here) { /* the call holds the loop (_contCallPlace) */ }
       else {
@@ -2790,6 +2799,9 @@ class RetinueConversation extends HTMLElement {
   _contResumeCall(call) {
     if (!this._id || !this._contOn() || !ENGAGED.has(this) || this._calling || this._placingCall) return;
     if (this._recState !== 'idle') return;
+    // Hidden while the take was transcribed: nobody would see the Cancel
+    // button, so the call is dropped, as hiding the page drops a waiting one.
+    if (document.visibilityState === 'hidden') { this._contDisengage(); return; }
     CONT_CALL = { conv: this._id, number: call.number, name: call.name, voiceCancel: false };
     this._contCall();
   }
@@ -2807,6 +2819,21 @@ class RetinueConversation extends HTMLElement {
     this._callTimer = null;
     this._calling = null;
     if (!call) return;
+    // Out of sight the call is dropped, never dialled (_onContVisibility).
+    if (document.visibilityState === 'hidden') { this._contDisengage(); return; }
+    // A take that may hold the user's answer is not thrown away for the
+    // call: one already sent by touch whose recorder has not yet flushed,
+    // and one the page cannot hear (no detector, so no speech cancelled the
+    // call however much was said). Either cancels the call, and its
+    // transcript decides, as for a take that speech ended: words go to Ara
+    // with the cancelled call, none let it go ahead (_contResumeCall).
+    if (this._contRec && this._recState === 'recording' && !this._recAborted
+        && (this._recIntent === 'send' || (!this._recIntent && this._vadLive === false))) {
+      CANCELLED_CALLS.set(this._key(), { number: call.number, name: call.name });
+      if (!this._recIntent) this._finishRecording(this._draftHasInput() ? 'review' : 'send');
+      this.render();
+      return;
+    }
     // The call needs the microphone: the take that listened for a cancel is
     // dropped first (nothing was said in it, or there would be no call), and
     // the loop stays engaged meanwhile (_onRecordingStopped), as the shell

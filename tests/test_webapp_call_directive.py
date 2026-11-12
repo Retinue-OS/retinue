@@ -22,8 +22,11 @@ faster: a call is placed even when the no-speech timeout (or the mic) gives
 out before its 5 s are up; its row shows the number beside the name; a call
 the shell refuses, or never answers, says in the composer that it was not
 placed; a user who is writing gets no call, and a take that cancelled one
-never sends what is in the box unseen; a call waiting with the mic shut is
-dropped when the page is hidden; and only Ara's own answer places a
+never sends what is in the box unseen; a take sent by touch, or one the
+page cannot hear, cancels the call and its transcript decides; a call waiting
+with the mic shut, or one resumed after an empty transcript while the page
+was hidden, is dropped; no-voice-cancel in the name's place is the flag;
+and only Ara's own answer places a
 call, never a message an agent pushed into the thread nor her reply to a
 chat arrival, in the same poll as the answer or while it is read.
 
@@ -107,8 +110,14 @@ ok('callOf finds the last valid directive', () => {
 ok('no-voice-cancel is read, and never shows', () => {
   assert.deepEqual(callOf('Calling again. [[call: 0441234567 | Anna | no-voice-cancel]]'),
     { number: '0441234567', name: 'Anna', voiceCancel: false });
+  // The flag in the name's place, with no name, is the flag: it is neither
+  // ignored nor shown as a name, whatever its case.
   assert.deepEqual(callOf('[[call: 0441234567 | no-voice-cancel]]'),
-    { number: '0441234567', name: 'no-voice-cancel', voiceCancel: true });
+    { number: '0441234567', name: '', voiceCancel: false });
+  assert.deepEqual(callOf('[[call: 112 | No-Voice-Cancel ]]'),
+    { number: '112', name: '', voiceCancel: false });
+  assert.equal(renderInline('[[call: 112 | no-voice-cancel]]'),
+    `<a class="md-call" href="tel:112">${PHONE}112</a>`);
   assert.deepEqual(callOf('[[call: 0441234567 | | no-voice-cancel]]'),
     { number: '0441234567', name: '', voiceCancel: false });
   assert.equal(renderInline('[[call: 0441234567 | Anna | no-voice-cancel]]'),
@@ -374,6 +383,8 @@ globalThis.speechSynthesis = {
 const threads = {};
 const posts = [];
 let transcript = '';
+// While set, a transcription waits for it (a promise) before it answers.
+let transcribing = null;
 let clock = Date.parse('2026-11-12T10:00:00Z');
 const ts = () => new Date(clock += 60000).toISOString();
 const answer = (body) => Promise.resolve({ ok: true, status: 200, json: async () => JSON.parse(JSON.stringify(body)) });
@@ -383,7 +394,9 @@ globalThis.fetch = (url, opts = {}) => {
   if (read && method === 'GET') return answer(threads[read[1]]);
   const reply = /^\/conversations\/([0-9a-f]{32})\/messages$/.exec(url);
   if (reply && method === 'POST') { posts.push(JSON.parse(opts.body)); return answer(threads[reply[1]]); }
-  if (url.startsWith('/conversations/transcribe') && method === 'POST') return answer({ text: transcript });
+  if (url.startsWith('/conversations/transcribe') && method === 'POST') {
+    return (transcribing || Promise.resolve()).then(() => answer({ text: transcript }));
+  }
   return answer({});
 };
 
@@ -425,7 +438,7 @@ const notPlaced = (el) => { el.render(); return el.shadowRoot.innerHTML.includes
 let passed = 0;
 async function ok(name, fn) {
   placed.length = 0; posts.length = 0; micFails = false; webAudio = true; level = 0; transcript = '';
-  shellAnswer = { state: 'placed' }; speakMs = 30; said.length = 0;
+  shellAnswer = { state: 'placed' }; speakMs = 30; said.length = 0; transcribing = null;
   await fn();
   passed += 1;
   console.log(`ok - ${name}`);
@@ -603,6 +616,88 @@ await ok('a call waiting with the mic shut is dropped when the user leaves the p
   assert.equal(placed.length, 0, 'no call');
   assert.ok(!el._calling && !callRow(el), 'no call row');
   assert.ok(!el._contArmed, 'the loop stopped');
+  el.disconnectedCallback();
+});
+
+const CANCELLED = { number: '+41791234567', name: 'Anna Muster' };
+
+await ok('a take sent by touch while a call waits cancels it, and tells Ara', async () => {
+  const el = await spoken({ role: 'assistant', text: ANNA });
+  await until(() => el._calling && el._recState === 'recording', 'the call waits with the mic open');
+  // Spoken too softly for the detector, and sent with the row's ➤.
+  transcript = 'no, stop, call Ben instead';
+  el._finishRecording('send');
+  await until(() => posts.length === 1, 'the take goes out');
+  assert.deepEqual(posts[0].cancelled_call, CANCELLED, 'with the call it cancelled');
+  assert.ok(!el._calling && !callRow(el), 'no call row');
+  await wait(7000);
+  assert.equal(placed.length, 0, 'no call');
+  el.disconnectedCallback();
+});
+
+await ok('one sent by touch with no words in it lets the call go ahead', async () => {
+  const el = await spoken({ role: 'assistant', text: ANNA });
+  await until(() => el._calling && el._recState === 'recording', 'the call waits with the mic open');
+  el._finishRecording('send');
+  await until(() => placed.length === 1, 'the call is placed after all');
+  assert.equal(posts.length, 0, 'nothing was sent');
+  el.disconnectedCallback();
+});
+
+await ok('where the page cannot hear the stream, what was said decides the call', async () => {
+  webAudio = false;
+  transcript = 'no, stop';
+  const el = await spoken({ role: 'assistant', text: ANNA });
+  await until(() => el._calling && el._recState === 'recording', 'the call waits with the mic open');
+  await until(() => posts.length === 1, 'the take goes out when the call is due');
+  assert.deepEqual(posts[0].cancelled_call, CANCELLED, 'with the call it cancelled');
+  await wait(7000);
+  assert.equal(placed.length, 0, 'no call');
+  el.disconnectedCallback();
+});
+
+await ok('a call resumed after an empty transcript is dropped when the page was hidden meanwhile', async () => {
+  const el = await spoken({ role: 'assistant', text: ANNA });
+  await until(() => el._calling && el._recState === 'recording', 'the call waits with the mic open');
+  await wait(500);
+  let release;
+  transcribing = new Promise((r) => { release = r; });
+  level = 0.3;
+  await until(() => !el._calling, 'noise cancelled the call');
+  assert.equal(placed.length, 0, 'not by placing it');
+  await wait(800);
+  level = 0;
+  await until(() => el._recState === 'idle', 'the take went to be transcribed');
+  document.visibilityState = 'hidden';
+  document.hidden = true;
+  try {
+    el._onContVisibility();
+    release();
+    await wait(7000);
+  } finally {
+    document.visibilityState = 'visible';
+    document.hidden = false;
+  }
+  assert.equal(placed.length, 0, 'no call');
+  assert.equal(posts.length, 0, 'nothing was sent');
+  assert.ok(!el._calling && !callRow(el), 'no call row');
+  assert.ok(!el._contArmed && !el._contBusy(), 'the loop stopped');
+  el.disconnectedCallback();
+});
+
+await ok('the flag in place of the name is the flag, and never shown or read as a name', async () => {
+  const again = 'Calling again. [[call: +41 79 123 45 67 | no-voice-cancel]]';
+  const el = await spoken({ role: 'assistant', text: again }, null,
+    [{ role: 'user', text: 'Call Anna' }, { role: 'assistant', text: ANNA }]);
+  await until(() => el._calling, 'the call waits');
+  assert.equal(el._calling.voiceCancel, false, 'speech cannot cancel it');
+  assert.equal(el._calling.name, '');
+  assert.equal(el._recState, 'idle', 'the mic is shut');
+  el.render();
+  assert.ok(!el.shadowRoot.innerHTML.includes('no-voice-cancel'), el.shadowRoot.innerHTML);
+  assert.ok(said.some((t) => t.includes('Calling again. +41 79 123 45 67')), said.join(' / '));
+  assert.ok(!said.some((t) => /no-voice-cancel/i.test(t)), said.join(' / '));
+  await until(() => placed.length === 1, 'and is placed');
   el.disconnectedCallback();
 });
 

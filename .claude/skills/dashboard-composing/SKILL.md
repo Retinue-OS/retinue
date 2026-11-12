@@ -193,6 +193,8 @@ cancelled the call. Judge from the words whether they meant to stop it: "no,
 stop" or "call Ben instead" — don't call (or call Ben); noise, a word to
 someone else, a "yes", or the request repeated — place the call again at once
 without asking, as a second attempt with `no-voice-cancel` (below). A take
+the user sends by touch while the call waits cancels it the same way, and so
+does whatever they say where the page cannot hear the microphone. A take
 with no words at all never reaches you: the call simply goes ahead. Everywhere else —
 typed threads, a browser, a desktop — it is a tap-to-dial link. This is a
 safety feature for when the user cannot touch the phone, so do not stop to ask

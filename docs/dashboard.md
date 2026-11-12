@@ -917,12 +917,19 @@ unless the words mean to stop it, place it again as a second attempt with
 the call goes ahead at once, with Cancel by touch only. A cancelling take
 that would carry text or files from the box goes to review instead, like any
 take, and the call stays cancelled. Cancel itself (by touch) cancels for good.
+Speech cancels only where the detector can hear the stream; a take sent by
+touch (➤) while the call waits cancels it all the same, and where the page
+cannot hear the stream (plain timers, above) the take that listened is not
+dropped when the call is due but sent (to review with text or files in the
+box) as a cancelling take, so its transcript decides. A call that would go
+ahead after an empty transcript while the page is hidden is dropped.
 Nobody speaking, the take is dropped, the mic released (up to 2 s), the number
 handed to the shell, and the voice flag let go once the shell has answered
 (10 s at most). A call the shell refuses, or does not answer in that time,
 leaves a note in the composer that the call to the number could not be
 placed; a call placed, or the dialer opened with the number, needs none. The
-flag `| no-voice-cancel` as a third part keeps the mic
+flag `| no-voice-cancel` as a third part (or in the name's place, with no
+name) keeps the mic
 shut for those 5 s — for a loud room or an emergency — but only on a second
 attempt: unless an earlier answer of Ara's in the thread carried a directive
 for the same number (`calledBefore`), the flag is ignored. Only a directive

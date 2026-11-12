@@ -92,6 +92,8 @@ def main() -> int:
         text = "Calling Anna now. [[call: +41 79 123 45 67 | Anna Muster | no-voice-cancel]]"
         assert attention_store.markup_words(text) == "Calling Anna now. Anna Muster"
         assert attention_store.markup_words("[[chip: Yes]] · Ring? [[call: 044 123 45 67]]") == "Ring? 044 123 45 67"
+        # The flag written in the name's place is the flag, not a name.
+        assert attention_store.markup_words("Again. [[call: 112 | No-Voice-Cancel]]") == "Again. 112"
         conv = {"id": "c" * 32, "title": "Anna", "initiator": "agent",
                 "messages": [{"role": "assistant", "text": text}]}
         assert attention_store.thread_item(conv, {})["preview"] == "Calling Anna now. Anna Muster"
