@@ -114,7 +114,8 @@ self.addEventListener('message', (e) => {
 //       there — see "Sent dictations" below. `call` ({number, name}), with
 //       `send` only: the call the take cancelled in the continuous loop
 //       (components/conversation.js, CANCELLED_CALLS), sent along as
-//       `cancelled_call` as the page's own send would.
+//       `cancelled_call` as the page's own send would — while the take is
+//       fresh (DICT_CALL_FRESH_MS).
 //   {type:'dictation-adopt', keys} + a port  take over the jobs under these
 //       places whose owner is gone, restart any this worker was stopped in
 //       the middle of, and answer on the port with {jobs} — every job under
@@ -130,6 +131,12 @@ const DICT_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
 // has been stopped since, and is started again.
 const DICT_RUNNING = new Map();
 const DICT_SEND_TIMEOUT_MS = 30 * 1000;
+// A sent take's cancelled call (`call`) goes along only while the take is this
+// fresh: one sent later — a restart of a job the worker was stopped in, for
+// whichever page asks — goes out as words alone, or Ara could place a call
+// nobody is waiting for. The page keeps the same window for an adopted take
+// (components/conversation.js, CALL_FRESH_MS).
+const DICT_CALL_FRESH_MS = 90 * 1000;
 
 // ── Sent dictations ──────────────────────────────────────────────────────────
 // A dictation sent with ➤ (or a take of the continuous loop ending on a pause)
@@ -160,11 +167,12 @@ function dictCall(call) {
 async function dictSend(rec) {
   const ctl = new AbortController();
   const timer = setTimeout(() => ctl.abort(), DICT_SEND_TIMEOUT_MS);
+  const call = rec.call && Date.now() - (rec.at || 0) < DICT_CALL_FRESH_MS ? rec.call : null;
   try {
     const res = await fetch(rec.send, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(rec.call ? { message: rec.text, cancelled_call: rec.call } : { message: rec.text }),
+      body: JSON.stringify(call ? { message: rec.text, cancelled_call: call } : { message: rec.text }),
       signal: ctl.signal,
     });
     return res.ok ? { sent: true } : { unsent: 'failed' };

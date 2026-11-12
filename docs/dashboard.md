@@ -1057,7 +1057,10 @@ that would carry text or files from the box goes to review instead, like any
 take, and the call stays cancelled. A cancelling take the service worker
 sends because the page was left or frozen meanwhile (webapp README, "Unsent
 input") carries the call there all the same; one the worker could not send
-waits in the box with its note, and the call stays cancelled. Cancel itself
+waits in the box with its note, and the call stays cancelled. Sent more
+than 90 s after it was recorded (a worker restarted late, a page opened
+later that takes the take over), it carries no call: its words go to Ara
+alone, and no call is placed again that nobody is waiting for. Cancel itself
 (by touch) cancels for good.
 Speech cancels only where the detector can hear the stream; a take sent by
 touch (➤) while the call waits cancels it all the same, and where the page

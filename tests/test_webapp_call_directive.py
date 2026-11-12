@@ -337,24 +337,47 @@ const stream = { getTracks: () => [{ stop() {} }] };
 // takes each dictation, keeps what the page posted, and answers with the
 // transcript and, for a sent one, `swOutcome` — as if the page had been
 // frozen while the worker sent it ({sent: true}), or the send had failed.
+// `swLeft` holds the jobs an earlier page left behind, handed to whichever
+// page asks for their place (dictation-adopt) — as done ones, their
+// transcripts in. While `swHold` is set (a promise), a new job's transcript
+// waits for it.
 let swOn = false;
 let swOutcome = { sent: true };
 const swJobs = [];
+const swLeft = [];
+let swHold = null;
 const swListeners = [];
 const SW = {
   addEventListener(t, f) { if (t === 'message') swListeners.push(f); },
   controller: {
-    postMessage(msg) {
+    postMessage(msg, ports) {
+      if (msg.type === 'dictation-adopt') {
+        // The left jobs under these places, and this page's own still running.
+        const left = swLeft.filter((j) => msg.keys.includes(j.key));
+        for (const j of left) swLeft.splice(swLeft.indexOf(j), 1);
+        const running = swJobs.filter((j) => !j.done && msg.keys.includes(j.key))
+          .map((j) => ({ id: j.id, key: j.key, state: 'running', send: !!j.send, at: Date.now() }));
+        setTimeout(() => ports[0].postMessage({ jobs: [...left, ...running] }), 0);
+        return;
+      }
       if (msg.type !== 'dictation') return;
       swJobs.push(msg);
       const tell = (data, ms) => setTimeout(() => swListeners.forEach((f) => f({ data })), ms);
       tell({ type: 'dictation-started', id: msg.id }, 0);
       const out = msg.send ? swOutcome : {};
-      tell({ type: 'dictation-done', id: msg.id, key: msg.key, text: transcript, error: '', send: !!msg.send,
-             sent: !!out.sent, unsent: out.unsent || '', at: Date.now(), call: msg.call || null }, 20);
+      const text = transcript;
+      Promise.resolve(swHold).then(() => {
+        msg.done = true;
+        tell({ type: 'dictation-done', id: msg.id, key: msg.key, text, error: '', send: !!msg.send,
+               sent: !!out.sent, unsent: out.unsent || '', at: Date.now(), call: msg.call || null }, 20);
+      });
     },
   },
 };
+// A sent take an earlier page left under thread `id` with its transcript in
+// but not yet sent, recorded `age` ms ago, the call it cancelled with it.
+const leftTake = (id, text, age, call) => swLeft.push({ id: `left-${id}-${swLeft.length}`, key: `conv:${id}`,
+  state: 'done', text, error: '', send: true, sent: false, unsent: '', at: Date.now() - age, call: call || null });
 Object.defineProperty(globalThis, 'navigator', { value: {
   get serviceWorker() { return swOn ? SW : undefined; },
   userAgent: 'node RetinueShell/6 (Android)',
@@ -462,7 +485,7 @@ let passed = 0;
 async function ok(name, fn) {
   placed.length = 0; posts.length = 0; micFails = false; webAudio = true; level = 0; transcript = '';
   shellAnswer = { state: 'placed' }; speakMs = 30; said.length = 0; transcribing = null;
-  swOn = false; swOutcome = { sent: true }; swJobs.length = 0;
+  swOn = false; swOutcome = { sent: true }; swJobs.length = 0; swLeft.length = 0; swHold = null;
   try { await fn(); } finally { swOn = false; }
   passed += 1;
   console.log(`ok - ${name}`);
@@ -768,6 +791,60 @@ await ok('a cancelling take the service worker could not send waits in the box, 
   await el._send(transcript);
   assert.equal(posts.length, 1);
   assert.equal(posts[0].cancelled_call, undefined, 'sent by hand later, it no longer cancels a call');
+  await wait(6000);
+  assert.equal(placed.length, 0, 'no call');
+  el.disconnectedCallback();
+});
+
+await ok("a cancelling take an earlier page left is sent by the next one, with its call, while it is fresh", async () => {
+  swOn = true;
+  const el = await spoken({ role: 'assistant', text: NOTED }, (e) => leftTake(e.thread.id, 'yes, go ahead', 5000, CANCELLED));
+  await until(() => posts.length === 1, 'the page that took the take over sends it');
+  assert.equal(posts[0].message, 'yes, go ahead');
+  assert.deepEqual(posts[0].cancelled_call, CANCELLED, 'with the call it cancelled');
+  el.disconnectedCallback();
+});
+
+await ok('...but an old one goes out as words alone, and no call is placed with the mic shut', async () => {
+  swOn = true;
+  // Its page died before it could send it; days later the thread is opened
+  // again, the mode still on.
+  const el = await spoken({ role: 'assistant', text: NOTED },
+    (e) => leftTake(e.thread.id, 'yes, go ahead', 3 * 24 * 3600 * 1000, CANCELLED));
+  await until(() => posts.length === 1, 'the page that took the take over sends it');
+  assert.equal(posts[0].message, 'yes, go ahead');
+  assert.equal(posts[0].cancelled_call, undefined, 'a call that old is not put to Ara again');
+  await wait(6000);
+  assert.equal(placed.length, 0, 'no call');
+  el.disconnectedCallback();
+});
+
+await ok("a take another page left does not borrow the call this page's own take cancelled", async () => {
+  const el = await spoken({ role: 'assistant', text: ANNA });
+  await until(() => el._calling && el._recState === 'recording', 'the call waits with the mic open');
+  swOn = true;
+  swOutcome = {};   // this page is there: it sends its own take
+  let release;
+  swHold = new Promise((r) => { release = r; });
+  await wait(500);
+  transcript = 'no, call Ben instead';
+  level = 0.3;
+  await until(() => !el._calling, 'speech cancelled the call');
+  await wait(800);
+  level = 0;
+  await until(() => swJobs.length === 1, "this page's take is being transcribed");
+  assert.deepEqual(swJobs[0].call, CANCELLED);
+  // Meanwhile a tab on the same thread closes, leaving a sent take of its
+  // own: this page takes it over (a resync) and sends it.
+  leftTake(el.thread.id, 'and remind me at six', 5000, null);
+  dispatchEvent({ type: 'pageshow', persisted: true });
+  await until(() => posts.length === 1, 'the left take is sent');
+  assert.equal(posts[0].message, 'and remind me at six');
+  assert.equal(posts[0].cancelled_call, undefined, "it carries no call: the one cancelled is this page's take's");
+  release();
+  await until(() => posts.length === 2, "this page's take goes out");
+  assert.equal(posts[1].message, 'no, call Ben instead');
+  assert.deepEqual(posts[1].cancelled_call, CANCELLED, 'with the call it cancelled');
   await wait(6000);
   assert.equal(placed.length, 0, 'no call');
   el.disconnectedCallback();

@@ -147,6 +147,13 @@ const CONT_PENDING_MS = 60 * 1000;
 // voice flag go (see _contWatch). Looked at every CONT_WATCH_MS.
 const CONT_IDLE_MS = 90 * 1000;
 const CONT_WATCH_MS = 5 * 1000;
+// A take that cancelled a call tells Ara so (`cancelled_call`) only while
+// the conversation it answered can still be going on: one sent later than
+// this after it was recorded — a page that died before sending it, its
+// take adopted by a page opened since — goes out as words alone, or Ara
+// could place a call nobody is waiting for, with the mic shut. The worker
+// keeps the same window for the sends it makes (sw.js, DICT_CALL_FRESH_MS).
+const CALL_FRESH_MS = CONT_IDLE_MS;
 // A call the loop places ([[call: …]] in the answer, see _contCall) waits
 // this long after the answer was read, on screen with a Cancel button and,
 // unless the directive says otherwise, the mic open: speech cancels it.
@@ -659,17 +666,12 @@ function adoptDictations(key) {
         if (t && hasTurnSince(t, text, new Date(at || Date.now()).toISOString())) { refreshSent(key); return; }
         if (t && el.isConnected) {
           VOICE_ERRORS.delete(key);
-          // A take that cancelled a call tells Ara so from here too
-          // (sendMessage takes CANCELLED_CALLS for the turn it sends) — and
-          // only this turn: a send that did not get as far leaves no note
-          // behind for a later one.
-          const note = call && !CANCELLED_CALLS.has(key) ? { number: call.number, name: call.name } : null;
-          if (note) CANCELLED_CALLS.set(key, note);
-          try {
-            await el._send(text, { fromDraft: false });
-          } finally {
-            if (note && CANCELLED_CALLS.get(key) === note) CANCELLED_CALLS.delete(key);
-          }
+          // A take that cancelled a call tells Ara so from here too, while
+          // it is fresh (CALL_FRESH_MS). Its own call, handed to this send
+          // alone: CANCELLED_CALLS[key] belongs to a take of this page's,
+          // which may be on its way right now and is left untouched.
+          const fresh = call && Date.now() - (at || 0) < CALL_FRESH_MS;
+          await el._send(text, { fromDraft: false, call: fresh ? { number: call.number, name: call.name } : null });
           return;
         }
       }
@@ -2115,7 +2117,10 @@ class RetinueConversation extends HTMLElement {
   // beside whatever the user has half-written: it takes none of their files,
   // spends none of their text, and — having never been in the box — goes INTO
   // it if the send fails, which is the only place a retry could come from.
-  async _send(text, { fromDraft = true } = {}) {
+  // `call`, when given (null included), is the cancelled call this turn
+  // carries, in place of whatever CANCELLED_CALLS holds for the thread —
+  // which is then neither read nor spent (see sendMessage).
+  async _send(text, { fromDraft = true, call } = {}) {
     const key = this._key();
     const d = draftOf(key);
     // A message needs text or at least one attachment.
@@ -2162,7 +2167,7 @@ class RetinueConversation extends HTMLElement {
       // draft is written with this turn marked (keepDraft), and the next page
       // settles it against the thread.
       Object.assign(sent, { posted: true, target, before: base, at: new Date().toISOString(), project: this._seed().project });
-      const conv = await sendMessage(target, text, sent.files, this._seed(), this._newModel, sent)
+      const conv = await sendMessage(target, text, sent.files, this._seed(), this._newModel, sent, call)
         .catch((err) => arrivedAnyway(err, target, text, base));
       delivered = true;
       d.leftSend = null;  // whatever an earlier page left, this send is the one that went
@@ -3570,7 +3575,9 @@ function sendFailureNote(err) {
 
 // `track`, optional: told whether the request went out as a keepalive one
 // (track.keepalive), which the browser finishes even if the page is left.
-async function sendMessage(id, text, files, seed, model, track) {
+// `call`, optional: the cancelled call this turn carries ({number, name}, or
+// null for none). Left out, it is the thread's CANCELLED_CALLS entry, spent.
+async function sendMessage(id, text, files, seed, model, track, call) {
   const body = { message: text };
   if (!id) {
     if (seed && seed.project) {
@@ -3584,11 +3591,12 @@ async function sendMessage(id, text, files, seed, model, track) {
   }
   // The take that cancelled a call by being spoken (CANCELLED_CALLS): Ara
   // hears which call, and places it again if the words show no wish to stop.
-  const cancelled = id ? CANCELLED_CALLS.get(String(id)) : null;
-  if (cancelled) {
-    body.cancelled_call = { number: cancelled.number, name: cancelled.name };
-    CANCELLED_CALLS.delete(String(id));
-  }
+  // A call handed in by the caller (an adopted take's own) takes its place,
+  // and the thread's entry stays for the take it belongs to.
+  const own = call !== undefined;
+  const cancelled = !id ? null : own ? call : CANCELLED_CALLS.get(String(id));
+  if (cancelled) body.cancelled_call = { number: cancelled.number, name: cancelled.name };
+  if (id && !own) CANCELLED_CALLS.delete(String(id));
   const url = id ? `/conversations/${encodeURIComponent(id)}/messages` : LIST_URL;
   const payload = JSON.stringify(body);
   const ms = REQUEST_TIMEOUT_MS + Math.ceil(payload.length / UPLOAD_BYTES_PER_SECOND) * 1000;

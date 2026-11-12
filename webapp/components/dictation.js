@@ -30,7 +30,8 @@
 //                               call this take cancelled (conversation.js,
 //                               CANCELLED_CALLS), which the worker's send
 //                               carries as `cancelled_call`, as the page's
-//                               own would.
+//                               own would, while the take is fresh (sw.js,
+//                               DICT_CALL_FRESH_MS).
 //   handOff(key, blob, url)     the page is going (pagehide) with the mic
 //                               live: the audio so far is sent off as it is,
 //                               and nothing waits here for the answer.

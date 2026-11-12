@@ -11,7 +11,7 @@ into the recorded thread — and only that thread, only the dashboard's own
 messages endpoint; a page showing the thread meanwhile is told it went; a
 refused send is never retried and goes to the draft; a review dictation (✓,
 a hand-off on leaving) and an empty transcript are never sent; a take that
-cancelled a call carries it as `cancelled_call`.
+cancelled a call carries it as `cancelled_call`, while it is fresh.
 
 Standalone like the rest of the suite. Needs `node` on PATH; without it the
 test reports a skip and passes.
@@ -222,6 +222,28 @@ await message({ type: 'dictation', id: 'j14', key: 'conv:t1', url: '/conversatio
 const done11 = CLIENTS.get('A').posted.find((m) => m.type === 'dictation-done');
 assert.equal(done11.call, null, 'a review dictation carries no call');
 assert.equal(POSTS.length, 0);
+
+// 11. A cancelling take the worker was stopped in the middle of transcribing, restarted for a
+//     page that asks for its place long after it was recorded: it goes out as words alone —
+//     the call it cancelled is not put to Ara again.
+reset(); CLIENTS.set('C', { posted: [] });
+DB.set('j15', { id: 'j15', key: 'conv:t1', url: '/conversations/transcribe?thread=t1', blob, owner: '', origin: 'A',
+                send: SEND, state: 'running', text: '', error: '', at: Date.now() - 2 * 3600 * 1000, call: CALL });
+await adopt(['conv:t1'], 'C');
+for (let i = 0; i < 100 && !CLIENTS.get('C').posted.some((m) => m.type === 'dictation-done'); i += 1) {
+  await new Promise((r) => setTimeout(r, 10));
+}
+assert.deepEqual(POSTS, [{ url: SEND, body: { message: 'hello thread' } }], 'an old take carries no cancelled call');
+assert.equal(CLIENTS.get('C').posted.find((m) => m.type === 'dictation-done').sent, true, 'sent all the same');
+// The same restart within the window still carries it.
+reset(); CLIENTS.set('C', { posted: [] });
+DB.set('j16', { id: 'j16', key: 'conv:t1', url: '/conversations/transcribe?thread=t1', blob, owner: '', origin: 'A',
+                send: SEND, state: 'running', text: '', error: '', at: Date.now() - 5000, call: CALL });
+await adopt(['conv:t1'], 'C');
+for (let i = 0; i < 100 && !CLIENTS.get('C').posted.some((m) => m.type === 'dictation-done'); i += 1) {
+  await new Promise((r) => setTimeout(r, 10));
+}
+assert.deepEqual(POSTS, [{ url: SEND, body: { message: 'hello thread', cancelled_call: CALL } }], 'a fresh one does');
 console.log('ok');
 """
 
