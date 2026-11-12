@@ -10,7 +10,9 @@ code dropped, too short or too long refused), that the last directive in a
 message is the one placed, that one quoted as code (a span, a ``` or ~~~
 fence, an unclosed fence) stays code, that only what the bubble shows as a
 call link is a call (not one split across lines, cut apart by a table, or
-quoted by a code span whose backticks pair only across lines), and that the
+quoted by a code span whose backticks pair only across lines, with
+JavaScript's whitespace, which the gateway's lint guard copies), that a
+service code's # is escaped in the link but not in the call, and that the
 label is the name — or the number — behind a glyph, with no words in any
 language.
 
@@ -20,7 +22,8 @@ faster: a call is placed even when the no-speech timeout (or the mic) gives
 out before its 5 s are up; its row shows the number beside the name; a call
 the shell refuses, or never answers, says in the composer that it was not
 placed; a user who is writing gets no call, and a take that cancelled one
-never sends what is in the box unseen; and only Ara's own answer places a
+never sends what is in the box unseen; a call waiting with the mic shut is
+dropped when the page is hidden; and only Ara's own answer places a
 call, never a message an agent pushed into the thread nor her reply to a
 chat arrival, in the same poll as the answer or while it is read.
 
@@ -159,6 +162,34 @@ ok('only what the bubble shows as a call link is a call', () => {
   const text = 'Here:\n> [[call: 0441234567 | Anna]]\n- [[call: +1 900 555 0100 | Bank]]';
   assert.match(renderMarkdown(text), /tel:\+19005550100/);
   assert.deepEqual(callOf(text), { number: '+19005550100', name: 'Bank', voiceCancel: true });
+});
+
+ok('a service code dials whole: its # is escaped in the link, not in the call', () => {
+  // A tap on tel:*100# would dial *100 — the # starts the URI's fragment.
+  assert.equal(renderInline('[[call: *100# | Balance]]'),
+    `<a class="md-call" href="tel:*100%23">${PHONE}Balance</a>`);
+  assert.deepEqual(callOf('[[call: *100# | Balance]]'),
+    { number: '*100#', name: 'Balance', voiceCancel: true });
+});
+
+ok("the bubble's whitespace is JavaScript's", () => {
+  // The gateway's lint guard copies these readings
+  // (test_web_gateway_claude_spawn.py): a no-break space or byte-order mark
+  // ends a fence line, and \x1c or \x85 after a separator row makes it none.
+  const bank = { number: '+19005550100', name: 'Bank', voiceCancel: true };
+  const call = '[[call: +1 900 555 0100 | Bank]]';
+  assert.deepEqual(callOf(`Says:\n\`\`\`\n\`\`\`\u00a0\n${call}\n\`\`\`\nShall I?`), bank);
+  assert.deepEqual(callOf(`Says:\n\`\`\`\n\`\`\`\ufeff\n${call}\n\`\`\`\nShall I?`), bank);
+  assert.deepEqual(callOf(`Says:\n${call}\n|---|---|\x1c\nShall I?`), bank);
+  assert.deepEqual(callOf(`Says:\n${call}\n|---|---|\x85\nShall I?`), bank);
+  assert.equal(callOf(`| a | ${call} |\n|---|---|\u00a0`), null);
+  assert.equal(callOf(`\`\`\`\u00a0\n${call}\n\`\`\``), null);
+  assert.deepEqual(callOf('| a | b |\x1c\n|---|---|\n| x | y | [[call: 0441234567]] |'),
+    { number: '0441234567', name: '', voiceCancel: true });
+  // No chip swallows the directive: "chıp" is no chip, nor does a prefill
+  // run across U+2028.
+  assert.deepEqual(callOf(`[[ch\u0131p: Yes | ${call}`), bank);
+  assert.deepEqual(callOf(`[[chip: Yes | a\u2028${call}`), bank);
 });
 
 ok('calledBefore: only an earlier reply to the same number counts', () => {
@@ -366,11 +397,13 @@ const ANNA = 'Calling Anna now. [[call: +41 79 123 45 67 | Anna Muster]]';
 // A thread in continuous mode whose loop is armed by the user's spoken turn;
 // `answerMsg` is what arrives for it (a list: several messages in one poll).
 // `before` runs once the thread is open.
-async function spoken(answerMsg, before) {
+// `history` is what the thread held before, after its earlier exchange.
+async function spoken(answerMsg, before, history = []) {
   const id = String(++n).padStart(32, '0');
   threads[id] = { id, title: 'Anna', pending: false, model: '', messages: [
     { role: 'user', text: 'Earlier question', ts: ts() },
     { role: 'assistant', text: 'Earlier answer', ts: ts() },
+    ...history.map((m) => ({ ...m, ts: ts() })),
   ] };
   setContinuous(id, true);
   const el = new Conv();
@@ -545,6 +578,31 @@ await ok('a take that cancelled the call goes to review when the box holds somet
   el.render();
   const box = el.shadowRoot.innerHTML.match(/<textarea[^>]*>([\s\S]*?)<\/textarea>/);
   assert.ok(box && box[1].includes('A note for later') && box[1].includes('wait'), 'both are in the box for review');
+  el.disconnectedCallback();
+});
+
+await ok('a call waiting with the mic shut is dropped when the user leaves the page', async () => {
+  // A second attempt at the number, so no-voice-cancel holds: no take
+  // listens, and only Cancel on the screen stops the call. With the page
+  // gone, nobody sees it, so the call goes as it would with the mic open.
+  const again = 'Calling Anna again. [[call: +41 79 123 45 67 | Anna Muster | no-voice-cancel]]';
+  const el = await spoken({ role: 'assistant', text: again }, null,
+    [{ role: 'user', text: 'Call Anna' }, { role: 'assistant', text: ANNA }]);
+  await until(() => el._calling, 'the call waits');
+  assert.equal(el._calling.voiceCancel, false, 'speech cannot cancel it');
+  assert.equal(el._recState, 'idle', 'the mic is shut');
+  document.visibilityState = 'hidden';
+  document.hidden = true;
+  try {
+    el._onContVisibility();
+    await wait(6000);
+  } finally {
+    document.visibilityState = 'visible';
+    document.hidden = false;
+  }
+  assert.equal(placed.length, 0, 'no call');
+  assert.ok(!el._calling && !callRow(el), 'no call row');
+  assert.ok(!el._contArmed, 'the loop stopped');
   el.disconnectedCallback();
 });
 

@@ -175,7 +175,10 @@ export function renderInline(text) {
         voiceCancel: !flag,
       });
     }
-    return stash(`<a class="md-call" href="tel:${num}">\u{1F4DE} ${name || raw.trim()}</a>`);
+    // In the href a # would start the URI's fragment, and a tap on a service
+    // code (*100#) would dial it cut short. The number collected above stays
+    // as written, since placeCall takes it raw.
+    return stash(`<a class="md-call" href="tel:${num.replace(/#/g, '%23')}">\u{1F4DE} ${name || raw.trim()}</a>`);
   });
   // `code` before any link: a code span is literal, so a URL inside one
   // (`https://schema.org/`) stays code instead of becoming a link with the

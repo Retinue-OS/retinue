@@ -2868,9 +2868,14 @@ class RetinueConversation extends HTMLElement {
   _onContVisibility() {
     if (document.visibilityState === 'hidden') {
       // A take under way ends with the page (see _contStopListening); the
-      // loop stops with it unless an answer is still to come.
+      // loop stops with it unless an answer is still to come. A call still
+      // waiting goes with it, as the loop stopping drops it: whether a take
+      // listens for a cancel or not (no-voice-cancel, a resumed call, a mic
+      // that failed), its Cancel is out of the user's sight now.
       if (this._contRec && this._recState === 'recording') {
         this._contStopListening();
+        this._contDisengage();
+      } else if (this._calling) {
         this._contDisengage();
       }
       return;

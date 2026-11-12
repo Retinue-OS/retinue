@@ -236,8 +236,9 @@ project context, run outside `/workspace` so no CLAUDE.md is loaded, on
 default, else `haiku`). The lint is form-only and fail-open — a timeout, a
 non-zero exit, a result that shrinks or balloons beyond the drift guards, or
 one whose `[[call: …]]` directives differ in any way from the original's (a
-call the voice loop would place, `docs/dashboard.md`) delivers the original
-text unchanged. `PRESENTATION_LINT=0` disables it. The
+call the voice loop would place, `docs/dashboard.md`) or that, in a message
+with one, changes a line holding a directive or a fence or table-separator
+line, delivers the original text unchanged. `PRESENTATION_LINT=0` disables it. The
 first live tier deployment is what motivated shipping this early: a
 router-tier model reliably forgot chips and composed bullet lists, which no
 amount of prompt discipline fixed.

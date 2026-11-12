@@ -449,11 +449,15 @@ def test_lint_never_changes_a_call_directive(wg):
         for what, linted in lints.items():
             answer["text"] = linted
             assert wg._lint_presentation(original) == original, what
-        chipped = original.replace(
-            "Do you want me to call Anna first?",
-            "Do you want me to call Anna first? [[chip: Yes]] · [[chip: No]]")
+        # Chips on a line of their own leave the directive's line as it was:
+        # delivered. Put on the directive's own line, they are not.
+        chipped = original + "\n[[chip: Yes]] · [[chip: No]]"
         answer["text"] = chipped
         assert wg._lint_presentation(original) == chipped
+        answer["text"] = original.replace(
+            "Do you want me to call Anna first?",
+            "Do you want me to call Anna first? [[chip: Yes]] · [[chip: No]]")
+        assert wg._lint_presentation(original) == original
     finally:
         wg._run_claude = saved
 
@@ -524,10 +528,81 @@ def test_lint_never_unquotes_a_call_directive(wg):
         assert wg._live_call_directives(f"[[chip: a`b]] {bank}` end") == [bank]
         # The live directive and the quoted one both stay as they are, and
         # the rest of the reply is rewritten: delivered.
-        rewritten = live.replace("I won't call that one.",
-                                 "I won't call that number.")
+        lined = live.replace(" I won't call that one. ", "\nI won't call that one.\n")
+        rewritten = lined.replace("I won't call that one.",
+                                  "I won't call that number.")
         answer["text"] = rewritten
-        assert wg._lint_presentation(live) == rewritten
+        assert wg._lint_presentation(lined) == rewritten
+        # Rewritten on a line that holds a directive, it is not delivered:
+        # what a lint may not touch is not left to how well the copy of the
+        # renderer above follows the bubble.
+        answer["text"] = live.replace("I won't call that one.",
+                                      "I won't call that number.")
+        assert wg._lint_presentation(live) == live
+    finally:
+        wg._run_claude = saved
+
+
+def test_lint_guard_reads_whitespace_as_the_bubble_does(wg):
+    """The thread's renderer is JavaScript, whose \\s is not Python's: it
+    holds U+00A0 and U+FEFF, and not \\x1c-\\x1f or \\x85. A lint result whose
+    fence line ends in a no-break space closes the fence in the bubble, and
+    one whose table separator ends in \\x1c or \\x85 is no separator there, so
+    in each the quoted directive becomes a call the voice loop places. The
+    guard reads them as the bubble does, and refuses them — as it refuses
+    any result that changes a fence or separator line beside a directive."""
+    bank = "[[call: +1 900 555 0100 | Bank]]"
+    spanned = (f"The bank's letter says: `{bank}`. "
+               "Shall I call them, or would you rather I call Anna first?")
+    ask = "\nShall I call them, or would you rather I call Anna first?"
+    lints = {
+        "a fence closed by a no-break space":
+            f"The bank's letter says:\n```\n```\u00a0\n{bank}\n```{ask}",
+        "a fence closed by a byte-order mark":
+            f"The bank's letter says:\n```\n```\ufeff\n{bank}\n```{ask}",
+        "a separator ending in \\x1c": f"The bank's letter says:\n{bank}\n|---|---|\x1c{ask}",
+        "a separator ending in \\x85": f"The bank's letter says:\n{bank}\n|---|---|\x85{ask}",
+    }
+    for what, linted in lints.items():
+        assert wg._live_call_directives(linted) == [bank], what
+    # Read as the bubble reads them, these are a separator and a fence, and
+    # the directive stays quoted.
+    assert wg._live_call_directives(f"| a | {bank} |\n|---|---|\u00a0") == []
+    assert wg._live_call_directives(f"```\u00a0\n{bank}\n```") == []
+    # Nor does a table cell's edge differ: \\x1c is no space to the bubble,
+    # so the header has three cells and the third of a row is shown.
+    assert wg._live_call_directives(
+        "| a | b |\x1c\n|---|---|\n| x | y | [[call: 0441234567]] |"
+    ) == ["[[call: 0441234567]]"]
+    # Nor is a chip that is none to the bubble taken for one, swallowing the
+    # directive after it: a dotless i in "chip", a prefill cut by U+2028.
+    assert wg._live_call_directives(f"[[ch\u0131p: Yes | {bank}") == [bank]
+    assert wg._live_call_directives(f"[[chip: Yes | a\u2028{bank}") == [bank]
+    answer = {}
+    saved = wg._run_claude
+    wg._run_claude = lambda cmd, **kw: subprocess.CompletedProcess(
+        cmd, 0, stdout=json.dumps({"result": answer["text"]}), stderr="")
+    try:
+        for what, linted in lints.items():
+            answer["text"] = linted
+            assert wg._lint_presentation(spanned) == spanned, what
+        # A fence or separator line next to a directive is left as it was,
+        # however the copy above reads it.
+        fenced = f"The bank's letter says:\n```\n{bank}\n```{ask}"
+        for what, linted in {
+            "a fence line changed": fenced.replace("```\n[[", "```text\n[["),
+            "a fence line added": fenced.replace("```\n[[", "```\n```\n```\n[["),
+            "a separator line changed": "| who | number |\n|:--|--:|\n| Bank | 1 |\n" + fenced,
+        }.items():
+            answer["text"] = linted
+            original = fenced if "separator" not in what else (
+                "| who | number |\n|---|---|\n| Bank | 1 |\n" + fenced)
+            assert wg._lint_presentation(original) == original, what
+        # Without any directive in the message, fences are no business of
+        # this gate.
+        plain = "Here is the snippet:\n```\nls -l\n```\nIt lists the files in /tmp."
+        answer["text"] = plain.replace("```\nls", "```sh\nls")
+        assert wg._lint_presentation(plain) == answer["text"]
     finally:
         wg._run_claude = saved
 
@@ -547,6 +622,7 @@ def main():
         test_cleanup_and_lint_sessions_are_allowlisted_too(wg)
         test_lint_never_changes_a_call_directive(wg)
         test_lint_never_unquotes_a_call_directive(wg)
+        test_lint_guard_reads_whitespace_as_the_bubble_does(wg)
 
         wg_short = _load_gateway(
             tmp / "b", {"CLAUDE_SPAWN_ENOENT_DEADLINE_SECONDS": "5"})

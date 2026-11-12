@@ -930,14 +930,17 @@ the bubble shows as a call link is a call: `callOf` renders the reply as the
 bubble does and takes the last link. One quoted as code (a span, whose
 backticks pair within a line, or a ``` or ~~~ fence, closed or not), split
 across lines, or cut apart by a table's cells is shown as text, never placed.
-Leaving the thread or
+Leaving the thread, hiding the page (the mic open or not) or
 stopping the loop drops the call. Anywhere else — a typed thread, an older reply, a message pushed
 into the thread (an agent's included), Ara's reply to a chat message that
 arrived in a companion thread meanwhile (stored with `arrival: true`, never the
-loop's answer nor an earlier attempt), a browser — the directive is only a tap-to-dial `tel:` link
+loop's answer nor an earlier attempt), a browser — the directive is only a tap-to-dial `tel:` link (its `#`
+written `%23`, so a service code dials whole)
 (`webapp/components/markdown.js`, `callOf`; `tests/test_webapp_call_directive.py`).
 The presentation lint never delivers a result whose call directives differ
-from the original's (`docs/model-routing.md`, phase 4).
+from the original's, read as the bubble reads them (JavaScript's whitespace
+included), nor one that changes a line holding a directive, or a fence or
+table-separator line, in a message with one (`docs/model-routing.md`, phase 4).
 Entry points: the toggle, `/#new?voice=1` (the composer in the mode — its
 first take opens the thread, which continues in it) and a wake (`/?wake=1`
 or the shell's `wake` event), which opens the thread used in the mode within

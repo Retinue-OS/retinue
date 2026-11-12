@@ -5228,26 +5228,56 @@ _LINT_URLISH_RE = re.compile(r"https?://|\w\.\w|/\w")
 # QUOTE_RE, LIST_RE, HR_RE), a table's separator row (TABLE_SEP_RE), and the
 # inline patterns of renderInline that run before the call link — the two
 # chip forms, each skipping a code span met first — and CALL_RE itself.
-_LINT_FENCE_RE = re.compile(r"^(?:```|~~~)\s*([\w.+-]*)\s*$", re.ASCII)
-_LINT_OWN_BLOCK_RE = re.compile(
+# Its regular expressions are JavaScript's, whose \s, trim() and `.` differ
+# from Python's: \s and trim() hold U+00A0 and U+FEFF but not \x1c-\x1f or
+# \x85, and `.` stops at \r, U+2028 and U+2029 as well as \n. A copy that
+# read any of these otherwise would let a lint result through whose quoted
+# directive the bubble shows as a call, so the copy spells them out
+# (_JS_S, _JS_DOT, _js_trim). Its case-blind matching folds ASCII only, as
+# JavaScript's does without the u flag, where Python's would also fold a
+# dotless i into the i of "chip".
+_JS_SPACE = ("\t\n\v\f\r \u00a0\u1680" + "".join(map(chr, range(0x2000, 0x200b)))
+             + "\u2028\u2029\u202f\u205f\u3000\ufeff")
+_JS_S = r"[\t\n\v\f\r \u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000\ufeff]"
+_JS_DOT = r"[^\n\r\u2028\u2029]"
+
+
+def _js_re(pattern: str, flags: int = 0):
+    """`pattern`, written with JavaScript's \\s, compiled to match as there."""
+    return re.compile(pattern.replace(r"\s", _JS_S), flags | re.ASCII)
+
+
+def _js_trim(s: str) -> str:
+    """String.prototype.trim()."""
+    return s.strip(_JS_SPACE)
+
+
+_LINT_FENCE_RE = _js_re(r"^(?:```|~~~)\s*([A-Za-z0-9_.+-]*)\s*$")
+_LINT_OWN_BLOCK_RE = _js_re(
     r"^(?:#{1,6}\s+|>|\s*(?:[-*+]|[0-9]+[.)])\s+|\s*(?:-{3,}|\*{3,}|_{3,})\s*$)")
-_LINT_TABLE_SEP_RE = re.compile(r"^\s*\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)+\|?\s*$")
+_LINT_TABLE_SEP_RE = _js_re(r"^\s*\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)+\|?\s*$")
 _LINT_CODE = r"(`[^`]+`)|"
 _LINT_CHIP_RES = (
-    re.compile(_LINT_CODE + r"\[\[chip:\s*([^|\]]+?)\s*\|\s*(.+?)\s*\]\]", re.I),
-    re.compile(_LINT_CODE + r"\[\[chip:\s*([^|\]]+?)\s*\]\]", re.I),
+    _js_re(_LINT_CODE + r"\[\[chip:\s*([^|\]]+?)\s*\|\s*(" + _JS_DOT + r"+?)\s*\]\]", re.I),
+    _js_re(_LINT_CODE + r"\[\[chip:\s*([^|\]]+?)\s*\]\]", re.I),
 )
-_LINT_CALL_RE = re.compile(
+_LINT_CALL_RE = _js_re(
     _LINT_CODE + r"\[\[call:\s*([+0-9*#][0-9*# ().\/-]*?)\s*(?:\|\s*([^|\]]*?)\s*)?"
     r"(?:\|\s*(no-voice-cancel)\s*)?\]\]", re.I)
+# The lines a lint result must leave exactly as they were whenever the
+# message holds a call directive (_call_frame): each line with one, and each
+# that is, or could be read as, a fence or a table's separator — drawn wider
+# than the renderer draws them, so that a future difference between it and
+# the copy above cannot make a quoted directive a call either.
+_LOOSE_SEP_RE = re.compile(r"[\s\ufeff|:-]*--[\s\ufeff|:-]*")
 
 
 def _table_cells(line: str) -> list:
     """A table row's cells, split as splitTableRow() splits them."""
-    s = line.strip()
+    s = _js_trim(line)
     s = s[1:] if s.startswith("|") else s
     s = s[:-1] if s.endswith("|") else s
-    return [c.replace("\\|", "|").strip() for c in re.split(r"(?<!\\)\|", s)]
+    return [_js_trim(c.replace("\\|", "|")) for c in re.split(r"(?<!\\)\|", s)]
 
 
 def _inline_segments(text: str) -> list:
@@ -5269,7 +5299,7 @@ def _inline_segments(text: str) -> list:
             head = _table_cells(line)
             out.extend(head)
             i += 2
-            while i < len(lines) and "|" in lines[i] and lines[i].strip():
+            while i < len(lines) and "|" in lines[i] and _js_trim(lines[i]):
                 # A row's cells beyond the header's are not shown.
                 out.extend(_table_cells(lines[i])[:len(head)])
                 i += 1
@@ -5295,6 +5325,15 @@ def _live_call_directives(text: str) -> list:
             seg = chip_re.sub(lambda m: m.group(0) if m.group(1) else "\x01", seg)
         found.extend(m.group(0) for m in _LINT_CALL_RE.finditer(seg) if not m.group(1))
     return found
+
+
+def _call_frame(text: str) -> list:
+    """The lines of `text` a lint may not change beside a call directive, in
+    order: those that hold one, and every fence-like or separator-like line
+    (_LOOSE_SEP_RE)."""
+    return [line for line in text.split("\n")
+            if "[[call:" in line.lower() or "```" in line or "~~~" in line
+            or _LOOSE_SEP_RE.fullmatch(line)]
 
 
 def _lint_presentation(text: str, *, kind: str = "chat") -> str:
@@ -5371,10 +5410,15 @@ def _lint_presentation(text: str, *, kind: str = "chat") -> str:
     # text of a quoted directive survives a lint that only drops its
     # backticks or fence lines, and the call it then becomes would be placed.
     # The count of all of them, quoted ones included, is compared as well, so
-    # the lint cannot add or drop a quoted one either.
+    # the lint cannot add or drop a quoted one either. And whatever the copy
+    # of the renderer makes of a message, the lint may change no line that
+    # holds a directive, nor any fence or separator line, in one that holds
+    # any (_call_frame).
+    has_call = "[[call:" in raw.lower() or "[[call:" in linted.lower()
     if (_live_call_directives(raw) != _live_call_directives(linted)
             or len(attention_store.CALL_MARKUP_RE.findall(raw))
-            != len(attention_store.CALL_MARKUP_RE.findall(linted))):
+            != len(attention_store.CALL_MARKUP_RE.findall(linted))
+            or (has_call and _call_frame(raw) != _call_frame(linted))):
         print("[web-gateway] presentation lint changed a call directive — "
               "delivering the text unchanged", flush=True)
         return text
