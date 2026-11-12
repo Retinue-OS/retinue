@@ -282,6 +282,20 @@ def main() -> int:
             status, headers, _ = _request(port, "GET", f"/conversations/{conv['id']}")
             check(f"/conversations/{conv['id']}", status, headers)
             print("ok: the API's JSON forbids sniffing")
+
+            # ── The dashboard's own scripts forbid sniffing as well ──────────
+            # They are scripts and say so, which is what script-src 'self' is
+            # for; the header is there so that no answer of this origin is
+            # left to a browser's guess. The service worker has a responder
+            # of its own (the cache name is stamped into it), so it is named
+            # here beside two files the static responder serves.
+            for route in ("/sw.js", "/sw-register.js", "/components/shell.js"):
+                status, headers, _ = _request(port, "GET", route)
+                if status != 200:
+                    failures.append(f"{route}: status {status}, expected 200")
+                if (headers.get("X-Content-Type-Options") or "").lower() != "nosniff":
+                    failures.append(f"{route}: sniffing is not forbidden")
+            print("ok: the dashboard's own scripts forbid sniffing, the service worker included")
         finally:
             for s in (server, gw_server, store_server):
                 s.shutdown()
