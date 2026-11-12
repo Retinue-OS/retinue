@@ -960,10 +960,26 @@ the name field's placeholder.
 Both are applied when the gateway serves the file — the baked webapp is never
 edited — and both are folded into the service worker's shell hash, so a change
 reaches installed clients like any shell edit, and a change on the Settings
-page reaches the very next response. An already-installed PWA may keep its old
-home-screen label and icon until the browser refreshes the manifest (Chrome
-checks about daily); reinstalling applies it at once. The Android shell is not
-held up by that: it fetches the manifest itself.
+page reaches the very next response.
+
+**The colour is in the icon URLs too.** An installed app keeps the icon it
+fetched for a URL: desktop Chrome, since 143 ("predictable app updating"),
+refreshes an installed PWA's icons only when the manifest names other icon
+URLs, and the Windows taskbar, the Start menu and the macOS dock show the
+shortcut icons Chrome made from those at install. So with a colour in force
+every icon reference the shell makes carries it as a version —
+`/icons/icon-192.png?v=cb6cfe` in the manifest, in every page's `rel="icon"`
+and `apple-touch-icon` link, and in the service worker's precache list and
+notification icon. The gateway ignores the query and serves the colour in
+force. A new colour means new URLs, which the browser takes as a new icon the
+next time it checks the manifest (on a launch of the app; Chrome may ask the
+user to confirm a changed icon). The stock colour keeps the plain URLs.
+
+An already-installed PWA may keep its old home-screen label and icon until the
+browser has checked the manifest; reinstalling applies it at once. A pinned
+taskbar entry that still shows the old icon after Chrome's update is Windows'
+icon cache; unpinning and pinning it again refreshes it. The Android shell is
+not held up by any of that: it fetches the manifest itself.
 
 ## The settings page
 

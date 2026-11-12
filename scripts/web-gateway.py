@@ -1389,6 +1389,9 @@ def _news_ingest_authorized(provided: str) -> bool:
 
 # Recoloured icons, keyed by (path, colour): the recolouring is a pure-Python
 # pixel pass, so it runs once per icon per configured colour, not per request.
+# The pages and the manifest name them with the colour as a version
+# (/icons/icon-192.png?v=cb6cfe); the query is not read here, the colour in
+# force is what is served.
 _BRANDED_ICON_CACHE: dict[tuple[str, str], bytes] = {}
 
 # Where the Android app serves its own settings page from (a reserved address
@@ -9591,13 +9594,16 @@ class Handler(BaseHTTPRequestHandler):
         the browser to install the new worker and drop the stale cache. The file
         (baked, read-only) is never mutated on disk — the substitution is done on
         the response only. Served no-cache so the worker itself is always
-        revalidated."""
+        revalidated. With an instance colour in force, its icon paths (the
+        precache list, the notification icon) carry the colour like every
+        other icon reference (instance_branding.brand_icon_refs)."""
         sw = WEBAPP_DIR / "sw.js"
         try:
             text = sw.read_text(encoding="utf-8")
         except OSError:
             return False
-        body = text.replace("__SHELL_HASH__", _shell_hash()).encode("utf-8")
+        text = instance_branding.brand_icon_refs(text.replace("__SHELL_HASH__", _shell_hash()))
+        body = text.encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "text/javascript; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
