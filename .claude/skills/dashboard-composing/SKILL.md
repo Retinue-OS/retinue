@@ -216,8 +216,11 @@ number is (several contacts match, two numbers and no hint which).
   Android lets no app call those directly: the dialer opens with it and needs a
   tap. Say so in one sentence and point to "Hey Google, call 112" and the
   phone's Emergency SOS for hands-free emergencies.
-- A **service code** (any number with `*` or `#`, such as `*#06#`) always
+- A **service code** (any number with `*` or `#`, such as `*100#`) always
   opens the dialer too, which waits for the user's tap; say so.
+- The number needs **3 to 20 digits** (`*` and `#` do not count). With fewer
+  than 3, such as `*#06#`, the directive is no call and stays plain text: no
+  call is placed and no dialer opens, so never promise one.
 - The number as you have it; spaces, dashes, dots and brackets are fine. The
   name may contain neither `|` nor `]`; with no name and the flag, leave the
   name empty (`[[call: 112 | | no-voice-cancel]]`). One directive per

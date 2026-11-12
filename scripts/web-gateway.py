@@ -5220,6 +5220,29 @@ _LINT_SYSTEM_PROMPT = (
 # unchanged), or a `/path` token (relative URLs like /sends).
 _LINT_URLISH_RE = re.compile(r"https?://|\w\.\w|/\w")
 
+# A fence line as the thread's block pass finds one (FENCE_RE in
+# webapp/components/markdown.js): ``` or ~~~, optionally with a language.
+_LINT_FENCE_RE = re.compile(r"^(?:```|~~~)\s*([\w.+-]*)\s*$", re.ASCII)
+_LINT_CODE_SPAN_RE = re.compile(r"`[^`]+`")
+
+
+def _live_call_directives(text: str) -> list:
+    """The call directives in `text` that the thread would act on, in order:
+    those outside code, found the way callOf() (webapp/components/markdown.js)
+    finds them. A fence runs from an opening ``` or ~~~ line to the next fence
+    line of either kind, or to the end of the text when none closes it, and
+    code spans are dropped after the fences, so one quoted either way is an
+    example the bubble shows literally rather than a call."""
+    kept, fenced = [], False
+    for line in text.split("\n"):
+        if _LINT_FENCE_RE.match(line):
+            fenced = not fenced
+        elif not fenced:
+            kept.append(line)
+    prose = _LINT_CODE_SPAN_RE.sub(" ", "\n".join(kept))
+    return [m.group(0) for m in attention_store.CALL_MARKUP_RE.finditer(prose)]
+
+
 def _lint_presentation(text: str, *, kind: str = "chat") -> str:
     """Enforce the dashboard-composing form on an agent→user message.
 
@@ -5290,9 +5313,14 @@ def _lint_presentation(text: str, *, kind: str = "chat") -> str:
     # reads the reply raw, quoted mail or web text included. That it never
     # adds, changes or removes one is therefore not left to its prompt: a
     # result whose directives differ from the original's in any way is not
-    # delivered.
-    if ([m.group(0) for m in attention_store.CALL_MARKUP_RE.finditer(raw)]
-            != [m.group(0) for m in attention_store.CALL_MARKUP_RE.finditer(linted)]):
+    # delivered. The directives compared are the live ones, outside code: the
+    # text of a quoted directive survives a lint that only drops its
+    # backticks or fence lines, and the call it then becomes would be placed.
+    # The count of all of them, quoted ones included, is compared as well, so
+    # the lint cannot add or drop a quoted one either.
+    if (_live_call_directives(raw) != _live_call_directives(linted)
+            or len(attention_store.CALL_MARKUP_RE.findall(raw))
+            != len(attention_store.CALL_MARKUP_RE.findall(linted))):
         print("[web-gateway] presentation lint changed a call directive — "
               "delivering the text unchanged", flush=True)
         return text

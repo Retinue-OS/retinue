@@ -56,6 +56,9 @@ ok('a written number becomes a dialable one', () => {
 
 ok('anything else is not a number', () => {
   assert.equal(callNumber('12'), null);
+  // A service code counts its digits too: the skill's example of one that
+  // is no call (dashboard-composing).
+  assert.equal(callNumber('*#06#'), null);
   assert.equal(callNumber('123456789012345678901'), null);
   assert.equal(callNumber('+41 79 abc'), null);
   assert.equal(callNumber('tel:+41791234567'), null);

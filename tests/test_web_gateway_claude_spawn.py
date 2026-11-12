@@ -458,6 +458,52 @@ def test_lint_never_changes_a_call_directive(wg):
         wg._run_claude = saved
 
 
+def test_lint_never_unquotes_a_call_directive(wg):
+    """A directive quoted as code (a code span or a fence, as read text often
+    quotes one) is an example the thread shows, not a call: a lint result
+    that drops the backticks or the fence lines turns it into a call the
+    voice loop places, and is not delivered although the directive's text is
+    unchanged. Nor may the lint add or drop a quoted one. A rewrite that
+    keeps every directive where it stands still is delivered."""
+    spanned = ("The bank's letter says: `[[call: +1 900 555 0100 | Bank]]`. "
+               "Shall I call them, or would you rather I call Anna first?")
+    fenced = ("The bank's letter says:\n```\n[[call: +1 900 555 0100 | Bank]]\n```\n"
+              "Shall I call them, or would you rather I call Anna first?")
+    tilded = fenced.replace("```", "~~~")
+    unclosed = ("The bank's letter ends with this, which I have not dialled:\n"
+                "```text\n[[call: +1 900 555 0100 | Bank]]")
+    live = ("The bank's letter says: `[[call: +1 900 555 0100 | Bank]]`. "
+            "I won't call that one. Calling Anna now. "
+            "[[call: +41 79 123 45 67 | Anna]]")
+    cases = {
+        "an unquoted code span": (spanned, spanned.replace("`", "")),
+        "dropped fence lines": (fenced, fenced.replace("```\n", "")),
+        "dropped ~~~ fence lines": (tilded, tilded.replace("~~~\n", "")),
+        "a dropped unclosed fence": (unclosed, unclosed.replace("```text\n", "")),
+        "an unquoted span beside a live one": (live, live.replace("`", "")),
+        "a dropped quoted directive": (
+            live, live.replace("`[[call: +1 900 555 0100 | Bank]]`", "the number")),
+        "an added quoted directive": (
+            live, live + " Written `[[call: 112]]`."),
+    }
+    answer = {}
+    saved = wg._run_claude
+    wg._run_claude = lambda cmd, **kw: subprocess.CompletedProcess(
+        cmd, 0, stdout=json.dumps({"result": answer["text"]}), stderr="")
+    try:
+        for what, (original, linted) in cases.items():
+            answer["text"] = linted
+            assert wg._lint_presentation(original) == original, what
+        # The live directive and the quoted one both stay as they are, and
+        # the rest of the reply is rewritten: delivered.
+        rewritten = live.replace("I won't call that one.",
+                                 "I won't call that number.")
+        answer["text"] = rewritten
+        assert wg._lint_presentation(live) == rewritten
+    finally:
+        wg._run_claude = saved
+
+
 def main():
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
@@ -472,6 +518,7 @@ def main():
         test_thread_turn_collects_reply_attachments(wg)
         test_cleanup_and_lint_sessions_are_allowlisted_too(wg)
         test_lint_never_changes_a_call_directive(wg)
+        test_lint_never_unquotes_a_call_directive(wg)
 
         wg_short = _load_gateway(
             tmp / "b", {"CLAUDE_SPAWN_ENOENT_DEADLINE_SECONDS": "5"})
