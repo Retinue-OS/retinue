@@ -2915,6 +2915,7 @@ def _conv_add_message(cid: str, role: str, text: str, *,
                       agent: str | None = None,
                       context: str | None = None,
                       shell_actions_: list[dict] | None = None,
+                      reply_to: str | None = None,
                       via_edge: bool = False,
                       wake: bool = False) -> dict | None:
     """Append a message to a thread and update its flags. Returns the thread.
@@ -2930,7 +2931,12 @@ def _conv_add_message(cid: str, role: str, text: str, *,
     after whatever `attachments` stores. `shell_actions_` are the validated
     shell actions (text for the user's paired keyboard device) Ara's reply
     carries — scripts/shell_actions.py; the dashboard hands them to the
-    Android app.
+    Android app. `reply_to` is the id of the user message such a reply
+    answers: when any user message stands after it by the time the reply is
+    stored, the user wrote again while the turn ran ("no, don't type that"),
+    so none of the actions runs without a tap (`auto` False). That is
+    checked here, under the lock, so no message can land between the check
+    and the append.
 
     `wake` marks an append that carries something new for the user (an agent
     filing an inbound message into an existing thread). Such an append
@@ -2966,6 +2972,15 @@ def _conv_add_message(cid: str, role: str, text: str, *,
             message["context"] = context
         if shell_actions_:
             message["shell_actions"] = list(shell_actions_)
+            if reply_to is not None:
+                thread = [m for m in conv.get("messages", []) if isinstance(m, dict)]
+                ids = [_conv_message_id(m) for m in thread]
+                # A message the reply answers that is no longer found leaves
+                # nothing to tell the newer ones by, so all of them count.
+                later = thread[ids.index(reply_to) + 1:] if reply_to in ids else thread
+                if any(m.get("role") == "user" for m in later):
+                    message["shell_actions"] = [dict(a, auto=False)
+                                                for a in shell_actions_]
             if any(a.get("sensitive") for a in shell_actions_):
                 # The file loses the text by itself even if nobody reads the
                 # thread again; a restart in between is covered by
@@ -3765,6 +3780,7 @@ def _conv_worker(cid: str, session_key: str, *, arrival: str | None = None,
     skipped = False
     reply_atts: list[dict] = []
     reply_actions: list[dict] = []
+    reply_to: str | None = None
     with _conv_pending_lock:
         _conv_pending_turns[cid] = _conv_pending_turns.get(cid, 0) + 1
     try:
@@ -3892,6 +3908,13 @@ def _conv_worker(cid: str, session_key: str, *, arrival: str | None = None,
                 action["auto"] = bool(i == 0 and thread_auto
                                       and shell_actions.runs_by_itself(action)
                                       and _conv_text_was_shown(shown, action.get("text")))
+            # Those marks were decided on the thread as the turn found it. A
+            # user message that lands after the one this turn answered (the
+            # newest it covered, else the one it was started for) is a word
+            # the reply never read, perhaps "no, don't type that":
+            # _conv_add_message then holds every action for a tap, checked
+            # under the lock it appends with.
+            reply_to = covered[0] or target_id
             if any(a.get("sensitive") for a in reply_actions):
                 # A title derived from the user's message may carry the very
                 # text typed; it reaches the thread list and every push.
@@ -3930,6 +3953,7 @@ def _conv_worker(cid: str, session_key: str, *, arrival: str | None = None,
                              pending=bool(still_running),
                              stored_attachments=reply_atts,
                              shell_actions_=reply_actions,
+                             reply_to=reply_to,
                              model_name=result.get("model_name"),
                              cost_usd=result.get("cost_usd"))
     if not still_running:
@@ -10995,7 +11019,11 @@ class Handler(BaseHTTPRequestHandler):
     def _via_edge(self) -> bool:
         """Whether this request came through the reverse proxy — quietly, for
         marking what it writes (see _request_from_edge for the refusing gate
-        and what the distinction is worth)."""
+        and what the distinction is worth). A request another site's page
+        made the browser send also passes the reverse proxy, with the user's
+        credentials, but its words are not the user's: it is never marked."""
+        if not self._claude_auth_same_origin():
+            return False
         try:
             peer = self.client_address[0]
         except Exception:  # noqa: BLE001
@@ -12550,6 +12578,11 @@ class Handler(BaseHTTPRequestHandler):
 
     def _handle_conversation_create(self) -> None:
         """User opens a new thread from the dashboard and Ara replies (async)."""
+        # Another site's page could otherwise post words in the user's name
+        # (a text/plain form body that is valid JSON needs no preflight).
+        if not self._claude_auth_same_origin():
+            self._send_json(403, {"error": "cross-site request rejected"})
+            return
         payload = self._read_json_body()
         if payload is None:
             self._send_json(400, {"error": "invalid JSON"})
@@ -12595,6 +12628,9 @@ class Handler(BaseHTTPRequestHandler):
 
     def _handle_conversation_reply(self, cid: str) -> None:
         """User replies within an existing thread; Ara answers (async)."""
+        if not self._claude_auth_same_origin():   # see _handle_conversation_create
+            self._send_json(403, {"error": "cross-site request rejected"})
+            return
         payload = self._read_json_body()
         if payload is None:
             self._send_json(400, {"error": "invalid JSON"})
@@ -12631,7 +12667,11 @@ class Handler(BaseHTTPRequestHandler):
         keeps its kind, id and marks, so the page can say "Text deleted" and
         nothing can type it again. Behind the dashboard's own auth like every
         /conversations/ call, and only through the reverse proxy: what the
-        page saw happen is the page's to say, not an in-container caller's."""
+        page saw happen is the page's to say, not an in-container caller's,
+        nor another site's page (it could purge a code before it is typed)."""
+        if not self._claude_auth_same_origin():
+            self._send_json(403, {"error": "cross-site request rejected"})
+            return
         ok, reason = self._request_from_edge(f"shell-action outcome for {cid}")
         if not ok:
             self._send_json(403, {"error": "forbidden", "reason": reason})
@@ -13390,13 +13430,15 @@ class Handler(BaseHTTPRequestHandler):
         self._send_json(200, body)
 
     def _claude_auth_same_origin(self) -> bool:
-        """CSRF guard for the sign-in endpoints. The dashboard's basic-auth
+        """CSRF guard for the sign-in endpoints and for the conversation
+        endpoints whose messages count as the user's own (`via_edge`, which
+        lets a turn type on the paired device). The dashboard's basic-auth
         credential is ambient — the browser attaches it to cross-site requests
-        too — and these POSTs change authentication state and can restart the
-        container. Every current browser stamps Sec-Fetch-Site; when the
-        header is absent (curl, older engines) we allow, which is the status
-        quo of the other POST routes."""
-        site = self.headers.get("Sec-Fetch-Site", "")
+        too — and these POSTs change authentication state, can restart the
+        container, or speak for the user. Every current browser stamps
+        Sec-Fetch-Site; when the header is absent (curl, older engines) we
+        allow, which is the status quo of the other POST routes."""
+        site = (self.headers.get("Sec-Fetch-Site") or "").strip().lower()
         return site in ("", "same-origin", "none")
 
     def _handle_claude_login_start(self) -> None:

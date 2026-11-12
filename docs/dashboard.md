@@ -1071,7 +1071,11 @@ phone types it there.
   actions go with her discarded reply; outside a thread turn the CLI refuses.
   Only a turn the **user** started **from the dashboard** gets the manifest
   (`_conv_turn_may_type`): its message came through the reverse proxy
-  (`via_edge`, set by the dashboard's own endpoints), so neither a chat
+  (`via_edge`, set by the dashboard's own endpoints, never for a request
+  another site's page made the browser send, `Sec-Fetch-Site` other than
+  `same-origin` or `none`: `POST /conversations`, `…/<id>/messages` and the
+  outcome call below answer it 403, as the sign-in endpoints do), so
+  neither a chat
   arrival — someone else's words — nor a "user" message an in-container
   agent posted can make the phone type; the gateway drops any action such a
   turn produced anyway. It is decided again once the turn holds the session
@@ -1099,12 +1103,18 @@ phone types it there.
   turn itself posted, types by itself — and only a reply's first action, so
   no text is put together from pieces, and none is typed ahead of an earlier
   action that waits for a tap (an Enter confirmed later would run a line the
-  user never saw; the page, too, runs no later one by itself). What plain
+  user never saw; the page, too, runs no later one by itself) — and none
+  at all when the user wrote again while the turn ran: if any user message
+  stands after the one the reply answers (the newest it covered, else the
+  one it was started for) by the time the reply is stored, every action
+  waits for a tap, since that message ("no, don't type that") was never read
+  by the reply; `_conv_add_message` checks it under the lock it appends
+  with, so none can land in between. What plain
   characters do is the device's affair: a letter can be an app's shortcut
   there, which is why a piece of a line does not count — and, once the page reports
   it, `outcome` (`{state: typed | error | secret-typed | secret-cancelled,
   error?, at}`, `POST /conversations/<id>/shell-actions/<action id>/outcome`,
-  through the reverse proxy only). An action once typed stays typed: a later
+  through the reverse proxy only, never cross-site). An action once typed stays typed: a later
   Retype that does not type (a confirmation declined, say) is kept beside it
   as `last_attempt` and told to Ara as *typed (a later retype: …)*, since
   what the first one did on the device stands (`shell_actions.record_outcome`).
