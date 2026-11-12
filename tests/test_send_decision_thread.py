@@ -165,6 +165,7 @@ class _FakeSendHandler:
         self.redirected_to = None
         self.client_address = ("172.19.0.4", 51234)
         self.connection = _FakeConnection()
+        self.headers = {}
 
     def _send_html(self, status, body):
         self.html = (status, body)
@@ -175,6 +176,7 @@ class _FakeSendHandler:
 
 def test_email_decisions_are_noted(wg):
     _FakeSendHandler._request_from_edge = wg.Handler._request_from_edge
+    _FakeSendHandler._claude_auth_same_origin = wg.Handler._claude_auth_same_origin
     cid = wg._new_conv("user", "me", "Mail", "user", "reply to the landlord")["id"]
     approved = {"approved": "42", "sent": True, "to": ["landlord@example.com"],
                 "subject": "Re: Rent", "saved_to_sent": True,

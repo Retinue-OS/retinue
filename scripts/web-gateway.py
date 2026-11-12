@@ -11303,7 +11303,12 @@ class Handler(BaseHTTPRequestHandler):
         POST .../approve here would simply queue its own send and then approve
         it, which would leave the send gate closing nothing at all. Reject is
         gated too — it cannot cause a send, but suppressing a message the user
-        meant to allow is equally not an agent's call."""
+        meant to allow is equally not an agent's call. Another site's page
+        is refused before that: it reaches here through the proxy with the
+        user's credentials, so the edge gate alone would let it decide."""
+        if not self._claude_auth_same_origin():
+            self._send_json(403, {"error": "cross-site request rejected"})
+            return
         ok, reason = self._request_from_edge(
             f"{verb} of pending send {account}/{request_id}")
         if not ok:
@@ -11984,7 +11989,11 @@ class Handler(BaseHTTPRequestHandler):
         if chat_id is None:
             return
         # Erasure is the user's own act, like a send: an agent can archive or
-        # mute, never destroy. Same edge-origin gate as POST /chats/<id>/send.
+        # mute, never destroy. Same gates as POST /chats/<id>/send, the
+        # cross-site one included.
+        if not self._claude_auth_same_origin():
+            self._send_json(403, {"error": "cross-site request rejected"})
+            return
         ok, reason = self._request_from_edge(f"chat delete of {chat_id}")
         if not ok:
             self._send_json(403, {
@@ -12159,6 +12168,13 @@ class Handler(BaseHTTPRequestHandler):
         it without waiting for the store."""
         chat_id = self._chat_id_or_404(raw_id)
         if chat_id is None:
+            return
+        # Another site's page can make the browser POST here through the proxy
+        # with the user's credentials (a text/plain form body that is valid
+        # JSON needs no preflight), and its peer is then the proxy's: the edge
+        # gate below cannot tell it from the send press.
+        if not self._claude_auth_same_origin():
+            self._send_json(403, {"error": "cross-site request rejected"})
             return
         ok, reason = self._request_from_edge(f"chat send to {chat_id}")
         if not ok:
@@ -14060,9 +14076,11 @@ class Handler(BaseHTTPRequestHandler):
         self._send_json(200, body)
 
     def _claude_auth_same_origin(self) -> bool:
-        """CSRF guard for the sign-in endpoints and for the conversation
+        """CSRF guard for the sign-in endpoints, for the conversation
         endpoints whose messages count as the user's own (`via_edge`, which
-        lets a turn type on the paired device). The dashboard's basic-auth
+        lets a turn type on the paired device), and for the endpoints that act
+        with the user's own authority (a chat send or delete, a pending send's
+        approve or reject; see _request_from_edge). The dashboard's basic-auth
         credential is ambient — the browser attaches it to cross-site requests
         too — and these POSTs change authentication state, can restart the
         container, or speak for the user. Every current browser stamps

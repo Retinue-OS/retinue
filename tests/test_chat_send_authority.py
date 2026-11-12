@@ -16,7 +16,8 @@ end, in tests/test_chat_api.py.
 What is covered here is the second, lesser layer: POST /chats/<id>/send and the
 /sends approve action refuse a request that did not arrive through the reverse
 proxy, decided on the TCP peer address and failing closed on anything it cannot
-classify. This was once meant to be the guarantee and is not — the endpoint's
+classify, and one another site's page made the browser send through it
+(Sec-Fetch-Site). This was once meant to be the guarantee and is not — the endpoint's
 old justification ("it sits behind the edge auth") was simply false, since that
 auth is a forward-auth Traefik consults and an in-container caller is never
 asked for it. It is kept as defence in depth: it closes the obvious path and
@@ -117,10 +118,11 @@ def _load_gateway(tmp: Path, gw_port: int):
     return mod
 
 
-def _http(base, method, path, body=None):
+def _http(base, method, path, body=None, headers=None):
     data = json.dumps(body).encode("utf-8") if body is not None else None
     req = urllib.request.Request(base + path, data=data, method=method,
-                                 headers={"Content-Type": "application/json"})
+                                 headers={"Content-Type": "application/json",
+                                          **(headers or {})})
     try:
         with urllib.request.urlopen(req, timeout=10) as resp:
             return resp.status, resp.read().decode("utf-8")
@@ -281,6 +283,42 @@ def test_dashboard_send_still_works(base, wg):
     print("PASS test_dashboard_send_still_works")
 
 
+def test_another_sites_request_is_refused(base, wg):
+    """A page on another site the user happens to visit can make the browser
+    POST here through the proxy, with the user's ambient credentials (a
+    text/plain form whose body is valid JSON needs no preflight). The peer is
+    then the proxy's, so the edge gate alone would let it send, release or
+    drop a pending send, or erase a chat in the user's name. Sec-Fetch-Site
+    tells it apart from the dashboard's own page."""
+    GW_SEEN.clear()
+    saved = wg._EDGE_PEER_NETS
+    try:
+        wg._EDGE_PEER_NETS = wg._parse_edge_peers("127.0.0.1")
+        for site in ("cross-site", " Same-Site "):
+            cross = {"Sec-Fetch-Site": site}
+            status, body = _http(base, "POST", f"/chats/{_quote(CHAT)}/send",
+                                 {"text": "geht raus"}, cross)
+            assert status == 403, (site, status, body)
+            assert json.loads(body)["error"] == "cross-site request rejected", body
+            for verb in ("approve", "reject"):
+                status, body = _http(base, "POST",
+                                     f"/sends/signal-gateway/deadbeef/{verb}",
+                                     None, cross)
+                assert status == 403, (site, verb, status, body)
+            status, body = _http(base, "POST", f"/chats/{_quote(CHAT)}/delete",
+                                 None, cross)
+            assert status == 403, (site, status, body)
+        assert GW_SEEN == [], "a gateway was asked to act for another site"
+        # The dashboard's own page still sends.
+        status, body = _http(base, "POST", f"/chats/{_quote(CHAT)}/send",
+                             {"text": "geht raus"}, {"Sec-Fetch-Site": "same-origin"})
+        assert status == 200, (status, body)
+    finally:
+        wg._EDGE_PEER_NETS = saved
+    assert len(GW_SEEN) == 1, GW_SEEN
+    print("PASS test_another_sites_request_is_refused")
+
+
 def main():
     gw = _serve(_MockGateway)
     with tempfile.TemporaryDirectory() as tmp:
@@ -298,6 +336,7 @@ def main():
             test_delete_from_inside_the_container_is_refused(base, wg)
             test_approving_a_pending_send_is_refused(base, wg)
             test_dashboard_send_still_works(base, wg)
+            test_another_sites_request_is_refused(base, wg)
         finally:
             server.shutdown()
     gw.shutdown()
