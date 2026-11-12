@@ -874,7 +874,9 @@ both processes needing the vocabulary import, each keeping its own cache:
   (`DICTATION_HOTWORD_CHARS`) and each rank gets a share of that budget
   (`HOTWORD_SHARES`) — otherwise a store full of people would crowd the
   medications out entirely. Only names' *words* are used (runs of three or more
-  letters in any script), since Whisper matches hotwords word-wise.
+  letters in any script, two for Han, Kana and Hangul, where two characters are
+  a whole name; combining vowel signs as in Devanagari or Thai belong to the
+  word), since Whisper matches hotwords word-wise.
 - the **web gateway** hands the whole names to the cleanup pass below as
   **spelling hints**.
 
@@ -958,11 +960,11 @@ Language handling (constrain detection to the languages the user speaks, and
 re-decode when a guess falls outside that set — carrying the same hotwords and
 settings into the second pass) lives entirely in the service.
 `STT_SUPPORTED_LANGUAGES` states the set outright; left unset it is the **union**
-of what the messenger channels declare (`SIGNAL_`/`WHATSAPP_`/`TELEGRAM_
-SUPPORTED_LANGUAGES`), because this one model transcribes for all of them and no
-single channel's setting speaks for the deployment. An optional `STT_TOKEN` gates the endpoint
-(defence-in-depth; the service is not published to the host). Downloaded model
-weights persist in the `stt-models` volume.
+of what the messenger channels declare (the `*_SUPPORTED_LANGUAGES` settings of
+Signal, WhatsApp and Telegram), because this one model transcribes for all of
+them and no single channel's setting speaks for the deployment. An optional
+`STT_TOKEN` gates the endpoint (defence-in-depth; the service is not published
+to the host). Downloaded model weights persist in the `stt-models` volume.
 
 ## Several instances: name and colour
 

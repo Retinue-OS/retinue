@@ -36,6 +36,7 @@ import os
 import re
 import threading
 import time
+import unicodedata
 import urllib.parse
 import urllib.request
 
@@ -87,7 +88,9 @@ SELECT DISTINCT ?rank ?name WHERE {
   }
   ?s rdf:type ?cls ; ?np ?name .
   FILTER(isLiteral(?name))
-  FILTER(STRLEN(STR(?name)) > 2 && STRLEN(STR(?name)) < 60)
+  # Two characters are a whole name in Han, Kana and Hangul (see _IDEOGRAPHIC).
+  FILTER((STRLEN(STR(?name)) > 2 || REGEX(STR(?name), "[@IDEOGRAPHIC@]"))
+         && STRLEN(STR(?name)) < 60)
   # Some vocabularies use a name predicate for a whole descriptive phrase; a
   # label with that many words is not a proper noun anyone dictates.
   FILTER(STRLEN(STR(?name)) - STRLEN(REPLACE(STR(?name), " ", "")) < 5)
@@ -95,10 +98,46 @@ SELECT DISTINCT ?rank ?name WHERE {
 ORDER BY ?rank ?name
 """
 
-# Runs of at least three letters, in any script: a language-agnostic way to take
-# the dictatable words out of a name and leave numbers and honorifics ("Dr.")
-# behind. Whisper matches hotwords as words, so word pieces are the right unit.
-_WORD_RE = re.compile(r"[^\W\d_]{3,}", re.UNICODE)
+# Scripts in which one character carries a syllable or a whole word, so a name
+# of two characters (王芳, 田中) is ordinary where two Latin letters are not.
+# One class serves both the store query and the word extraction below, so a name
+# the query lets through is a name the extraction can use.
+_IDEOGRAPHIC = ("\u1100-\u11ff\u3040-\u30ff\u3130-\u318f\u31f0-\u31ff"
+                "\u3400-\u4dbf\u4e00-\u9fff\uac00-\ud7af\uf900-\ufaff"
+                "\uff66-\uff9f")
+NAME_QUERY = NAME_QUERY.replace("@IDEOGRAPHIC@", _IDEOGRAPHIC)
+_IDEOGRAPHIC_RE = re.compile(f"[{_IDEOGRAPHIC}]")
+
+
+def _words(name: str) -> list[str]:
+    """The dictatable words of a name, in any script: runs of letters, with
+    numbers, punctuation and honorific stops ("Dr.") left behind. Whisper
+    matches hotwords as words, so word pieces are the right unit.
+
+    A run needs three letters, or two when it is Han, Kana or Hangul. Combining
+    marks belong to the run but do not count as letters: the vowel signs of
+    Devanagari or Thai (हिन्दी, สวัสดี) and a decomposed accent are marks, and
+    a pattern built on \\w would split the word at every one of them.
+    """
+    words: list[str] = []
+    run: list[str] = []
+
+    def flush() -> None:
+        word = "".join(run)
+        run.clear()
+        letters = sum(unicodedata.category(c).startswith("L") for c in word)
+        if letters >= (2 if _IDEOGRAPHIC_RE.search(word) else 3):
+            words.append(word)
+
+    for char in name:
+        if unicodedata.category(char)[0] in "LM":
+            run.append(char)
+        elif run:
+            flush()
+    if run:
+        flush()
+    return words
+
 
 _cache: tuple[float, list[str], str] | None = None
 _lock = threading.Lock()
@@ -132,7 +171,7 @@ def hotword_string(ranked: list[tuple[int, str]], max_chars: int = HOTWORD_CHARS
         share = HOTWORD_SHARES.get(rank, 0.0)
         budget = min(max_chars, budget + round(share * max_chars))
         for word in (w for r, name in ranked if r == rank
-                     for w in _WORD_RE.findall(name)):
+                     for w in _words(name)):
             key = word.casefold()
             if key in seen:
                 continue

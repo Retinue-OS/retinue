@@ -83,6 +83,40 @@ def test_names_are_deduplicated_and_normalized():
     assert hotwords == "Mira Halloran Zolabin", hotwords
 
 
+def test_words_of_scripts_with_combining_vowel_signs():
+    """Devanagari and Thai write vowels as combining marks, which are not word
+    characters to a \\w pattern: it split these names into fragments below the
+    length floor, so they contributed no hotword at all."""
+    dv = _load_vocabulary()
+    assert dv._words("हिन्दी") == ["हिन्दी"], dv._words("हिन्दी")
+    assert dv._words("สวัสดี") == ["สวัสดี"], dv._words("สวัสดี")
+    # Marks alone are no word, digits and underscores still end one, and an
+    # accent written as a combining mark does not split a Latin name.
+    assert dv._words("\u093f\u094d \u0e31") == [], dv._words("\u093f\u094d")
+    assert dv._words("Zolabin_10mg") == ["Zolabin"], dv._words("Zolabin_10mg")
+    assert dv._words("Jose\u0301 Dr.") == ["Jose\u0301"], dv._words("Jose\u0301 Dr.")
+    assert dv.hotword_string([(1, "हिन्दी"), (1, "สวัสดี Mira")], 100) == \
+        "हिन्दी สวัสดี Mira"
+
+
+def test_two_character_cjk_names_are_names():
+    """Two characters are a whole name in Han, Kana and Hangul, where the
+    three-letter floor that suits cased alphabets would discard them; the store
+    query lets them through for the repair model as well."""
+    dv = _load_vocabulary()
+    assert dv._words("王芳") == ["王芳"] and dv._words("田中") == ["田中"]
+    assert dv._words("さくら") == ["さくら"] and dv._words("김민수") == ["김민수"]
+    # The relaxed floor is for those scripts only: a Latin pair stays out.
+    assert dv._words("Li Wu") == [], dv._words("Li Wu")
+    assert dv._words("王") == [], "one character is below the floor in any script"
+    assert dv.hotword_string([(1, "王芳 Mira"), (1, "田中")], 100) == "王芳 Mira 田中"
+    assert "REGEX(STR(?name), \"[" in dv.NAME_QUERY and "\u4e00-\u9fff" in dv.NAME_QUERY
+    assert "@IDEOGRAPHIC@" not in dv.NAME_QUERY
+    dv._bindings = lambda q: _bindings("王芳", "田中")
+    names, hotwords = dv.vocabulary()
+    assert names == ["王芳", "田中"] and hotwords == "王芳 田中", (names, hotwords)
+
+
 def test_unreachable_store_fails_open():
     dv = _load_vocabulary()
 
@@ -390,6 +424,8 @@ def test_gateway_hints_come_from_the_same_module():
 def main():
     test_vocabulary_from_the_store_and_its_cache()
     test_names_are_deduplicated_and_normalized()
+    test_words_of_scripts_with_combining_vowel_signs()
+    test_two_character_cjk_names_are_names()
     test_unreachable_store_fails_open()
     test_hotword_budget_is_respected()
     test_every_rank_gets_a_share_of_the_budget()
