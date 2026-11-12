@@ -300,6 +300,84 @@ def test_reconnect_backoff():
         assert fake.disconnects == 2
 
 
+def _run_fake_bridge(wg):
+    """Run _start_bridge() against a stand-in neonize and return the handlers it
+    registered, by event class name. The stand-in only records registrations;
+    connect() returns at once, as a bridge whose connection ended would."""
+    import types
+
+    handlers = {}
+
+    class _Client:
+        def __init__(self, *_a, **_kw):
+            pass
+
+        def qr(self, fn):
+            handlers["qr"] = fn
+            return fn
+
+        def event(self, ev):
+            def register(fn):
+                handlers[ev.__name__] = fn
+                return fn
+            return register
+
+        def connect(self):
+            pass
+
+    events = types.ModuleType("neonize.events")
+    for name in ("ConnectedEv", "MessageEv", "PairStatusEv", "DisconnectedEv",
+                 "ClientOutdatedEv", "ConnectFailureEv", "LoggedOutEv"):
+        setattr(events, name, type(name, (), {}))
+    client_mod = types.ModuleType("neonize.client")
+    client_mod.NewClient = _Client
+    fakes = {"neonize": types.ModuleType("neonize"), "neonize.client": client_mod,
+             "neonize.events": events, "segno": types.ModuleType("segno")}
+    saved = {k: sys.modules.get(k) for k in fakes}
+    sys.modules.update(fakes)
+    try:
+        wg._start_bridge()
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                sys.modules.pop(k, None)
+            else:
+                sys.modules[k] = v
+    return handlers
+
+
+def test_client_outdated_survives_the_disconnect_after_it():
+    with tempfile.TemporaryDirectory() as tmp:
+        wg = _load_whatsapp_gateway(tmp)
+        h = _run_fake_bridge(wg)
+        assert {"ClientOutdatedEv", "ConnectFailureEv", "DisconnectedEv"} <= set(h), sorted(h)
+
+        # A 405, then the socket EOF that follows it: /health keeps naming the
+        # 405, not the generic "disconnected".
+        h["ClientOutdatedEv"](None, object())
+        h["DisconnectedEv"](None, object())
+        snap = wg._health_snapshot()
+        assert snap["client_outdated"] is True and snap["connected"] is False
+        assert "outdated (405)" in snap["error"], snap["error"]
+
+        # A later attempt that fails for another reason is no longer a 405.
+        class _Failure:
+            Reason = 503
+            Message = "service unavailable"
+        h["ConnectFailureEv"](None, _Failure())
+        h["DisconnectedEv"](None, object())
+        snap = wg._health_snapshot()
+        assert snap["client_outdated"] is False, snap
+        assert snap["error"] == "WhatsApp refused the connection (reason 503) service unavailable", snap["error"]
+
+        # A successful connect clears both; a plain disconnect after it is generic.
+        wg._set_conn(client_outdated=True)
+        h["ConnectedEv"](None, object())
+        assert wg._health_snapshot()["client_outdated"] is False
+        h["DisconnectedEv"](None, object())
+        assert wg._health_snapshot()["error"] == "bridge disconnected from WhatsApp"
+
+
 def main() -> int:
     tests = [test_iq_wedge_flips_health_after_debounce,
              test_logged_out_wins_over_iq_state,
@@ -311,7 +389,8 @@ def main() -> int:
              test_send_partial_failure_never_resends,
              test_send_exhausted_records_lookup_failure,
              test_send_non_usync_error_propagates,
-             test_reconnect_backoff]
+             test_reconnect_backoff,
+             test_client_outdated_survives_the_disconnect_after_it]
     failures = 0
     for test in tests:
         try:

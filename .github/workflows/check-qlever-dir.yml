@@ -1,0 +1,132 @@
+name: Check qlever-dir release
+
+# qlever-life runs the released qlever-dir image, pinned by version and
+# digest in docker-compose.yml; qlever-dir's versions follow QLever's (see
+# "Versioning" in qlever-dir's README). When a newer release has published
+# its image, open a PR that moves the pin to it.
+
+on:
+  schedule:
+    # Daily at 09:00 UTC, an hour after qlever-dir's own QLever check
+    - cron: "0 9 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+  pull-requests: write
+
+env:
+  IMAGE: ghcr.io/retinue-os/qlever-dir
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Get pinned version
+        id: pinned
+        run: |
+          VERSION=$(grep -oP "^\s*image: ${IMAGE//./\\.}:\K[0-9]+(\.[0-9]+)+(?=@)" docker-compose.yml || true)
+          if [ -z "$VERSION" ]; then
+            echo "Could not read the pinned qlever-dir image from docker-compose.yml" >&2
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Pinned version: $VERSION"
+
+      - name: Get latest release
+        id: latest
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          LATEST=$(gh api repos/Retinue-OS/qlever-dir/releases/latest --jq '.tag_name' | sed 's/^v//')
+          if ! echo "$LATEST" | grep -qE '^[0-9]+(\.[0-9]+)+$'; then
+            echo "Unexpected version format from API: $LATEST" >&2
+            exit 1
+          fi
+          echo "version=$LATEST" >> "$GITHUB_OUTPUT"
+          echo "Latest version: $LATEST"
+
+      - name: Compare versions
+        id: compare
+        env:
+          PINNED: ${{ steps.pinned.outputs.version }}
+          LATEST: ${{ steps.latest.outputs.version }}
+        run: |
+          if [ "$PINNED" = "$LATEST" ] || [ "$(printf '%s\n' "$PINNED" "$LATEST" | sort -V | tail -1)" != "$LATEST" ]; then
+            echo "needs_update=false" >> "$GITHUB_OUTPUT"
+            echo "Already up to date ($PINNED)"
+            exit 0
+          fi
+          # The image is pushed before its release is created, but check
+          # anyway: a missing or private package must not produce a PR.
+          REPO=${IMAGE#ghcr.io/}
+          TOKEN=$(curl -fsSL "https://ghcr.io/token?scope=repository:${REPO}:pull" | jq -r '.token // empty' || true)
+          DIGEST=$(curl -fsSI \
+            -H "Authorization: Bearer ${TOKEN}" \
+            -H "Accept: application/vnd.oci.image.index.v1+json" \
+            -H "Accept: application/vnd.docker.distribution.manifest.list.v2+json" \
+            -H "Accept: application/vnd.oci.image.manifest.v1+json" \
+            -H "Accept: application/vnd.docker.distribution.manifest.v2+json" \
+            "https://ghcr.io/v2/${REPO}/manifests/${LATEST}" \
+            | tr -d '\r' | awk 'tolower($1) == "docker-content-digest:" {print $2}' || true)
+          if ! echo "$DIGEST" | grep -qE '^sha256:[0-9a-f]{64}$'; then
+            echo "::warning::qlever-dir v$LATEST is released, but $IMAGE:$LATEST cannot be pulled anonymously"
+            echo "needs_update=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "needs_update=true" >> "$GITHUB_OUTPUT"
+          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
+          echo "New version available: $LATEST ($DIGEST, pinned: $PINNED)"
+
+      - name: Create bump PR
+        if: steps.compare.outputs.needs_update == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PINNED: ${{ steps.pinned.outputs.version }}
+          LATEST: ${{ steps.latest.outputs.version }}
+          DIGEST: ${{ steps.compare.outputs.digest }}
+        run: |
+          BRANCH="bump/qlever-dir-${LATEST}"
+
+          # Skip if a PR for this release exists, open or closed: closing a
+          # bump PR unmerged means "skip this release".
+          if [ "$(gh pr list --state all --head "$BRANCH" --json number --jq 'length')" -gt 0 ]; then
+            echo "::notice::A PR for $BRANCH already exists (open or closed), skipping"
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git checkout -b "$BRANCH"
+          sed -i -E "s|^(\s*image: ${IMAGE//./\\.}):[^[:space:]]+|\1:${LATEST}@${DIGEST}|" docker-compose.yml
+          git add docker-compose.yml
+          git commit -m "chore(qlever-dir): bump from ${PINNED} to ${LATEST}"
+          git push origin "$BRANCH"
+
+          BODY=$(cat <<EOF
+          Automated bump found by the daily qlever-dir release check.
+
+          - **Previous version:** ${PINNED}
+          - **New version:** ${LATEST} (\`${IMAGE}:${LATEST}@${DIGEST}\`)
+          - **Release notes:** https://github.com/Retinue-OS/qlever-dir/releases/tag/v${LATEST}
+
+          After merging, recreate the life store (\`docker compose up -d qlever-life\`
+          pulls the new image).
+          EOF
+          )
+          NEW_PR=$(gh pr create \
+            --title "chore(qlever-dir): bump from ${PINNED} to ${LATEST}" \
+            --body "$BODY" \
+            --base main \
+            --head "$BRANCH")
+
+          # Close older bump PRs this one supersedes
+          gh pr list --state open --json number,headRefName \
+            --jq ".[] | select(.headRefName | startswith(\"bump/qlever-dir-\")) | select(.headRefName != \"$BRANCH\") | .number" \
+            | while read -r N; do
+                gh pr close "$N" --delete-branch --comment "Superseded by $NEW_PR."
+              done

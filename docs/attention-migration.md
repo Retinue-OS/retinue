@@ -90,7 +90,8 @@ persistent volume) holds:
   interruptible the user is; a deployment edits the file or, later, drives it
   from the calendar.
 - **`profile.json`** — importance priors per sender or kind, lead times per
-  kind, permits per mode, and the learned log. Slice 3 mirrors it as prose the
+  kind, permits per mode, expiry per sender (`docs/dashboard.md`, "Expiry"),
+  and the learned log. Slice 3 mirrors it as prose the
   user can read and edit, as `preferences.md` is for news.
 
 ## The API the home screen uses
@@ -109,7 +110,7 @@ persistent volume) holds:
 | `POST /attention/spheres` `{add}` / `{remove}` / `{sphere, within}` | grow, prune or nest the sphere vocabulary — a word, normalised to an id (`Board Games` → `board-games`, any script); removal is refused while a mode admits it, and the spheres a removed one held move up to the one it lay within. `{sphere, within}` puts a sphere within another (`within: null` lets it stand alone), so whatever admits the outer admits it too; loops are refused, and held items are re-evaluated (`scripts/attention-spheres.py`) |
 | `POST /chats/<id>/contact` `{name, sphere?, tags?, permit?}` | the contact card for a screened stranger: names the chat, moves the bare handle's priors and permits onto the name, sets the sphere and tags on the item and writes the address book. An empty name removes the card |
 | `GET /attention/profile`, `POST /attention/profile` | read and replace the profile and the focus rules |
-| `POST /internal/attention/set` `{id, …}` | an agent declares or revises an item's properties (token-gated; `scripts/attention-set.py`) |
+| `POST /internal/attention/set` `{id, …, sender_sphere?, sender_expiry?}` | an agent declares or revises an item's properties (token-gated; `scripts/attention-set.py`); `sender_expiry` (minutes or `10m`, `2h`, one minute to seven days; `null` clears) makes the sender's messages settle themselves that long after each arrival |
 
 Item ids are the existing ones (`thread:<id>`, `chat:<id>`, the project URI)
 and travel in the body — chat ids and project URIs carry characters no path
@@ -139,9 +140,9 @@ it is configured and where it is tested: `docs/dashboard.md`, "The home".*
   and `profile.json` under `ATTENTION_DIR`.
 - Push obeys the mode: `_push_conv_notification` and `_chat_push_notification`
   ask `attention.on_arrival` first; a held item badges but does not push. The
-  per-device `notification_mode` keeps working as a second filter until slice 2
-  replaces it with the mode (issue #66's four choices collapse to *follow the
-  mode* / *everything* / *off*).
+  per-device `notification_mode` kept working as a second filter behind the
+  model until slice 2 retired it (issue #66's four choices collapse to
+  *notified* / *disabled*).
 - `webapp/components/attention.js` from the prototype's list: rows with the
   preview and the three-field line, the mode chip and menu, the collapsed Held
   and Waiting sections, the details sheet with the corrections. `index.html`
@@ -162,8 +163,10 @@ it is configured and where it is tested: `docs/dashboard.md`, "The home".*
   mode; a manual change is a breakpoint immediately. *Built.*
 - The repeat policy per sender class, applied on the notify rail
   (`attention.repeat_policy`). *Built.*
-- The per-device notification mode stays as a second filter for now;
-  retiring it is the one item of this slice still open.
+- The per-device notification mode is **retired** (`push_notify.py`,
+  `webapp/components/push.js`): the event kinds it filtered on — new,
+  stalled, reply — are gone with it, and the model's decision is the only
+  one. A device is either notified or disabled. *Built.*
 
 **3 — learning**
 
@@ -200,7 +203,9 @@ transcript cleanup does.
    (first from the list's footer, which put them — and each page's way back
    — at the end of a list).
 3. The per-device notification modes stay as the second filter behind the
-   model until a later slice retires them.
+   model until a later slice retires them — retired in slice 2: a filter by
+   event kind, behind a model that decides from what an item is about, only
+   dropped what the model had released.
 4. What a message is worth before anyone has judged it: a person writing
    directly is *active* (held for the next digest; rung at once where they
    hold a permit), a group is chatter (passive, listed). An agent thread

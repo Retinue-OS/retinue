@@ -56,11 +56,11 @@ KB = "https://w3id.org/retinue/kb#"
 T_IN, T_OUT = KB + "InboundMessage", KB + "OutboundMessage"
 BEAT_HOLD_SECONDS = 3.2
 SPEEDS = [(2.0, "×1 — the day in 12 min"), (4.8, "×2 — 5 min"), (12.0, "×5 — 2 min"), (24.0, "×10 — 1 min")]
-# How the phone in the frame names its notification setting: the push
-# opt-in's default (push_notify.DEFAULT_PREFERENCES, webapp/components/push.js).
-PHONE_SETTING = "new & stalled conversations"
-EVENT_WORDS = {"reply": "a reply in an exchange already under way", "stalled": "a stalled conversation",
-               "new": "something new"}
+# How the phone in the frame names its notification setting: a device with the
+# push opt-in's defaults no longer filters anything of its own
+# (push_notify.DEFAULT_PREFERENCES, webapp/components/push.js), so whether a
+# push rings is the attention model's decision and nothing else's.
+PHONE_SETTING = "whatever the attention model lets through"
 
 
 def zero_stats() -> dict:
@@ -527,23 +527,25 @@ class Simulation:
         entry = {"t": self.clock.minute, "who": who, "text": text, **extra}
         self.feed.append(entry)
 
-    def _on_push(self, title, body, url="/", tag=None, mode=None, archived=False, urgency=None, topic=None):
-        # What the gateway sends, then what the phone makes of it: the filter
-        # a device that took the opt-in's defaults stores (push_notify), and
-        # the service worker's tag — a notification replaces one still in the
-        # tray with the same tag (webapp/sw.js).
-        shown = self.wg.push_notify.device_wants(self.wg.push_notify.DEFAULT_PREFERENCES, mode, archived)
+    def _on_push(self, title, body, url="/", tag=None, archived=False, urgency=None, topic=None):
+        # What the gateway sends, then what the phone makes of it: the one
+        # filter a device that took the opt-in's defaults still stores — the
+        # archived opt-out, which the default does not take (push_notify) —
+        # and the service worker's tag, a notification replacing one still in
+        # the tray with the same tag (webapp/sw.js).
+        shown = self.wg.push_notify.device_wants(self.wg.push_notify.DEFAULT_PREFERENCES, archived)
         if shown:
             self._notify_phone(title, body, url, tag or url, urgency, topic == "digest")
-        off = "" if shown else (f" Not on the phone: {EVENT_WORDS.get(mode, mode)}, "
-                                f"and the phone notifies on {PHONE_SETTING}.")
+        off = "" if shown else " Not on the phone: the thread is archived and the phone opted out of those."
         if topic == "digest":
             self.stats["digests"] += 1
             self.say("push", f"{title}: {body.replace(chr(10), '; ')}{off}", urgency=urgency or "normal",
                      digest=True, url=url, phone=shown)
-        elif mode == "reply" and urgency is None:
+        elif urgency is None:
+            # Ara's own reply in a thread the user is in: pushed without the
+            # model's urgency, since they asked for it.
             self.stats["replies"] += 1
-            self.say("reply", f"Ara replied in “{title}” (pushed as a reply).{off}", phone=shown)
+            self.say("reply", f"Ara replied in “{title}”.{off}", phone=shown)
         else:
             self.stats["pushes"] += 1
             self.say("push", f"{title} — {body}{off}", urgency=urgency or "high", phone=shown)

@@ -29,6 +29,7 @@ import urllib.parse
 import urllib.request
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import agent_models  # noqa: E402
 import claude_auth  # noqa: E402
 import session_env  # noqa: E402
 
@@ -101,11 +102,11 @@ def build_prompt(rows: list[dict]) -> str:
         "  - If you can complete the next action now, do it and update the "
         "project file (set current_actor away from the agent, or resolved: true "
         "when done).",
-        "  - If it needs Reto's input, open a dashboard conversation with a "
+        "  - If it needs the owner's input, open a dashboard conversation with a "
         "concrete proposal (conversation-push.py). Do not nag: no thread for "
         "work you can simply do.",
         "  - Route each project to its owning agent: handle Ara's directly; "
-        "dispatch the owning subagent (Ari, Coach, Medic, ...) for theirs and "
+        "dispatch the owning chamber subagent for theirs and "
         "relay/escalate as usual.",
         "",
         "Projects pending on an AI agent:",
@@ -141,6 +142,9 @@ def main() -> int:
            "--permission-mode", PERMISSION_MODE, build_prompt(rows)]
     if CLAUDE_MODEL:
         cmd[2:2] = ["--model", CLAUDE_MODEL]
+    # Per-agent model overrides for the subagents this session dispatches
+    # (scripts/agent_models.py); [] when none is set.
+    cmd[-1:-1] = agent_models.cli_args()
     # The allowlisted environment (scripts/session_env.py), never a copy of
     # this process's own: under the scheduler that is already clean, but run
     # by hand from a session it would not be. It also stamps the session's

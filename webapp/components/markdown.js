@@ -12,8 +12,11 @@
 //           ~~strikethrough~~, `code`
 //
 // Safety: the input is HTML-escaped before any markup is generated, and only
-// http(s)/mailto/tel URLs ever become links (never javascript:). The output is
-// therefore safe to assign to innerHTML.
+// http(s)/mailto/tel URLs and root-relative paths (/sends/…, never //host)
+// ever become links (never javascript:). The output is therefore safe to
+// assign to innerHTML. Links to the dashboard's own origin — a root-relative
+// path always is one — open in place; every other web link opens in a new tab
+// (see anchor()).
 //
 // Rendering hooks let a host specialize without forking the renderer: the
 // conversations card passes a `quote` hook that adds its copy-to-clipboard
@@ -32,10 +35,28 @@ const SEP = String.fromCharCode(1); // sentinel absent from escaped text
 // no longer see either, because the anchor is stashed by then.
 const URL_TAIL_RE = /[.,;:!?)\]*]+$/;
 
+// A link into the dashboard itself — another thread, /sends/…, a project page —
+// navigates in place. In a standalone PWA a target="_blank" link is handed to a
+// browsing context outside the app window, so Ara's link to another thread would
+// open the browser instead of the app (and the back gesture would then leave
+// the PWA instead of returning to the thread). Same-origin is the test, so a
+// link to /#conversation-<id> on the home page is a plain fragment change the
+// conversations card already answers. Loading another page this way costs
+// nothing the user put in and has not sent: it waits in its field for the
+// next visit (drafts.js, dictation.js), so the press is never held. Anything
+// else opens in a new tab.
+function isOwnOrigin(url) {
+  if (typeof location === 'undefined' || !location.origin) return false;
+  try {
+    return new URL(url, location.href).origin === location.origin;
+  } catch (_e) {
+    return false;
+  }
+}
+
 function anchor(url, label) {
-  const external = !/^mailto:|^tel:/i.test(url);
-  const attrs = external ? ' target="_blank" rel="noopener noreferrer"' : '';
-  return `<a href="${url}"${attrs}>${label}</a>`;
+  if (/^mailto:|^tel:/i.test(url) || isOwnOrigin(url)) return `<a href="${url}">${label}</a>`;
+  return `<a href="${url}" target="_blank" rel="noopener noreferrer">${label}</a>`;
 }
 
 // Render inline Markdown on one text segment. The text is escaped first, so
@@ -80,8 +101,12 @@ export function renderInline(text) {
   // ![alt](url) — no remote fetches from rendered content; show it as a link.
   s = s.replace(/!\[([^\]]*)\]\(((?:https?:\/\/)[^\s)]+)\)/gi,
     (_m, alt, url) => stash(anchor(url, alt || url)));
-  // [label](url)
-  s = s.replace(/\[([^\]]+)\]\(((?:https?:\/\/|mailto:|tel:)[^\s)]+)\)/gi,
+  // [label](url). A root-relative target (/sends/default/752) is a link into
+  // the dashboard itself: the browser resolves it against the page's own
+  // origin, so it can neither run script nor leave the site. A second slash
+  // (//host/…) would be protocol-relative — another origin — and a backslash
+  // is read as a slash by browsers, so both are refused right after the first.
+  s = s.replace(/\[([^\]]+)\]\(((?:https?:\/\/|mailto:|tel:|\/(?![\/\\]))[^\s)]*)\)/gi,
     (_m, label, url) => stash(anchor(url, label)));
   // Bare URLs; keep any trailing punctuation (URL_TAIL_RE) outside the link,
   // and stop at a stash placeholder (\x01 is SEP) so a code span right after a

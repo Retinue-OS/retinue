@@ -38,7 +38,7 @@ There is no build step. The stack is Docker Compose; the agent logic is
 Markdown and Python.
 
 ```bash
-git clone --recurse-submodules https://github.com/retinue-os/retinue.git
+git clone https://github.com/retinue-os/retinue.git
 cd retinue
 cp .env.example .env      # then fill it in — see README.md
 docker compose up -d

@@ -139,8 +139,9 @@ an `extra_hosts` override, not Docker's default `host-gateway`.
 
 The dashboard list is `GET /conversation-models`. With LiteLLM it is
 built from `GET /model/info` and `GET /v1/models`. Plumbing aliases
-(`retinue-claude`, wildcards) stay hidden. An Ollama primary also
-drops leftover Claude catalog seeds.
+(`retinue-claude`, wildcards) stay hidden, and so do unflagged Claude
+catalog rows. A leftover route still flagged `retinue_picker: true` is
+hidden by setting it to `false`.
 
 If the picker still shows only Claude ids, set an explicit list. That
 wins over LiteLLM:
@@ -153,6 +154,21 @@ A small helper that turns `GET /api/tags` into that JSON is enough to
 keep the dropdown aligned with pulled models. Recreate the `retinue`
 service after changing the env var (the list is read at process start
 and cached briefly).
+
+## Subagents on local tags
+
+The picker above governs Ara's own turns. The subagents Ara dispatches (the
+Secretary, Herald, Archivist, chamber agents) pin their own models; the
+dashboard's **Settings › Agent models** card (or `RETINUE_AGENT_MODELS`)
+overrides those per agent, offering the same list — `docs/dashboard.md`,
+"Agent models". The caveats in this document apply doubly: every subagent
+reads through tools (the Secretary its persona and style files), so it needs
+a tag with a tools capability, behind a route that keeps `tools` — the
+`ollama/*` route above drops them and caps output at 512 tokens, which suits
+a chat bubble, not a subagent — and a dispatched agent's prompt is its whole
+definition plus the dispatch context, which an 8k-context tag will overflow.
+Start with the Secretary: it has no write or shell tools, so a failed
+experiment does the least harm.
 
 ## Checking a tag before you chat
 

@@ -208,7 +208,7 @@ def _attach_reply_tokens(messages: list) -> None:
         if origin and _is_phone_number(str(origin)):
             msg["reply_token"] = REPLY_TOKENS.mint(str(origin), channel="sms")
         elif origin:
-            msg["no_reply"] = "alphanumeric sender id; SMS cannot be sent back to it"
+            msg["no_reply"] = "alphanumeric sender id or short code; SMS cannot be sent back to it"
         msg["thread_key"] = _ibstore.thread_key(
             "sms", SMS_ACCOUNT, msg.get("chat"), msg.get("message_id"),
             subject=msg.get("subject"))
@@ -438,10 +438,19 @@ def _normalize_sender(raw) -> str | None:
     return cleaned[:SMS_SENDER_MAX_CHARS].strip() or None
 
 
+# A normalized sender that can be written back to: an international number
+# (its "+" kept by _normalize_sender), or a national one of at least seven
+# digits. A shorter run of digits is a short code ("4636", "72000"), one-way
+# like an alphanumeric id — the range contacts.py files as a sender account
+# (_SMS_SHORT_CODE_RE, 3–6 digits), so a contact's short code is never offered
+# a reply here.
+_REPLYABLE_SENDER_RE = re.compile(r"\+[0-9]{5,}|[0-9]{7,}")
+
+
 def _is_phone_number(sender: str | None) -> bool:
     """Whether a normalized sender can be written back to. Alphanumeric ids
     and short codes are one-way: the server's send API takes phone numbers."""
-    return bool(sender) and bool(re.fullmatch(r"\+?[0-9]{5,}", sender))
+    return bool(sender) and bool(_REPLYABLE_SENDER_RE.fullmatch(sender))
 
 
 def _parse_sms_received(event: dict) -> dict | None:
@@ -673,6 +682,11 @@ def _forward_to_inbox(text: str, sender: str, store_path,
         ts=received_at,
         gate={"forward": bool(gate.get("forward")),
               "vip": bool(gate.get("vip")),
+              # The user wrote this sender a standing instruction: the rail
+              # works the message by it, and its verdict decides the ring.
+              # An SMS sender is easily spoofed, which docs/contacts.md warns
+              # about before anyone writes one an instruction.
+              "instructed": bool(gate.get("instructed")),
               "reason": str(gate.get("reason") or "")},
         handover=True, timeout=RETINUE_POST_TIMEOUT,
     )
@@ -683,8 +697,8 @@ def _forward_to_inbox(text: str, sender: str, store_path,
     if rail is not None and rail.get("accepted") is True:
         rail_job = (rail.get("job_url") or "").strip() or None
         if rail_job:
-            print(f"[sms-gateway] the chat's companion turn took the SMS from {sender} (vip)",
-                  flush=True)
+            print(f"[sms-gateway] the chat's companion turn took the SMS from {sender} "
+                  f"({'vip' if gate.get('vip') else 'instructed'})", flush=True)
             _confirm_delivery(rail_job, store_path, sender, base=_chats.CHATS_INGEST_URL)
             return
         _mark_delivered(store_path)

@@ -13,8 +13,10 @@ These checks pin that contract under Node with a scripted DOM:
 - a plain press dispatches `retinue-back` and navigates nowhere; a modified
   press (new tab) is left to the link;
 - a drill-down's path underlines its list (Chats on a chat);
-- a tab press on a page holding unsent input is held, as a Home press of
-  the Android shell is;
+- a tab press is a plain link and always goes — on a page holding unsent
+  input too: that input is kept on the device and waits in its field, so
+  nothing is held and no note pops up at the bottom of the screen; the
+  Android shell's Home press and wake navigate the same way;
 - the conversations card shows the button only while a thread or the
   composer is open, and a press on the row unwinds exactly one entry — the
   element's own `retinue-back` (its minimize) still reaches the host once,
@@ -48,7 +50,8 @@ class FakeShadow {
   constructor() { this.innerHTML = ''; this._stubs = new Map(); }
   querySelector(sel) {
     const present = sel === 'nav' ? this.innerHTML.includes('<nav')
-      : sel === '[data-back]' ? this.innerHTML.includes('data-back') : false;
+      : sel === '[data-back]' ? this.innerHTML.includes('data-back')
+      : sel === 'a[href="/settings.html"]' ? this.innerHTML.includes('href="/settings.html"') : false;
     if (!present) return null;
     if (!this._stubs.has(sel)) this._stubs.set(sel, new Stub());
     return this._stubs.get(sel);
@@ -95,10 +98,11 @@ globalThis.document = {
   body: { appendChild(el) { note = el; } },
 };
 globalThis.window = globalThis;
-globalThis.location = { hash: '', pathname: '/', search: '', href: 'http://dash/' };
+const assigned = [];
+globalThis.location = { hash: '', pathname: '/', search: '', href: 'http://dash/', assign: (u) => { assigned.push(u); } };
 globalThis.addEventListener = (t, f) => { if (!winListeners.has(t)) winListeners.set(t, []); winListeners.get(t).push(f); };
 globalThis.removeEventListener = () => {};
-const fire = (type) => { for (const f of winListeners.get(type) || []) f({ type }); };
+const fire = (type, detail) => { for (const f of winListeners.get(type) || []) f({ type, detail }); };
 let backs = 0;
 // The address moves as a browser's does: no URL (null or '', as the card's
 // state-only stamps pass) keeps it, a fragment replaces the hash, and a path
@@ -128,7 +132,7 @@ globalThis.fetch = () => new Promise(() => {});   // the card's poll never answe
 globalThis.setInterval = () => 0;
 globalThis.clearInterval = () => {};
 
-const { registerUnsavedCheck } = await import('./shell.js');
+const shell = await import('./shell.js');
 await import('./nav.js');
 await import('./conversations.js');
 const Nav = registry.get('retinue-nav');
@@ -200,22 +204,28 @@ await ok("a drill-down's path underlines its list", () => {
   location.pathname = '/';
 });
 
-await ok('a tab press with unsent input on the page is held, without it it goes', () => {
+await ok('a tab press is a plain link: nothing holds it, nothing pops up', () => {
   const nav = mountNav({ back: '', current: 'chats' });
+  assert.ok(!('registerUnsavedCheck' in shell) && !('shellEventHeld' in shell),
+    'there is no guard left to register with');
   const row = nav.shadowRoot.querySelector('nav');
   const tab = { closest: () => ({ hasAttribute: () => false }) };
-  const free = press({ target: tab });
-  row.fire('click', free);
-  assert.ok(!free.prevented, 'nothing held: the link follows');
-  const off = registerUnsavedCheck(() => true);
-  const held = press({ target: tab });
-  row.fire('click', held);
-  assert.ok(held.prevented, 'unsent input: the tab stays put');
-  assert.ok(note && /Unsent input/.test(note.textContent), 'and says why');
-  const back = press({ target: { closest: () => ({ hasAttribute: (n) => n === 'data-back' }) } });
-  row.fire('click', back);
-  assert.ok(!back.prevented, 'the back button is the page\'s to decide, not the guard\'s');
-  off();
+  const ev = press({ target: tab });
+  row.fire('click', ev);
+  assert.ok(!ev.prevented, 'the link follows');
+  assert.ok(!(row._l.get('click') || []).length, "the row wires no click handler of its own: the links are the browser's");
+  assert.ok(!/press again/.test(html(nav)), 'and says nothing about pressing again');
+  assert.equal(note, null, 'no note was ever put on the page');
+});
+
+await ok("the shell's Home press and wake navigate, whatever the page holds", () => {
+  // The home claims the events for itself; every other page goes there.
+  assigned.length = 0;
+  fire('retinue-shell', { type: 'home' });
+  fire('retinue-shell', { type: 'wake' });
+  fire('retinue-shell', { type: 'other' });
+  assert.deepEqual(assigned, ['/', '/?wake=1']);
+  assert.equal(note, null, 'no note');
 });
 
 await ok('the conversations card shows back only while a thread or the composer is open', () => {
@@ -269,6 +279,33 @@ await ok('a deep-linked thread closes in place, without leaving the page', () =>
   assert.ok(!navOnPage.hasAttribute('back'), 'the list: no back');
   card.disconnectedCallback();
   navOnPage = null;
+});
+
+await ok("the gear opens the app's own settings page inside the app, and is a plain link elsewhere", () => {
+  const gearOf = (nav) => nav.shadowRoot.querySelector('a[href="/settings.html"]');
+  // A browser, or an app without a page of its own: the link follows.
+  let opened = [];
+  delete window.RetinueShell;
+  let ev = press();
+  gearOf(mountNav({ current: 'home' })).fire('click', ev);
+  assert.ok(!ev.prevented, 'a browser follows the link');
+  window.RetinueShell = { platform: 'android', openSettings: (s) => { opened.push(s); } };
+  ev = press();
+  gearOf(mountNav({ current: 'home' })).fire('click', ev);
+  assert.ok(!ev.prevented, 'RetinueShell/3: the dashboard page still');
+  assert.deepEqual(opened, []);
+  // RetinueShell/4: the app's page opens and the link does not follow.
+  window.RetinueShell.settingsPage = true;
+  ev = press();
+  gearOf(mountNav({ current: 'home' })).fire('click', ev);
+  assert.ok(ev.prevented, 'the app opens its page');
+  assert.deepEqual(opened, [undefined]);
+  // A modified press is the link's, as anywhere.
+  ev = press({ ctrlKey: true });
+  gearOf(mountNav({ current: 'home' })).fire('click', ev);
+  assert.ok(!ev.prevented);
+  assert.equal(opened.length, 1);
+  delete window.RetinueShell;
 });
 
 console.log(`${passed} checks passed`);

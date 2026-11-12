@@ -117,35 +117,27 @@ def _sub_path(endpoint: str) -> Path:
 
 # Per-device notification preferences, stored on the subscription record.
 #
-# `notification_mode` says which event kinds notify this device. Every push is
-# classified by its caller as one of three event kinds — "new" (first message
-# of a thread the agent opened), "stalled" (a message after >10 min of thread
-# inactivity) or "reply" (any other turn of an active exchange) — and
-# `notify()` matches the event against each device's mode. "all" (also the
-# fallback for legacy records without a mode) matches every event; "off"
-# matches none.
-KNOWN_MODES = {"all", "new_only", "stalled_only", "new_and_stalled", "off"}
-_MODE_EVENTS = {
-    "new_only": {"new"},
-    "stalled_only": {"stalled"},
-    "new_and_stalled": {"new", "stalled"},
-}
-# What a device stores when its owner takes the opt-in's defaults
-# (webapp/components/push.js, DEFAULT_MODE): new and stalled conversations,
-# archived ones included. The attention simulation's phone is such a device.
-DEFAULT_PREFERENCES = {"notification_mode": "new_and_stalled", "notify_archived": True}
+# **Whether a push goes out at all is the attention model's decision**, taken
+# before `notify()` is ever called (`scripts/attention.py`, the gateway's
+# delivery gate): the mode in force, importance, deadline, VIP, critical,
+# digest. A device no longer filters by event kind. The per-device modes of
+# #66 — "all" / "new only" / "new & stalled" / "off", matching pushes
+# classified as "new", "stalled" or "reply" — predate the model and were the
+# same decision in its crude form; left in place behind it they only
+# suppressed, silently and knowing nothing of VIP or critical, what the model
+# had just released. A second message into a chat with something unread
+# counted as a "reply", so the default setting dropped it. Removed with
+# the event kinds; a legacy record's `notification_mode` is ignored (and
+# overwritten the next time that device re-registers).
+#
+# What is left is the one preference about something the model does not know:
+# whether archived conversations notify this device too.
+DEFAULT_PREFERENCES = {"notify_archived": True}
 
 
-def device_wants(sub: dict, mode: str | None, archived: bool = False) -> bool:
-    """Does a device with these stored preferences get a push of this event
-    kind? (See notify for the kinds.)"""
-    user_mode = sub.get("notification_mode", "all")
-    if user_mode == "off":
-        return False
-    if archived and not sub.get("notify_archived", True):
-        return False
-    wanted = _MODE_EVENTS.get(user_mode)  # None: "all" or legacy → everything
-    return wanted is None or mode is None or mode in wanted
+def device_wants(sub: dict, archived: bool = False) -> bool:
+    """Does a device with these stored preferences get this push?"""
+    return not (archived and not sub.get("notify_archived", True))
 
 
 def subscribe(payload: dict) -> bool:
@@ -154,7 +146,7 @@ def subscribe(payload: dict) -> bool:
         return False
 
     # The client sends either a raw subscription (legacy) or a wrapped
-    # {subscription, notification_mode, notify_archived}.
+    # {subscription, notify_archived}.
     wrapped = isinstance(payload, dict) and "subscription" in payload
     subscription = payload.get("subscription") if wrapped else payload
     if not isinstance(subscription, dict):
@@ -167,10 +159,8 @@ def subscribe(payload: dict) -> bool:
     record = {"endpoint": endpoint, "keys": {"p256dh": keys["p256dh"], "auth": keys["auth"]}}
 
     if wrapped:
-        # Both values come straight from the client: coerce anything unknown
-        # to the fail-safe defaults rather than storing arbitrary strings.
-        mode = payload.get("notification_mode", "all")
-        record["notification_mode"] = mode if mode in KNOWN_MODES else "all"
+        # Straight from the client, so coerced rather than stored verbatim;
+        # an older client still sending `notification_mode` is ignored.
         record["notify_archived"] = bool(payload.get("notify_archived", True))
 
     with _lock:
@@ -208,15 +198,15 @@ def subscription_count() -> int:
 
 
 def notify(title: str, body: str, url: str = "/", tag: str | None = None,
-           mode: str | None = None, archived: bool = False,
+           archived: bool = False,
            urgency: str | None = None, topic: str | None = None) -> int:
     """Push a notification to every device whose preferences match. Returns how
     many got it.
 
-    `mode` is the event kind of this push ("new"/"stalled"/"reply", see
-    KNOWN_MODES above); None means unclassified and matches every device not
-    set to "off". `archived` says the triggering conversation is archived, so
-    devices that opted out of archived threads are skipped.
+    Being called at all is the attention model's decision (see
+    DEFAULT_PREFERENCES); every subscribed device is notified. `archived` says
+    the triggering conversation is archived, so devices that opted out of
+    archived threads are skipped.
 
     `urgency` and `topic` are the Web Push request headers of RFC 8030 §5.3
     and §5.4, the attention model's two knobs on the push service itself: a
@@ -238,7 +228,7 @@ def notify(title: str, body: str, url: str = "/", tag: str | None = None,
         headers["Topic"] = str(topic)[:32]
     sent = 0
     for sub in _all_subscriptions():
-        if not device_wants(sub, mode, archived):
+        if not device_wants(sub, archived):
             continue
         try:
             webpush(
@@ -265,14 +255,14 @@ def notify(title: str, body: str, url: str = "/", tag: str | None = None,
 
 
 def notify_async(title: str, body: str, url: str = "/", tag: str | None = None,
-                 mode: str | None = None, archived: bool = False,
+                 archived: bool = False,
                  urgency: str | None = None, topic: str | None = None) -> None:
     """Fan out in the background so the triggering HTTP response isn't delayed."""
     if not enabled():
         return
     threading.Thread(
         target=notify,
-        args=(title, body, url, tag, mode, archived, urgency, topic),
+        args=(title, body, url, tag, archived, urgency, topic),
         name="push-notify",
         daemon=True,
     ).start()

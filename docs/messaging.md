@@ -14,7 +14,7 @@ Use the client script:
 
 ```bash
 # Text + spoken audio to the default recipient (the owner)
-python3 /workspace/scripts/signal-push.py "Ari: failed to send reply to Mara — check scheduler.log"
+python3 /workspace/scripts/signal-push.py "Agent: failed to send reply to Mara — check scheduler.log"
 
 # A briefing with a chart, German voice, to a specific number
 python3 /workspace/scripts/signal-push.py --lang de --image /tmp/glucose.png \
@@ -56,7 +56,7 @@ python3 /workspace/scripts/signal-contacts.py --all          # recent chats
 python3 /workspace/scripts/signal-contacts.py --groups
 ```
 
-**When an autonomous agent (e.g. Ari, Coach) hits an error that prevents it from
+**When an autonomous agent (a chamber subagent, a scheduled job) hits an error that prevents it from
 completing its task, it should call this script to alert the user** rather than
 only writing to a log. Routine success needs no push; problems do.
 
@@ -79,6 +79,16 @@ surfaces it later. So an agent reporting a queued send relays it as a labeled
 link in the same message (the `dashboard-composing` skill, rule 5). A report
 that names `/sends` without the link makes the user find the page and the entry
 themselves — and a queued send nobody approves is a message never sent.
+
+Every channel, e-mail included, ends an **Allow** the same way: the page shows
+the outcome (a spinner while a messenger gateway delivers, then a green check,
+or the gateway's error, which stays on screen), and a moment after success
+moves on — to the next pending send, or, with none left, back to the page the
+approval link was tapped on (a dashboard link opens in place, so that page is
+in the window's history). A page opened on its own, from another app, has
+nothing to go back to: it closes itself, or lands on the dashboard where the
+browser will not close it — never on the empty `/sends` list. **Deny** goes
+straight on to the next pending send, or, with none left, back the same way.
 
 ### Retracting a queued send
 
@@ -163,7 +173,7 @@ live only in that container, never in agent context, and there is no
 
 ```bash
 # Text to the default recipient
-python3 /workspace/scripts/whatsapp-push.py "Ari: reply to Mara failed — check scheduler.log"
+python3 /workspace/scripts/whatsapp-push.py "Agent: reply to Mara failed — check scheduler.log"
 
 # With an image, to a specific number
 python3 /workspace/scripts/whatsapp-push.py --recipient +15551234567 --image /tmp/chart.png "Summary"
@@ -196,7 +206,7 @@ thin CLI:
 
 ```bash
 # Text to the default recipient
-python3 /workspace/scripts/telegram-push.py "Ari: reply to Mara failed — check scheduler.log"
+python3 /workspace/scripts/telegram-push.py "Agent: reply to Mara failed — check scheduler.log"
 
 # With an image, to a specific chat (chat_id or @username)
 python3 /workspace/scripts/telegram-push.py --recipient @mara --image /tmp/chart.png "Summary"
@@ -204,7 +214,11 @@ python3 /workspace/scripts/telegram-push.py --recipient @mara --image /tmp/chart
 
 Resolve a name with `scripts/telegram-contacts.py` — same recent-chats-first,
 contact-directory-fallback contract as `signal-contacts.py` (the user client has
-both). Outbound is gated by `TELEGRAM_SEND_POLICY`, keyed — like
+both). `GET /resolve?q=<@username|phone>` answers a user's numeric id, the
+only identity inbound messages carry; the address book files it next to a
+username (docs/contacts.md, "Telegram ids"). A phone number resolves only for
+someone among the account's contacts; a name that is no user (unknown, or a
+group or channel) answers 404, a failing client 502. Outbound is gated by `TELEGRAM_SEND_POLICY`, keyed — like
 `EMAIL_SEND_POLICY` — by the **sending identity** (this account,
 `TELEGRAM_ACCOUNT`), not the recipient chat; since it is the user's own account,
 the fail-safe default means every send needs approval unless a policy entry grants

@@ -59,6 +59,12 @@ services:
       # by the entrypoint on first start persist here. The same volume is
       # mounted read-only by qlever-life, so every chamber is indexed equally.
       - chambers:/workspace/chambers
+      # The built-in letterbox (scripts/letterbox.py): an inbox chamber at a
+      # fixed path, shared over WebDAV at /inbox/ on the dashboard and emptied
+      # by the intake watcher and the inbox sweep. A volume of its own, so
+      # qlever-life never indexes what merely passes through; a deployment may
+      # mount a host folder here instead (docker-compose.override.example.yml).
+      - letterbox:/workspace/chambers/inbox
       # Triage delivery-gate: Ara writes each messenger channel's policy `.nt`
       # into the per-gateway volume, mounted here under the chambers tree at the
       # path triage_policy.messenger_policy_path() targets by default (CHAMBERS_DIR
@@ -218,6 +224,11 @@ services:
       # falls back to the held/forward path it had before: the switch off,
       # without a revert (docs/messenger-chats.md, phase 4).
       - CHAT_ARRIVAL_TURNS=1
+      # How long (seconds, default 60) the ring of a message from a sender with
+      # a standing instruction may wait for the turn that works it by that
+      # instruction (docs/contacts.md, "The instruction"). Past it the message
+      # rings as a VIP's would; the turn goes on, and its draft still lands.
+      - CHAT_INSTRUCTION_TIMEOUT
       # Which TCP peers count as "arrived through the reverse proxy" for the
       # endpoints that act with the user's own authority: the chat send press
       # and approving a pending send. Defence in depth only — no send skips an
@@ -268,6 +279,11 @@ services:
       # door in front of the user can be strong while dispatch stays cheap.
       - RETINUE_DASHBOARD_MODEL
       - RETINUE_TRIAGE_MODEL
+      # Per-subagent model overrides (scripts/agent_models.py): the deployment
+      # default; the dashboard's Settings › Agent models card writes the file
+      # (RETINUE_AGENT_MODELS_FILE, default on the persistent /root volume).
+      - RETINUE_AGENT_MODELS
+      - RETINUE_AGENT_MODELS_FILE
       - RETINUE_CONVERSATION_MODELS
       - RETINUE_CONVERSATION_MODELS_FILE
       - RETINUE_LITELLM_URL
@@ -340,6 +356,14 @@ services:
       # chat-surface tunables (all optional, documented in web-gateway.py).
       - CONVERSATION_BACKEND_TOKEN
       - CONVERSATION_BASE_URL
+      # Optional instance branding, for running more than one deployment: a
+      # label for the PWA, page titles and Ask-Ara identity, and an accent
+      # colour (#rrggbb) for icons and dashboard: the deployment defaults; the
+      # dashboard's Settings › Instance choices live in RETINUE_INSTANCE_FILE
+      # (default on the persistent /root volume). See scripts/instance_branding.py.
+      - RETINUE_INSTANCE_NAME
+      - RETINUE_INSTANCE_COLOR
+      - RETINUE_INSTANCE_FILE
       - SEND_APPROVAL_BASE_URL
       # Zone the approval pages render event times in; the containers run on
       # UTC, so without it a mis-zoned calendar entry reads as correct there.
@@ -433,11 +457,6 @@ services:
       - ARA_MCP_RATE_LIMIT
       - ARA_MCP_RATE_WINDOW
       - ARA_MCP_JOB_RETENTION
-      # Data refresh: Garmin (scripts/sync-garmin.py, run synchronously in the
-      # agent's own process by refresh.py --ensure, so this credential does
-      # reach sessions — until the fetch moves into a sidecar).
-      - GARMIN_EMAIL
-      - GARMIN_PASSWORD
       # News feed and triage tunables (scripts/news_store.py, news-fetch.py,
       # news-curate.py, triage-gate.py), the project-deadline lead
       # (scripts/recurring-projects.py), the self-update call timeout
@@ -1198,7 +1217,10 @@ services:
     restart: "no"
 
   qlever-life:
-    build: ./qlever-dir
+    # The released qlever-dir image, pinned by version and digest; versions
+    # follow QLever's. .github/workflows/check-qlever-dir.yml opens a PR for
+    # each new release.
+    image: ghcr.io/retinue-os/qlever-dir:0.6.0@sha256:cadaa89c6d1ad6dc863161e2a4c797aaee0effd20179303a8647cac55efeeb91
     depends_on:
       volumes-init:
         condition: service_completed_successfully
@@ -1298,6 +1320,7 @@ services:
 
 volumes:
   chambers:
+  letterbox:
   retinue-root:
   signal-data:
   whatsapp-data:

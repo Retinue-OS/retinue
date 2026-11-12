@@ -48,7 +48,7 @@ Products turned the same research into a few mechanisms Retinue can borrow:
 
 ## 3 · Recommendation: item, mode, delivery
 
-<p class="note"><small><strong>Mechanics.</strong> Threads and chats keep their JSON stores, emitted into <code>_generated/</code>; projects gain frontmatter keys; one free <code>SELECT</code> — what wants attention now, at which level — serves dashboard and scheduled jobs alike. Today’s knobs stay: the per-device <code>notification_mode</code> (<code>push_notify.py</code>), <code>muted</code> on threads and chats, and the delivery gate’s VIP flag keep working; the mode wraps them. Web Push headers per RFC 8030: <code>Urgency</code> (very-low … high), <code>Topic</code> (a new push replaces a pending one with the same topic), <code>TTL</code> — today only the TTL is set. Sender side: where a contact’s send policy allows, the Secretary may tell a held sender when the message will be seen.</small></p>
+<p class="note"><small><strong>Mechanics.</strong> Threads and chats keep their JSON stores, emitted into <code>_generated/</code>; projects gain frontmatter keys; one free <code>SELECT</code> — what wants attention now, at which level — serves dashboard and scheduled jobs alike. Today’s knobs stay: <code>muted</code> on threads and chats and the delivery gate’s VIP flag keep working, and the mode wraps them. The per-device <code>notification_mode</code> (<code>push_notify.py</code>) was kept at first and has since been removed — behind the model a second, blinder filter only suppressed what the model released (see <code>docs/dashboard.md</code>, “Delivery”). Web Push headers per RFC 8030: <code>Urgency</code> (very-low … high), <code>Topic</code> (a new push replaces a pending one with the same topic), <code>TTL</code> — today only the TTL is set. Sender side: where a contact’s send policy allows, the Secretary may tell a held sender when the message will be seen.</small></p>
 
 **The item.** All three entities get the same five properties in the `kb:` vocabulary, set where each is created:
 
@@ -80,6 +80,15 @@ in the delivery gate’s policy (`docs/triage-delivery-gate.md`) as someone whos
 message is worked by a model the moment it arrives. Their message rings in
 every mode, like critical; only a muted chat or a quieted/ignored group keeps
 it quiet.
+
+**The instructed sender** is the finer tool beside it: a person the user wrote
+a standing instruction for (`docs/contacts.md`, “The instruction”). A model
+works each of their messages by that brief and ends with a verdict — an
+importance and, where there is one, a deadline — and the message goes through
+the model above with those, like any other: the instruction adds no delivery
+path of its own, only a judgement the model then delivers by. Their ring waits
+for that turn; a turn that fails or runs past its timeout rings the message as
+a VIP's would be, and its reason line says so.
 
 **The stranger** is the one case where the model withholds a guess. A direct
 message from someone nothing vouches for — not a VIP, no contact card, no

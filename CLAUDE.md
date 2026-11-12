@@ -86,6 +86,21 @@ alerts and briefings to the owner, and dashboard thread replies — those are
 your own voice. The persona `agents/secretary.md` and the chamber style files
 are the subagent's style layer; you no longer read them yourself.
 
+**When to send.** A message the user asked for — now, or by a standing
+instruction that covers it — is sent by the sending identity's policy:
+
+- `verify` — send at once; it queues, relay the text with its approval link.
+- `trust` — send at once without `--user-approved`; it queues, relay the link.
+  With the permission phrase, or once the user tapped a send chip under this
+  text, send with `--user-approved`.
+- `allow` — send only with the permission phrase or after the user tapped a
+  send chip; otherwise show the text with a send chip.
+
+The permission phrase is "you have my permission to send", or its translation
+in the user's language; a standing instruction can carry it. A tapped send
+chip approves the text it sits under, and nothing else. A message nobody
+asked for is only proposed.
+
 **Where things live:** the framework's own files are under `/workspace`
 (`agents/`, `scripts/`, `docs/`). Everything else belongs to a chamber —
 discover what is mounted at runtime (`ls /workspace/chambers/`); never assume
@@ -183,7 +198,7 @@ not create `MEMORY.md`-style files.
 
 ## Data refresh and scheduled tasks
 
-**Before accessing a time-sensitive data source** (e.g. Garmin), run
+**Before accessing a time-sensitive data source** (one a chamber's `.refresh.json` declares), run
 
 ```bash
 python3 /workspace/scripts/refresh.py --data-dir /workspace/chambers/<chamber> --ensure <source-id>
@@ -208,7 +223,10 @@ A third, `inbox-sweep`, empties letterboxes: it dispatches the Archivist for
 every chamber whose `.inbox.json` declares an inbox that is not empty. **An
 inbox is a letterbox, not a shelf** — a file the user drops in is taken out,
 filed and deleted; the only file left lying there is one the Archivist could
-not classify and has flagged for the user.
+not classify and has flagged for the user. The built-in **letterbox**
+(`chambers/inbox`) takes drops over WebDAV (`/inbox/` on the dashboard) or a
+sync tool; file types a chamber declares in `accepts` are filed from it within
+seconds by a watcher, the rest go to the Archivist.
 
 Manifest formats, the gates, and the full wake semantics: `docs/scheduling.md`.
 
@@ -222,9 +240,11 @@ book (`contacts`, default `contacts/`). Use `scripts/contacts.py` — `find
 <chamber>` (a contact always names its chamber; ask when unclear), `update <id>
 --add-handle`/`--add-email` rather than filing a second person. The person also
 carries the attention model's facts about them (sphere, importance prior, the
-modes they may interrupt) and the **VIP flag** (`--vip`: a model works their
-messages on every channel; their e-mail is whitelisted) — set these on the
-person, not per handle. The dashboard's contact card and its Contacts page (a
+modes they may interrupt), the **VIP flag** (`--vip`: a model works their
+messages on every channel; their e-mail is whitelisted) and the user's
+**instruction** (`--instruction "…"`: the brief a model works each of their
+messenger messages by; its verdict decides whether the message rings) — set
+these on the person, not per handle. The dashboard's contact card and its Contacts page (a
 tab of the navigation row) write the same files. Vocabulary and file format:
 `docs/contacts.md`.
 

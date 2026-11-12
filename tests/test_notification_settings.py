@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""Notification-preference tests (#66): subscription storage, notify()'s
-per-device filtering, and the gateway's event-mode classification.
+"""Notification-preference tests: subscription storage and notify()'s fan-out.
 
-The classification tests load scripts/web-gateway.py the same way
-test_web_gateway_models.py does, because the previous rounds of this feature
-regressed exactly there — the filter worked, but every real push was classified
-"new", so nothing was ever filtered. The store/filter tests force the module's
-internals on instead of calling init(), so they run even where pywebpush (or a
-working cryptography build) is unavailable; `webpush` itself is always mocked.
+Since the per-device notification modes were removed, whether a push goes out
+is the attention model's decision alone (`push_notify.DEFAULT_PREFERENCES`):
+`notify()` reaches every subscribed device, a record left over from #66's
+modes included, and the only per-device preference left is the opt-out of
+archived conversations. The tests force the module's internals on instead of
+calling init(), so they run even where pywebpush (or a working cryptography
+build) is unavailable; `webpush` itself is always mocked.
 
     python3 tests/test_notification_settings.py
 """
@@ -19,7 +19,6 @@ import os
 import sys
 import tempfile
 import types
-from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -72,25 +71,24 @@ def test_subscribe_stores_preferences():
         sub = {"endpoint": "https://push.example/a",
                "keys": {"p256dh": "abc", "auth": "123"}}
         assert push_notify.subscribe({"subscription": sub,
-                                      "notification_mode": "new_only",
                                       "notify_archived": False}) is True
         record = _read_sub(Path(tmp), sub["endpoint"])
-        assert record["notification_mode"] == "new_only"
         assert record["notify_archived"] is False
         assert record["keys"]["p256dh"] == "abc"
 
 
-def test_subscribe_defaults_and_coercion():
+def test_subscribe_defaults_and_drops_the_retired_mode():
     with tempfile.TemporaryDirectory() as tmp:
         _force_store(Path(tmp))
         sub = {"endpoint": "https://push.example/b",
                "keys": {"p256dh": "abc", "auth": "123"}}
-        # An unknown mode from the client is coerced, never stored verbatim;
-        # notify_archived defaults to True (#66: archived notifies by default).
+        # notify_archived defaults to True (archived notifies by default); an
+        # older client still sending a notification_mode has it dropped, not
+        # stored — nothing reads it any more.
         assert push_notify.subscribe({"subscription": sub,
-                                      "notification_mode": "definitely_bogus"}) is True
+                                      "notification_mode": "new_and_stalled"}) is True
         record = _read_sub(Path(tmp), sub["endpoint"])
-        assert record["notification_mode"] == "all"
+        assert "notification_mode" not in record
         assert record["notify_archived"] is True
 
 
@@ -101,49 +99,43 @@ def test_subscribe_raw_legacy_payload():
                "keys": {"p256dh": "abc", "auth": "123"}}
         assert push_notify.subscribe(sub) is True
         record = _read_sub(Path(tmp), sub["endpoint"])
-        assert "notification_mode" not in record  # legacy record: treated as "all"
+        assert "notify_archived" not in record  # unwrapped: the default applies
 
 
-# ── notify() filtering ─────────────────────────────────────────────────────
+# ── notify()'s fan-out ─────────────────────────────────────────────────────
 
-def test_notify_event_filter_matrix():
+def test_notify_reaches_every_subscribed_device():
+    """No per-device event filter is left: a stored mode from #66 — 'off'
+    included — no longer keeps a device quiet. That filter sat behind the
+    attention model and dropped what the model had released."""
     with tempfile.TemporaryDirectory() as tmp:
         tmp_path = Path(tmp)
         _force_store(tmp_path)
         for mode in ("all", "new_only", "stalled_only", "new_and_stalled", "off"):
             _write_sub(tmp_path, f"https://push.example/{mode}", notification_mode=mode)
-        _write_sub(tmp_path, "https://push.example/legacy")  # no mode stored
+        _write_sub(tmp_path, "https://push.example/plain")  # nothing stored
 
-        def eps(*modes):
-            return {f"https://push.example/{m}" for m in modes}
-
-        assert _sent_endpoints(mode="new") == eps("all", "new_only", "new_and_stalled", "legacy")
-        assert _sent_endpoints(mode="stalled") == eps("all", "stalled_only", "new_and_stalled", "legacy")
-        # An ordinary reply in an active exchange only reaches "all"-mode devices.
-        assert _sent_endpoints(mode="reply") == eps("all", "legacy")
-        # An unclassified push (legacy caller) reaches everyone not switched off.
-        assert _sent_endpoints(mode=None) == eps("all", "new_only", "stalled_only",
-                                                 "new_and_stalled", "legacy")
+        assert _sent_endpoints() == {
+            f"https://push.example/{m}" for m in
+            ("all", "new_only", "stalled_only", "new_and_stalled", "off", "plain")}
 
 
 def test_notify_archived_optout():
     with tempfile.TemporaryDirectory() as tmp:
         tmp_path = Path(tmp)
         _force_store(tmp_path)
-        _write_sub(tmp_path, "https://push.example/optout",
-                   notification_mode="all", notify_archived=False)
-        _write_sub(tmp_path, "https://push.example/default",
-                   notification_mode="all")
+        _write_sub(tmp_path, "https://push.example/optout", notify_archived=False)
+        _write_sub(tmp_path, "https://push.example/default")
 
         # Archived thread: the opted-out device is skipped, the default
-        # (no notify_archived on record) still notifies — #66's default.
-        assert _sent_endpoints(mode="reply", archived=True) == {"https://push.example/default"}
+        # (no notify_archived on record) still notifies.
+        assert _sent_endpoints(archived=True) == {"https://push.example/default"}
         # Non-archived thread: the opt-out is irrelevant.
-        assert _sent_endpoints(mode="reply", archived=False) == {
+        assert _sent_endpoints(archived=False) == {
             "https://push.example/optout", "https://push.example/default"}
 
 
-# ── the gateway's event-mode classification ────────────────────────────────
+# ── the gateway's push helpers ─────────────────────────────────────────────
 
 def _load_gateway(tmp: Path):
     """Load scripts/web-gateway.py with sandboxed state, like the other tests."""
@@ -175,47 +167,6 @@ def _load_gateway(tmp: Path):
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
-
-
-def _iso(minutes_ago: float) -> str:
-    return (datetime.now(timezone.utc) - timedelta(minutes=minutes_ago)).isoformat()
-
-
-def _conv(initiator: str, message_ages_minutes, read_at_minutes=None) -> dict:
-    conv = {
-        "id": "cid", "initiator": initiator,
-        "messages": [{"role": "agent", "text": "m", "ts": _iso(age)}
-                     for age in message_ages_minutes],
-    }
-    if read_at_minutes is not None:
-        conv["read_at"] = _iso(read_at_minutes)
-    return conv
-
-
-def run_event_mode_tests(wg) -> None:
-    # First message of an agent-opened thread is the one "new" event.
-    assert wg._conv_event_mode(_conv("agent", [0])) == "new"
-    # A user-opened thread never produces a "new" event.
-    assert wg._conv_event_mode(_conv("user", [0])) == "reply"
-    # Second and later turns of an active exchange are replies, not "new" —
-    # the regression each previous round of this feature reintroduced.
-    assert wg._conv_event_mode(_conv("agent", [2, 0])) == "reply"
-    assert wg._conv_event_mode(_conv("agent", [5, 2, 0], read_at_minutes=4)) == "reply"
-    # No activity for >10 min before this message → stalled …
-    assert wg._conv_event_mode(_conv("agent", [11, 0])) == "stalled"
-    assert wg._conv_event_mode(_conv("user", [30, 11, 0], read_at_minutes=25)) == "stalled"
-    # … but a recent read keeps the thread active even if the last message is old.
-    assert wg._conv_event_mode(_conv("agent", [11, 0], read_at_minutes=2)) == "reply"
-    # Unparseable/missing anchors degrade to the quietest class.
-    legacy = {"id": "cid", "initiator": "agent",
-              "messages": [{"role": "agent", "text": "a"}, {"role": "agent", "text": "b"}]}
-    assert wg._conv_event_mode(legacy) == "reply"
-
-
-def test_conv_event_mode():
-    with tempfile.TemporaryDirectory() as tmp:
-        wg = _load_gateway(Path(tmp))
-        run_event_mode_tests(wg)
 
 
 # ── #61: the subscriber count an agent-opened thread reports ────────────────
@@ -333,11 +284,10 @@ def test_push_conv_notification_return_value():
 
 TESTS = [
     test_subscribe_stores_preferences,
-    test_subscribe_defaults_and_coercion,
+    test_subscribe_defaults_and_drops_the_retired_mode,
     test_subscribe_raw_legacy_payload,
-    test_notify_event_filter_matrix,
+    test_notify_reaches_every_subscribed_device,
     test_notify_archived_optout,
-    test_conv_event_mode,
     test_agent_conversation_reports_zero_subscribers,
     test_agent_conversation_reports_real_subscriber_count,
     test_agent_conversation_quiet_omits_push_subscribers,

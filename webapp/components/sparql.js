@@ -39,6 +39,17 @@ const DOC_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9_-]*$/;
 const DOC_MENTION_RE = /^(?:\/workspace\/)?docs\/([A-Za-z0-9][A-Za-z0-9_-]*)\.md$/;
 const SPARQL_FENCE_RE = /^```sparql[^\n]*\n([\s\S]*?)^```/gm;
 const PREFIX_RE = /^\s*PREFIX\s+([A-Za-z][\w.-]*)?:\s*<([^>\s]*)>/gim;
+// The brand part of the served <title> ("Retinue", or "Retinue (Admin)" on a
+// named instance, scripts/instance_branding.py), read once before any rewrite:
+// only what follows the last " — " is this page's own, and a label may itself
+// contain one.
+const TITLE_BRAND = (() => {
+  try {
+    const t = document.title;
+    const i = t.lastIndexOf(' — ');
+    return (i < 0 ? t : t.slice(0, i)) || 'Retinue';
+  } catch (_e) { return 'Retinue'; }
+})();
 
 // The store answers JSON for SELECT/ASK and Turtle for CONSTRUCT/DESCRIBE.
 const REQUEST = {
@@ -178,7 +189,7 @@ class RetinueSparqlDoc extends HTMLElement {
       a.append(code);
     }
     const title = this.querySelector('h1');
-    if (title) document.title = `Retinue — ${title.textContent}`;
+    if (title) document.title = `${TITLE_BRAND} — ${title.textContent}`;
   }
 
   // The example, in place: the code block gives way to an editor holding the

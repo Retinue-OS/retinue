@@ -47,12 +47,20 @@ them is a dead end, and on them it starts with a back button (`<retinue-nav
 back>`). The row only reports the press (`retinue-back`); the page decides
 where it goes: back to where the drill-down was opened from inside the app,
 or, opened cold (a push, a bookmark), to the home; an open thread on the
-home or the Threads page closes in place, a project being edited cancels the
-edit. The page's own bar (title, Archive, minimize, model picker, menu)
-stays as a second row under it. On a page holding unsent input — a typed
-message, an unsaved project edit, a dictation on its way — a tap on a tab is
-held with the same note a Home press of the Android shell gets, instead of
-dropping the input. While the phone keyboard is up the row steps aside on a
+home or the Threads page closes in place. A project being edited goes back
+like any other page — the edit is kept on the device and the editor opens
+again with it on the next visit; only the editor's own × drops the changes
+(back used to cancel the edit). The page's own bar (title, Archive, minimize, model picker, menu)
+stays as a second row under it. A tab always goes, whatever the page
+holds: a typed message, an unsaved project edit or a dictation on its way is
+kept on the device and waits in its field for the user to come back to the
+same place (`webapp/components/drafts.js`), and a dictation still being
+recorded or transcribed is finished by the service worker, its text landing
+in that field (`webapp/components/dictation.js`; webapp README, "Unsent
+input"). The tap used to be held instead, with a note popping up at the
+bottom asking for a second press — which the phone keyboard, coming up with
+the note, made impossible by hiding the row; pop-up notes at the bottom of
+the screen are an anti-pattern here. While the phone keyboard is up the row steps aside on a
 drill-down, as the page's own header does. On a phone the home never scrolls as
 a page (the attention list scrolls inside a locked frame, under the
 navigation); in the wide layout (`isWideFrame` in
@@ -131,15 +139,20 @@ a chamber ([contacts.md](contacts.md)). A new person needs the chamber it is
 kept in (a dropdown, pre-selecting the chamber the last contact was created in);
 the card also offers, one tap each, anyone the book already has for this handle
 or for the same number on another channel, and a change to a person reaches
-every chat of theirs. The card also carries the person's VIP switch. An empty
+every chat of theirs. The card also carries the person's VIP switch and their
+**instruction** — the standing brief a model works each of their messages by,
+whose verdict decides how loudly the message rings (docs/contacts.md, "The
+instruction"); *Copy from…* takes one another person carries. An empty
 name unlinks the handle — the person stays — and puts the sender back into
-screening.
+screening. For a chat whose newest message an instruction worked, the sheet
+shows an *Instruction* field: the turn's state, its verdict, what it did and
+what it flagged.
 
 The **Contacts page** (`contacts.html`, the *Contacts* tab of the navigation
 row) is the address book itself: every person, searchable by name
 and e-mail address, each editable in place — their handles on every channel,
-their spheres, importance prior, the Focus modes they may interrupt, and the VIP
-flag. A new contact names the chamber it is kept in. Rows open where the item lives: a thread in place (the conversations
+their spheres, importance prior, the Focus modes they may interrupt, the VIP
+flag and the instruction (with *Copy instruction from…*, for a team). A new contact names the chamber it is kept in. Rows open where the item lives: a thread in place (the conversations
 element on the home is a `viewer` — invisible until a `#conversation-<id>`
 hash opens a thread or `#new` the composer), a chat on `chat.html`, a project
 on `project.html`. The old chats, conversations and projects cards are gone
@@ -233,8 +246,12 @@ across a digest time (`tick.json` under `ATTENTION_DIR` keeps the mark) — up
 to three hours back.
 Repeats are a per-class policy: a family sender writing again while held in
 *Rest* breaks through; anyone else waits with their first message. The
-per-device notification modes of the settings page keep working as a second
-filter behind the model. `ATTENTION_PUSH_GATE=0` is the rollback: every
+decision is the model's alone: the per-device notification modes of #66 (new /
+stalled / reply) are **gone**, since behind the model they only suppressed,
+knowing nothing of VIP or critical, what it had just released — a second
+message into a chat with something unread counted as a *reply*, and the
+default setting dropped it. A device is notified or disabled, nothing in
+between. `ATTENTION_PUSH_GATE=0` is the rollback: every
 arrival pushes as before the model, while the list, the digest and the sweep
 keep working.
 
@@ -260,7 +277,8 @@ digest after it.
 (admitted spheres, admitting tags, threshold, blurb), the week, the holidays,
 the default digest times, the sphere vocabulary and the manual override — and
 `profile.json` — importance and sphere priors per sender or
-kind, lead times per kind, permits per mode, and the learned log; plus
+kind, lead times per kind, permits per mode, expiry per sender (below), and
+the learned log; plus
 `projects.json` with the delivery state of projects. `GET /attention/profile`
 returns both, `POST /attention/profile` replaces them, and `POST
 /attention/modes` changes the rules by patch (`attention.apply_rules`: a
@@ -271,6 +289,32 @@ times as `HH:MM` or minutes) — what the mode menu, the settings page and Ara
 write; a deployment edits the files or drives the mode from the menu. The
 shipped defaults are the brief's (`attention.default_focus()`,
 `default_profile()`).
+
+**Expiry.** Some messages are worthless minutes after they arrive — a
+one-time login code is the case. The profile's `expiry` maps a sender to
+minutes; each message from them stamps its chat's item with `expires_at`
+(arrival plus that span, restarted by every new message), and the gateway's
+minute tick (`_attention_expire`) settles an open item whose time is up: it
+is marked done (`done_how: "expired"`) and the chat archived, not muted, so
+the sender's next message brings it back and rings exactly as before. A
+message still on its way into the model when the timer fires (the rail has
+counted it in the chat state's `inbound_seq`, the attention block has not
+taken it in yet — `attended_seq` — e.g. while an instructed sender's turn
+works) keeps the chat unarchived: the old item is done, the new message stays
+in view. No
+model is involved — it is a clock, deterministic and free, and a deployment
+with no expiry pays nothing (the tick reads only the chat state documents,
+and only while some sender has one). Expiry decides when an item leaves the
+list, never whether it rings: that stays with importance, sphere and
+permits. Putting an expired item back (*Reopen*) unarchives the chat and
+clears its timer. The user sets or clears it in a chat item's details sheet
+(the *Expiry* field: a few presets from 5 minutes to a day, or *never*; `POST
+/attention/items/expiry`), Ara with `attention-set.py <chat item>
+--sender-expiry 10m` (`none` clears). Both take one contract: minutes as a
+number or a span (`10m`, `2h`), between one minute and seven days, or `null`
+to clear — anything else, an empty string included, is refused and the
+profile left as it was. The row in `GET /attention` carries `expires_at`,
+the sender's `expiry` and `done_how`, and the sheet shows them.
 
 **The week.** The schedule is not one day repeated, and not seven: it is a
 few **day plans**, each a day's schedule (`[minute, mode]` or `[minute,
@@ -311,7 +355,8 @@ default 15, and expired by a write on the project page), `GET /attention/item?id
 follows the schedule), `POST
 /attention/items/later {id, when: next|tomorrow}`, `…/pull`, `…/done`,
 `…/reopen`, `…/correct {id, importance?, due?, lead?, sphere?, tags?,
-critical?}`, `POST /attention/permits {sender, mode?, on}`, `POST
+critical?}`, `…/expiry {id, expiry: minutes | span | null}` (a chat's
+sender), `POST /attention/permits {sender, mode?, on}`, `POST
 /attention/admit {sphere, mode?, on}`, `POST /attention/modes {mode?, …}`
 (the rule patch above); and the token-gated `POST
 /internal/attention/set {id, …}` for agents (`attention-set.py`). Item ids are
@@ -395,14 +440,13 @@ is created and switchable mid-thread from a dropdown in the thread bar, effectiv
 from the next turn. A messenger chat's companion thread (the chat page's Ara
 pane) offers the same dropdown in its bar, so the tier answering there is as
 visible and as switchable as anywhere else. The picker governs **Ara's own turn only** — dispatched
-subagents (the Archivist and any chamber-provided subagents) always run on their
-own hard-wired models regardless of the selection. In a deployment that routes
+subagents (the Archivist and any chamber-provided subagents) run on their
+own pinned models regardless of the selection; those pins are changed on the
+settings page instead (see **Agent models** below). In a deployment that routes
 through **LiteLLM** (the shipped default), the offered list is managed **in
 LiteLLM itself**: the gateway reads `GET /model/info` (and `GET /v1/models`)
 and offers the concrete models the proxy currently serves. `retinue_picker: true`
 plus `retinue_label` still names a route; `retinue_picker: false` hides one.
-An Ollama primary (`LITELLM_PRIMARY_MODEL=ollama/…`) drops leftover Claude
-catalog seeds so the picker cannot offer a model the backend does not serve.
 Plumbing routes (`retinue-claude`, wildcards) stay hidden. The list
 is cached briefly
 (`RETINUE_MODELS_CACHE_SECONDS`, default 60) and read from
@@ -435,6 +479,77 @@ can never inject an arbitrary `--model`. The picker hides itself when fewer than
 two models are offered. Model tiers and per-thread escalation:
 `docs/model-routing.md`.
 
+## Agent models (the settings page)
+
+Every subagent pins its model in its definition (`model:` in the frontmatter
+of `.claude/agents/*.md`, or of a chamber plugin's `agents/*.md`), and those
+files are baked into the image. **Settings › Agent models** is the knob over
+them: one dropdown per dispatchable agent, offering the same list as the
+thread picker (`GET /conversation-models`, so an Ollama tag the picker shows
+is offered here too), with "Built-in" as the first entry and, where
+`RETINUE_AGENT_MODELS` sets one for the agent, "Deployment default" second.
+The card is server-side state shared by every device, not a per-device
+preference.
+
+Mechanism (`scripts/agent_models.py`): Claude Code's `--agents <file>` flag
+defines agents for one session and takes precedence over the same name from
+`.claude/agents/` or a plugin — as a *replacement*, not a merge. So an
+override is the agent's own file re-read (frontmatter plus body) and handed
+back with only `model` swapped; the agent's description, tools and prompt are
+untouched. Every framework spawner (`web-gateway.py`, `scheduler.py`, the
+base-job scripts, the MCP connector) appends `agent_models.cli_args()` to its
+`claude -p` command — `[]` when nothing is overridden — and the generated file
+is rewritten only when the choices change, so a new choice reaches the very
+next dispatch of those sessions with no restart. `cli_args()` never raises: an
+override that cannot be applied leaves the spawn as it was. **Interactive
+sessions are not covered** — the remote-control main session `entrypoint.sh`
+starts, and the ones the spawn-session skill starts: Claude accepts an
+`--agents` file only with `-p`, so the subagents they dispatch keep their
+pinned models.
+
+Two sources, the dashboard winning: `RETINUE_AGENT_MODELS` (deployment
+default; a JSON object or `agent=model,…`) and the file the card writes
+(`RETINUE_AGENT_MODELS_FILE`, default `/root/.retinue/agent-models.json`,
+where choosing "Built-in" is an explicit entry that also cancels the env
+default for that agent, and choosing "Deployment default" —
+`POST /agent-models {agent, reset: true}` — removes the agent's entry).
+Agent ids are what the Agent tool takes: the frontmatter `name` for core
+agents, `<plugin>:<name>` for plugin agents; a plugin the retinue marketplace
+no longer lists (a removed chamber) is skipped, as Claude skips it.
+`POST /agent-models` accepts only agents discovery lists and models on the
+offered list — the thread picker's gate — so a client can never inject an
+arbitrary definition.
+
+Some agents are listed but **fixed**, left as the only definition: Claude
+validates an `--agents` value as a whole and refuses to start on one bad
+field (where it merely warns about the same field in an agent file), so an
+agent is redefined only when every field is one the no-dependency
+frontmatter parser carries faithfully. Nested YAML (`hooks:`,
+`mcpServers:`), a field or value it does not know (an unrecognised `effort`
+or `permissionMode`, `maxTurns: 0`), or a prompt using the plugin
+placeholders Claude expands only when it loads the file itself
+(`${CLAUDE_PLUGIN_ROOT}`, `${CLAUDE_PLUGIN_DATA}`, `${CLAUDE_PROJECT_DIR}`,
+`${user_config.…}`) make the agent fixed. A plugin agent's `permissionMode`
+and `initialPrompt`, which Claude ignores in plugin files, are left out of
+its redefinition, so a model change does not switch them on.
+
+An override does not change attribution: a subagent's memories carry the
+dispatching session's stamp (`RETINUE_SESSION_MODEL`, `docs/memory.md`), and
+the bubble names the turn's costliest model, usually Ara's own — the
+subagent's model shows only in the turn's `modelUsage`. A resumed session's
+envelope sums usage over all its turns, so the gateway stores each turn's
+totals with the session entry and labels and prices the next bubble from the
+difference — otherwise a model switch mid-thread would be credited to the
+earlier model, and every cost after the first would be a running total.
+
+Every core agent calls tools — even the Secretary (Read/Glob/Grep for its
+persona and style files) and the archivist-reader (Read for the document) —
+so an overriding model needs tool support, behind a route that does not drop
+`tools`; `docs/ollama.md` records which local tags fail there, and its
+`ollama/*` route (tools dropped, 512 output tokens) suits Ara's chat turns,
+not subagents. The Secretary and the archivist-reader have no write or shell
+tools, so a failed experiment there does the least harm.
+
 ## Attachments
 
 A thread can carry **file attachments** the user downloads straight from
@@ -447,10 +562,60 @@ message bubble, served by `GET /conversations/<id>/attachments/<att-id>` behind
 the dashboard's own auth. Prefer this over pushing a document via Signal when
 the user is already working in the dashboard.
 
+A file row has two links: its name opens the file to view — in the
+dashboard's file viewer (below) or, for a PDF a frame would not show whole,
+as the bare file; either way the file is fetched with `?inline=1`, answered
+with `Content-Disposition: inline` for `_INLINE_SAFE_TYPES` — and ↓ saves a
+copy (`attachment`); a type the gateway does not serve inline gets the save
+link alone. Both attachment URLs end in the file's own name —
+`…/attachments/<att-id>/<filename>`, which is also the viewer's `src` — a
+segment the route ignores (the header always carries the stored name). It is there for clients that name a
+saved file after the URL rather than the header: Android's
+`URLUtil.guessFileName` takes a name only from a bare
+`attachment; filename="…"` — neither `inline` nor the trailing `filename*`
+(RFC 6266, for non-ASCII names) gets through — and the shell, which named its
+downloads with it until it read the header itself, saved `<att-id>.pdf`.
+Inside the shell the two links stay distinct even though its WebView renders
+no PDF: see "Files" under "Inside the Android shell".
+
+The view link opens the dashboard's **file viewer**,
+`/viewer.html?src=<attachment path>&name=…&type=…`
+(`components/viewer-page.js`): the file in a frame under the navigation row,
+with its name and ↓ Save above it. The browser's own PDF or image view carries
+no navigation, so in an installed PWA — no browser chrome — a file opened bare
+had no way back to the thread but a gesture or a keyboard shortcut. The
+viewer's ‹ goes back through history when the dashboard opened it (the
+Navigation API's `canGoBack`, else the history length), and home when it was
+opened cold. It shows nothing but a thread attachment exactly as a file row
+links it — `src` is checked as the browser will request it, so no `..` or
+other spelling of a path step leads to another route of the origin — and only
+the inline types; its `frame-src 'self'` keeps a link inside a PDF from
+loading another site into the frame. The service worker serves the page from
+its cache whatever the query, so it opens offline too, ‹ and all.
+
+Images and text open in the viewer everywhere. A PDF does only where a frame
+shows the whole document (`framesWholePdf` in `components/base.js`);
+elsewhere its row keeps the bare `?inline=1` link and the platform's own way
+back:
+
+- in the Android shell, the phone's viewer app (see "Files" under "Inside the
+  Android shell");
+- in a browser with no PDF viewer of its own (`navigator.pdfViewerEnabled
+  === false`), and on Android, where no browser draws a PDF in a frame even
+  when it reports a viewer (Chrome's `AndroidHandlePdfInIframe`, on by default
+  on Android laptops, shows an "Open" placeholder instead): the browser's own
+  PDF view or a download;
+- on iOS and iPadOS, WebKit's full PDF view: a frame there shows only a
+  picture of the first page (WebKit's `UseImageDocumentForSubframePDF`),
+  although `pdfViewerEnabled` is true. In a Safari tab that view has the
+  browser's back button; in an app installed to the home screen it still has
+  none — drawing the PDF in the page itself (pdf.js) would be the way to give
+  it one.
+
 Images the gateway serves inline (`_INLINE_SAFE_TYPES`: PNG, JPEG, GIF, WebP,
 AVIF — never SVG, which is script in the dashboard's origin) also **preview in
 the bubble**: a lazy-loaded `<img>` at its true aspect ratio, capped in width
-and height, linking to the full view (`?inline=1`), with the name row and the
+and height, linking to the full view (the file viewer above), with the name row and the
 ↓ save link beneath. The gateway records an image's intrinsic size when it
 stores it, so the preview's box is reserved before the bytes arrive and a
 thread never jumps while it loads (older records without a size get a fixed
@@ -514,10 +679,14 @@ gateway endpoints: `GET /push/config`, `POST /push/subscribe`,
 `POST /push/unsubscribe`. The user manages the opt-in from the **settings
 page** (`settings.html`, reached via the gear in the navigation row), where
 `webapp/components/push.js` in `manage` mode shows this device's state —
-unsupported, blocked, off, or enabled with the delivery preferences and a
-disable button. The module also runs a silent re-registration on every
-dashboard load, so an already-granted device heals a rotated or server-reset
-subscription without visiting settings. Two caveats worth knowing: on **iOS**
+unsupported, blocked, off, or enabled with the one preference left (whether
+archived conversations notify here too) and a disable button. There is no
+per-device choice of *which* pushes arrive; that is the model's (see *The
+home*). The module also runs a silent re-registration on every dashboard load,
+so an already-granted device heals a rotated or server-reset subscription
+without visiting settings — a device the user disabled is skipped
+(`retinue_push_disabled` in its `localStorage`, which is what makes *Disable*
+outlast a reload). Two caveats worth knowing: on **iOS**
 push only works if the dashboard was added to the home screen (in a plain
 Safari tab the settings page says so), and if `pywebpush` is unavailable the
 whole feature reports itself disabled rather than failing — conversations
@@ -557,7 +726,8 @@ conversation and chat APIs. The rules (one item per page, automatic items
 living for one turn, Close suppressing re-adding for that turn, capacity
 evicting quiet items only, archive/mute) and the mechanics are in
 `webapp/README.md`, "The shelf: minimized pages"; the size is a setting on the
-settings page. Design and acceptance criteria: issue #282.
+settings page — inside the Android app, on the app's own, one size for every
+endpoint (see "The settings page"). Design and acceptance criteria: issue #282.
 
 ## Project pages and edit threads
 
@@ -745,6 +915,111 @@ re-decode when a guess falls outside that set) lives entirely in the service via
 (defence-in-depth; the service is not published to the host). Downloaded model
 weights persist in the `stt-models` volume.
 
+## Several instances: name and colour
+
+Every deployment serves the same baked manifest and icons, so two installed
+PWAs (a main and an admin instance, say) look identical on the home screen and
+in the task switcher. Two optional settings brand an instance; a single
+deployment needs neither (`scripts/instance_branding.py`):
+
+- **Name** — a short label (`Admin`, at most 40 characters, one line). The
+  manifest's `short_name` becomes the label, its `name` and every page
+  `<title>` `Retinue (Admin)`; push notifications without a thread title fall
+  back to it, the Ask-Ara connector answers as `Ara (Admin)` unless
+  `ARA_MCP_IDENTITY` says otherwise, and the Android shell lists the instance
+  under it: the shell reads each endpoint's manifest `short_name` and shows
+  that in its endpoint menu — there is no label of the shell's own (see
+  "Inside the Android shell").
+- **Accent colour** — `#rrggbb` (or `#rgb`), for the icons and the dashboard
+  alike. The stock icons (blue ring on near-black) are recoloured, and the
+  dashboard's accent with them: the `--accent` definition in `styles.css` plus
+  the `rgba(110, 168, 254, …)` tints the components' shadow styles hard-code —
+  send buttons, links, focus rings, hovers. Mode, sphere and status colours
+  (`--high`, `--ok`, `--outbound`) are left alone; they carry meaning. The send
+  glyph stays dark, so choose a light or medium tone. An invalid value is
+  ignored.
+
+Two sources, dashboard over deployment, as for the agent models:
+**Settings › Instance** (`GET`/`POST /instance`, server-side and shared by
+every device) writes `RETINUE_INSTANCE_FILE` (default
+`/root/.retinue/instance.json`, the persistent volume); the variables
+`RETINUE_INSTANCE_NAME` and `RETINUE_INSTANCE_COLOR` are the deployment
+defaults, in force wherever the card holds nothing (its *Stock colour* button
+and an emptied name field hand back to them). The card shows the default as
+the name field's placeholder.
+
+Both are applied when the gateway serves the file — the baked webapp is never
+edited — and both are folded into the service worker's shell hash, so a change
+reaches installed clients like any shell edit, and a change on the Settings
+page reaches the very next response.
+
+**The colour is in the icon URLs too.** An installed app keeps the icon it
+fetched for a URL: desktop Chrome, since 143 ("predictable app updating"),
+refreshes an installed PWA's icons only when the manifest names other icon
+URLs, and the Windows taskbar, the Start menu and the macOS dock show the
+shortcut icons Chrome made from those at install. So with a colour in force
+every icon reference the shell makes carries it as a version —
+`/icons/icon-192.png?v=cb6cfe` in the manifest, in every page's `rel="icon"`
+and `apple-touch-icon` link, and in the service worker's precache list and
+notification icon. The gateway ignores the query and serves the colour in
+force. A new colour means new URLs, which the browser takes as a new icon the
+next time it checks the manifest (on a launch of the app; Chrome may ask the
+user to confirm a changed icon). The stock colour keeps the plain URLs.
+
+An already-installed PWA may keep its old home-screen label and icon until the
+browser has checked the manifest; reinstalling applies it at once. A pinned
+taskbar entry that still shows the old icon after Chrome's update is Windows'
+icon cache; unpinning and pinning it again refreshes it. The Android shell is
+not held up by any of that: it fetches the manifest itself.
+
+## The settings page
+
+`settings.html` (the gear in the navigation row) has two parts in a browser:
+
+- **This browser** — what is kept per device and browser: Web Push
+  notifications, the voice timeouts, the layout, the shelf size, and the
+  dashboard version with a manual update check.
+- **This instance** — what is the same on every device: the instance's name
+  and colour (see above), the agent models, the system pages
+  (`components/instance-settings.js`, `<retinue-instance-settings>`).
+
+Inside the Android app there is one settings page for the user, the app's own
+(the app's README, "First run and settings"), in three parts: *this app* (its
+endpoints, voice and shelf, home screen, split screen, wake phrase, launcher
+bar, updates), *this app with the endpoint shown* (its health data; its
+notifications, once the app receives them), and *this instance*. The app
+serves that page itself, so it opens with no server at all, on first run and
+when the dashboard cannot load. Only the instance part comes from the server,
+as **`/settings-instance.html`**: the instance section on its own, served with
+`Content-Security-Policy: frame-ancestors 'self'
+https://appassets.androidplatform.net` — the address at which the app serves
+its page (reserved by Google for exactly this; nothing on the internet answers
+it) — so no other site can frame it. Framed, it tells the app's page how tall
+it is (`postMessage({type: 'retinue-instance-settings', state: 'ready',
+height})`, addressed to that origin only), and its links leave the frame
+(`<base target="_top">`); the app opens them in the dashboard. A shell that
+has a page of its own says so (`RetinueShell.settingsPage === true`,
+RetinueShell/4): the gear then opens that page instead of `settings.html`, and
+`settings.html`, reached anyway, shows a card leading there in place of the
+browser part (Web Push does not reach a WebView anyway). A shell without one
+(RetinueShell/3) keeps the Phone shell card at the top of `settings.html`, as
+before.
+
+**Per-device preferences** (`components/device-store.js`). The voice
+timeouts, the shelf size, the column layout and the list or card views belong
+to the device, not to the instance. In a browser they live in `localStorage`,
+per origin. Inside the app (RetinueShell/4) the app holds them, so one phone
+has one set for every endpoint it shows: `deviceGet(key)` reads the app's
+value (`RetinueShell.deviceSettings()`), `deviceSet(key, value)` writes it
+(`setDeviceSetting`), and a value the app does not have yet is taken over from
+the page's own `localStorage` once. A change made elsewhere — on the app's
+settings page, or by another tab in a browser — reaches an open page through
+`onDeviceChange` (in the app, the `device-settings` event naming the keys
+that changed). Only the keys the store lists go to the app, and the app takes
+only those, bounded in size, so one instance cannot pass data to another
+through them; a new per-device preference is added to both lists
+(`DEVICE_KEYS`/`DEVICE_PREFIXES` here, `DeviceWebSettings` in the app).
+
 ## Inside the Android shell
 
 The Android app (`ara-android`, its own repository) is a specialised browser
@@ -763,12 +1038,17 @@ The contract the two sides share (web side: `webapp/components/shell.js`):
 
 | Direction | What |
 |---|---|
-| User agent | ` RetinueShell/1 (Android)` appended. |
-| `window.RetinueShell` | Installed at document start, configured origin only: `platform`, `version`, `setVoiceActive(bool)` and `openSettings()`, behind Settings → Phone shell (shown only when the object exists). `setVoiceActive(true)` means *a voice conversation is engaged: keep the screen on and pause the wake phrase*. The page asserts it before it asks for the mic (the wake detector must release it first) and keeps it asserted for as long as a continuous conversation is going — through transcription, Ara's answer and its reading, not only while the mic is open — and sends `false` once the loop stops (mode off, no speech, leaving the thread, an error). Wake detection being paused for the whole conversation is intended. |
-| Shell → page | `window.dispatchEvent(new CustomEvent('retinue-shell', {detail: {type}}))`, `type` `wake` or `home`. The home answers in place: `wake` opens continuous conversation (the thread used in the mode in the last 15 minutes, else a new one), `home` unwinds every open thread or composer back to the list at `/`, closes a sheet and scrolls the list to its top. Other dashboard pages answer by loading `/?wake=1` or `/` — unless they hold unsent input (the draft of the conversation on screen, a dictation or send under way, an unsaved project edit or chat draft): then neither event navigates, a short note says why, and the composer holding it is brought into view. A draft left in a thread no longer on screen does not hold the press. |
+| User agent | ` RetinueShell/4 (Android)` appended (` RetinueShell/3` before the app's own settings page and the per-device preferences, `/2` before the endpoint members, `/1` before the Health Connect members; the page feature-detects every member rather than parsing the version). |
+| `window.RetinueShell` | Installed at document start, configured origin only: `platform`, `version`, `setVoiceActive(bool)` and `openSettings(section?)`, which opens the app's settings: from RetinueShell/4 its own page (the gear calls it when `settingsPage` is true), before that the native screens behind Settings → Phone shell (shown only when the object exists; the card is the first on the page there). `setVoiceActive(true)` means *a voice conversation is engaged: keep the screen on and pause the wake phrase*. The page asserts it before it asks for the mic (the wake detector must release it first) and keeps it asserted for as long as a continuous conversation is going — through transcription, Ara's answer and its reading, not only while the mic is open — and sends `false` once the loop stops (mode off, no speech, leaving the thread, an error). Wake detection being paused for the whole conversation is intended. |
+| Endpoints (RetinueShell/3) | The shell holds a list of Retinue servers (address, client certificate, sign-in, health switch) and shows one; the app's settings page lists, edits and switches them (RetinueShell/3: the Settings page's Phone shell card lists them in a menu and switches between them). `endpoints()` → a JSON string `[{"id": str, "label": str, "current": bool}]` — the label is the instance's own name, the manifest `short_name` the shell fetched with that endpoint's certificate or password (the host while it is unknown; the host appended when two names collide); no URLs, the other servers being none of the current page's business. `selectEndpoint(id)` asks the shell to show that server (it loads that dashboard's start page, so the page is left). `openSettings("endpoints")` opens the app's settings at the endpoint list, or at the editor straight away with one endpoint. The page may ask; it can never write an address, certificate or password — whatever origin the shell is pointed at receives its bridge, microphone, certificate and password, so that stays in the app. An `endpoints` event (`detail.type`) says the list changed while a page is open; the card re-renders. The shell's one base URL of earlier builds is the first endpoint after an update. |
+| Health Connect (RetinueShell/2) | Further members on `window.RetinueShell`: `healthConnectAvailable()` → `"true"`/`"false"`; `healthSync()` — a deliberate sync now, returns at once (a deliberate sync always runs, whatever the interval); `healthSyncStatus()` → a JSON string `{"available": bool, "permissions": "granted"\|"partial"\|"none", "last_sync_at": ISO\|null, "last_result": "ok"\|"error"\|"skipped"\|null, "last_error": str\|null, "last_count": int\|null, "min_interval_minutes": int, "auto_on_resume": bool, "enabled": bool}` (`enabled`, RetinueShell/3: the current endpoint's own health switch, set in the shell's editor — off, nothing is read or sent for that server, a sync asked for is `skipped` with reason `disabled`, and the card shows one line and *Edit endpoint* instead of the controls; an older shell omits the field and uploads for its one server); `setHealthSyncInterval(minutes)`; `setHealthAutoSync(bool)`. The shell reads the phone's Health Connect store through its Changes API and uploads what it returns, unaltered, as one JSON file per delivery by **WebDAV `PUT` to `/inbox/<name>`** — the letterbox share below, with the WebView's own client certificate and cookies — where a chamber that declares the file type in its `accepts` takes it (docs/scheduling.md); the framework knows nothing about the data. On resume the shell syncs on its own at most every `min_interval_minutes` (default 5) while `auto_on_resume` holds. From RetinueShell/4 the app's settings page has these controls, beside the endpoint's switch, and the dashboard shows none; with RetinueShell/3, Settings → Phone shell shows, only where `healthConnectAvailable()` is true, "Update health data now", the last sync (from `healthSyncStatus()` and the events), the auto-sync toggle and the interval. Every member is feature-detected (`webapp/components/shell.js`): an older shell simply shows none of it. |
+| Settings page and per-device preferences (RetinueShell/4) | `settingsPage: true`: the app has a settings page of its own (see "The settings page"), and the gear opens it. `deviceSettings()` → a JSON string `{key: value}` of the per-device preferences the app holds for every endpoint; `setDeviceSetting(key, value)` writes one (`null` removes it; a key the app does not take is ignored). `components/device-store.js` is the only caller. |
+| Shell → page | `window.dispatchEvent(new CustomEvent('retinue-shell', {detail: {type}}))`, `type` `wake`, `home`, `health-sync`, `endpoints` or `device-settings` (with `keys`, the per-device preferences that changed). A `health-sync` event carries `state`: `started`, `done` (with `count`), `error` (with `error`) or `skipped` (with `reason`: `interval`, `no-permission`, `unavailable`, `no-backend-support`, `disabled`); it, `endpoints` and `device-settings` are information only — no page navigates on them. The home answers in place: `wake` opens continuous conversation (the thread used in the mode in the last 15 minutes, else a new one), `home` unwinds every open thread or composer back to the list at `/`, closes a sheet and scrolls the list to its top. Other dashboard pages answer by loading `/?wake=1` or `/`, always: unsent input on the page (a draft, an unsaved project edit, a dictation or send under way) never holds either back — it is kept on the device and waits in its field, a dictation finished by the service worker (webapp README, "Unsent input"). |
 | Pages without the web app's code | The gateway's own pages (`/sends`, `/claude-auth`) do not load `components/shell.js`, so nothing on them answers `wake` or `home`. The shell handles that itself: when the page in front is not one of the dashboard's, a Home press loads `/` and a wake loads `/?wake=1` instead of dispatching the event. |
+| `/sync-health` | The link target for "update your health data" in threads: `https://<dashboard origin>/sync-health#sync` (the origin is `CONVERSATION_BASE_URL`'s). Same origin, so the shell opens it in place. A static page — a GET never changes server state; the fragment is the instruction, and the server never sees it. In the shell with `#sync` it calls `healthSync()`, says "Health data update triggered", and after a moment goes back (`history.back()`, or `/` when opened cold); a `done` arriving first is shown before it leaves, an `error` or `skipped` stays on screen with *Update now* and *Back*. The fragment is dropped from the address once read, so a reload starts nothing. In the shell without `#sync`: a short explanation, the last sync and *Update now*. In a browser on Android: the Ara app is needed, and an **Open in Ara app** link — an intent link the page builds from `location`, never from configuration: `intent://open?url=<percent-encoded https://<origin>/sync-health#sync>#Intent;scheme=retinue-shell;package=os.retinue.ara;S.browser_fallback_url=<percent-encoded https://<origin>/sync-health>;end`. The app opens the URL only when its origin is exactly the one it is configured for, and otherwise says so and connects nowhere (no Android App Links, no Play services). On a desktop: the explanation only. The page loads `shell.js`, so `wake` and `home` work on it, and it is in the service worker's shell cache like every page. |
 | Cold wake | With no page loaded the shell loads `/?wake=1`; the home treats it as a wake and drops the flag from the address. A wake should reach the page once it is resumed; one that arrives while the page is hidden still waits (up to 60 s) for it to come to the front before the mic opens. |
 | Speech output | A `speechSynthesis` / `SpeechSynthesisUtterance` stand-in over the native TTS when the WebView has none; `webapp/components/speech.js` is unchanged. |
+| Files | A file the WebView cannot show (a PDF, anything served as `attachment`) reaches the shell's download listener, which follows the `Content-Disposition` as a browser does. `inline` — a PDF row's name link (`?inline=1`; images and text open in the dashboard's file viewer, see "Attachments") — means *view*: the shell opens it in the phone's app for the type from a private copy, so no copy lands in Downloads (none installed: it saves it there and says so). Anything else — the ↓ link — is saved to Downloads. The name is the header's (`filename*`, then `filename`); the attachment URL ends in it too (see "Attachments"). |
 
 `manifest.webmanifest` declares `launch_handler: {client_mode:
 "focus-existing"}`, so a second launch of the installed PWA brings its open
@@ -776,3 +1056,35 @@ window to the front as it is — an open thread, a draft or a recording under
 way are kept; `navigate-existing` would load `/` over them. Known gap: Web
 Push does not reach a page inside an Android WebView, so notifications still
 need the PWA installed in Chrome alongside.
+
+## The letterbox share (`/inbox/`)
+
+The built-in letterbox (`/workspace/chambers/inbox`, docs/scheduling.md,
+"The built-in letterbox") is shared over **WebDAV** at `/inbox/` on the
+dashboard origin, by the gateway itself (`scripts/webdav_share.py`): OPTIONS,
+PROPFIND (depth 0 and 1), GET/HEAD, PUT (with a `Content-Length` or chunked;
+`LETTERBOX_MAX_UPLOAD`, default 1 GiB), DELETE, MKCOL and MOVE — class 1, no
+locks. That is what the phone shell's Health Connect upload uses, and it is
+enough for `curl -T file https://<origin>/inbox/`, scanners and the WebDAV
+clients of file managers and sync apps.
+
+**Auth is the dashboard's, unchanged**: the router's forward-auth to `/auth`
+(`scripts/gateway_auth.py`) — the client certificate, or a basic-auth user,
+host-scoped by `GATEWAY_BASIC_AUTH_SCOPES`. Scoping works per host, so a
+deployment that wants to hand a sync app or scanner a credential that opens the
+share and nothing else gives the share a host name of its own (a Traefik router
+with `Host(…) && PathPrefix(`/inbox`)`) and scopes that user to it — commented
+example in `docker-compose.override.example.yml`. Nothing here adds a login.
+
+The share refuses hidden names (any segment starting with a dot — so its
+`.inbox.json` is out of reach, and no dot-manifest can be planted) and the
+names the framework reads (`letterbox.DENIED_NAMES`: `CLAUDE.md`, `AGENTS.md`,
+`requirements.txt`, `accepted-requesters.txt`, …; docs/scheduling.md,
+"Reserved names"), `..` and symlinks — all 403 — and answers every GET as a
+sandboxed download
+(`application/octet-stream`, `attachment`, `nosniff`), so an uploaded HTML file
+never runs on the dashboard's origin. An upload is written to a hidden sibling
+and renamed into place when complete, so the intake watcher never sees half a
+file. Every request gets an answer: a malformed header is a 400, a full
+letterbox volume a 507, a read-only one a 403. Changes to the share are Tier 3 like the rest of the gateway's serving
+logic.

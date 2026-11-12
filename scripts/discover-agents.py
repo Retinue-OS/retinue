@@ -36,9 +36,11 @@ marketplace.
 
 from __future__ import annotations
 
-import glob
 import os
 import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import letterbox  # noqa: E402
 from pathlib import Path
 
 KB = "https://w3id.org/retinue/kb#"
@@ -73,9 +75,10 @@ def _agent_dirs() -> list[Path]:
         WORKSPACE / "agents",              # core personas (no frontmatter)
         WORKSPACE / ".claude" / "agents",  # core subagent (archivist)
         # chamber agents provided as plugins
-        *(Path(p) for p in sorted(
-            glob.glob(str(CHAMBERS_DIR / "*" / ".retinue" / "agents"))
-        )),
+        # chamber agents provided as plugins — never from the letterbox, which
+        # outsiders write to (scripts/letterbox.py, mounted_chambers)
+        *(c / ".retinue" / "agents" for c in letterbox.mounted_chambers(CHAMBERS_DIR)
+          if (c / ".retinue" / "agents").is_dir()),
     ]
 
 

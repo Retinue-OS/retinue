@@ -21,6 +21,8 @@ import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 STORE = os.path.join(HERE, "..", "webapp", "components", "shelf-store.js")
+# The shelf size is kept through the device store.
+DEVICE_STORE = os.path.join(HERE, "..", "webapp", "components", "device-store.js")
 
 HARNESS = r"""
 import assert from 'node:assert/strict';
@@ -261,6 +263,7 @@ def main() -> int:
         return 0
     with tempfile.TemporaryDirectory() as tmp:
         shutil.copy(STORE, os.path.join(tmp, "shelf-store.js"))
+        shutil.copy(DEVICE_STORE, os.path.join(tmp, "device-store.js"))
         with open(os.path.join(tmp, "package.json"), "w", encoding="utf-8") as fh:
             fh.write('{"type":"module"}')
         with open(os.path.join(tmp, "harness.mjs"), "w", encoding="utf-8") as fh:

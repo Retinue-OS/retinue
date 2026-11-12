@@ -122,23 +122,6 @@ def test_coerce_intersects_v1_models_when_unflagged(wg):
     ], models
 
 
-def test_ollama_backend_hides_leftover_claude_flags(wg):
-    parsed = _model_info_response(
-        _route("claude-opus-5", picker=True, label="Opus (deepest reasoning)"),
-        _route("claude-sonnet-5", picker=True, label="Sonnet (balanced)"),
-        _route("claude-haiku-4-5", picker=True, label="Haiku (fastest)"),
-        _route("ollama/qwen3.6"),
-    )
-    models = wg._coerce_litellm_models(parsed)
-    assert models == [{"id": "ollama/qwen3.6", "label": "qwen3.6"}], models
-    # Primary pinned to Ollama even when the proxy has not expanded tags yet.
-    os.environ["LITELLM_PRIMARY_MODEL"] = "ollama/qwen3.6"
-    only_claude = _model_info_response(
-        _route("claude-opus-5", picker=True, label="Opus (deepest reasoning)"))
-    assert wg._coerce_litellm_models(only_claude) == []
-    os.environ.pop("LITELLM_PRIMARY_MODEL")
-
-
 def test_coerce_ollama_tags(wg):
     tags = {
         "models": [
@@ -428,6 +411,36 @@ def test_master_key_implies_in_stack_litellm(tmp: Path):
     assert wg._LITELLM_URL == "http://litellm:4000"
 
 
+def test_turn_usage_subtracts_resumed_session_baseline(wg):
+    # A resumed `claude -p` reports usage summed over the whole session. The
+    # bubble must show this turn's cost and the model that answered it — not
+    # the model with the most cost across all earlier turns (the bug: a turn
+    # on qwen3.6 was labelled with the earlier turns' qwen3:8b).
+    turn3 = {"total_cost_usd": 0.0615, "modelUsage": {
+        "ollama/qwen3:8b": {"costUSD": 0.0615, "outputTokens": 293}}}
+    turn4 = {"total_cost_usd": 0.0702, "modelUsage": {
+        "ollama/qwen3:8b": {"costUSD": 0.0615, "outputTokens": 293},
+        "ollama/qwen3.6:latest": {"costUSD": 0.0087, "outputTokens": 27}}}
+    baseline = wg._usage_snapshot(turn3)
+    turn = wg._turn_usage(turn4, baseline)
+    assert abs(turn["total_cost_usd"] - 0.0087) < 1e-9
+    assert list(turn["modelUsage"]) == ["ollama/qwen3.6:latest"]
+    assert wg._envelope_model_name(turn) == "Qwen3.6:latest"
+    # Without the baseline the cumulative figures mislabel the turn.
+    assert wg._envelope_model_name(turn4) == "Qwen3:8b"
+
+
+def test_turn_usage_without_baseline_is_the_envelope(wg):
+    # New sessions, and state entries stored before baselines existed.
+    env = {"total_cost_usd": 0.02, "modelUsage": {
+        "claude-opus-5-5": {"costUSD": 0.02, "outputTokens": 10}}}
+    assert wg._turn_usage(env, None) is env
+    snap = wg._usage_snapshot(env)
+    assert snap == {"total_cost_usd": 0.02,
+                    "models": {"claude-opus-5-5": {"costUSD": 0.02,
+                                                   "outputTokens": 10}}}
+
+
 def main() -> None:
     with tempfile.TemporaryDirectory() as tmp_s:
         tmp = Path(tmp_s)
@@ -439,7 +452,6 @@ def main() -> None:
         test_coerce_litellm_models(wg)
         test_coerce_unflagged_advertised_models(wg)
         test_coerce_intersects_v1_models_when_unflagged(wg)
-        test_ollama_backend_hides_leftover_claude_flags(wg)
         test_coerce_ollama_tags(wg)
         test_fetch_ollama_bypasses_http_proxy_for_local_host(wg)
         test_fetch_ollama_keeps_proxy_for_remote_host(wg)
@@ -448,6 +460,8 @@ def main() -> None:
         test_default_flagged_on_concrete_entry(wg)
         test_unoffered_default_gets_its_own_row(wg)
         test_envelope_model_name_resolves_route_label(wg)
+        test_turn_usage_subtracts_resumed_session_baseline(wg)
+        test_turn_usage_without_baseline_is_the_envelope(wg)
         test_static_fallback_when_litellm_empty_or_down(wg)
         test_last_good_survives_refresh_failure(wg)
         test_litellm_headers(wg)

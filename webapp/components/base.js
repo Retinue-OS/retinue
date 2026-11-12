@@ -8,6 +8,8 @@
 // Subclasses override body(data) -> HTML string, and optionally css() -> extra
 // CSS string.
 
+import { deviceGet, deviceSet } from './device-store.js';
+
 export function esc(s) {
   return String(s == null ? '' : s)
     .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
@@ -46,6 +48,42 @@ export function onFrameChange(fn) {
   const handler = () => fn(mq.matches);
   mq.addEventListener('change', handler);
   return () => mq.removeEventListener('change', handler);
+}
+
+// ── Files ─────────────────────────────────────────────────────────────────────
+// Types the gateway will serve with `Content-Disposition: inline`, i.e. that the
+// browser shows in place instead of saving. Mirrors _INLINE_SAFE_TYPES in
+// web-gateway.py — offering "view" for anything else would just download it.
+// One list for a thread's file rows (conversation.js) and the file viewer
+// (viewer-page.js), so the viewer accepts every type a row sends it.
+export const INLINE_SAFE_TYPES = new Set([
+  'image/png', 'image/jpeg', 'image/gif', 'image/webp', 'image/avif',
+  'application/pdf', 'text/plain',
+]);
+
+// Whether a PDF in a frame of a page (an <iframe>) shows the whole document, as
+// the browser's own viewer would — what the file viewer (viewer.html) needs to
+// be worth opening. Not where the browser has no PDF viewer of its own
+// (navigator.pdfViewerEnabled false), and not on two systems that say they
+// have one but draw no whole PDF in a frame:
+//  - Android: no Android build of Chromium draws a PDF in a frame. Chrome
+//    there reports no viewer, except with AndroidHandlePdfInIframe (on by
+//    default on Android laptops), where the frame gets an "Open" placeholder
+//    instead. Android laptops send a ChromeOS user agent, but their client
+//    hints name the platform.
+//  - iOS and iPadOS: WebKit draws a framed PDF as a picture of its first page
+//    (UseImageDocumentForSubframePDF), and every browser there is WebKit.
+//    iPadOS asks for desktop sites with a Mac user agent, so a "Macintosh"
+//    with a touch screen is an iPad.
+export function framesWholePdf() {
+  if (typeof navigator === 'undefined') return false;
+  if (navigator.pdfViewerEnabled === false) return false;
+  const ua = navigator.userAgent || '';
+  const platform = (navigator.userAgentData && navigator.userAgentData.platform) || '';
+  if (/\bAndroid\b/.test(ua) || platform === 'Android') return false;
+  const appleTouch = /\biP(?:hone|ad|od)\b/.test(ua) ||
+    (/\bMacintosh\b/.test(ua) && navigator.maxTouchPoints > 1);
+  return !appleTouch;
 }
 
 // ── Focus and presses ─────────────────────────────────────────────────────────
@@ -100,17 +138,18 @@ export function onPressOutside(el, fn, { capture = false } = {}) {
 // ── List/cards view preference ────────────────────────────────────────────────
 // Each list card (conversations, projects, news) can present its rows either as
 // reflowing tiles ("cards") or as a single full-width column ("list"). The
-// choice is a per-device preference, persisted in localStorage per card key.
+// choice is a per-device preference, persisted per card key (in localStorage,
+// or inside the Android app by the app, for every endpoint: device-store.js).
 // On phones the tile grid collapses to one column anyway, so the toggle is only
 // rendered in the wide layout (see VIEW_TOGGLE_CSS) — small devices keep the
 // one presentation that makes sense there.
 export function viewPref(key) {
-  try { return localStorage.getItem(`retinue.view.${key}`) || 'cards'; }
+  try { return deviceGet(`retinue.view.${key}`) || 'cards'; }
   catch (_e) { return 'cards'; }
 }
 
 export function setViewPref(key, view) {
-  try { localStorage.setItem(`retinue.view.${key}`, view); } catch (_e) { /* private mode */ }
+  try { deviceSet(`retinue.view.${key}`, view); } catch (_e) { /* private mode */ }
 }
 
 // The header control both list cards share. Clicks carry data-setview; the

@@ -7,16 +7,34 @@
 // nothing here does anything:
 //   - the user agent ends in ` RetinueShell/<n> (Android)`;
 //   - `window.RetinueShell` is installed at document start: {platform,
-//     version, setVoiceActive(bool), openSettings()};
+//     version, setVoiceActive(bool), openSettings(section?)}, from
+//     RetinueShell/2 the Health Connect members (healthConnectAvailable(),
+//     healthSync(), healthSyncStatus(), setHealthSyncInterval(minutes),
+//     setHealthAutoSync(bool)), and from RetinueShell/3 the endpoint members
+//     (endpoints(), selectEndpoint(id); openSettings takes a section);
 //   - the shell dispatches `retinue-shell` window events, detail.type `wake`
-//     (the wake phrase) or `home` (a Home press while the shell is in front).
+//     (the wake phrase), `home` (a Home press while the shell is in front),
+//     `health-sync` (a Health Connect sync started, done, failed or skipped)
+//     or `endpoints` (the shell's endpoint list changed).
+//
+// Every member is feature-detected: an older shell lacks the newer ones, and
+// a call that throws is treated as a shell without it.
 //
 // The home (the conversations viewer on index.html) answers both events in
 // place and says so with claimShellEvents(). Every other page of the web app
 // answers by going there: a wake loads `/?wake=1`, which the home turns into
-// the continuous conversation; a home press loads the home — unless the page
-// holds input that leaving would lose (see registerUnsavedCheck): then it
-// stays where it is, and the user finishes or drops that input first.
+// the continuous conversation; a home press loads the home. Always — input
+// on the page never holds either back. What the user typed is kept on the
+// device and is in its field again when they come back (drafts.js), and a
+// dictation still being recorded or transcribed is finished by the service
+// worker, its text waiting in that same field (dictation.js).
+//
+// The press used to be held when the page held unsent input, with a note
+// popping up at the bottom of the screen and a second press to go anyway. On
+// a phone the keyboard came up with that note and the navigation went away
+// under it, so the second press could not even be made. Neither comes back:
+// input never stands in the way of leaving, and pop-up notes at the bottom
+// of the screen are an anti-pattern here.
 //
 // Pages that do not load this module — the gateway's own (/sends,
 // /claude-auth) and anything else outside the web app — never answer either
@@ -44,94 +62,196 @@ export function setVoiceActive(on) {
   } catch (_e) { /* ignore */ }
 }
 
-export function openShellSettings() {
+// ── The app's own settings page (RetinueShell/4) ───────────────────────────
+// The Android app has a settings page of its own: this app's settings (which
+// Retinue it shows and its endpoints, voice timeouts and shelf size for every
+// endpoint, wake phrase, launcher bar, updates), then those for the endpoint
+// on screen (health data), then this instance's, which it embeds from
+// settings-instance.html. Inside such an app the dashboard's gear opens it
+// (nav.js) and the dashboard's Settings page keeps only the way there and the
+// instance section.
+export function hasShellSettingsPage() {
+  const s = typeof window !== 'undefined' ? window.RetinueShell : null;
+  return !!s && s.settingsPage === true && typeof s.openSettings === 'function';
+}
+
+// Open the phone shell's own settings; `section` names a part of them
+// ('endpoints': the endpoint list, or straight into the editor when there is
+// one endpoint). A shell before RetinueShell/3 ignores the argument.
+export function openShellSettings(section) {
   try {
     const s = window.RetinueShell;
-    if (s && typeof s.openSettings === 'function') { s.openSettings(); return true; }
+    if (s && typeof s.openSettings === 'function') {
+      if (section) s.openSettings(String(section)); else s.openSettings();
+      return true;
+    }
   } catch (_e) { /* ignore */ }
   return false;
+}
+
+// ── Endpoints (RetinueShell/3) ──────────────────────────────────────────────
+// The Retinue servers the phone knows, as the shell lists them: [{id, label,
+// current}], the label being the instance's own name (the manifest's
+// short_name, fetched by the shell) with the host appended only to tell two
+// equal names apart. No URLs: this page knows its own origin, and the other
+// servers are none of its business. Switching and editing are the shell's;
+// the page asks and is left when the switch happens.
+
+// True when this shell has the endpoint members at all.
+export function hasShellEndpoints() {
+  const s = typeof window !== 'undefined' ? window.RetinueShell : null;
+  return !!s && typeof s.endpoints === 'function' && typeof s.selectEndpoint === 'function';
+}
+
+// [{id, label, current}], [] for a shell without the member.
+export function shellEndpoints() {
+  const [called, raw] = shellInvoke('endpoints');
+  if (!called || raw == null) return [];
+  try {
+    const list = typeof raw === 'string' ? JSON.parse(raw) : raw;
+    if (!Array.isArray(list)) return [];
+    return list
+      .filter((e) => e && typeof e === 'object' && typeof e.id === 'string' && e.id)
+      .map((e) => ({ id: e.id, label: typeof e.label === 'string' && e.label ? e.label : e.id, current: !!e.current }));
+  } catch (_e) { return []; }
+}
+
+// Ask the shell to show the endpoint `id`; it loads that server's dashboard,
+// so this page is left. False when this shell cannot switch.
+export function selectShellEndpoint(id) {
+  if (typeof id !== 'string' || !id) return false;
+  return shellInvoke('selectEndpoint', id)[0];
+}
+
+// Subscribe to the shell's `endpoints` events (the list changed while this
+// page is open: an endpoint was added, renamed or removed in the shell's
+// settings). Returns the unsubscribe function.
+export function onShellEndpoints(cb) {
+  if (typeof window === 'undefined') return () => {};
+  const listener = (e) => {
+    const d = e && e.detail;
+    if (d && d.type === 'endpoints') cb();
+  };
+  window.addEventListener('retinue-shell', listener);
+  return () => window.removeEventListener('retinue-shell', listener);
+}
+
+// ── Health Connect (RetinueShell/2) ─────────────────────────────────────────
+// The shell reads the phone's Health Connect store and uploads the changes
+// itself, by WebDAV PUT to /inbox/ (docs/dashboard.md, "Inside the Android
+// shell"); the page only starts a deliberate sync, shows the last result and
+// edits the two auto-sync settings. The bridge returns strings: "true"/"false"
+// and a JSON status document.
+
+// [called, value]: called is false when this shell lacks the member or the
+// call threw.
+function shellInvoke(name, ...args) {
+  const s = typeof window !== 'undefined' ? window.RetinueShell : null;
+  if (!s || typeof s[name] !== 'function') return [false, undefined];
+  try { return [true, s[name](...args)]; } catch (_e) { return [false, undefined]; }
+}
+
+export function healthConnectAvailable() {
+  const [called, value] = shellInvoke('healthConnectAvailable');
+  return called && String(value) === 'true';
+}
+
+// Start a deliberate sync (it always runs, whatever the interval); returns at
+// once. False when this shell cannot sync at all.
+export function healthSync() {
+  return shellInvoke('healthSync')[0];
+}
+
+// {available, permissions, last_sync_at, last_result, last_error, last_count,
+// min_interval_minutes, auto_on_resume, enabled}, or null. `enabled` is the
+// current endpoint's own health switch (RetinueShell/3; absent in older
+// shells, which upload for their one server): false means nothing is read or
+// sent for this server, not even on request, until it is turned on in the
+// shell's endpoint editor.
+export function healthSyncStatus() {
+  const [called, raw] = shellInvoke('healthSyncStatus');
+  if (!called || raw == null) return null;
+  try {
+    const st = typeof raw === 'string' ? JSON.parse(raw) : raw;
+    return st && typeof st === 'object' ? st : null;
+  } catch (_e) { return null; }
+}
+
+export function setHealthSyncInterval(minutes) {
+  return shellInvoke('setHealthSyncInterval', Math.round(Number(minutes)))[0];
+}
+
+export function setHealthAutoSync(on) {
+  return shellInvoke('setHealthAutoSync', !!on)[0];
+}
+
+// The shell uploads health data for the current endpoint at all (see
+// healthSyncStatus): true for a shell that does not say.
+export function healthUploadEnabled(st) {
+  return !st || st.enabled !== false;
+}
+
+// One line for the last sync, shared by Settings and /sync-health: when, and
+// how it went. `st` is healthSyncStatus()'s document.
+export function describeHealthSync(st) {
+  if (!st) return '';
+  if (!healthUploadEnabled(st)) return 'Health data is not uploaded to this Retinue. Turn it on for this endpoint in the phone shell\u2019s settings.';
+  if (st.permissions === 'none') return 'Health Connect access not granted yet — the phone shell asks on the next update.';
+  if (!st.last_sync_at) return 'No update yet.';
+  const when = new Date(st.last_sync_at);
+  const at = isNaN(when) ? st.last_sync_at : when.toLocaleString([], {
+    weekday: 'short', day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' });
+  if (st.last_result === 'error') return `Last update ${at} failed${st.last_error ? `: ${st.last_error}` : '.'}`;
+  if (st.last_result === 'skipped') return `Last update ${at} skipped.`;
+  const n = Number.isFinite(st.last_count) ? ` — ${st.last_count} change${st.last_count === 1 ? '' : 's'}` : '';
+  const partial = st.permissions === 'partial' ? ' (access granted for some data types only)' : '';
+  return `Last update ${at}${n}${partial}.`;
+}
+
+// What a `health-sync` event says, as a line; '' for one not worth a line.
+export function describeHealthSyncEvent(d) {
+  if (!d) return '';
+  if (d.state === 'started') return 'Updating health data…';
+  if (d.state === 'done') {
+    const n = Number.isFinite(d.count) ? ` — ${d.count} change${d.count === 1 ? '' : 's'}` : '';
+    return `Health data updated${n}.`;
+  }
+  if (d.state === 'error') return `Health data update failed${d.error ? `: ${d.error}` : '.'}`;
+  if (d.state === 'skipped') {
+    const why = {
+      interval: 'updated a moment ago',
+      'no-permission': 'Health Connect access is not granted',
+      unavailable: 'Health Connect is not available on this phone',
+      'no-backend-support': 'this dashboard does not accept health data',
+      disabled: 'health data is not uploaded to this Retinue (off for this endpoint in the phone shell)',
+    }[d.reason];
+    return `Health data update skipped${why ? `: ${why}` : ''}.`;
+  }
+  return '';
+}
+
+// Subscribe to the shell's `health-sync` events: cb(detail) with detail.state
+// `started`, `done` (count), `error` (error) or `skipped` (reason). Returns
+// the unsubscribe function.
+export function onHealthSync(cb) {
+  if (typeof window === 'undefined') return () => {};
+  const listener = (e) => {
+    const d = e && e.detail;
+    if (d && d.type === 'health-sync') cb(d);
+  };
+  window.addEventListener('retinue-shell', listener);
+  return () => window.removeEventListener('retinue-shell', listener);
 }
 
 // A page that handles `wake` and `home` itself (the home does) claims them,
 // so the fallback below stays out of its way.
 export function claimShellEvents() { claimed = true; }
 
-// What a page registers to say "leaving now would lose something": a
-// function returning true while it holds unsent or unsaved input — a typed
-// draft not yet stored, a dictation recording or being transcribed, an
-// edit not yet saved. Returns the function that unregisters it. Kept here,
-// with no imports, so any page module can use it without a cycle (update.js
-// asks the same question of the conversations card before a reload).
-// `reveal`, optional: called when that input has just held a wake or a Home
-// press back, to show the user where it is (focus the field holding it,
-// scroll it into view) — a press that did nothing visible reads as broken.
-const unsavedChecks = new Map();
-
-export function registerUnsavedCheck(fn, reveal) {
-  if (typeof fn !== 'function') return () => {};
-  const entry = { fn, reveal: typeof reveal === 'function' ? reveal : null };
-  // Keyed by an object of its own: the same function registered twice is
-  // two registrations, each undone by its own unregister.
-  const token = {};
-  unsavedChecks.set(token, entry);
-  return () => { unsavedChecks.delete(token); };
-}
-
-// The registration holding unsaved input, or null.
-function unsavedHolder() {
-  for (const entry of unsavedChecks.values()) {
-    try { if (entry.fn()) return entry; } catch (_e) { /* a broken check is no veto */ }
-  }
-  return null;
-}
-
-export function hasUnsavedInput() {
-  return !!unsavedHolder();
-}
-
-// A short note at the bottom of the page: why the press did nothing.
-let noteTimer = null;
-function holdNote(type) {
-  if (typeof document === 'undefined' || !document.body) return;
-  let el = document.getElementById('retinue-shell-note');
-  if (!el) {
-    el = document.createElement('div');
-    el.id = 'retinue-shell-note';
-    el.setAttribute('role', 'status');
-    el.style.cssText = 'position:fixed;left:16px;right:16px;bottom:calc(16px + env(safe-area-inset-bottom, 0px));' +
-      'z-index:2147483647;margin:0 auto;max-width:420px;padding:10px 14px;border-radius:12px;' +
-      'background:var(--card-2, #1c2230);color:var(--fg, #e7ebf2);font:14px/1.35 system-ui, sans-serif;' +
-      'box-shadow:0 4px 18px rgba(0,0,0,.35);text-align:center;pointer-events:none';
-    document.body.appendChild(el);
-  }
-  el.textContent = type === 'wake'
-    ? 'Unsent input here — send or clear it, then wake again.'
-    : 'Unsent input here — send or clear it first.';
-  el.hidden = false;
-  if (noteTimer) clearTimeout(noteTimer);
-  noteTimer = setTimeout(() => { el.hidden = true; noteTimer = null; }, 3500);
-}
-
-// Unsent input here: a Home press does nothing, and a wake goes nowhere —
-// the wake phrase can be said again once the input is dealt with, the input
-// could not be had back. Said so, and the input shown. True when the event
-// is held. The page that claims the events (the home) asks this too before
-// acting on one, so its own draft is as safe as any other page's.
-export function shellEventHeld(type) {
-  const holder = unsavedHolder();
-  if (!holder) return false;
-  holdNote(type);
-  if (holder.reveal) { try { holder.reveal(); } catch (_e) { /* the note still says it */ } }
-  return true;
-}
-
 if (typeof window !== 'undefined') {
   window.addEventListener('retinue-shell', (e) => {
     if (claimed) return;
     const type = e && e.detail && e.detail.type;
-    if (type !== 'wake' && type !== 'home') return;
-    if (shellEventHeld(type)) return;
     if (type === 'wake') location.assign('/?wake=1');
-    else location.assign('/');
+    else if (type === 'home') location.assign('/');
   });
 }

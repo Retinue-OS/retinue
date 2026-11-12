@@ -20,6 +20,8 @@ import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 CONTINUOUS_JS = os.path.join(HERE, "..", "webapp", "components", "continuous.js")
+# continuous.js keeps its per-device timeouts through the device store.
+DEVICE_STORE_JS = os.path.join(HERE, "..", "webapp", "components", "device-store.js")
 
 HARNESS = r"""
 import assert from 'node:assert/strict';
@@ -393,8 +395,12 @@ def main() -> int:
         print("SKIP: node is not installed; the continuous.js behaviour test needs it")
         return 0
     with tempfile.TemporaryDirectory() as tmp:
-        # Node treats a bare .js as CommonJS; the module is ESM, so import a copy.
+        # Node treats a bare .js as CommonJS; the module is ESM, so import a copy
+        # (and the directory says so for the device store it imports).
         shutil.copy(CONTINUOUS_JS, os.path.join(tmp, "continuous.mjs"))
+        shutil.copy(DEVICE_STORE_JS, os.path.join(tmp, "device-store.js"))
+        with open(os.path.join(tmp, "package.json"), "w", encoding="utf-8") as fh:
+            fh.write('{"type":"module"}')
         with open(os.path.join(tmp, "harness.mjs"), "w", encoding="utf-8") as fh:
             fh.write(HARNESS)
         proc = subprocess.run([node, "harness.mjs"], cwd=tmp, capture_output=True, text=True)

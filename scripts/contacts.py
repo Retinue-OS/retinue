@@ -39,8 +39,10 @@ the ontology defaults (docs/ontology.md):
   ``dcterms:created``; spheres as ``kb:sphere`` / ``kb:tag`` pointing at
   ``urn:retinue:sphere:<word>``; what the attention model knows about them —
   their importance prior (``kb:importance``, 0–5) and the Focus modes they may
-  interrupt (``kb:permit <urn:retinue:mode:<id>>``); and whether they are a
+  interrupt (``kb:permit <urn:retinue:mode:<id>>``); whether they are a
   VIP (``kb:vip true``), whose messages a model works the moment they arrive;
+  and the user's standing **instruction** for them (``kb:instruction``, free
+  text), the brief a model works each of their messages by;
 - each messaging-service handle: a ``foaf:OnlineAccount`` linked by
   ``foaf:account``, with ``foaf:accountName``, ``foaf:accountServiceHomepage``
   and ``kb:channel`` (the literal the message ledger carries, so an account
@@ -51,9 +53,11 @@ Handles
 Code speaks of *handles*: ``(channel, handle)`` pairs, whatever the channel.
 ``email`` maps to ``vcard:hasEmail``, ``sms`` to ``vcard:hasTelephone`` (an SMS
 number is a telephone, not an account), every other channel to an account. An
-account whose name is an E.164 number also gives the person that telephone.
-An account or an e-mail address belongs to at most one person across all
-chambers; telephones may be shared (a family landline).
+SMS sender that is no number — an alphanumeric sender id ("HBL", "DHL") or a
+short code — is an account on the ``sms`` channel: it reaches nobody, it only
+names who wrote. An account whose name is an E.164 number also gives the
+person that telephone. An account or an e-mail address belongs to at most one
+person across all chambers; telephones may be shared (a family landline).
 
 Library use (the web-gateway's contact card)::
 
@@ -69,6 +73,7 @@ Command line (agents)::
     contacts.py add --chamber private --name "Mara Keller" --email mara@example.org
     contacts.py update <id> --add-handle whatsapp:+41791234567
     contacts.py update <id> --vip --importance 4 --permit focused
+    contacts.py update <id> <id> --instruction "Draft a reply; ring if it is about today."
 
 Writes are committed and pushed in the owning chamber (best effort, like the
 dashboard's project edits).
@@ -88,6 +93,9 @@ import urllib.parse
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import letterbox  # noqa: E402
 
 DEFAULT_PATH = "contacts"
 # The framework's own derived output under CHAMBERS_DIR — in no chamber's
@@ -120,14 +128,27 @@ SERVICE_HOMEPAGES = {
 }
 EMAIL = "email"
 SMS = "sms"
+TELEGRAM = "telegram"
+_TG_ID_RE = re.compile(r"^-?[0-9]+$")
+_TG_USERNAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{3,31}$")
 _CHANNEL_RE = re.compile(r"^[a-z][a-z0-9-]{0,31}$")
 _PHONE_RE = re.compile(r"^\+[0-9]{6,20}$")
 _WA_PN_SUFFIX = "@s.whatsapp.net"
 _PHONE_PUNCT_RE = re.compile(r"[\s\-().\u00a0/]")
 _EMAIL_RE = re.compile(r"^[^@\s<>\"]+@[^@\s<>\"]+$")
+# An SMS sender that is no phone number, in the shape sms-gateway.py's
+# _normalize_sender delivers it: an alphanumeric sender id of at most 16
+# characters with a letter in it ("HBL", "Swisscom"), or a short code. A
+# longer run of digits is a national number, refused rather than guessed.
+_SMS_SENDER_ID_RE = re.compile(r"^(?=.*[A-Za-z])[A-Za-z0-9 ._&-]{1,16}$")
+_SMS_SHORT_CODE_RE = re.compile(r"^[0-9]{3,6}$")
 
 _HEADER = ("# Contact managed by scripts/contacts.py (docs/contacts.md).\n"
            "# Lines it did not write are kept on every rewrite: add your own freely.\n")
+
+# An instruction is a brief, not a document: it rides in every prompt a
+# message of this person's buys, so it is kept to what a brief needs.
+INSTRUCTION_MAX = 2000
 
 
 class ContactError(ValueError):
@@ -166,7 +187,16 @@ def normalize_handle(channel: str, handle: str) -> tuple[str, str]:
     elif channel == SMS:
         value = normalize_phone(value)
         if not _PHONE_RE.match(value):
-            raise ContactError(f"not an E.164 phone number: {handle!r}")
+            value = " ".join(value.split())
+            if not is_sms_sender_id(value):
+                raise ContactError(f"not an E.164 phone number, nor an SMS sender id: {handle!r}")
+    elif channel == TELEGRAM and not _TG_ID_RE.match(value) and not _PHONE_RE.match(normalize_phone(value)):
+        # A username is case-insensitive and written with or without its @:
+        # one spelling, so the same person is not filed twice.
+        name = value[1:] if value.startswith("@") else value
+        if not _TG_USERNAME_RE.match(name):
+            raise ContactError(f"not a Telegram username, user id or phone number: {handle!r}")
+        value = "@" + name.lower()
     else:
         if channel == "whatsapp" and value.lower().endswith(_WA_PN_SUFFIX):
             # A phone-number JID (a chat key) is the number itself; a LID JID
@@ -180,12 +210,42 @@ def normalize_handle(channel: str, handle: str) -> tuple[str, str]:
     return channel, value
 
 
+def is_sms_sender_id(handle: str) -> bool:
+    """Whether an SMS handle names a sender that is no phone number — an
+    alphanumeric sender id or a short code, which cannot be written back to."""
+    return bool(_SMS_SENDER_ID_RE.match(handle) or _SMS_SHORT_CODE_RE.match(handle))
+
+
+def _is_telephone(channel: str, handle: str) -> bool:
+    """Whether a pair is stored as a telephone rather than as an account."""
+    return channel == SMS and not is_sms_sender_id(handle)
+
+
 def parse_handle(spec: str) -> tuple[str, str]:
     """``channel:handle`` (the CLI's and a chat id's shape) → a normalized pair."""
     channel, sep, handle = str(spec or "").partition(":")
     if not sep:
         raise ContactError(f"expected channel:handle, got {spec!r}")
     return normalize_handle(channel, handle)
+
+
+def _canonical(channel: str, handle: str) -> tuple[str, str]:
+    """A filed handle in today's spelling — the form a lookup compares. Filed
+    handles predate some normalization rules (a Telegram username kept as it
+    was typed, ``@Mara_K``); one that no longer normalizes is compared as filed."""
+    try:
+        return normalize_handle(channel, handle)
+    except ContactError:
+        return channel, handle
+
+
+def _match_key(channel: str, handle: str) -> tuple[str, str]:
+    """What two account handles are compared by: the canonical spelling, and an
+    SMS sender id case-folded, as the delivery gate matches it ("HBL", "hbl")."""
+    channel, handle = _canonical(channel, handle)
+    if channel == SMS and is_sms_sender_id(handle):
+        return channel, handle.casefold()
+    return channel, handle
 
 
 def account_iri(channel: str, handle: str) -> str:
@@ -197,11 +257,52 @@ def _im_uri(channel: str, handle: str) -> str | None:
         return "sgnl://signal.me/#p/" + handle
     if channel == "whatsapp" and _PHONE_RE.match(handle):
         return "https://wa.me/" + handle[1:]
-    if channel == "telegram":
+    if channel == TELEGRAM:
         name = handle[1:] if handle.startswith("@") else handle
-        if re.match(r"^[A-Za-z][A-Za-z0-9_]{3,31}$", name):
+        if _TG_USERNAME_RE.match(name):
             return "https://t.me/" + name
     return None
+
+
+def _telegram_lookup(query: str) -> dict | None:
+    """Ask the Telegram gateway who a username or phone is (GET /resolve)."""
+    import urllib.error
+    import urllib.request
+    base = os.environ.get("TELEGRAM_GATEWAY_BASE_URL", "http://telegram-gateway:8093").rstrip("/")
+    token = os.environ.get("TELEGRAM_GATEWAY_TOKEN", "").strip()
+    request = urllib.request.Request(base + "/resolve?" + urllib.parse.urlencode({"q": query}),
+                                     headers={"Authorization": f"Bearer {token}"} if token else {})
+    try:
+        with urllib.request.urlopen(request, timeout=30) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            return None
+        raise ContactError(f"the Telegram gateway could not resolve {query}: HTTP {exc.code}", 502)
+    except (OSError, ValueError) as exc:
+        raise ContactError(f"the Telegram gateway could not resolve {query}: {exc}", 502)
+
+
+def with_telegram_ids(pairs, lookup=_telegram_lookup) -> list[tuple[str, str]]:
+    """``pairs``, plus the numeric user id of every Telegram username or phone
+    among them. Telegram delivers a message under the sender's id only, so a
+    person filed by name or number alone would never match one: the delivery
+    gate, the chat card and the instruction all compare the id. The name stays
+    too — it is what a person recognizes, and it gives the t.me link. A name
+    Telegram does not know is refused rather than filed unreachable."""
+    out = list(pairs)
+    for channel, handle in pairs:
+        if channel != TELEGRAM or _TG_ID_RE.match(handle):
+            continue
+        user = lookup(handle)
+        if not user or user.get("id") is None:
+            # Telegram finds a number only among the account's own contacts.
+            where = " among the account's Telegram contacts" if _PHONE_RE.match(handle) else ""
+            raise ContactError(f"Telegram knows no user {handle}{where}", 404)
+        pair = (TELEGRAM, str(user["id"]))
+        if pair not in out:
+            out.append(pair)
+    return out
 
 
 # ── N-Triples, just enough ──────────────────────────────────────────────────
@@ -280,6 +381,8 @@ def _person_triples(record: dict) -> set[tuple[str, str, str]]:
         out.add((s, _iri(KB + "permit"), _iri(MODE_PREFIX + urllib.parse.quote(mode, safe=""))))
     if record.get("vip"):
         out.add((s, _iri(KB + "vip"), _lit("true", XSD_BOOLEAN)))
+    if record.get("instruction"):
+        out.add((s, _iri(KB + "instruction"), _lit(record["instruction"])))
     for address in record.get("emails") or []:
         out.add((s, _iri(VCARD + "hasEmail"), _iri("mailto:" + address)))
     for number in record.get("phones") or []:
@@ -312,7 +415,7 @@ def _records_from(triples, path: Path, chamber: str, rel: str) -> list[dict]:
             continue
         record = {"iri": iri, "name": "", "sphere": None, "tags": [], "emails": [],
                   "phones": [], "accounts": [], "created": None, "importance": None,
-                  "permits": [], "vip": False}
+                  "permits": [], "vip": False, "instruction": None}
         tels = []
         for p, o in sorted(props):
             pred = _iri_value(p)
@@ -333,6 +436,8 @@ def _records_from(triples, path: Path, chamber: str, rel: str) -> list[dict]:
                 record["permits"].append(urllib.parse.unquote(_iri_value(o)[len(MODE_PREFIX):]))
             elif pred == KB + "vip":
                 record["vip"] = (_lit_value(o) or "").strip().lower() in ("true", "1")
+            elif pred == KB + "instruction" and not record["instruction"]:
+                record["instruction"] = (_lit_value(o) or "").strip() or None
             elif pred == VCARD + "hasEmail" and (_iri_value(o) or "").lower().startswith("mailto:"):
                 record["emails"].append(_iri_value(o)[7:].lower())
             elif pred == VCARD + "hasTelephone" and (_iri_value(o) or "").lower().startswith("tel:"):
@@ -377,6 +482,17 @@ def _importance(value) -> float | None:
     return number
 
 
+def _instruction(value) -> str | None:
+    """A standing instruction as the person keeps it: the user's own words,
+    trimmed, or None for none."""
+    if value is None:
+        return None
+    text = str(value).replace("\r\n", "\n").strip()
+    if len(text) > INSTRUCTION_MAX:
+        raise ContactError(f"an instruction is at most {INSTRUCTION_MAX} characters, not {len(text)}")
+    return text or None
+
+
 def _modes(values) -> list[str]:
     out = set()
     for value in values or ():
@@ -401,7 +517,8 @@ def public(record: dict) -> dict:
             "sphere": record.get("sphere"), "tags": list(record.get("tags") or []),
             "handles": handles_of(record), "phones": list(record.get("all_phones") or []),
             "importance": record.get("importance"), "permits": list(record.get("permits") or []),
-            "vip": bool(record.get("vip")), "created": record.get("created")}
+            "vip": bool(record.get("vip")), "instruction": record.get("instruction") or None,
+            "created": record.get("created")}
 
 
 def _slug(name: str) -> str:
@@ -436,12 +553,10 @@ class ContactBook:
 
     def chambers(self) -> list[str]:
         """Every chamber: each directory mounted under CHAMBERS_DIR, except the
-        framework's generated output. Manifest order first, then by name."""
-        try:
-            mounted = {p.name for p in self.chambers_dir.iterdir()
-                       if p.is_dir() and p.name != GENERATED and not p.name.startswith(".")}
-        except OSError:
-            return []
+        framework's generated output and the letterbox (scripts/letterbox.py),
+        which keeps nobody. Manifest order first, then by name."""
+        mounted = {p.name for p in letterbox.mounted_chambers(self.chambers_dir)
+                   if p.name != GENERATED}
         listed = [str(e["name"]) for e in self._manifest_entries() if str(e["name"]) in mounted]
         return list(dict.fromkeys(listed)) + sorted(mounted - set(listed))
 
@@ -530,12 +645,13 @@ class ContactBook:
     def find(self, channel: str, handle: str) -> dict | None:
         """The person this handle belongs to, if anyone's."""
         channel, handle = normalize_handle(channel, handle)
+        key = _match_key(channel, handle)  # a sender id compares case-insensitively
         for record in self.all():
             if channel == EMAIL and handle in record["emails"]:
                 return record
             if channel == SMS and handle in record["all_phones"]:
                 return record
-            if (channel, handle) in record["accounts"]:
+            if any(_match_key(*account) == key for account in record["accounts"]):
                 return record
         return None
 
@@ -565,7 +681,7 @@ class ContactBook:
     # Writing
 
     def _claimed(self, channel: str, handle: str, but: str | None = None) -> dict | None:
-        if channel == SMS:
+        if _is_telephone(channel, handle):
             return None  # telephones may be shared
         owner = self.find(channel, handle)
         return owner if owner and owner["iri"] != but else None
@@ -589,7 +705,7 @@ class ContactBook:
 
     def create(self, chamber: str, name: str, handles=(), *, sphere: str | None = None,
                tags=(), created: str | None = None, importance=None, permits=(),
-               vip: bool = False) -> dict:
+               vip: bool = False, instruction: str | None = None) -> dict:
         name = " ".join(str(name or "").split())
         if not name:
             raise ContactError("a contact needs a name")
@@ -605,7 +721,8 @@ class ContactBook:
             uid = str(uuid.uuid4())
             record = _blank(PERSON_PREFIX + uid, name, sphere, tags,
                             created or datetime.now(timezone.utc).replace(microsecond=0).isoformat())
-            record.update(importance=_importance(importance), permits=_modes(permits), vip=bool(vip))
+            record.update(importance=_importance(importance), permits=_modes(permits), vip=bool(vip),
+                          instruction=_instruction(instruction))
             for pair in pairs:
                 _add_pair(record, pair)
             path = loc["dir"] / f"{_slug(name)}-{uid[:8]}.nt"
@@ -614,9 +731,10 @@ class ContactBook:
 
     def update(self, key: str, *, name: str | None = None, sphere: str | None | bool = False,
                tags=None, add=(), remove=(), importance=False, permits=None,
-               vip: bool | None = None) -> dict:
-        """Change a person. ``sphere=False`` / ``importance=False`` leave the
-        field; None clears it. ``tags`` / ``permits`` None leave them."""
+               vip: bool | None = None, instruction: str | None | bool = False) -> dict:
+        """Change a person. ``sphere=False`` / ``importance=False`` /
+        ``instruction=False`` leave the field; None (or an empty instruction)
+        clears it. ``tags`` / ``permits`` None leave them."""
         with self._lock:
             old = self.get(key)
             if old is None:
@@ -637,6 +755,8 @@ class ContactBook:
                 new["permits"] = _modes(permits)
             if vip is not None:
                 new["vip"] = bool(vip)
+            if instruction is not False:
+                new["instruction"] = _instruction(instruction)
             for channel, handle in (normalize_handle(c, h) for c, h in remove):
                 _remove_pair(new, (channel, handle))
             for channel, handle in (normalize_handle(c, h) for c, h in add):
@@ -670,7 +790,7 @@ def _blank(iri, name, sphere, tags, created) -> dict:
     return {"iri": iri, "name": name, "sphere": sphere,
             "tags": sorted({str(t).strip().lower() for t in tags if str(t).strip()} - {sphere}),
             "emails": [], "phones": [], "accounts": [], "created": created,
-            "importance": None, "permits": [], "vip": False}
+            "importance": None, "permits": [], "vip": False, "instruction": None}
 
 
 def _copy(record: dict) -> dict:
@@ -681,23 +801,36 @@ def _add_pair(record: dict, pair: tuple[str, str]) -> None:
     channel, handle = pair
     if channel == EMAIL:
         record["emails"] = sorted(set(record["emails"]) | {handle})
-    elif channel == SMS:
+    elif _is_telephone(channel, handle):
         record["phones"] = sorted(set(record["phones"]) | {handle})
     else:
-        record["accounts"] = sorted(set(record["accounts"]) | {pair})
+        # The pair is normalized; an older spelling of the same handle gives way.
+        key = _match_key(*pair)
+        record["accounts"] = sorted({a for a in record["accounts"] if _match_key(*a) != key} | {pair})
 
 
 def _remove_pair(record: dict, pair: tuple[str, str]) -> None:
     channel, handle = pair
     if channel == EMAIL:
         record["emails"] = [e for e in record["emails"] if e != handle]
-    elif channel == SMS:
+    elif _is_telephone(channel, handle):
         record["phones"] = [p for p in record["phones"] if p != handle]
     else:
-        record["accounts"] = [a for a in record["accounts"] if a != pair]
+        key = _match_key(*pair)
+        record["accounts"] = [a for a in record["accounts"] if _match_key(*a) != key]
 
 
 # ── The delivery gate ───────────────────────────────────────────────────────
+
+def _gate_handles(record: dict):
+    """Every messenger handle of one person as the delivery gate compares it:
+    their accounts, and their telephones for SMS."""
+    for channel, handle in record.get("accounts") or []:
+        # Project the current form, which is the one the gateways deliver.
+        yield _canonical(channel, handle)
+    for number in record.get("all_phones") or []:
+        yield SMS, number
+
 
 def policy_projection(book: ContactBook) -> tuple[dict[str, set[str]], set[str]]:
     """What the address book's VIP persons mean to the triage delivery gate:
@@ -709,18 +842,42 @@ def policy_projection(book: ContactBook) -> tuple[dict[str, set[str]], set[str]]
     for record in book.all():
         if not record.get("vip"):
             continue
-        for channel, handle in record.get("accounts") or []:
-            # Filed handles predate some normalization rules; project the
-            # current form, which is the one the gateways deliver.
-            try:
-                channel, handle = normalize_handle(channel, handle)
-            except ContactError:
-                pass
+        for channel, handle in _gate_handles(record):
             handles.setdefault(channel, set()).add(handle)
-        for number in record.get("all_phones") or []:
-            handles.setdefault(SMS, set()).add(number)
         emails |= set(record.get("emails") or [])
     return handles, emails
+
+
+def instruction_projection(book: ContactBook) -> dict[str, set[str]]:
+    """The messenger handles of every person the user wrote an instruction
+    for — the gate's ``instructed`` class: each message of theirs buys a turn
+    with the instruction as its brief. Only the handle reaches the gate; the
+    words stay with the person, where the turn reads them
+    (:func:`instructed_person`)."""
+    handles: dict[str, set[str]] = {}
+    for record in book.all():
+        if record.get("instruction"):
+            for channel, handle in _gate_handles(record):
+                handles.setdefault(channel, set()).add(handle)
+    return handles
+
+
+def instructed_person(book: ContactBook, channel: str, handle: str) -> dict | None:
+    """The person whose instruction applies to a message from this handle, or
+    None. Matched exactly as the gate matched it — the projected form,
+    compared case-insensitively — so a message the gate called instructed
+    finds the instruction it was called that for."""
+    try:
+        channel, handle = normalize_handle(channel, handle)
+    except ContactError:
+        return None
+    want = (channel, handle.strip().lower())
+    for record in book.all():
+        if not record.get("instruction"):
+            continue
+        if any((c, h.strip().lower()) == want for c, h in _gate_handles(record)):
+            return record
+    return None
 
 
 def sync_policy(book: ContactBook) -> list[str]:
@@ -728,7 +885,8 @@ def sync_policy(book: ContactBook) -> list[str]:
     contact-owned members). Idempotent and write-if-changed; returns the
     files it wrote."""
     import triage_policy
-    return triage_policy.sync_contacts(*policy_projection(book))
+    return triage_policy.sync_contacts(*policy_projection(book),
+                                       instructed_handles=instruction_projection(book))
 
 
 # ── Committing ──────────────────────────────────────────────────────────────
@@ -779,6 +937,8 @@ def _print(args, value) -> None:
                                     + (["VIP"] if row.get("vip") else [])))
         note = " [same phone number, other channel]" if row.get("match") == "phone" else ""
         print(f"[{row['id']}] {row['name']} ({row['chamber']}){' — ' + spheres if spheres else ''}{note}\n    {handles}")
+        if row.get("instruction"):
+            print("    instruction: " + " ".join(row["instruction"].split()))
 
 
 def main(argv=None) -> int:
@@ -807,11 +967,18 @@ def main(argv=None) -> int:
                        help="a Focus mode id they may interrupt (repeatable; replaces on update)")
         p.add_argument("--vip", action=argparse.BooleanOptionalAction, default=None,
                        help="a model works their messages the moment they arrive, on every channel")
+        p.add_argument("--instruction",
+                       help="the user's standing brief for their messages: a model works each one "
+                            "by it, and its verdict decides whether the message rings")
+        p.add_argument("--instruction-from", metavar="ID",
+                       help="copy the instruction another contact carries")
     p_add.add_argument("--chamber", required=True, help="the chamber the contact is stored in")
     p_add.add_argument("--email", action="append", default=[])
     p_add.add_argument("--phone", action="append", default=[], help="a telephone (also reachable by SMS)")
     p_add.add_argument("--handle", action="append", default=[], help="channel:handle (repeatable)")
-    p_upd.add_argument("id")
+    p_upd.add_argument("id", nargs="+",
+                       help="the contact; several to give a team the same facts (no name or handle changes then)")
+    p_upd.add_argument("--no-instruction", action="store_true", help="remove the instruction")
     p_upd.add_argument("--add-handle", action="append", default=[], help="channel:handle; email:… and sms:… too")
     p_upd.add_argument("--remove-handle", action="append", default=[])
     p_upd.add_argument("--add-email", action="append", default=[])
@@ -821,8 +988,29 @@ def main(argv=None) -> int:
     p_upd.add_argument("--no-permits", action="store_true", help="clear every Focus-mode permit")
     p_del = sub.add_parser("delete")
     p_del.add_argument("id")
+    sub.add_parser("telegram-ids", help="file the user id next to every Telegram username or phone "
+                                        "filed without one (a contact filed before ids were resolved)")
     args = ap.parse_args(argv)
     book = ContactBook(args.chambers_dir, args.manifest)
+
+    def instruction_arg():
+        """The instruction the flags ask for: False leaves it, None clears it."""
+        given = [f for f, on in (("--instruction", args.instruction is not None),
+                                 ("--instruction-from", args.instruction_from is not None),
+                                 ("--no-instruction", getattr(args, "no_instruction", False))) if on]
+        if len(given) > 1:
+            raise ContactError(f"{' and '.join(given)} contradict each other: give one")
+        if args.instruction_from is not None:
+            source = book.get(args.instruction_from)
+            if source is None:
+                raise ContactError(f"no contact {args.instruction_from!r}", 404)
+            if not source.get("instruction"):
+                raise ContactError(f"{source['name']} carries no instruction to copy")
+            return source["instruction"]
+        if getattr(args, "no_instruction", False):
+            return None
+        return False if args.instruction is None else args.instruction
+
     try:
         if args.cmd == "locations":
             _print(args, [{"chamber": l["chamber"], "path": l["path"]} for l in book.locations()])
@@ -849,27 +1037,89 @@ def main(argv=None) -> int:
         elif args.cmd == "add":
             if not args.name:
                 raise ContactError("--name is required")
-            pairs = ([("email", e) for e in args.email] + [("sms", p) for p in args.phone]
-                     + [parse_handle(h) for h in args.handle])
+            pairs = with_telegram_ids([("email", e) for e in args.email] + [("sms", p) for p in args.phone]
+                                      + [parse_handle(h) for h in args.handle])
+            instruction = instruction_arg()
             record = book.create(args.chamber, args.name, pairs, sphere=args.sphere, tags=args.tag or (),
                                  importance=args.importance or None, permits=args.permit or (),
-                                 vip=bool(args.vip))
+                                 vip=bool(args.vip), instruction=instruction or None)
             sync_policy(book)
             commit(book.chambers_dir, record["path"], f"chore(contacts): add {record['name']}")
             _print(args, public(record))
         elif args.cmd == "update":
-            add = ([parse_handle(h) for h in args.add_handle] + [("email", e) for e in args.add_email]
-                   + [("sms", p) for p in args.add_phone])
+            add = with_telegram_ids([parse_handle(h) for h in args.add_handle]
+                                    + [("email", e) for e in args.add_email]
+                                    + [("sms", p) for p in args.add_phone])
             remove = ([parse_handle(h) for h in args.remove_handle] + [("email", e) for e in args.remove_email]
                       + [("sms", p) for p in args.remove_phone])
-            record = book.update(args.id, name=args.name,
-                                 sphere=args.sphere if args.sphere is not None else False,
-                                 tags=args.tag, add=add, remove=remove,
-                                 importance=False if args.importance is None else (args.importance or None),
-                                 permits=[] if args.no_permits else args.permit, vip=args.vip)
+            ids = list(dict.fromkeys(args.id))
+            # Several people take the same person-level facts — a team that
+            # shares one instruction, say. A name or a handle belongs to one
+            # person, so those changes name exactly one.
+            if len(ids) > 1 and (args.name is not None or add or remove):
+                raise ContactError("a name or a handle belongs to one person: update them one at a time")
+            instruction = instruction_arg()
+            # Every id is looked up before anything is written, so a typo in
+            # the third one does not leave the first two changed.
+            missing = [i for i in ids if book.get(i) is None]
+            if missing:
+                raise ContactError(f"no contact {missing[0]!r}", 404)
+            records = []
+            for key in ids:
+                record = book.update(key, name=args.name,
+                                     sphere=args.sphere if args.sphere is not None else False,
+                                     tags=args.tag, add=add, remove=remove,
+                                     importance=False if args.importance is None else (args.importance or None),
+                                     permits=[] if args.no_permits else args.permit, vip=args.vip,
+                                     instruction=instruction)
+                records.append(record)
             sync_policy(book)
-            commit(book.chambers_dir, record["path"], f"chore(contacts): update {record['name']}")
-            _print(args, public(record))
+            for record in records:
+                commit(book.chambers_dir, record["path"], f"chore(contacts): update {record['name']}")
+            _print(args, public(records[0]) if len(records) == 1 else [public(r) for r in records])
+        elif args.cmd == "telegram-ids":
+            # Every lookup comes before any write, so a gateway that fails
+            # halfway leaves every contact as it was. What cannot be done — a
+            # name Telegram does not know, a handle that is no name at all, an
+            # id someone else already holds — is reported; the rest is
+            # written, synced and committed.
+            plan, problems = [], []
+            for record in book.all():
+                have = []
+                for channel, handle in record["accounts"]:
+                    if channel != TELEGRAM:
+                        continue
+                    try:
+                        pair = normalize_handle(channel, handle)
+                    except ContactError as exc:  # filed before handles were checked
+                        problems.append(f"{record['name']} ({record['key']}): {exc}")
+                        continue
+                    if pair not in have:
+                        have.append(pair)
+                try:
+                    add = [p for p in with_telegram_ids(have) if p not in have]
+                except ContactError as exc:
+                    if exc.status != 404:
+                        raise
+                    problems.append(f"{record['name']} ({record['key']}): {exc}")
+                    continue
+                if add:
+                    plan.append((record, add))
+            changed = []
+            for record, add in plan:
+                try:
+                    changed.append(book.update(record["key"], add=add))
+                except ContactError as exc:
+                    problems.append(f"{record['name']} ({record['key']}): {exc}")
+            if changed:
+                sync_policy(book)
+            for record in changed:
+                commit(book.chambers_dir, record["path"], f"chore(contacts): Telegram id for {record['name']}")
+            _print(args, [public(r) for r in changed])
+            for problem in problems:
+                print(f"contacts: {problem}", file=sys.stderr)
+            if problems:
+                return 2
         elif args.cmd == "delete":
             record = book.delete(args.id)
             sync_policy(book)

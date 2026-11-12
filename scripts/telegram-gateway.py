@@ -683,10 +683,12 @@ def _poll_retinue_job(job_url: str, lang: str, sender: str | None) -> tuple[str,
 async def _resolve_entity(recipient: str):
     """Resolve a recipient (numeric id, @username, phone, or 'me') to an entity."""
     r = str(recipient).strip()
-    try:
-        return await _client.get_entity(int(r))
-    except (ValueError, TypeError):
-        return await _client.get_entity(r)
+    if not r.startswith("+"):  # int() reads a phone number as an id too
+        try:
+            return await _client.get_entity(int(r))
+        except (ValueError, TypeError):
+            pass
+    return await _client.get_entity(r)
 
 
 def _sent_message(obj):
@@ -803,6 +805,36 @@ def _list_contacts() -> list:
     if _client is None or _LOOP is None:
         return []
     fut = asyncio.run_coroutine_threadsafe(_async_list_contacts(), _LOOP)
+    return fut.result(timeout=30)
+
+
+async def _async_resolve_user(query: str) -> dict | None:
+    """The user an @username or phone number names, or None. Only people:
+    a group or channel is no address-book handle. A phone number is found
+    among the account's own contacts only (Telethon's lookup by number)."""
+    from telethon.errors import BadRequestError  # noqa: PLC0415 - localized bridge dep
+    try:
+        entity = await _resolve_entity(query)
+    except (ValueError, TypeError, BadRequestError):
+        # A 400 is about the query, not the gateway: Telegram answers a name
+        # nobody uses with USERNAME_INVALID as well as USERNAME_NOT_OCCUPIED
+        # (which Telethon raises as ValueError).
+        return None
+    if type(entity).__name__ != "User":
+        return None
+    name = (" ".join(p for p in (getattr(entity, "first_name", None),
+                                 getattr(entity, "last_name", None)) if p).strip()
+            or getattr(entity, "username", None) or None)
+    return {"id": getattr(entity, "id", None), "username": getattr(entity, "username", None),
+            "phone": getattr(entity, "phone", None), "name": name}
+
+
+def _resolve_user(query: str) -> dict | None:
+    """Resolve a username or phone to the numeric id inbound events carry —
+    what the address book must file for a contact to match (docs/contacts.md)."""
+    if _client is None or _LOOP is None:
+        raise RuntimeError("Telegram client is not connected yet")
+    fut = asyncio.run_coroutine_threadsafe(_async_resolve_user(query), _LOOP)
     return fut.result(timeout=30)
 
 
@@ -1475,6 +1507,9 @@ def _forward_to_inbox(question: str, lang: str, chat_id: str,
         attachments=attachment_urls,
         gate={"forward": bool(gate.get("forward")),
               "vip": bool(gate.get("vip")),
+              # The user wrote this sender a standing instruction: the rail
+              # works the message by it, and its verdict decides the ring.
+              "instructed": bool(gate.get("instructed")),
               "reason": str(gate.get("reason") or "")},
     )
 
@@ -1492,7 +1527,8 @@ def _forward_to_inbox(question: str, lang: str, chat_id: str,
     # — the rail switched off, unreachable, or an older web-gateway — falls
     # through to everything this gateway did before the chat surface existed.
     rail = _chats.notify_chat_event(**rail_event, handover=True,
-                                    files=files if gate.get("vip") else None,
+                                    files=(files if gate.get("vip") or gate.get("instructed")
+                                           else None),
                                     timeout=RETINUE_POST_TIMEOUT)
     if rail is not None and rail.get("uncertain"):
         # The rail's answer was lost, so whether the chat took this message is
@@ -1512,7 +1548,8 @@ def _forward_to_inbox(question: str, lang: str, chat_id: str,
         rail_job = (rail.get("job_url") or "").strip() or None
         if rail_job:
             print(f"[telegram-gateway] the chat's companion turn took the message "
-                  f"from {sender_label} (vip)", flush=True)
+                  f"from {sender_label} "
+                  f"({'vip' if gate.get('vip') else 'instructed'})", flush=True)
             _confirm_delivery(rail_job, store_path, sender_label,
                               base=_chats.CHATS_INGEST_URL)
             return
@@ -1533,7 +1570,9 @@ def _forward_to_inbox(question: str, lang: str, chat_id: str,
     # design says it never does — for an `ignored` group, silently, by marking
     # the message delivered with nothing left to recover it. The rail could not
     # work this VIP's message, so the pre-chat-surface forward does.
-    if not gate["forward"] and not gate.get("vip"):
+    # An instructed sender is owed a model turn as a VIP is, so the same
+    # holds for them: the rail could not work the message, the forward does.
+    if not gate["forward"] and not gate.get("vip") and not gate.get("instructed"):
         # Mark delivered only for a fully-accounted class (an ignored group)
         # the drain must never re-surface. One held from a quieted group stays
         # delivered=False, so a sweep can still find it.
@@ -2215,6 +2254,29 @@ class _PushHandler(BaseHTTPRequestHandler):
             except Exception as exc:
                 print(f"[telegram-gateway] contacts lookup failed: {exc}", flush=True)
                 self._reply(502, {"error": f"contacts lookup failed: {exc}"})
+            return
+        if self.path.split("?", 1)[0].rstrip("/") == "/resolve":
+            # ?q=@username or a phone → the user's numeric id. Inbound events
+            # carry only the id, so the address book files it next to the
+            # name a person was entered by (scripts/contacts.py).
+            if not self._authorized():
+                self._reply(401, {"error": "unauthorized"})
+                return
+            from urllib.parse import parse_qs, urlsplit
+            query = ((parse_qs(urlsplit(self.path).query).get("q") or [""])[0]).strip()
+            if not query:
+                self._reply(400, {"error": "q is required"})
+                return
+            try:
+                user = _resolve_user(query)
+            except Exception as exc:
+                print(f"[telegram-gateway] resolve failed: {exc}", flush=True)
+                self._reply(502, {"error": f"resolve failed: {exc}"})
+                return
+            if user is None:
+                self._reply(404, {"error": f"no Telegram user {query!r}"})
+                return
+            self._reply(200, user)
             return
         m = _PENDING_SEND_RE.match(self.path)
         if m and not m.group(2):

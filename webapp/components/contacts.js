@@ -8,7 +8,10 @@
 //     further ones, their importance prior, the Focus modes they may
 //     interrupt;
 //   - the VIP flag: a model works their messages the moment they arrive, on
-//     every channel (their e-mail addresses are whitelisted).
+//     every channel (their e-mail addresses are whitelisted);
+//   - their instruction: the user's standing brief a model works each of
+//     their messages by — it decides what is done with a message and how
+//     loudly it rings. One can be copied from another person (a team).
 //
 // Live endpoints, never cached by the service worker:
 //   GET  /contacts[?q=]         -> { locations, default, contacts }
@@ -35,7 +38,7 @@ const CSS = `
        color: var(--muted, #8b93a3); margin: 0; }
   .muted, .note { color: var(--muted, #8b93a3); font-size: .78rem; }
   .err { color: #ff8a8a; font-size: .85rem; margin: 8px 0; }
-  input[type=search], input[type=text], input[type=email], select {
+  input[type=search], input[type=text], input[type=email], select, textarea {
     font: inherit; color: var(--fg, #e7ebf2); background: var(--card-2, #1c2230);
     border: 1px solid var(--line, rgba(231, 235, 242, .12)); border-radius: 10px; padding: 8px 10px; min-width: 0; }
   input[type=search] { width: 100%; margin-bottom: 10px; }
@@ -54,6 +57,10 @@ const CSS = `
   .name { color: var(--fg, #e7ebf2); font-weight: 600; }
   .vip { display: inline-block; font-size: .66rem; font-weight: 700; letter-spacing: .06em;
          color: #0b0d12; background: #f5c542; border-radius: 6px; padding: 1px 5px; margin-left: 6px; vertical-align: 2px; }
+  .brief { display: inline-block; font-size: .66rem; font-weight: 700; letter-spacing: .06em;
+           color: var(--accent, #6ea8fe); border: 1px solid currentColor; border-radius: 6px; padding: 0 5px;
+           margin-left: 6px; vertical-align: 2px; }
+  textarea[data-set="instruction"] { width: 100%; min-height: 4.5em; resize: vertical; line-height: 1.35; }
   .meta { font-size: .76rem; color: var(--muted, #8b93a3); margin-top: 3px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .editor { background: var(--card, #151922); border: 1px solid var(--accent, #6ea8fe); border-radius: 14px;
             padding: 12px; display: grid; gap: 12px; }
@@ -122,9 +129,9 @@ class RetinueContacts extends HTMLElement {
     this._error = '';
     this._form = c
       ? { name: c.name, sphere: c.sphere || '', tags: [...(c.tags || [])], importance: c.importance,
-          permits: [...(c.permits || [])], vip: Boolean(c.vip), handles: c.handles.map((h) => ({ ...h })),
-          chamber: c.chamber, add: { channel: 'email', handle: '' } }
-      : { name: '', sphere: '', tags: [], importance: null, permits: [], vip: false, handles: [],
+          permits: [...(c.permits || [])], vip: Boolean(c.vip), instruction: c.instruction || '',
+          handles: c.handles.map((h) => ({ ...h })), chamber: c.chamber, add: { channel: 'email', handle: '' } }
+      : { name: '', sphere: '', tags: [], importance: null, permits: [], vip: false, instruction: '', handles: [],
           chamber: (this._data && this._data.default) || '', add: { channel: 'email', handle: '' } };
     this.render();
     const input = this.shadowRoot.querySelector('[data-set="name"]');
@@ -146,6 +153,12 @@ class RetinueContacts extends HTMLElement {
     else if (what === 'add-handle') this._form.add.handle = el.value;
     else if (what === 'add-channel') this._form.add.channel = el.value;
     else if (what === 'chamber') this._form.chamber = el.value;
+    else if (what === 'instruction') this._form.instruction = el.value;
+    else if (what === 'instruction-from' && e.type === 'change') {
+      // Copy another person's instruction, to edit here or keep as it is.
+      const from = this._contact(el.value);
+      if (from && from.instruction) { this._form.instruction = from.instruction; this.render(); }
+    }
     else if (what === 'importance' && e.type === 'change') {
       this._form.importance = el.value === '' ? null : Number(el.value);
     }
@@ -191,7 +204,7 @@ class RetinueContacts extends HTMLElement {
     const isNew = this._open === 'new';
     if (isNew && !f.chamber) { this._error = 'A chamber to keep the contact in.'; this.render(); return; }
     const facts = { name: f.name.trim(), sphere: f.sphere || null, tags: f.tags, importance: f.importance,
-      permits: f.permits, vip: f.vip };
+      permits: f.permits, vip: f.vip, instruction: (f.instruction || '').trim() };
     let body;
     if (isNew) {
       body = { ...facts, chamber: f.chamber, handles: f.handles };
@@ -228,7 +241,8 @@ class RetinueContacts extends HTMLElement {
     const handles = (c.handles || []).map((h) => h.handle).join(' · ') || 'no handles';
     const spheres = sphereList(c);
     return `<li><button class="row" data-act="open" data-id="${esc(c.id)}">` +
-      `<div class="name">${esc(c.name)}${c.vip ? '<span class="vip">VIP</span>' : ''}</div>` +
+      `<div class="name">${esc(c.name)}${c.vip ? '<span class="vip">VIP</span>' : ''}` +
+      `${c.instruction ? '<span class="brief" title="Their messages are worked by your instruction">BRIEF</span>' : ''}</div>` +
       `<div class="meta">${esc(handles)}</div>` +
       `<div class="meta">${spheres.length ? esc(spheres.join(', ')) + ' · ' : ''}${esc(c.chamber)}</div>` +
       `</button></li>`;
@@ -270,10 +284,34 @@ class RetinueContacts extends HTMLElement {
       `<div><div class="k">May interrupt in</div><div class="chips">${modes.map(([id, m]) => chip('permit', id, f.permits.includes(id), (m && m.name) || id)).join('')}</div></div>` +
       `<div><div class="chips">${chip('vip', 'vip', f.vip, 'VIP')}</div>` +
       `<div class="note">A model works a VIP's messages the moment they arrive — on every channel above; their e-mail addresses are handled on the frequent run.</div></div>` +
+      this._instructionField(f, busy) +
       `<div class="actions"><button class="btn primary" data-act="save"${busy}>${isNew ? 'Add the contact' : 'Save'}</button>` +
       `<button class="btn" data-act="cancel"${busy}>Cancel</button></div>` +
       (this._error ? `<div class="err">${esc(this._error)}</div>` : '') +
       `</div>`;
+  }
+
+  // The instruction: the user's standing brief for this person's messages.
+  // A model works each one by it — drafts, calendar entries, flags — and its
+  // verdict sets how important the message is, which is what decides whether
+  // it rings (unless they are a VIP, who rings at once regardless).
+  _instructionField(f, busy) {
+    const others = ((this._data && this._data.contacts) || [])
+      .filter((c) => c.instruction && c.id !== this._open);
+    const copy = others.length
+      ? `<select data-set="instruction-from"${busy}><option value="">Copy instruction from…</option>` +
+        others.map((c) => `<option value="${esc(c.id)}">${esc(c.name)}</option>`).join('') + `</select>`
+      : '';
+    return `<div><div class="k">Instruction</div>` +
+      `<textarea data-set="instruction" rows="3" maxlength="2000"${busy} ` +
+      `placeholder="e.g. Draft a reply to every message. When a visit moves, add it to the calendar — you have my approval for that. Ring me only if it is about today or tomorrow.">` +
+      `${esc(f.instruction || '')}</textarea>` +
+      (copy ? `<div class="chips" style="margin-top:6px">${copy}</div>` : '') +
+      `<div class="note">A model works each of their messages by this, on every messenger channel above: it stages a ` +
+      `reply in the chat's draft (never sends), takes the actions you name, and sets how important the message is — ` +
+      `which decides whether it rings, after the work is done. If that work fails or takes over a minute, the message ` +
+      `rings anyway. What they write decides how loudly it rings, so use this for senders you trust — and think twice ` +
+      `on SMS, where a sender is easily faked.</div></div>`;
   }
 
   render() {

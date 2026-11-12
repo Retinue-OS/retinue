@@ -12,7 +12,8 @@ segment, and validated against a bare-hex regex) unchanged.
 Covers: the suffix is derived and appended on disk; _conv_attachment_note()
 and _serve_conversation_attachment() both resolve the suffixed path; a
 pre-existing attachment recorded without a "suffix" key (stored before this
-fix) still resolves to its original, extensionless path.
+fix) still resolves to its original, extensionless path. The download route
+takes an optional filename segment after the id and ignores it.
 
 Also covers the files Ara attaches to her own reply (conversation-push.py
 --reply-attach): an image's intrinsic size is recorded at store time (the
@@ -191,6 +192,34 @@ def test_serve_conversation_attachment_legacy_style(wg):
     assert fake.wfile.getvalue() == b"legacy png bytes"
 
 
+def test_attachment_route_takes_a_name_segment(wg):
+    """The dashboard links …/attachments/<att-id>/<filename> so a client that
+    names a saved file after the URL (Android's URLUtil.guessFileName, in the
+    shell's WebView) saves invoice.pdf, not <att-id>.pdf. The segment is
+    cosmetic: the route ignores it and the header keeps the stored name."""
+    cid, att_id = "6" * 32, "7" * 32
+    base = f"/conversations/{cid}/attachments/{att_id}"
+    for path in (base, base + "/", base + "/invoice.pdf",
+                 base + "/Rechnung%20M%C3%A4rz.pdf", base + "/anything-else/"):
+        m = wg._CONV_ATT_RE.match(path)
+        assert m and m.groups() == (cid, att_id), path
+    for path in (base + "/a/b", base + "x", f"/conversations/{cid}/attachments/"):
+        assert not wg._CONV_ATT_RE.match(path), path
+
+    cid = "8" * 32
+    stored = wg._store_attachments(cid, [
+        {"filename": "Rechnung März.pdf", "content_type": "application/pdf",
+         "data": _b64(b"%PDF named")},
+    ])
+    wg._save_conv({"id": cid, "messages": [{"attachments": stored}]})
+    fake = _FakeHandler()
+    wg.Handler._serve_conversation_attachment(fake, cid, stored[0]["id"], inline=True)
+    assert fake.status == 200, fake.status
+    disposition = fake.headers.get("Content-Disposition")
+    assert disposition.startswith("inline;"), disposition
+    assert "filename*=UTF-8''Rechnung%20M%C3%A4rz.pdf" in disposition, disposition
+
+
 def _png(w: int, h: int) -> bytes:
     """A PNG signature plus an IHDR chunk header — enough for the size sniff."""
     return (b"\x89PNG\r\n\x1a\n" + b"\x00\x00\x00\x0dIHDR"
@@ -328,6 +357,7 @@ def main():
         test_conv_attachment_note_backward_compatible_without_suffix(wg)
         test_serve_conversation_attachment_new_style(wg)
         test_serve_conversation_attachment_legacy_style(wg)
+        test_attachment_route_takes_a_name_segment(wg)
         test_image_dimensions_are_recorded(wg)
         scratch = Path(td) / "scratch"
         scratch.mkdir()

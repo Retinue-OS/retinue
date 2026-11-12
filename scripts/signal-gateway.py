@@ -1804,6 +1804,9 @@ def _forward_to_inbox(question: str, lang: str, sender: str,
         text=question, attachments=attachment_urls,
         gate={"forward": bool(gate.get("forward")),
               "vip": bool(gate.get("vip")),
+              # The user wrote this sender a standing instruction: the rail
+              # works the message by it, and its verdict decides the ring.
+              "instructed": bool(gate.get("instructed")),
               "reason": str(gate.get("reason") or "")},
     )
 
@@ -1821,7 +1824,8 @@ def _forward_to_inbox(question: str, lang: str, sender: str,
     # — the rail switched off, unreachable, or an older web-gateway — falls
     # through to everything this gateway did before the chat surface existed.
     rail = _chats.notify_chat_event(**rail_event, handover=True,
-                                    files=files if gate.get("vip") else None,
+                                    files=(files if gate.get("vip") or gate.get("instructed")
+                                           else None),
                                     timeout=RETINUE_POST_TIMEOUT)
     if rail is not None and rail.get("uncertain"):
         # The rail's answer was lost, so whether the chat took this message is
@@ -1841,7 +1845,8 @@ def _forward_to_inbox(question: str, lang: str, sender: str,
         rail_job = (rail.get("job_url") or "").strip() or None
         if rail_job:
             print(f"[signal-gateway] the chat's companion turn took the message "
-                  f"from {sender_label} (vip)", flush=True)
+                  f"from {sender_label} "
+                  f"({'vip' if gate.get('vip') else 'instructed'})", flush=True)
             _confirm_delivery(rail_job, store_path, sender_label,
                               base=_chats.CHATS_INGEST_URL)
             return
@@ -1862,7 +1867,9 @@ def _forward_to_inbox(question: str, lang: str, sender: str,
     # design says it never does — for an `ignored` group, silently, by marking
     # the message delivered with nothing left to recover it. The rail could not
     # work this VIP's message, so the pre-chat-surface forward does.
-    if not gate["forward"] and not gate.get("vip"):
+    # An instructed sender is owed a model turn as a VIP is, so the same
+    # holds for them: the rail could not work the message, the forward does.
+    if not gate["forward"] and not gate.get("vip") and not gate.get("instructed"):
         # Mark delivered only for a message that is fully accounted for (an
         # ignored group, which the drain must never re-surface). One held from a
         # quieted group stays delivered=False, so a sweep can still find it.

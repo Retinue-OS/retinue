@@ -14,7 +14,10 @@ a Progressive Web App on the phone home screen.
   `<retinue-conversation>`: the thread with its bubbles (Markdown, copy
   buttons on quotes and code, click-to-fill chips, attachments — images the
   gateway serves inline get a preview in the bubble, sized from the dimensions it
-  recorded at store time — model and cost meta), the pending state while Ara answers, the composer with text,
+  recorded at store time; a file's view link opens the file viewer,
+  `viewer.html` / `components/viewer-page.js`, which keeps the navigation row
+  and its ‹ above the image, text or PDF — a PDF only where a frame shows it
+  whole, see docs/dashboard.md "Attachments" — model and cost meta), the pending state while Ara answers, the composer with text,
   file attachments (picked or pasted) and voice dictation, the model picker,
   and the read-aloud player (`<retinue-read-aloud>`, its bar, placeable by
   any host). Given a
@@ -24,7 +27,8 @@ a Progressive Web App on the phone home screen.
   `retinue-created`, `retinue-sent`, `retinue-archived`, `retinue-open`,
   `retinue-thread`); drafts, dictation jobs and the reader outlive one
   instance, so a thread left and reopened has its text, and a reading goes
-  on. A host can shape the frame without forking the thread: `bar="none"` or
+  on — and drafts and dictations outlive the page as well (see "Unsent
+  input"). A host can shape the frame without forking the thread: `bar="none"` or
   `bar="actions"` for a header of its own, `continuous` to open it in
   continuous conversation (see "Voice conversations"), `stamp="clock"` beside a
   clock-stamped timeline, `no-autofocus` where the host keeps it mounted
@@ -57,6 +61,13 @@ a Progressive Web App on the phone home screen.
 - `/sparql`             → the life store, read-only (a query), or `sparql.html`
                           (a browser without one) — see `docs/dashboard.md`
 - `/docs/<name>.md`     → `DOCS_DIR/<name>.md`, the framework docs that page renders
+- `/sync-health`        → `sync-health.html`, the target of "update your health
+                          data" links (see "Inside the Android shell")
+- `/instance`           → GET/POST, the instance's name and accent colour the
+                          Settings page stores (`scripts/instance_branding.py`,
+                          docs/dashboard.md "Several instances")
+- `/inbox/…`            → the letterbox's WebDAV share (`scripts/webdav_share.py`),
+                          not a page — see `docs/dashboard.md`
 - everything else       → `WEBAPP_DIR/<path>` (shell assets)
 
 `vendor/` is not committed: `scripts/vendor-yasgui.sh webapp/vendor/yasgui`
@@ -148,19 +159,23 @@ The wide layout itself is resizable, VS Code style (`layout.js`): the
 boundaries between conversations, news and the projects column are draggable
 splitters — double-click resets one, dragging news fully down closes it — and
 each card's header toggles between list and card view. Both preferences
-persist per device in localStorage. Every page opens with the
+persist per device (`components/device-store.js`: `localStorage` in a browser,
+the app inside the Android shell). Every page opens with the
 navigation row (`components/nav.js`: Home · Chats · Threads · Projects · News
 · Contacts, then the pending-sends outbox icon and the settings gear), pinned
 while a list page scrolls. On a drill-down (a chat, a project, an open
 thread) it starts with the back button: `<retinue-nav back>` dispatches
 `retinue-back` and the page listening on the row decides where back goes.
-Device-level settings (notifications, the voice timeouts, the running shell
-version with a manual update check, and — inside
-the Android shell only — a button into the shell's own settings) live on
-`settings.html`, reached via that gear. The address book (`contacts.html`,
+The settings live on `settings.html`, reached via that gear: *This browser*
+(notifications, the voice timeouts, the layout, the shelf size, the running
+shell version with a manual update check) and *This instance*
+(`components/instance-settings.js`: name and colour, agent models, system
+pages). Inside the Android shell from RetinueShell/4 the gear opens the app's
+own settings page instead, which embeds *This instance* from
+`settings-instance.html` (docs/dashboard.md, "The settings page"). The address book (`contacts.html`,
 `components/contacts.js`; docs/contacts.md) is the *Contacts* tab — people,
-their handles on every channel, their attention settings and the VIP flag —
-over the live `/contacts` API. The outbox icon opens the gateway's `/sends`
+their handles on every channel, their attention settings, the VIP flag and
+the instruction their messages are worked by — over the live `/contacts` API. The outbox icon opens the gateway's `/sends`
 page, the queue of messages waiting for approval: a queue that wants action,
 one tap away from every page.
 
@@ -246,6 +261,33 @@ docstring). Pieces:
   rotation with the keyboard up, dropped while pinch-zoomed) — the header
   and the companion's bar are hidden, and the pane being typed in is kept
   scrolled to its newest message; the navigation row steps aside with them.
+  On a short frame (the Android shell's, above its launcher bar) the thread
+  keeps its room: the chips — one sideways-scrolling row on a touch screen —
+  and a standing instruction's report (its flags first) share a region capped
+  at a fifth of the pane that scrolls inside and steps aside while the
+  keyboard is up, and the field grows to at most 30% of the pane; the thread
+  gives way before the send row does. A **grip** on the line between the
+  thread and the composer hands that split to the user: dragged up, the
+  composer takes the height it is given — the chips and the report stay in
+  view even with the keyboard up (snapping in once the drag is nearer the
+  composer with them than without), the field fills what is left, and the
+  thread keeps a strip of at least one message wherever the composer's own
+  contents leave room for it; dragged back down to the composer's own
+  height, or tapped twice (Enter from the keyboard, arrows to step), it is
+  the composer it was. The keyboard-up and keyboard-down frames each keep
+  their own position, per device beside the splitter's. A press on the grip
+  leaves the focus where it was, so the phone keyboard stays up through a
+  drag, and a press that dragged is never also a tap on whatever has moved
+  under the finger. The grip is a separator with a value (the composer's
+  share of the pane), stepped and reset from the keyboard as above. A draft
+  longer than its box shows an
+  expand control in the field's top-right corner: the field then takes the
+  whole pane at its full width (the thread and the chips step aside, the mic
+  and send sit under its corners) until the control is pressed again, Escape
+  is pressed, a recording starts or the draft is sent. Shrunk again by the
+  control or Escape, the thread is back at the message it was left at; while
+  it is hidden nothing arriving is marked read. A tap on the control leaves
+  the focus where it was, so the phone keyboard stays as it was.
   The open chat polls on the conversations cadence,
   appending only unseen messages, and posts the read watermark on open, on
   arrivals while at the bottom, and when the page becomes visible again.
@@ -274,7 +316,8 @@ The API, as the components consume it:
 
 - `GET /chats` — `{generated, chats: [ChatSummary]}`, ordered by last
   activity. A `ChatSummary` is `{id, channel, account, key, name, group,
-  members?, unread, archived, muted, companion, last, draft, messages}`.
+  members?, unread, archived, muted, companion, instructed, last, draft,
+  messages}`.
 
   A chat is one peer **on one account**, and `id` names both:
   `<channel>:~<account>:<chat-key>`, or `<channel>:<chat-key>` for history
@@ -291,11 +334,16 @@ The API, as the components consume it:
   the preview `{ts, direction, author?, sender_name?, text, kind}`, `draft`
   is the shared draft `{text, author, agent?, ts, version}` or null, and
   `companion` is the conversation id of this chat's companion thread (null
-  until one exists).
+  until one exists). `instructed` is null unless a sender's standing
+  instruction applied to a message here (docs/contacts.md, "The
+  instruction"): then `{state: working|done|failed, person, instruction, vip,
+  since, finished?, verdict?: {importance, due, actions, flags}, delivery?,
+  reason?, fallback?, failure?}` for the newest such message — what the chat
+  page shows above the composer while the turn works and after.
 
   Nothing here says whether Ara works a message on arrival: that follows the
-  **sender** (their VIP flag in the triage policy), not the chat, so it holds
-  wherever that person writes. See `docs/triage-delivery-gate.md`.
+  **sender** (their VIP flag or standing instruction), not the chat, so it
+  holds wherever that person writes. See `docs/triage-delivery-gate.md`.
 
   `messages` is the URL of the chat's message document — the client follows
   it and never constructs message URLs. `archived` and `muted` carry the
@@ -497,14 +545,80 @@ key (`thread:<id>` · `chat:<id>` · `project:<uri>`) with independent membershi
   through `sessionStorage`.
 
 The shelf is per device and browser: `localStorage`, shared by all tabs, which
-follow each other's changes through the `storage` event. It is event-driven
+follow each other's changes through the `storage` event. Its size is a
+per-device preference (`components/device-store.js`): inside the Android
+shell the app holds it, one size for every endpoint, and a change made on the
+app's settings page reaches an open page as a `device-settings` event. It is event-driven
 first — a page showing an item (`<retinue-conversation shelf-key=…>`, the chat
 page, the project page) feeds its facts as it reads and marks the key as the
 current page — and reads only the items no page in the tab is showing
 (`GET /conversations/<id>`, `GET /chats`), every 4 s while one is waiting on
 Ara and every 20 s otherwise, never in a hidden tab. A thread's unsent draft
-still lives only in page memory, so it survives a minimize within the same page
-but not a reload.
+is kept on the device (see "Unsent input"), so it survives a minimize, a
+reload and a later visit alike.
+
+## Unsent input
+
+Leaving a page is never held back by what it holds. A tab of the navigation
+row is a plain link, and the Android shell's Home press and wake always
+navigate. What the user put in waits where they left it instead, and is in
+its field again when they come back to the same place — on any later page
+load of this device and browser:
+
+- **Drafts** (`components/drafts.js`). Every composer, command bar and editor
+  writes what it holds to `localStorage` as it changes (`retinue-draft:<key>`:
+  `conv:<thread id | new | new:<project>>` for the conversation composer,
+  `chat:<chat id>` for a messenger chat's composer, `project-cmd:<id>` and
+  `project-edit:<id>` for a project's command bar and raw editor), and reads
+  it back when its place opens again. Synchronous storage, so a write made as
+  the page unloads (`pagehide`) is not lost; written on every change, so a page
+  the system kills without an unload loses nothing either. Attachments (a
+  thread's picked files, a chat's staged images) are too large for it and go
+  to IndexedDB (`retinue-drafts`) when they are picked or dropped. A project
+  edit is kept with the file version it was started from, so saving it on a
+  later visit still answers 409 when the file changed meanwhile. A chat's
+  composer text also goes to the server's shared draft as the page unloads (a
+  keepalive request); the device copy is put back only while the server's
+  draft has not moved past it. A draft nobody came back to within a month is
+  dropped.
+- **Dictation** (`components/dictation.js`, and the "Dictation" section of
+  `sw.js`). Transcription runs in the service worker, not in the page that
+  recorded it: a page that is left takes its fetches with it. The worker
+  keeps each job, audio and all, in IndexedDB (`retinue-dictation`) under the
+  place it was recorded for, and its result until a page showing that place
+  takes it — the page that recorded it if it is still open, else the next one
+  to open the place, whose box shows "Transcribing …" while the job still
+  runs. A job has one owner, a live client: a page that goes releases its
+  jobs, and a second tab on the same place takes nothing that is not its own.
+  Recorders run in 250 ms slices, so a page left with the mic live hands the
+  worker everything said up to the last fraction of a second, and leaving acts
+  as **✓**: the transcript waits in the draft for review. A dictation sent
+  with **➤** whose page is gone before its transcript is in lands in the draft
+  too, unsent — the context a send needs left with that page. Without a
+  controlling worker (the very first load, a browser without one), and with
+  an older worker that does not take the job up within 4 s, transcription is
+  the page's own fetch, as before.
+- **Sends on the wire.** A turn small enough (all text-only turns in
+  practice) goes out as a `keepalive` request, which the browser finishes even
+  when the page is left meanwhile — but not offline, so that is never taken
+  for delivery. A conversation turn still on the wire as the page goes is
+  written into its draft, marked with when and where it went, and settled when
+  the composer is next shown: dropped from the box once the thread holds it
+  (read twice, a moment apart, as a keepalive request may still be landing),
+  left in it with a note when it does not; when the server cannot be asked at
+  all, the note hedges and the mark stays for the next visit to look again.
+  A first message, which has no thread to read, is looked for in the threads
+  the user opened from that moment on. A chat message is looked for in the chat's own mirror on the
+  next visit; one carrying images is too large for a keepalive request and is
+  the likelier to need it. A project command is taken as delivered.
+
+The page-side guard that held a tab or a Home press on such a page is gone,
+and with it the note that popped up at the bottom of the screen asking for a
+second press — on a phone the keyboard came up with that note and hid the
+navigation, so the second press could not even be made. Pop-up notes at the
+bottom of the screen are an anti-pattern here. Shell updates still wait for
+a moment that costs nothing (`components/update.js`): a reload under a user
+who is writing is not one they asked for.
 
 ## Markdown rendering
 
@@ -513,7 +627,12 @@ goes through the one shared renderer in `components/markdown.js` (paragraphs,
 headings, fenced code, blockquotes, nested and task lists, pipe tables, links,
 bold/italic/strike/inline code). Input is HTML-escaped before any markup is
 generated and only `http(s)`/`mailto:`/`tel:` URLs become links, so the output
-is safe for `innerHTML`. Hosts can specialize rendering via hooks — the
+is safe for `innerHTML`. A link to the dashboard's own origin (Ara's link to
+another thread, an approval page) navigates in place, so it stays in the PWA
+window and the back gesture returns to where it was tapped; every other web
+link opens in a new tab. Like a tab of the navigation row, such a press is
+never held: what the page holds unsent waits in its field (see "Unsent
+input"). Hosts can specialize rendering via hooks — the
 conversations card uses the blockquote hook to keep its copy-to-clipboard
 button on Ara's ready-to-send drafts.
 
@@ -597,11 +716,14 @@ Threads can be spoken as well as typed, with no streaming and split by direction
   showing only a status line until the send completes (the textarea never
   reappears mid-flow, so the phone keyboard stays down). The transcript lands
   in the conversation where **✓**/**➤** was tapped; navigating away from the
-  conversation acts as **✓**, so the transcript waits in that thread's draft.
+  conversation acts as **✓**, so the transcript waits in that thread's draft —
+  and so does leaving the page, recording or transcribing: the service worker
+  finishes the job (see "Unsent input").
   Transcription is a background job of its one conversation: every other
   thread keeps a fully usable row (text and voice) meanwhile, and is not
   re-rendered or refocused when the job — or its reply — arrives. Either way
-  the audio blob is POSTed to `/conversations/transcribe`, which the web gateway proxies
+  the audio blob is POSTed to `/conversations/transcribe` (by the service
+  worker, `components/dictation.js`), which the web gateway proxies
   to the shared STT service (`scripts/stt-service.py`) owning the Whisper model
   (so this image ships no ASR stack). Requires `STT_SERVICE_URL` (set in
   `docker-compose.yml`); when unset the endpoint returns 503 and the mic button
@@ -650,7 +772,8 @@ Threads can be spoken as well as typed, with no streaming and split by direction
   is dropped). Where the page cannot hear the stream, plain timers stand in
   for the detector. A listen wanted while the page is hidden waits up to 60 s
   for it to return. The recording row keeps its ✕/✓/➤ throughout. Both
-  timeouts are per-device settings (Settings → Voice). Opening it: the
+  timeouts are per-device settings (Settings → Voice; in the Android shell,
+  the app's settings page, one pair for every endpoint). Opening it: the
   toggle; `#new?voice=1`, the composer in the mode, whose first take opens
   the thread that then goes on in it; and a wake (`/?wake=1`, or the shell's
   `wake` event), which reopens the thread used in the mode within the last
@@ -677,30 +800,72 @@ cannot do — the home-screen role, a wake phrase, native speech output, the
 client certificate. Everything that is Retinue stays here, so it behaves the
 same in the shell, in Chrome and on a desktop. The contract between them:
 
-- **User agent**: the shell appends ` RetinueShell/1 (Android)`.
+- **User agent**: the shell appends ` RetinueShell/4 (Android)` (`/3` before
+  the app's own settings page and the per-device preferences, `/2` before the
+  endpoint members, `/1` before the Health Connect members below).
 - **`window.RetinueShell`**, installed at document start on the configured
   origin only: `platform`, `version`, `setVoiceActive(bool)` and
-  `openSettings()`. `setVoiceActive(true)` means "a voice conversation is
+  `openSettings(section?)`. `setVoiceActive(true)` means "a voice conversation is
   engaged: keep the screen on, pause the wake phrase". The page asserts it
   before asking for the mic (so the wake detector lets go of it first) and
   holds it for as long as a continuous conversation is engaged — Ara's
   thinking and reading time included — then sends `false` once the loop
-  stops (mode off, no speech, leaving, an error). Settings → Phone shell —
-  shown only when the object exists — calls `openSettings()`.
-  `components/shell.js` wraps both.
+  stops (mode off, no speech, leaving, an error). `components/shell.js` wraps
+  both.
+- **Settings** (RetinueShell/4): `settingsPage: true` — the app has a settings
+  page of its own, and the gear opens it (`openSettings()`); `settings.html`,
+  reached anyway, shows a card leading there instead of the browser part. With
+  RetinueShell/3, Settings → Phone shell — shown only when the object exists,
+  and first on the page there — calls `openSettings()`.
+- **Per-device preferences** (RetinueShell/4): `deviceSettings()` → a JSON
+  string `{key: value}`, `setDeviceSetting(key, value)` and `device-settings`
+  events with the `keys` that changed: the app holds the voice timeouts, the
+  shelf size and the layout for every endpoint. `components/device-store.js`
+  is the only caller (`deviceGet`, `deviceSet`, `onDeviceChange`); in a
+  browser it is plain `localStorage`.
+- **Endpoints** (RetinueShell/3): the shell keeps a list of Retinue servers
+  and shows one. `endpoints()` → `[{id, label, current}]` as a JSON string,
+  the label being the instance's own name (its manifest `short_name`, which
+  Settings › Instance sets); `selectEndpoint(id)` switches (the page is left
+  for the other dashboard); `openSettings('endpoints')` opens the shell's
+  endpoint list or, with one endpoint, its editor. With RetinueShell/3 the
+  Phone shell card shows the menu and *Edit endpoints*; from RetinueShell/4
+  the app's own settings page has them. The page never writes an address,
+  certificate or password — those stay in the shell. An `endpoints` event says the list
+  changed while the page is open.
 - **Shell → page**: `window.dispatchEvent(new CustomEvent('retinue-shell',
   {detail: {type}}))` with `type` `wake` (the wake phrase) or `home` (a Home
   press while the shell is in front). The home answers both in place: a wake
   opens continuous conversation (above), a home press closes an open thread or
   sheet back to `/` (every view entry unwound, not just one) and scrolls the
   list to its top. Any other page of the web app answers by loading
-  `/?wake=1` or `/` — unless it holds unsent input (pages register a check
-  with `registerUnsavedCheck` in `components/shell.js`), in which case
-  neither event navigates. The gateway's own pages (`/sends`, `/claude-auth`)
+  `/?wake=1` or `/` — always: unsent input on the page waits in its field
+  for the user to come back (see "Unsent input"). The gateway's own pages (`/sends`, `/claude-auth`)
   carry no `shell.js`, so the shell itself loads the home (or `/?wake=1`)
   when the page in front is not the dashboard's. A wake while the page is not
   loaded makes the shell load `/?wake=1` itself; the home drops the flag from
   the address on load.
+- **Files**: the WebView renders no PDF, so a PDF row's view link
+  (`?inline=1`, answered `Content-Disposition: inline`) reaches the shell,
+  which opens it in the phone's viewer app from a private copy; the ↓ link
+  (`attachment`) saves it to Downloads. Images and text open in the
+  dashboard's file viewer, as anywhere else. The shell names the file from that
+  header; the URL ends in the name too, for anything that names a file after
+  its URL.
+- **Health Connect** (RetinueShell/2): `healthConnectAvailable()`,
+  `healthSync()`, `healthSyncStatus()`, `setHealthSyncInterval(minutes)`,
+  `setHealthAutoSync(bool)` and `health-sync` events. With RetinueShell/3,
+  Settings → Phone shell shows "Update health data now", the last result, the
+  auto-sync toggle and interval when the shell reports Health Connect
+  available (from RetinueShell/4 the app's settings page does, beside the
+  endpoint's switch); `sync-health.html`
+  (`/sync-health`, `#sync` starts a sync) is the link target for threads. The
+  shell uploads by WebDAV `PUT` to `/inbox/` — the page never handles the
+  data. From RetinueShell/3 the status carries `enabled`, the current
+  endpoint's own health switch: off, both pages show one line and the way to
+  the shell's endpoint editor instead of the controls, and a sync asked for is
+  `skipped` with reason `disabled`. `components/shell.js` wraps all of it,
+  feature-detected.
 - **Speech output**: Android's WebView has no Web Speech API, so the shell
   installs a `speechSynthesis` / `SpeechSynthesisUtterance` stand-in backed by
   the native TTS where the page has none. `components/speech.js` is unchanged;

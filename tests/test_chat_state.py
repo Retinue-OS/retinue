@@ -242,6 +242,28 @@ def test_last_read_forward_only_and_unread_modes():
         print("PASS test_last_read_forward_only_and_unread_modes")
 
 
+def test_archive_unless_arrived():
+    with tempfile.TemporaryDirectory() as tmp:
+        store = cs.ChatStateStore(tmp)
+        cid = "signal:+41790000080"
+        # A chat the attention model has never seen archives as before.
+        doc, archived = store.archive_unless_arrived(cid)
+        assert archived and doc["archived"]
+        store.set_flags(cid, archived=False)
+        # An arrival counted but not yet taken in holds the archive off…
+        doc, _ = store.mark_unread(cid, 1000.0)
+        assert doc["inbound_seq"] == 1 and doc["attended_seq"] == 0
+        doc, archived = store.archive_unless_arrived(cid)
+        assert not archived and not doc["archived"]
+        # …until a block decided from it is stored; it only moves forward.
+        store.set_attention(cid, {"state": "open"}, attended=1)
+        doc = store.set_attention(cid, {"state": "open"}, attended=0)
+        assert doc["attended_seq"] == 1
+        doc, archived = store.archive_unless_arrived(cid)
+        assert archived and doc["archived"]
+        print("PASS test_archive_unless_arrived")
+
+
 def test_flags_and_note_message():
     with tempfile.TemporaryDirectory() as tmp:
         store = cs.ChatStateStore(tmp)
@@ -344,6 +366,7 @@ if __name__ == "__main__":
     test_undo_clear_is_refused_once_it_is_stale_or_moot()
     test_agent_staging_never_clobbers_user_text()
     test_last_read_forward_only_and_unread_modes()
+    test_archive_unless_arrived()
     test_flags_and_note_message()
     test_companion_link()
     test_overlay_merge_dedup_expiry()

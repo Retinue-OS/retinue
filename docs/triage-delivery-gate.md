@@ -39,6 +39,7 @@ arrives.
 | Class | On arrival | Owed afterwards |
 |---|---|---|
 | **VIP sender**, any group | the chat shows it, **and** a model turn runs; it pushes unless the group is quieted/ignored | nothing |
+| **instructed sender** (not a VIP), any group | the chat shows it silently, **and** a model turn runs by the user's instruction; the turn's verdict decides the push (a failed or slow turn pushes), unless the group is quieted/ignored | nothing |
 | a non-VIP, normal group | the chat shows it and pushes | nothing |
 | a non-VIP, **quieted** group | the chat shows it, silently | held `delivered:false` — a recovery sweep can find it |
 | a non-VIP, **ignored** group | the chat shows it, silently | nothing, ever |
@@ -179,10 +180,19 @@ newsletter that turns out to carry a `List-Id` is not silently un-filed.
 ### Messenger sender axis: vip
 
 Messenger identity is a **handle**, not a domain — no aliasing problem, so no
-wildcards needed there. One flag lives on it:
+wildcards needed there. Two flags live on it:
 
 - **VIP** — a person whose messages are worked by a model on arrival, wherever
   they arrive. Independent of every group flag — see *The VIP axis* below.
+- **instructed** — a person the user wrote a standing instruction for
+  (`kb:instruction`, [contacts.md](contacts.md#the-instruction)): each message
+  of theirs is worked by one model turn with that instruction as its brief,
+  and for a sender who is not also a VIP that turn's verdict — an importance,
+  a deadline — is what decides, through the attention model, whether the
+  message rings. Projected only from the address book (`triageInstructedHandle`
+  under the `…:contacts` subject); there is nothing to set by hand, since the
+  words live with the person. Independent of VIP: a handle carrying both rings
+  at once and is worked as instructed in the same single turn.
 
 The handle is **the person who wrote**, which in a shared chat is the poster and
 never the room: a group is matched on the group axis, and only there. Each
@@ -286,7 +296,10 @@ addresses as whitelisted addresses — under a subject of their own
 projection is replaced wholesale on every change and on the gateway's tick;
 hand-set VIPs and the Sent-derived whitelist are never touched by it. Readers
 need no change: the loaders read the predicate and ignore the subject.
-`triage_policy.py vip-add` remains for a handle nobody has filed.
+`triage_policy.py vip-add` remains for a handle nobody has filed. The same
+projection writes every messenger handle of every person with an instruction
+as `triageInstructedHandle` (the `instructed` class); `show` lists them and
+`check-handle` says `instructed` on a second line.
 
 The one thing that is **not** hers alone is where a
 chat sits on the user's screen: Archive and Mute are buttons in the dashboard,
@@ -534,6 +547,19 @@ python3 scripts/triage_policy.py show --channel signal      # …and a vip line
 ```
 
 Like every other entry here, this is normally edited by talking to Ara.
+
+The **`instructed`** flag buys the same turn, and the rail answers it the same
+way (`202` + `job_url`, the gateway waiting on the job before it flips
+`delivered`). What differs is the push: for an instructed sender who is not
+also a VIP the arrival pushes nothing, the turn runs with the user's
+instruction as its brief and ends with a verdict
+(`POST /internal/chats/<id>/verdict`), and the web gateway then puts the
+message through the attention model with that importance and deadline. A turn
+that fails, sets no verdict or runs past `CHAT_INSTRUCTION_TIMEOUT` has the
+message pushed as a VIP's would be. The gate verdict carries the flag to the
+rail as `gate.instructed`, and the message's attachments ride along as they do
+for a VIP. On the fallback path — the rail declining — an instructed sender is
+treated as a VIP is: never held, forwarded to triage.
 
 A rail that cannot take the message answers no acceptance and no handle, and
 the gateway falls back to everything it did before the chat surface existed —

@@ -23,6 +23,10 @@
   <!-- The minimized pages: threads, chats and projects parked one tap away
        (issue #282). Every page carries it as the last child of <main>. -->
   <script type="module" src="/components/shelf.js"></script>
+  <!-- This instance: name and colour, agent models, system pages — the same
+       on every device. Also what the Android app embeds as the last section
+       of its own settings page (settings-instance.html). -->
+  <script type="module" src="/components/instance-settings.js"></script>
 </head>
 <body>
   <main class="settings">
@@ -31,7 +35,76 @@
       <h1>Settings</h1>
     </header>
 
-    <section class="scard">
+    <!-- Inside the Android app (RetinueShell/4 and later): the app has a
+         settings page of its own, with this app's settings, the ones for the
+         endpoint on screen (health data) and this instance's, in that order.
+         The gear opens it directly; this card is for arriving here anyway. -->
+    <section class="scard" data-app-settings hidden>
+      <h2>This app</h2>
+      <p class="hint">The Android app's settings page has everything of this
+        phone: which Retinue it shows and its endpoints, voice and shelf,
+        health data, wake phrase, launcher bar and updates, followed by this
+        instance's settings.</p>
+      <div class="shell-actions">
+        <button type="button" class="setting-btn" data-app-settings-open>App settings</button>
+      </div>
+    </section>
+
+    <!-- Only inside an Android app without its own settings page
+         (RetinueShell/3; components/shell.js), and first there: which Retinue
+         this phone shows, and the phone's own settings. The endpoints (address, certificate, sign-in, health data)
+         are set up in the shell, never from here — a page must not be able to
+         point the shell, its microphone and its certificate at another host —
+         so this card lists them under their own names (the instances' manifest
+         short_name, fetched by the shell), switches between them, and opens the
+         shell's editor. -->
+    <section class="scard" data-shell-settings hidden>
+      <h2>Phone shell</h2>
+      <p class="hint">The Android app around this dashboard. Which Retinue it
+        shows, and the phone's own settings: endpoints, launcher bar, wake
+        phrase, updates.</p>
+      <label class="num-setting endpoint-pick" data-endpoint-pick hidden>Retinue
+        <select data-endpoint-select aria-label="Retinue endpoint"></select>
+      </label>
+      <div class="shell-actions">
+        <button type="button" class="setting-btn" data-shell-endpoints hidden>Edit endpoints</button>
+        <button type="button" class="setting-btn" data-shell-open>Phone shell settings</button>
+      </div>
+      <!-- Health Connect (RetinueShell/2): only where the shell reports it
+           available. The shell does the sync and the upload itself (WebDAV
+           PUT to /inbox/); this block starts a deliberate one and edits the
+           auto-sync settings the shell keeps. From RetinueShell/3 each
+           endpoint has its own upload switch, set in the shell's editor: off,
+           the controls give way to one line and the way to the editor. -->
+      <div class="health-sync" data-health-sync hidden>
+        <div data-health-controls>
+          <p class="hint">Health data from the phone's Health Connect (watch,
+            ring, blood-pressure app) is sent to your health records when the
+            app comes to the front, at most once per interval below. An update
+            started here always runs.</p>
+          <button type="button" class="setting-btn" data-health-sync-now>Update health data now</button>
+          <p class="health-sync-line" data-health-sync-line aria-live="polite"></p>
+          <label class="num-setting">Update when the app comes to the front
+            <input type="checkbox" data-health-auto>
+          </label>
+          <label class="num-setting">At most every (minutes)
+            <input type="number" min="1" max="1440" step="1" inputmode="numeric" data-health-interval>
+          </label>
+        </div>
+        <div data-health-disabled hidden>
+          <p class="hint">Health data is not uploaded to this Retinue. The switch
+            is on the endpoint, in the phone shell.</p>
+          <button type="button" class="setting-btn" data-health-edit-endpoint>Edit endpoint</button>
+        </div>
+      </div>
+    </section>
+
+    <!-- This browser: what is kept per device and browser. Inside the Android
+         app these belong to the app (its settings page; components/
+         device-store.js) and the group is not shown. -->
+    <h2 class="settings-group" data-device-group>This browser</h2>
+
+    <section class="scard" data-device-card>
       <h2>Notifications</h2>
       <p class="hint">Web Push to this device: Ara notifies you when a
         conversation needs a decision or an answer arrives while the dashboard
@@ -40,7 +113,7 @@
       <retinue-push-optin manage></retinue-push-optin>
     </section>
 
-    <section class="scard">
+    <section class="scard" data-device-card>
       <h2>Voice</h2>
       <p class="hint">Continuous conversation (the loop button in a thread's
         bar) reads Ara's answers aloud, then opens the mic. A pause as long as
@@ -55,24 +128,14 @@
       </label>
     </section>
 
-    <!-- Only inside the Android shell (window.RetinueShell, components/shell.js):
-         what needs native APIs — the base URL, the client certificate, the
-         launcher bar and the wake phrase — is set there, not here. -->
-    <section class="scard" data-shell-settings hidden>
-      <h2>Phone shell</h2>
-      <p class="hint">The Android app around this dashboard: its address and
-        client certificate, the launcher bar, and the wake phrase.</p>
-      <button type="button" class="setting-btn" data-shell-open>Open phone shell settings</button>
-    </section>
-
-    <section class="scard">
+    <section class="scard" data-device-card>
       <h2>Layout</h2>
       <p class="hint">On a wide screen the dashboard's columns are resizable —
         drag the dividers, double-click one to reset it. Each card's header
         switches between list and card view. Both are remembered per device.</p>
     </section>
 
-    <section class="scard">
+    <section class="scard" data-device-card>
       <h2>Shelf</h2>
       <p class="hint">Threads, chats and projects you minimize — or leave while
         Ara is still answering — wait on the shelf at the foot of every page.
@@ -84,29 +147,45 @@
       </label>
     </section>
 
-    <section class="scard">
-      <h2>System</h2>
-      <ul class="linklist">
-        <li><a href="/gateways">Messenger gateways &mdash; connection status &amp; pairing</a></li>
-        <li><a href="/claude-auth">Claude sign-in &mdash; account status &amp; browser re-login</a></li>
-        <li><a href="/sends">Pending sends &mdash; messages waiting for approval</a></li>
-        <li><a href="/sparql">Life store &mdash; SPARQL endpoint, ontology &amp; runnable example queries</a></li>
-      </ul>
+    <section class="scard" data-device-card>
+      <h2>Dashboard version</h2>
       <!-- Updates apply on their own (the app reloads once a new version is
            installed); this row is the manual fallback and shows which shell
            version this device is running. -->
-      <retinue-update-check style="margin-top:12px"></retinue-update-check>
+      <retinue-update-check></retinue-update-check>
     </section>
+
+    <!-- This instance: the same on every device (components/instance-settings.js). -->
+    <h2 class="settings-group">This instance</h2>
+    <retinue-instance-settings></retinue-instance-settings>
     <retinue-shelf></retinue-shelf>
   </main>
 
   <script type="module">
     import { shelfSize, setShelfSize, subscribe } from '/components/shelf-store.js';
     import { voiceTimeouts, setVoiceTimeouts } from '/components/continuous.js';
-    import { inShell, openShellSettings } from '/components/shell.js';
+    import {
+      inShell, openShellSettings, healthConnectAvailable, healthSync, healthSyncStatus,
+      setHealthSyncInterval, setHealthAutoSync, onHealthSync, describeHealthSync,
+      describeHealthSyncEvent, healthUploadEnabled,
+      hasShellEndpoints, shellEndpoints, selectShellEndpoint, onShellEndpoints,
+      hasShellSettingsPage,
+    } from '/components/shell.js';
+
+    // Inside an Android app with a settings page of its own (RetinueShell/4):
+    // everything of the phone is there, including the per-device values this
+    // page would otherwise show (the app holds them for every endpoint), so
+    // only the way there and this instance's settings remain here.
+    const appPage = hasShellSettingsPage();
+    if (appPage) {
+      document.querySelector('[data-app-settings]').hidden = false;
+      document.querySelector('[data-app-settings-open]').addEventListener('click', () => openShellSettings());
+      for (const el of document.querySelectorAll('[data-device-group], [data-device-card]')) el.hidden = true;
+    }
 
     // The shelf size (components/shelf-store.js): kept per device and browser
-    // like the shelf; lowering it makes room at once, quiet items first.
+    // (inside the app: by the app, for every endpoint); lowering it makes room
+    // at once, quiet items first.
     const input = document.querySelector('[data-shelf-size]');
     const show = () => { if (document.activeElement !== input) input.value = String(shelfSize()); };
     input.addEventListener('change', () => { input.value = String(setShelfSize(input.value)); });
@@ -127,11 +206,100 @@
       showVoice(setVoiceTimeouts({ noSpeechMs: Number(noSpeech.value) * 1000 })));
     showVoice(voiceTimeouts());
 
-    // The phone shell's own settings, where the page runs inside it.
-    if (inShell()) {
+    // An app without a page of its own (RetinueShell/3 and older): the Phone
+    // shell card as before — its settings, and from RetinueShell/3 the
+    // endpoint menu (the shell's list, under the instances' own names;
+    // changing the choice switches, so this page is left for the other
+    // server's) and the way into the shell's editor.
+    if (inShell() && !appPage) {
       document.querySelector('[data-shell-settings]').hidden = false;
       document.querySelector('[data-shell-open]').addEventListener('click', () => openShellSettings());
+      if (hasShellEndpoints()) {
+        const pick = document.querySelector('[data-endpoint-pick]');
+        const select = document.querySelector('[data-endpoint-select]');
+        const edit = document.querySelector('[data-shell-endpoints]');
+        edit.hidden = false;
+        edit.addEventListener('click', () => openShellSettings('endpoints'));
+        const renderEndpoints = () => {
+          const list = shellEndpoints();
+          pick.hidden = list.length === 0;
+          select.disabled = false;
+          select.replaceChildren();
+          for (const e of list) {
+            const opt = document.createElement('option');
+            opt.value = e.id; opt.textContent = e.label; opt.selected = e.current;
+            select.appendChild(opt);
+          }
+        };
+        select.addEventListener('change', () => {
+          const id = select.value;
+          const current = shellEndpoints().find((e) => e.current);
+          if (!id || (current && current.id === id)) return;
+          select.disabled = true;
+          if (!selectShellEndpoint(id)) renderEndpoints();
+        });
+        onShellEndpoints(renderEndpoints);
+        renderEndpoints();
+      }
     }
+
+    // Health Connect, where an app without a page of its own has it (with one,
+    // health data is on the app's page, next to the endpoint's switch;
+    // components/shell.js): the last
+    // sync from healthSyncStatus(), kept current by the shell's health-sync
+    // events; the button starts a deliberate sync; the toggle and interval
+    // are the shell's own settings, re-read after every write so what shows
+    // is what the shell holds.
+    if (inShell() && !appPage && healthConnectAvailable()) {
+      const box = document.querySelector('[data-health-sync]');
+      const controls = document.querySelector('[data-health-controls]');
+      const disabled = document.querySelector('[data-health-disabled]');
+      const now = document.querySelector('[data-health-sync-now]');
+      const line = document.querySelector('[data-health-sync-line]');
+      const auto = document.querySelector('[data-health-auto]');
+      const interval = document.querySelector('[data-health-interval]');
+      box.hidden = false;
+      document.querySelector('[data-health-edit-endpoint]').addEventListener('click', () => openShellSettings('endpoints'));
+      const showStatus = () => {
+        const st = healthSyncStatus();
+        if (!st) return;
+        // The endpoint's own switch (RetinueShell/3): off, the controls give way.
+        const enabled = healthUploadEnabled(st);
+        controls.hidden = !enabled;
+        disabled.hidden = enabled;
+        if (!enabled) return;
+        line.textContent = describeHealthSync(st);
+        auto.checked = !!st.auto_on_resume;
+        if (document.activeElement !== interval && Number.isFinite(st.min_interval_minutes)) {
+          interval.value = String(st.min_interval_minutes);
+        }
+      };
+      now.addEventListener('click', () => {
+        if (!healthSync()) { line.textContent = 'This phone shell cannot update health data.'; return; }
+        now.disabled = true;
+        line.textContent = 'Updating health data…';
+      });
+      auto.addEventListener('change', () => { setHealthAutoSync(auto.checked); showStatus(); });
+      interval.addEventListener('change', () => {
+        const minutes = Math.round(Number(interval.value));
+        if (Number.isFinite(minutes) && minutes >= 1) setHealthSyncInterval(minutes);
+        showStatus();
+      });
+      onHealthSync((d) => {
+        if (d.state !== 'started') now.disabled = false;
+        if (d.state === 'started' || d.state === 'skipped') {
+          line.textContent = describeHealthSyncEvent(d);
+        } else {
+          showStatus();
+          if (d.state === 'error' && !line.textContent) line.textContent = describeHealthSyncEvent(d);
+        }
+      });
+      document.addEventListener('visibilitychange', () => { if (!document.hidden) showStatus(); });
+      // The endpoint list changed (edited in the shell): so may the switch.
+      onShellEndpoints(showStatus);
+      showStatus();
+    }
+
   </script>
   <script>
     // Register the service worker so this page is available offline too.

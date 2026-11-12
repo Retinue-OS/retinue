@@ -2,15 +2,22 @@
 //
 // The <retinue-push-optin> element lives on the settings page (settings.html),
 // in `manage` mode: it always shows this device's push state — unsupported,
-// blocked, off, or enabled — with the enable button, the preference row (which
-// events notify this device, whether archived conversations do too) and a
-// disable button. Without the `manage` attribute it keeps its original
+// blocked, off, or enabled — with the enable button, the one preference left
+// (whether archived conversations notify this device too) and a disable
+// button. Without the `manage` attribute it keeps its original
 // dashboard-banner behaviour: hidden unless push is available and not yet
 // enabled (no page uses that mode any more, but the contract stays).
 //
-// The preferences live on the server-side subscription record; the local copy
+// There is deliberately no per-device choice of *which* events notify: the
+// attention model decides whether a push goes out (see push_notify.py,
+// DEFAULT_PREFERENCES). #66's modes — new / new & stalled / all / off — sat
+// behind it as a second, blinder filter and dropped what it had released. A
+// device that should stay quiet is disabled, which also stops the browser
+// subscription rather than only the fan-out.
+//
+// The preference lives on the server-side subscription record; the local copy
 // in localStorage exists so the device can be re-registered with the same
-// preferences on every load (a subscription the browser rotated behind our
+// preference on every load (a subscription the browser rotated behind our
 // back — or one lost when the server's store was reset — is restored
 // silently). That upkeep must not depend on the element being on the page —
 // the dashboard imports this module without one — so it also runs once at
@@ -23,23 +30,21 @@
 const CONFIG_URL = '/push/config';
 const SUBSCRIBE_URL = '/push/subscribe';
 const UNSUBSCRIBE_URL = '/push/unsubscribe';
-const STORAGE_KEY = 'retinue_notification_mode';
 const STORAGE_KEY_ARCHIVED = 'retinue_notify_archived';
+// Disable is this device's off switch, now that the 'off' notification mode is
+// gone — and it has to outlive a reload: the upkeep at the bottom of this
+// module re-registers any device whose permission is granted, which used to
+// undo a disable on the next page load.
+const STORAGE_KEY_OFF = 'retinue_push_disabled';
+// Left behind on devices that chose one of #66's retired modes (see header).
+// Only 'off' carried intent worth keeping: it becomes a real disable.
+const LEGACY_MODE_KEY = 'retinue_notification_mode';
 
-// #66 names "new & stalled" as the default for devices with no stored choice.
-const DEFAULT_MODE = 'new_and_stalled';
-
-const MODES = [
-  { id: 'all', label: 'All messages' },
-  { id: 'new_only', label: 'New conversations only' },
-  { id: 'new_and_stalled', label: 'New & stalled conversations' },
-  { id: 'off', label: 'No notifications' },
-];
-
-// Modes that can fire on a message in an existing thread. Only these need the
-// archived-conversations opt-out: a "new" event is a thread being opened,
-// which is never archived, and "off" notifies on nothing.
-const MESSAGE_MODES = ['all', 'new_and_stalled'];
+// What the settings page says once this device is notifying: where the
+// decision is taken, now that it is taken in one place.
+const ENABLED_NOTE = 'Notifications are on for this device. What rings is '
+  + 'decided by your focus mode and how much an item matters — not per '
+  + 'device; this device shows whatever gets through.';
 
 function urlBase64ToUint8Array(base64) {
   const padded = (base64 + '='.repeat((4 - (base64.length % 4)) % 4))
@@ -52,13 +57,27 @@ function supported() {
   return 'serviceWorker' in navigator && 'PushManager' in window && 'Notification' in window;
 }
 
-function storedMode() {
-  return localStorage.getItem(STORAGE_KEY) || DEFAULT_MODE;
-}
-
 function storedArchived() {
   return localStorage.getItem(STORAGE_KEY_ARCHIVED) !== '0';
 }
+
+function storedOff() {
+  return localStorage.getItem(STORAGE_KEY_OFF) === '1';
+}
+
+// One-time migration off #66's retired notification modes (see the header).
+// A device left on 'off' meant it, and Disable is where that now lives; every
+// other mode is dropped, and the device keeps notifying — on the attention
+// model's say alone, which is the point of the change. Run before the element
+// is defined, so the settings page reads the migrated state, not the old one.
+function migrateLegacyMode() {
+  const legacy = localStorage.getItem(LEGACY_MODE_KEY);
+  if (legacy === null) return;
+  localStorage.removeItem(LEGACY_MODE_KEY);
+  if (legacy === 'off') localStorage.setItem(STORAGE_KEY_OFF, '1');
+}
+
+if (supported()) migrateLegacyMode();
 
 async function serverKey() {
   const res = await fetch(CONFIG_URL, { cache: 'no-store' });
@@ -68,8 +87,8 @@ async function serverKey() {
 }
 
 // Register (or re-register) this device with the gateway, carrying the
-// device's notification preferences on the subscription record.
-async function ensureSubscription(mode, notifyArchived) {
+// device's notification preference on the subscription record.
+async function ensureSubscription(notifyArchived) {
   if (!supported() || Notification.permission !== 'granted') return false;
   const key = await serverKey();
   if (!key) return false;
@@ -97,11 +116,25 @@ async function ensureSubscription(mode, notifyArchived) {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       subscription: sub,
-      notification_mode: mode,
       notify_archived: notifyArchived,
     }),
   });
   return res.ok;
+}
+
+// Stop deliveries to this device: the browser subscription first (the part
+// that actually stops them), then the server record.
+async function dropSubscription() {
+  const reg = await navigator.serviceWorker.ready;
+  const sub = await reg.pushManager.getSubscription();
+  if (!sub) return;
+  const endpoint = sub.endpoint;
+  await sub.unsubscribe();
+  await fetch(UNSUBSCRIBE_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ endpoint }),
+  }).catch(() => {});
 }
 
 const CSS = `
@@ -132,11 +165,6 @@ const CSS = `
   .controls { display: none; align-items: center; gap: 8px; width: 100%; flex-wrap: wrap; }
   :host([enabled]) .controls { display: flex; }
   :host([enabled]) .btn-main { display: none; }
-  select {
-    background: var(--bg, #0b0d12); color: var(--fg, #e7ebf2);
-    border: 1px solid var(--line, rgba(231,235,242,.2));
-    border-radius: 4px; font-size: 0.8rem; padding: 2px 4px;
-  }
   .archived-opt { display: flex; align-items: center; gap: 4px; cursor: pointer; }
   .status { margin-left: auto; }
   /* State explanation (manage mode only): unsupported browser, blocked
@@ -164,10 +192,7 @@ class RetinuePushOptIn extends HTMLElement {
       <div class="container">
         <button type="button" class="btn-main"><span class="ico">&#128276;</span><span class="lbl">Enable notifications</span></button>
         <div class="controls">
-          <span class="muted">Mode:</span>
-          <select class="mode-select">
-            ${MODES.map(m => `<option value="${m.id}">${m.label}</option>`).join('')}
-          </select>
+          <span class="muted">Notifications on</span>
           <label class="archived-opt muted" title="Also notify for messages in archived conversations">
             <input type="checkbox" class="archived-check" checked> Archived
           </label>
@@ -178,8 +203,6 @@ class RetinuePushOptIn extends HTMLElement {
       <div class="note"></div>
     `;
     this._btn = this.shadowRoot.querySelector('.btn-main');
-    this._select = this.shadowRoot.querySelector('.mode-select');
-    this._archivedOpt = this.shadowRoot.querySelector('.archived-opt');
     this._archivedCheck = this.shadowRoot.querySelector('.archived-check');
     this._status = this.shadowRoot.querySelector('.status');
     this._lblEl = this.shadowRoot.querySelector('.lbl');
@@ -187,7 +210,6 @@ class RetinuePushOptIn extends HTMLElement {
     this._btnOff = this.shadowRoot.querySelector('.btn-off');
     this._btn.addEventListener('click', () => this._enable());
     this._btnOff.addEventListener('click', () => this._disable());
-    this._select.addEventListener('change', () => this._prefsChanged());
     this._archivedCheck.addEventListener('change', () => this._prefsChanged());
   }
 
@@ -215,21 +237,25 @@ class RetinuePushOptIn extends HTMLElement {
       return;
     }
 
-    this._select.value = storedMode();
     this._archivedCheck.checked = storedArchived();
-    this._syncControls();
 
-    if (Notification.permission === 'granted') {
+    if (Notification.permission === 'granted' && !storedOff()) {
       this.setAttribute('enabled', '');
       this.setAttribute('visible', '');
-      const { mode, notifyArchived } = this._prefs();
-      ensureSubscription(mode, notifyArchived).catch(() => {});
+      this._setNote(ENABLED_NOTE);
+      ensureSubscription(this._prefs().notifyArchived).catch(() => {});
       return;
     }
     if (this.manage) {
       this._setNote('Notifications are off on this device. Enable them to be '
         + 'told when Ara needs a decision or answers while the dashboard is '
         + 'closed.');
+    }
+    if (Notification.permission === 'granted') {
+      // Disabled here, but the browser permission is still granted: the
+      // enable button only needs to clear the local off switch.
+      this.setAttribute('visible', '');
+      return;
     }
     try {
       if (await serverKey()) {
@@ -247,22 +273,13 @@ class RetinuePushOptIn extends HTMLElement {
     if (this._note) this._note.textContent = this.manage ? text : '';
   }
 
-  // Drop this device's subscription: browser-side first (the part that stops
-  // deliveries), then the server record, then back to the opt-in state.
+  // Drop this device's subscription and remember the choice, so the upkeep at
+  // the bottom of this module does not re-register it on the next load.
   async _disable() {
     this._btnOff.disabled = true;
     try {
-      const reg = await navigator.serviceWorker.ready;
-      const sub = await reg.pushManager.getSubscription();
-      if (sub) {
-        const endpoint = sub.endpoint;
-        await sub.unsubscribe();
-        await fetch(UNSUBSCRIBE_URL, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ endpoint }),
-        }).catch(() => {});
-      }
+      localStorage.setItem(STORAGE_KEY_OFF, '1');
+      await dropSubscription();
       this.removeAttribute('enabled');
       this.setAttribute('visible', '');
       this._setLabel('Enable notifications');
@@ -274,13 +291,7 @@ class RetinuePushOptIn extends HTMLElement {
   }
 
   _prefs() {
-    return { mode: this._select.value, notifyArchived: this._archivedCheck.checked };
-  }
-
-  // The archived opt-out only applies to modes that notify on messages.
-  _syncControls() {
-    this._archivedOpt.style.display =
-      MESSAGE_MODES.includes(this._select.value) ? '' : 'none';
+    return { notifyArchived: this._archivedCheck.checked };
   }
 
   async _enable() {
@@ -293,11 +304,11 @@ class RetinuePushOptIn extends HTMLElement {
         this._setLabel('Notifications blocked', true);
         return;
       }
-      const { mode, notifyArchived } = this._prefs();
-      if (await ensureSubscription(mode, notifyArchived)) {
+      localStorage.removeItem(STORAGE_KEY_OFF);
+      if (await ensureSubscription(this._prefs().notifyArchived)) {
         this.setAttribute('enabled', '');
         this.removeAttribute('visible');
-        this._setNote('');
+        this._setNote(ENABLED_NOTE);
       } else {
         this._setLabel('Could not enable', true);
         this._btn.disabled = false;
@@ -309,13 +320,11 @@ class RetinuePushOptIn extends HTMLElement {
   }
 
   async _prefsChanged() {
-    const { mode, notifyArchived } = this._prefs();
-    localStorage.setItem(STORAGE_KEY, mode);
+    const { notifyArchived } = this._prefs();
     localStorage.setItem(STORAGE_KEY_ARCHIVED, notifyArchived ? '1' : '0');
-    this._syncControls();
     this._setStatus('Updating…');
     try {
-      this._setStatus(await ensureSubscription(mode, notifyArchived)
+      this._setStatus(await ensureSubscription(notifyArchived)
         ? 'Updated' : 'Update failed');
     } catch (err) {
       this._setStatus('Update failed');
@@ -340,9 +349,15 @@ customElements.define('retinue-push-optin', RetinuePushOptIn);
 
 // Subscription upkeep, independent of the element: any page that imports this
 // module (the dashboard does) silently re-registers an already-granted device
-// with its stored preferences, so a browser-rotated or server-reset
+// with its stored preference, so a browser-rotated or server-reset
 // subscription heals on the pages people actually open — not only when they
-// visit the settings page.
+// visit the settings page. A device the user disabled is left alone.
 if (supported() && Notification.permission === 'granted') {
-  ensureSubscription(storedMode(), storedArchived()).catch(() => {});
+  if (storedOff()) {
+    // Disabled here, but the browser permission is still granted: make sure
+    // no subscription survived (a legacy 'off' mode, or a failed disable).
+    dropSubscription().catch(() => {});
+  } else {
+    ensureSubscription(storedArchived()).catch(() => {});
+  }
 }

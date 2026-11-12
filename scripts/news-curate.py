@@ -8,7 +8,7 @@ feedback nobody has folded into the preferences yet — does it spawn a single
 `claude -p` session, which dispatches the **Herald** subagent.
 
 That keeps the loop honest: a quiet news day costs nothing, and the model is
-only asked the question it is actually good at ("does Reto care about this?"),
+only asked the question it is actually good at ("does the owner care about this?"),
 never the ranking arithmetic, which is a formula in `news_store.py`.
 
 The payload (unscored items, pending feedback, current preferences) is written
@@ -30,6 +30,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import claude_auth  # noqa: E402
+import agent_models  # noqa: E402
 import news_store as store  # noqa: E402
 import session_env  # noqa: E402
 
@@ -126,6 +127,9 @@ def main() -> int:
            build_prompt(path, len(items), len(feedback))]
     if CLAUDE_MODEL:
         cmd[2:2] = ["--model", CLAUDE_MODEL]
+    # Per-agent model overrides for the Herald this session dispatches
+    # (scripts/agent_models.py); [] when none is set.
+    cmd[-1:-1] = agent_models.cli_args()
     # The allowlisted environment (scripts/session_env.py), never a copy of
     # this process's own: under the scheduler that is already clean, but run
     # by hand from a session it would not be. It also stamps the session's

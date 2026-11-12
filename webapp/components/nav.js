@@ -27,7 +27,9 @@
 // path. `back` may come and go (the thread viewer on the home sets it while a
 // thread is open). Plain links, so the row works offline from the service
 // worker's shell cache (the sends page is the gateway's own, so it needs the
-// network).
+// network). One exception: inside the Android app with a settings page of its
+// own (RetinueShell/4), a plain press on the gear opens that page, which has
+// the phone's settings and this instance's (components/shell.js).
 //
 // Contacts and the sends queue used to sit in an app dock at the foot of the
 // home, beside the phone's own dialer, SMS, mail and map buttons. Those four
@@ -39,12 +41,14 @@
 import { esc } from './base.js';
 // Every page carries this row, so it brings the Android shell's
 // fallback with it: a wake or Home press on a page that is not the home
-// goes there (components/shell.js). Its links ask the same question a Home
-// press does: on a page holding unsent input (a typed message, an unsaved
-// project edit, a dictation on its way) a tap on a tab stays put and says
-// why, instead of dropping the input — the drill-downs that carry the row
-// now are where such input lives.
-import { shellEventHeld } from './shell.js';
+// goes there (components/shell.js). Its links are plain links and always go:
+// a typed message, an unsaved project edit or a dictation on its way stays
+// where it is, kept on the device, and is in its field again when the user
+// comes back (components/drafts.js, components/dictation.js). A tap on a tab
+// used to be held on such a page, with a note at the bottom asking for a
+// second tap — which the phone keyboard, coming up with the note, hid along
+// with the row.
+import { hasShellSettingsPage, openShellSettings } from './shell.js';
 
 const PAGES = [
   { id: 'home', href: '/', label: 'Home', paths: ['/', '/index.html'] },
@@ -132,18 +136,16 @@ class RetinueNav extends HTMLElement {
       `</div>${link(SENDS, 'icon', OUTBOX_SVG)}${link(SETTINGS, 'icon', '&#9881;')}</nav>`;
     const btn = this.shadowRoot.querySelector('[data-back]');
     if (btn) btn.addEventListener('click', (e) => this._onBack(e));
-    const nav = this.shadowRoot.querySelector('nav');
-    if (nav) nav.addEventListener('click', (e) => this._onLink(e));
+    const gear = this.shadowRoot.querySelector(`a[href="${SETTINGS.href}"]`);
+    if (gear) gear.addEventListener('click', (e) => this._onSettings(e));
   }
 
-  // A tab or icon press on a page holding unsent input is held, with the
-  // shell's note, like a Home press (a modified click opens elsewhere and
-  // loses nothing). The back button is the page's to decide.
-  _onLink(e) {
+  // Inside the app with its own settings page, the gear opens that page; a
+  // modified press, or a page the app cannot open, follows the link.
+  _onSettings(e) {
     if (e.metaKey || e.ctrlKey || e.shiftKey || e.altKey || e.button) return;
-    const a = e.target && e.target.closest ? e.target.closest('a') : null;
-    if (!a || a.hasAttribute('data-back')) return;
-    if (shellEventHeld('home')) e.preventDefault();
+    if (!hasShellSettingsPage()) return;
+    if (openShellSettings()) e.preventDefault();
   }
 
   // A plain press hands back to the page; a modified one (new tab, new

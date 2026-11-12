@@ -4,9 +4,11 @@ per file, stored in the chamber the manifest names (docs/contacts.md).
 
 Covers: manifest locations (a declared path, the default where none is
 declared, the opt-out, a declared path that would leave its chamber); handles of every kind (e-mail, SMS,
-messenger accounts) and their normalization; lookup by handle, phone and name;
-the uniqueness of accounts and addresses; lossless rewrites that keep lines the
-module did not write; the CLI; and the best-effort commit in the chamber repo.
+messenger accounts) and their normalization, a handle filed in an older spelling
+among them; the Telegram user id filed next to a name, and its backfill; lookup
+by handle, phone and name; the uniqueness of accounts and addresses; lossless rewrites that keep lines the
+module did not write; the standing instruction and its projection into the
+gate; the CLI; and the best-effort commit in the chamber repo.
 
 Standalone (stdlib only):
 
@@ -17,6 +19,9 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
+import urllib.parse
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -81,13 +86,191 @@ def test_handles():
     assert contacts.normalize_handle("whatsapp", "41791234567@s.whatsapp.net") == ("whatsapp", "+41791234567")
     assert contacts.normalize_handle("matrix", "@mara:example.org") == ("matrix", "@mara:example.org")
     assert contacts.parse_handle("telegram:@mara_k") == ("telegram", "@mara_k")
-    for bad in (("email", "no-at-sign"), ("sms", "not a number"), ("Not A Channel", "x"), ("signal", " ")):
+    # An SMS sender that is no number: an alphanumeric sender id or a short code.
+    assert contacts.normalize_handle("sms", " HBL ") == ("sms", "HBL")
+    assert contacts.normalize_handle("sms", "Post  CH") == ("sms", "Post CH")
+    assert contacts.normalize_handle("sms", "4636") == ("sms", "4636")
+    # Any character the SMS gateway keeps may lead, as long as a letter follows.
+    assert contacts.normalize_handle("sms", ".HBL") == ("sms", ".HBL")
+    for bad in (("email", "no-at-sign"), ("sms", "not a number at all"), ("sms", "079 123 45 67"),
+                ("sms", "<b>HBL</b>"), ("sms", "12"), ("Not A Channel", "x"), ("signal", " ")):
         try:
             contacts.normalize_handle(*bad)
             raise AssertionError(f"accepted {bad}")
         except contacts.ContactError:
             pass
     print("ok test_handles")
+
+
+def test_telegram_ids(chambers, manifest):
+    # One spelling per username: with or without @, any case.
+    for spelled in ("@Mara_K", "mara_k", " @mara_k "):
+        assert contacts.normalize_handle("telegram", spelled) == ("telegram", "@mara_k")
+    assert contacts.normalize_handle("telegram", "123456789") == ("telegram", "123456789")
+    assert contacts.normalize_handle("telegram", "-1001234") == ("telegram", "-1001234")
+    assert contacts.normalize_handle("telegram", "0041 79 123 45 67") == ("telegram", "+41791234567")
+    try:
+        contacts.normalize_handle("telegram", "@no way")
+        raise AssertionError("accepted a username with a space")
+    except contacts.ContactError:
+        pass
+
+    # Telegram delivers the sender's id only: a name or phone gets its id
+    # filed next to it; an id needs no lookup; an unknown name is refused.
+    known = {"@mara_k": 4242, "+41791234567": 4243}
+    asked = []
+
+    def lookup(q):
+        asked.append(q)
+        return {"id": known[q]} if q in known else None
+
+    pairs = [("telegram", "@mara_k"), ("email", "m@x.ch"), ("telegram", "99")]
+    assert contacts.with_telegram_ids(pairs, lookup) == pairs + [("telegram", "4242")]
+    assert asked == ["@mara_k"]
+    assert contacts.with_telegram_ids([("telegram", "+41791234567")], lookup) == [
+        ("telegram", "+41791234567"), ("telegram", "4243")]
+    try:
+        contacts.with_telegram_ids([("telegram", "@nobody")], lookup)
+        raise AssertionError("filed an unknown username")
+    except contacts.ContactError as exc:
+        assert exc.status == 404
+
+    # Filed with its id, the person is who the gate and the instruction match.
+    book = contacts.ContactBook(chambers, manifest)
+    record = book.create("private", "Mara", contacts.with_telegram_ids(
+        [contacts.parse_handle("telegram:@Mara_K")], lookup), instruction="Ring for anything urgent.")
+    assert contacts.instructed_person(book, "telegram", "4242")["name"] == "Mara"
+    assert book.find("telegram", "4242")["name"] == "Mara"
+    assert "4242" in contacts.instruction_projection(book)["telegram"]
+    book.delete(record["key"])
+
+    # Filed before usernames were normalized, in the spelling it was typed:
+    # found, owned and removed by today's spelling all the same.
+    old = book.create("private", "Mara")
+    book._write(Path(old["file"]), old, dict(old, accounts=[("telegram", "@Mara_K")]))
+    for spelled in ("@Mara_K", "mara_k", "@mara_k"):
+        assert book.find("telegram", spelled)["key"] == old["key"], spelled
+    try:
+        book.create("work", "Someone Else", [("telegram", "@mara_k")])
+        raise AssertionError("the username was claimed twice")
+    except contacts.ContactError as exc:
+        assert exc.status == 409
+    # Filing it again rewrites the old spelling; removing it takes it away.
+    again = book.update(old["key"], add=[("telegram", "@mara_k")])
+    assert again["accounts"] == [("telegram", "@mara_k")], again
+    text = (chambers / old["path"]).read_text(encoding="utf-8")
+    assert "Mara_K" not in text and "https://t.me/mara_k" in text, text
+    book._write(Path(old["file"]), again, dict(again, accounts=[("telegram", "@Mara_K")]))
+    assert book.update(old["key"], remove=[("telegram", "@mara_k")])["accounts"] == []
+    assert "Mara_K" not in (chambers / old["path"]).read_text(encoding="utf-8")
+    book.delete(old["key"])
+    print("ok test_telegram_ids")
+
+
+class _FakeTelegramGateway:
+    """GET /resolve as scripts/telegram-gateway.py answers it: 200 with the
+    user (a username in any case, as Telegram has it), 404 for no such user,
+    502 for a lookup its client fails."""
+
+    def __init__(self, users: dict, token: str):
+        self.users, self.asked, self.failing = users, [], set()
+        fake = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def do_GET(self):
+                url = urllib.parse.urlsplit(self.path)
+                query = (urllib.parse.parse_qs(url.query).get("q") or [""])[0]
+                if self.headers.get("Authorization") != f"Bearer {token}":
+                    return self._answer(401, {"error": "unauthorized"})
+                fake.asked.append(query)
+                if query.lower() in fake.failing:
+                    return self._answer(502, {"error": "resolve failed: a flood wait"})
+                if url.path != "/resolve" or query.lower() not in fake.users:
+                    return self._answer(404, {"error": f"no Telegram user {query!r}"})
+                return self._answer(200, {"id": fake.users[query.lower()], "username": None, "phone": None,
+                                          "name": query})
+
+            def _answer(self, status, body):
+                payload = json.dumps(body).encode("utf-8")
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.url = f"http://127.0.0.1:{self.server.server_address[1]}"
+
+
+def test_telegram_backfill(chambers, manifest):
+    """`contacts.py telegram-ids` files the id next to every Telegram name
+    filed without one: every lookup before any write, and a contact it cannot
+    complete holds up only itself."""
+    gateway = _FakeTelegramGateway({"@ines_m": 5001, "+41790000033": 5003, "@twin_b": 5005}, "tg-token")
+    env = dict(os.environ, TELEGRAM_GATEWAY_BASE_URL=gateway.url, TELEGRAM_GATEWAY_TOKEN="tg-token",
+               TRIAGE_MESSENGER_DIR=str(chambers.parent / "backfill-policy" / "messenger"),
+               TRIAGE_EMAIL_WHITELIST_PATH=str(chambers.parent / "backfill-policy" / "email.nt"))
+
+    def backfill():
+        proc = subprocess.run(CLI + ["--chambers-dir", str(chambers), "--manifest", str(manifest), "--json",
+                                     "telegram-ids"], capture_output=True, text=True, env=env)
+        return proc.returncode, json.loads(proc.stdout or "null"), proc.stderr
+
+    # Filed before ids were resolved: a username in the spelling it was
+    # typed, a number, and a name whose id another person already holds.
+    book = contacts.ContactBook(chambers, manifest)
+    ines = book.create("work", "Ines Moser", instruction="Ring for anything urgent.")
+    book._write(Path(ines["file"]), ines, dict(ines, accounts=[("telegram", "@Ines_M")]))
+    otto = book.create("work", "Otto Frei", [("telegram", "+41790000033")])
+    twin_a = book.create("work", "Twin A", [("telegram", "5005")])
+    twin_b = book.create("work", "Twin B", [("telegram", "@twin_b")])
+    people = [ines, otto, twin_a, twin_b]
+    try:
+        # A gateway that fails on the last name changes nobody — not even
+        # the people looked up before it.
+        files = {p["key"]: (chambers / p["path"]).read_text(encoding="utf-8") for p in people}
+        gateway.failing = {"@twin_b"}
+        code, out, err = backfill()
+        assert code == 2 and "HTTP 502" in err, (code, out, err)
+        assert {k: (chambers / book.get(k)["path"]).read_text(encoding="utf-8") for k in files} == files
+        gateway.failing = set()
+
+        # And a name Telegram no longer knows, and a link filed by hand
+        # before handles were checked — no name to look up.
+        gone = book.create("work", "Gone Person", [("telegram", "@gone_away")])
+        linked = book.create("work", "Link Only")
+        book._write(Path(linked["file"]), linked, dict(linked, accounts=[("telegram", "t.me/link_only")]))
+        people += [gone, linked]
+        code, out, err = backfill()
+        assert code == 2, (code, out, err)
+        assert sorted((p["name"], h["handle"]) for p in out for h in p["handles"]) == [
+            ("Ines Moser", "5001"), ("Ines Moser", "@Ines_M"),
+            ("Otto Frei", "+41790000033"), ("Otto Frei", "5003")], out
+        assert "@ines_m" in gateway.asked, "looked up in today's spelling"
+        assert "Gone Person" in err and "knows no user @gone_away" in err, err
+        assert "Twin B" in err and "already belongs to Twin A" in err, err
+        assert "Link Only" in err and "not a Telegram username" in err, err
+        assert not [q for q in gateway.asked if "link_only" in q], gateway.asked
+        assert book.get(gone["key"])["accounts"] == [("telegram", "@gone_away")]
+        assert book.get(twin_b["key"])["accounts"] == [("telegram", "@twin_b")]
+        # Written is synced: the gate learns Ines's id for her instruction.
+        policy = Path(env["TRIAGE_MESSENGER_DIR"]) / "telegram" / "policy" / "policy.nt"
+        assert '<https://w3id.org/retinue/kb#triageInstructedHandle> "5001"' in policy.read_text(encoding="utf-8")
+
+        # Once those are settled, a second run finds nothing left to do.
+        for person in (gone, linked, twin_b):
+            book.delete(person["key"])
+        assert backfill()[:2] == (0, [])
+    finally:
+        gateway.server.shutdown()
+        for person in people:
+            if book.get(person["key"]):
+                book.delete(person["key"])
+    print("ok test_telegram_backfill")
 
 
 def test_create_find_update(chambers, manifest):
@@ -119,6 +302,25 @@ def test_create_find_update(chambers, manifest):
             assert exc.status == 409
     home = book.create("work", "Mara's flatmate", [("sms", "+41791234567")])
     assert home["phones"] == ["+41791234567"]
+    # An alphanumeric SMS sender is an account of its own: no telephone, found
+    # case-insensitively (as the gate matches it), and claimed by one person.
+    bank = book.create("work", "HBL", [("sms", "HBL")])
+    assert bank["accounts"] == [("sms", "HBL")] and bank["phones"] == [], bank
+    text = (chambers / bank["path"]).read_text(encoding="utf-8")
+    assert '<https://w3id.org/retinue/kb#channel> "sms"' in text and "<tel:" not in text, text
+    assert book.find("sms", "hbl")["key"] == bank["key"]
+    assert {"channel": "sms", "handle": "HBL"} in contacts.public(book.get(bank["key"]))["handles"]
+    assert ("sms", "HBL") in set(contacts._gate_handles(book.get(bank["key"])))
+    try:
+        book.create("private", "Someone", [("sms", "HBL")])
+        raise AssertionError("a sender id was claimed twice")
+    except contacts.ContactError as exc:
+        assert exc.status == 409
+    # Another spelling of the same sender id replaces it rather than adding a
+    # second handle, and removes it whatever its case.
+    assert book.update(bank["key"], add=[("sms", "hbl")])["accounts"] == [("sms", "hbl")]
+    assert book.update(bank["key"], remove=[("sms", "HBL")])["accounts"] == []
+    book.delete(bank["key"])
     # A line somebody else wrote survives every rewrite.
     path = chambers / mara["path"]
     extra = f'<{mara["iri"]}> <http://www.w3.org/2006/vcard/ns#bday> "1990-04-01" .'
@@ -200,6 +402,50 @@ def test_attention_and_vip(chambers, manifest):
     print("ok test_attention_and_vip")
 
 
+def test_instruction(chambers, manifest):
+    """A person carries the user's standing instruction (kb:instruction): kept
+    in their file, projected into the gate as the `instructed` class by their
+    messenger handles alone, and found again from a handle the way the gate
+    matched it."""
+    book = contacts.ContactBook(chambers, manifest)
+    brief = "Draft a reply to every message.\nRing me only if a visit moves to today."
+    spitex = book.create("work", "Spitex Team", [("signal", "+41790000077"), ("email", "team@spitex.example")],
+                         instruction="  " + brief + "  ")
+    assert spitex["instruction"] == brief, spitex
+    assert contacts.public(spitex)["instruction"] == brief
+    text = (chambers / spitex["path"]).read_text(encoding="utf-8")
+    assert '<https://w3id.org/retinue/kb#instruction> "Draft a reply to every message.\\nRing me' in text, text
+    # Not a VIP: the instruction is its own class, and the e-mail address is
+    # not whitelisted by it.
+    assert contacts.policy_projection(book) == ({}, set())
+    projected = contacts.instruction_projection(book)
+    assert projected == {"signal": {"+41790000077"}, "sms": {"+41790000077"}}, projected
+    # The lookup matches as the gate does — the projected form, any case.
+    assert contacts.instructed_person(book, "signal", "+41 79 000 00 77")["key"] == spitex["key"]
+    assert contacts.instructed_person(book, "sms", "0041790000077")["key"] == spitex["key"]
+    assert contacts.instructed_person(book, "whatsapp", "+41790000077") is None
+    # A handle filed before a normalization rule still finds its person.
+    old = book.create("work", "Old Filing", [("telegram", "@old_filing")], instruction="Flag everything.")
+    path = chambers / old["path"]
+    path.write_text(path.read_text(encoding="utf-8").replace('"@old_filing"', '"41791234567@s.whatsapp.net"')
+                    .replace('"telegram"', '"whatsapp"'), encoding="utf-8")
+    assert contacts.instructed_person(book, "whatsapp", "+41791234567")["key"] == old["key"]
+    book.delete(old["key"])
+    # Too long is refused; an empty one, and None, remove it; False leaves it.
+    try:
+        book.update(spitex["key"], instruction="x" * (contacts.INSTRUCTION_MAX + 1))
+        raise AssertionError("accepted an instruction past the cap")
+    except contacts.ContactError:
+        pass
+    assert book.update(spitex["key"], vip=True)["instruction"] == brief
+    assert book.update(spitex["key"], instruction="   ")["instruction"] is None
+    assert "kb#instruction" not in (chambers / spitex["path"]).read_text(encoding="utf-8")
+    assert contacts.instruction_projection(book) == {}
+    assert contacts.instructed_person(book, "signal", "+41790000077") is None
+    book.delete(spitex["key"])
+    print("ok test_instruction")
+
+
 def test_cli(chambers, manifest):
     env = dict(os.environ,
                TRIAGE_MESSENGER_DIR=str(chambers.parent / "policy" / "messenger"),
@@ -236,6 +482,26 @@ def test_cli(chambers, manifest):
     assert '"+41790000000"' in sms.read_text(encoding="utf-8")
     run("update", eva["id"], "--no-vip", "--importance", "", "--no-permits")
     assert '"eva@example.org"' not in Path(env["TRIAGE_EMAIL_WHITELIST_PATH"]).read_text(encoding="utf-8")
+    # An instruction, given to a team at once: one update, several ids, and
+    # the gate learns each member's handles as `instructed`.
+    max_ = run("add", "--chamber", "work", "--name", "Max Weber", "--handle", "signal:+41790000002")
+    lea = run("add", "--chamber", "work", "--name", "Lea Graf", "--handle", "telegram:7311",
+              "--instruction", "Draft a reply; ring me if it is about today.")
+    assert lea["instruction"] == "Draft a reply; ring me if it is about today.", lea
+    team = run("update", eva["id"], max_["id"], "--instruction-from", lea["id"])
+    assert [p["instruction"] for p in team] == [lea["instruction"]] * 2, team
+    signal = Path(env["TRIAGE_MESSENGER_DIR"]) / "signal" / "policy" / "policy.nt"
+    nt = signal.read_text(encoding="utf-8")
+    assert '<https://w3id.org/retinue/kb#triageInstructedHandle> "+41790000002"' in nt, nt
+    assert "kb#triageVipHandle" not in nt, "an instruction does not make anyone a VIP"
+    # A name or a handle belongs to one person; contradictory flags are
+    # refused; an unknown id changes nobody.
+    run("update", eva["id"], max_["id"], "--name", "Twins", code=2)
+    run("update", eva["id"], "--instruction", "x", "--no-instruction", code=2)
+    run("update", eva["id"], "nobody-here", "--no-instruction", code=2)
+    assert run("show", eva["id"])["instruction"] == lea["instruction"]
+    assert run("update", eva["id"], max_["id"], "--no-instruction")[0]["instruction"] is None
+    assert "triageInstructedHandle" not in signal.read_text(encoding="utf-8")
     print("ok test_cli")
 
 
@@ -275,9 +541,12 @@ def main():
         chambers, manifest = _setup(tmp)
         test_locations(chambers, manifest)
         test_handles()
+        test_telegram_ids(chambers, manifest)
+        test_telegram_backfill(chambers, manifest)
         test_create_find_update(chambers, manifest)
         test_hand_written_person(chambers, manifest)
         test_attention_and_vip(chambers, manifest)
+        test_instruction(chambers, manifest)
         test_cli(chambers, manifest)
         test_commit(tmp)
     print("all contacts checks passed")

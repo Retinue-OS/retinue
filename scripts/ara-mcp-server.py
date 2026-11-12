@@ -64,7 +64,8 @@ in the tool descriptions and in the answering prompt, so the choice is made on
 subject matter instead of order.
 
 Configuration (environment):
-    ARA_MCP_IDENTITY          what this instance calls itself (default "Ara")
+    ARA_MCP_IDENTITY          what this instance calls itself (default "Ara",
+                              or "Ara (<RETINUE_INSTANCE_NAME>)" when set)
     ARA_MCP_SCOPE_HINT        one line on what it covers, for clients with
                               several instances attached (default: unset)
     ARA_MCP_PORT              listen port (default 8110)
@@ -100,10 +101,27 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import agent_models  # noqa: E402
 import claude_auth  # noqa: E402
+import instance_branding  # noqa: E402
 import session_env  # noqa: E402
 
-IDENTITY = os.environ.get("ARA_MCP_IDENTITY", "").strip() or "Ara"
+
+def current_identity() -> str:
+    """What this instance calls itself: ARA_MCP_IDENTITY, else "Ara (<instance name>)" for an
+    instance named on the dashboard's Settings page or by RETINUE_INSTANCE_NAME
+    (scripts/instance_branding.py), else "Ara". Read per call: the dashboard's name can change
+    while the server runs."""
+    explicit = os.environ.get("ARA_MCP_IDENTITY", "").strip()
+    if explicit:
+        return explicit
+    label = instance_branding.instance_name()
+    return f"Ara ({label})" if label else "Ara"
+
+
+# The identity at start: what the module-level texts (tool list, server info)
+# were rendered with. Handlers that can, ask current_identity() instead.
+IDENTITY = current_identity()
 SCOPE_HINT = os.environ.get("ARA_MCP_SCOPE_HINT", "").strip()
 PORT = int(os.environ.get("ARA_MCP_PORT", "8110"))
 WORKDIR = os.environ.get("ARA_MCP_WORKDIR", "/workspace")
@@ -139,7 +157,7 @@ def _slug(name: str) -> str:
 
 
 def _server_info(identity: str | None = None) -> dict:
-    name = identity or IDENTITY
+    name = identity or current_identity()
     return {"name": _slug(name), "title": f"Ask {name}", "version": VERSION}
 
 # Tools the answering session may never have. Bash is deliberately not on this
@@ -154,7 +172,7 @@ FORBIDDEN_TOOLS = ("Write", "Edit", "NotebookEdit")
 # decide what that name should be called.
 
 def _instructions(identity: str | None = None, scope: str | None = None) -> str:
-    name = identity or IDENTITY
+    name = identity or current_identity()
     scope = SCOPE_HINT if scope is None else scope.strip()
     remit = f" It covers: {scope}." if scope else ""
     paragraphs = [
@@ -204,101 +222,107 @@ def _instructions(identity: str | None = None, scope: str | None = None) -> str:
 SERVER_INFO = _server_info()
 SERVER_INSTRUCTIONS = _instructions()
 
-TOOLS = [
-    {
-        "name": "ask_ara",
-        "title": f"Ask {IDENTITY}",
-        "description": (
-            f"Ask {IDENTITY} — the user's personal agent"
-            + (f", covering {SCOPE_HINT}" if SCOPE_HINT else "")
-            + " — a question about the user's "
-            "projects, data, correspondence, schedule, preferences, or the state "
-            "of their system. Use this instead of asking the user whenever the "
-            f"answer is something {IDENTITY} would already know. If several "
-            "Retinue connectors are attached, pick the one whose remit fits the "
-            "question. Answers can take a "
-            "while: if this returns status \"pending\", poll get_answer with the "
-            "returned job_id."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "question": {
-                    "type": "string",
-                    "description": "The question, in plain prose.",
+def _tools(name: str) -> list:
+    """The tool list, worded around the identity [name] (see current_identity())."""
+    return [
+        {
+            "name": "ask_ara",
+            "title": f"Ask {name}",
+            "description": (
+                f"Ask {name} — the user's personal agent"
+                + (f", covering {SCOPE_HINT}" if SCOPE_HINT else "")
+                + " — a question about the user's "
+                "projects, data, correspondence, schedule, preferences, or the state "
+                "of their system. Use this instead of asking the user whenever the "
+                f"answer is something {name} would already know. If several "
+                "Retinue connectors are attached, pick the one whose remit fits the "
+                "question. Answers can take a "
+                "while: if this returns status \"pending\", poll get_answer with the "
+                "returned job_id."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "question": {
+                        "type": "string",
+                        "description": "The question, in plain prose.",
+                    },
+                    "context": {
+                        "type": "string",
+                        "description": (
+                            "What you are working on and why you are asking. Lets "
+                            "Ara answer the question behind the question."
+                        ),
+                    },
                 },
-                "context": {
-                    "type": "string",
-                    "description": (
-                        "What you are working on and why you are asking. Lets "
-                        "Ara answer the question behind the question."
-                    ),
+                "required": ["question"],
+            },
+            "annotations": {"readOnlyHint": True, "openWorldHint": True},
+        },
+        {
+            "name": "get_answer",
+            "title": "Get a pending answer",
+            "description": (
+                "Retrieve the answer to an earlier ask_ara call that returned "
+                "status \"pending\". Poll every few seconds; status is one of "
+                "pending, done, error."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {"job_id": {"type": "string"}},
+                "required": ["job_id"],
+            },
+            "annotations": {"readOnlyHint": True},
+        },
+        {
+            "name": "list_projects",
+            "title": "List the user's projects",
+            "description": (
+                "List the user's active projects with their status, current actor "
+                "and next action. Cheap and immediate — prefer it over ask_ara when "
+                "you only need the project list."
+            ),
+            "inputSchema": {"type": "object", "properties": {}},
+            "annotations": {"readOnlyHint": True},
+        },
+        {
+            "name": "get_project",
+            "title": "Read one project",
+            "description": (
+                "Read one project's full source (frontmatter and body) as Markdown. "
+                "Takes the project id/URI as returned by list_projects."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {"id": {"type": "string"}},
+                "required": ["id"],
+            },
+            "annotations": {"readOnlyHint": True},
+        },
+        {
+            "name": "tell_ara",
+            "title": "Leave the user a note",
+            "description": (
+                f"Leave a note for the user in the {name} dashboard — something "
+                "they should know or decide about, arising from the work you are "
+                "doing. Not for questions you need answered now; use ask_ara for "
+                "those. Returns a link to the thread."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "note": {"type": "string", "description": "The note, in prose."},
+                    "title": {"type": "string", "description": "Short thread title."},
                 },
+                "required": ["note"],
             },
-            "required": ["question"],
+            "annotations": {"readOnlyHint": False, "destructiveHint": False},
         },
-        "annotations": {"readOnlyHint": True, "openWorldHint": True},
-    },
-    {
-        "name": "get_answer",
-        "title": "Get a pending answer",
-        "description": (
-            "Retrieve the answer to an earlier ask_ara call that returned "
-            "status \"pending\". Poll every few seconds; status is one of "
-            "pending, done, error."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {"job_id": {"type": "string"}},
-            "required": ["job_id"],
-        },
-        "annotations": {"readOnlyHint": True},
-    },
-    {
-        "name": "list_projects",
-        "title": "List the user's projects",
-        "description": (
-            "List the user's active projects with their status, current actor "
-            "and next action. Cheap and immediate — prefer it over ask_ara when "
-            "you only need the project list."
-        ),
-        "inputSchema": {"type": "object", "properties": {}},
-        "annotations": {"readOnlyHint": True},
-    },
-    {
-        "name": "get_project",
-        "title": "Read one project",
-        "description": (
-            "Read one project's full source (frontmatter and body) as Markdown. "
-            "Takes the project id/URI as returned by list_projects."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {"id": {"type": "string"}},
-            "required": ["id"],
-        },
-        "annotations": {"readOnlyHint": True},
-    },
-    {
-        "name": "tell_ara",
-        "title": "Leave the user a note",
-        "description": (
-            f"Leave a note for the user in the {IDENTITY} dashboard — something "
-            "they should know or decide about, arising from the work you are "
-            "doing. Not for questions you need answered now; use ask_ara for "
-            "those. Returns a link to the thread."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "note": {"type": "string", "description": "The note, in prose."},
-                "title": {"type": "string", "description": "Short thread title."},
-            },
-            "required": ["note"],
-        },
-        "annotations": {"readOnlyHint": False, "destructiveHint": False},
-    },
-]
+    ]
+
+
+# The tool list as rendered at start; tools/list renders it afresh.
+TOOLS = _tools(IDENTITY)
 
 _JOB_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 _jobs: dict[str, dict] = {}
@@ -448,7 +472,7 @@ def _confirmation_thread(title: str | None, message: str) -> dict:
 
 def _build_prompt(question: str, context: str, identity: str | None = None,
                   scope: str | None = None) -> str:
-    name = identity or IDENTITY
+    name = identity or current_identity()
     scope = SCOPE_HINT if scope is None else scope.strip()
     parts = [
         "An outside Claude client is working with the user and has consulted "
@@ -495,6 +519,9 @@ def _run_once(prompt: str, model: str,
     cmd = [CLAUDE_BIN, "-p", "--output-format=json"]
     if model:
         cmd += ["--model", model]
+    # Per-agent model overrides for the subagents the answer may dispatch
+    # (scripts/agent_models.py); [] when none is set.
+    cmd += agent_models.cli_args()
     for tool in FORBIDDEN_TOOLS:
         cmd += ["--disallowed-tools", tool]
     # The session's environment comes from the allowlist in
@@ -805,8 +832,10 @@ def handle_rpc(msg: dict) -> dict | None:
         return _result(rid, {
             "protocolVersion": version,
             "capabilities": {"tools": {"listChanged": False}},
-            "serverInfo": SERVER_INFO,
-            "instructions": SERVER_INSTRUCTIONS,
+            # Rendered per handshake: the instance's name may have changed on
+            # the dashboard since the server started.
+            "serverInfo": _server_info(),
+            "instructions": _instructions(),
         })
 
     if method in ("notifications/initialized", "notifications/cancelled"):
@@ -818,7 +847,7 @@ def handle_rpc(msg: dict) -> dict | None:
         return _result(rid, {})
 
     if method == "tools/list":
-        return _result(rid, {"tools": TOOLS})
+        return _result(rid, {"tools": _tools(current_identity())})
 
     if method == "tools/call":
         name = params.get("name") or ""
@@ -872,7 +901,7 @@ class Handler(BaseHTTPRequestHandler):
             with _jobs_lock:
                 pending = sum(1 for j in _jobs.values() if j["status"] == "pending")
             self._send(200, {"status": "ok", "service": "ara-mcp",
-                             "identity": IDENTITY, "scope": SCOPE_HINT,
+                             "identity": current_identity(), "scope": SCOPE_HINT,
                              "tools": [t["name"] for t in TOOLS],
                              "pending": pending, "audit": AUDIT})
             return
