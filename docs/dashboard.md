@@ -451,8 +451,10 @@ Plumbing routes (`retinue-claude`, wildcards) stay hidden. A **family pin**
 — `ANTHROPIC_DEFAULT_<FAMILY>_MODEL`, the variable Claude Code resolves the bare
 `opus`/`sonnet`/`haiku`/`fable` aliases through — also retargets that family's
 picker entry to the pinned concrete id (label kept), so one setting moves both
-the agents and the dashboard to a new release; a thread that chose the
-family's previous id follows the pin. A pin the proxy does not route is
+the agents and the dashboard to a new release. Where the picker had several
+routes of that family, they become this one entry under the first one's
+label, since they would all name the same model. A thread that chose any
+other id of the family follows the pin. A pin the proxy does not route is
 ignored and logged once, and a family with a `retinue_picker: false` route
 stays out of the picker despite its pin. The list
 is cached briefly
