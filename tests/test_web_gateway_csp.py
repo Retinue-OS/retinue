@@ -147,6 +147,9 @@ def check_policy_text(cp) -> None:
     assert directives["style-src"] == ["'self'", "'unsafe-inline'"]
     for name in ("img-src", "media-src", "font-src", "connect-src", "frame-src"):
         assert name in directives, f"{name} is stated, not left to default-src"
+    # Where reports go (tests/test_web_gateway_csp_report.py) is no source.
+    assert directives.pop("report-uri") == ["/csp-report"]
+    assert directives.pop("report-to") == ["csp"]
     for sources in directives.values():
         for source in sources:
             # Nothing of another origin, no scheme a script could come from.

@@ -373,9 +373,11 @@ services:
       - RETINUE_INSTANCE_COLOR
       - RETINUE_INSTANCE_FILE
       # The dashboard's Content-Security-Policy: report (the default: the
-      # browser only says what it would block), enforce, or off. See
-      # docs/dashboard.md, "The Content-Security-Policy".
+      # browser reports what it would block, at GET /csp-report), enforce, or
+      # off; and where the reports are kept (default on the /root volume).
+      # See docs/dashboard.md, "The Content-Security-Policy".
       - RETINUE_CSP
+      - RETINUE_CSP_REPORTS_FILE
       - SEND_APPROVAL_BASE_URL
       # Zone the approval pages render event times in; the containers run on
       # UTC, so without it a mis-zoned calendar entry reads as correct there.

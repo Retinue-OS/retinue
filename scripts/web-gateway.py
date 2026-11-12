@@ -1401,6 +1401,13 @@ _ATTENTION_POST_RE = re.compile(r"^/attention/(?:items/)?(mode|modes|permits|adm
 PUSH_DIR = Path(os.environ.get("PUSH_DIR", str(CONVERSATIONS_DIR.parent / "push")))
 push_notify.init(PUSH_DIR)
 
+# What the browsers report of the Content-Security-Policy (POST /csp-report,
+# scripts/content_policy.py): one small file beside the conversations, so it
+# is on the persistent volume and outlives a rebuild, and out of /data/, which
+# the agents write and the pages read.
+CSP_REPORTS_FILE = Path(os.environ.get("RETINUE_CSP_REPORTS_FILE")
+                        or str(CONVERSATIONS_DIR.parent / "csp-reports.json"))
+
 # ── Attention (the home screen's model) ────────────────────────────────────
 # What the dashboard shows first is no longer three cards but one list of what
 # wants attention — threads, chats and projects alike — each item with an
@@ -9921,8 +9928,51 @@ class Handler(BaseHTTPRequestHandler):
         if not self._serve_inbox():
             self.send_error(501, "Unsupported method ('HEAD')")
 
+    def _handle_csp_report(self) -> None:
+        """POST /csp-report: what a browser reports of the
+        Content-Security-Policy (scripts/content_policy.py), in either of its
+        two formats. Behind the dashboard's sign-in like every path, and
+        nothing more: the browser sends it with the page's own credentials.
+
+        The answer says nothing of what was sent, only whether it was taken:
+        204, or a fixed error. A body is read only up to a small limit and
+        only with a Content-Length."""
+        if not content_policy.report_format(self.headers.get("Content-Type")):
+            self._send_json(415, {"error": "send application/csp-report or "
+                                           "application/reports+json"})
+            return
+        if self.headers.get("Transfer-Encoding"):
+            self._send_json(411, {"error": "send the report with a Content-Length"})
+            return
+        raw_length = (self.headers.get("Content-Length") or "").strip()
+        if not raw_length.isascii() or not raw_length.isdigit():
+            self._send_json(411, {"error": "send the report with a Content-Length"})
+            return
+        length = int(raw_length) if len(raw_length) <= 18 else content_policy.REPORT_MAX_BYTES + 1
+        if length > content_policy.REPORT_MAX_BYTES:
+            self._send_json(413, {"error": "too large for a report"})
+            return
+        violations = content_policy.parse_reports(self.headers.get("Content-Type"),
+                                                  self.rfile.read(length))
+        if violations is None:
+            self._send_json(400, {"error": "not a report"})
+            return
+        try:
+            new = content_policy.record(CSP_REPORTS_FILE, violations)
+        except OSError as exc:
+            print(f"[web-gateway] CSP reports not kept: {exc}", flush=True)
+            new = []
+        for v in new:
+            print(content_policy.log_line(v), flush=True)
+        self.send_response(204)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
     def do_POST(self):
         if self._serve_inbox():
+            return
+        if self.path.split("?", 1)[0] == content_policy.REPORT_PATH:
+            self._handle_csp_report()
             return
         if self.path.split("?", 1)[0] in ("/sparql", "/sparql/"):
             self._handle_sparql()
@@ -12439,6 +12489,12 @@ class Handler(BaseHTTPRequestHandler):
                 # outside make the same comparison (build_stamp.py).
                 "build": build_stamp.build_info(),
             })
+            return
+        if self.path.split("?", 1)[0] == content_policy.REPORT_PATH:
+            # What the browsers reported of the Content-Security-Policy: the
+            # page to read before switching RETINUE_CSP from report to enforce.
+            self._send_json(200, content_policy.summary(CSP_REPORTS_FILE),
+                            {"Cache-Control": "private, no-store"})
             return
         job_match = _JOB_RE.match(self.path)
         if job_match:
