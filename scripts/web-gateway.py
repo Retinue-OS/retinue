@@ -2344,7 +2344,9 @@ def _conv_summary(conv: dict) -> dict:
         "pending_since": conv.get("pending_since"),
         "pending_status": conv.get("pending_status"),
         "message_count": len(messages),
-        "last_preview": _derive_title(last.get("text", "")),
+        # The conversation list's row shows words, as the attention row and
+        # the push do: a call directive as its name, never markup and number.
+        "last_preview": _derive_title(attention_store.markup_words(last.get("text", ""))),
     }
 
 
@@ -2945,7 +2947,8 @@ def _conv_add_message(cid: str, role: str, text: str, *,
                       cost_usd: float | None = None,
                       agent: str | None = None,
                       context: str | None = None,
-                      wake: bool = False) -> dict | None:
+                      wake: bool = False,
+                      arrival: bool = False) -> dict | None:
     """Append a message to a thread and update its flags. Returns the thread.
 
     `model_name`/`cost_usd` carry the answering turn's metadata (short model
@@ -2957,6 +2960,13 @@ def _conv_add_message(cid: str, role: str, text: str, *,
     the user — see _conv_context_note. `stored_attachments` is metadata of
     files already written to the thread's store (_store_reply_files), appended
     after whatever `attachments` stores.
+
+    `arrival` marks Ara's reply to a turn nobody in the thread asked for: a
+    chat message that arrived in a companion thread's chat (_conv_worker's
+    `arrival`). The dashboard's voice loop takes only a reply without it as
+    the answer to the user's spoken turn, so a call directive that a
+    correspondent's text steered into such a reply is never placed
+    (webapp/components/conversation.js, _maybeAutoplay).
 
     `wake` marks an append that carries something new for the user (an agent
     filing an inbound message into an existing thread). Such an append
@@ -2987,6 +2997,8 @@ def _conv_add_message(cid: str, role: str, text: str, *,
             message["agent"] = agent
         if context:
             message["context"] = context
+        if arrival:
+            message["arrival"] = True
         conv.setdefault("messages", []).append(message)
         conv["updated"] = now
         if wake and conv.get("archived") and not conv.get("muted"):
@@ -3255,6 +3267,38 @@ def _conv_context_note(msg: dict) -> str:
         return ""
     return ("\n\n[Agent context carried with this message — for you, "
             "not shown to the user:\n" + ctx + "]")
+
+
+_CANCELLED_CALL_NUMBER_RE = re.compile(r"\+?[0-9*#]{3,24}")
+
+
+def _cancelled_call_context(value) -> str | None:
+    """The note for a voice take that cancelled a call by being spoken.
+
+    In the phone shell's voice conversation a call Ara placed waits 5 s with
+    the mic open, and any speech cancels it (webapp/components/conversation.js,
+    CANCELLED_CALLS); the take that did is sent in any case, carrying
+    `cancelled_call: {number, name}`. Only its words can tell whether the user
+    meant to stop the call, so Ara is told — in wording fixed here, the
+    client supplying nothing but a validated number and a short name."""
+    if not isinstance(value, dict):
+        return None
+    number = str(value.get("number") or "").strip()
+    if not _CANCELLED_CALL_NUMBER_RE.fullmatch(number):
+        return None
+    name = " ".join(str(value.get("name") or "").replace("|", " ").replace("]", " ").split())[:80]
+    who = f"{name} ({number})" if name else number
+    return (
+        f"This voice take cancelled the call to {who}: it was heard while the "
+        "call waited to be placed, so the call was NOT made. Judge from the "
+        "words whether the user meant to stop it. If not — background noise, a "
+        "word to someone else, an affirmation, or a request that still wants "
+        "the call — place it again at once without asking: this is a second "
+        "attempt, so end your reply with "
+        f"[[call: {number} | {name} | no-voice-cancel]] and say it cannot be "
+        "stopped by voice this time. If they did mean to stop it (or asked for "
+        "something else instead), do not call; act on what they said."
+    )
 
 
 # How a message's author is named when a transcript is replayed to Ara.
@@ -3572,9 +3616,6 @@ def _conv_engage_prompt(conv: dict, fresh: bool,
     )
 
 
-_CHIP_MARKUP_RE = re.compile(r"\[\[chip:[^\]]*\]\]\s*(?:·\s*)?")
-
-
 def _push_conv_notification(conv: dict, text: str, urgency: str | None = None) -> int:
     """Notify the user's devices that a thread needs their attention.
 
@@ -3599,8 +3640,9 @@ def _push_conv_notification(conv: dict, text: str, urgency: str | None = None) -
               "notifies nobody", flush=True)
         return 0
     title = conv.get("title") or instance_branding.display_name()
-    # The notification shows words, not the chip markup the thread renders.
-    body = " ".join(_CHIP_MARKUP_RE.sub("", str(text or "")).split())
+    # The notification shows words, not the chip and call markup the thread
+    # renders (attention_store.markup_words, as the row's preview does).
+    body = " ".join(attention_store.markup_words(text).split())
     if len(body) > 160:
         body = body[:157].rstrip() + "…"
     push_notify.notify_async(title, body, url=f"/#conversation-{cid}", tag=cid,
@@ -3702,7 +3744,8 @@ def _conv_worker(cid: str, session_key: str, *, arrival: str | None = None,
                              pending=bool(still_running),
                              stored_attachments=reply_atts,
                              model_name=result.get("model_name"),
-                             cost_usd=result.get("cost_usd"))
+                             cost_usd=result.get("cost_usd"),
+                             arrival=bool(arrival))
     if conv is None:
         # Nothing was stored, so nothing has accounted for whatever prompted
         # this turn. Saying otherwise would let a gateway mark an inbound
@@ -5499,7 +5542,9 @@ _LINT_SYSTEM_PROMPT = (
     "phone dashboard. The dashboard renders Markdown plus one extra "
     "affordance, the reply chip: [[chip: Label | prefill text]] — an inline "
     "click-to-fill button; clicking it drops the prefill into the composer "
-    "for the user to review and send themselves, it never auto-sends.\n\n"
+    "for the user to review and send themselves, it never auto-sends. A "
+    "[[call: number | name]] token is a phone call the assistant places; "
+    "never add, change or remove one.\n\n"
     "Return the message below with ONLY these presentation rules enforced, "
     "changing nothing else:\n\n"
     "1. Options get chips. When the message asks the user to choose, confirm "
@@ -5530,6 +5575,120 @@ _LINT_SYSTEM_PROMPT = (
 # which merely over-lints, and the lint returns a compliant message
 # unchanged), or a `/path` token (relative URLs like /sends).
 _LINT_URLISH_RE = re.compile(r"https?://|\w\.\w|/\w")
+
+# The thread's renderer (webapp/components/markdown.js), as far as it decides
+# which call directives become call links: its fence lines (FENCE_RE), the
+# lines that open a block of their own rather than a table (HEADING_RE,
+# QUOTE_RE, LIST_RE, HR_RE), a table's separator row (TABLE_SEP_RE), and the
+# inline patterns of renderInline that run before the call link — the two
+# chip forms, each skipping a code span met first — and CALL_RE itself.
+# Its regular expressions are JavaScript's, whose \s, trim() and `.` differ
+# from Python's: \s and trim() hold U+00A0 and U+FEFF but not \x1c-\x1f or
+# \x85, and `.` stops at \r, U+2028 and U+2029 as well as \n. A copy that
+# read any of these otherwise would let a lint result through whose quoted
+# directive the bubble shows as a call, so the copy spells them out
+# (_JS_S, _JS_DOT, _js_trim). Its case-blind matching folds ASCII only, as
+# JavaScript's does without the u flag, where Python's would also fold a
+# dotless i into the i of "chip".
+_JS_SPACE = ("\t\n\v\f\r \u00a0\u1680" + "".join(map(chr, range(0x2000, 0x200b)))
+             + "\u2028\u2029\u202f\u205f\u3000\ufeff")
+_JS_S = r"[\t\n\v\f\r \u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000\ufeff]"
+_JS_DOT = r"[^\n\r\u2028\u2029]"
+
+
+def _js_re(pattern: str, flags: int = 0):
+    """`pattern`, written with JavaScript's \\s, compiled to match as there."""
+    return re.compile(pattern.replace(r"\s", _JS_S), flags | re.ASCII)
+
+
+def _js_trim(s: str) -> str:
+    """String.prototype.trim()."""
+    return s.strip(_JS_SPACE)
+
+
+_LINT_FENCE_RE = _js_re(r"^(?:```|~~~)\s*([A-Za-z0-9_.+-]*)\s*$")
+_LINT_OWN_BLOCK_RE = _js_re(
+    r"^(?:#{1,6}\s+|>|\s*(?:[-*+]|[0-9]+[.)])\s+|\s*(?:-{3,}|\*{3,}|_{3,})\s*$)")
+_LINT_TABLE_SEP_RE = _js_re(r"^\s*\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)+\|?\s*$")
+_LINT_CODE = r"(`[^`]+`)|"
+_LINT_CHIP_RES = (
+    _js_re(_LINT_CODE + r"\[\[chip:\s*([^|\]]+?)\s*\|\s*(" + _JS_DOT + r"+?)\s*\]\]", re.I),
+    _js_re(_LINT_CODE + r"\[\[chip:\s*([^|\]]+?)\s*\]\]", re.I),
+)
+_LINT_CALL_RE = _js_re(
+    _LINT_CODE + r"\[\[call:\s*([+0-9*#][0-9*# ().\/-]*?)\s*(?:\|\s*([^|\]]*?)\s*)?"
+    r"(?:\|\s*(no-voice-cancel)\s*)?\]\]", re.I)
+# The lines a lint result must leave exactly as they were whenever the
+# message holds a call directive (_call_frame): each line with one, and each
+# that is, or could be read as, a fence or a table's separator — drawn wider
+# than the renderer draws them, so that a future difference between it and
+# the copy above cannot make a quoted directive a call either.
+_LOOSE_SEP_RE = re.compile(r"[\s\ufeff|:-]*--[\s\ufeff|:-]*")
+
+
+def _table_cells(line: str) -> list:
+    """A table row's cells, split as splitTableRow() splits them."""
+    s = _js_trim(line)
+    s = s[1:] if s.startswith("|") else s
+    s = s[:-1] if s.endswith("|") else s
+    return [_js_trim(c.replace("\\|", "|")) for c in re.split(r"(?<!\\)\|", s)]
+
+
+def _inline_segments(text: str) -> list:
+    """The pieces of a message the thread renders inline, each on its own:
+    every line outside a fence (a fence runs from an opening ``` or ~~~ line
+    to the next fence line of either kind, or to the end of the text), and in
+    a table each cell the table shows. A message keeps its line breaks, so no
+    inline markup — a code span, a directive — reaches across one."""
+    lines, out, i = text.split("\n"), [], 0
+    while i < len(lines):
+        line = lines[i]
+        if _LINT_FENCE_RE.match(line):
+            i += 1
+            while i < len(lines) and not _LINT_FENCE_RE.match(lines[i]):
+                i += 1
+            i += 1
+        elif ("|" in line and not _LINT_OWN_BLOCK_RE.match(line)
+                and i + 1 < len(lines) and _LINT_TABLE_SEP_RE.match(lines[i + 1])):
+            head = _table_cells(line)
+            out.extend(head)
+            i += 2
+            while i < len(lines) and "|" in lines[i] and _js_trim(lines[i]):
+                # A row's cells beyond the header's are not shown.
+                out.extend(_table_cells(lines[i])[:len(head)])
+                i += 1
+        else:
+            out.append(line)
+            i += 1
+    return out
+
+
+def _live_call_directives(text: str) -> list:
+    """The call directives in `text` that the thread would act on, in order:
+    those its renderer turns into call links, which callOf()
+    (webapp/components/markdown.js) collects. Each line, or table cell, is
+    rendered on its own; in it the chips go first, then a directive counts
+    unless a code span met first holds it. One quoted as code, split across
+    lines or cut apart by a table's cells is an example or debris the bubble
+    shows literally rather than a call. An invalid number counts all the
+    same: it changes no other directive's standing, and a lint that alters
+    one is refused rather than delivered."""
+    found = []
+    for seg in _inline_segments(text):
+        for chip_re in _LINT_CHIP_RES:
+            seg = chip_re.sub(lambda m: m.group(0) if m.group(1) else "\x01", seg)
+        found.extend(m.group(0) for m in _LINT_CALL_RE.finditer(seg) if not m.group(1))
+    return found
+
+
+def _call_frame(text: str) -> list:
+    """The lines of `text` a lint may not change beside a call directive, in
+    order: those that hold one, and every fence-like or separator-like line
+    (_LOOSE_SEP_RE)."""
+    return [line for line in text.split("\n")
+            if "[[call:" in line.lower() or "```" in line or "~~~" in line
+            or _LOOSE_SEP_RE.fullmatch(line)]
+
 
 def _lint_presentation(text: str, *, kind: str = "chat") -> str:
     """Enforce the dashboard-composing form on an agent→user message.
@@ -5596,6 +5755,26 @@ def _lint_presentation(text: str, *, kind: str = "chat") -> str:
     if (not linted
             or len(linted) < len(raw) * PRESENTATION_LINT_MIN_KEEP
             or len(linted) > len(raw) * PRESENTATION_LINT_MAX_GROWTH + 200):
+        return text
+    # A call directive is a phone call the voice loop places, and the lint
+    # reads the reply raw, quoted mail or web text included. That it never
+    # adds, changes or removes one is therefore not left to its prompt: a
+    # result whose directives differ from the original's in any way is not
+    # delivered. The directives compared are the live ones, outside code: the
+    # text of a quoted directive survives a lint that only drops its
+    # backticks or fence lines, and the call it then becomes would be placed.
+    # The count of all of them, quoted ones included, is compared as well, so
+    # the lint cannot add or drop a quoted one either. And whatever the copy
+    # of the renderer makes of a message, the lint may change no line that
+    # holds a directive, nor any fence or separator line, in one that holds
+    # any (_call_frame).
+    has_call = "[[call:" in raw.lower() or "[[call:" in linted.lower()
+    if (_live_call_directives(raw) != _live_call_directives(linted)
+            or len(attention_store.CALL_MARKUP_RE.findall(raw))
+            != len(attention_store.CALL_MARKUP_RE.findall(linted))
+            or (has_call and _call_frame(raw) != _call_frame(linted))):
+        print("[web-gateway] presentation lint changed a call directive — "
+              "delivering the text unchanged", flush=True)
         return text
     return linted
 
@@ -12164,7 +12343,8 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(400, {"error": "empty message"})
             return
         conv = _conv_add_message(cid, "user", message, unread=False,
-                                 attachments=attachments)
+                                 attachments=attachments,
+                                 context=_cancelled_call_context(payload.get("cancelled_call")))
         if conv is None:
             self._send_json(404, {"error": "not found"})
             return

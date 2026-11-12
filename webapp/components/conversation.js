@@ -121,7 +121,7 @@
 //   GET  /conversation-models           the offered models (once per page)
 
 import { esc, fmtAge, framesWholePdf, INLINE_SAFE_TYPES, softKeyboard, visibleHeight } from './base.js';
-import { renderMarkdown, MD_CSS } from './markdown.js';
+import { renderMarkdown, MD_CSS, callOf, calledBefore } from './markdown.js';
 import { canRecord, micErrorText, recordingRowHtml, statusRowHtml, Waveform, VOICE_CSS } from './voice.js';
 import { pastedFiles, pastedText } from './clipboard.js';
 import { Reader, speechAvailable } from './speech.js';
@@ -132,7 +132,7 @@ import {
   modeEntries, endedByAra, noteAraOff,
   chime, primeAudio,
 } from './continuous.js';
-import { setVoiceActive } from './shell.js';
+import { setVoiceActive, canPlaceCall, placeCall, onCall } from './shell.js';
 import { loadDraft, saveDraft, loadFiles, saveFiles } from './drafts.js';
 import { transcribe, handOff, adopt } from './dictation.js';
 
@@ -147,6 +147,23 @@ const CONT_PENDING_MS = 60 * 1000;
 // voice flag go (see _contWatch). Looked at every CONT_WATCH_MS.
 const CONT_IDLE_MS = 90 * 1000;
 const CONT_WATCH_MS = 5 * 1000;
+// A take that cancelled a call tells Ara so (`cancelled_call`) only while
+// the conversation it answered can still be going on: one sent later than
+// this after its transcript came (after it was recorded, where the worker
+// restarted it) — a page that died before sending it, its
+// take adopted by a page opened since — goes out as words alone, or Ara
+// could place a call nobody is waiting for, with the mic shut. The worker
+// keeps the same window for the sends it makes (sw.js, DICT_CALL_FRESH_MS).
+const CALL_FRESH_MS = CONT_IDLE_MS;
+// A call the loop places ([[call: …]] in the answer, see _contCall) waits
+// this long after the answer was read, on screen with a Cancel button and,
+// unless the directive says otherwise, the mic open: speech cancels it.
+const CALL_DELAY_MS = 5000;
+// How long the call waits for that mic to close again before it dials.
+const CALL_MIC_RELEASE_MS = 2000;
+// How long the loop holds the shell's voice flag for the shell's answer to a
+// call it was handed — the shell places calls only while the flag is up.
+const CALL_ANSWER_MS = 10 * 1000;
 // While Ara is answering the reply is what the user is waiting for.
 const PENDING_POLL_MS = 1500;
 const PENDING_WARN_SECONDS = 2 * 60;
@@ -333,6 +350,15 @@ let PLAYING = null;     // {conv, ts, who, title} of the loaded message
 // ends, its thread opens the mic. A reading the user started by hand is not
 // the loop's, and its end opens nothing.
 let CONT_READ = null;
+// The call in the answer the loop is reading ({conv, ts, number, name}): where
+// the end of that reading would open the mic, the thread places it instead.
+let CONT_CALL = null;
+// Calls speech cancelled, per thread ({number, name}): the take that did it
+// goes out in any case, telling Ara (`cancelled_call` on the send) so she can
+// place the call again when what was said shows no wish to stop it — noise,
+// a word to someone else, a "yes". Its transcript empty, the call goes ahead
+// at once (_contResumeCall). Gone once that take is sent, dropped or kept.
+const CANCELLED_CALLS = new Map();
 let SCRUBBING = false;  // the user is dragging a bar's position slider
 // The Android shell's voice flag (shell.js, setVoiceActive): "a voice
 // conversation is engaged — keep the screen on, pause the wake phrase". It is
@@ -629,7 +655,7 @@ function adoptDictations(key) {
     ADOPTED.set(key, (ADOPTED.get(key) || 0) + 1);
     const el = LIVE.get(key);
     if (el) el.render();
-    job.then(async ({ text, sent, unsent, send, at }) => {
+    job.then(async ({ text, sent, unsent, send, at, textAt, call }) => {
       if (sent) { VOICE_ERRORS.delete(key); refreshSent(key); return; }
       // A sent dictation whose page went after the transcript was in but
       // before that page could send it: the send is this page's. Unless the
@@ -639,7 +665,18 @@ function adoptDictations(key) {
         const el = LIVE.get(key);
         const t = el && !isNewKey(key) ? await readThread(key) : null;
         if (t && hasTurnSince(t, text, new Date(at || Date.now()).toISOString())) { refreshSent(key); return; }
-        if (t && el.isConnected) { VOICE_ERRORS.delete(key); await el._send(text, { fromDraft: false }); return; }
+        if (t && el.isConnected) {
+          VOICE_ERRORS.delete(key);
+          // A take that cancelled a call tells Ara so from here too, while
+          // it is fresh (CALL_FRESH_MS) — counted from its transcript, as
+          // the worker counts it, or from its recording where the worker
+          // restarted it. Its own call, handed to this send alone:
+          // CANCELLED_CALLS[key] belongs to a take of this page's, which may
+          // be on its way right now and is left untouched.
+          const fresh = call && Date.now() - (textAt || at || 0) < CALL_FRESH_MS;
+          await el._send(text, { fromDraft: false, call: fresh ? { number: call.number, name: call.name } : null });
+          return;
+        }
       }
       if (text) {
         appendToDraft(key, text);
@@ -719,12 +756,15 @@ function fmtClock(iso) {
 
 // Strip Markdown so the synthesizer reads clean prose: no code fences,
 // backticks, emphasis marks, quote markers, list bullets or table rules;
-// links and chips read as their labels, a raw URL as its host.
+// links and chips read as their labels, a call as its name (or number), a raw
+// URL as its host. A call's no-voice-cancel written in the name's place is
+// its flag, not a name (markdown.js), so the number is read instead.
 function plainForSpeech(text) {
   return String(text == null ? '' : text)
     .replace(/```[\s\S]*?```/g, ' ')
     .replace(/`([^`]+)`/g, '$1')
     .replace(/\[\[chip:\s*([^|\]]+?)\s*(?:\|[^\]]*)?\]\]/gi, '$1')
+    .replace(/\[\[call:\s*([^|\]]*?)\s*(?:\|\s*([^|\]]*?)\s*)?(?:\|[^\]]*)?\]\]/gi, (_m, num, name) => (name && !/^no-voice-cancel$/i.test(name) ? name : num))
     .replace(/!\[([^\]]*)\]\([^)]*\)/g, '$1')
     .replace(/\[([^\]]+)\]\((?:[^)]+)\)/g, '$1')
     .replace(/\bhttps?:\/\/([^\s/)]+)[^\s)]*/g, '$1')
@@ -2038,7 +2078,7 @@ class RetinueConversation extends HTMLElement {
     // the DOM for the entire flow, so the phone keyboard never pops up
     // mid-dictation.
     if (this._recState === 'recording' && this._recKey === key) {
-      return `<div class="composer">` + chipRow + errRow + recordingRowHtml() + `</div>`;
+      return `<div class="composer">` + chipRow + errRow + this._callRowHtml() + recordingRowHtml() + `</div>`;
     }
     const job = VOICE_JOBS.get(key) || (ADOPTED.has(key) ? { sending: false, phase: 'transcribing' } : null);
     if (job) {
@@ -2046,6 +2086,7 @@ class RetinueConversation extends HTMLElement {
         : (job.sending ? 'Transcribing & sending …' : 'Transcribing …');
       return `<div class="composer">` + chipRow + errRow + statusRowHtml(label) + `</div>`;
     }
+    if (this._calling) return `<div class="composer">` + this._callRowHtml() + `</div>`;
     const micTitle = this._contOn() ? 'Talk — continuous conversation' : 'Record a voice message';
     // Opened in the mode without a gesture behind it: the first take starts
     // from a tap, which is also what lets the page play the chime.
@@ -2079,7 +2120,10 @@ class RetinueConversation extends HTMLElement {
   // beside whatever the user has half-written: it takes none of their files,
   // spends none of their text, and — having never been in the box — goes INTO
   // it if the send fails, which is the only place a retry could come from.
-  async _send(text, { fromDraft = true } = {}) {
+  // `call`, when given (null included), is the cancelled call this turn
+  // carries, in place of whatever CANCELLED_CALLS holds for the thread —
+  // which is then neither read nor spent (see sendMessage).
+  async _send(text, { fromDraft = true, call } = {}) {
     const key = this._key();
     const d = draftOf(key);
     // A message needs text or at least one attachment.
@@ -2126,7 +2170,7 @@ class RetinueConversation extends HTMLElement {
       // draft is written with this turn marked (keepDraft), and the next page
       // settles it against the thread.
       Object.assign(sent, { posted: true, target, before: base, at: new Date().toISOString(), project: this._seed().project });
-      const conv = await sendMessage(target, text, sent.files, this._seed(), this._newModel, sent)
+      const conv = await sendMessage(target, text, sent.files, this._seed(), this._newModel, sent, call)
         .catch((err) => arrivedAnyway(err, target, text, base));
       delivered = true;
       d.leftSend = null;  // whatever an earlier page left, this send is the one that went
@@ -2409,8 +2453,10 @@ class RetinueConversation extends HTMLElement {
       this._stopStream();
       // A loop take that cannot open the mic ends the spoken turn now rather
       // than holding the shell's voice state until the watchdog; the mode
-      // stays on, so the mic button tries again.
-      if (this._contOn()) this._contDisengage();
+      // stays on, so the mic button tries again. Except for the take that
+      // listens for a cancel while a call waits: the call needs no mic, and
+      // is placed when its time comes (_contCallPlace), Cancel still shown.
+      if (this._contOn() && !this._calling && !this._placingCall) this._contDisengage();
       if (this.isConnected) this.render();
     }
   }
@@ -2500,6 +2546,9 @@ class RetinueConversation extends HTMLElement {
     this._recIntent = null;
     const aborted = this._recAborted;
     this._recAborted = false;
+    // A take that cancelled a call and does not go out (✕, ✓, leaving):
+    // nobody is told, and the call stays cancelled.
+    if (aborted || intent !== 'send' || !chunks.length) CANCELLED_CALLS.delete(key);
     // A take of the loop that goes out keeps the loop engaged through the
     // transcription and Ara's answer; one dropped (nobody spoke, ✕) or kept
     // for review (✓, the length cap, leaving) ends it.
@@ -2510,7 +2559,16 @@ class RetinueConversation extends HTMLElement {
     if (wasTake) {
       const goes = !aborted && intent === 'send' && chunks.length;
       const here = this.isConnected && this._key() === key;
+      // A take sent by touch (➤) while a call waits is the user answering
+      // it, heard by the detector or not: it cancels the call as speech
+      // does, and its transcript decides, as for speech (an empty one lets
+      // the call go ahead, _contResumeCall).
+      if (goes && here && this._calling) {
+        CANCELLED_CALLS.set(key, { number: this._calling.number, name: this._calling.name });
+        this._contCallCancel();
+      }
       if (goes && here) this._contEngage();
+      else if (this._placingCall && here) { /* the call holds the loop (_contCallPlace) */ }
       else {
         this._contDisengage();
         const el = goes ? LIVE.get(key) : null;
@@ -2536,22 +2594,43 @@ class RetinueConversation extends HTMLElement {
       // left meanwhile, a dictation kept for review lands in this draft, and
       // one sent into a thread is sent there by the worker (sw.js, "Sent
       // dictations") — the thread it was recorded in, whatever is on screen.
+      // A take that cancelled a call carries it there too, so Ara hears of
+      // the call whichever of the two sends it (the page's send below).
       const send = intent === 'send' ? sendUrlFor(key) : '';
-      const got = await transcribe(storeKey(key), blob, transcribeUrl(key), send ? { send } : undefined);
+      const cancelled = send ? CANCELLED_CALLS.get(key) : null;
+      const got = await transcribe(storeKey(key), blob, transcribeUrl(key),
+        send ? { send, ...(cancelled ? { call: cancelled } : {}) } : undefined);
       const text = send ? got.text : got;
       if (send && got.sent) {
-        // Frozen meanwhile (the back-forward cache) and back: it went.
+        // Frozen meanwhile (the back-forward cache) and back: it went, with
+        // the cancelled call, if any — no later turn may carry it again.
         sentByWorker = true;
+        CANCELLED_CALLS.delete(key);
         VOICE_ERRORS.delete(key);
       } else if (text) {
         appendToDraft(key, text);
-        if (send && got.unsent) VOICE_ERRORS.set(key, unsentNote(got.unsent));
-        // Send the whole draft, so anything typed before dictating comes along.
-        else if (intent === 'send') toSend = draftOf(key).text;
+        if (send && got.unsent) {
+          // The worker could not send it (or may have): it waits in the box
+          // for review, and like a take kept for review it tells nobody of
+          // the call, which stays cancelled.
+          CANCELLED_CALLS.delete(key);
+          VOICE_ERRORS.set(key, unsentNote(got.unsent));
+        } else if (intent === 'send') {
+          // Send the whole draft, so anything typed before dictating comes along.
+          toSend = draftOf(key).text;
+        }
+      } else if (CANCELLED_CALLS.has(key)) {
+        // What cancelled the call had no words in it: the call goes ahead,
+        // now with Cancel by touch only (_contResumeCall).
+        const call = CANCELLED_CALLS.get(key);
+        CANCELLED_CALLS.delete(key);
+        setTimeout(() => { const el = LIVE.get(key); if (el) el._contResumeCall(call); }, 0);
       } else {
         VOICE_ERRORS.set(key, 'No speech was detected in the recording.');
       }
     } catch (err) {
+      // No transcript, no telling what was meant: the call stays cancelled.
+      CANCELLED_CALLS.delete(key);
       // Taken by another page while this one was frozen (dictation.js,
       // 'elsewhere'): its text is in the draft on the device, not an error.
       if (err && err.message === 'elsewhere') refreshDraft(key);
@@ -2563,6 +2642,14 @@ class RetinueConversation extends HTMLElement {
     // reference, where the key would no longer find it.
     let adopted = null;
     if (toSend) {
+      // The call this take cancelled is its own, spent here and handed to
+      // its send alone. A send that turns back (one already on the wire —
+      // an adopted take, say — a refused pin, a thread that could not be
+      // started) leaves the take in the box, its call cancelled as for a
+      // take kept for review: nothing is left for a later, unrelated turn
+      // to carry.
+      const call = CANCELLED_CALLS.get(key) || null;
+      CANCELLED_CALLS.delete(key);
       // Send path: the status row stays in place of the textarea until the
       // send completes, so the keyboard never appears. On failure the draft
       // stays in place, which then shows up (unfocused) for a manual retry.
@@ -2570,7 +2657,7 @@ class RetinueConversation extends HTMLElement {
       if (live()) live().render();
       const el = live();
       if (!isNewKey(key) && el) {
-        await el._send(toSend);
+        await el._send(toSend, { call });
       } else {
         // Off screen, or a first message: the send goes out with the context
         // captured when the recording started. The key names that context —
@@ -2604,7 +2691,10 @@ class RetinueConversation extends HTMLElement {
           const out = { text: toSend, files: sentFiles, fromDraft: true, posted: true, target, before,
             at: new Date().toISOString(), project: (seed && seed.project) || '' };
           if (VOICE_JOBS.get(key)) VOICE_JOBS.get(key).out = out;
-          const conv = await sendMessage(target, toSend, sentFiles, seed, model, out)
+          // A first message has no thread a call could have been placed
+          // from: none goes with it (sendMessage, too, sends none without an
+          // id, and a minted thread is a new one).
+          const conv = await sendMessage(target, toSend, sentFiles, seed, model, out, isNewKey(key) ? null : call)
             .catch((err) => arrivedAnyway(err, target, toSend, before))
             .catch((err) => { VOICE_ERRORS.set(key, sendFailureNote(err)); throw err; });
           draftOf(key).leftSend = null;
@@ -2715,6 +2805,9 @@ class RetinueConversation extends HTMLElement {
   _contDisengage() {
     this._contArmed = false;
     this._contClearPending();
+    if (CONT_CALL && CONT_CALL.conv === this._id) CONT_CALL = null;
+    this._contCallCancel();
+    this._placingCall = false;
     if (this._contWatchTimer) clearInterval(this._contWatchTimer);
     this._contWatchTimer = null;
     if (ENGAGED.delete(this)) syncShellVoice();
@@ -2746,6 +2839,7 @@ class RetinueConversation extends HTMLElement {
   _contBusy() {
     const key = this._key();
     if (this._recState !== 'idle' || VOICE_JOBS.has(key) || ADOPTED.has(key) || SENDS.has(key) || this._contPending) return true;
+    if (this._calling || this._placingCall) return true;
     if (this._id && this._thread && this._thread.pending) return true;
     return !!(CONT_READ && CONT_READ.conv === this._id && READER.state === 'playing');
   }
@@ -2768,6 +2862,14 @@ class RetinueConversation extends HTMLElement {
     if (this._recState !== 'idle' || this._busy || VOICE_JOBS.has(this._key()) || ADOPTED.has(this._key())) return;
     if (this._missing) { this._contDisengage(); return; }
     if (this._id && (!this._thread || this._thread.pending)) return;
+    // The call comes where the mic would open, so not while the user is
+    // writing (below): the loop stops as it would, and the directive stays a
+    // link in the bubble. The take listening for a cancel would replace the
+    // row they are writing in, and could send what they wrote along with it.
+    if (loop && CONT_CALL && CONT_CALL.conv === this._id && (asked || !this._typing())) {
+      this._contCall();
+      return;
+    }
     if (!canRecord()) { this._contDisengage(); return; }
     // The user is writing — text or files in the box, or the cursor in it:
     // the loop going round must not take the row from under their hands
@@ -2798,6 +2900,119 @@ class RetinueConversation extends HTMLElement {
     }, CONT_PENDING_MS);
   }
 
+  // The answer just read places a call: shown with a Cancel button for
+  // CALL_DELAY_MS, then handed to the shell, which calls (or opens the dialer,
+  // see shell.js). The answer itself said who is being called, aloud, in the
+  // user's language; this row adds no words of its own but the name and the
+  // number, so a wrong number (the wrong one of two entries, one taken from
+  // a mail read in the same turn) can be seen before it is dialled.
+  // Meanwhile the mic is open as for any take: speech cancels the call, and
+  // the take goes on to Ara as the user's next turn ("no, stop", "call Ben
+  // instead"), whatever language it is in. A directive with no-voice-cancel
+  // on a second attempt (see _maybeAutoplay) leaves the mic shut, for a room
+  // too loud to tell a voice from the noise — Cancel still works.
+  _contCall() {
+    const call = CONT_CALL;
+    CONT_CALL = null;
+    this._contArmed = false;
+    this._calling = { number: call.number, name: call.name, voiceCancel: call.voiceCancel };
+    this._callTimer = setTimeout(() => this._contCallPlace(), CALL_DELAY_MS);
+    this.render();
+    if (call.voiceCancel && canRecord()) this._startRecording();
+  }
+
+  // A call speech cancelled with no words in it: placed after all, the mic
+  // shut this time — the room has shown it can set the detector off.
+  _contResumeCall(call) {
+    if (!this._id || !this._contOn() || !ENGAGED.has(this) || this._calling || this._placingCall) return;
+    if (this._recState !== 'idle') return;
+    // Hidden while the take was transcribed: nobody would see the Cancel
+    // button, so the call is dropped, as hiding the page drops a waiting one.
+    if (document.visibilityState === 'hidden') { this._contDisengage(); return; }
+    CONT_CALL = { conv: this._id, number: call.number, name: call.name, voiceCancel: false };
+    this._contCall();
+  }
+
+  _callRowHtml() {
+    if (!this._calling) return '';
+    const { name, number } = this._calling;
+    const who = name ? `${esc(name)} · ${esc(number)}` : esc(number);
+    return `<div class="call-row"><span class="call-who"><span aria-hidden="true">\u{1F4DE}</span> ${who}</span>` +
+      `<button type="button" class="call-cancel" data-call-cancel>Cancel</button></div>`;
+  }
+
+  _contCallPlace() {
+    const call = this._calling;
+    this._callTimer = null;
+    this._calling = null;
+    if (!call) return;
+    // Out of sight the call is dropped, never dialled (_onContVisibility).
+    if (document.visibilityState === 'hidden') { this._contDisengage(); return; }
+    // A take that may hold the user's answer is not thrown away for the
+    // call: one already sent by touch whose recorder has not yet flushed,
+    // and one the page cannot hear (no detector, so no speech cancelled the
+    // call however much was said). Either cancels the call, and its
+    // transcript decides, as for a take that speech ended: words go to Ara
+    // with the cancelled call, none let it go ahead (_contResumeCall).
+    if (this._contRec && this._recState === 'recording' && !this._recAborted
+        && (this._recIntent === 'send' || (!this._recIntent && this._vadLive === false))) {
+      CANCELLED_CALLS.set(this._key(), { number: call.number, name: call.name });
+      if (!this._recIntent) this._finishRecording(this._draftHasInput() ? 'review' : 'send');
+      this.render();
+      return;
+    }
+    // The call needs the microphone: the take that listened for a cancel is
+    // dropped first (nothing was said in it, or there would be no call), and
+    // the loop stays engaged meanwhile (_onRecordingStopped), as the shell
+    // takes a call only while the voice flag is up. It lets go once the
+    // shell has answered, or did not in time.
+    this._placingCall = true;
+    this.render();
+    const since = Date.now();
+    let done = null;
+    // `detail` is the shell's answer; none means it could not be asked or
+    // did not answer in time. The user heard Ara say she was calling, so a
+    // call that was not placed says so in the composer, with the number to
+    // dial by hand; a call placed, or the dialer opened with the number,
+    // needs no word.
+    const finish = (detail) => {
+      if (!done) return;
+      clearTimeout(done.timer);
+      done.off();
+      done = null;
+      this._placingCall = false;
+      if (!detail || detail.state === 'refused') {
+        VOICE_ERRORS.set(this._key(), `The call to ${call.number} could not be placed.`);
+      }
+      this._contDisengage();
+      this.render();
+    };
+    const dial = () => {
+      if (!this._placingCall) return;
+      if (this._recState !== 'idle' && Date.now() - since < CALL_MIC_RELEASE_MS) {
+        this._abortRecording();
+        setTimeout(dial, 100);
+        return;
+      }
+      done = { off: onCall(finish), timer: setTimeout(finish, CALL_ANSWER_MS) };
+      if (!placeCall(call.number)) finish();
+    };
+    dial();
+  }
+
+  // Cancel pressed, speech heard, or the loop stopped: no call. Pressed, the
+  // conversation goes on — the mic opens for what the user wants instead (a
+  // take already listening simply goes on).
+  _contCallCancel({ listen = false } = {}) {
+    if (this._callTimer) clearTimeout(this._callTimer);
+    this._callTimer = null;
+    const was = !!this._calling;
+    this._calling = null;
+    if (!was) return;
+    this.render();
+    if (listen) this._contListen({ asked: true });
+  }
+
   _contClearPending() {
     if (this._contPendingTimer) clearTimeout(this._contPendingTimer);
     this._contPendingTimer = null;
@@ -2807,9 +3022,14 @@ class RetinueConversation extends HTMLElement {
   _onContVisibility() {
     if (document.visibilityState === 'hidden') {
       // A take under way ends with the page (see _contStopListening); the
-      // loop stops with it unless an answer is still to come.
+      // loop stops with it unless an answer is still to come. A call still
+      // waiting goes with it, as the loop stopping drops it: whether a take
+      // listens for a cancel or not (no-voice-cancel, a resumed call, a mic
+      // that failed), its Cancel is out of the user's sight now.
       if (this._contRec && this._recState === 'recording') {
         this._contStopListening();
+        this._contDisengage();
+      } else if (this._calling) {
         this._contDisengage();
       }
       return;
@@ -2836,8 +3056,14 @@ class RetinueConversation extends HTMLElement {
     this._vadHeard = false;
     this._vadLive = null;
     this._recTouched = false;
-    const { noSpeechMs } = voiceTimeouts();
-    const meter = new LevelMeter(new Vad(voiceTimeouts()), (ev) => this._onVad(ev, mr));
+    const timeouts = voiceTimeouts();
+    // The take that listens for a cancel while a call waits (_contCall) is
+    // not closed by its no-speech timeout before the call is placed: closed,
+    // it would end the loop, and the call with it. The call itself drops the
+    // take when its time comes; cancelled by touch, the take goes on.
+    if (this._calling) timeouts.noSpeechMs = Math.max(timeouts.noSpeechMs, CALL_DELAY_MS + CALL_MIC_RELEASE_MS);
+    const { noSpeechMs } = timeouts;
+    const meter = new LevelMeter(new Vad(timeouts), (ev) => this._onVad(ev, mr));
     this._meter = meter;
     const still = () => this._meter === meter && this._mediaRecorder === mr && this._recState === 'recording';
     chime().then(async () => {
@@ -2891,7 +3117,15 @@ class RetinueConversation extends HTMLElement {
 
   _onVad(ev, mr) {
     if (this._mediaRecorder !== mr) return;
-    if (ev.type === 'speech') this._vadHeard = true;
+    if (ev.type === 'speech') {
+      this._vadHeard = true;
+      // Speech while a call waits to be placed cancels it (_contCall), and
+      // the take carries the news to Ara.
+      if (this._calling) {
+        CANCELLED_CALLS.set(this._key(), { number: this._calling.number, name: this._calling.name });
+        this._contCallCancel();
+      }
+    }
     // What began as speech was the room getting louder (continuous.js).
     else if (ev.type === 'noise') this._vadHeard = false;
     // A pause after speech ends the take and sends it. Any other end goes
@@ -2903,12 +3137,19 @@ class RetinueConversation extends HTMLElement {
     // So does a take that would carry text or files the user put in the box
     // before it: the send takes the whole draft, which they have not seen
     // go together with what they said.
+    // A take that cancelled a call goes out whatever ended it, as only its
+    // transcript can tell whether the user meant to stop the call; but not
+    // with text or files in the box, which go to review as above.
     else if (ev.type === 'end') {
-      this._finishRecording(ev.reason === 'silence' && !this._draftHasInput() ? 'send' : 'review');
+      const cancelled = CANCELLED_CALLS.has(this._key());
+      this._finishRecording((cancelled || ev.reason === 'silence') && !this._draftHasInput() ? 'send' : 'review');
     }
     // Nobody spoke: the mic closes, the mode stays on, and nothing is sent
     // (no "no speech detected" note either — silence was the answer).
-    else if (ev.type === 'timeout') this._abortRecording();
+    else if (ev.type === 'timeout') {
+      if (CANCELLED_CALLS.has(this._key())) this._finishRecording(this._draftHasInput() ? 'review' : 'send');
+      else this._abortRecording();
+    }
   }
 
   // Listening ends without the user ending the take (they left, the page
@@ -3057,13 +3298,30 @@ class RetinueConversation extends HTMLElement {
     // only on the element the user is looking at.
     const cont = this._contOn() && LIVE.get(cid) === this && this.isConnected;
     if (!fresh.length || (!autoplay && !cont)) return;
-    const m = fresh[fresh.length - 1];
     // Only an answer to this element's own turn (it is armed, _contEngage)
     // is the loop's reading, whose end opens the mic. Anything else pushed
     // into the thread is read in the mode, never opening the mic — and never
-    // over the loop's own reading.
-    const loop = cont && this._contArmed;
+    // over the loop's own reading. Ara's reply to a chat message that arrived
+    // in a companion thread meanwhile (`arrival`, set by the gateway) answers
+    // the correspondent, not the user, so it is never the loop's answer, even
+    // when it lands while the loop waits or in the same poll as the answer:
+    // the correspondent's text may have steered it, call directive and all.
+    const own = cont && this._contArmed ? fresh.filter((r) => !r.arrival) : [];
+    const loop = own.length > 0;
+    const m = loop ? own[own.length - 1] : fresh[fresh.length - 1];
     if (!loop && CONT_READ && CONT_READ.conv === cid) return;
+    // An answer to a spoken turn that places a call, in a shell that can: the
+    // call comes where the mic would open. Only the loop's own answer — a
+    // directive anywhere else (an older reply, a message pushed into the
+    // thread, an agent's message arriving while the answer is awaited, a
+    // reply to a chat arrival) stays a link to tap.
+    if (loop) {
+      const call = canPlaceCall() && m.role === 'assistant' && !m.arrival ? callOf(m.text) : null;
+      // A call speech cannot cancel only on a second attempt at the number.
+      if (call && !call.voiceCancel &&
+          !calledBefore(t.messages, (t.messages || []).indexOf(m), call.number)) call.voiceCancel = true;
+      CONT_CALL = call ? { conv: cid, ts: m.ts, ...call } : null;
+    }
     // Named before the reading starts: an engine that refuses at once
     // reports it from inside playMessage, and that refusal must open the mic.
     if (loop) CONT_READ = { conv: cid, ts: m.ts };
@@ -3115,6 +3373,8 @@ class RetinueConversation extends HTMLElement {
     }
     const mic = root.querySelector('[data-mic]');
     if (mic) mic.addEventListener('click', () => { if (this._contOn()) primeAudio(); this._startRecording(); });
+    const callCancel = root.querySelector('[data-call-cancel]');
+    if (callCancel) callCancel.addEventListener('click', () => { primeAudio(); this._contCallCancel({ listen: true }); });
     const startTalk = root.querySelector('[data-start-talk]');
     if (startTalk) startTalk.addEventListener('click', () => { primeAudio(); this.listen(); });
     // Touching the recording row at all means someone is there and will end
@@ -3329,7 +3589,9 @@ function sendFailureNote(err) {
 
 // `track`, optional: told whether the request went out as a keepalive one
 // (track.keepalive), which the browser finishes even if the page is left.
-async function sendMessage(id, text, files, seed, model, track) {
+// `call`, optional: the cancelled call this turn carries ({number, name}, or
+// null for none). Left out, it is the thread's CANCELLED_CALLS entry, spent.
+async function sendMessage(id, text, files, seed, model, track, call) {
   const body = { message: text };
   if (!id) {
     if (seed && seed.project) {
@@ -3341,6 +3603,14 @@ async function sendMessage(id, text, files, seed, model, track) {
   if (files && files.length) {
     body.attachments = files.map((f) => ({ filename: f.name, content_type: f.type, data: f.data }));
   }
+  // The take that cancelled a call by being spoken (CANCELLED_CALLS): Ara
+  // hears which call, and places it again if the words show no wish to stop.
+  // A call handed in by the caller (an adopted take's own) takes its place,
+  // and the thread's entry stays for the take it belongs to.
+  const own = call !== undefined;
+  const cancelled = !id ? null : own ? call : CANCELLED_CALLS.get(String(id));
+  if (cancelled) body.cancelled_call = { number: cancelled.number, name: cancelled.name };
+  if (id && !own) CANCELLED_CALLS.delete(String(id));
   const url = id ? `/conversations/${encodeURIComponent(id)}/messages` : LIST_URL;
   const payload = JSON.stringify(body);
   const ms = REQUEST_TIMEOUT_MS + Math.ceil(payload.length / UPLOAD_BYTES_PER_SECOND) * 1000;
@@ -3640,6 +3910,12 @@ const CSS = `
                 font: inherit; font-weight: 600; color: #0b0d12;
                 background: var(--accent, #6ea8fe); border: 0; border-radius: 12px; }
   .start-talk:hover { filter: brightness(1.08); }
+  .call-row { display: flex; align-items: center; gap: 12px; margin-bottom: 8px; padding: 12px;
+              border-radius: 12px; background: rgba(110, 168, 254, .12); }
+  .call-who { flex: 1; font-weight: 600; animation: call-pulse 1s ease-in-out infinite alternate; }
+  @keyframes call-pulse { from { opacity: .55; } to { opacity: 1; } }
+  .call-cancel { font: inherit; font-weight: 600; padding: 10px 18px; cursor: pointer; border: 0;
+                 border-radius: 10px; color: #0b0d12; background: var(--high, #ff6b6b); }
 `;
 
 customElements.define('retinue-read-aloud', RetinueReadAloud);

@@ -744,7 +744,8 @@ await ok('a sent dictation whose page went is posted by the worker, and the page
   assert.ok(!req.opts.signal.aborted, 'answered within the deadline');
   req.respond(200);
   await until(() => got.length === 1, 'the outcome arrived');
-  assert.deepEqual({ ...got[0], at: 0 }, { text: 'Gesendet.', sent: true, unsent: '', send: true, at: 0 });
+  assert.deepEqual({ ...got[0], at: 0, textAt: 0 }, { text: 'Gesendet.', sent: true, unsent: '', send: true, at: 0, textAt: 0 });
+  assert.ok(got[0].at > 0 && got[0].textAt >= got[0].at, 'with when it was recorded and when its transcript came');
   await until(() => !jobs().some((j) => j.key === `conv:${R1}`), 'nothing is left to hand out');
 });
 
@@ -782,7 +783,8 @@ await ok('a sent dictation whose page is still there is left to that page to sen
   await until(() => swFetches.length === n + 1, 'running');
   swFetches[n].answer('Selbst gesendet.');
   const got = await p;
-  assert.deepEqual({ ...got, at: 0 }, { text: 'Selbst gesendet.', sent: false, unsent: '', send: true, at: 0 });
+  assert.deepEqual({ ...got, at: 0, textAt: 0 }, { text: 'Selbst gesendet.', sent: false, unsent: '', send: true, at: 0, textAt: 0 });
+  assert.ok(got.at > 0 && got.textAt >= got.at, 'with when it was recorded and when its transcript came');
   await until(() => !jobs().some((j) => j.key === 'conv:alive'), 'taken');
   assert.equal(swFetches.length, n + 1, 'the worker posted nothing');
 });

@@ -10,7 +10,10 @@ itself (the worker does not); a page gone before the transcript has it sent
 into the recorded thread — and only that thread, only the dashboard's own
 messages endpoint; a page showing the thread meanwhile is told it went; a
 refused send is never retried and goes to the draft; a review dictation (✓,
-a hand-off on leaving) and an empty transcript are never sent.
+a hand-off on leaving) and an empty transcript are never sent; a take that
+cancelled a call carries it as `cancelled_call`, while it is fresh — counted
+from the transcript for the run that started the job, from the recording for
+a restart.
 
 Standalone like the rest of the suite. Needs `node` on PATH; without it the
 test reports a skip and passes.
@@ -71,8 +74,10 @@ const POSTS = [];            // message POSTs the worker made
 let sendStatus = 200;
 let transcript = 'hello thread';
 let hangSends = false;       // a message POST that never answers, until its signal aborts
+let onTranscribe = null;     // run while a transcription is being answered (a slow one moves the clock)
 async function fetchMock(url, init = {}) {
   if (String(url).startsWith('/conversations/transcribe')) {
+    if (onTranscribe) onTranscribe();
     return { ok: true, json: async () => ({ text: transcript }) };
   }
   POSTS.push({ url, body: JSON.parse(init.body) });
@@ -95,6 +100,11 @@ const shortTimeout = (fn, ms, ...rest) => setTimeout(fn, ms === 30000 ? 30 : ms,
 const ctx = vm.createContext({ self, indexedDB, fetch: fetchMock, Blob, AbortController, setTimeout: shortTimeout, clearTimeout,
   console, Response: class {}, caches: {}, URL, structuredClone });
 vm.runInContext(fs.readFileSync(process.argv[2], 'utf8'), ctx);
+// The worker's clock (its realm's Date), which a test can move forward.
+const WorkerDate = vm.runInContext('Date', ctx);
+const realNow = WorkerDate.now.bind(WorkerDate);
+let skew = 0;
+WorkerDate.now = () => realNow() + skew;
 
 function message(data, sourceId, ports) {
   let done = Promise.resolve();
@@ -111,7 +121,8 @@ function adopt(keys, asker) {
 }
 const blob = new Blob(['audio'], { type: 'audio/webm' });
 const SEND = '/conversations/t1/messages';
-const reset = () => { DB.clear(); CLIENTS.clear(); POSTS.length = 0; sendStatus = 200; hangSends = false; transcript = 'hello thread'; };
+const reset = () => { DB.clear(); CLIENTS.clear(); POSTS.length = 0; sendStatus = 200; hangSends = false; transcript = 'hello thread';
+                      onTranscribe = null; skew = 0; };
 
 // 1. ➤, page still there and owning the job: the worker does NOT send; the page hears send:true.
 reset(); CLIENTS.set('A', { posted: [] });
@@ -196,6 +207,81 @@ assert.equal(jobs9[0].state, 'done'); assert.equal(jobs9[0].unsent, 'maybe'); as
 assert.equal(POSTS.length, 0, 'a record stranded mid-send is never sent again');
 await new Promise((r) => setTimeout(r, 50));
 assert.equal(POSTS.length, 0, 'nor restarted afterwards');
+
+// 10. A take that cancelled a call in the continuous loop (components/conversation.js,
+//     CANCELLED_CALLS) and is sent by the worker carries the call as `cancelled_call`, as the
+//     page's own send would; a page showing the thread that has to send it gets it handed on;
+//     a call on a review dictation, or one not shaped as {number, name}, goes nowhere.
+reset(); CLIENTS.set('A', { posted: [] });
+const CALL = { number: '+41 79 555 01 23', name: 'Anna' };
+const run10 = message({ type: 'dictation', id: 'j11', key: 'conv:t1', url: '/conversations/transcribe?thread=t1', blob, send: SEND, call: CALL }, 'A');
+CLIENTS.delete('A'); await message({ type: 'dictation-release' }, 'A');
+await run10;
+assert.deepEqual(POSTS, [{ url: SEND, body: { message: 'hello thread', cancelled_call: CALL } }]);
+reset(); CLIENTS.set('A', { posted: [] });
+await message({ type: 'dictation', id: 'j12', key: 'conv:t1', url: '/conversations/transcribe?thread=t1', blob, send: SEND, call: CALL }, 'A');
+const done10 = CLIENTS.get('A').posted.find((m) => m.type === 'dictation-done');
+assert.deepEqual(done10.call, CALL, 'the page that sends it itself still knows the call');
+reset(); CLIENTS.set('A', { posted: [] });
+const run11 = message({ type: 'dictation', id: 'j13', key: 'conv:t1', url: '/conversations/transcribe?thread=t1', blob, send: SEND, call: { number: 5 } }, 'A');
+CLIENTS.delete('A'); await message({ type: 'dictation-release' }, 'A');
+await run11;
+assert.deepEqual(POSTS, [{ url: SEND, body: { message: 'hello thread' } }], 'a malformed call is dropped');
+reset(); CLIENTS.set('A', { posted: [] });
+await message({ type: 'dictation', id: 'j14', key: 'conv:t1', url: '/conversations/transcribe?thread=t1', blob, call: CALL }, 'A');
+const done11 = CLIENTS.get('A').posted.find((m) => m.type === 'dictation-done');
+assert.equal(done11.call, null, 'a review dictation carries no call');
+assert.equal(POSTS.length, 0);
+
+// 11. A cancelling take the worker was stopped in the middle of transcribing, restarted for a
+//     page that asks for its place long after it was recorded: it goes out as words alone —
+//     the call it cancelled is not put to Ara again.
+reset(); CLIENTS.set('C', { posted: [] });
+DB.set('j15', { id: 'j15', key: 'conv:t1', url: '/conversations/transcribe?thread=t1', blob, owner: '', origin: 'A',
+                send: SEND, state: 'running', text: '', error: '', at: Date.now() - 2 * 3600 * 1000, call: CALL });
+await adopt(['conv:t1'], 'C');
+for (let i = 0; i < 100 && !CLIENTS.get('C').posted.some((m) => m.type === 'dictation-done'); i += 1) {
+  await new Promise((r) => setTimeout(r, 10));
+}
+assert.deepEqual(POSTS, [{ url: SEND, body: { message: 'hello thread' } }], 'an old take carries no cancelled call');
+assert.equal(CLIENTS.get('C').posted.find((m) => m.type === 'dictation-done').sent, true, 'sent all the same');
+// The same restart within the window still carries it.
+reset(); CLIENTS.set('C', { posted: [] });
+DB.set('j16', { id: 'j16', key: 'conv:t1', url: '/conversations/transcribe?thread=t1', blob, owner: '', origin: 'A',
+                send: SEND, state: 'running', text: '', error: '', at: Date.now() - 5000, call: CALL });
+await adopt(['conv:t1'], 'C');
+for (let i = 0; i < 100 && !CLIENTS.get('C').posted.some((m) => m.type === 'dictation-done'); i += 1) {
+  await new Promise((r) => setTimeout(r, 10));
+}
+assert.deepEqual(POSTS, [{ url: SEND, body: { message: 'hello thread', cancelled_call: CALL } }], 'a fresh one does');
+
+// 12. The window runs from the transcript, for the run that started the job: a slow
+//     transcription (up to DICT_TIMEOUT_MS) of a cancelling take whose page went is sent the
+//     moment it is in, and still carries the call — and a page that adopts it right after
+//     hears the transcript's time with it.
+reset(); CLIENTS.set('A', { posted: [] });
+onTranscribe = () => { skew += 100 * 1000; };
+const run12 = message({ type: 'dictation', id: 'j17', key: 'conv:t1', url: '/conversations/transcribe?thread=t1', blob, send: SEND, call: CALL }, 'A');
+CLIENTS.delete('A'); await message({ type: 'dictation-release' }, 'A');
+await run12;
+assert.deepEqual(POSTS, [{ url: SEND, body: { message: 'hello thread', cancelled_call: CALL } }],
+  'a slow transcript sent at once keeps its call');
+reset(); CLIENTS.set('A', { posted: [] });
+onTranscribe = () => { skew += 100 * 1000; };
+await message({ type: 'dictation', id: 'j18', key: 'conv:t1', url: '/conversations/transcribe?thread=t1', blob, send: SEND, call: CALL }, 'A');
+const done12 = CLIENTS.get('A').posted.find((m) => m.type === 'dictation-done');
+assert.ok(done12.textAt - done12.at >= 100 * 1000, 'the page hears when the transcript came');
+// A restart's transcript is not the original run's: it sets no transcript time, so the window
+// stays measured from `at`, and a take recorded long ago goes out as words alone.
+reset(); CLIENTS.set('C', { posted: [] });
+DB.set('j19', { id: 'j19', key: 'conv:t1', url: '/conversations/transcribe?thread=t1', blob, owner: '', origin: 'A',
+                send: SEND, state: 'running', text: '', error: '', at: Date.now() - 2 * 3600 * 1000, call: CALL });
+await adopt(['conv:t1'], 'C');
+for (let i = 0; i < 100 && !CLIENTS.get('C').posted.some((m) => m.type === 'dictation-done'); i += 1) {
+  await new Promise((r) => setTimeout(r, 10));
+}
+assert.deepEqual(POSTS, [{ url: SEND, body: { message: 'hello thread' } }], 'a late restart still sends words alone');
+assert.ok(!CLIENTS.get('C').posted.find((m) => m.type === 'dictation-done').textAt, 'and gives no transcript time');
 console.log('ok');
 """
 

@@ -1038,6 +1038,64 @@ carries the loop on: another message pushed into a thread in the mode may be
 read aloud, but never opens the mic. A mic the loop wants while the page is
 hidden (a wake in the background, an answer read in a pocket) waits up to
 60 s for the page to come back.
+An answer of Ara's to the loop's own turn that ends in a **call directive**
+(`[[call: <number> | <name>]]`, `.claude/skills/dashboard-composing` §7)
+places the call where the mic would open, when the page runs in a shell that
+can (`placeCall`, below): once the answer has been read, the composer shows
+the name and the number to be dialled with a **Cancel** button for 5 s while
+the mic is open as for any take, its no-speech timeout stretched past the
+call's wait (a mic that fails to open leaves the call to go ahead). Where the
+mic would not open because the user is writing, no call is placed either: the
+loop stops as it does there, and the directive stays a link. Speech (the
+detector's `speech`, so in any language) cancels the call, and the take goes
+on to Ara as the next turn, whatever ends it, carrying `cancelled_call: {number, name}`, from which the gateway writes a
+fixed agent-only note (`_cancelled_call_context`): the call was not made;
+unless the words mean to stop it, place it again as a second attempt with
+`no-voice-cancel`. A cancelling take whose transcript is empty is no turn:
+the call goes ahead at once, with Cancel by touch only. A cancelling take
+that would carry text or files from the box goes to review instead, like any
+take, and the call stays cancelled. A cancelling take the service worker
+sends because the page was left or frozen meanwhile (webapp README, "Unsent
+input") carries the call there all the same; one the worker could not send
+waits in the box with its note, and the call stays cancelled; so does one
+the page could not send (another turn still on the wire, a model pin
+refused): it waits in the box, and no later turn carries its call. Sent
+more than 90 s after its transcript came (a page opened later that takes
+the take over), or after it was recorded where the worker restarted it, it
+carries no call: its words go to Ara alone, and no call is placed again
+that nobody is waiting for. Cancel itself
+(by touch) cancels for good.
+Speech cancels only where the detector can hear the stream; a take sent by
+touch (➤) while the call waits cancels it all the same, and where the page
+cannot hear the stream (plain timers, above) the take that listened is not
+dropped when the call is due but sent (to review with text or files in the
+box) as a cancelling take, so its transcript decides. A call that would go
+ahead after an empty transcript while the page is hidden is dropped.
+Nobody speaking, the take is dropped, the mic released (up to 2 s), the number
+handed to the shell, and the voice flag let go once the shell has answered
+(10 s at most). A call the shell refuses, or does not answer in that time,
+leaves a note in the composer that the call to the number could not be
+placed; a call placed, or the dialer opened with the number, needs none. The
+flag `| no-voice-cancel` as a third part (or in the name's place, with no
+name) keeps the mic
+shut for those 5 s — for a loud room or an emergency — but only on a second
+attempt: unless an earlier answer of Ara's in the thread carried a directive
+for the same number (`calledBefore`), the flag is ignored. Only a directive
+the bubble shows as a call link is a call: `callOf` renders the reply as the
+bubble does and takes the last link. One quoted as code (a span, whose
+backticks pair within a line, or a ``` or ~~~ fence, closed or not), split
+across lines, or cut apart by a table's cells is shown as text, never placed.
+Leaving the thread, hiding the page (the mic open or not) or
+stopping the loop drops the call. Anywhere else — a typed thread, an older reply, a message pushed
+into the thread (an agent's included), Ara's reply to a chat message that
+arrived in a companion thread meanwhile (stored with `arrival: true`, never the
+loop's answer nor an earlier attempt), a browser — the directive is only a tap-to-dial `tel:` link (its `#`
+written `%23`, so a service code dials whole)
+(`webapp/components/markdown.js`, `callOf`; `tests/test_webapp_call_directive.py`).
+The presentation lint never delivers a result whose call directives differ
+from the original's, read as the bubble reads them (JavaScript's whitespace
+included), nor one that changes a line holding a directive, or a fence or
+table-separator line, in a message with one (`docs/model-routing.md`, phase 4).
 Entry points: the toggle, `/#new?voice=1` (the composer in the mode — its
 first take opens the thread, which continues in it) and a wake (`/?wake=1`
 or the shell's `wake` event), which opens the thread used in the mode within
@@ -1052,7 +1110,8 @@ and her turn runs `conversation-push.py --end-continuous` (the thread is the
 turn's own, `RETINUE_THREAD_ID`). The gateway stamps the thread document
 `continuous_off` (ISO time); each device showing the thread in the mode
 leaves it on its next read, as if the toggle had been tapped (the mic closes,
-the shell's voice flag is released). The stamp acts once per device and only
+the shell's voice flag is released, and a call directive the answer ends in,
+or a call waiting to be placed, is not placed). The stamp acts once per device and only
 on a mode switched on before it (one minute of clock skew allowed), so a
 toggle the user presses afterwards stays on.
 
@@ -1190,16 +1249,17 @@ The contract the two sides share (web side: `webapp/components/shell.js`):
 
 | Direction | What |
 |---|---|
-| User agent | ` RetinueShell/4 (Android)` appended (` RetinueShell/3` before the app's own settings page and the per-device preferences, `/2` before the endpoint members, `/1` before the Health Connect members; the page feature-detects every member rather than parsing the version). |
+| User agent | ` RetinueShell/6 (Android)` appended (` RetinueShell/5` before `placeCall`, ` RetinueShell/4` before the keyboard members, ` RetinueShell/3` before the app's own settings page and the per-device preferences, `/2` before the endpoint members, `/1` before the Health Connect members; the page feature-detects every member rather than parsing the version). |
 | `window.RetinueShell` | Installed at document start, configured origin only: `platform`, `version`, `setVoiceActive(bool)` and `openSettings(section?)`, which opens the app's settings: from RetinueShell/4 its own page (the gear calls it when `settingsPage` is true), before that the native screens behind Settings → Phone shell (shown only when the object exists; the card is the first on the page there). `setVoiceActive(true)` means *a voice conversation is engaged: keep the screen on and pause the wake phrase*. The page asserts it before it asks for the mic (the wake detector must release it first) and keeps it asserted for as long as a continuous conversation is going — through transcription, Ara's answer and its reading, not only while the mic is open — and sends `false` once the loop stops (mode off, no speech, leaving the thread, an error). Wake detection being paused for the whole conversation is intended. |
 | Endpoints (RetinueShell/3) | The shell holds a list of Retinue servers (address, client certificate, sign-in, health switch) and shows one; the app's settings page lists, edits and switches them (RetinueShell/3: the Settings page's Phone shell card lists them in a menu and switches between them). `endpoints()` → a JSON string `[{"id": str, "label": str, "current": bool}]` — the label is the instance's own name, the manifest `short_name` the shell fetched with that endpoint's certificate or password (the host while it is unknown; the host appended when two names collide); no URLs, the other servers being none of the current page's business. `selectEndpoint(id)` asks the shell to show that server (it loads that dashboard's start page, so the page is left). `openSettings("endpoints")` opens the app's settings at the endpoint list, or at the editor straight away with one endpoint. The page may ask; it can never write an address, certificate or password — whatever origin the shell is pointed at receives its bridge, microphone, certificate and password, so that stays in the app. An `endpoints` event (`detail.type`) says the list changed while a page is open; the card re-renders. The shell's one base URL of earlier builds is the first endpoint after an update. |
 | Health Connect (RetinueShell/2) | Further members on `window.RetinueShell`: `healthConnectAvailable()` → `"true"`/`"false"`; `healthSync()` — a deliberate sync now, returns at once (a deliberate sync always runs, whatever the interval); `healthSyncStatus()` → a JSON string `{"available": bool, "permissions": "granted"\|"partial"\|"none", "last_sync_at": ISO\|null, "last_result": "ok"\|"error"\|"skipped"\|null, "last_error": str\|null, "last_count": int\|null, "min_interval_minutes": int, "auto_on_resume": bool, "enabled": bool}` (`enabled`, RetinueShell/3: the current endpoint's own health switch, set in the shell's editor — off, nothing is read or sent for that server, a sync asked for is `skipped` with reason `disabled`, and the card shows one line and *Edit endpoint* instead of the controls; an older shell omits the field and uploads for its one server); `setHealthSyncInterval(minutes)`; `setHealthAutoSync(bool)`. The shell reads the phone's Health Connect store through its Changes API and uploads what it returns, unaltered, as one JSON file per delivery by **WebDAV `PUT` to `/inbox/<name>`** — the letterbox share below, with the WebView's own client certificate and cookies — where a chamber that declares the file type in its `accepts` takes it (docs/scheduling.md); the framework knows nothing about the data. On resume the shell syncs on its own at most every `min_interval_minutes` (default 5) while `auto_on_resume` holds. From RetinueShell/4 the app's settings page has these controls, beside the endpoint's switch, and the dashboard shows none; with RetinueShell/3, Settings → Phone shell shows, only where `healthConnectAvailable()` is true, "Update health data now", the last sync (from `healthSyncStatus()` and the events), the auto-sync toggle and the interval. Every member is feature-detected (`webapp/components/shell.js`): an older shell simply shows none of it. |
 | Settings page and per-device preferences (RetinueShell/4) | `settingsPage: true`: the app has a settings page of its own (see "The settings page"), and the gear opens it. `deviceSettings()` → a JSON string `{key: value}` of the per-device preferences the app holds for every endpoint; `setDeviceSetting(key, value)` writes one (`null` removes it; a key the app does not take is ignored). `components/device-store.js` is the only caller. |
-| Shell → page | `window.dispatchEvent(new CustomEvent('retinue-shell', {detail: {type}}))`, `type` `wake`, `home`, `health-sync`, `endpoints` or `device-settings` (with `keys`, the per-device preferences that changed). A `health-sync` event carries `state`: `started`, `done` (with `count`), `error` (with `error`) or `skipped` (with `reason`: `interval`, `no-permission`, `unavailable`, `no-backend-support`, `disabled`); it, `endpoints` and `device-settings` are information only — no page navigates on them. The home answers in place: `wake` opens continuous conversation (the thread used in the mode in the last 15 minutes, else a new one), `home` unwinds every open thread or composer back to the list at `/`, closes a sheet and scrolls the list to its top. Other dashboard pages answer by loading `/?wake=1` or `/`, always: unsent input on the page (a draft, an unsaved project edit, a dictation or send under way) never holds either back — it is kept on the device and waits in its field; a dictation is finished by the service worker, which puts a review dictation into its field and posts one the user had sent into its thread (webapp README, "Unsent input"). |
+| Shell → page | `window.dispatchEvent(new CustomEvent('retinue-shell', {detail: {type}}))`, `type` `wake`, `home`, `health-sync`, `endpoints`, `device-settings` (with `keys`, the per-device preferences that changed) or `call` (what became of a `placeCall`, see Phone calls below). A `health-sync` event carries `state`: `started`, `done` (with `count`), `error` (with `error`) or `skipped` (with `reason`: `interval`, `no-permission`, `unavailable`, `no-backend-support`, `disabled`); it, `endpoints`, `device-settings` and `call` are information only — no page navigates on them. The home answers in place: `wake` opens continuous conversation (the thread used in the mode in the last 15 minutes, else a new one), `home` unwinds every open thread or composer back to the list at `/`, closes a sheet and scrolls the list to its top. Other dashboard pages answer by loading `/?wake=1` or `/`, always: unsent input on the page (a draft, an unsaved project edit, a dictation or send under way) never holds either back — it is kept on the device and waits in its field; a dictation is finished by the service worker, which puts a review dictation into its field and posts one the user had sent into its thread (webapp README, "Unsent input"). |
 | Pages without the web app's code | The gateway's own pages (`/sends`, `/claude-auth`) do not load `components/shell.js`, so nothing on them answers `wake` or `home`. The shell handles that itself: when the page in front is not one of the dashboard's, a Home press loads `/` and a wake loads `/?wake=1` instead of dispatching the event. |
 | `/sync-health` | The link target for "update your health data" in threads: `https://<dashboard origin>/sync-health#sync` (the origin is `CONVERSATION_BASE_URL`'s). Same origin, so the shell opens it in place. A static page — a GET never changes server state; the fragment is the instruction, and the server never sees it. In the shell with `#sync` it calls `healthSync()`, says "Health data update triggered", and after a moment goes back (`history.back()`, or `/` when opened cold); a `done` arriving first is shown before it leaves, an `error` or `skipped` stays on screen with *Update now* and *Back*. The fragment is dropped from the address once read, so a reload starts nothing. In the shell without `#sync`: a short explanation, the last sync and *Update now*. In a browser on Android: the Ara app is needed, and an **Open in Ara app** link — an intent link the page builds from `location`, never from configuration: `intent://open?url=<percent-encoded https://<origin>/sync-health#sync>#Intent;scheme=retinue-shell;package=os.retinue.ara;S.browser_fallback_url=<percent-encoded https://<origin>/sync-health>;end`. The app opens the URL only when its origin is exactly the one it is configured for, and otherwise says so and connects nowhere (no Android App Links, no Play services). On a desktop: the explanation only. The page loads `shell.js`, so `wake` and `home` work on it, and it is in the service worker's shell cache like every page. |
 | Cold wake | With no page loaded the shell loads `/?wake=1`; the home treats it as a wake and drops the flag from the address. A wake should reach the page once it is resumed; one that arrives while the page is hidden still waits (up to 60 s) for it to come to the front before the mic opens. |
 | Speech output | A `speechSynthesis` / `SpeechSynthesisUtterance` stand-in over the native TTS when the WebView has none; `webapp/components/speech.js` is unchanged. |
+| Phone calls (RetinueShell/6) | `placeCall(number)` on `window.RetinueShell`: the shell calls the number without a tap (`ACTION_CALL`, on speakerphone — the user may not be holding the phone) when *Call directly by voice* is on for the endpoint (a switch per endpoint, in the app's settings under *This app with <endpoint>* → *Phone calls*, off for a new endpoint), Android's phone-call permission is granted, and a voice conversation is engaged (`setVoiceActive(true)`) — never outside one, so no page can dial behind the user's back. The shell normalises the number (separators, a leading `tel:` and the `(0)` of `+44 (0)20` dropped); it must then be an optional `+` followed by digits, `*` and `#`, with 3 to 20 digits and at most 32 characters. It answers with a `retinue-shell` event `{type: "call", state, reason?, number?}`: `placed` (with `number`); `dialer` — the dialer opened with the number instead (with `number`), for an emergency number (Android lets no app call those directly; `reason: "emergency"`), a service code — any number with `*` or `#`, which always opens the dialer (`service-code`) —, with the switch off (`disabled`) or without the permission (`no-permission`); or `refused` (`invalid-number`, `not-in-voice`, `no-telephony`, or `failed` with `number`). An empty string is answered `refused` / `invalid-number`; `placeCall()` and `placeCall(null)` send nothing. The web side (`shell.js`: `canPlaceCall`, `placeCall`, `onCall`) uses it only for the call directive of the continuous loop's own answer (above), and lets the voice flag go on any answer, whatever its state. |
 | Files | A file the WebView cannot show (a PDF, anything served as `attachment`) reaches the shell's download listener, which follows the `Content-Disposition` as a browser does. `inline` — a PDF row's name link (`?inline=1`; images and text open in the dashboard's file viewer, see "Attachments") — means *view*: the shell opens it in the phone's app for the type from a private copy, so no copy lands in Downloads (none installed: it saves it there and says so). Anything else — the ↓ link — is saved to Downloads. The name is the header's (`filename*`, then `filename`); the attachment URL ends in it too (see "Attachments"). |
 
 `manifest.webmanifest` declares `launch_handler: {client_mode:
