@@ -12,7 +12,7 @@
 //     healthSync(), healthSyncStatus(), setHealthSyncInterval(minutes),
 //     setHealthAutoSync(bool)), from RetinueShell/3 the endpoint members
 //     (endpoints(), selectEndpoint(id); openSettings takes a section), and
-//     from RetinueShell/3 placeCall(number);
+//     from RetinueShell/6 placeCall(number);
 //   - the shell dispatches `retinue-shell` window events, detail.type `wake`
 //     (the wake phrase), `home` (a Home press while the shell is in front),
 //     `health-sync` (a Health Connect sync started, done, failed or skipped),
@@ -245,12 +245,19 @@ export function onHealthSync(cb) {
   return () => window.removeEventListener('retinue-shell', listener);
 }
 
-// ── Phone calls (RetinueShell/3) ────────────────────────────────────────────
-// The shell places a call without a tap — only while a voice conversation is
-// engaged (setVoiceActive), and only when the user switched "Call directly by
-// voice" on in its settings; otherwise, and for emergency numbers always
-// (Android lets no app call those directly), it opens the dialer with the
-// number. The outcome comes back as a `call` event.
+// ── Phone calls (RetinueShell/6) ────────────────────────────────────────────
+// The shell places a call without a tap only while a voice conversation is
+// engaged (setVoiceActive); outside one it refuses, so no page can dial
+// behind the user's back. The switch "Call directly by voice" is per
+// endpoint, in the app's settings under "This app with <endpoint>", then
+// "Phone calls", and off for a new endpoint: with it off, or without
+// Android's phone-call permission, the shell opens the dialer with the number
+// instead. It always does so for an emergency number (Android lets no app
+// call those directly) and for a service code (any number with * or #). The
+// shell normalises the number itself (separators, a leading tel: and the (0)
+// after a country code dropped) and refuses one that is not an optional +
+// followed by digits, * and #, with 3 to 20 digits and at most 32
+// characters. The outcome comes back as a `call` event.
 
 export function canPlaceCall() {
   const s = typeof window !== 'undefined' ? window.RetinueShell : null;
@@ -263,8 +270,14 @@ export function placeCall(number) {
 }
 
 // Subscribe to the shell's `call` events: cb(detail) with detail.state
-// `placed`, `dialer` (reason `emergency`, `disabled` or `no-permission`) or
-// `refused` (reason). Returns the unsubscribe function.
+// `placed` (with number), `dialer` (the dialer opened with the number
+// instead; reason `emergency`, `service-code`, `disabled` or `no-permission`,
+// with number) or `refused` (reason `invalid-number`, `not-in-voice`,
+// `no-telephony`, or `failed` with number). An empty number is answered as
+// refused / invalid-number, while the bridge's placeCall() and
+// placeCall(null) get no answer at all; placeCall above always passes a
+// string, so it never waits for one that cannot come. Returns the
+// unsubscribe function.
 export function onCall(cb) {
   if (typeof window === 'undefined') return () => {};
   const listener = (e) => {

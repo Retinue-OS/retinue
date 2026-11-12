@@ -809,7 +809,8 @@ cannot do — the home-screen role, a wake phrase, native speech output, the
 client certificate. Everything that is Retinue stays here, so it behaves the
 same in the shell, in Chrome and on a desktop. The contract between them:
 
-- **User agent**: the shell appends ` RetinueShell/4 (Android)` (`/3` before
+- **User agent**: the shell appends ` RetinueShell/6 (Android)` (`/5` before
+  `placeCall`, `/4` before the keyboard members, `/3` before
   the app's own settings page and the per-device preferences, `/2` before the
   endpoint members, `/1` before the Health Connect members below).
 - **`window.RetinueShell`**, installed at document start on the configured

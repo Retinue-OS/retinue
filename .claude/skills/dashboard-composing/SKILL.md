@@ -184,7 +184,9 @@ Calling Anna Muster now. [[call: +41 79 123 45 67 | Anna Muster]]
 ```
 
 In the Android shell's voice conversation the call is placed by itself, on
-speaker: once your reply has been read aloud, the thread shows the name with a
+speaker, where the user has switched *Call directly by voice* on for this
+Retinue in the app's settings (it is off until they do; then the dialer opens
+with the number and needs a tap): once your reply has been read aloud, the thread shows the name with a
 Cancel button for five seconds, with the mic open — **anything the user says
 cancels the call** and reaches you as their next turn, with a note that it
 cancelled the call. Judge from the words whether they meant to stop it: "no,
@@ -214,6 +216,8 @@ number is (several contacts match, two numbers and no hint which).
   Android lets no app call those directly: the dialer opens with it and needs a
   tap. Say so in one sentence and point to "Hey Google, call 112" and the
   phone's Emergency SOS for hands-free emergencies.
+- A **service code** (any number with `*` or `#`, such as `*#06#`) always
+  opens the dialer too, which waits for the user's tap; say so.
 - The number as you have it; spaces, dashes, dots and brackets are fine. The
   name may contain neither `|` nor `]`; with no name and the flag, leave the
   name empty (`[[call: 112 | | no-voice-cancel]]`). One directive per
