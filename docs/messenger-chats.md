@@ -460,7 +460,7 @@ and what a model turn is *for*:
      note that tells the turn about them names each file by the path the
      gateway gave it, its type and its size, never by the sender's file name.
      The type is the one the sender's client declared, so it is kept only as
-     one media type, written back from what was read, and as
+     the bare `type/subtype` of one media type, without parameters, and as
      `application/octet-stream` otherwise: text from outside never reads as
      the framework's own words in a prompt. The chat note every companion
      turn carries names the types of the recent messages' attachments under
