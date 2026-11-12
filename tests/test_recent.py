@@ -126,6 +126,7 @@ def main():
         os.environ["CONVERSATIONS_DIR"] = str(convs)
         os.environ["CHAMBERS_MANIFEST"] = str(Path(tmp) / "absent.json")
         os.environ.pop("TRIAGE_MESSENGER_DIR", None)
+        os.environ.pop("RETINUE_MEMORY_DIR", None)
         recent = _load("recent")
         assert recent.contact_handles("Roger", chambers) == (["Roger Peng"], {"111222"})
 
@@ -155,6 +156,22 @@ def main():
 
         out = _run(recent, "brandle", "--source", "memory")     # unescaped, not mojibake
         assert "café C:\\users\\Brändle x" in out, out
+
+        # memory.py writes to RETINUE_MEMORY_DIR when set; the lookup must read
+        # the same place, not the default under the chambers dir.
+        custom = Path(tmp) / "custom-mem"
+        custom.mkdir()
+        now = dt.datetime.now(dt.timezone.utc)
+        (custom / "e.nt").write_text(
+            _entry(f"{now:%Y%m%dT%H%M%SZ}-cust01", "Zoltan lives in Graz", now), encoding="utf-8")
+        os.environ["RETINUE_MEMORY_DIR"] = str(custom)
+        try:
+            out = _run(recent, "Zoltan", "--source", "memory")
+            assert "Zoltan lives in Graz" in out, out
+            out = _run(recent, "Carla", "--source", "memory")   # default dir is not read
+            assert "## memory (0)" in out, out
+        finally:
+            os.environ.pop("RETINUE_MEMORY_DIR", None)
 
         assert recent.fold("BRÄNDLE") == "brandle"
 

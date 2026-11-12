@@ -253,10 +253,13 @@ def main(argv: list[str] | None = None) -> int:
     names, handles = contact_handles(term, CHAMBERS_DIR)
     handles.add(_bare(term))
     messenger = Path(os.environ.get("TRIAGE_MESSENGER_DIR") or CHAMBERS_DIR / "_generated" / "messenger")
+    # Where memory.py writes: RETINUE_MEMORY_DIR overrides the default, and a
+    # lookup that ignored it would report an empty memory on such a setup.
+    memory = Path(os.environ.get("RETINUE_MEMORY_DIR") or CHAMBERS_DIR / "_generated" / "memory")
     scanners = {
         "chats": lambda: scan_chats(messenger, since, needles, handles),
         "threads": lambda: scan_threads(CONVERSATIONS_DIR, since, needles, names),
-        "memory": lambda: scan_memory(CHAMBERS_DIR / "_generated" / "memory", since, needles, names),
+        "memory": lambda: scan_memory(memory, since, needles, names),
         "projects": lambda: scan_projects(CHAMBERS_DIR, since, needles, names),
     }
     print(f"recent: «{term}» since {since:%Y-%m-%d %H:%M}Z"
