@@ -372,6 +372,10 @@ services:
       - RETINUE_INSTANCE_NAME
       - RETINUE_INSTANCE_COLOR
       - RETINUE_INSTANCE_FILE
+      # The dashboard's Content-Security-Policy: report (the default: the
+      # browser only says what it would block), enforce, or off. See
+      # docs/dashboard.md, "The Content-Security-Policy".
+      - RETINUE_CSP
       - SEND_APPROVAL_BASE_URL
       # Zone the approval pages render event times in; the containers run on
       # UTC, so without it a mis-zoned calendar entry reads as correct there.

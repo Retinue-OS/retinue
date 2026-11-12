@@ -296,6 +296,7 @@ import attention_store
 import build_stamp
 import claude_auth
 import agent_models
+import content_policy
 import chat_state as chat_state_mod
 import contacts as contacts_mod
 import dictation_vocabulary
@@ -1580,6 +1581,11 @@ def _shell_hash() -> str:
     # Only when set, so an unbranded deployment keeps the hash it always had.
     if instance_branding.branded():
         entries.append(f"branding:{instance_branding.signature()}")
+    # So is the Content-Security-Policy: the worker serves the shell pages
+    # from its cache with the headers they were cached with, so a changed mode
+    # (RETINUE_CSP) or policy reaches an installed client only with a new
+    # worker, as a changed file does.
+    entries.append(f"csp:{content_policy.signature()}")
     signature = "\n".join(entries)
     cached = _SHELL_HASH_CACHE.get(signature)
     if cached is not None:
@@ -9561,6 +9567,27 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):  # suppress default access log noise
         pass
 
+    # ── The Content-Security-Policy on every HTML response ───────────────────
+    # Every answer that is a page (text/html) carries the policy of
+    # scripts/content_policy.py in the mode RETINUE_CSP names, whichever code
+    # path wrote it: the static pages, the pages the gateway builds, a
+    # download that happens to be HTML, and http.server's own error pages
+    # (send_error). So it is added where the headers end rather than by each
+    # page's code, which could forget it. A response that is not a page needs
+    # none: a policy governs the document it arrives with.
+
+    def send_header(self, keyword, value):
+        if keyword.lower() == "content-type":
+            self._csp_page = str(value).split(";", 1)[0].strip().lower() == "text/html"
+        super().send_header(keyword, value)
+
+    def end_headers(self):
+        if getattr(self, "_csp_page", False):
+            self._csp_page = False
+            for name, value in content_policy.headers():
+                super().send_header(name, value)
+        super().end_headers()
+
     def _send_json(self, status: int, body: dict,
                    headers: dict[str, str] | None = None) -> None:
         payload = json.dumps(body, ensure_ascii=False).encode()
@@ -12885,5 +12912,6 @@ if __name__ == "__main__":
     threading.Thread(target=_attention_tick_loop, name="attention-tick", daemon=True).start()
     _warn_if_arrival_turns_are_open()
     server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
-    print(f"[web-gateway] listening on port {PORT} (max concurrency {MAX_CONCURRENCY})", flush=True)
+    print(f"[web-gateway] listening on port {PORT} (max concurrency {MAX_CONCURRENCY}; "
+          f"Content-Security-Policy: {content_policy.mode()})", flush=True)
     server.serve_forever()
