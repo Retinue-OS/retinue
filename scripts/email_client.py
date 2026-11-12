@@ -1160,6 +1160,22 @@ def cmd_read(cfg, args):
     print(json.dumps(out, ensure_ascii=False, indent=2))
 
 
+# Control characters (C0 and C1) have no place in a file name written here.
+_FILE_NAME_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+
+
+def _attachment_file_name(declared, part: int) -> str:
+    """The name fetch-attachment saves a part under when --out is not given.
+
+    ``declared`` is the attachment's file name as its sender wrote it, which
+    may name a path (``../..``, an absolute one, backslashes) or a hidden
+    file. What is kept is its base name without control characters or
+    leading dots; ``attachment-<part>`` when nothing is left."""
+    name = str(declared or "").replace("\\", "/")
+    name = _FILE_NAME_CONTROL_RE.sub("", os.path.basename(name)).strip().lstrip(".").strip()
+    return name or f"attachment-{part}"
+
+
 def cmd_fetch_attachment(cfg, args):
     M = imap_connect(cfg)
     imap_select(M, args.folder, readonly=True)
@@ -1176,9 +1192,20 @@ def cmd_fetch_attachment(cfg, args):
     if target is None:
         die(f"attachment part {args.part} not found on uid {args.uid}")
     payload = target.get_payload(decode=True) or b""
-    out_path = args.out or _decode(target.get_filename()) or f"attachment-{args.part}"
-    with open(out_path, "wb") as fh:
-        fh.write(payload)
+    if args.out:
+        # The operator's own choice of path, written as given.
+        out_path, mode = args.out, "wb"
+    else:
+        # The attachment's name is what the mail's sender declared, so it is
+        # only ever a base name in the working directory, and a file that is
+        # already there is never overwritten (exclusive create).
+        out_path = _attachment_file_name(_decode(target.get_filename()), args.part)
+        mode = "xb"
+    try:
+        with open(out_path, mode) as fh:
+            fh.write(payload)
+    except FileExistsError:
+        die(f"{out_path} already exists; not overwriting it (choose a path with --out)")
     M.logout()
     print(json.dumps({
         "saved": out_path,
@@ -1948,7 +1975,8 @@ def main():
     sp.add_argument("--uid", required=True)
     sp.add_argument("--folder", default="INBOX")
     sp.add_argument("--part", type=int, required=True, help="attachment index from 'read' output")
-    sp.add_argument("--out", help="output path (default: original filename)")
+    sp.add_argument("--out", help="output path (default: the attachment's own base "
+                                  "name in the working directory, never overwriting a file)")
     sp.set_defaults(func=cmd_fetch_attachment)
 
     sp = sub.add_parser("move", help="move a message to another folder")
