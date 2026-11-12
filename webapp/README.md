@@ -409,7 +409,9 @@ The API, as the components consume it:
   direction, author? (out: user|agent|device, plus agent name),
   sender?/sender_name? (in), text, lang?, ts, attachments?: [{id, url,
   type?, size?, width?, height?, name?}]}`. Attachment URLs are the web-gateway's
-  authenticated media proxy (`/chats/media/…`); type, size and name are what
+  authenticated media proxy (`/chats/media/…`), which serves a file in place
+  only as an inline-safe image, audio, video, PDF or plain text and as a
+  download otherwise (`docs/dashboard.md`, "Attachments"); type, size and name are what
   the storing gateway stated about the blob in its ledger record (absent on
   records older than that statement). `width`/`height` are the medium's real intrinsic size, sniffed
   at ingest — when present the client reserves the true aspect box before the
@@ -421,7 +423,8 @@ The API, as the components consume it:
   above the transcript, which is already the message `text`; `video/*` is an
   inline player (`preload=metadata`, box-reserved the same way); anything
   else (a document, an animated sticker) is a file row showing the stated
-  `name` and `size` that opens the file in a new tab. Reactions and quoted replies (issue #130) will
+  `name` and `size` that links the file: a PDF or plain text opens in a new
+  tab, anything else is saved, as the proxy serves it. Reactions and quoted replies (issue #130) will
   decorate these records later. The companion thread is not in this payload:
   it is an ordinary conversation, named by the summary's `companion` id and
   read through `/conversations`.

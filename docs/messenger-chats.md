@@ -230,7 +230,10 @@ chat state; the chat API adds no writer to any of it.
 Media stays where it is: attachment references are the gateways' token-gated
 `GET /media/<id>` URLs, and the web-gateway proxies them behind the dashboard's
 own auth (the same shape as the `/gateways/<slug>/qr` proxy), so images render
-inline in chat bubbles without exposing gateway tokens to the browser.
+inline in chat bubbles without exposing gateway tokens to the browser. A blob
+comes with the content type its sender declared, so the proxy decides from it
+what is served in place and what as a download (`docs/dashboard.md`,
+"Attachments").
 
 ### Retinue-side chat state
 
