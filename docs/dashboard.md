@@ -685,7 +685,9 @@ case, with its `charset` or `codecs` parameter and no other), never relayed as
 it came, and every answer, a relayed error included, carries
 `X-Content-Type-Options: nosniff`. The proxy does not know the name the sender
 gave the file, so a download is named after its URL and type
-(`<media-id>.docx`).
+(`<media-id>.docx`). The gateways' store keeps the stated type as one line of
+printable ASCII (`inbound_store.clean_content_type`), so it is exactly one
+header of their own `GET /media/<id>`, whatever was declared.
 
 ## Push notifications
 
