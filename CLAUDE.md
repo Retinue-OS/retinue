@@ -196,6 +196,18 @@ agent. `RETINUE_MEMORY=0` disables the mechanism. **This store is the only
 memory**: Claude Code's built-in auto memory is disabled deployment-wide — do
 not create `MEMORY.md`-style files.
 
+**Look before you ask or write.** Memory holds what was stored, not the
+recent course of events. Before asking the user something about a person or
+subject, and before writing to someone — autonomous chats included — run
+
+```bash
+python3 /workspace/scripts/recent.py "<name or subject>" [--days 14]
+```
+
+(the last days of chats, dashboard threads, memory and project logs, matched
+by name and the contact's handles; e-mail: `email_client.py search --text`).
+Ask only what it leaves open, and never contradict what another thread said.
+
 ## Data refresh and scheduled tasks
 
 **Before accessing a time-sensitive data source** (one a chamber's `.refresh.json` declares), run
