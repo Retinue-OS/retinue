@@ -65,7 +65,9 @@ def main() -> int:
     now = store.now()
 
     item = {
-        "id": hashlib.sha1(args.url.encode("utf-8")).hexdigest()[:16],
+        # From the link as it is stored, so the same link is one item however
+        # it was typed (blanks around it are no part of it).
+        "id": hashlib.sha1(url.encode("utf-8")).hexdigest()[:16],
         "title": args.title.strip(),
         "url": url,
         "summary": args.summary.strip(),
