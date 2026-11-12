@@ -14,7 +14,8 @@
 //   - Nothing runs outside the shell; the row only says the app is needed.
 //   - Only plain one-line text runs by itself, ONCE: only when the gateway
 //     marked it `auto` (shell_actions.runs_by_itself, in a chat the user
-//     opened, on a turn they started from the dashboard), only when its
+//     opened, on a turn they started from the dashboard, a whole line they
+//     had seen there, at most one per reply), only when its
 //     message arrived live in the thread open and visible on this device
 //     (never on opening a thread, a reload, a history read, or coming back to
 //     a page that was hidden), only while it is younger than
@@ -22,8 +23,14 @@
 //   - Everything else waits for a tap (needsTap): Enter, a line break (typed
 //     as Shift+Enter, which submits in a terminal or a one-line field), a tab
 //     (moves to a form's button), any single key (Space presses a focused
-//     button), a sensitive text, a password-manager field. The gateway never
-//     marks those `auto`; the page checks again.
+//     button), a sensitive text, a password-manager field, a text that is
+//     only whitespace or starts or ends with it. The gateway never marks
+//     those `auto`; the page checks again.
+//   - The phone asks once more, in a confirmation it draws itself, before
+//     Enter, a line break, a tab or any key (phoneConfirms) — up to 25 s for
+//     a text, 12 s for a key. The row says it waits for that rather than
+//     "Typing…"; a declined or unanswered confirmation ends as `cancelled`,
+//     as the page's own Stop does, so neither is worded as the user's no.
 //   - What a tap types is shown before it: the text itself (visibleText,
 //     line breaks and tabs marked), and in the label every Enter it presses
 //     (enterCount — a line break is one). Only a sensitive text is not:
@@ -101,10 +108,23 @@ export function claim(id) {
 // ── The auto-run decision ──────────────────────────────────────────────────
 // Whether the action waits for the user's tap whatever the gateway says — the
 // page side of shell_actions.runs_by_itself: everything but plain one-line
-// text without Enter.
+// text without Enter, and with no whitespace at its edges. (JavaScript's
+// trim() takes a few characters more for whitespace than Python's strip(),
+// U+FEFF among them; that only makes the page the stricter.)
 export function needsTap(a) {
   if (!a || a.kind !== 'keyboard-type') return true;
-  return !!a.enter || a.sensitive === true || typeof a.text !== 'string' || /[\r\n\t]/.test(a.text);
+  return !!a.enter || a.sensitive === true || typeof a.text !== 'string' || /[\r\n\t]/.test(a.text)
+    || !a.text.trim() || a.text.trim() !== a.text;
+}
+
+// Whether the Ara app asks on the phone before it carries `a` out: before
+// anything that can act on the device — Enter, a line break or a tab in a
+// text, any key. Plain one-line text it types at once; a password-manager
+// field is a dialog of its own.
+export function phoneConfirms(a) {
+  if (!a) return false;
+  if (a.kind === 'keyboard-key') return true;
+  return a.kind === 'keyboard-type' && (!!a.enter || (typeof a.text === 'string' && /[\r\n\t]/.test(a.text)));
 }
 
 // `live`: the message arrived while the thread was open here (liveArrivals);
@@ -243,7 +263,8 @@ function start(entry) {
   entry.timer = setTimeout(() => { if (current === entry) advance(); }, watchdogMs(entry.action));
   started.set(entry.action.id, entry);
   while (started.size > STARTED_MAX) started.delete(started.keys().next().value);
-  notify(entry, 'pending');
+  // `confirm`: the phone asks first, so the row says it waits for that.
+  notify(entry, 'pending', phoneConfirms(entry.action) ? { confirm: true } : {});
   return true;
 }
 
@@ -394,7 +415,9 @@ const ERRORS = {
   'too-long': 'the text is too long',
   'unsupported-char': 'it contains a character the device’s keyboard layout lacks',
   busy: 'still typing the previous text',
-  cancelled: 'stopped',
+  // The page's Stop, and a confirmation on the phone declined or not answered
+  // in time: the wire tells them apart no more than this.
+  cancelled: 'stopped, or not confirmed on the phone',
   failed: 'the device did not take it',
 };
 
@@ -404,7 +427,7 @@ export function describeOutcome(d, host = '') {
   if (!d) return ['', false];
   const on = host ? ` on ${host}` : '';
   if (d.state === 'queued') return ['Waiting for the one before…', false];
-  if (d.state === 'pending') return [`Typing${on}…`, false];
+  if (d.state === 'pending') return [d.confirm ? 'Waiting for confirmation on the phone…' : `Typing${on}…`, false];
   if (d.state === 'typed') return [`Typed${on} ✓`, false];
   if (d.state === 'deleted') return ['Text deleted', false];
   if (d.state === 'secret-typed') return [`Password typed${on} ✓`, false];

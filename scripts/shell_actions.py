@@ -152,15 +152,21 @@ def runs_by_itself(action: dict) -> bool:
     (typed as Shift+Enter, which submits in a terminal or a one-line field),
     a tab (which moves to a form's button) or any single key (Space presses
     a focused button) — and no sensitive text, which goes nowhere the user
-    has not just confirmed. Never a password-manager field."""
+    has not just confirmed. Never a password-manager field.
+
+    The Ara app asks on the phone itself, a second time, before Enter, a line
+    break, a tab or any key, and types plain one-line text at once: whatever
+    this rule lets run by itself, the phone does not ask about, and what it
+    asks about this rule never lets run by itself."""
     if not isinstance(action, dict) or action.get("kind") != "keyboard-type":
         return False
     text = action.get("text")
     # Nor text that is only whitespace or starts or ends with it (a space
     # presses a focused button too). What plain characters do on the device
     # is the device's: a letter can be an app's shortcut — which is why the
-    # gateway also requires the text to be one the user has already seen in
-    # the thread (_conv_text_was_shown).
+    # gateway also requires the text to be a whole line the user has already
+    # seen in the thread (_conv_text_was_shown), and marks at most one action
+    # per reply.
     return (isinstance(text, str) and bool(text.strip()) and text.strip() == text
             and not action.get("enter") and not action.get("sensitive")
             and not re.search(r"[\r\n\t]", text))
@@ -242,7 +248,15 @@ def outcome_phrase(action: dict) -> str:
         return "cancelled by the user"
     if state == "error":
         why = o.get("error") or "failed"
-        return "stopped by the user" if why == "cancelled" else f"not typed: {why}"
+        if why == "cancelled":
+            # The page's Stop and a confirmation on the phone (asked before
+            # Enter, a line break, a tab or a key) that the user declined or
+            # did not answer in time end the same way on the wire. Saying
+            # "stopped by the user" would tell Ara the user refused, when
+            # they may not have looked at the phone.
+            return ("not typed: cancelled — stopped, or declined or not "
+                    "confirmed in time on the phone")
+        return f"not typed: {why}"
     return "no outcome reported yet"
 
 

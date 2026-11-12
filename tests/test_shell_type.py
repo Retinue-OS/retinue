@@ -159,7 +159,15 @@ def test_outcome_and_auto_run():
                                   "label": "x", "enter": False})
     assert sa.normalize_outcome({"state": "error", "error": "cancelled"}) == \
         {"state": "error", "error": "cancelled"}
-    assert "stopped by the user" in sa.describe(dict(t, outcome={"state": "error", "error": "cancelled"}))
+    # `cancelled` is also what a confirmation on the phone ends as when the
+    # user declines it or does not answer: Ara is not told the user stopped it.
+    stopped = sa.describe(dict(t, outcome={"state": "error", "error": "cancelled"}))
+    assert "(not typed: cancelled — stopped, or declined or not confirmed in time "\
+           "on the phone)" in stopped, stopped
+    assert "by the user" not in stopped, stopped
+    key = {"kind": "keyboard-key", "id": "b" * 32, "key": "enter",
+           "outcome": {"state": "error", "error": "cancelled"}}
+    assert "not confirmed in time" in sa.describe(key), sa.describe(key)
     for spaced in (" ", "  ", " a", "a ", "\u00a0x"):
         assert not sa.runs_by_itself(dict(t, text=spaced)), repr(spaced)
     assert sa.runs_by_itself(dict(t, text="a b"))

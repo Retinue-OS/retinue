@@ -129,6 +129,43 @@ await ok('only plain one-line text the gateway marked auto runs by itself', () =
     assert.equal(kbd.shouldAutoRun(a, fresh, { live: true, now }), false, what);
   }
   assert.equal(kbd.needsTap(typeA), false);
+  // Nor only whitespace, nor whitespace at an edge (a space presses a focused
+  // button) — as shell_actions.runs_by_itself, tests/test_shell_type.py.
+  for (const text of [' ', '  ', ' a', 'a ', ' x']) {
+    assert.equal(kbd.needsTap({ ...typeA, text }), true, JSON.stringify(text));
+    assert.equal(kbd.shouldAutoRun({ ...typeA, text }, fresh, { live: true, now }), false, JSON.stringify(text));
+  }
+  assert.equal(kbd.needsTap({ ...typeA, text: 'a b' }), false);
+});
+
+await ok('the phone confirms Enter, a line break, a tab and any key; the row says so', () => {
+  const calls = installShell();
+  for (const [what, a, asks] of [
+    ['plain text', typeA, false],
+    ['a sensitive text without Enter', { ...typeA, sensitive: true }, false],
+    ['Enter', { ...typeA, enter: true }, true],
+    ['a line break', { ...typeA, text: 'a\nb' }, true],
+    ['a tab', { ...typeA, text: 'a\tb' }, true],
+    ['the Enter key', keyB, true],
+    ['the Space key', { ...keyTab, key: 'space' }, true],
+    ['a password-manager field', secretC, false],
+  ]) assert.equal(kbd.phoneConfirms(a), asks, what);
+  const states = [];
+  const onState = (out) => states.push(out);
+  kbd.run({ ...typeA, text: 'ls', enter: true }, { threadId: tid, onState });
+  assert.deepEqual(states.at(-1), { state: 'pending', confirm: true });
+  assert.deepEqual(kbd.describeOutcome(states.at(-1), 'Quest 3'),
+    ['Waiting for confirmation on the phone…', false], 'an Enter text: the phone asks first');
+  kbd._reset();
+  kbd.run(keyB, { threadId: tid, onState });
+  assert.deepEqual(kbd.describeOutcome(states.at(-1), 'Quest 3'),
+    ['Waiting for confirmation on the phone…', false], 'a key: the phone asks first');
+  kbd._reset();
+  kbd.run(typeA, { threadId: tid, onState });
+  assert.deepEqual(states.at(-1), { state: 'pending' });
+  assert.deepEqual(kbd.describeOutcome(states.at(-1), 'Quest 3'), ['Typing on Quest 3…', false],
+    'plain text types at once');
+  assert.equal(calls.length, 3);
 });
 
 await ok('liveArrivals: the first read and the first after a hidden page only learn', () => {
@@ -244,7 +281,9 @@ await ok('wording', () => {
   assert.deepEqual(kbd.describeOutcome({ state: 'queued' }), ['Waiting for the one before…', false]);
   assert.deepEqual(kbd.describeOutcome({ state: 'error', error: 'not-connected' }), ['Not typed: no device connected', true]);
   assert.deepEqual(kbd.describeOutcome({ state: 'error', error: 'not-in-front' }), ['Not typed: the Ara app was not in front', false]);
-  assert.deepEqual(kbd.describeOutcome({ state: 'error', error: 'cancelled' }), ['Not typed: stopped', false]);
+  // `cancelled` is also a confirmation on the phone declined or not answered in time.
+  assert.deepEqual(kbd.describeOutcome({ state: 'error', error: 'cancelled' }),
+    ['Not typed: stopped, or not confirmed on the phone', false]);
   assert.deepEqual(kbd.describeOutcome({ state: 'secret-cancelled' }), ['Password not typed: cancelled', false]);
   assert.deepEqual(kbd.describeOutcome(null), ['', false]);
 });

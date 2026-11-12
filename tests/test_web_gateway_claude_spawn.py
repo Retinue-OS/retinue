@@ -429,7 +429,9 @@ def test_only_a_dashboard_turn_can_type(wg):
     wg.send_message = stub
     try:
         with _daemon_environment():
-            dash = wg._new_conv("user", "reto", "t", "user", "type hello", via_edge=True)
+            # The text on a line of its own, as auto-running needs it
+            # (_conv_text_was_shown).
+            dash = wg._new_conv("user", "reto", "t", "user", "type this:\nhello", via_edge=True)
             assert wg._conv_worker(dash["id"], f"conv:{dash['id']}",
                                    arrival="A chat message arrived.", push=False)
             assert wg._conv_worker(dash["id"], f"conv:{dash['id']}", push=False)

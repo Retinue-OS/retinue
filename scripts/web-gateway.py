@@ -3834,11 +3834,21 @@ def _conv_worker(cid: str, session_key: str, *, arrival: str | None = None,
             # Whether the page may run each without a tap is decided here,
             # once (the page runs by itself only what carries auto: true):
             # never in a thread where other people's words reach the turn.
+            # What the user has seen is the thread as it stood when the turn
+            # started, up to the message it answers: whatever the turn itself
+            # posted meanwhile (a "user" message from inside the container, a
+            # push) came out of what Ara read, not from the user's screen. And
+            # at most one action per reply runs by itself, so no text can be
+            # put together from pieces that each stand somewhere in the thread.
             thread_auto = _conv_allows_auto_run(conv)
-            shown = (_load_conv(cid) or conv).get("messages", []) if reply_actions else []
+            upto = next((i for i, m in enumerate(messages) if m is target), -1)
+            shown = messages[:upto + 1]
+            auto_left = 1
             for action in reply_actions:
-                action["auto"] = (thread_auto and shell_actions.runs_by_itself(action)
-                                  and _conv_text_was_shown(shown, action.get("text")))
+                action["auto"] = bool(auto_left and thread_auto
+                                      and shell_actions.runs_by_itself(action)
+                                      and _conv_text_was_shown(shown, action.get("text")))
+                auto_left -= action["auto"]
             if any(a.get("sensitive") for a in reply_actions):
                 # A title derived from the user's message may carry the very
                 # text typed; it reaches the thread list and every push.
@@ -3968,14 +3978,29 @@ def _conv_allows_auto_run(conv: dict) -> bool:
 
 
 def _conv_text_was_shown(messages: list, text: object) -> bool:
-    """Whether `text` stands verbatim in the thread as the user has seen it —
-    their own messages or Ara's earlier replies — before this turn's reply. A
-    text that runs without a tap must be one the user could have read ("type
-    the text above"), not one that came out of something Ara read meanwhile."""
-    if not isinstance(text, str) or not text:
+    """Whether `text` stands verbatim, as a whole line, in `messages` — the
+    thread as the user saw it before this turn: their own messages sent from
+    the dashboard (`via_edge`) or Ara's earlier replies. A text that runs
+    without a tap must be one the user could have read ("type the text
+    above"), not one that came out of something Ara read meanwhile; a "user"
+    message posted from inside the container is not the user's. A whole line
+    (its edge whitespace aside), not any piece of one: otherwise a single
+    letter — an app's shortcut on the device — or a command cut out of a
+    sentence would count as seen."""
+    if not isinstance(text, str) or not text.strip():
         return False
-    return any(isinstance(m, dict) and m.get("role") in ("user", "assistant")
-               and text in str(m.get("text") or "") for m in messages or [])
+    text = text.strip()
+    for m in messages or []:
+        if not isinstance(m, dict):
+            continue
+        if m.get("role") == "user" and m.get("via_edge") is not True:
+            continue
+        if m.get("role") not in ("user", "assistant"):
+            continue
+        lines = re.split(r"\r\n|\r|\n", str(m.get("text") or ""))
+        if any(line.strip() == text for line in lines):
+            return True
+    return False
 
 
 SENSITIVE_THREAD_TITLE = "Typing on a paired device"

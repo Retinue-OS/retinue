@@ -146,8 +146,9 @@ def main(argv: list[str] | None = None) -> int:
     else:
         what = (f"a secret field for {action['label']!r}"
                 + (" + Enter" if action["enter"] else ""))
-    when = ("when the reply arrives (in a chat the user opened; elsewhere once "
-            "they tap it)" if shell_actions.runs_by_itself(action)
+    when = ("when the reply arrives (in a chat the user opened, if it is a whole "
+            "line they have already seen there and the reply's first such text; "
+            "otherwise once they tap it)" if shell_actions.runs_by_itself(action)
             else "once the user taps it")
     print(f"shell-type: {what} will ride on your reply; the Ara app types it on "
           f"the paired device {when}")
