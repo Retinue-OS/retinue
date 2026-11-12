@@ -8,8 +8,9 @@ into agent-only context in wording of its own, so Ara can place the call
 again when the words show no wish to stop it. Pinned here: the client gives
 only a validated number and a short name — nothing else reaches the prompt —
 and the note names the second-attempt directive. Pinned too: the one-line
-previews of a thread (the attention row, the digest line, the push) show a
-call directive as its name, never the markup and the number.
+previews of a thread (the attention row, the digest line, the push, the
+conversation list's row) show a call directive as its name, never the markup
+and the number.
 
     python3 tests/test_cancelled_call_context.py
 """
@@ -100,6 +101,13 @@ def main() -> int:
                 patch.object(wg.push_notify, "notify_async", lambda title, body, **kw: pushed.append(body)):
             assert wg._push_conv_notification(conv, text) == 1
         assert pushed == ["Calling Anna now. Anna Muster"], pushed
+        # The conversation list's row (_conv_summary's last_preview) too.
+        conv["messages"].insert(0, {"role": "user", "text": "Ring Anna"})
+        summary = wg._conv_summary(conv)
+        assert summary["last_preview"] == "Calling Anna now. Anna Muster", summary
+        assert summary["title"] == "Anna", summary
+        conv["messages"].append({"role": "assistant", "text": "Ring? [[call: 044 123 45 67]]"})
+        assert wg._conv_summary(conv)["last_preview"] == "Ring? 044 123 45 67"
     print("PASS: cancelled-call context test")
     return 0
 

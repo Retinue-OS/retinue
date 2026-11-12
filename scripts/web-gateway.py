@@ -2168,7 +2168,9 @@ def _conv_summary(conv: dict) -> dict:
         "pending_since": conv.get("pending_since"),
         "pending_status": conv.get("pending_status"),
         "message_count": len(messages),
-        "last_preview": _derive_title(last.get("text", "")),
+        # The conversation list's row shows words, as the attention row and
+        # the push do: a call directive as its name, never markup and number.
+        "last_preview": _derive_title(attention_store.markup_words(last.get("text", ""))),
     }
 
 
@@ -5220,27 +5222,79 @@ _LINT_SYSTEM_PROMPT = (
 # unchanged), or a `/path` token (relative URLs like /sends).
 _LINT_URLISH_RE = re.compile(r"https?://|\w\.\w|/\w")
 
-# A fence line as the thread's block pass finds one (FENCE_RE in
-# webapp/components/markdown.js): ``` or ~~~, optionally with a language.
+# The thread's renderer (webapp/components/markdown.js), as far as it decides
+# which call directives become call links: its fence lines (FENCE_RE), the
+# lines that open a block of their own rather than a table (HEADING_RE,
+# QUOTE_RE, LIST_RE, HR_RE), a table's separator row (TABLE_SEP_RE), and the
+# inline patterns of renderInline that run before the call link — the two
+# chip forms, each skipping a code span met first — and CALL_RE itself.
 _LINT_FENCE_RE = re.compile(r"^(?:```|~~~)\s*([\w.+-]*)\s*$", re.ASCII)
-_LINT_CODE_SPAN_RE = re.compile(r"`[^`]+`")
+_LINT_OWN_BLOCK_RE = re.compile(
+    r"^(?:#{1,6}\s+|>|\s*(?:[-*+]|[0-9]+[.)])\s+|\s*(?:-{3,}|\*{3,}|_{3,})\s*$)")
+_LINT_TABLE_SEP_RE = re.compile(r"^\s*\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)+\|?\s*$")
+_LINT_CODE = r"(`[^`]+`)|"
+_LINT_CHIP_RES = (
+    re.compile(_LINT_CODE + r"\[\[chip:\s*([^|\]]+?)\s*\|\s*(.+?)\s*\]\]", re.I),
+    re.compile(_LINT_CODE + r"\[\[chip:\s*([^|\]]+?)\s*\]\]", re.I),
+)
+_LINT_CALL_RE = re.compile(
+    _LINT_CODE + r"\[\[call:\s*([+0-9*#][0-9*# ().\/-]*?)\s*(?:\|\s*([^|\]]*?)\s*)?"
+    r"(?:\|\s*(no-voice-cancel)\s*)?\]\]", re.I)
+
+
+def _table_cells(line: str) -> list:
+    """A table row's cells, split as splitTableRow() splits them."""
+    s = line.strip()
+    s = s[1:] if s.startswith("|") else s
+    s = s[:-1] if s.endswith("|") else s
+    return [c.replace("\\|", "|").strip() for c in re.split(r"(?<!\\)\|", s)]
+
+
+def _inline_segments(text: str) -> list:
+    """The pieces of a message the thread renders inline, each on its own:
+    every line outside a fence (a fence runs from an opening ``` or ~~~ line
+    to the next fence line of either kind, or to the end of the text), and in
+    a table each cell the table shows. A message keeps its line breaks, so no
+    inline markup — a code span, a directive — reaches across one."""
+    lines, out, i = text.split("\n"), [], 0
+    while i < len(lines):
+        line = lines[i]
+        if _LINT_FENCE_RE.match(line):
+            i += 1
+            while i < len(lines) and not _LINT_FENCE_RE.match(lines[i]):
+                i += 1
+            i += 1
+        elif ("|" in line and not _LINT_OWN_BLOCK_RE.match(line)
+                and i + 1 < len(lines) and _LINT_TABLE_SEP_RE.match(lines[i + 1])):
+            head = _table_cells(line)
+            out.extend(head)
+            i += 2
+            while i < len(lines) and "|" in lines[i] and lines[i].strip():
+                # A row's cells beyond the header's are not shown.
+                out.extend(_table_cells(lines[i])[:len(head)])
+                i += 1
+        else:
+            out.append(line)
+            i += 1
+    return out
 
 
 def _live_call_directives(text: str) -> list:
     """The call directives in `text` that the thread would act on, in order:
-    those outside code, found the way callOf() (webapp/components/markdown.js)
-    finds them. A fence runs from an opening ``` or ~~~ line to the next fence
-    line of either kind, or to the end of the text when none closes it, and
-    code spans are dropped after the fences, so one quoted either way is an
-    example the bubble shows literally rather than a call."""
-    kept, fenced = [], False
-    for line in text.split("\n"):
-        if _LINT_FENCE_RE.match(line):
-            fenced = not fenced
-        elif not fenced:
-            kept.append(line)
-    prose = _LINT_CODE_SPAN_RE.sub(" ", "\n".join(kept))
-    return [m.group(0) for m in attention_store.CALL_MARKUP_RE.finditer(prose)]
+    those its renderer turns into call links, which callOf()
+    (webapp/components/markdown.js) collects. Each line, or table cell, is
+    rendered on its own; in it the chips go first, then a directive counts
+    unless a code span met first holds it. One quoted as code, split across
+    lines or cut apart by a table's cells is an example or debris the bubble
+    shows literally rather than a call. An invalid number counts all the
+    same: it changes no other directive's standing, and a lint that alters
+    one is refused rather than delivered."""
+    found = []
+    for seg in _inline_segments(text):
+        for chip_re in _LINT_CHIP_RES:
+            seg = chip_re.sub(lambda m: m.group(0) if m.group(1) else "\x01", seg)
+        found.extend(m.group(0) for m in _LINT_CALL_RE.finditer(seg) if not m.group(1))
+    return found
 
 
 def _lint_presentation(text: str, *, kind: str = "chat") -> str:

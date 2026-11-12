@@ -925,9 +925,12 @@ placed; a call placed, or the dialer opened with the number, needs none. The
 flag `| no-voice-cancel` as a third part keeps the mic
 shut for those 5 s — for a loud room or an emergency — but only on a second
 attempt: unless an earlier answer of Ara's in the thread carried a directive
-for the same number (`calledBefore`), the flag is ignored. A directive quoted
-as code (a span, or a ``` or ~~~ fence, closed or not) is an example, never a
-call. Leaving the thread or
+for the same number (`calledBefore`), the flag is ignored. Only a directive
+the bubble shows as a call link is a call: `callOf` renders the reply as the
+bubble does and takes the last link. One quoted as code (a span, whose
+backticks pair within a line, or a ``` or ~~~ fence, closed or not), split
+across lines, or cut apart by a table's cells is shown as text, never placed.
+Leaving the thread or
 stopping the loop drops the call. Anywhere else — a typed thread, an older reply, a message pushed
 into the thread (an agent's included), Ara's reply to a chat message that
 arrived in a companion thread meanwhile (stored with `arrival: true`, never the

@@ -8,8 +8,11 @@ pins the parts a wrong number would come from: how a written number becomes
 a dialable one (separators dropped, the bracketed trunk zero after a country
 code dropped, too short or too long refused), that the last directive in a
 message is the one placed, that one quoted as code (a span, a ``` or ~~~
-fence, an unclosed fence) stays code, and that the label is the name — or
-the number — behind a glyph, with no words in any language.
+fence, an unclosed fence) stays code, that only what the bubble shows as a
+call link is a call (not one split across lines, cut apart by a table, or
+quoted by a code span whose backticks pair only across lines), and that the
+label is the name — or the number — behind a glyph, with no words in any
+language.
 
 A second harness drives the thread itself (conversation.js), with a shell
 that places calls, a scripted mic and detector, and time run ten times
@@ -39,7 +42,7 @@ import assert from 'node:assert/strict';
 globalThis.HTMLElement = class {};
 globalThis.document = { addEventListener: () => {}, getElementById: () => null };
 
-const { renderInline, callOf, callNumber, calledBefore } = await import('./markdown.js');
+const { renderInline, renderMarkdown, callOf, callNumber, calledBefore } = await import('./markdown.js');
 
 let passed = 0;
 const ok = (name, fn) => { fn(); passed += 1; console.log(`ok - ${name}`); };
@@ -128,6 +131,34 @@ ok('a directive quoted as code is an example, not a call', () => {
     { number: '+41791234567', name: 'Anna', voiceCancel: true });
   assert.deepEqual(callOf('Calling Anna. [[call: 0441234567 | Anna]] Written `[[call: 112]]`.'),
     { number: '0441234567', name: 'Anna', voiceCancel: true });
+});
+
+ok('only what the bubble shows as a call link is a call', () => {
+  // A stray backtick on one line pairs with nothing: the bubble pairs
+  // backticks within a line, so the directive on the next is still code.
+  assert.equal(callOf('use `notes\nand then `[[call: +1 900 555 0100 | Bank]]`'), null);
+  // A directive split across lines is no link on either.
+  assert.equal(callOf('Calling the bank. [[call: +1 900 555 0100 |\nBank]]'), null);
+  assert.equal(callOf('Calling the bank. [[call:\n+1 900 555 0100 | Bank]]'), null);
+  // A table cuts a named directive apart at its pipe; one without a name,
+  // or with the pipe escaped, is a link in its cell as anywhere else.
+  assert.equal(callOf('| who | call |\n|---|---|\n| Bank | [[call: +1 900 555 0100 | Bank]] |'), null);
+  assert.deepEqual(callOf('| who | call |\n|---|---|\n| Bank | [[call: +1 900 555 0100]] |'),
+    { number: '+19005550100', name: '', voiceCancel: true });
+  assert.deepEqual(callOf('| who | call |\n|---|---|\n| Bank | [[call: +1 900 555 0100 \\| Bank]] |'),
+    { number: '+19005550100', name: 'Bank', voiceCancel: true });
+  // A chip's label may hold a backtick, which then opens no code span: the
+  // directive after it is a link, and so a call.
+  assert.deepEqual(callOf('[[chip: a`b]] Calling the bank. [[call: +1 900 555 0100 | Bank]]` end'),
+    { number: '+19005550100', name: 'Bank', voiceCancel: true });
+  assert.equal(callOf('[[chip: a`b]] `[[call: +1 900 555 0100 | Bank]]` end'), null);
+  // The name is the one written, not the escaped label.
+  assert.deepEqual(callOf('[[call: 0441234567 | Smith & "Sons" <AG>]]'),
+    { number: '0441234567', name: 'Smith & "Sons" <AG>', voiceCancel: true });
+  // And so is every call link the bubble shows: the last of them is placed.
+  const text = 'Here:\n> [[call: 0441234567 | Anna]]\n- [[call: +1 900 555 0100 | Bank]]';
+  assert.match(renderMarkdown(text), /tel:\+19005550100/);
+  assert.deepEqual(callOf(text), { number: '+19005550100', name: 'Bank', voiceCancel: true });
 });
 
 ok('calledBefore: only an earlier reply to the same number counts', () => {

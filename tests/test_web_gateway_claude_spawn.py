@@ -463,7 +463,8 @@ def test_lint_never_unquotes_a_call_directive(wg):
     quotes one) is an example the thread shows, not a call: a lint result
     that drops the backticks or the fence lines turns it into a call the
     voice loop places, and is not delivered although the directive's text is
-    unchanged. Nor may the lint add or drop a quoted one. A rewrite that
+    unchanged. Nor may the lint add or drop a quoted one. Quoted means what
+    the thread shows literally, line by line and cell by cell. A rewrite that
     keeps every directive where it stands still is delivered."""
     spanned = ("The bank's letter says: `[[call: +1 900 555 0100 | Bank]]`. "
                "Shall I call them, or would you rather I call Anna first?")
@@ -494,6 +495,33 @@ def test_lint_never_unquotes_a_call_directive(wg):
         for what, (original, linted) in cases.items():
             answer["text"] = linted
             assert wg._lint_presentation(original) == original, what
+        # The thread renders each line, and each table cell, on its own, so
+        # the lint may not make a call of a directive that only a stray
+        # backtick on an earlier line, a line break or a table's cells kept
+        # from being one — nor of one a chip's backtick left quoted.
+        bank = "[[call: +1 900 555 0100 | Bank]]"
+        stray = f"Its footer reads `notes\nand then `{bank}`. Shall I call Anna first?"
+        split = "Its footer reads [[call: +1 900 555 0100 |\nBank]]. Shall I call Anna first?"
+        table = f"| who | number |\n|---|---|\n| Bank | {bank} |\n\nShall I call Anna first?"
+        chipped = f"[[chip: a`b]] Its footer reads `{bank}`. Shall I call Anna first?"
+        per_line = {
+            "a span unquoted past a stray backtick": (stray, stray.replace(f"`{bank}`", bank)),
+            "a directive joined onto one line": (split, split.replace("|\nBank", "| Bank")),
+            "a directive taken out of a table": (
+                table, f"The bank: {bank}\n\nShall I call Anna first?"),
+            "a span unquoted after a chip": (chipped, chipped.replace(f"`{bank}`", bank)),
+        }
+        for what, (original, linted) in per_line.items():
+            assert wg._live_call_directives(original) == [], what
+            assert wg._live_call_directives(linted) == [bank], what
+            answer["text"] = linted
+            assert wg._lint_presentation(original) == original, what
+        # A directive the thread does show as a link is live wherever it
+        # stands: in a table cell of its own, or past a chip with a backtick.
+        assert wg._live_call_directives(
+            "| who | number |\n|---|---|\n| Bank | [[call: +1 900 555 0100]] |"
+        ) == ["[[call: +1 900 555 0100]]"]
+        assert wg._live_call_directives(f"[[chip: a`b]] {bank}` end") == [bank]
         # The live directive and the quoted one both stay as they are, and
         # the rest of the reply is rewritten: delivered.
         rewritten = live.replace("I won't call that one.",

@@ -59,27 +59,26 @@ export function callNumber(raw) {
 
 // The last call directive in a message, as {number, name, voiceCancel}, or
 // null. The last, because a reply that mentions a number first and then
-// places the call puts the directive at its end. One quoted as code (a fence,
-// then a code span, the order the bubble renders them in) is an example the
-// bubble shows literally, so it is no call either. Fences are found line by
-// line, as the block pass finds them: an opening ``` or ~~~ line runs to the
-// next fence line of either kind, or to the end of the text when none closes
-// it, so a ~~~ block or an unclosed one quotes the directive just as well.
+// places the call puts the directive at its end. Only a directive the bubble
+// shows as a call link counts, so the message is rendered as the bubble
+// renders it and the links are collected as they are made. One quoted as
+// code (a fence, or a code span, whose backticks pair within a line as the
+// bubble pairs them), split across lines, cut apart by a table's cells, or
+// otherwise left as text is shown literally, so it is no call either; and no
+// second parser imitating the renderer can drift from what the user sees.
+let callSink = null;
+
+const ENTITY = { amp: '&', lt: '<', gt: '>', quot: '"', '#39': "'" };
+
 export function callOf(text) {
-  const re = new RegExp(CALL_RE.source, 'gi');
-  const kept = [];
-  let fenced = false;
-  for (const line of String(text == null ? '' : text).split('\n')) {
-    if (FENCE_RE.test(line)) fenced = !fenced;
-    else if (!fenced) kept.push(line);
+  const found = [];
+  callSink = found;
+  try {
+    renderMarkdown(text);
+  } finally {
+    callSink = null;
   }
-  const prose = kept.join('\n').replace(/`[^`]+`/g, ' ');
-  let found = null;
-  for (const m of prose.matchAll(re)) {
-    const number = callNumber(m[1]);
-    if (number) found = { number, name: (m[2] || '').trim(), voiceCancel: !m[3] };
-  }
-  return found;
+  return found.length ? found[found.length - 1] : null;
 }
 
 // Whether an answer of Ara's before `messages[index]` already placed (or
@@ -162,10 +161,20 @@ export function renderInline(text) {
   // phone shell's voice conversation the thread places the call itself. The
   // label is the name (the number when there is none) behind a phone glyph,
   // no words, so it reads the same in whatever language the message is in.
-  s = s.replace(chip(CALL_RE), (m, code, raw, name) => {
+  s = s.replace(chip(CALL_RE), (m, code, raw, name, flag) => {
     if (code) return m;
     const num = callNumber(raw);
     if (!num) return m;
+    // callOf's collection: the name as written, since the text here is
+    // escaped and may hold a stashed chip's placeholder.
+    if (callSink) {
+      callSink.push({
+        number: num,
+        name: (name || '').replace(new RegExp(SEP + '\\d+' + SEP, 'g'), '')
+          .replace(/&(amp|lt|gt|quot|#39);/g, (_e, e) => ENTITY[e]).trim(),
+        voiceCancel: !flag,
+      });
+    }
     return stash(`<a class="md-call" href="tel:${num}">\u{1F4DE} ${name || raw.trim()}</a>`);
   });
   // `code` before any link: a code span is literal, so a URL inside one
