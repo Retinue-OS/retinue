@@ -12,7 +12,12 @@ rule on its own, under Node with a scripted DOM:
   http(s) URL renders the element its type calls for, as before;
 - anything else (another scheme, a reference into the dashboard, a proxy path
   with a path step in it, a control character, no url at all) renders the
-  attachment's name as text: no href, no src, no lightbox;
+  attachment's name as text: no href, no src, no lightbox, save the two
+  exceptions below, neither of which is ever a link;
+- a data:image, data:audio or data:video URL (the reference documents' media)
+  renders through the element of its own kind, and an image's through the
+  lightbox, when the attachment's type is of that kind; no other data: URL
+  renders at all;
 - the bubble of a send on its way still previews the user's own staged image
   from the object URL the page created, and a blob: URL that came with a
   message does not.
@@ -132,6 +137,7 @@ ok('a data: URL of a medium shows through the element of its own kind, and is ne
   const pic = 'data:image/svg+xml,<svg/>';
   const img = el._attachmentHtml({ url: pic, type: 'image/svg+xml', name: 'p.svg' });
   assert.ok(img.includes('<img class="att-img') && !/<a[\s>]/.test(img), img);
+  assert.ok(img.includes('data-lightbox="data:image/svg+xml,'), img);
   const audio = el._attachmentHtml({ url: 'data:audio/wav;base64,AAAA', type: 'audio/wav' });
   assert.ok(audio.startsWith('<audio class="att-audio"') && !/<a[\s>]/.test(audio), audio);
   const video = el._attachmentHtml({ url: 'data:video/webm;base64,AAAA', type: 'video/webm' });

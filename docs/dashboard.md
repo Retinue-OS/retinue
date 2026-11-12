@@ -713,9 +713,13 @@ attachment without a URL otherwise (`_shape_chat_attachments`). The chat page
 holds to the same rule on its own: it renders a link, an image, a player or
 the lightbox only for a URL of the proxy (`/chats/media/<slug>/<media-id>`)
 or a web link, and the file's name as plain text for anything else, so a
-reference from outside never becomes script or a link of another scheme. The
-one exception is the page's own: the bubble of a send on its way previews
-the user's staged images from object URLs the page created.
+reference from outside never becomes script or a link of another scheme. Two
+further kinds of URL are rendered, neither of them ever as a link: the bubble
+of a send on its way previews the user's staged images from object URLs the
+page created, and a `data:image/…`, `data:audio/…` or `data:video/…` URL (the
+reference documents under `data/chats/` use them) is taken for the `<img>`,
+`<audio>` or `<video>` of its own kind, and for an image's lightbox, when the
+attachment's type is of that kind as well.
 
 ## Push notifications
 

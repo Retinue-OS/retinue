@@ -96,17 +96,19 @@ const TITLE_BRAND = (() => {
 // media proxy (/chats/media/<slug>/<media-id>) for a file a gateway holds, or
 // an absolute http(s) URL (webLink); a reference that is neither is text from
 // outside and never becomes an href or a src, so such an attachment is shown
-// by its name alone. The one other source is this page itself: the bubble it
-// shows while a send is on its way previews the user's own staged images from
-// object URLs it created, and only the attachments it built for that bubble
-// are in OWN_PREVIEWS.
+// by its name alone. Two exceptions are taken, never for a link: this page's
+// own object URLs, with which the bubble it shows while a send is on its way
+// previews the user's staged images (only the attachments it built for that
+// bubble are in OWN_PREVIEWS), and a data: URL of a medium (DATA_MEDIA_RE
+// below), for the element of its own kind and an image's lightbox.
 const MEDIA_PROXY_RE = /^\/chats\/media\/[A-Za-z0-9_-][A-Za-z0-9._-]*\/[0-9a-f]{32}$/;
 const OWN_PREVIEWS = new WeakSet();
 
 // A data: URL carries its bytes in itself. Inside an <img>, <audio> or <video>
 // nothing in it runs, so the reference documents under data/chats/, which
 // use such URLs, still show their media. It is taken only for the element
-// its own kind picks, never for a file row, whose link would open it as a
+// its own kind picks (and, for an image, the lightbox, which shows it in an
+// <img> as well), never for a file row, whose link would open it as a
 // document.
 const DATA_MEDIA_RE = /^data:(image|audio|video)\/[a-z0-9.+-]+[;,]/;
 
@@ -1522,7 +1524,7 @@ class RetinueChatPage extends HTMLElement {
 
   // The attachment the bubble of a send on its way shows for one of the
   // user's staged images: its preview's object URL, which this page created,
-  // so it is the one url that is neither the proxy's nor a web link
+  // so it is taken although it is neither the proxy's nor a web link
   // (attachmentUrl).
   _ownPreview(im, i) {
     const att = {
@@ -1549,8 +1551,10 @@ class RetinueChatPage extends HTMLElement {
   // plain text opens in the browser, anything else is saved (docs/dashboard.md,
   // "Attachments"). The same holds for an image opened by itself: only the
   // inline-safe types are shown, an SVG is a download. An attachment whose url
-  // is neither the proxy's nor a web link (attachmentUrl) is its name as text,
-  // whatever its type: there is nothing it may be loaded from.
+  // is neither the proxy's nor a web link, nor one of the two exceptions
+  // attachmentUrl takes for media (the page's own previews, a data: URL of
+  // the attachment's kind), is its name as text, whatever its type: there is
+  // nothing it may be loaded from.
   _attachmentHtml(a) {
     const type = String(a.type || '');
     const url = attachmentUrl(a);
