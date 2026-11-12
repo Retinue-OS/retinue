@@ -106,7 +106,9 @@ DIRECTIVES = (
     # every other form. Only forms: a link the user follows is a navigation,
     # which no directive here restricts, so the call directive's tel: link
     # and the mailto: links (webapp/components/markdown.js) work in every
-    # mode. Which schemes become links at all is the renderer's rule.
+    # mode. Which schemes become links at all is the renderers' rule:
+    # markdown.js for the dashboard, _md_refuse_links in web-gateway.py for
+    # the session log.
     ("form-action", ("'self'",)),
     # The service worker (sw.js).
     ("worker-src", ("'self'",)),

@@ -1874,6 +1874,38 @@ _MD_ATTR_RE = re.compile(r'([a-z]+)="([^"]*)"')
 # Where such a link may point: the web, or a path on this origin (a second
 # slash or a backslash would make it another origin), as markdown.js allows.
 _MD_IMG_LINK_RE = re.compile(r'(?i)(?:https?://|/(?![/\\]))')
+# Where an answer's own link may point: the web, a mail address, a telephone
+# number or a path on this origin, the rule of the dashboard's Markdown
+# renderer (markdown.js). markdown-it itself refuses only javascript:,
+# vbscript:, file: and data: other than an image, so without this a link of
+# any other scheme in model output, which can quote outside text, would be a
+# link on this origin; inside the Android shell some of them open another
+# app. The href is markdown-it's normalised one, in which a backslash is
+# already percent-encoded and so cannot make it another origin.
+_MD_LINK_RE = re.compile(r'(?i)(?:https?://|mailto:|tel:|/(?![/\\]))')
+
+
+def _md_refuse_links(state) -> None:
+    """Drop every link whose href ``_MD_LINK_RE`` refuses, keeping its
+    text: the text of a refused link reads as text, as an image whose URL is
+    refused reads as its alt text. A link never holds another link, but an
+    image inside one is a token of its own and is left to _image_as_link."""
+    for block in state.tokens:
+        if block.type != "inline" or not block.children:
+            continue
+        kept, refused = [], []
+        for tok in block.children:
+            if tok.type == "link_open":
+                refused.append(not _MD_LINK_RE.match(tok.attrGet("href") or ""))
+                if refused[-1]:
+                    continue
+            elif tok.type == "link_close" and refused and refused.pop():
+                continue
+            kept.append(tok)
+        block.children = kept
+
+
+_md.core.ruler.push("refuse_links", _md_refuse_links)
 
 # ── Async job store ───────────────────────────────────────────────────────────
 # POST /message can request async handling; the request returns a job handle

@@ -149,10 +149,17 @@ restricts (`form-action` covers only where a form is sent). So the call
 directive's tap-to-dial `tel:` link (see "Speech-to-text (the `stt` service)
 and voice input") and the `mailto:` links work in every mode. What keeps a
 link of another scheme out of the pages is the markup's own rules, not the
-policy: the dashboard's Markdown renderer makes links only of `http(s)`,
-`mailto:` and `tel:` URLs and of paths on this origin, and its call link only
-of a number it has checked (`webapp/components/markdown.js`). The one such
-scheme the policy does stop is `javascript:`, which `script-src` blocks.
+policy, and both renderers keep the same one. The dashboard's Markdown
+renderer makes links only of `http(s)`, `mailto:` and `tel:` URLs and of
+paths on this origin, and its call link only of a number it has checked
+(`webapp/components/markdown.js`). The session log (`/conversation`,
+`/conversation/<date>`) renders answers with markdown-it in
+`scripts/web-gateway.py`, which by itself would link any scheme but
+`javascript:`, `vbscript:`, `file:` and `data:` other than an image; the
+gateway drops every other link there and leaves its text
+(`_md_refuse_links`). The one scheme the policy itself stops is
+`javascript:`, which `script-src` blocks, and only in `enforce` mode: in
+`report` mode it reports it and stops nothing.
 
 **Three modes**, `RETINUE_CSP`:
 
