@@ -25,6 +25,7 @@ reply staying text-less.
     python3 tests/test_web_gateway_attachments.py
 """
 import base64
+import http.server
 import importlib.util
 import io
 import json
@@ -220,6 +221,128 @@ def test_attachment_route_takes_a_name_segment(wg):
     assert "filename*=UTF-8''Rechnung%20M%C3%A4rz.pdf" in disposition, disposition
 
 
+class _WireHandler(_FakeHandler):
+    """A fake whose headers go through http.server's own send_header, the
+    writer the gateway answers with: the header block as it would leave."""
+
+    request_version = "HTTP/1.1"
+
+    def __init__(self):
+        super().__init__()
+        self._headers_buffer = []
+
+    def send_header(self, key, value):
+        http.server.BaseHTTPRequestHandler.send_header(self, key, value)
+        super().send_header(key, value)
+
+    def header_lines(self) -> list[str]:
+        return b"".join(self._headers_buffer).decode("latin-1").split("\r\n")[:-1]
+
+
+# A name and a type as a file from outside may carry them: the name an e-mail
+# attachment decoded to, saved under it and attached to a thread as it is.
+HOSTILE_NAME = "report.pdf\r\nSet-Cookie: sid=evil; Path=/\r\nX-x: y"
+HOSTILE_TYPE = "application/pdf\r\nSet-Cookie: sid=evil"
+
+
+def _serve(wg, cid, att_id, inline=False) -> _WireHandler:
+    fake = _WireHandler()
+    wg.Handler._serve_conversation_attachment(fake, cid, att_id, inline=inline)
+    assert fake.status == 200, fake.status
+    return fake
+
+
+def _assert_clean_headers(fake: _WireHandler):
+    """Exactly the headers the route writes, one line each."""
+    names = [line.split(":", 1)[0] for line in fake.header_lines()]
+    assert names == ["Content-Type", "Content-Length", "Content-Disposition",
+                     "X-Content-Type-Options", "Cache-Control"], fake.header_lines()
+    for value in fake.headers.values():
+        assert not any(c in value for c in "\r\n\x00"), repr(value)
+        value.encode("latin-1")
+
+
+def test_stored_name_and_type_are_one_line(wg):
+    """At storage: no control character survives in the name, and a type is
+    kept only as one media type."""
+    cid = "9" * 32
+    stored = wg._store_attachments(cid, [
+        {"filename": HOSTILE_NAME, "content_type": HOSTILE_TYPE, "data": _b64(b"%PDF x")},
+        {"filename": "a\x85b\x7f\x00c.pdf", "content_type": "Application/PDF",
+         "data": _b64(b"%PDF y")},
+        {"filename": "\r\n\t", "content_type": "text/plain; charset=ü",
+         "data": _b64(b"z")},
+        {"filename": "Rechnung März.pdf", "content_type": "application/pdf; charset=binary",
+         "data": _b64(b"%PDF z")},
+    ])
+    # The name is a base name first: what follows its last "/" (here the one
+    # in "Path=/").
+    assert [a["filename"] for a in stored] == [
+        "X-x: y", "abc.pdf", "attachment", "Rechnung März.pdf"], stored
+    assert [a["content_type"] for a in stored] == [
+        "application/octet-stream", "application/pdf", "application/octet-stream",
+        "application/pdf; charset=binary"], stored
+    wg._save_conv({"id": cid, "messages": [{"attachments": stored}]})
+    for att in stored:
+        _assert_clean_headers(_serve(wg, cid, att["id"]))
+    # The note that hands the files to Ara's turn: one line per file.
+    note = wg._conv_attachment_note({"id": cid}, {"attachments": stored})
+    assert len(note.strip("\n").split("\n")) == 1 + len(stored), note
+
+
+def test_stored_metadata_from_before_is_served_clean(wg):
+    """At serve time: metadata already on disk, written before storage cleaned
+    it, never reaches a header as it is."""
+    cid = "a" * 32
+    rows = [
+        ("b" * 32, HOSTILE_NAME, HOSTILE_TYPE),
+        ("c" * 32, "x.png", "image/png\r\nX-Injected: 1"),
+        ("d" * 32, "y.txt", "text/plain; charset=ü"),
+        ("e" * 32, "z.png", "IMAGE/PNG"),
+        ("f" * 32, " \x1b[31m.pdf", None),
+    ]
+    legacy_dir = wg.CONVERSATION_ATTACHMENTS_DIR / cid
+    legacy_dir.mkdir(parents=True, exist_ok=True)
+    atts = []
+    for att_id, name, ctype in rows:
+        (legacy_dir / att_id).write_bytes(b"bytes")
+        att = {"id": att_id, "filename": name, "size": 5}
+        if ctype is not None:
+            att["content_type"] = ctype
+        atts.append(att)
+    wg._save_conv({"id": cid, "messages": [{"attachments": atts}]})
+
+    fake = _serve(wg, cid, "b" * 32, inline=True)
+    _assert_clean_headers(fake)
+    assert fake.headers["Content-Type"] == "application/octet-stream"
+    assert fake.headers["Content-Disposition"].startswith(
+        "attachment; filename=\"report.pdfSet-Cookie: sid=evil; Path=/X-x: y\"; filename*="), \
+        fake.headers["Content-Disposition"]
+    # A type that is not exactly one media type is a download, even when it
+    # starts like an inline-safe one.
+    fake = _serve(wg, cid, "c" * 32, inline=True)
+    _assert_clean_headers(fake)
+    assert fake.headers["Content-Type"] == "application/octet-stream"
+    assert fake.headers["Content-Disposition"].startswith("attachment;")
+    fake = _serve(wg, cid, "d" * 32)
+    _assert_clean_headers(fake)
+    assert fake.headers["Content-Type"] == "application/octet-stream"
+    # A valid type is served as one, and inline where it may be.
+    fake = _serve(wg, cid, "e" * 32, inline=True)
+    _assert_clean_headers(fake)
+    assert fake.headers["Content-Type"] == "image/png"
+    assert fake.headers["Content-Disposition"].startswith('inline; filename="z.png"')
+    fake = _serve(wg, cid, "f" * 32)
+    _assert_clean_headers(fake)
+    assert fake.headers["Content-Disposition"].startswith('attachment; filename="[31m.pdf"'), \
+        fake.headers["Content-Disposition"]
+
+    note = wg._conv_attachment_note({"id": cid}, {"attachments": atts})
+    lines = note.strip("\n").split("\n")
+    assert len(lines) == 1 + len(rows), note
+    assert "Set-Cookie: sid=evil\r" not in note and " " not in note, note
+
+
 def _png(w: int, h: int) -> bytes:
     """A PNG signature plus an IHDR chunk header — enough for the size sniff."""
     return (b"\x89PNG\r\n\x1a\n" + b"\x00\x00\x00\x0dIHDR"
@@ -358,6 +481,8 @@ def main():
         test_serve_conversation_attachment_new_style(wg)
         test_serve_conversation_attachment_legacy_style(wg)
         test_attachment_route_takes_a_name_segment(wg)
+        test_stored_name_and_type_are_one_line(wg)
+        test_stored_metadata_from_before_is_served_clean(wg)
         test_image_dimensions_are_recorded(wg)
         scratch = Path(td) / "scratch"
         scratch.mkdir()

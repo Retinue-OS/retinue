@@ -2300,13 +2300,19 @@ def _store_attachment_blob(cid: str, blob: bytes, filename, content_type) -> dic
     (base64 payloads from the internal API and the composer) and
     _store_reply_files (files Ara attaches to her own reply) both end here, so
     naming, size cap and metadata shape cannot drift apart. An empty or
-    oversized blob is refused (None). An image's intrinsic ``width``/``height``
+    oversized blob is refused (None). The name is kept as a base name without
+    control characters (_attachment_name) and the type only as one media type
+    (_stated_media_type), application/octet-stream otherwise. An image's
+    intrinsic ``width``/``height``
     (sniffed by magic, the same parser the chat store uses) is recorded when
     found, so the dashboard reserves its inline preview's box before the bytes
     arrive."""
     if not blob or len(blob) > MAX_ATTACHMENT_BYTES:
         return None
-    content_type = str(content_type or "application/octet-stream")
+    # Name and type come from whoever attached the file — a mail sender's
+    # attachment name, a messenger client's type — and are later written into
+    # the download's headers and the note of Ara's turn: kept as one line.
+    content_type = _stated_media_type(content_type)
     suffix = Path(os.path.basename(str(filename or ""))).suffix
     if not re.fullmatch(r"\.[A-Za-z0-9]{1,8}", suffix):
         suffix = mimetypes.guess_extension(content_type) or ""
@@ -2314,7 +2320,7 @@ def _store_attachment_blob(cid: str, blob: bytes, filename, content_type) -> dic
     conv_dir = CONVERSATION_ATTACHMENTS_DIR / cid
     conv_dir.mkdir(parents=True, exist_ok=True)
     (conv_dir / f"{att_id}{suffix}").write_bytes(blob)
-    filename = os.path.basename(str(filename or "attachment")) or "attachment"
+    filename = _attachment_name(os.path.basename(str(filename or "")))
     meta = {
         "id": att_id,
         "filename": filename,
@@ -2529,9 +2535,31 @@ _INLINE_SAFE_TYPES = frozenset({
 })
 
 
+# What never belongs in a file name that is shown or sent: the C0 and C1
+# control characters, line breaks among them, and Unicode's own line and
+# paragraph separators.
+_NAME_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f\u2028\u2029]")
+
+
+def _attachment_name(filename) -> str:
+    """A thread attachment's name as it may be stored, shown and sent.
+
+    The name is whatever the file was called where it came from — for a mail
+    attachment, what its sender declared — and it is written into the
+    download's Content-Disposition and listed in the note of Ara's turn, each
+    one line. Control characters are dropped; "attachment" when nothing is
+    left. Applied where a name is stored and again where it is used, so a name
+    stored before this keeps to it too."""
+    name = _NAME_CONTROL_RE.sub("", str(filename or "")).strip()
+    return name or "attachment"
+
+
 def _content_disposition(filename: str, inline: bool = False) -> str:
     """Build a Content-Disposition header that survives non-ASCII filenames
-    (RFC 6266: an ASCII fallback plus a UTF-8 ``filename*``)."""
+    (RFC 6266: an ASCII fallback plus a UTF-8 ``filename*``). The name goes
+    through _attachment_name first, so the header is one line of ASCII
+    whatever was stored."""
+    filename = _attachment_name(filename)
     ascii_name = filename.encode("ascii", "replace").decode("ascii").replace('"', "'")
     quoted = urllib.parse.quote(filename, safe="")
     kind = "inline" if inline else "attachment"
@@ -3043,9 +3071,12 @@ def _conv_attachment_note(conv: dict, msg: dict) -> str:
     for att in atts:
         stored_name = str(att.get("id", "")) + str(att.get("suffix", ""))
         path = CONVERSATION_ATTACHMENTS_DIR / cid / stored_name
+        # Name and type as they are stored, read again: the note is part of
+        # the turn's prompt, and metadata stored before both were kept as one
+        # line may hold anything.
         lines.append(
-            f"- {att.get('filename', 'attachment')} "
-            f"({att.get('content_type', 'application/octet-stream')}, "
+            f"- {_attachment_name(att.get('filename'))} "
+            f"({_stated_media_type(att.get('content_type'))}, "
             f"{att.get('size', 0)} bytes) — saved at {path}"
         )
     who = "The user" if msg.get("role") == "user" else "This message"
@@ -9647,8 +9678,12 @@ class Handler(BaseHTTPRequestHandler):
         except (OSError, ValueError):
             self._send_json(404, {"error": "not found"})
             return
-        ctype = meta.get("content_type") or "application/octet-stream"
-        inline = inline and ctype.split(";", 1)[0].strip().lower() in _INLINE_SAFE_TYPES
+        # The stored type is read again, so metadata stored before it was
+        # kept as one media type is never written into a header as it is: a
+        # type that does not read as one is application/octet-stream, and so
+        # a download.
+        ctype = _stated_media_type(meta.get("content_type"))
+        inline = inline and ctype.split(";", 1)[0] in _INLINE_SAFE_TYPES
         self.send_response(200)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(data)))

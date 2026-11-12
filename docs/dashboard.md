@@ -562,6 +562,16 @@ message bubble, served by `GET /conversations/<id>/attachments/<att-id>` behind
 the dashboard's own auth. Prefer this over pushing a document via Signal when
 the user is already working in the dashboard.
 
+A file's name and type are what it was given where it came from — for a mail
+attachment, what the sender declared — and they are written into the
+download's headers and into the note that hands the file to Ara's turn. So
+the stored name is a base name without control characters (`attachment` when
+nothing is left) and the stored type is one media type, read strictly and
+written back from what was read, or `application/octet-stream`. Both are read
+again in the same way where they are used, so metadata stored before this
+keeps to it too: a name or a type from outside never becomes a header line of
+its own, and a type that does not read as one media type is a download.
+
 A file row has two links: its name opens the file to view — in the
 dashboard's file viewer (below) or, for a PDF a frame would not show whole,
 as the bare file; either way the file is fetched with `?inline=1`, answered
