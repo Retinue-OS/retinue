@@ -3239,7 +3239,11 @@ def _conv_chat_note(conv: dict) -> str:
             text = " ".join(str(m.get("text") or "").split())
             atts = m.get("attachments") or []
             if atts:
-                kinds = sorted({a.get("type") for a in atts if a.get("type")})
+                # The note is part of the prompt, so a type is named here
+                # only as the essence of one media type, whichever path
+                # handed the attachment on; anything else is left out.
+                parsed = (_parse_media_type(a.get("type")) for a in atts)
+                kinds = sorted({p[0] for p in parsed if p})
                 label = f"{len(atts)} attachment" + ("s" if len(atts) > 1 else "")
                 if kinds:
                     label += ": " + ", ".join(kinds)
@@ -6268,8 +6272,13 @@ def _chat_media_meta_lookup(references) -> dict:
         if not att:
             continue
         meta = out.setdefault(att, {})
-        if _bval(b, "ct"):
-            meta["type"] = _bval(b, "ct")
+        # The type is what the sender declared, and records written before
+        # the gateways cleaned it may hold any text. It goes to the page and,
+        # through the companion note, into a prompt, so it is kept only as
+        # the essence of one media type, and a type that is none is dropped.
+        parsed = _parse_media_type(_bval(b, "ct"))
+        if parsed:
+            meta["type"] = parsed[0]
         if _bval(b, "name"):
             meta["name"] = _bval(b, "name")
         for key, var in (("size", "size"), ("width", "w"), ("height", "h")):

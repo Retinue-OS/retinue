@@ -462,7 +462,11 @@ and what a model turn is *for*:
      The type is the one the sender's client declared, so it is kept only as
      one media type, written back from what was read, and as
      `application/octet-stream` otherwise: text from outside never reads as
-     the framework's own words in a prompt.
+     the framework's own words in a prompt. The chat note every companion
+     turn carries names the types of the recent messages' attachments under
+     the same rule: the chat listing keeps a stated type only as the essence
+     of one media type, the note reads it once more the same way, and a type
+     that is none is left out.
    - **One message, one notification.** The arrival's own Web Push already
      fired, deterministically and at once; the turn's note lands in the
      companion thread without pushing again.

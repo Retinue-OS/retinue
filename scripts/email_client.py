@@ -1162,6 +1162,8 @@ def cmd_read(cfg, args):
 
 # Control characters (C0 and C1) have no place in a file name written here.
 _FILE_NAME_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+# Dots and whitespace at either end of a name, however they alternate.
+_FILE_NAME_EDGE_RE = re.compile(r"^[\s.]+|[\s.]+$")
 
 
 def _attachment_file_name(declared, part: int) -> str:
@@ -1169,10 +1171,12 @@ def _attachment_file_name(declared, part: int) -> str:
 
     ``declared`` is the attachment's file name as its sender wrote it, which
     may name a path (``../..``, an absolute one, backslashes) or a hidden
-    file. What is kept is its base name without control characters or
-    leading dots; ``attachment-<part>`` when nothing is left."""
+    file. What is kept is its base name without control characters and
+    without dots and whitespace at either end, so that it is never ``.`` or
+    ``..`` and never hidden; ``attachment-<part>`` when nothing is left."""
     name = str(declared or "").replace("\\", "/")
-    name = _FILE_NAME_CONTROL_RE.sub("", os.path.basename(name)).strip().lstrip(".").strip()
+    name = _FILE_NAME_CONTROL_RE.sub("", os.path.basename(name))
+    name = _FILE_NAME_EDGE_RE.sub("", name)
     return name or f"attachment-{part}"
 
 

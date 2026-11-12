@@ -92,6 +92,11 @@ def test_a_declared_path_is_a_base_name_here(ec, work: Path):
         ("..", "attachment-1"),
         ("../", "attachment-1"),
         ("\x1b", "attachment-1"),
+        (". ..", "attachment-1"),
+        (". .", "attachment-1"),
+        (".. .", "attachment-1"),
+        ("x/. ..", "attachment-1"),
+        (" . notes.txt . ", "notes.txt"),
     ]
     for given, want in cases:
         payload = f"bytes of {given!r}".encode()
