@@ -1632,6 +1632,13 @@ _STATIC_CONTENT_TYPES = {
     ".ico": "image/x-icon",
     ".woff2": "font/woff2",
 }
+# What /data/ answers with. The directory holds what the deployment's agents
+# write (DASHBOARD_DATA_DIR) — content of the deployment, not of the shell —
+# and the cards read JSON from it, nothing else. So a page, a script, a
+# stylesheet or an SVG an agent left there is never served as one on the
+# dashboard's origin: any other file is application/octet-stream, as a
+# download.
+_DATA_CONTENT_TYPES = {".json": "application/json; charset=utf-8"}
 # Conversations are keyed by requester identity. Requests that carry no
 # "on-behalf-of" identity share this default key.
 DEFAULT_SESSION_KEY = "Web"
@@ -2831,6 +2838,35 @@ def _stated_media_type(stated) -> str:
     return _media_type_header(*parsed) if parsed else "application/octet-stream"
 
 
+# What a browser runs as a script or a worker: the JavaScript MIME types
+# (WHATWG MIME Sniffing, "JavaScript MIME type"). The page's
+# Content-Security-Policy (scripts/content_policy.py) lets scripts run from
+# this origin only, which is a boundary only while nothing on the origin
+# answers bytes chosen outside under one of these types: a <script src> or a
+# worker pointed at such an answer would run it as the dashboard's own. Under
+# nosniff, every answer here, no other type is run as a script, so a route
+# that serves bytes from outside (a thread attachment, a messenger file, a
+# store's result) answers these as application/octet-stream instead.
+_SCRIPT_MEDIA_TYPES = frozenset({
+    "application/ecmascript", "application/javascript", "application/x-ecmascript",
+    "application/x-javascript", "text/ecmascript", "text/javascript",
+    "text/javascript1.0", "text/javascript1.1", "text/javascript1.2",
+    "text/javascript1.3", "text/javascript1.4", "text/javascript1.5", "text/jscript",
+    "text/livescript", "text/x-ecmascript", "text/x-javascript",
+})
+
+
+def _served_media_type(stated) -> str:
+    """A content type from outside as a route of this origin may answer with
+    it: one media type, written back from what was read (_stated_media_type),
+    and never a script type (_SCRIPT_MEDIA_TYPES), which becomes
+    application/octet-stream."""
+    parsed = _parse_media_type(stated)
+    if not parsed or parsed[0] in _SCRIPT_MEDIA_TYPES:
+        return "application/octet-stream"
+    return _media_type_header(*parsed)
+
+
 def _media_essence(stated) -> str:
     """A stated content type as its bare ``type/subtype``, or
     application/octet-stream.
@@ -2854,8 +2890,12 @@ def _chat_media_headers(stated) -> dict:
     any ``+xml`` type for an XML document, so it is a download like the rest.
     The file name the sender gave is not known here (it is in the gateway's
     store and in the ledger record), so a download goes out without one and
-    is named after the URL and the type."""
+    is named after the URL and the type. A script type is never sent: such a
+    file is application/octet-stream (_SCRIPT_MEDIA_TYPES)."""
     parsed = _parse_media_type(stated[0]) if stated and len(stated) == 1 else None
+    if parsed and parsed[0] in _SCRIPT_MEDIA_TYPES:
+        # Never a script of this origin; a download, saved as bytes.
+        parsed = None
     essence, params = parsed or ("application/octet-stream", {})
     major, _, minor = essence.partition("/")
     in_place = essence in _INLINE_SAFE_TYPES or (
@@ -9598,10 +9638,15 @@ class Handler(BaseHTTPRequestHandler):
     def _send_json(self, status: int, body: dict,
                    headers: dict[str, str] | None = None) -> None:
         payload = json.dumps(body, ensure_ascii=False).encode()
+        headers = dict(headers or {})
+        # The API's answers carry text from outside (messages, names, files'
+        # notes): sniffing would let a browser take one for something else,
+        # so the type sent is the type used.
+        headers.setdefault("X-Content-Type-Options", "nosniff")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(payload)))
-        for name, value in (headers or {}).items():
+        for name, value in headers.items():
             self.send_header(name, value)
         self.end_headers()
         self.wfile.write(payload)
@@ -9634,12 +9679,18 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def _serve_static_file(self, path: Path, base: Path, cache: str = "no-cache",
-                           transform=None, headers: dict | None = None) -> bool:
+                           transform=None, headers: dict | None = None,
+                           types: dict | None = None) -> bool:
         """Serve a file from within ``base``, guarding against path traversal.
 
         ``transform`` rewrites the bytes on the response only (the instance
         branding); the file on disk is never touched. ``headers`` are sent
-        as well (a page's framing policy).
+        as well (a page's framing policy). ``types`` maps the suffixes this
+        directory may answer with to their types, in place of
+        _STATIC_CONTENT_TYPES; a file of any other suffix is a download
+        (/data/, below). Every answer forbids sniffing, so the type sent is
+        the type a browser uses: a file is run as a script only where it is
+        served as one.
         Returns True if a file was sent, False otherwise (caller emits 404)."""
         try:
             full = path.resolve()
@@ -9653,12 +9704,21 @@ class Handler(BaseHTTPRequestHandler):
             return False
         if transform is not None:
             data = transform(data)
-        ctype = _STATIC_CONTENT_TYPES.get(full.suffix.lower(), "application/octet-stream")
+        headers = dict(headers or {})
+        if types is None:
+            ctype = _STATIC_CONTENT_TYPES.get(full.suffix.lower(), "application/octet-stream")
+        else:
+            ctype = types.get(full.suffix.lower())
+            if ctype is None:
+                ctype = "application/octet-stream"
+                headers["Content-Disposition"] = "attachment"
+                headers["Content-Security-Policy"] = _DOWNLOAD_CSP
         self.send_response(200)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Cache-Control", cache)
-        for name, value in (headers or {}).items():
+        self.send_header("X-Content-Type-Options", "nosniff")
+        for name, value in headers.items():
             self.send_header(name, value)
         self.end_headers()
         self.wfile.write(data)
@@ -9718,8 +9778,9 @@ class Handler(BaseHTTPRequestHandler):
         # The stored type is read again, so metadata stored before it was
         # kept as one media type is never written into a header as it is: a
         # type that does not read as one is application/octet-stream, and so
-        # a download.
-        ctype = _stated_media_type(meta.get("content_type"))
+        # a download. So is a script type: the file is the sender's, never a
+        # script of this origin (_SCRIPT_MEDIA_TYPES).
+        ctype = _served_media_type(meta.get("content_type"))
         inline = inline and ctype.split(";", 1)[0] in _INLINE_SAFE_TYPES
         self.send_response(200)
         self.send_header("Content-Type", ctype)
@@ -9759,8 +9820,12 @@ class Handler(BaseHTTPRequestHandler):
                 transform=instance_branding.brand_html,
                 headers={"Content-Security-Policy": f"frame-ancestors 'self' {APP_SETTINGS_ORIGIN}"})
         if path.startswith("/data/"):
+            # What the deployment's agents wrote, for the cards to read: it is
+            # answered only as the passive type the dashboard reads from here,
+            # JSON, and anything else as a download (_DATA_CONTENT_TYPES).
             rel = path[len("/data/"):]
-            return self._serve_static_file(DASHBOARD_DATA_DIR / rel, DASHBOARD_DATA_DIR, cache="no-store")
+            return self._serve_static_file(DASHBOARD_DATA_DIR / rel, DASHBOARD_DATA_DIR,
+                                           cache="no-store", types=_DATA_CONTENT_TYPES)
         rel = path.lstrip("/")
         if not rel:
             return False
@@ -9844,8 +9909,11 @@ class Handler(BaseHTTPRequestHandler):
         with resp:
             ctype = resp.headers.get("Content-Type") or "application/octet-stream"
             # No result format is HTML; never let one render on this origin.
+            # Nor is one a script: a result holds whatever the chambers hold,
+            # so it is never answered as a type a browser would run.
             if "html" in ctype.lower():
                 ctype = "text/plain; charset=utf-8"
+            ctype = _served_media_type(ctype)
             self.send_response(resp.getcode())
             self.send_header("Content-Type", ctype)
             if resp.headers.get("Content-Length"):
@@ -12900,9 +12968,10 @@ class Handler(BaseHTTPRequestHandler):
     def _handle_gateway_qr(self, slug: str) -> None:
         """Proxy a gateway's pairing QR (adding the token) to the /gateways page.
 
-        Passes the gateway's own response through verbatim — a PNG when a code
-        is ready, JSON progress/errors otherwise — so the page's <img> either
-        renders the code or falls back to its "not ready yet" note."""
+        Passes the gateway's own response through — a PNG when a code is
+        ready, JSON progress/errors otherwise — so the page's <img> either
+        renders the code or falls back to its "not ready yet" note; a type
+        that is neither goes out as application/octet-stream."""
         _slug, gw = _channel_gateway(slug)
         if not gw:
             self._send_json(404, {"error": "unknown gateway"})
@@ -12919,10 +12988,18 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as exc:  # noqa: BLE001
             self._send_json(502, {"error": f"gateway unreachable: {exc}"})
             return
+        # The page shows the code through <img> and nothing else: the image,
+        # or the JSON progress the gateway answers before there is one. Any
+        # other type the gateway states is not passed on as a type of this
+        # origin, and nothing is left to sniffing.
+        content_type = _served_media_type(content_type)
+        if content_type.split(";", 1)[0] not in ("image/png", "application/json"):
+            content_type = "application/octet-stream"
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
         self.end_headers()
         self.wfile.write(data)
 

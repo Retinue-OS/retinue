@@ -1909,8 +1909,12 @@ MEDIA_RULE = [
     ("text/xml", "text/xml", "download"),
     ("application/xml", "application/xml", "download"),
     ("application/rss+xml", "application/rss+xml", "download"),
-    ("text/javascript", "text/javascript", "download"),
-    ("application/javascript", "application/javascript", "download"),
+    # Except a script type: a <script src> or a worker pointed at the proxy
+    # would run it as the dashboard's own, whatever the disposition, so it
+    # goes out as bytes (tests/test_web_gateway_no_script_types.py).
+    ("text/javascript", OCTET, "download"),
+    ("application/javascript", OCTET, "download"),
+    ("Text/JavaScript; charset=utf-8", OCTET, "download"),
     ("text/css", "text/css", "download"),
     ("text/csv", "text/csv", "download"),
     ("application/json", "application/json", "download"),
