@@ -216,8 +216,12 @@ def test_per_spawn_stamps_are_never_inherited():
     assert "RETINUE_SESSION_MODEL" not in env
     assert "RETINUE_ESCALATE_FILE" not in env
     assert "RETINUE_REPLY_ATTACHMENTS_FILE" not in env
+    assert "RETINUE_REPLY_SHELL_ACTIONS_FILE" not in se.build(
+        {**src, "RETINUE_REPLY_SHELL_ACTIONS_FILE": "/tmp/stale-actions"})
     env = se.build(src, model="sonnet", escalate_file=Path("/tmp/flag-1"),
-                   reply_attachments_file=Path("/tmp/manifest-1"))
+                   reply_attachments_file=Path("/tmp/manifest-1"),
+                   reply_shell_actions_file=Path("/tmp/actions-1"))
+    assert env["RETINUE_REPLY_SHELL_ACTIONS_FILE"] == "/tmp/actions-1"
     assert env["RETINUE_SESSION_MODEL"] == "sonnet"
     assert env["RETINUE_ESCALATE_FILE"] == "/tmp/flag-1"
     assert env["RETINUE_REPLY_ATTACHMENTS_FILE"] == "/tmp/manifest-1"
@@ -226,12 +230,15 @@ def test_per_spawn_stamps_are_never_inherited():
     # Nor can the escape hatch bring a stale one back: naming the stamp or
     # the flag there, verbatim or by wildcard, admits configuration only.
     for extra in ("RETINUE_SESSION_MODEL,RETINUE_ESCALATE_FILE,"
-                  "RETINUE_REPLY_ATTACHMENTS_FILE", "RETINUE_*"):
+                  "RETINUE_REPLY_ATTACHMENTS_FILE,RETINUE_REPLY_SHELL_ACTIONS_FILE",
+                  "RETINUE_*"):
         hatch = {**src, "RETINUE_SESSION_ENV_EXTRA": extra}
         env = se.build(hatch, model="")
         assert "RETINUE_SESSION_MODEL" not in env, extra
         assert "RETINUE_ESCALATE_FILE" not in env, extra
         assert "RETINUE_REPLY_ATTACHMENTS_FILE" not in env, extra
+        hatch_actions = {**hatch, "RETINUE_REPLY_SHELL_ACTIONS_FILE": "/tmp/stale"}
+        assert "RETINUE_REPLY_SHELL_ACTIONS_FILE" not in se.build(hatch_actions), extra
         env = se.build(hatch, model="sonnet", escalate_file="/tmp/flag-2")
         assert env["RETINUE_SESSION_MODEL"] == "sonnet", extra
         assert env["RETINUE_ESCALATE_FILE"] == "/tmp/flag-2", extra

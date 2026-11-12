@@ -132,7 +132,11 @@ import {
   modeEntries, endedByAra, noteAraOff,
   chime, primeAudio,
 } from './continuous.js';
-import { setVoiceActive, canPlaceCall, placeCall, onCall } from './shell.js';
+import {
+  setVoiceActive, canPlaceCall, placeCall, onCall,
+  hasKeyboard, keyboardOpen, onKeyboard, hasShellSettingsPage, openShellSettings,
+} from './shell.js';
+import * as kbd from './shell-keyboard.js';
 import { loadDraft, saveDraft, loadFiles, saveFiles } from './drafts.js';
 import { transcribe, handOff, adopt } from './dictation.js';
 
@@ -1105,6 +1109,12 @@ class RetinueConversation extends HTMLElement {
     this._hadFocus = false;  // the input had focus before the current re-render
     this._threadSig = '';
     this._pollTimer = null;
+    // Shell actions (shell-keyboard.js): the keys of the messages this element
+    // has seen, so a message that arrives later is known to be live (its own
+    // field — _seenTs is the shelf's); the outcome of each action run here,
+    // by id, for its row.
+    this._kbdSeen = null;
+    this._kbdOutcome = new Map();
     this._loadSeq = 0;       // reads issued: only the newest one commits
     this._pickerStale = false; // a refused pick to put back, even under focus
     this._adopting = false;  // the id is being set from within (a created thread)
@@ -1146,6 +1156,18 @@ class RetinueConversation extends HTMLElement {
     this._onViewport = () => this._fitFrame();
     window.addEventListener('retinue-viewport', this._onViewport);
     this._fitFrame();
+    this._offKeyboard = onKeyboard((d) => this._onKeyboardEvent(d));
+    // A sensitive text reported typed is deleted by the gateway: read again.
+    this._offKbdReported = kbd.onOutcomeReported((r) => {
+      if (r.ok && r.threadId === this._id && r.state === 'typed' && kbd.isSensitive(r.action)) {
+        this._threadSig = '';
+        this._load();
+      }
+    });
+    // While the page is hidden the user is not looking: what arrives then
+    // never types by itself, so coming back only learns what is there.
+    this._onKbdVisibility = () => { if (document.hidden) this._kbdSeen = null; };
+    document.addEventListener('visibilitychange', this._onKbdVisibility);
     LIVE.set(this._key(), this);
     adoptDictations(this._key());
     this._shelfEnter();
@@ -1200,6 +1222,12 @@ class RetinueConversation extends HTMLElement {
     if (LIVE.get(this._key()) === this) LIVE.delete(this._key());
     if (this._onViewport) window.removeEventListener('retinue-viewport', this._onViewport);
     this._onViewport = null;
+    if (this._offKeyboard) this._offKeyboard();
+    this._offKeyboard = null;
+    if (this._offKbdReported) this._offKbdReported();
+    this._offKbdReported = null;
+    if (this._onKbdVisibility) document.removeEventListener('visibilitychange', this._onKbdVisibility);
+    this._onKbdVisibility = null;
     this._wave.stop();
     this._stopStream();
     // The reader is not stopped: a reading follows the user out of the thread.
@@ -1230,6 +1258,8 @@ class RetinueConversation extends HTMLElement {
     this._id = now || '';
     this._thread = null;
     this._threadSig = '';
+    this._kbdSeen = null;
+    this._kbdOutcome = new Map();
     this._attachError = '';
     this._missing = false;
     LIVE.set(this._key(), this);
@@ -1509,6 +1539,7 @@ class RetinueConversation extends HTMLElement {
       this._shelfObserve(t);
       if (t.unread) this._markRead();
       this._maybeAutoplay(t);
+      this._shellActionsArrived(t);
       this._restorePosition(t);
       // Ara's turn is over: in continuous mode the mic opens — now, or when
       // the reading of her answer ends (see onReaderProgress).
@@ -1600,7 +1631,9 @@ class RetinueConversation extends HTMLElement {
   _signature(t) {
     return JSON.stringify([
       (t.messages || []).map((m) => [m.role, m.text, m.ts, (m.attachments || []).length,
-        m.model_name || '', m.cost_usd ?? '', m.agent || '']),
+        m.model_name || '', m.cost_usd ?? '', m.agent || '',
+        kbd.actionsOf(m).map((a) => [a.id, (this._kbdOutcome.get(a.id) || {}).state || '',
+          (kbd.storedOutcome(a) || {}).state || '', kbd.isPurged(a, m) ? 'x' : ''].join(':')).join(',')]),
       !!t.pending,
       t.pending_since || '',
       t.pending_status || '',
@@ -1789,6 +1822,7 @@ class RetinueConversation extends HTMLElement {
         speakBtn + `</div>` +
         `<div class="bubble">${this._renderBubble(m.text)}` +
         this._attachmentsHtml(t.id, m.attachments) +
+        this._shellActionsHtml(m) +
         `</div></div>`;
     }).join('');
     const pending = t.pending
@@ -1809,6 +1843,129 @@ class RetinueConversation extends HTMLElement {
         `<div class="bubble">${this._renderBubble(out.text)}</div></div>`
       : '';
     return msgs + sending + pending;
+  }
+
+  // ── Shell actions (shell-keyboard.js) ─────────────────────────────────────
+  // A reply may carry text for the device the Android shell types on as a
+  // Bluetooth keyboard. The row under it shows what, the outcome, and the
+  // tap that (re)runs it; outside the shell it says the Ara app is needed.
+  _shellActionsHtml(m) {
+    // A sensitive text past its two minutes goes from this copy too.
+    kbd.expireSensitive(m);
+    const actions = kbd.actionsOf(m);
+    if (!actions.length) return '';
+    if (!hasKeyboard()) {
+      return `<div class="kbd-row"><small class="kbd-note">` +
+        `${esc(kbd.describeAction(actions[0]))}${actions.length > 1 ? ` (+${actions.length - 1})` : ''}` +
+        ` — typing on another device needs the Ara app.</small></div>`;
+    }
+    const host = kbd.hostName();
+    return actions.map((a) => {
+      // What happened here this visit, else what the gateway kept.
+      const out = this._kbdOutcome.get(a.id) || kbd.storedOutcome(a)
+        || (kbd.isDone(a.id) ? { state: 'sent' } : null);
+      const [line, fix] = kbd.describeOutcome(out, host);
+      const running = out && (out.state === 'pending' || out.state === 'queued');
+      const stop = running ? `<button type="button" class="kbd-link" data-kbd-stop>Stop</button>` : '';
+      if (kbd.isPurged(a, m)) {
+        // Nothing left to type: a sensitive text deleted (typed, or past
+        // its two minutes).
+        const done = out && out.state === 'typed' ? `${line} · ` : '';
+        return `<div class="kbd-row"><small class="kbd-note">${esc(done)}` +
+          `${kbd.isSensitive(a) ? 'Typed: •••••• · ' : ''}Text deleted</small>${stop}</div>`;
+      }
+      const secret = a.kind === 'keyboard-secret';
+      const enters = kbd.enterSuffix(a);
+      const label = secret ? kbd.describeAction(a)
+        : (out ? `${kbd.isSensitive(a) ? 'Retype ••••••' : 'Retype'}${enters}`
+          : `${kbd.describeAction(a)}${host ? ` on ${host}` : ''}`);
+      // What a tap types, before the tap: the text itself, every line break
+      // marked (each presses Enter).
+      const shown = kbd.visibleText(a);
+      const textBlock = shown !== null ? `<pre class="kbd-text">${esc(shown)}</pre>` : '';
+      return textBlock + `<div class="kbd-row">` +
+        `<button type="button" class="kbd-btn${secret ? ' kbd-secret' : ''}" data-kbd-run="${esc(a.id)}"${running ? ' disabled' : ''}>` +
+        `<span aria-hidden="true">⌨️</span> ${esc(label)}</button>` +
+        (line ? `<small class="kbd-note">${esc(line)}</small>` : '') + stop +
+        (fix === 'keyboard' ? `<button type="button" class="kbd-link" data-kbd-open>Open keyboard</button>` : '') +
+        // The app refuses its keyboard screen while this server may not
+        // type; its settings page holds that switch and the way there.
+        (fix === 'settings' && hasShellSettingsPage()
+          ? `<button type="button" class="kbd-link" data-kbd-settings>Open settings</button>` : '') +
+        `</div>`;
+    }).join('');
+  }
+
+  // The action `id` and the message carrying it, or null.
+  _findShellAction(id) {
+    for (const m of (this._thread && this._thread.messages) || []) {
+      const a = kbd.actionsOf(m).find((x) => x.id === id);
+      if (a) return { a, m };
+    }
+    return null;
+  }
+
+  // Hand an action to the shell (queued behind one running); its row follows
+  // the states shell-keyboard.js reports.
+  _startShellAction(a, m) {
+    const ok = kbd.run(a, {
+      threadId: this._id,
+      message: m,
+      onState: (out) => { if (this.isConnected) this._setKbdOutcome(a.id, out); },
+    });
+    if (!ok) this._setKbdOutcome(a.id, kbd.isPurged(a, m) ? { state: 'deleted' } : { state: 'unavailable' });
+  }
+
+  // A deliberate tap: always runs (Retype included), and is recorded so no
+  // later arrival runs it by itself.
+  _runShellAction(id) {
+    const found = this._findShellAction(id);
+    if (!found) return;
+    kbd.claim(id);
+    this._startShellAction(found.a, found.m);
+  }
+
+  // After a read: messages that were not there before arrived live, in the
+  // thread open and visible here, and their typing actions run by themselves
+  // — once (kbd.claim), and only while young (kbd.shouldAutoRun). The first
+  // read of a thread, and the first after the page was hidden, only learns
+  // what is there; opening a thread never types.
+  _shellActionsArrived(t) {
+    const hidden = typeof document !== 'undefined' && document.hidden;
+    const { seen, live } = kbd.liveArrivals(t.messages || [], hidden ? null : this._kbdSeen);
+    this._kbdSeen = seen;
+    for (const m of live) {
+      for (const a of kbd.actionsOf(m)) {
+        if (kbd.shouldAutoRun(a, m, { live: true }) && kbd.claim(a.id)) this._startShellAction(a, m);
+      }
+    }
+  }
+
+  // The row follows the shell's events; shell-keyboard.js reports them to the
+  // gateway (and the purge of a sensitive text brings a fresh read, above).
+  _onKeyboardEvent(d) {
+    if (d.state === 'status') { this._threadSig = ''; this._partialUpdate(); return; }
+    if (!d.id || !this._findShellAction(d.id)) return;
+    this._setKbdOutcome(d.id, d);
+  }
+
+  // Stop on a row that still says "Typing…" of an action the module no
+  // longer runs or holds (its final event came while this view was away):
+  // nothing is left to stop, so the row says the app never answered and its
+  // Retype is free again.
+  _settleStaleKbd() {
+    for (const [id, out] of this._kbdOutcome) {
+      if (out && (out.state === 'pending' || out.state === 'queued') && !kbd.isActive(id)) {
+        this._setKbdOutcome(id, { state: 'unanswered' });
+      }
+    }
+  }
+
+  _setKbdOutcome(id, out) {
+    this._kbdOutcome.set(id, out);
+    // The signature carries the outcome, so the next partial update redraws
+    // the row; do it now rather than at the next poll.
+    if (this._thread) this._partialUpdate();
   }
 
   // The header meta after the sender name: for an answer bubble, the model
@@ -3357,6 +3514,11 @@ class RetinueConversation extends HTMLElement {
         if (btn) { copyToClipboard(btn, root); return; }
         const chip = e.target.closest('.md-chip');
         if (chip) { this._fillComposer(chip.getAttribute('data-fill') || ''); return; }
+        const kb = e.target.closest('[data-kbd-run]');
+        if (kb) { this._runShellAction(kb.getAttribute('data-kbd-run')); return; }
+        if (e.target.closest('[data-kbd-open]')) { keyboardOpen(); return; }
+        if (e.target.closest('[data-kbd-settings]')) { openShellSettings(); return; }
+        if (e.target.closest('[data-kbd-stop]')) { kbd.cancel(); this._settleStaleKbd(); return; }
         const sbtn = e.target.closest('.speak');
         if (sbtn) this._onSpeakButton(sbtn);
       });
@@ -3841,6 +4003,20 @@ const CSS = `
   .attach .a-size { flex: none; color: var(--muted, #8b93a3); font-size: .72rem; }
   .msg.me .attach { border-color: rgba(11, 13, 18, .4); background: rgba(11, 13, 18, .12); }
   .msg.me .attach .a-size { color: rgba(11, 13, 18, .7); }
+  .kbd-row { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; margin-top: 8px; }
+  .md:empty + .kbd-row { margin-top: 0; }
+  .kbd-btn { display: inline-flex; align-items: center; gap: 6px; padding: 6px 12px; border-radius: 8px;
+             border: 1px solid var(--accent, #6ea8fe); background: rgba(110, 168, 254, .1);
+             color: inherit; font: inherit; font-size: .82rem; cursor: pointer; }
+  .kbd-btn:hover { background: rgba(110, 168, 254, .2); }
+  .kbd-btn:disabled { opacity: .55; cursor: default; }
+  .kbd-text { margin: 8px 0 0; padding: 6px 8px; border-radius: 6px; max-height: 12em; overflow: auto;
+              white-space: pre-wrap; word-break: break-word; font: .8rem/1.35 ui-monospace, monospace;
+              background: rgba(110, 168, 254, .08); border: 1px solid rgba(110, 168, 254, .25); }
+  .kbd-btn.kbd-secret { font-weight: 600; }
+  .kbd-note { color: var(--muted, #8b93a3); font-size: .74rem; }
+  .kbd-link { background: none; border: 0; padding: 0; color: var(--accent, #6ea8fe); font: inherit;
+              font-size: .74rem; text-decoration: underline; cursor: pointer; }
   .quote { margin: 6px 0; padding: 8px 10px; border-left: 3px solid var(--accent, #6ea8fe);
            background: rgba(110, 168, 254, .1); border-radius: 8px;
            display: flex; flex-direction: column; gap: 6px; }

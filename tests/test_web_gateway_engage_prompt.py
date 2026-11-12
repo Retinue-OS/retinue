@@ -64,12 +64,14 @@ def _msg(role, text, attachments=None):
 
 
 def check_fresh_single_message_is_bare(gw):
-    """The common case must stay byte-identical: no framing around one message."""
+    """The common case stays bare: no framing around one message — only its
+    id, by which Ara can redact it on the user's request."""
     conv = _conv(_msg("user", "hi"),
                  _msg("assistant", "hello"),
                  _msg("user", "what about tomorrow?"))
     prompt = gw._conv_engage_prompt(conv, fresh=True)
-    assert prompt == "what about tomorrow?", prompt
+    mid = gw._conv_message_id(conv["messages"][-1])
+    assert prompt == f"what about tomorrow? [message id: {mid}]", prompt
     print("PASS fresh single message sent bare")
 
 
@@ -108,7 +110,8 @@ def check_fresh_without_anchor_falls_back(gw):
     """With no assistant message we cannot tell what the session saw."""
     conv = _conv(_msg("agent", "opening note"), _msg("user", "ok"))
     prompt = gw._conv_engage_prompt(conv, fresh=True)
-    assert prompt == "ok", prompt
+    mid = gw._conv_message_id(conv["messages"][-1])
+    assert prompt == f"ok [message id: {mid}]", prompt
     print("PASS fresh without an assistant anchor sends the latest message only")
 
 
