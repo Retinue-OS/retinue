@@ -59,26 +59,32 @@ export function callNumber(raw) {
 
 // The last call directive in a message, as {number, name, voiceCancel}, or
 // null. The last, because a reply that mentions a number first and then
-// places the call puts the directive at its end.
+// places the call puts the directive at its end. One quoted as code (a fence,
+// then a code span, the order the bubble renders them in) is an example the
+// bubble shows literally, so it is no call either.
 export function callOf(text) {
   const re = new RegExp(CALL_RE.source, 'gi');
+  const prose = String(text == null ? '' : text)
+    .replace(/```[\s\S]*?```/g, ' ')
+    .replace(/`[^`]+`/g, ' ');
   let found = null;
-  for (const m of String(text == null ? '' : text).matchAll(re)) {
+  for (const m of prose.matchAll(re)) {
     const number = callNumber(m[1]);
     if (number) found = { number, name: (m[2] || '').trim(), voiceCancel: !m[3] };
   }
   return found;
 }
 
-// Whether a reply before `messages[index]` already placed (or tried to
-// place) a call to `number`: the condition for a call speech cannot cancel.
-// A first attempt is always cancellable by voice, so a mistaken directive
-// never dials without the chance to say no.
+// Whether an answer of Ara's before `messages[index]` already placed (or
+// tried to place) a call to `number`: the condition for a call speech cannot
+// cancel. A first attempt is always cancellable by voice, so a mistaken
+// directive never dials without the chance to say no. Only Ara's own answers
+// count: a message an agent pushed into the thread is not an attempt of hers.
 export function calledBefore(messages, index, number) {
   const list = Array.isArray(messages) ? messages : [];
   for (let i = Math.min(index, list.length) - 1; i >= 0; i -= 1) {
     const m = list[i];
-    if (m && m.role !== 'user') {
+    if (m && m.role === 'assistant') {
       const c = callOf(m.text);
       if (c && c.number === number) return true;
     }

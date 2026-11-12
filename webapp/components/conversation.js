@@ -2379,8 +2379,10 @@ class RetinueConversation extends HTMLElement {
       this._stopStream();
       // A loop take that cannot open the mic ends the spoken turn now rather
       // than holding the shell's voice state until the watchdog; the mode
-      // stays on, so the mic button tries again.
-      if (this._contOn()) this._contDisengage();
+      // stays on, so the mic button tries again. Except for the take that
+      // listens for a cancel while a call waits: the call needs no mic, and
+      // is placed when its time comes (_contCallPlace), Cancel still shown.
+      if (this._contOn() && !this._calling && !this._placingCall) this._contDisengage();
       if (this.isConnected) this.render();
     }
   }
@@ -2724,7 +2726,14 @@ class RetinueConversation extends HTMLElement {
     if (this._recState !== 'idle' || this._busy || VOICE_JOBS.has(this._key()) || ADOPTED.has(this._key())) return;
     if (this._missing) { this._contDisengage(); return; }
     if (this._id && (!this._thread || this._thread.pending)) return;
-    if (loop && CONT_CALL && CONT_CALL.conv === this._id) { this._contCall(); return; }
+    // The call comes where the mic would open, so not while the user is
+    // writing (below): the loop stops as it would, and the directive stays a
+    // link in the bubble. The take listening for a cancel would replace the
+    // row they are writing in, and could send what they wrote along with it.
+    if (loop && CONT_CALL && CONT_CALL.conv === this._id && (asked || !this._typing())) {
+      this._contCall();
+      return;
+    }
     if (!canRecord()) { this._contDisengage(); return; }
     // The user is writing — text or files in the box, or the cursor in it:
     // the loop going round must not take the row from under their hands
@@ -2758,7 +2767,9 @@ class RetinueConversation extends HTMLElement {
   // The answer just read places a call: shown with a Cancel button for
   // CALL_DELAY_MS, then handed to the shell, which calls (or opens the dialer,
   // see shell.js). The answer itself said who is being called, aloud, in the
-  // user's language; this row adds no words of its own but the name.
+  // user's language; this row adds no words of its own but the name and the
+  // number, so a wrong number (the wrong one of two entries, one taken from
+  // a mail read in the same turn) can be seen before it is dialled.
   // Meanwhile the mic is open as for any take: speech cancels the call, and
   // the take goes on to Ara as the user's next turn ("no, stop", "call Ben
   // instead"), whatever language it is in. A directive with no-voice-cancel
@@ -2785,7 +2796,8 @@ class RetinueConversation extends HTMLElement {
 
   _callRowHtml() {
     if (!this._calling) return '';
-    const who = esc(this._calling.name || this._calling.number);
+    const { name, number } = this._calling;
+    const who = name ? `${esc(name)} · ${esc(number)}` : esc(number);
     return `<div class="call-row"><span class="call-who"><span aria-hidden="true">\u{1F4DE}</span> ${who}</span>` +
       `<button type="button" class="call-cancel" data-call-cancel>Cancel</button></div>`;
   }
@@ -2876,8 +2888,14 @@ class RetinueConversation extends HTMLElement {
     this._vadHeard = false;
     this._vadLive = null;
     this._recTouched = false;
-    const { noSpeechMs } = voiceTimeouts();
-    const meter = new LevelMeter(new Vad(voiceTimeouts()), (ev) => this._onVad(ev, mr));
+    const timeouts = voiceTimeouts();
+    // The take that listens for a cancel while a call waits (_contCall) is
+    // not closed by its no-speech timeout before the call is placed: closed,
+    // it would end the loop, and the call with it. The call itself drops the
+    // take when its time comes; cancelled by touch, the take goes on.
+    if (this._calling) timeouts.noSpeechMs = Math.max(timeouts.noSpeechMs, CALL_DELAY_MS + CALL_MIC_RELEASE_MS);
+    const { noSpeechMs } = timeouts;
+    const meter = new LevelMeter(new Vad(timeouts), (ev) => this._onVad(ev, mr));
     this._meter = meter;
     const still = () => this._meter === meter && this._mediaRecorder === mr && this._recState === 'recording';
     chime().then(async () => {
@@ -2951,16 +2969,18 @@ class RetinueConversation extends HTMLElement {
     // So does a take that would carry text or files the user put in the box
     // before it: the send takes the whole draft, which they have not seen
     // go together with what they said.
-    // A take that cancelled a call always goes out, whatever ended it: only
-    // its transcript can tell whether the user meant to stop the call.
+    // A take that cancelled a call goes out whatever ended it, as only its
+    // transcript can tell whether the user meant to stop the call; but not
+    // with text or files in the box, which go to review as above.
     else if (ev.type === 'end') {
       const cancelled = CANCELLED_CALLS.has(this._key());
-      this._finishRecording(cancelled || (ev.reason === 'silence' && !this._draftHasInput()) ? 'send' : 'review');
+      this._finishRecording((cancelled || ev.reason === 'silence') && !this._draftHasInput() ? 'send' : 'review');
     }
     // Nobody spoke: the mic closes, the mode stays on, and nothing is sent
     // (no "no speech detected" note either — silence was the answer).
     else if (ev.type === 'timeout') {
-      if (CANCELLED_CALLS.has(this._key())) this._finishRecording('send'); else this._abortRecording();
+      if (CANCELLED_CALLS.has(this._key())) this._finishRecording(this._draftHasInput() ? 'review' : 'send');
+      else this._abortRecording();
     }
   }
 
@@ -3120,9 +3140,10 @@ class RetinueConversation extends HTMLElement {
     // An answer to a spoken turn that places a call, in a shell that can: the
     // call comes where the mic would open. Only the loop's own answer — a
     // directive anywhere else (an older reply, a message pushed into the
-    // thread) stays a link to tap.
+    // thread, an agent's message arriving while the answer is awaited) stays
+    // a link to tap.
     if (loop) {
-      const call = canPlaceCall() ? callOf(m.text) : null;
+      const call = canPlaceCall() && m.role === 'assistant' ? callOf(m.text) : null;
       // A call speech cannot cancel only on a second attempt at the number.
       if (call && !call.voiceCancel &&
           !calledBefore(t.messages, (t.messages || []).indexOf(m), call.number)) call.voiceCancel = true;

@@ -7,7 +7,9 @@ and speech cancels it; the take that did goes out with `cancelled_call:
 into agent-only context in wording of its own, so Ara can place the call
 again when the words show no wish to stop it. Pinned here: the client gives
 only a validated number and a short name — nothing else reaches the prompt —
-and the note names the second-attempt directive.
+and the note names the second-attempt directive. Pinned too: the one-line
+previews of a thread (the attention row, the digest line, the push) show a
+call directive as its name, never the markup and the number.
 
     python3 tests/test_cancelled_call_context.py
 """
@@ -17,6 +19,7 @@ import sys
 import tempfile
 import types
 from pathlib import Path
+from unittest.mock import patch
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SCRIPTS_DIR = REPO_ROOT / "scripts"
@@ -80,6 +83,23 @@ def main() -> int:
         for bad in (None, "x", [], {"number": "12"}, {"number": "+41 79 123"},
                     {"number": "0441234567; rm -rf /"}, {"name": "Anna"}):
             assert wg._cancelled_call_context(bad) is None, bad
+
+        # One-line previews show words, never the directive: the attention
+        # row and digest line (attention_store.thread_item) and the push read
+        # a call as its name, or as the number when it has none.
+        import attention_store
+        text = "Calling Anna now. [[call: +41 79 123 45 67 | Anna Muster | no-voice-cancel]]"
+        assert attention_store.markup_words(text) == "Calling Anna now. Anna Muster"
+        assert attention_store.markup_words("[[chip: Yes]] · Ring? [[call: 044 123 45 67]]") == "Ring? 044 123 45 67"
+        conv = {"id": "c" * 32, "title": "Anna", "initiator": "agent",
+                "messages": [{"role": "assistant", "text": text}]}
+        assert attention_store.thread_item(conv, {})["preview"] == "Calling Anna now. Anna Muster"
+        pushed = []
+        with patch.object(wg.push_notify, "enabled", lambda: True), \
+                patch.object(wg.push_notify, "subscription_count", lambda: 1), \
+                patch.object(wg.push_notify, "notify_async", lambda title, body, **kw: pushed.append(body)):
+            assert wg._push_conv_notification(conv, text) == 1
+        assert pushed == ["Calling Anna now. Anna Muster"], pushed
     print("PASS: cancelled-call context test")
     return 0
 

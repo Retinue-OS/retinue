@@ -173,7 +173,7 @@ prose: fences render monospace and unrendered. Reserve them for actual code.
 
 ## 7. A call the user asks for ends with a call directive
 
-When the user asks you to call someone ("call Anna", "ruf Anna an"), find the
+When the user asks you to call someone, in any language (e.g. "call Anna"), find the
 number — `scripts/contacts.py find --name` (allow for speech-recognition
 variants of the name, as `messaging-contact-lookup` does), or the number the
 user said — say in one short sentence whom you are calling, and end the reply
@@ -186,7 +186,7 @@ Calling Anna Muster now. [[call: +41 79 123 45 67 | Anna Muster]]
 In the Android shell's voice conversation the call is placed by itself, on
 speaker, where the user has switched *Call directly by voice* on for this
 Retinue in the app's settings (it is off until they do; then the dialer opens
-with the number and needs a tap): once your reply has been read aloud, the thread shows the name with a
+with the number and needs a tap): once your reply has been read aloud, the thread shows the name and the number with a
 Cancel button for five seconds, with the mic open — **anything the user says
 cancels the call** and reaches you as their next turn, with a note that it
 cancelled the call. Judge from the words whether they meant to stop it: "no,

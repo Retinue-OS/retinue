@@ -900,27 +900,32 @@ carries the loop on: another message pushed into a thread in the mode may be
 read aloud, but never opens the mic. A mic the loop wants while the page is
 hidden (a wake in the background, an answer read in a pocket) waits up to
 60 s for the page to come back.
-An answer to the loop's own turn that ends in a **call directive**
+An answer of Ara's to the loop's own turn that ends in a **call directive**
 (`[[call: <number> | <name>]]`, `.claude/skills/dashboard-composing` §7)
 places the call where the mic would open, when the page runs in a shell that
 can (`placeCall`, below): once the answer has been read, the composer shows
-the name with a **Cancel** button for 5 s while the mic is open as for any
-take. Speech (the detector's `speech`, so in any language) cancels the call,
-and the take goes on to Ara as the next turn — always, whatever ends it,
-carrying `cancelled_call: {number, name}`, from which the gateway writes a
+the name and the number to be dialled with a **Cancel** button for 5 s while
+the mic is open as for any take, its no-speech timeout stretched past the
+call's wait (a mic that fails to open leaves the call to go ahead). Where the
+mic would not open because the user is writing, no call is placed either: the
+loop stops as it does there, and the directive stays a link. Speech (the
+detector's `speech`, so in any language) cancels the call, and the take goes
+on to Ara as the next turn, whatever ends it, carrying `cancelled_call: {number, name}`, from which the gateway writes a
 fixed agent-only note (`_cancelled_call_context`): the call was not made;
 unless the words mean to stop it, place it again as a second attempt with
 `no-voice-cancel`. A cancelling take whose transcript is empty is no turn:
-the call goes ahead at once, with Cancel by touch only. Cancel itself (by
-touch) cancels for good.
+the call goes ahead at once, with Cancel by touch only. A cancelling take
+that would carry text or files from the box goes to review instead, like any
+take, and the call stays cancelled. Cancel itself (by touch) cancels for good.
 Nobody speaking, the take is dropped, the mic released (up to 2 s), the number
 handed to the shell, and the voice flag let go once the shell has answered
 (10 s at most). The flag `| no-voice-cancel` as a third part keeps the mic
 shut for those 5 s — for a loud room or an emergency — but only on a second
-attempt: unless an earlier reply in the thread carried a directive for the
-same number (`calledBefore`), the flag is ignored. Leaving the thread or
+attempt: unless an earlier answer of Ara's in the thread carried a directive
+for the same number (`calledBefore`), the flag is ignored. A directive quoted
+as code (a span or a fence) is an example, never a call. Leaving the thread or
 stopping the loop drops the call. Anywhere else — a typed thread, an older reply, a message pushed
-into the thread, a browser — the directive is only a tap-to-dial `tel:` link
+into the thread (an agent's included), a browser — the directive is only a tap-to-dial `tel:` link
 (`webapp/components/markdown.js`, `callOf`; `tests/test_webapp_call_directive.py`).
 Entry points: the toggle, `/#new?voice=1` (the composer in the mode — its
 first take opens the thread, which continues in it) and a wake (`/?wake=1`

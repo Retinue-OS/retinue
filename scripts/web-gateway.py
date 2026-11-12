@@ -3222,12 +3222,6 @@ def _conv_engage_prompt(conv: dict, fresh: bool,
     )
 
 
-_CHIP_MARKUP_RE = re.compile(r"\[\[chip:[^\]]*\]\]\s*(?:·\s*)?")
-# [[call: <number> | <name> | no-voice-cancel]] (webapp/components/markdown.js):
-# words for the name, or the number when there is none.
-_CALL_MARKUP_RE = re.compile(r"\[\[call:\s*([^|\]]*?)\s*(?:\|\s*([^|\]]*?)\s*)?(?:\|[^\]]*)?\]\]", re.I)
-
-
 def _push_conv_notification(conv: dict, text: str, urgency: str | None = None) -> int:
     """Notify the user's devices that a thread needs their attention.
 
@@ -3252,10 +3246,9 @@ def _push_conv_notification(conv: dict, text: str, urgency: str | None = None) -
               "notifies nobody", flush=True)
         return 0
     title = conv.get("title") or instance_branding.display_name()
-    # The notification shows words, not the chip markup the thread renders.
-    body = _CALL_MARKUP_RE.sub(lambda m: m.group(2) or m.group(1),
-                               _CHIP_MARKUP_RE.sub("", str(text or "")))
-    body = " ".join(body.split())
+    # The notification shows words, not the chip and call markup the thread
+    # renders (attention_store.markup_words, as the row's preview does).
+    body = " ".join(attention_store.markup_words(text).split())
     if len(body) > 160:
         body = body[:157].rstrip() + "…"
     push_notify.notify_async(title, body, url=f"/#conversation-{cid}", tag=cid,

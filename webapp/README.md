@@ -781,9 +781,10 @@ Threads can be spoken as well as typed, with no streaming and split by direction
   address once read and open the mic by themselves only inside the shell;
   elsewhere the conversation offers a **Start talking** button. An answer
   that ends in a call directive (`[[call: <number> | <name>]]`) places the
-  call instead of opening the mic, in a shell with `placeCall`: the name and
-  a **Cancel** button for 5 s with the mic open — speech cancels, and always
-  goes to Ara as the next turn with a `cancelled_call` note, so she places the
+  call instead of opening the mic, in a shell with `placeCall`: the name, the
+  number and a **Cancel** button for 5 s with the mic open — speech cancels,
+  and goes to Ara as the next turn with a `cancelled_call` note (to review
+  instead, like any take, when the box holds text or files), so she places the
   call again when the words did not mean to stop it (no words at all: it goes
   ahead at once); `| no-voice-cancel` keeps the mic shut, honoured only
   on a second attempt at the number — then the shell dials on speaker
@@ -844,8 +845,9 @@ same in the shell, in Chrome and on a desktop. The contract between them:
   certificate or password — those stay in the shell. An `endpoints` event says the list
   changed while the page is open.
 - **Shell → page**: `window.dispatchEvent(new CustomEvent('retinue-shell',
-  {detail: {type}}))` with `type` `wake` (the wake phrase) or `home` (a Home
-  press while the shell is in front). The home answers both in place: a wake
+  {detail: {type}}))` with `type` `wake` (the wake phrase), `home` (a Home
+  press while the shell is in front) or `call` (what became of a
+  `placeCall`, information only; see Phone calls below). The home answers both in place: a wake
   opens continuous conversation (above), a home press closes an open thread or
   sheet back to `/` (every view entry unwound, not just one) and scrolls the
   list to its top. Any other page of the web app answers by loading
@@ -880,6 +882,24 @@ same in the shell, in Chrome and on a desktop. The contract between them:
   installs a `speechSynthesis` / `SpeechSynthesisUtterance` stand-in backed by
   the native TTS where the page has none. `components/speech.js` is unchanged;
   it simply finds an engine there.
+- **Phone calls** (RetinueShell/6): `placeCall(number)` calls the number
+  without a tap, on speakerphone, and only while the page holds
+  `setVoiceActive(true)`. It needs *Call directly by voice*, a switch per
+  endpoint in the app's settings (*This app with <endpoint>* → *Phone
+  calls*, off for a new endpoint), and Android's phone-call permission; short
+  of either, the shell opens the dialer with the number instead. The shell
+  normalises the number (separators, a leading `tel:` and the `(0)` of
+  `+44 (0)20` dropped); it must then be an optional `+` followed by digits,
+  `*` and `#`, with 3 to 20 digits and at most 32 characters. The answer is a
+  `call` event `{state, reason?, number?}`: `placed` (with `number`);
+  `dialer`, the dialer opened instead (`emergency`, `service-code` for any
+  number with `*` or `#`, `disabled` or `no-permission`, each with
+  `number`); or `refused` (`invalid-number`, `not-in-voice`, `no-telephony`,
+  or `failed` with `number`). `placeCall('')` is answered `refused` /
+  `invalid-number`, while `placeCall()` and `placeCall(null)` send nothing.
+  `components/shell.js` wraps it as `canPlaceCall`, `placeCall` and `onCall`;
+  the continuous loop is its only caller (above). The full text is in
+  docs/dashboard.md, "Inside the Android shell".
 
 ## Next steps
 
