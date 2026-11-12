@@ -1044,10 +1044,23 @@ else's computer: the user says "type the text above" in a thread, and the
 phone types it there.
 
 - **Agent side.** Inside a dashboard-thread turn, `scripts/shell-type.py`
-  attaches an action to the reply being written — `"text"` (`--enter` to press
+  attaches an action to the reply being written — a text (`--enter` to press
   Enter after it), `--key <name>`, or `--secret "<label>"` — by appending one
-  ASCII JSON line to the turn's manifest, `RETINUE_REPLY_SHELL_ACTIONS_FILE`
-  (a text from stdin loses the one trailing line break `echo` adds).
+  ASCII JSON line to the turn's manifest, `RETINUE_REPLY_SHELL_ACTIONS_FILE`.
+  A text goes on stdin, in a quoted heredoc, so the shell passes it as
+  written (a text from stdin loses the one trailing line break a heredoc or
+  `echo` adds):
+
+  ```sh
+  scripts/shell-type.py [--sensitive] [--enter] - <<'EOF'
+  the text
+  EOF
+  ```
+
+  Inside `"…"` bash expands `$`, backticks and `\` before the CLI sees the
+  text — `Pa$$w0rd!` would be typed with the shell's PID in it, `$(…)` would
+  run in the container — so a text in `"…"` is only for one with no `$`,
+  backtick, `\` or `"`; anything else takes single quotes or the heredoc.
   It is the sibling of `conversation-push.py --reply-attach`
   (RETINUE_REPLY_ATTACHMENTS_FILE) and follows the same rules: a fresh
   manifest per spawn, only the kept run's is read, so an escalated junior's
@@ -1096,11 +1109,11 @@ phone types it there.
   phone's confirmation (Keyboard, above) end the same way, so it never
   reads as the user's refusal.
 - **Passwords, PINs and codes** can be typed two ways:
-  - `shell-type.py --sensitive "<text>"` — one the user dictated, or one Ara
-    fetched (an SMS code). The text reaches the phone, but the dashboard
-    shows it only as `••••••` (no reveal) and types it only on the user's
-    tap, a replayed transcript never carries it (`shell_actions.describe`),
-    and it is **deleted from the stored reply** as soon as the page reports
+  - `shell-type.py --sensitive - <<'EOF'` (the text, then `EOF`) — one the
+    user dictated, or one Ara fetched (an SMS code). The text reaches the
+    phone, but the dashboard shows it only as `••••••` (no reveal) and types
+    it only on the user's tap, a replayed transcript never carries it
+    (`shell_actions.describe`), and it is **deleted from the stored reply** as soon as the page reports
     it typed (the `outcome` call above) and in any case after
     `SENSITIVE_TTL_SECONDS` (two minutes): every read of a thread
     (`_load_conv`) purges an expired text before anything sees it, a timer
@@ -1183,7 +1196,12 @@ phone types it there.
   another** — the next starts on the previous one's final event, the app
   refusing a second one while it types — and *Stop* ends the one running (a
   text being typed, or an open password dialog — never a password being
-  typed) and drops the rest. The outcomes are reported to the gateway from the module,
+  typed) and drops the rest. A confirmation on the phone declined or not
+  answered in time (`cancelled`) drops the rest too, as do `not-enabled`,
+  `not-in-front` and `not-connected`: what waited was meant to follow the
+  action that did not run (a text after a Tab is for the field the Tab moves
+  to), so it is reported `cancelled` rather than typed into whatever has
+  focus. The outcomes are reported to the gateway from the module,
   not the thread view, so leaving the thread mid-text loses none. A
   `keyboard-type` action runs **by itself once**: only when the gateway
   marked it `auto`, only when its message arrives live in the thread open

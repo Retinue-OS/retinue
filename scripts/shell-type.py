@@ -6,13 +6,24 @@ headset, a TV, a computer — that cannot run Retinue itself. Inside a
 dashboard thread's turn, this attaches a *shell action* to the reply you are
 writing; when the reply reaches the user's phone, the app types it there.
 
-    shell-type.py "text to type"            # type it, no Enter
-    shell-type.py --enter "search terms"    # type it, then press Enter
+    shell-type.py - <<'EOF'                 # type the text, no Enter
+    text to type
+    EOF
+    shell-type.py --enter - <<'EOF'         # type it, then press Enter
+    search terms
+    EOF
+    shell-type.py --sensitive - <<'EOF'     # a password, PIN or code: see below
+    <PIN>
+    EOF
     shell-type.py --key enter               # press one key
-    shell-type.py --sensitive "<PIN>"       # a password, PIN or code: see below
     shell-type.py --secret "Meta account"   # a password from the user's manager
-    printf '%s' "$TEXT" | shell-type.py -   # text from stdin (one trailing
-                                            # line break, as echo adds, is dropped)
+
+A text goes on stdin (`-`) in a quoted heredoc (<<'EOF'), which passes it as
+written; the one trailing line break the heredoc adds is dropped. Inside
+"..." the shell expands $, backticks and backslashes before this script sees
+the text — a password typed wrong, a command run in the container — so a text
+in "..." is only for one with none of $, a backtick, a backslash or a double
+quote; anything else takes single quotes or the heredoc.
 
 Rules (CLAUDE.md, "Dashboard"):
 - Only on the user's explicit request ("type the text above", "type: …").

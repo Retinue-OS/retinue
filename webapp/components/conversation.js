@@ -1781,8 +1781,7 @@ class RetinueConversation extends HTMLElement {
           `${kbd.isSensitive(a) ? 'Typed: •••••• · ' : ''}Text deleted</small>${stop}</div>`;
       }
       const secret = a.kind === 'keyboard-secret';
-      const n = kbd.enterCount(a);
-      const enters = n === 0 ? '' : n === 1 ? ' + Enter' : ` + Enter ×${n}`;
+      const enters = kbd.enterSuffix(a);
       const label = secret ? kbd.describeAction(a)
         : (out ? `${kbd.isSensitive(a) ? 'Retype ••••••' : 'Retype'}${enters}`
           : `${kbd.describeAction(a)}${host ? ` on ${host}` : ''}`);

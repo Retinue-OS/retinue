@@ -2627,19 +2627,32 @@ def _sweep_stale_shell_manifests() -> int:
     behind. One holding a sensitive text belongs to a turn that typed it in a
     session this gateway would resume — that key's sessions are dropped, like
     a completed turn's (_record_turn_session) — and every one is deleted.
-    Returns how many keys were dropped."""
+    Returns how many keys were dropped.
+
+    Every key is dropped before anything is deleted, and each entry is dealt
+    with on its own: an entry with a manifest's name that cannot be read or
+    deleted (a directory, another user's file) must not stop the sweep, nor
+    leave resumable the session of a real manifest beside it."""
     tmp = Path(tempfile.gettempdir())
     by_tag = {_session_key_tag(k): k for k in _load_state()}
+    paths = list(tmp.glob(_SHELL_MANIFEST_PREFIX + "*"))
     dropped = 0
-    for path in tmp.glob(_SHELL_MANIFEST_PREFIX + "*"):
+    for path in paths:
         rest = path.name[len(_SHELL_MANIFEST_PREFIX):]
         tag = rest.split("-", 1)[0]
         try:
             if _manifest_has_sensitive(path) and tag in by_tag:
                 _record_turn_session(by_tag[tag], {}, drop=True)
                 dropped += 1
-        finally:
+        except OSError as exc:
+            print(f"[web-gateway] stale shell manifest {path} not checked: {exc}",
+                  flush=True)
+    for path in paths:
+        try:
             path.unlink(missing_ok=True)
+        except OSError as exc:
+            print(f"[web-gateway] stale shell manifest {path} not deleted: {exc}",
+                  flush=True)
     return dropped
 
 

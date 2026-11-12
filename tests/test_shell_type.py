@@ -10,13 +10,15 @@ Covers: each kind writes its canonical action; calls accumulate; Enter is off
 unless asked; the call fails outside a thread turn; bad input (two modes,
 --enter with --key, oversized or control-character text, unknown key) writes
 nothing; and the gateway-side parser keeps valid lines, drops bad ones and
-duplicate ids, and caps the count.
+duplicate ids, and caps the count; the documented heredoc form passes a text
+as written, and no example puts one in double quotes.
 
     python3 tests/test_shell_type.py
 """
 import importlib.util
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -268,6 +270,32 @@ def test_parse_manifest():
           "and never carries text on a secret")
 
 
+def test_heredoc_is_the_documented_form(tmp: Path):
+    """The documented form passes the text to the CLI as written: through a
+    quoted heredoc, bash expands nothing. In "..." it would expand `$$` (a
+    password typed with the shell's PID in it) and run `$(...)` and
+    backticks in the container, so the docs never show a text in "..."."""
+    m = tmp / "m-heredoc"
+    text = "Pa$$w0rd! $HOME $(echo run) `echo run` \\n \"q\""
+    script = (f"{sys.executable!s} {str(SCRIPT)!s} --sensitive - <<'EOF'\n"
+              f"{text}\nEOF\n")
+    env = dict(os.environ, **{sa.MANIFEST_VAR: str(m)})
+    r = subprocess.run(["bash", "-c", script], env=env, capture_output=True,
+                       text=True, timeout=30)
+    assert r.returncode == 0, r.stderr
+    got = _lines(m)
+    assert got[0]["text"] == text and got[0]["sensitive"] is True, got
+    # Every documented example of a text uses stdin; a text in "..." after
+    # the script's name or a text flag is the form that expands.
+    bad = re.compile(r'shell-type\.py(?:\s+--(?:sensitive|enter))*\s+"')
+    for doc in (REPO_ROOT / "CLAUDE.md", REPO_ROOT / "docs" / "dashboard.md", SCRIPT):
+        hits = [line for line in doc.read_text(encoding="utf-8").splitlines()
+                if bad.search(line)]
+        assert not hits, (doc.name, hits)
+    print("ok: the documented heredoc passes a text as written; no example puts "
+          "one in double quotes")
+
+
 def main():
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
@@ -279,6 +307,7 @@ def main():
         test_purge_and_describe()
         test_outcome_and_auto_run()
         test_separators_and_labels(tmp)
+        test_heredoc_is_the_documented_form(tmp)
     print("all shell-type tests passed")
 
 

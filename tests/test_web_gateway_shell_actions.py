@@ -2,10 +2,10 @@
 """Shell actions in the gateway, end to end where it matters: a queued turn
 answers its own message (or nothing), the session log never records a prompt,
 a raising spawn or a restart leaves no resumable session that typed a
-password, `auto` needs a text the user has seen — and over HTTP: which user
-messages count as the dashboard's (`via_edge`), the outcome endpoint only
-through the reverse proxy, the redact endpoint only from inside a turn the
-user started after that message.
+password (an undeletable leftover entry included), `auto` needs a text the
+user has seen — and over HTTP: which user messages count as the dashboard's
+(`via_edge`), the outcome endpoint only through the reverse proxy, the redact
+endpoint only from inside a turn the user started after that message.
 
 Standalone like the rest of the suite:
 
@@ -239,6 +239,34 @@ def test_restart_sweeps_stale_manifests(wg, tmp: Path):
     print("ok: a restart leaves no manifest and no resumable session behind")
 
 
+
+def test_restart_sweep_survives_an_undeletable_entry(wg, tmp: Path):
+    """An entry with a manifest's name that cannot be deleted — a directory,
+    another user's file — neither stops the sweep nor keeps the session of a
+    real manifest beside it resumable, whichever the directory lists first."""
+    key = "conv:" + "5" * 32
+    sid = "55555555-1111-2222-3333-444444444444"
+    t = _transcript(wg, tmp, sid)
+    wg._record_turn_session(key, {"session_id": sid, "last_activity": wg._now_ts()})
+    private = tmp / "sweep-tmp"
+    private.mkdir()
+    tag = wg._session_key_tag(key)
+    blocker = private / f"{wg._SHELL_MANIFEST_PREFIX}{tag}-{'0' * 32}"
+    blocker.mkdir()
+    (blocker / "inside").write_text("x", encoding="utf-8")
+    stale = private / f"{wg._SHELL_MANIFEST_PREFIX}{tag}-{'c' * 32}"
+    stale.write_text(json.dumps(SENS) + "\n", encoding="utf-8")
+    saved = tempfile.tempdir
+    tempfile.tempdir = str(private)
+    try:
+        assert wg._sweep_stale_shell_manifests() >= 1
+    finally:
+        tempfile.tempdir = saved
+    assert not stale.exists(), "the real manifest still goes"
+    assert wg._get_session_entry(key) == {} and not t.exists(), "and its session"
+    assert blocker.is_dir(), "the entry it cannot delete is left as it is"
+    print("ok: one undeletable entry neither stops the sweep nor saves a session")
+
 def test_auto_needs_a_text_the_user_has_seen(wg):
     conv = wg._new_conv("user", "reto", "t", "user", "type the line above", via_edge=True)
     cid = conv["id"]
@@ -461,6 +489,7 @@ def main():
         test_a_turn_covers_only_what_it_may_answer(wg)
         test_session_log_never_records_a_prompt(wg)
         test_restart_sweeps_stale_manifests(wg, tmp)
+        test_restart_sweep_survives_an_undeletable_entry(wg, tmp)
         test_auto_needs_a_text_the_user_has_seen(wg)
         test_auto_counts_only_what_the_user_saw_before_the_turn(wg)
         test_auto_needs_a_whole_line_and_is_one_per_reply(wg)

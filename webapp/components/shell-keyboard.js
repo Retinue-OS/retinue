@@ -43,7 +43,10 @@
 //     or once the shell has not answered in time (watchdogMs; the row then
 //     says so rather than waiting on, and a late answer still counts).
 //     Stop (cancel) ends the current one — a typing text, or an open password
-//     dialog; never a password being typed — and drops the rest.
+//     dialog; never a password being typed — and drops the rest. A declined
+//     or unanswered confirmation on the phone (`cancelled`), and an app or
+//     device that is not ready, drop the rest too (STOPS_THE_REST): what
+//     waited was meant to follow it, and would type into the wrong field.
 //   - Every outcome goes back to the gateway (reportOutcome) from here, not
 //     from the thread view, which may have closed meanwhile; the gateway
 //     keeps it on the action for Ara's later turns.
@@ -233,8 +236,33 @@ function ensureReporter() {
       started.delete(d.id);
       report(entry, d);
     }
-    if (current && current.action.id === d.id) advance();
+    if (current && current.action.id === d.id) {
+      // What waited was meant to follow this one: the text after a Tab is for
+      // the field the Tab moves to. When it did not run — the phone's
+      // confirmation declined or not answered (`cancelled`), or the app or the
+      // device not ready — the rest is dropped, as Stop drops it, rather than
+      // typed into whatever has focus now.
+      if (d.state === 'error' && STOPS_THE_REST.has(d.error)) dropWaiting();
+      advance();
+    }
   });
+}
+
+// The errors after which nothing that waited runs: `cancelled` (the page's
+// Stop, or the phone's confirmation declined or not answered in time), and
+// those that leave the device where it was for every action after it. The
+// others ('failed', 'busy', 'unsupported-char', 'too-long') concern this one
+// action, and the next starts as before.
+const STOPS_THE_REST = new Set(['cancelled', 'not-enabled', 'not-in-front', 'not-connected']);
+
+// Drop every waiting entry, each told and reported as cancelled.
+function dropWaiting() {
+  const waiting = queue.splice(0, queue.length);
+  for (const entry of waiting) {
+    const d = { state: 'error', error: 'cancelled' };
+    notify(entry, 'error', { error: 'cancelled' });
+    report(entry, d);
+  }
 }
 
 function report(entry, d) {
@@ -307,12 +335,7 @@ export function run(action, { threadId = '', message = null, onState = null, now
 // Stop: the shell ends what it is typing (its outcome comes as `error`
 // `cancelled`), and whatever waited is dropped, reported as cancelled too.
 export function cancel() {
-  const waiting = queue.splice(0, queue.length);
-  for (const entry of waiting) {
-    const d = { state: 'error', error: 'cancelled' };
-    notify(entry, 'error', { error: 'cancelled' });
-    report(entry, d);
-  }
+  dropWaiting();
   if (!current) return false;
   // A password dialog open on the phone is closed by the shell, which answers
   // `secret-cancelled`; one that does not answer is given up on soon, not after
@@ -396,7 +419,9 @@ export function enterCount(a) {
   return breaks + (a.enter ? 1 : 0);
 }
 
-function enterSuffix(a) {
+// ' + Enter' (×N) for every Enter `a` presses, '' for none: every label that
+// names the action says it, so no Enter is pressed unannounced.
+export function enterSuffix(a) {
   const n = enterCount(a);
   return n === 0 ? '' : n === 1 ? ' + Enter' : ` + Enter ×${n}`;
 }
@@ -419,7 +444,7 @@ export function describeAction(a) {
     return `Type ${n} character${n === 1 ? '' : 's'}${enterSuffix(a)}`;
   }
   if (a.kind === 'keyboard-key') return `Press ${keyName(a.key)}`;
-  if (a.kind === 'keyboard-secret') return `Password from manager: ${a.label || 'secret'}`;
+  if (a.kind === 'keyboard-secret') return `Password from manager: ${a.label || 'secret'}${enterSuffix(a)}`;
   return '';
 }
 

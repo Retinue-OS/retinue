@@ -6,7 +6,8 @@ Bluetooth keyboard (scripts/shell-type.py). These checks pin down the policy:
 nothing runs outside the shell; only plain one-line text runs by itself, and
 only live, young and once; a secret never runs by itself and its text never
 exists on the page; actions run one at a time, every outcome is reported, and
-Stop drops what waits; a sensitive text is gone from the page after two
+Stop drops what waits, as does a confirmation on the phone declined or not
+answered; a sensitive text is gone from the page after two
 minutes; the shell members are called with the contract's arguments; and the
 outcome wording.
 
@@ -197,7 +198,9 @@ await ok('actions run one after another, each on the previous one\'s final event
   assert.deepEqual(states, ['pending', 'queued', 'queued']);
   event('typed', typeA.id, { count: 11 });
   assert.deepEqual(calls.at(-1), ['key', 'enter', { id: keyB.id }]);
-  event('error', keyB.id, { error: 'not-connected' });
+  // An error of this one action only: the next starts (one that stops the
+  // rest: 'a declined or unanswered confirmation drops the rest too').
+  event('error', keyB.id, { error: 'failed' });
   assert.deepEqual(calls.at(-1), ['secret', { id: secretC.id, label: 'Meta account', enter: true }], 'a secret carries no text');
   event('secret-cancelled', secretC.id);
   assert.equal(kbd.isRunning(), false);
@@ -205,7 +208,7 @@ await ok('actions run one after another, each on the previous one\'s final event
   // Every outcome reached the gateway — from the module, whatever the view does.
   assert.deepEqual(posted, [
     [`/conversations/${tid}/shell-actions/${typeA.id}/outcome`, { state: 'typed' }],
-    [`/conversations/${tid}/shell-actions/${keyB.id}/outcome`, { state: 'error', error: 'not-connected' }],
+    [`/conversations/${tid}/shell-actions/${keyB.id}/outcome`, { state: 'error', error: 'failed' }],
     [`/conversations/${tid}/shell-actions/${secretC.id}/outcome`, { state: 'secret-cancelled' }],
   ]);
   assert.equal(shell.keyboardOpen(), true);
@@ -225,6 +228,41 @@ await ok('Stop ends the one typing and drops the rest, reported as cancelled', a
   assert.equal(kbd.isRunning(), false);
   assert.deepEqual(posted.map((x) => x[1]), [{ state: 'error', error: 'cancelled' }, { state: 'error', error: 'cancelled' }]);
   assert.deepEqual(heard.map((h) => h[0]).sort(), [keyTab.id, typeA.id].sort());
+});
+
+await ok('a declined or unanswered confirmation drops the rest too', async () => {
+  // Ara's Tab, then a text meant for the field the Tab moves to: the phone
+  // asks for the key, and the user declines or lets it run out. The text
+  // must not type into the field that still has focus.
+  for (const error of ['cancelled', 'not-enabled', 'not-in-front', 'not-connected']) {
+    kbd._reset();
+    posted.length = 0;
+    const calls = installShell();
+    const rows = new Map();
+    const onState = (id) => (out) => rows.set(id, out);
+    const pin = { ...typeA, id: 'd'.repeat(32), text: 'hunter2', sensitive: true };
+    kbd.run(keyTab, { threadId: tid, onState: onState(keyTab.id) });
+    kbd.run(pin, { threadId: tid, onState: onState(pin.id), message: { ts: new Date().toISOString() } });
+    assert.deepEqual(rows.get(pin.id), { state: 'queued' });
+    event('error', keyTab.id, { error });
+    assert.equal(calls.filter((c) => c[0] === 'type').length, 0, `${error}: the queued text never types`);
+    assert.deepEqual(rows.get(pin.id), { state: 'error', error: 'cancelled' }, error);
+    assert.equal(kbd.isRunning(), false, error);
+    await tick();
+    assert.deepEqual(posted.map(([url, body]) => [url.split('/')[4], body]).sort(), [
+      [keyTab.id, { state: 'error', error }],
+      [pin.id, { state: 'error', error: 'cancelled' }],
+    ].sort(), error);
+  }
+  // An error that says nothing about the device or the user moves on.
+  for (const error of ['failed', 'busy', 'unsupported-char', 'too-long']) {
+    kbd._reset();
+    const calls = installShell();
+    kbd.run(keyTab, { threadId: tid });
+    kbd.run(typeA, { threadId: tid });
+    event('error', keyTab.id, { error });
+    assert.deepEqual(calls.at(-1), ['type', 'Hallo Quest', { id: typeA.id, enter: false }], error);
+  }
 });
 
 await ok('the watchdog settles a row the shell never answered; a late event still counts', async () => {
@@ -331,7 +369,9 @@ await ok('wording', () => {
   assert.equal(kbd.describeAction(typeA), 'Type 11 characters');
   assert.equal(kbd.describeAction({ ...typeA, text: 'x', enter: true }), 'Type 1 character + Enter');
   assert.equal(kbd.describeAction(keyB), 'Press Enter');
-  assert.equal(kbd.describeAction(secretC), 'Password from manager: Meta account');
+  assert.equal(kbd.describeAction(secretC), 'Password from manager: Meta account + Enter',
+    'the Enter after a password from the manager is shown too');
+  assert.equal(kbd.describeAction({ ...secretC, enter: false }), 'Password from manager: Meta account');
   assert.deepEqual(kbd.describeOutcome({ state: 'typed' }, 'Quest 3'), ['Typed on Quest 3 ✓', '']);
   assert.deepEqual(kbd.describeOutcome({ state: 'queued' }), ['Waiting for the one before…', '']);
   // Each fix where it can be made: the keyboard screen connects a device;
