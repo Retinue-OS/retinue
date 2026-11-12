@@ -155,7 +155,9 @@ def runs_by_itself(action: dict) -> bool:
     has not just confirmed. Never a password-manager field.
 
     The Ara app asks on the phone itself, a second time, before Enter, a line
-    break, a tab or any key, and by default (its one-line mode) types plain
+    break, a tab, an empty text, a text with whitespace at either end, or any
+    key (everything its onlyWrites rule does not hold for; the phone cannot
+    see `sensitive`), and by default (its one-line mode) types plain
     one-line text at once: in that mode, whatever this rule lets run by
     itself the phone does not ask about, and what it asks about this rule
     never lets run by itself. The app's rule must never be the stricter one.

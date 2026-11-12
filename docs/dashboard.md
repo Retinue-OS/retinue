@@ -1211,7 +1211,9 @@ phone types it there.
   comes later still reaches the row and the gateway. *Stop* on a row that
   still says it is typing an action the page no longer runs settles it the
   same way. While the phone asks before
-  an Enter, a line break, a tab or a key (`phoneConfirms`), the row says
+  an Enter, a line break, a tab, a key, an empty text or a text with
+  whitespace at either end (Python's set; `phoneConfirms`, which follows
+  the app's `onlyWrites` rule), the row says
   *Waiting for confirmation on the phone…* instead of *Typing…*; a
   `cancelled` reads *Not typed: stopped, or not confirmed on the phone*.
   The phone may also ask about a plain one-line text, an automatic run

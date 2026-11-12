@@ -194,6 +194,15 @@ await ok('the phone confirms Enter, a line break, a tab and any key; the row say
     ['the Enter key', keyB, true],
     ['the Space key', { ...keyTab, key: 'space' }, true],
     ['a password-manager field', secretC, false],
+    ['a trailing space', { ...typeA, text: 'a ' }, true],
+    ['a leading space', { ...typeA, text: ' a' }, true],
+    ['git push with a trailing space', { ...typeA, text: 'git push ' }, true],
+    ['an empty text', { ...typeA, text: '' }, true],
+    ['a text ending in U+0085', { ...typeA, text: 'a\u0085' }, true],
+    ['a text starting with U+3000', { ...typeA, text: '\u3000a' }, true],
+    ['U+FEFF at the end (not Python whitespace; the app does not ask)', { ...typeA, text: 'a\ufeff' }, false],
+    ['a space inside', { ...typeA, text: 'a b' }, false],
+    ['a sensitive text with an edge space', { ...typeA, text: 'a ', sensitive: true }, true],
   ]) assert.equal(kbd.phoneConfirms(a), asks, what);
   const states = [];
   const onState = (out) => states.push(out);

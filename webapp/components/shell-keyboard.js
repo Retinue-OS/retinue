@@ -27,7 +27,8 @@
 //     only whitespace or starts or ends with it. The gateway never marks
 //     those `auto`; the page checks again.
 //   - The phone asks once more, in a confirmation it draws itself, before
-//     Enter, a line break, a tab or any key (phoneConfirms) — up to 25 s for
+//     Enter, a line break, a tab, an empty text, a text with whitespace at
+//     either end, or any key (phoneConfirms) — up to 25 s for
 //     a text, 12 s for a key. The row says it waits for that rather than
 //     "Typing…"; a declined or unanswered confirmation ends as `cancelled`,
 //     as the page's own Stop does, so neither is worded as the user's no.
@@ -135,14 +136,23 @@ export function needsTap(a) {
     || PY_EDGE_SPACE.test(a.text) || !a.text.trim() || a.text.trim() !== a.text;
 }
 
-// Whether the Ara app asks on the phone before it carries `a` out: before
-// anything that can act on the device — Enter, a line break or a tab in a
-// text, any key. Plain one-line text it types at once; a password-manager
-// field is a dialog of its own.
+// Whether the Ara app asks on the phone before it carries `a` out, in its
+// default (one-line) mode: everything that is not "only writes"
+// (KeyboardLogic.onlyWrites in ara-android, the twin of
+// shell_actions.runs_by_itself less its `sensitive`, which the phone cannot
+// see, so it does not matter here). That is any key; a text with Enter, a
+// line break or a tab; an empty text; and a text with whitespace at either
+// end, by Python's set (PY_EDGE_SPACE, not trim()), since a space there
+// presses a focused button. Plain one-line text it types at once; a
+// password-manager field is a dialog of its own. Used for the row's wording
+// only.
 export function phoneConfirms(a) {
   if (!a) return false;
   if (a.kind === 'keyboard-key') return true;
-  return a.kind === 'keyboard-type' && (!!a.enter || (typeof a.text === 'string' && /[\r\n\t]/.test(a.text)));
+  if (a.kind !== 'keyboard-type') return false;
+  if (a.enter) return true;
+  return typeof a.text === 'string'
+    && (a.text === '' || /[\r\n\t]/.test(a.text) || PY_EDGE_SPACE.test(a.text));
 }
 
 // `live`: the message arrived while the thread was open here (liveArrivals);
