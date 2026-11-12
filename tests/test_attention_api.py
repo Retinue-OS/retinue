@@ -1184,6 +1184,45 @@ def test_hand_set_focus_and_breaks(base, wg):
     print("ok test_hand_set_focus_and_breaks")
 
 
+def test_focus_can_be_turned_off(base, wg):
+    """Focus is optional per instance: turned off in Settings, the home's
+    mode is Focus off, a hand-set mode is refused, Rest holds nothing back,
+    and turned on again the week is where it was."""
+    night = datetime(2026, 9, 9, 23, 0, tzinfo=timezone.utc)          # a Wednesday, Rest
+    _clock(wg, night)
+    _mode(base, None)
+    assert _sections(base)["mode"]["id"] == "rest"
+    # Held by Rest, then focus turned off: the breakpoint's digest carries
+    # it, and it does not ring a second time on its own.
+    waited = _open(base, "Overnight", "Needs an answer by 07:00.",
+                   {"importance": 4, "sphere": "customers", "due": (night + timedelta(hours=8)).isoformat(), "lead": "12h"})
+    assert waited["attention"]["delivery"] == "hold", waited["attention"]
+    PUSHES.clear()
+    status, out = _http(base, "POST", "/attention/modes", {"enabled": False})
+    assert len(PUSHES) == 1, PUSHES                                   # the digest alone
+    assert out["pushed"] == [], out
+    assert status == 200 and out["changed"] == ["focus modes off"] and out["focus"]["enabled"] is False, out
+    assert out["mode"]["enabled"] is False and out["mode"]["id"] == "focus-off", out["mode"]
+    body = _sections(base)
+    assert body["focus_enabled"] is False and body["mode"]["id"] == "focus-off" and not body["mode"]["manual"]
+    status, out = _http(base, "GET", "/attention/profile")
+    assert status == 200 and out["focus"]["enabled"] is False
+    status, out = _http(base, "POST", "/attention/mode", {"mode": "focused"})
+    assert status == 409 and out["error"], out
+    status, _ = _http(base, "POST", "/attention/mode", {"mode": None})   # releasing stays harmless
+    assert status == 200
+    urgent = _open(base, "Night call", "Please confirm by 06:00.",
+                   {"importance": 4, "sphere": "friends", "due": (night + timedelta(hours=7)).isoformat(), "lead": "12h"})
+    assert urgent["attention"]["delivery"] == "push", urgent["attention"]      # Rest would have held it
+    tid = "thread:" + urgent["id"]
+    sheet = _http(base, "GET", "/attention/item?" + urllib.parse.urlencode({"id": tid}))[1]
+    assert sheet["item"]["admission"] == {"by": "focus-off", "what": ""} and sheet["mode"]["enabled"] is False
+    _http(base, "POST", "/attention/items/done", {"id": tid})
+    status, out = _http(base, "POST", "/attention/modes", {"enabled": True})
+    assert status == 200 and out["changed"] == ["focus modes on"] and out["mode"]["id"] == "rest", out
+    assert _sections(base)["focus_enabled"] is True
+
+
 def test_week_and_holidays(base, wg):
     """A day plan rules the days it names; a holiday follows the plan that
     claims holidays, whatever its weekday; the patch keeps every weekday in
@@ -1611,6 +1650,7 @@ def main():
         test_tick_digest_and_sweep(base, wg)
         test_internal_set(base, wg)
         test_hand_set_focus_and_breaks(base, wg)
+        test_focus_can_be_turned_off(base, wg)
         test_week_and_holidays(base, wg)
         test_append_reports_delivery(base, wg)
         test_unarchive_keeps_done(base, wg)
