@@ -155,9 +155,14 @@ def runs_by_itself(action: dict) -> bool:
     has not just confirmed. Never a password-manager field.
 
     The Ara app asks on the phone itself, a second time, before Enter, a line
-    break, a tab or any key, and types plain one-line text at once: whatever
-    this rule lets run by itself, the phone does not ask about, and what it
-    asks about this rule never lets run by itself."""
+    break, a tab or any key, and by default (its one-line mode) types plain
+    one-line text at once: in that mode, whatever this rule lets run by
+    itself the phone does not ask about, and what it asks about this rule
+    never lets run by itself. The app's rule must never be the stricter one.
+    The phone also asks about plain one-line text after the user pressed
+    Stop on its strip, and always on a device set to ask every time; such a
+    text may then end as `cancelled` up to 25 s after the page asked, which
+    the page takes as the end of that action like any other."""
     if not isinstance(action, dict) or action.get("kind") != "keyboard-type":
         return False
     text = action.get("text")

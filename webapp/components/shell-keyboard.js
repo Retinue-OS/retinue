@@ -31,6 +31,13 @@
 //     a text, 12 s for a key. The row says it waits for that rather than
 //     "Typing…"; a declined or unanswered confirmation ends as `cancelled`,
 //     as the page's own Stop does, so neither is worded as the user's no.
+//     That is the app's default (one-line) mode: after the user pressed Stop
+//     on the phone's strip, and on a device set to ask every time, the phone
+//     asks about plain one-line text too, an automatic run included, while
+//     the row, which cannot know, says "Typing…". Such a text may then end
+//     as `cancelled` up to 25 s later, a final event like any other:
+//     reported, worded as above, offered for Retype, never run by itself
+//     again.
 //   - What a tap types is shown before it: the text itself (visibleText,
 //     line breaks and tabs marked), and in the label every Enter it presses
 //     (enterCount — a line break is one). Only a sensitive text is not:
@@ -111,15 +118,19 @@ export function claim(id) {
 }
 
 // ── The auto-run decision ──────────────────────────────────────────────────
+// What Python's str.strip() strips (str.isspace()), character by character.
+// JavaScript's trim() is not the same set: it also takes U+FEFF, but not
+// U+0085 or U+001C-U+001F, so the page tests Python's set itself and trim()
+// on top, which keeps the page at least as strict as the gateway.
+const PY_EDGE_SPACE = /^[\t-\r\x1c-\x20\x85\xa0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]|[\t-\r\x1c-\x20\x85\xa0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]$/;
+
 // Whether the action waits for the user's tap whatever the gateway says — the
 // page side of shell_actions.runs_by_itself: everything but plain one-line
-// text without Enter, and with no whitespace at its edges. (JavaScript's
-// trim() takes a few characters more for whitespace than Python's strip(),
-// U+FEFF among them; that only makes the page the stricter.)
+// text without Enter, and with no whitespace at its edges.
 export function needsTap(a) {
   if (!a || a.kind !== 'keyboard-type') return true;
   return !!a.enter || a.sensitive === true || typeof a.text !== 'string' || /[\r\n\t]/.test(a.text)
-    || !a.text.trim() || a.text.trim() !== a.text;
+    || PY_EDGE_SPACE.test(a.text) || !a.text.trim() || a.text.trim() !== a.text;
 }
 
 // Whether the Ara app asks on the phone before it carries `a` out: before

@@ -13,7 +13,7 @@ nothing; and the gateway-side parser keeps valid lines, drops bad ones and
 duplicate ids, and caps the count; the documented --file form passes a text
 as written (a line `EOF` and quotes included), and no example puts one in
 quotes or a heredoc; --file refuses what it cannot read or combine and
-deletes a sensitive text's file once read.
+deletes a sensitive text's file, also when the call is refused.
 
     python3 tests/test_shell_type.py
 """
@@ -194,6 +194,24 @@ def test_outcome_and_auto_run():
     for spaced in (" ", "  ", " a", "a ", "\u00a0x"):
         assert not sa.runs_by_itself(dict(t, text=spaced)), repr(spaced)
     assert sa.runs_by_itself(dict(t, text="a b"))
+    # Every character strip() takes, at either edge, keeps a text from running
+    # by itself. The set is pinned as well: the page's needsTap
+    # (tests/test_webapp_shell_keyboard.py is handed it) and the Android app's
+    # PY_WHITESPACE (KeyboardLogic.kt) test the same characters, so a change
+    # here must reach both.
+    py_whitespace = [c for c in map(chr, range(sys.maxunicode + 1)) if ("a" + c).strip() == "a"]
+    assert [ord(c) for c in py_whitespace] == [
+        0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x1C, 0x1D, 0x1E, 0x1F, 0x20, 0x85, 0xA0, 0x1680,
+        *range(0x2000, 0x200B), 0x2028, 0x2029, 0x202F, 0x205F, 0x3000], \
+        [hex(ord(c)) for c in py_whitespace]
+    for c in py_whitespace:
+        for text in ("a" + c, c + "a"):
+            assert not sa.runs_by_itself(dict(t, text=text)), repr(text)
+    for c in map(chr, (0x3000, 0x2028, 0x0B, 0x85, 0x1C, 0x1D, 0x1E, 0x1F)):
+        assert not sa.runs_by_itself(dict(t, text="a" + c)), repr(c)
+        assert not sa.runs_by_itself(dict(t, text=c + "a")), repr(c)
+    # Inside the text, whitespace other than a tab or a line break is plain.
+    assert sa.runs_by_itself(dict(t, text="a" + chr(0x3000) + "b"))
     print("ok: outcomes are validated; only plain one-line text runs by itself")
 
 
@@ -323,7 +341,8 @@ def test_file_option(tmp: Path):
     (an editor ends a file with one; --enter is how to ask for Enter), it
     goes with --sensitive and --enter but not with TEXT, --key or --secret,
     an unreadable file writes nothing, and with --sensitive the file is
-    deleted once read, so a password does not stay in the container."""
+    deleted, also when the call is refused, so a password does not stay
+    in the container."""
     m = tmp / "m-file2"
     f = tmp / "plain.txt"
     f.write_text("hello Quest\n", encoding="utf-8")
@@ -360,8 +379,34 @@ def test_file_option(tmp: Path):
     assert not secret.exists(), "a sensitive text's file is deleted once read"
     last = _lines(m)[-1]
     assert last["text"] == "4711" and last["sensitive"] is True, last
+    # A sensitive text's file goes whatever the outcome: a call that is
+    # refused (outside a turn, a bad combination, a file that is no text, a
+    # text that does not validate, a full manifest) leaves no PIN behind.
+    full = tmp / "m-file-full"
+    full.write_text("{}\n" * sa.MAX_ACTIONS, encoding="utf-8")
+    for content, args, manifest in (
+            (b"4711\n", [], None),
+            (b"4711\n", ["--key", "tab"], refused),
+            (b"4711\n", ["x"], refused),
+            (b"4711\n", ["--secret", "Wi-Fi"], refused),
+            (b"4711\n", ["--enter", "--key", "enter"], refused),
+            (b"47\xe911", [], refused),
+            (b"47\x0711", [], refused),
+            (b"\n", [], refused),
+            (b"x" * (sa.MAX_TEXT + 1), [], refused),
+            (b"4711", [], full)):
+        secret.write_bytes(content)
+        r = _run(["--sensitive", "--file", str(secret), *args], manifest)
+        assert r.returncode == 2, (content, args, r.returncode, r.stderr)
+        assert "4711" not in r.stdout + r.stderr, r.stderr
+        assert not secret.exists(), ("a refused sensitive call deletes its file", content, args)
+    assert not refused.exists(), "a refused call must not write"
+    # A file that is not there is refused as unreadable, without a second
+    # complaint about deleting it.
+    r = _run(["--sensitive", "--file", str(secret)], refused)
+    assert r.returncode == 2 and "could not delete" not in r.stderr, r.stderr
     print("ok: --file reads a text as written, refuses what it cannot read or "
-          "combine, and deletes a sensitive text's file once read")
+          "combine, and deletes a sensitive text's file on every outcome")
 
 
 def main():

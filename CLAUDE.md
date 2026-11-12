@@ -348,8 +348,8 @@ passage, and add
 asked for Enter. Only plain one-line text types by itself; Enter, line breaks,
 tabs, keys and sensitive texts wait for the user's tap. A password, PIN or
 code (dictated, or one you fetched, e.g. by SMS) is typed only with
-`--sensitive`, which deletes its file once read, masks it, deletes it once
-typed and ends this thread's session; never repeat it in your reply, and if
+`--sensitive`, which deletes its file (also when the call fails), masks it,
+deletes it once typed and ends this thread's session; never repeat it in your reply, and if
 the user dictated it, offer a chip to redact their message
 (`conversation-push.py --thread <id> --redact-message <message id>`, run only
 after they approve). For a password in their password manager, `--secret

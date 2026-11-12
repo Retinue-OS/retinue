@@ -20,8 +20,8 @@ command line, in quotes or in a heredoc: the text itself can end any of them
 — a `$` or backtick inside "...", an apostrophe inside '...', a line `EOF`
 inside <<'EOF' — and what follows is then typed wrong or runs as commands in
 the container, with the agent's tokens. With `--sensitive` the file is
-deleted once read. (`-` reads the text from stdin, for another program's
-output.)
+deleted when the call ends, also when it is refused. (`-` reads the text
+from stdin, for another program's output.)
 
 Rules (CLAUDE.md, "Dashboard"):
 - Only on the user's explicit request ("type the text above", "type: …").
@@ -82,7 +82,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--file", metavar="PATH",
                         help="type the text this file holds, as written (one trailing "
                              "line break dropped); with --sensitive the file is "
-                             "deleted once read")
+                             "deleted, also when the call is refused")
     parser.add_argument("--enter", action="store_true",
                         help="press Enter after the text or secret (only when asked)")
     parser.add_argument("--key", choices=shell_actions.KEYS,
@@ -95,7 +95,26 @@ def main(argv: list[str] | None = None) -> int:
                              "account'), filled by the user's password manager; the "
                              "password never passes through here")
     args = parser.parse_args(argv)
+    try:
+        return _attach(args)
+    finally:
+        if args.sensitive and args.file is not None:
+            # A password must not stay in the container, whether it now rides
+            # on the reply or the call was refused (outside a turn, a bad
+            # combination, a file that is no text): the file was written for
+            # this call alone, and a refused call is written anew.
+            try:
+                os.unlink(args.file)
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                print(f"shell-type: could not delete {args.file} "
+                      f"({exc.strerror}); delete it yourself", file=sys.stderr)
 
+
+def _attach(args: argparse.Namespace) -> int:
+    """Check the call, then append its action to the turn's manifest; the
+    exit status. main() deletes a sensitive text's file afterwards."""
     given = [m for m in (args.text is not None, args.file is not None,
                          args.key is not None, args.secret is not None) if m]
     if len(given) != 1:
@@ -132,14 +151,6 @@ def main(argv: list[str] | None = None) -> int:
                 reason = exc.strerror if isinstance(exc, OSError) else "not UTF-8 text"
                 print(f"shell-type: cannot read {args.file}: {reason}", file=sys.stderr)
                 return 2
-            if args.sensitive:
-                # A password must not stay in the container once it rides on
-                # the reply; the file was written for this call alone.
-                try:
-                    os.unlink(args.file)
-                except OSError as exc:
-                    print(f"shell-type: could not delete {args.file} "
-                          f"({exc.strerror}); delete it yourself", file=sys.stderr)
         else:
             text = args.text
             if text == "-":

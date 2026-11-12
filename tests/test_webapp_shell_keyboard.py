@@ -16,6 +16,7 @@ test reports a skip and passes.
 
     python3 tests/test_webapp_shell_keyboard.py
 """
+import json
 import os
 import shutil
 import subprocess
@@ -24,6 +25,11 @@ import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 COMPONENTS = os.path.join(HERE, "..", "webapp", "components")
+
+# Every character Python's str.strip() takes off an edge: the set
+# shell_actions.runs_by_itself judges with, handed to the page's twin below.
+PY_WHITESPACE = "".join(chr(c) for c in range(sys.maxunicode + 1)
+                        if ("a" + chr(c)).strip() == "a")
 
 HARNESS = r"""
 import assert from 'node:assert/strict';
@@ -139,6 +145,27 @@ await ok('only plain one-line text the gateway marked auto runs by itself', () =
     assert.equal(kbd.shouldAutoRun({ ...typeA, text }, fresh, { live: true, now }), false, JSON.stringify(text));
   }
   assert.equal(kbd.needsTap({ ...typeA, text: 'a b' }), false);
+  // Every character Python's strip() takes, at either edge, waits for a tap:
+  // the list comes from Python itself (PY_WHITESPACE, put in by main()), so
+  // the page and shell_actions.runs_by_itself cannot drift apart. trim()
+  // alone misses U+0085 and U+001C-U+001F.
+  const pyWhitespace = __PY_WHITESPACE__;
+  assert.ok(pyWhitespace.length >= 29, 'the list made it into the harness');
+  for (const c of pyWhitespace) {
+    for (const text of ['a' + c, c + 'a']) {
+      assert.equal(kbd.needsTap({ ...typeA, text }), true, JSON.stringify(text));
+    }
+  }
+  for (const c of ['\u3000', '\u2028', '\u000b', '\u0085', '\u001c', '\u001d', '\u001e', '\u001f']) {
+    assert.ok(pyWhitespace.includes(c), JSON.stringify(c));
+    assert.equal(kbd.needsTap({ ...typeA, text: 'a' + c }), true, JSON.stringify(c));
+    assert.equal(kbd.needsTap({ ...typeA, text: c + 'a' }), true, JSON.stringify(c));
+  }
+  // trim()'s U+FEFF, not whitespace to Python, still waits: the page may be
+  // the stricter of the two, never the looser.
+  assert.equal(kbd.needsTap({ ...typeA, text: 'a\ufeff' }), true);
+  // Inside the text, whitespace other than a tab or a line break is plain.
+  assert.equal(kbd.needsTap({ ...typeA, text: 'a\u3000b' }), false);
 });
 
 await ok('the phone confirms Enter, a line break, a tab and any key; the row says so', () => {
@@ -318,6 +345,54 @@ await ok('the watchdog settles a row the shell never answered; a late event stil
   ]);
 });
 
+await ok('a plain text the phone asked about anyway ends as cancelled like any other', async () => {
+  // After the Stop on the phone's strip, or on a device set to ask every
+  // time, the phone asks about plain one-line text too, an automatic run
+  // included; declined or let run out, it ends as `cancelled` up to 25 s
+  // later. The row cannot know, so it says "Typing…"; the watchdog leaves
+  // room for that confirmation; the end is reported and worded as any
+  // cancelled, Retype is free, and the text never runs by itself again.
+  store.clear();
+  const calls = installShell();
+  const realSet = globalThis.setTimeout;
+  const realClear = globalThis.clearTimeout;
+  const timers = [];
+  globalThis.setTimeout = (fn, ms) => { timers.push({ fn, ms }); return timers.length; };
+  globalThis.clearTimeout = () => {};
+  const rows = new Map();
+  const onState = (id) => (out) => rows.set(id, out);
+  const msg = { ts: new Date(now - 1000).toISOString() };
+  try {
+    assert.equal(kbd.shouldAutoRun(typeA, msg, { live: true, now }), true);
+    assert.equal(kbd.claim(typeA.id), true);
+    kbd.run(typeA, { threadId: tid, message: msg, onState: onState(typeA.id), now });
+    kbd.run(keyTab, { threadId: tid, onState: onState(keyTab.id) });
+    assert.deepEqual(rows.get(typeA.id), { state: 'pending' }, 'no confirm mark: the page cannot know');
+    assert.deepEqual(kbd.describeOutcome(rows.get(typeA.id), 'Quest 3'), ['Typing on Quest 3…', '']);
+    assert.ok(timers[0].ms > 25000, "the watchdog outlasts the phone's 25 s");
+    event('error', typeA.id, { error: 'cancelled' });
+  } finally {
+    globalThis.setTimeout = realSet;
+    globalThis.clearTimeout = realClear;
+  }
+  // The view takes the final event itself (_onKeyboardEvent) and words it.
+  assert.deepEqual(kbd.describeOutcome({ state: 'error', error: 'cancelled' }),
+    ['Not typed: stopped, or not confirmed on the phone', '']);
+  assert.deepEqual(rows.get(keyTab.id), { state: 'error', error: 'cancelled' }, 'what waited is dropped');
+  assert.equal(calls.filter((c) => c[0] === 'key').length, 0);
+  assert.equal(kbd.isRunning(), false);
+  assert.equal(kbd.isActive(typeA.id), false, 'Retype is free');
+  assert.equal(kbd.shouldAutoRun(typeA, msg, { live: true, now }), false, 'never by itself again');
+  await tick();
+  assert.deepEqual(posted.map(([url, body]) => [url.split('/')[4], body]).sort(), [
+    [typeA.id, { state: 'error', error: 'cancelled' }],
+    [keyTab.id, { state: 'error', error: 'cancelled' }],
+  ].sort());
+  // A Retype is a deliberate tap and runs as before.
+  assert.equal(kbd.run(typeA, { threadId: tid, message: msg, now }), true);
+  assert.deepEqual(calls.at(-1), ['type', 'Hallo Quest', { id: typeA.id, enter: false }]);
+});
+
 await ok('a tap shows what it types: the text, and every Enter it presses', () => {
   assert.equal(kbd.visibleText({ ...typeA, text: 'ls -la\nrm x\tz' }), 'ls -la⏎\nrm x⇥z');
   assert.equal(kbd.visibleText({ ...typeA, sensitive: true }), null, 'never a sensitive text');
@@ -449,7 +524,7 @@ def main() -> int:
         with open(os.path.join(tmp, "package.json"), "w", encoding="utf-8") as fh:
             fh.write('{"type":"module"}')
         with open(os.path.join(tmp, "harness.mjs"), "w", encoding="utf-8") as fh:
-            fh.write(HARNESS)
+            fh.write(HARNESS.replace("__PY_WHITESPACE__", json.dumps(PY_WHITESPACE)))
         proc = subprocess.run([node, "harness.mjs"], cwd=tmp, capture_output=True, text=True)
     sys.stdout.write(proc.stdout)
     if proc.returncode != 0:
