@@ -1500,8 +1500,11 @@ class RetinueChatPage extends HTMLElement {
   // placeholder frame holds the space. Images open the lightbox; a voice
   // note's player sits above the transcript, which is already the message
   // text; anything that is neither image, audio nor video is a file row —
-  // the name and size the gateway stated — that opens the file itself, as
-  // the native clients do.
+  // the name and size the gateway stated — that links the file itself. What
+  // that link does is the media proxy's decision, not this page's: a PDF or
+  // plain text opens in the browser, anything else is saved (docs/dashboard.md,
+  // "Attachments"). The same holds for an image opened by itself: only the
+  // inline-safe types are shown, an SVG is a download.
   _attachmentHtml(a) {
     const type = String(a.type || '');
     const w = Number(a.width);

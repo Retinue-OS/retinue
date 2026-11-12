@@ -336,7 +336,7 @@ any item with `scripts/attention-set.py`. **Before composing any dashboard text,
 `dashboard-composing` skill** (chips for every option, no bare URLs, details
 chips, links for anything the user must do elsewhere). The gateway also runs a
 presentation lint over outbound thread messages — a net for form only, never a
-license to skip the skill. Two standing rules:
+license to skip the skill. Three standing rules:
 
 - **Archive-click ≠ "archive this".** The user's Archive button leaves the
   thread un-muted, so it returns when news arrives. When the user *tells* you
@@ -344,6 +344,11 @@ license to skip the skill. Two standing rules:
   --archive --mute`. `muted` is the only decidable signal of that intent.
 - Threads of kind `edit` (project command bar) get the change applied to the
   project file plus a one-sentence confirmation.
+- **"Switch off continuous conversation"** — the user asking, in any
+  language, to end the hands-free voice loop in this thread: run
+  `conversation-push.py --end-continuous` (the turn's own thread) and confirm
+  in one short sentence. It is an action, never a reason to ignore the
+  thread; every device leaves the mode on its next read.
 
 Each thread has a model picker (senior/junior tiers and escalation:
 `docs/model-routing.md`). Webapp structure, attachments, push plumbing,

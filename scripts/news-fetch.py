@@ -22,7 +22,9 @@ dashboard's read-aloud when an item carries no language of its own), and
 
 What lands in the store is a *reference*: title, source, the excerpt the feed
 itself published (truncated), and the link. The article is read at the source,
-never mirrored here.
+never mirrored here. The link is a web link (`news_store.web_link`): one written
+relative to the feed is resolved against the feed's URL, and an entry whose
+links are all something else is no item.
 
     python3 scripts/news-fetch.py             # every chamber manifest
     python3 scripts/news-fetch.py --manifest /path/.news.json --dry-run
@@ -187,27 +189,38 @@ def clean_summary(raw: str) -> str:
     return cut.rstrip(" ,;:—-") + "…"
 
 
-def _entry_link(entry) -> str:
+def _entry_link(entry, base: str = "") -> str:
     """The URL to read this item at — an RSS <link> body or an Atom
     <link rel="alternate" href>. This is the whole point of an item, so an entry
-    without one is dropped by the caller."""
+    without one is dropped by the caller.
+
+    Only a web link counts (``store.web_link``): what a feed puts in a link is
+    its own choice, and the dashboard makes the headline lead there. A
+    candidate that is no web link is passed over and the search goes on,
+    through the entry's further <link> elements and then its guid. A link
+    written relative to the feed is resolved against ``base``, the feed's own
+    URL, so a feed that links that way keeps its items; a guid is a name, and
+    counts only when it is a web link as it stands."""
     alternate = ""
     for child in entry:
         if _local(child.tag) != "link":
             continue
         href = child.get("href")
         if href:
+            url = store.web_link(href, base)
+            if not url:
+                continue
             rel = child.get("rel") or "alternate"
             if rel == "alternate":
-                return href.strip()
-            alternate = alternate or href.strip()
-        elif _text(child):
-            return _text(child)
+                return url
+            alternate = alternate or url
+        else:
+            url = store.web_link(_text(child), base)
+            if url:
+                return url
     if alternate:
         return alternate
-    guid = _find(entry, "guid", "id")
-    text = _text(guid)
-    return text if text.startswith(("http://", "https://")) else ""
+    return store.web_link(_text(_find(entry, "guid", "id")))
 
 
 def _entry_time(entry) -> str | None:
@@ -229,8 +242,12 @@ def _entry_time(entry) -> str | None:
     return None
 
 
-def parse_feed(xml_text: str, feed: dict) -> list[dict]:
-    """Turn one feed document into news items. Unparseable XML yields nothing."""
+def parse_feed(xml_text: str, feed: dict, base_url: str | None = None) -> list[dict]:
+    """Turn one feed document into news items. Unparseable XML yields nothing.
+
+    ``base_url`` is where the document was read from — the feed's URL, or
+    where a redirect led — and is what a link written relative to the feed is
+    resolved against; it defaults to the URL the manifest declares."""
     if has_doctype(xml_text):
         # Also the friendly answer when a server hands back an HTML error page
         # instead of the feed: "<!DOCTYPE html>" says so plainly.
@@ -247,9 +264,10 @@ def parse_feed(xml_text: str, feed: dict) -> list[dict]:
     declared = _find_all(root, "language")
     feed_lang = feed.get("lang") or (_text(declared[0]) if declared else "")
     fetched = store.iso(store.now())
+    base = base_url or feed.get("url") or ""
     items = []
     for entry in _find_all(root, "item", "entry"):
-        url = _entry_link(entry)
+        url = _entry_link(entry, base)
         title = _text(_find(entry, "title"))
         if not url or not title:
             continue
@@ -282,10 +300,12 @@ def fetch_feed(feed: dict) -> list[dict]:
     try:
         with urllib.request.urlopen(req, timeout=FETCH_TIMEOUT) as resp:
             raw = resp.read(MAX_FEED_BYTES)
+            # Where the document came from in the end, after any redirect.
+            base_url = getattr(resp, "url", None)
     except (urllib.error.URLError, OSError, ValueError) as exc:
         log(f"feed '{feed['id']}' unreachable: {exc}")
         return []
-    return parse_feed(raw.decode("utf-8", errors="replace"), feed)
+    return parse_feed(raw.decode("utf-8", errors="replace"), feed, base_url)
 
 
 def main() -> int:

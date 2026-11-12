@@ -55,9 +55,14 @@ stays as a second row under it. A tab always goes, whatever the page
 holds: a typed message, an unsaved project edit or a dictation on its way is
 kept on the device and waits in its field for the user to come back to the
 same place (`webapp/components/drafts.js`), and a dictation still being
-recorded or transcribed is finished by the service worker, its text landing
-in that field (`webapp/components/dictation.js`; webapp README, "Unsent
-input"). The tap used to be held instead, with a note popping up at the
+recorded or transcribed is finished by the service worker
+(`webapp/components/dictation.js`; webapp README, "Unsent input"). A review
+dictation (✓, or leaving with the mic live) lands in its field. A dictation
+the user sent (➤, or a take of the continuous loop ending on a pause) in an
+existing thread is a message, so the worker posts it into the thread it was
+recorded in; only a send that failed or may have failed brings its text to
+the field, with a note, and a first message (no thread yet) waits in its
+composer's field. The tap used to be held instead, with a note popping up at the
 bottom asking for a second press — which the phone keyboard, coming up with
 the note, made impossible by hiding the row; pop-up notes at the bottom of
 the screen are an anti-pattern here. While the phone keyboard is up the row steps aside on a
@@ -346,6 +351,20 @@ to one is released — so a hand-edited or older file can never make every
 attention call fail. The mode menu's *Follow the schedule* row names today's
 plan, and the holiday when there is one.
 
+**Focus is optional, per instance.** The modes suit a personal instance; on
+a shared one, or one with a single remit, a mood to follow makes no sense.
+`focus.json` `enabled` (on unless set to `false`) is the switch: the
+*Focus modes* card under Settings › This instance, `POST /attention/modes
+{enabled}`, or `scripts/attention-week.py off` / `on`. Off, one mode is in
+force at every moment (`attention.FOCUS_OFF_MODE`: every sphere admitted,
+anything time-sensitive rings, active items wait for a digest, passive ones are listed); the schedule
+changes nothing, a hand-set mode is refused (409) and a stored one released,
+the digests go out at the document's `digest_times` every day, and the
+home's header shows no mode and opens no menu, the sheet no Focus rules.
+Turning it off or on is a breakpoint like a mode change. The modes, the week,
+the holidays and the permits stay as they were, for when it is turned on
+again; `GET /attention` says which with `focus_enabled` (and `mode.enabled`).
+
 **The API** (behind the dashboard's auth like the rest): `GET /attention`
 (the sections, the mode, the next breakpoint, `degraded` naming a source the
 store could not answer for — read without the lock inbound messages and the
@@ -447,7 +466,16 @@ through **LiteLLM** (the shipped default), the offered list is managed **in
 LiteLLM itself**: the gateway reads `GET /model/info` (and `GET /v1/models`)
 and offers the concrete models the proxy currently serves. `retinue_picker: true`
 plus `retinue_label` still names a route; `retinue_picker: false` hides one.
-Plumbing routes (`retinue-claude`, wildcards) stay hidden. The list
+Plumbing routes (`retinue-claude`, wildcards) stay hidden. A **family pin**
+— `ANTHROPIC_DEFAULT_<FAMILY>_MODEL`, the variable Claude Code resolves the bare
+`opus`/`sonnet`/`haiku`/`fable` aliases through — also retargets that family's
+picker entry to the pinned concrete id (label kept), so one setting moves both
+the agents and the dashboard to a new release. Where the picker had several
+routes of that family, they become this one entry under the first one's
+label, since they would all name the same model. A thread that chose any
+other id of the family follows the pin. A pin the proxy does not route is
+ignored and logged once, and a family with a `retinue_picker: false` route
+stays out of the picker despite its pin. The list
 is cached briefly
 (`RETINUE_MODELS_CACHE_SECONDS`, default 60) and read from
 `RETINUE_LITELLM_URL` (default: `ANTHROPIC_BASE_URL`) with the credentials
@@ -657,6 +685,37 @@ message, are stored the same way, and their on-disk paths are handed to Ara in
 her engage prompt — so she can actually open a file the user sends (a PDF, a
 CSV) rather than only knowing one exists. A message may be text, files, or both.
 The chat page's composer takes pasted images the same way (see `webapp/README.md`).
+
+**Media in a messenger chat** is another store under the same rule. A file a
+contact sends stays with the gateway that received it, together with the
+content type the sender's client declared, and the chat page loads it through
+the gateway's authenticated proxy, `GET /chats/media/<slug>/<media-id>`
+(docs/messenger-chats.md). That type comes from outside, as the bytes do, so
+the proxy reads it strictly and writes its own headers from it
+(`_chat_media_headers`):
+
+- **In place**: the images of `_INLINE_SAFE_TYPES`, which a bubble shows
+  through `<img>`; `audio/*` and `video/*`, which the chat's players load
+  (an XML type, `…+xml`, excepted); and a PDF or plain text, which a file row
+  opens in the browser's own viewer.
+- **As a download** (`Content-Disposition: attachment` and the letterbox
+  share's sandboxing `Content-Security-Policy`): everything else, so a file
+  from outside never becomes a page or a script of the dashboard. An image of
+  another type (SVG, TIFF, HEIC) still shows in the bubble, since `<img>` runs
+  nothing in it, and is saved when opened by itself; an HTML or XML file, a
+  script, an office document or an archive is a file row that saves it. Such
+  a file keeps its stated type, because the browser and the Android shell
+  take the saved file's extension, and the app that opens it, from the type.
+
+A stated type that does not read as exactly one media type counts as
+`application/octet-stream`. The type sent is written from what was read (lower
+case, with its `charset` or `codecs` parameter and no other), never relayed as
+it came, and every answer, a relayed error included, carries
+`X-Content-Type-Options: nosniff`. The proxy does not know the name the sender
+gave the file, so a download is named after its URL and type
+(`<media-id>.docx`). The gateways' store keeps the stated type as one line of
+printable ASCII (`inbound_store.clean_content_type`), so it is exactly one
+header of their own `GET /media/<id>`, whatever was declared.
 
 ## Push notifications
 
@@ -908,6 +967,15 @@ and only inside the shell do they open the mic by themselves; elsewhere (a
 link in a message, a reload) the conversation opens in the mode with a
 **Start talking** button. The detector listens for energy, not words, so it
 is language-agnostic.
+Ending it: the toggle, or **by voice** — the user tells Ara to switch the
+mode off (in any language; Ara reads the intent, the page reads no words),
+and her turn runs `conversation-push.py --end-continuous` (the thread is the
+turn's own, `RETINUE_THREAD_ID`). The gateway stamps the thread document
+`continuous_off` (ISO time); each device showing the thread in the mode
+leaves it on its next read, as if the toggle had been tapped (the mic closes,
+the shell's voice flag is released). The stamp acts once per device and only
+on a mode switched on before it (one minute of clock skew allowed), so a
+toggle the user presses afterwards stays on.
 
 Language handling (constrain detection to the languages the user speaks, and
 re-decode when a guess falls outside that set) lives entirely in the service via
@@ -951,10 +1019,26 @@ the name field's placeholder.
 Both are applied when the gateway serves the file — the baked webapp is never
 edited — and both are folded into the service worker's shell hash, so a change
 reaches installed clients like any shell edit, and a change on the Settings
-page reaches the very next response. An already-installed PWA may keep its old
-home-screen label and icon until the browser refreshes the manifest (Chrome
-checks about daily); reinstalling applies it at once. The Android shell is not
-held up by that: it fetches the manifest itself.
+page reaches the very next response.
+
+**The colour is in the icon URLs too.** An installed app keeps the icon it
+fetched for a URL: desktop Chrome, since 143 ("predictable app updating"),
+refreshes an installed PWA's icons only when the manifest names other icon
+URLs, and the Windows taskbar, the Start menu and the macOS dock show the
+shortcut icons Chrome made from those at install. So with a colour in force
+every icon reference the shell makes carries it as a version —
+`/icons/icon-192.png?v=cb6cfe` in the manifest, in every page's `rel="icon"`
+and `apple-touch-icon` link, and in the service worker's precache list and
+notification icon. The gateway ignores the query and serves the colour in
+force. A new colour means new URLs, which the browser takes as a new icon the
+next time it checks the manifest (on a launch of the app; Chrome may ask the
+user to confirm a changed icon). The stock colour keeps the plain URLs.
+
+An already-installed PWA may keep its old home-screen label and icon until the
+browser has checked the manifest; reinstalling applies it at once. A pinned
+taskbar entry that still shows the old icon after Chrome's update is Windows'
+icon cache; unpinning and pinning it again refreshes it. The Android shell is
+not held up by any of that: it fetches the manifest itself.
 
 ## The settings page
 
@@ -964,7 +1048,8 @@ held up by that: it fetches the manifest itself.
   notifications, the voice timeouts, the layout, the shelf size, and the
   dashboard version with a manual update check.
 - **This instance** — what is the same on every device: the instance's name
-  and colour (see above), the agent models, the system pages
+  and colour (see above), whether it follows focus modes (see "The home"),
+  the agent models, the system pages
   (`components/instance-settings.js`, `<retinue-instance-settings>`).
 
 Inside the Android app there is one settings page for the user, the app's own
@@ -1027,7 +1112,7 @@ The contract the two sides share (web side: `webapp/components/shell.js`):
 | Endpoints (RetinueShell/3) | The shell holds a list of Retinue servers (address, client certificate, sign-in, health switch) and shows one; the app's settings page lists, edits and switches them (RetinueShell/3: the Settings page's Phone shell card lists them in a menu and switches between them). `endpoints()` → a JSON string `[{"id": str, "label": str, "current": bool}]` — the label is the instance's own name, the manifest `short_name` the shell fetched with that endpoint's certificate or password (the host while it is unknown; the host appended when two names collide); no URLs, the other servers being none of the current page's business. `selectEndpoint(id)` asks the shell to show that server (it loads that dashboard's start page, so the page is left). `openSettings("endpoints")` opens the app's settings at the endpoint list, or at the editor straight away with one endpoint. The page may ask; it can never write an address, certificate or password — whatever origin the shell is pointed at receives its bridge, microphone, certificate and password, so that stays in the app. An `endpoints` event (`detail.type`) says the list changed while a page is open; the card re-renders. The shell's one base URL of earlier builds is the first endpoint after an update. |
 | Health Connect (RetinueShell/2) | Further members on `window.RetinueShell`: `healthConnectAvailable()` → `"true"`/`"false"`; `healthSync()` — a deliberate sync now, returns at once (a deliberate sync always runs, whatever the interval); `healthSyncStatus()` → a JSON string `{"available": bool, "permissions": "granted"\|"partial"\|"none", "last_sync_at": ISO\|null, "last_result": "ok"\|"error"\|"skipped"\|null, "last_error": str\|null, "last_count": int\|null, "min_interval_minutes": int, "auto_on_resume": bool, "enabled": bool}` (`enabled`, RetinueShell/3: the current endpoint's own health switch, set in the shell's editor — off, nothing is read or sent for that server, a sync asked for is `skipped` with reason `disabled`, and the card shows one line and *Edit endpoint* instead of the controls; an older shell omits the field and uploads for its one server); `setHealthSyncInterval(minutes)`; `setHealthAutoSync(bool)`. The shell reads the phone's Health Connect store through its Changes API and uploads what it returns, unaltered, as one JSON file per delivery by **WebDAV `PUT` to `/inbox/<name>`** — the letterbox share below, with the WebView's own client certificate and cookies — where a chamber that declares the file type in its `accepts` takes it (docs/scheduling.md); the framework knows nothing about the data. On resume the shell syncs on its own at most every `min_interval_minutes` (default 5) while `auto_on_resume` holds. From RetinueShell/4 the app's settings page has these controls, beside the endpoint's switch, and the dashboard shows none; with RetinueShell/3, Settings → Phone shell shows, only where `healthConnectAvailable()` is true, "Update health data now", the last sync (from `healthSyncStatus()` and the events), the auto-sync toggle and the interval. Every member is feature-detected (`webapp/components/shell.js`): an older shell simply shows none of it. |
 | Settings page and per-device preferences (RetinueShell/4) | `settingsPage: true`: the app has a settings page of its own (see "The settings page"), and the gear opens it. `deviceSettings()` → a JSON string `{key: value}` of the per-device preferences the app holds for every endpoint; `setDeviceSetting(key, value)` writes one (`null` removes it; a key the app does not take is ignored). `components/device-store.js` is the only caller. |
-| Shell → page | `window.dispatchEvent(new CustomEvent('retinue-shell', {detail: {type}}))`, `type` `wake`, `home`, `health-sync`, `endpoints` or `device-settings` (with `keys`, the per-device preferences that changed). A `health-sync` event carries `state`: `started`, `done` (with `count`), `error` (with `error`) or `skipped` (with `reason`: `interval`, `no-permission`, `unavailable`, `no-backend-support`, `disabled`); it, `endpoints` and `device-settings` are information only — no page navigates on them. The home answers in place: `wake` opens continuous conversation (the thread used in the mode in the last 15 minutes, else a new one), `home` unwinds every open thread or composer back to the list at `/`, closes a sheet and scrolls the list to its top. Other dashboard pages answer by loading `/?wake=1` or `/`, always: unsent input on the page (a draft, an unsaved project edit, a dictation or send under way) never holds either back — it is kept on the device and waits in its field, a dictation finished by the service worker (webapp README, "Unsent input"). |
+| Shell → page | `window.dispatchEvent(new CustomEvent('retinue-shell', {detail: {type}}))`, `type` `wake`, `home`, `health-sync`, `endpoints` or `device-settings` (with `keys`, the per-device preferences that changed). A `health-sync` event carries `state`: `started`, `done` (with `count`), `error` (with `error`) or `skipped` (with `reason`: `interval`, `no-permission`, `unavailable`, `no-backend-support`, `disabled`); it, `endpoints` and `device-settings` are information only — no page navigates on them. The home answers in place: `wake` opens continuous conversation (the thread used in the mode in the last 15 minutes, else a new one), `home` unwinds every open thread or composer back to the list at `/`, closes a sheet and scrolls the list to its top. Other dashboard pages answer by loading `/?wake=1` or `/`, always: unsent input on the page (a draft, an unsaved project edit, a dictation or send under way) never holds either back — it is kept on the device and waits in its field; a dictation is finished by the service worker, which puts a review dictation into its field and posts one the user had sent into its thread (webapp README, "Unsent input"). |
 | Pages without the web app's code | The gateway's own pages (`/sends`, `/claude-auth`) do not load `components/shell.js`, so nothing on them answers `wake` or `home`. The shell handles that itself: when the page in front is not one of the dashboard's, a Home press loads `/` and a wake loads `/?wake=1` instead of dispatching the event. |
 | `/sync-health` | The link target for "update your health data" in threads: `https://<dashboard origin>/sync-health#sync` (the origin is `CONVERSATION_BASE_URL`'s). Same origin, so the shell opens it in place. A static page — a GET never changes server state; the fragment is the instruction, and the server never sees it. In the shell with `#sync` it calls `healthSync()`, says "Health data update triggered", and after a moment goes back (`history.back()`, or `/` when opened cold); a `done` arriving first is shown before it leaves, an `error` or `skipped` stays on screen with *Update now* and *Back*. The fragment is dropped from the address once read, so a reload starts nothing. In the shell without `#sync`: a short explanation, the last sync and *Update now*. In a browser on Android: the Ara app is needed, and an **Open in Ara app** link — an intent link the page builds from `location`, never from configuration: `intent://open?url=<percent-encoded https://<origin>/sync-health#sync>#Intent;scheme=retinue-shell;package=os.retinue.ara;S.browser_fallback_url=<percent-encoded https://<origin>/sync-health>;end`. The app opens the URL only when its origin is exactly the one it is configured for, and otherwise says so and connects nowhere (no Android App Links, no Play services). On a desktop: the explanation only. The page loads `shell.js`, so `wake` and `home` work on it, and it is in the service worker's shell cache like every page. |
 | Cold wake | With no page loaded the shell loads `/?wake=1`; the home treats it as a wake and drops the flag from the address. A wake should reach the page once it is resumed; one that arrives while the page is hidden still waits (up to 60 s) for it to come to the front before the mic opens. |
