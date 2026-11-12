@@ -3782,6 +3782,11 @@ def _conv_worker(cid: str, session_key: str, *, arrival: str | None = None,
         elif chosen is None and DASHBOARD_MODEL:
             chosen = _default_thread_model()
         may_type = _conv_turn_may_type(messages, arrival)
+        # Whether the turn may still type once it holds the session lock
+        # (build_prompt below): the prompt it is then sent ends with the
+        # newest message of the thread, which need not be the one it was
+        # started for. Once False it stays False.
+        typing_ok = [may_type]
 
         covered: list = [None]
 
@@ -3811,6 +3816,12 @@ def _conv_worker(cid: str, session_key: str, *, arrival: str | None = None,
             # the session is shown the whole thread instead.
             if fresh_now and target_id and _conv_replied_after(msgs, target_id):
                 fresh_now = False
+            # The prompt asks Ara to reply to the newest user message. One a
+            # caller inside the container posted while this turn waited is not
+            # the user's, yet it would be the one answered: such a turn may no
+            # longer type, though the dashboard message it started for is
+            # still covered (and answered, without typing).
+            typing_ok[0] = typing_ok[0] and _conv_turn_may_type(msgs, arrival)
             return _conv_engage_prompt(current, fresh_now, arrival)
 
         result = send_message(prompt, display_question=latest, session_key=session_key,
@@ -3818,8 +3829,9 @@ def _conv_worker(cid: str, session_key: str, *, arrival: str | None = None,
                               resume=resume,
                               reply_attachments=True,
                               # Only a turn the user started, from the
-                              # dashboard, may type on their paired device.
-                              reply_shell_actions=may_type,
+                              # dashboard, may type on their paired device —
+                              # asked once the prompt is built, as it is then.
+                              reply_shell_actions=lambda: may_type and typing_ok[0],
                               thread_id=cid, prompt_builder=build_prompt,
                               display_message_id=target_id)
         if result.get("skipped"):
@@ -3841,9 +3853,9 @@ def _conv_worker(cid: str, session_key: str, *, arrival: str | None = None,
             # And the shell actions (scripts/shell-type.py): text the user's
             # phone types on the device it is paired with as a keyboard.
             reply_actions = list(result.get("reply_shell_actions") or [])
-            if not may_type and reply_actions:
+            if not (may_type and typing_ok[0]) and reply_actions:
                 print(f"[web-gateway] conversation {cid}: {len(reply_actions)} shell "
-                      "action(s) of a turn the user did not start dropped", flush=True)
+                      "action(s) of a turn that may not type dropped", flush=True)
                 reply_actions = []
             # Whether the page may run each without a tap is decided here,
             # once (the page runs by itself only what carries auto: true):
@@ -5471,7 +5483,7 @@ def send_message(message: str, display_question: str | None = None,
                  restart_message: str | None = None,
                  resume: bool = True,
                  reply_attachments: bool = False,
-                 reply_shell_actions: bool | None = None,
+                 reply_shell_actions=None,
                  thread_id: str | None = None,
                  prompt_builder=None,
                  display_message_id: str | None = None) -> dict:
@@ -5531,7 +5543,10 @@ def send_message(message: str, display_question: str | None = None,
     `reply_shell_actions` (default: as `reply_attachments`) withholds that
     second manifest alone: a turn nobody asked for — a chat arrival — gets
     none, so nothing it read can make the user's phone type
-    (_conv_worker).
+    (_conv_worker). It may be a callable, asked once `prompt_builder` has
+    built the prompt: whether a turn may type can change while it waits for
+    the lock, since the prompt then ends with whatever reached the thread
+    meanwhile.
 
     `thread_id` is the dashboard thread the turn answers, handed to every
     spawn as RETINUE_THREAD_ID: the push CLIs stamp it on the sends they
@@ -5616,6 +5631,8 @@ def send_message(message: str, display_question: str | None = None,
             # one belongs to the run whose reply is kept.
             manifests: list[Path] = []
             action_manifests: list[Path] = []
+            if callable(reply_shell_actions):
+                reply_shell_actions = bool(reply_shell_actions())
             want_shell_actions = (reply_attachments if reply_shell_actions is None
                                   else reply_shell_actions)
 

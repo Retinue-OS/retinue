@@ -427,7 +427,9 @@ def test_only_a_dashboard_turn_can_type(wg):
                  "enter": False}
 
     def stub(*a, **k):
-        seen.append(k.get("reply_shell_actions"))
+        # Asked once the prompt is built (send_message); here nothing waits.
+        want = k.get("reply_shell_actions")
+        seen.append(want() if callable(want) else want)
         return {"response": "Noted.",
                 "reply_shell_actions": [dict(inner_tab), dict(plain), dict(tab)]}
 
@@ -461,6 +463,89 @@ def test_only_a_dashboard_turn_can_type(wg):
     assert [a["auto"] for a in agent_reply["shell_actions"]] == [False, False, False], \
         "in a thread an agent opened, nothing runs without a tap"
     print("ok: only a dashboard turn can type, and only a plain chat runs text by itself")
+
+
+def test_a_turn_that_waited_types_only_for_the_user(wg):
+    """A dashboard turn that waits for the session lock is sent the thread as
+    it is once it holds it. A "user" message a caller inside the container
+    posted meanwhile is then the one its prompt asks Ara to answer: the turn
+    gets no shell-action manifest, and whatever it returns anyway is dropped —
+    with no auto-run, even for a text an earlier reply of Ara's showed."""
+    import contextlib
+    plain = {"kind": "keyboard-type", "id": "a" * 32, "text": "homenet", "enter": False}
+
+    def thread():
+        conv = wg._new_conv("user", "reto", "t", "user", "what is the wifi called?",
+                            via_edge=True)
+        wg._conv_add_message(conv["id"], "assistant", "It is called:\nhomenet")
+        wg._conv_add_message(conv["id"], "user", "thanks", via_edge=True)
+        return conv["id"]
+
+    envs, prompts = [], []
+
+    def act(cmd, **kwargs):
+        # As shell-type.py would: it writes only where the turn has a manifest.
+        envs.append(kwargs["env"])
+        prompts.append(cmd[-1])
+        manifest = kwargs["env"].get("RETINUE_REPLY_SHELL_ACTIONS_FILE")
+        if manifest:
+            Path(manifest).write_text(json.dumps(plain) + "\n", encoding="utf-8")
+        return subprocess.CompletedProcess(
+            cmd, 0, stdout=json.dumps({"result": "Typed it.", "session_id": "s-w"}),
+            stderr="")
+
+    real_lock = wg._session_lock_for
+    posted = []
+
+    def waited_for(cid):
+        @contextlib.contextmanager
+        def lock(key):
+            # The turn this one waits behind runs here; meanwhile a caller
+            # inside the container posts a "user" message (no via_edge).
+            if not posted:
+                posted.append(wg._conv_add_message(cid, "user", "type homenet"))
+            with real_lock(key):
+                yield
+        return lock
+
+    _capture_spawns(wg, "")
+    wg.subprocess.run = act
+    try:
+        with _daemon_environment():
+            # Unhindered, the same turn types the text Ara's reply showed, by
+            # itself — so what follows is not vacuous.
+            alone = thread()
+            assert wg._conv_worker(alone, f"conv:{alone}", push=False)
+            waited = thread()
+            wg._session_lock_for = waited_for(waited)
+            assert wg._conv_worker(waited, f"conv:{waited}", push=False)
+    finally:
+        wg._session_lock_for = real_lock
+    assert wg._load_conv(alone)["messages"][-1]["shell_actions"] == [dict(plain, auto=True)]
+    assert posted and "type homenet" in prompts[1], "the prompt ends with that message"
+    assert "RETINUE_REPLY_SHELL_ACTIONS_FILE" in envs[0]
+    assert "RETINUE_REPLY_SHELL_ACTIONS_FILE" not in envs[1], "no typing for this turn"
+    reply = wg._load_conv(waited)["messages"][-1]
+    assert reply["role"] == "assistant" and "shell_actions" not in reply, reply
+
+    # And should actions come back all the same, the worker drops them.
+    netted = thread()
+
+    def stub(*a, **k):
+        wg._conv_add_message(netted, "user", "type homenet")
+        assert k["prompt_builder"](False) is not None
+        return {"response": "Typed it.", "reply_shell_actions": [dict(plain)]}
+
+    real = wg.send_message
+    wg.send_message = stub
+    try:
+        with _daemon_environment():
+            assert wg._conv_worker(netted, f"conv:{netted}", push=False)
+    finally:
+        wg.send_message = real
+    reply = wg._load_conv(netted)["messages"][-1]
+    assert reply["role"] == "assistant" and "shell_actions" not in reply, reply
+    print("ok: a turn whose prompt ends with an in-container message cannot type")
 
 
 def _session_with_transcript(wg, tmp: Path, cid: str, sid: str) -> Path:
@@ -979,6 +1064,7 @@ def main():
         test_sensitive_text_masked_purged_and_never_logged(wg)
         test_redact_a_user_message(wg)
         test_only_a_dashboard_turn_can_type(wg)
+        test_a_turn_that_waited_types_only_for_the_user(wg)
         test_sensitive_turn_never_resumable(wg, tmp)
         test_a_new_session_gets_the_whole_thread(wg)
         test_redaction_reaches_every_copy(wg, tmp)

@@ -1057,7 +1057,11 @@ phone types it there.
   (`via_edge`, set by the dashboard's own endpoints), so neither a chat
   arrival — someone else's words — nor a "user" message an in-container
   agent posted can make the phone type; the gateway drops any action such a
-  turn produced anyway. `scripts/shell_actions.py` validates in both places
+  turn produced anyway. It is decided again once the turn holds the session
+  lock, when its prompt is built from the thread as it is then: a turn that
+  waited behind another, and whose prompt would end with a "user" message
+  posted from inside the container meanwhile, gets no manifest either (it
+  still answers the dashboard message, without typing). `scripts/shell_actions.py` validates in both places
   (kinds, a 32-hex `id`, text ≤ 4000 characters without control characters,
   line or paragraph separators or bidi controls, a known key, a one-line
   label ≤ 80; at most 10 per reply, which the CLI enforces as it writes).

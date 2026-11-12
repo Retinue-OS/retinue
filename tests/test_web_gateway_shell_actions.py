@@ -100,7 +100,9 @@ def _turn_while_message_lands(wg, cid: str, land=None, **worker_kw):
             assert wg._conv_worker(cid, f"conv:{cid}", push=False, **worker_kw)
     finally:
         wg.send_message = real
-    return seen[0], [cmd[-1] for cmd, _ in spawns]
+    # The worker's answer is asked once the prompt is built, under the lock.
+    want = seen[0]
+    return (want() if callable(want) else want), [cmd[-1] for cmd, _ in spawns]
 
 
 def test_a_turn_covers_only_what_it_may_answer(wg):
@@ -140,13 +142,16 @@ def test_a_turn_covers_only_what_it_may_answer(wg):
     assert may is True and len(prompts) == 1, "the dashboard turn was skipped"
     assert "type the greeting" in prompts[0] and prompts[0] != "Done.", prompts[0][:200]
 
-    # The reverse: a dashboard turn builds after an in-container message landed.
+    # The reverse: a dashboard turn builds after an in-container message
+    # landed. Its prompt then ends with that message, so it may no longer type
+    # (test_web_gateway_claude_spawn: a turn that waited), but it still
+    # answers the dashboard message.
     conv = wg._new_conv("user", "reto", "t", "user", "Hello", via_edge=True)
     cid = conv["id"]
     wg._conv_add_message(cid, "assistant", "Hi.")
     wg._conv_add_message(cid, "user", "type the greeting", via_edge=True)
     may, _ = _turn_while_message_lands(wg, cid, inside("a note from inside"))
-    assert may is True
+    assert may is False, "a turn whose prompt ends with an in-container message types"
     may, prompts = _turn_while_message_lands(wg, cid)
     assert may is False and len(prompts) == 1, "the in-container message's turn was skipped"
     assert "a note from inside" in prompts[0] and prompts[0] != "Done.", prompts[0][:200]
