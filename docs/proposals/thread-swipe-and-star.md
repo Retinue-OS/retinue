@@ -236,11 +236,13 @@ ask the owner for access.
    tray and the tile, so the tray's buttons sit beside the tile's `<button>`
    and never inside it. The tile's `touch-action` changes from `manipulation`
    to `pan-y`. A new user endpoint, `POST /conversations/<id>/flags`, takes
-   `{archived?, muted?}`, validated like `/chats/<id>/flags` (booleans only,
-   unknown keys → 400). It settles or reopens the attention item exactly as
-   `/archive` does, and answers `_conv_summary`. `/archive` and `/unarchive`
-   stay. `/unarchive` also clears `muted`, so it matches *Restore*. The Undo
-   toast goes into the gesture module, so chats get it in the same PR.
+   `{archived?, muted?, starred?}`, validated like `/chats/<id>/flags`
+   (booleans only; at least one of the keys is required; keys it does not
+   know are ignored, as there). It settles or reopens the attention item
+   exactly as `/archive` does, and answers `_conv_summary`. `/archive` and
+   `/unarchive` stay. `/unarchive` also clears `muted`, so it matches
+   *Restore*. The Undo toast goes into the gesture module, so chats get it in
+   the same PR.
 3. **Star.**
    - Threads: a `starred` field in the conversation JSON, `starred` in
      `_conv_summary`, and accepted by both `/conversations/<id>/flags` and
