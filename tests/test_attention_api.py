@@ -183,6 +183,24 @@ def _due(hours):
 
 # ── threads ────────────────────────────────────────────────────────────────
 
+def test_agent_ends_continuous(base, wg):
+    """conversation-push.py --end-continuous: the thread is stamped, nothing else moves."""
+    body = _open(base, "Voice loop", "Hello.")
+    cid = body["id"]
+    status, _ = _http(base, "POST", f"/internal/conversations/{cid}/flags", {"continuous_off": True})
+    assert status == 403, "token-gated like the other flags"
+    status, out = _http(base, "POST", f"/internal/conversations/{cid}/flags", {"continuous_off": True}, AGENT)
+    assert status == 200, (status, out)
+    status, doc = _http(base, "GET", f"/conversations/{cid}")
+    stamp = doc.get("continuous_off")
+    assert stamp and datetime.fromisoformat(stamp).tzinfo is not None, doc
+    assert not doc.get("archived") and not doc.get("muted"), doc
+    # Only `true` counts; anything else is no flag at all.
+    status, out = _http(base, "POST", f"/internal/conversations/{cid}/flags", {"continuous_off": "yes"}, AGENT)
+    assert status == 400, (status, out)
+    print("ok test_agent_ends_continuous")
+
+
 def test_open_mode_pushes_and_lists_now(base, wg):
     _mode(base, "chores")
     PUSHES.clear()
@@ -1626,6 +1644,7 @@ def main():
         threading.Thread(target=server.serve_forever, daemon=True).start()
         base = f"http://127.0.0.1:{server.server_address[1]}"
         test_payload_shape(base, wg)
+        test_agent_ends_continuous(base, wg)
         test_open_mode_pushes_and_lists_now(base, wg)
         test_deep_work_holds_pull_later_done(base, wg)
         test_critical_and_passive(base, wg)

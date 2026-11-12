@@ -71,7 +71,13 @@ Projects (dashboard project pages):
                                          (either or both). Same token gate. The
                                          only way to set `muted`, which is what
                                          keeps a thread archived when new
-                                         messages are filed into it.
+                                         messages are filed into it. Also
+                                         {continuous_off: true}: the user asked
+                                         Ara (by voice) to end continuous
+                                         conversation; the thread is stamped
+                                         `continuous_off` (now, ISO) and every
+                                         device showing it in the mode leaves
+                                         it on its next read.
 
 The life store (behind the dashboard's sign-in; read-only):
   GET|POST /sparql                    -> SPARQL 1.1 Protocol: query=<SPARQL>
@@ -11830,6 +11836,12 @@ class Handler(BaseHTTPRequestHandler):
             return
         flags = {key: bool(payload[key])
                  for key in ("archived", "muted") if key in payload}
+        # Ending continuous conversation is an event, not a state: the stamp
+        # says when Ara was asked to, and a device leaves the mode if it was
+        # switched on before that moment (webapp/components/conversation.js,
+        # _contEndedByAra). Switching it on again later is the user's call.
+        if payload.get("continuous_off") is True:
+            flags["continuous_off"] = datetime.now(timezone.utc).isoformat()
         if not flags:
             self._send_json(400, {"error": "no flags given"})
             return

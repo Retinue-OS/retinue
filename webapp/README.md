@@ -779,8 +779,12 @@ Threads can be spoken as well as typed, with no streaming and split by direction
   `wake` event), which reopens the thread used in the mode within the last
   15 minutes, else that voice composer. Both flags are dropped from the
   address once read and open the mic by themselves only inside the shell;
-  elsewhere the conversation offers a **Start talking** button. The pure parts — the detector's state machine and the wake's
-  choice of thread — are `components/continuous.js`
+  elsewhere the conversation offers a **Start talking** button. Closing it:
+  the toggle, or Ara — told by voice to switch the mode off, she stamps the
+  thread (`conversation-push.py --end-continuous` → `continuous_off`), and
+  every device showing it in the mode leaves it on its next read; a toggle
+  pressed after her stamp is the user's and stays on (docs/dashboard.md). The pure parts — the detector's state machine, the wake's
+  choice of thread and whether Ara's stamp ends the mode — are `components/continuous.js`
   (`tests/test_webapp_continuous.py`).
 
 ## Installing on Android

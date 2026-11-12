@@ -922,6 +922,15 @@ and only inside the shell do they open the mic by themselves; elsewhere (a
 link in a message, a reload) the conversation opens in the mode with a
 **Start talking** button. The detector listens for energy, not words, so it
 is language-agnostic.
+Ending it: the toggle, or **by voice** — the user tells Ara to switch the
+mode off (in any language; Ara reads the intent, the page reads no words),
+and her turn runs `conversation-push.py --end-continuous` (the thread is the
+turn's own, `RETINUE_THREAD_ID`). The gateway stamps the thread document
+`continuous_off` (ISO time); each device showing the thread in the mode
+leaves it on its next read, as if the toggle had been tapped (the mic closes,
+the shell's voice flag is released). The stamp acts once per device and only
+on a mode switched on before it (one minute of clock skew allowed), so a
+toggle the user presses afterwards stays on.
 
 Language handling (constrain detection to the languages the user speaks, and
 re-decode when a guess falls outside that set) lives entirely in the service via
