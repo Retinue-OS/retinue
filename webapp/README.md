@@ -51,6 +51,12 @@ a Progressive Web App on the phone home screen.
   refresh job regenerates them (write target = `DASHBOARD_DATA_DIR`).
 - **Offline:** `sw.js` caches the shell (cache-first) so the dashboard opens
   without connectivity. Data is network-first with cache fallback.
+- **No inline script.** Every page is served with a Content-Security-Policy
+  that runs scripts only from these files: no inline `<script>`, no handler
+  attributes (`onclick=` …) in pages or rendered markup, no `javascript:`
+  URLs, no `eval`. A page's script is a file of its own (`sw-register.js`,
+  `components/*-page.js`; `gateway/` for the pages the gateway builds). See
+  docs/dashboard.md, "The Content-Security-Policy".
 
 ## Serving
 
@@ -68,6 +74,9 @@ a Progressive Web App on the phone home screen.
                           docs/dashboard.md "Several instances")
 - `/inbox/…`            → the letterbox's WebDAV share (`scripts/webdav_share.py`),
                           not a page — see `docs/dashboard.md`
+- `/csp-report`         → POST: what browsers report of the pages'
+                          Content-Security-Policy; GET: the distinct reports
+                          kept (`scripts/content_policy.py`)
 - everything else       → `WEBAPP_DIR/<path>` (shell assets)
 
 `vendor/` is not committed: `scripts/vendor-yasgui.sh webapp/vendor/yasgui`
@@ -407,9 +416,23 @@ The API, as the components consume it:
   `?before=<ISO ts>` pages older history (the page renders the newest page —
   a load-older affordance is future work). A `Message` is `{id, chat,
   direction, author? (out: user|agent|device, plus agent name),
-  sender?/sender_name? (in), text, lang?, ts, attachments?: [{id, url,
+  sender?/sender_name? (in), text, lang?, ts, attachments?: [{id, url?,
   type?, size?, width?, height?, name?}]}`. Attachment URLs are the web-gateway's
-  authenticated media proxy (`/chats/media/…`); type, size and name are what
+  authenticated media proxy (`/chats/media/…`), which serves a file in place
+  only as an inline-safe image, audio, video, PDF or plain text and as a
+  download otherwise (`docs/dashboard.md`, "Attachments"). A reference that
+  names no blob is passed on as the `url` only when it is an absolute http(s)
+  URL, and the attachment has no `url` otherwise; the page renders an image,
+  a player or the lightbox only for a proxy URL, a link only for a proxy URL
+  or an http(s) URL, and the name as plain text for anything else, so a
+  reference from outside never becomes an `href` or a `src` of another kind.
+  An http(s) URL is a link to open whatever the type, never loaded as an
+  image or a player: the origin's Content-Security-Policy allows media from
+  this origin only (`docs/dashboard.md`, "The Content-Security-Policy"). The
+  page also takes a `data:image/…`, `data:audio/…` or `data:video/…` URL (the
+  reference documents' media; the gateway passes none on, and the policy
+  allows none on the chat page), only for the `<img>`, `<audio>` or `<video>`
+  of its own kind (and an image's lightbox), never for a link. Type, size and name are what
   the storing gateway stated about the blob in its ledger record (absent on
   records older than that statement). `width`/`height` are the medium's real intrinsic size, sniffed
   at ingest — when present the client reserves the true aspect box before the
@@ -421,7 +444,8 @@ The API, as the components consume it:
   above the transcript, which is already the message `text`; `video/*` is an
   inline player (`preload=metadata`, box-reserved the same way); anything
   else (a document, an animated sticker) is a file row showing the stated
-  `name` and `size` that opens the file in a new tab. Reactions and quoted replies (issue #130) will
+  `name` and `size` that links the file: a PDF or plain text opens in a new
+  tab, anything else is saved, as the proxy serves it. Reactions and quoted replies (issue #130) will
   decorate these records later. The companion thread is not in this payload:
   it is an ordinary conversation, named by the summary's `companion` id and
   read through `/conversations`.
@@ -503,7 +527,12 @@ corpus (the validation suite serves them as mocked `/chats*` responses). They
 are no longer a serving source. The corpus covers the media shapes: image
 attachments with intrinsic dimensions, a voice note (`audio/*` with the
 transcript as the message text) and a video (`video/*` with dimensions), all
-with playable `data:` URLs, and both companion states: one chat names an
+with `data:` URLs, which the page takes only for an `<img>`, `<audio>` or
+`<video>` of the same kind and for an image's lightbox, never for a link (a
+link's url is the proxy's or an http(s) URL); the origin's
+Content-Security-Policy allows no `data:` media on the chat page, since no
+record the gateway serves carries one, so the corpus shows its media only
+where it is served without that policy. It covers both companion states: one chat names an
 existing thread, the rest carry `companion: null`. Companion messages
 themselves are conversation documents, not chat ones, so the corpus holds
 none — the suite mocks `/conversations/<id>` for those.
@@ -592,9 +621,24 @@ load of this device and browser:
   jobs, and a second tab on the same place takes nothing that is not its own.
   Recorders run in 250 ms slices, so a page left with the mic live hands the
   worker everything said up to the last fraction of a second, and leaving acts
-  as **✓**: the transcript waits in the draft for review. A dictation sent
-  with **➤** whose page is gone before its transcript is in lands in the draft
-  too, unsent — the context a send needs left with that page. Without a
+  as **✓**: the transcript waits in the draft for review. A dictation the
+  user *sent* — **➤**, or a take of the continuous loop that ended on a pause
+  — is a message to the thread it was recorded in, as if typed there: should
+  its page be gone before the transcript is in, the worker posts it into that
+  thread itself (the thread fixed when recording started, never whatever is on
+  screen by then), and the next page showing the thread just reads it back.
+  A take that cancelled a call in the continuous loop carries that call to
+  the worker (`call`), whose send sends it along as `cancelled_call`, as the
+  page's own would (docs/dashboard.md, "Inside the Android shell") — while
+  the take is fresh: one sent more than 90 s after its transcript came (a
+  page opened later that takes it over), or after it was recorded where the
+  worker was stopped in the middle and restarted it, goes as words alone,
+  so no call is placed again that nobody is waiting for. A slow
+  transcription the worker sends the moment it is in keeps its call.
+  A send the worker could not make, or may not have made (no answer, a worker
+  stopped in the middle), is never retried blindly: its text waits in the
+  draft with a note. A first message (no thread yet) waits in its composer's
+  draft, as before. Without a
   controlling worker (the very first load, a browser without one), and with
   an older worker that does not take the job up within 4 s, transcription is
   the page's own fetch, as before.
@@ -687,8 +731,12 @@ then leave the feed). There is no data file and no stored ordering: the feed
 changes because the clock moved. The service worker deliberately does **not**
 cache `/news`, only the `news.html` shell.
 
-Every headline links out to the source (`target=_blank`) — items are references,
-never copies. The three per-item buttons plus the page's free-text note are the
+A headline links out to the source (`target=_blank`) — items are references,
+never copies. An item's link is an absolute `http(s)` URL or the item has
+none: the gateway serves nothing else as `url`, and the page puts nothing else
+into an `href` (`webLink`, the rule of `news_store.web_link`; `docs/news.md`,
+"The item"). An item without a link, a channel post that carried none, shows
+its headline as text. The three per-item buttons plus the page's free-text note are the
 user's half of the learning loop:
 
 - `POST /news/feedback` — `{id?, signal, note?}` with signal
@@ -779,8 +827,23 @@ Threads can be spoken as well as typed, with no streaming and split by direction
   `wake` event), which reopens the thread used in the mode within the last
   15 minutes, else that voice composer. Both flags are dropped from the
   address once read and open the mic by themselves only inside the shell;
-  elsewhere the conversation offers a **Start talking** button. The pure parts — the detector's state machine and the wake's
-  choice of thread — are `components/continuous.js`
+  elsewhere the conversation offers a **Start talking** button. Closing it:
+  the toggle, or Ara — told by voice to switch the mode off, she stamps the
+  thread (`conversation-push.py --end-continuous` → `continuous_off`), and
+  every device showing it in the mode leaves it on its next read; a toggle
+  pressed after her stamp is the user's and stays on (docs/dashboard.md). An
+  answer that ends in a call directive (`[[call: <number> | <name>]]`) places
+  the call instead of opening the mic, in a shell with `placeCall`: the name,
+  the number and a **Cancel** button for 5 s with the mic open — speech
+  cancels, and goes to Ara as the next turn with a `cancelled_call` note (to
+  review instead, like any take, when the box holds text or files), so she
+  places the call again when the words did not mean to stop it (no words at
+  all: it goes ahead at once); `| no-voice-cancel` keeps the mic shut,
+  honoured only on a second attempt at the number — then the shell dials on
+  speaker (docs/dashboard.md, "Inside the Android shell"); everywhere else the
+  directive is a tap-to-dial link. The pure parts — the detector's state
+  machine, the wake's choice of thread and whether Ara's stamp ends the mode —
+  are `components/continuous.js`
   (`tests/test_webapp_continuous.py`).
 
 ## Installing on Android
@@ -800,7 +863,8 @@ cannot do — the home-screen role, a wake phrase, native speech output, the
 client certificate. Everything that is Retinue stays here, so it behaves the
 same in the shell, in Chrome and on a desktop. The contract between them:
 
-- **User agent**: the shell appends ` RetinueShell/4 (Android)` (`/3` before
+- **User agent**: the shell appends ` RetinueShell/6 (Android)` (`/5` before
+  `placeCall`, `/4` before the keyboard members, `/3` before
   the app's own settings page and the per-device preferences, `/2` before the
   endpoint members, `/1` before the Health Connect members below).
 - **`window.RetinueShell`**, installed at document start on the configured
@@ -834,8 +898,11 @@ same in the shell, in Chrome and on a desktop. The contract between them:
   certificate or password — those stay in the shell. An `endpoints` event says the list
   changed while the page is open.
 - **Shell → page**: `window.dispatchEvent(new CustomEvent('retinue-shell',
-  {detail: {type}}))` with `type` `wake` (the wake phrase) or `home` (a Home
-  press while the shell is in front). The home answers both in place: a wake
+  {detail: {type}}))` with `type` `wake` (the wake phrase), `home` (a Home
+  press while the shell is in front), `keyboard` (RetinueShell/5: the
+  outcome of a keyboard request, information only; see the bullet below) or
+  `call` (what became of a `placeCall`, information only; see Phone calls
+  below). The home answers both in place: a wake
   opens continuous conversation (above), a home press closes an open thread or
   sheet back to `/` (every view entry unwound, not just one) and scrolls the
   list to its top. Any other page of the web app answers by loading
@@ -866,10 +933,39 @@ same in the shell, in Chrome and on a desktop. The contract between them:
   the shell's endpoint editor instead of the controls, and a sync asked for is
   `skipped` with reason `disabled`. `components/shell.js` wraps all of it,
   feature-detected.
+- **Keyboard** (RetinueShell/5): the shell can be paired with another device
+  as a Bluetooth keyboard and type into it. `keyboardStatus()`,
+  `keyboardType(text, opts)`, `keyboardKey(name, opts)`,
+  `keyboardSecret(opts)` (a native field the user's password manager fills;
+  the secret never reaches the page), `keyboardOpen()` and
+  `keyboardCancel()`, with `keyboard` events for each request's outcome. The
+  phone asks itself before anything that can act on the device. What drives
+  them is a reply's shell actions, through `components/shell-keyboard.js`
+  and `components/shell.js`; the contract and the policy are in
+  `docs/dashboard.md` (the "Keyboard (RetinueShell/5)" row and "Shell
+  actions: typing on a paired device").
 - **Speech output**: Android's WebView has no Web Speech API, so the shell
   installs a `speechSynthesis` / `SpeechSynthesisUtterance` stand-in backed by
   the native TTS where the page has none. `components/speech.js` is unchanged;
   it simply finds an engine there.
+- **Phone calls** (RetinueShell/6): `placeCall(number)` calls the number
+  without a tap, on speakerphone, and only while the page holds
+  `setVoiceActive(true)`. It needs *Call directly by voice*, a switch per
+  endpoint in the app's settings (*This app with <endpoint>* → *Phone
+  calls*, off for a new endpoint), and Android's phone-call permission; short
+  of either, the shell opens the dialer with the number instead. The shell
+  normalises the number (separators, a leading `tel:` and the `(0)` of
+  `+44 (0)20` dropped); it must then be an optional `+` followed by digits,
+  `*` and `#`, with 3 to 20 digits and at most 32 characters. The answer is a
+  `call` event `{state, reason?, number?}`: `placed` (with `number`);
+  `dialer`, the dialer opened instead (`emergency`, `service-code` for any
+  number with `*` or `#`, `disabled` or `no-permission`, each with
+  `number`); or `refused` (`invalid-number`, `not-in-voice`, `no-telephony`,
+  or `failed` with `number`). `placeCall('')` is answered `refused` /
+  `invalid-number`, while `placeCall()` and `placeCall(null)` send nothing.
+  `components/shell.js` wraps it as `canPlaceCall`, `placeCall` and `onCall`;
+  the continuous loop is its only caller (above). The full text is in
+  docs/dashboard.md, "Inside the Android shell".
 
 ## Next steps
 

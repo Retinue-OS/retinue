@@ -15,6 +15,7 @@ something they cannot see.
     python3 tests/test_web_gateway_send_page.py
 """
 import contextlib
+import html.parser
 import importlib.util
 import os
 import sys
@@ -24,6 +25,11 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SCRIPTS_DIR = REPO_ROOT / "scripts"
+# The pages' script is a file of the dashboard's own (their
+# Content-Security-Policy runs no inline script); the page carries what it
+# needs to know in its markup.
+SENDS_JS = (REPO_ROOT / "webapp" / "gateway" / "sends.js").read_text(encoding="utf-8")
+SENDS_SCRIPT_TAG = '<script src="/gateway/sends.js"></script>'
 
 
 def _load_gateway(tmp: Path):
@@ -67,6 +73,21 @@ def _display_zone(name):
             os.environ["RETINUE_DISPLAY_TZ"] = previous
 
 
+def _status_row(page: str) -> dict:
+    """The attributes of the status page's #st-row, which the script reads."""
+    found = {}
+
+    class _Parser(html.parser.HTMLParser):
+        def handle_starttag(self, tag, attrs):
+            attrs = dict(attrs)
+            if attrs.get("id") == "st-row":
+                found.update(attrs)
+
+    _Parser().feed(page)
+    assert found, "no #st-row on the page"
+    return found
+
+
 def _detail(status, **extra):
     return {"status": status, "recipient": "+15551112222", "category": "verify",
             "message": "hello", **extra}
@@ -80,8 +101,13 @@ def test_sending_page_polls_with_spinner():
         assert "/sends/whatsapp-gateway/" + "a" * 32 + "/status" in out  # client-side poll
         # No unconditional full-page refresh — only the no-JS fallback.
         assert out.count('http-equiv="refresh"') == 1 and "<noscript>" in out
-        # No next request → the next button stays hidden and nextUrl is null.
-        assert "var nextUrl=null;" in out
+        row = _status_row(out)
+        assert row["data-status"] == "sending"
+        assert row["data-poll"] == "/sends/whatsapp-gateway/" + "a" * 32 + "/status"
+        assert SENDS_SCRIPT_TAG in out
+        assert "if (status === 'sending') { setTimeout(poll, 1200); }" in SENDS_JS
+        # No next request → the next button stays hidden and there is no next URL.
+        assert "data-next" not in row
         assert 'id="st-next"' in out and "display:none" in out
 
 
@@ -90,7 +116,7 @@ def test_sending_page_with_next_shows_button():
         wg = _load_gateway(Path(tmp))
         out = wg._render_channel_send_html(_detail("sending"), "whatsapp-gateway", "a" * 32,
                                            "/sends/signal-gateway/bbb")
-        assert 'var nextUrl="/sends/signal-gateway/bbb";' in out
+        assert _status_row(out)["data-next"] == "/sends/signal-gateway/bbb"
         assert 'id="st-next" href="/sends/signal-gateway/bbb"' in out
         assert 'style=""' in out  # button visible
 
@@ -100,14 +126,18 @@ def test_approved_page_shows_check_and_advances():
         wg = _load_gateway(Path(tmp))
         out = wg._render_channel_send_html(_detail("approved"), "whatsapp-gateway", "a" * 32, None)
         assert 'class="check"' in out and "✓" in out       # green check
-        assert "setTimeout(advance,1500)" in out           # brief pause, then close/advance
+        assert _status_row(out)["data-status"] == "approved" and SENDS_SCRIPT_TAG in out
+        # Brief pause, then close/advance.
+        assert "else if (status === 'approved') { setTimeout(advance, 1500); }" in SENDS_JS
         # With nothing left, back to the page the link was tapped on: the
         # latest history entry that is not a /sends page.
-        assert "nav.traverseTo(entries[i].key)" in out
-        assert "if(u.origin!==location.origin||/^\\/sends(\\/|$)/.test(u.pathname))continue;" in out
+        assert "return { entry: entries[i], url: u };" in SENDS_JS
+        assert "window.navigation.traverseTo(o.entry.key)" in SENDS_JS
+        assert ("if (u.origin !== location.origin || /^\\/sends(\\/|$)/.test(u.pathname)) continue;"
+                in SENDS_JS)
         # Opened on its own: close, else the dashboard — never the /sends list.
-        assert "window.close()" in out and "location.replace('/')" in out
-        assert "location='/sends'" not in out
+        assert "window.close()" in SENDS_JS and "location.replace('/')" in SENDS_JS
+        assert "'/sends'" not in SENDS_JS
 
 
 def test_error_page_shows_gateway_error():
@@ -547,16 +577,18 @@ def test_email_outcome_page_ends_like_a_messenger_send():
         assert "<th>Recipients</th><td>a@example.com, b@example.com</td>" in out
         assert "<th>Subject</th><td>Lunch</td>" in out
         assert 'class="check"' in out and '<p id="st-note" class="meta">Sent.</p>' in out
-        assert "setTimeout(advance,1500)" in out and "window.close()" in out
-        assert "var nextUrl=null;" in out and "var pollUrl=null;" in out
-        # The messenger's approved page runs the very same script.
+        row = _status_row(out)
+        assert row["data-status"] == "approved"
+        assert "data-next" not in row and "data-poll" not in row
+        # The messenger's approved page runs the very same script, from the
+        # same kind of row.
         messenger = wg._render_channel_send_html(_detail("approved"), "whatsapp-gateway",
                                                  "a" * 32, None)
-        script = lambda html: html[html.index("function advance()"):html.index("</script>")]
-        assert script(out) == script(messenger)
+        assert out.count(SENDS_SCRIPT_TAG) == 1 and messenger.count(SENDS_SCRIPT_TAG) == 1
+        assert _status_row(messenger)["data-status"] == "approved"
         with_next = wg._render_email_send_outcome_html(result, "ari", "42",
                                                        "/sends/signal-gateway/bbb")
-        assert 'var nextUrl="/sends/signal-gateway/bbb";' in with_next
+        assert _status_row(with_next)["data-next"] == "/sends/signal-gateway/bbb"
 
 
 def test_empty_list_after_a_decision_goes_back():
@@ -566,13 +598,15 @@ def test_empty_list_after_a_decision_goes_back():
         wg = _load_gateway(Path(tmp))
         after = wg._render_sends_index_html([], leave=True)
         assert "No pending send requests." in after          # the no-script view
-        assert wg._SENDS_LEAVE_JS in after and "  leave();\n" in after
+        assert "<body data-sends-leave>" in after and SENDS_SCRIPT_TAG in after
+        assert "if (document.body.hasAttribute('data-sends-leave')) {\n    leave();" in SENDS_JS
         plain = wg._render_sends_index_html([])
-        assert "<script>" not in plain and "leave()" not in plain
+        assert "<script" not in plain and "data-sends-leave" not in plain
         # The status page runs the very same way out.
         status = wg._render_channel_send_html(_detail("approved"), "whatsapp-gateway",
                                               "a" * 32, None)
-        assert wg._SENDS_LEAVE_JS in status
+        assert SENDS_SCRIPT_TAG in status
+        assert "if (nextUrl) { location = nextUrl; return; }\n    leave();" in SENDS_JS
 
 
 def _write_thread(tmp: Path, cid: str, title: str) -> None:
@@ -595,16 +629,18 @@ def test_approval_page_links_back_to_the_asking_thread():
         link = (f'<a href="/conversations.html#conversation-{cid}" id="back-thread" '
                 f'data-thread="{cid}">‹ Back to Party &lt;RSVP&gt;</a>')
         assert f"<nav>{link}{wg._NAV_HOME}" in out
-        assert wg._SENDS_BACK_JS in out
-        # Back when the latest non-/sends entry is this thread, else the link.
-        assert "return threadOf(u)===id?entries[i]:null;" in wg._SENDS_BACK_JS
-        assert "window.navigation.traverseTo(entry.key)" in wg._SENDS_BACK_JS
-        assert "primeReturn(id);" in wg._SENDS_BACK_JS
-        # The place is handed over in the shelf's restore format.
-        assert "'retinue.shelf.restore'" in wg._SENDS_RETURN_JS.replace('"', "'")
-        assert "{key:'thread:'+id,location:r.location" in wg._SENDS_RETURN_JS
-        # The return after a decision hands it over too.
-        assert "primeReturn(threadOf(u));" in wg._SENDS_LEAVE_JS
+        assert SENDS_SCRIPT_TAG in out
+        # The script: Back when the latest non-/sends entry is this thread,
+        # else the plain link; the place is handed over in the shelf's restore
+        # format, by the return after a decision too.
+        assert "var back = document.getElementById('back-thread');" in SENDS_JS
+        assert "if (!o || threadOf(o.url) !== backId) return;" in SENDS_JS
+        assert "primeReturn(backId);" in SENDS_JS
+        assert "var SHELF_RESTORE_KEY = 'retinue.shelf.restore';" in SENDS_JS
+        assert "{ key: 'thread:' + id, location: r.location, at: Date.now() }" in SENDS_JS
+        assert "primeReturn(threadOf(o.url));" in SENDS_JS
+        # No script in the page itself (the Content-Security-Policy).
+        assert "<script>" not in out
         # E-mail approval, and the status page after the decision, alike.
         email = wg._render_send_single_html({"request_id": "42", "thread": cid}, "ari", None)
         assert link in email
@@ -623,15 +659,13 @@ def test_no_backlink_without_a_live_thread():
                                              "whatsapp-gateway", "a" * 32, None)
         for out in (none, gone, bogus):
             assert 'id="back-thread"' not in out
-            assert wg._SENDS_BACK_JS not in out
             assert f'<nav>{wg._NAV_HOME}<a href="/sends">' in out
 
 
 def test_thread_notes_where_an_approval_link_was_tapped():
     src = (REPO_ROOT / "webapp" / "components" / "conversation.js").read_text(encoding="utf-8")
     assert "const SENDS_RETURN_KEY = 'retinue.sends.return';" in src
-    with tempfile.TemporaryDirectory() as tmp:
-        assert _load_gateway(Path(tmp))._SENDS_RETURN_KEY == "retinue.sends.return"
+    assert "var SENDS_RETURN_KEY = 'retinue.sends.return';" in SENDS_JS
     assert "if (link) this._noteSendsReturn(link);" in src
     assert "location: this.shelfLocation()," in src
 

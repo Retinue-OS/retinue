@@ -41,6 +41,21 @@ keep it archived" is expressed. Set the flags (no message) with:
 
     conversation-push.py --thread 42ecb0113a3d48ac87be514cfaf99a7c --archive --mute
 
+Redact one of the user's own messages — on their request, typically the one in
+which they dictated a password you then typed (shell-type.py --sensitive). The
+replayed transcript shows each user message's id as [message id: …]:
+
+    conversation-push.py --thread 42ecb0113a3d48ac87be514cfaf99a7c \
+        --redact-message 3f2a9c1d0b7e
+
+The text becomes "[deleted by request]", for good.
+
+When the user asks Ara to end continuous conversation (the hands-free voice
+loop), she switches it off from her side — in a dashboard turn the thread is
+the one the user spoke in (RETINUE_THREAD_ID):
+
+    conversation-push.py --end-continuous
+
 Use --context to hand machine-usable context to the Ara sessions that will
 later serve this thread, without showing it to the user — canonically the
 exact reply command (reply token included) for a proposed messenger reply:
@@ -163,6 +178,45 @@ def _reply_attach(args, defaults: dict) -> int:
     return 0
 
 
+def _redact(args, defaults: dict) -> int:
+    """Redact one of the user's messages in --thread, for good — e.g. the one
+    in which they dictated a password Ara then typed (scripts/shell-type.py
+    --sensitive). Only on the user's own request."""
+    given = [f"--{dest.replace('_', '-')}" for dest, default in defaults.items()
+             if dest not in ("redact_message", "thread", "url", "timeout")
+             and getattr(args, dest, default) != default]
+    if given:
+        print(f"conversation-push: --redact-message takes only --thread "
+              f"(got {', '.join(given)})", file=sys.stderr)
+        return 2
+    if not args.thread or not _THREAD_ID_RE.fullmatch(args.thread):
+        print("conversation-push: --redact-message needs --thread <id>", file=sys.stderr)
+        return 2
+    if not re.fullmatch(r"[0-9a-f]{12,32}", args.redact_message):
+        print(f"conversation-push: not a message id: {args.redact_message}", file=sys.stderr)
+        return 2
+    if not TOKEN:
+        print("conversation-push: CONVERSATION_BACKEND_TOKEN is not set", file=sys.stderr)
+        return 2
+    url = args.url or f"{DEFAULT_URL.rstrip('/')}/{args.thread}/redact"
+    req = urllib.request.Request(
+        url, data=json.dumps({"message_id": args.redact_message}).encode("utf-8"),
+        headers={"Content-Type": "application/json",
+                 "X-Conversation-Backend-Token": TOKEN}, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=args.timeout) as resp:
+            body = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        print(f"conversation-push: HTTP {exc.code}: {detail}", file=sys.stderr)
+        return 1
+    except (urllib.error.URLError, OSError) as exc:
+        print(f"conversation-push: request failed: {exc}", file=sys.stderr)
+        return 1
+    print(json.dumps(body, ensure_ascii=False))
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Open a dashboard conversation tab with the user."
@@ -180,6 +234,10 @@ def main() -> int:
                         help="mute --thread: keep it where it is when news is filed into it")
     parser.add_argument("--unmute", dest="muted", action="store_false",
                         help="unmute --thread")
+    parser.add_argument("--end-continuous", dest="end_continuous", action="store_true",
+                        help="end continuous conversation (the hands-free voice loop) in "
+                             "--thread on every device showing it in the mode — for when "
+                             "the user asks Ara to switch it off")
     parser.add_argument("--on-behalf-of", dest="on_behalf_of",
                         help="requester identity that owns the thread (defaults to the dashboard user)")
     parser.add_argument("--agent",
@@ -238,6 +296,10 @@ def main() -> int:
                           "and Ara's turns in the thread know the project. New threads only.")
     att.add_argument("--project-title", dest="project_title", metavar="TEXT",
                      help="the project's title, shown with --project")
+    parser.add_argument("--redact-message", dest="redact_message", metavar="MSG_ID",
+                        help="with --thread: replace one of the user's messages with "
+                             "'[deleted by request]' (the id the transcript shows as "
+                             "[message id: …]); only on the user's request")
     parser.add_argument("--reply-attach", dest="reply_attach", action="append",
                         default=[], metavar="PATH",
                         help="attach a file to your own reply in the dashboard thread "
@@ -250,8 +312,14 @@ def main() -> int:
     if args.reply_attach:
         return _reply_attach(args, vars(parser.parse_args([])))
 
+    if args.redact_message:
+        return _redact(args, vars(parser.parse_args([])))
+
     message = args.message.strip()
-    flags_only = args.archived is not None or args.muted is not None
+    flags_only = args.archived is not None or args.muted is not None or args.end_continuous
+    if not args.thread and args.end_continuous and not args.url:
+        # A dashboard turn knows its own thread: the one the user just spoke in.
+        args.thread = os.environ.get("RETINUE_THREAD_ID") or None
     if not message and not args.attach and not flags_only:
         print("conversation-push: empty message", file=sys.stderr)
         return 2
@@ -271,13 +339,13 @@ def main() -> int:
         print("conversation-push: --project applies only to a new thread", file=sys.stderr)
         return 2
     if flags_only and not args.thread:
-        print("conversation-push: --archive/--mute need --thread", file=sys.stderr)
+        print("conversation-push: --archive/--mute/--end-continuous need --thread", file=sys.stderr)
         return 2
     # Flag changes are their own request; mixing them with a message would make
     # the ordering (does the append wake the thread before or after the mute?)
     # implicit. Send the flags first, then the message.
     if flags_only and (message or args.attach):
-        print("conversation-push: --archive/--mute cannot be combined with a message",
+        print("conversation-push: --archive/--mute/--end-continuous cannot be combined with a message",
               file=sys.stderr)
         return 2
     # Context rides with a message; on a flags-only call there is no message
@@ -298,6 +366,8 @@ def main() -> int:
             payload["archived"] = args.archived
         if args.muted is not None:
             payload["muted"] = args.muted
+        if args.end_continuous:
+            payload["continuous_off"] = True
     else:
         payload["message"] = message
         if args.agent:

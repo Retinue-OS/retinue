@@ -24,6 +24,7 @@ reach the reply that is kept.
 
     python3 tests/test_web_gateway_claude_spawn.py
 """
+import base64
 import importlib.util
 import json
 import os
@@ -267,6 +268,605 @@ def test_thread_turn_collects_reply_attachments(wg):
     assert not Path(manifests[0]).exists(), "manifest left behind"
 
 
+def test_thread_turn_collects_shell_actions(wg):
+    """A thread turn's session lists shell actions (scripts/shell-type.py) in
+    its own manifest; the valid ones come back as reply_shell_actions, the
+    invalid ones are dropped, and the manifest is gone afterwards. A turn that
+    is not a thread turn gets no manifest at all."""
+    manifests = []
+    good = {"kind": "keyboard-type", "id": "a" * 32, "text": "hello", "enter": False}
+    submit = {"kind": "keyboard-type", "id": "c" * 32, "text": "ls", "enter": True}
+
+    def act_and_answer(cmd, **kwargs):
+        manifest = kwargs["env"]["RETINUE_REPLY_SHELL_ACTIONS_FILE"]
+        manifests.append(manifest)
+        Path(manifest).write_text(
+            json.dumps(good) + "\n" + json.dumps({"kind": "nope", "id": "b" * 32}) + "\n"
+            + json.dumps(submit) + "\n",
+            encoding="utf-8")
+        return subprocess.CompletedProcess(
+            cmd, 0, stdout=json.dumps({"result": "typing it", "session_id": "s-7"}),
+            stderr="")
+
+    _capture_spawns(wg, "")
+    wg.subprocess.run = act_and_answer
+    with _daemon_environment():
+        out = wg.send_message("type hello", session_key="env-shell",
+                              model="sonnet", reply_attachments=True)
+    # Validated and canonical; whether the page may run them without a tap is
+    # the thread worker's decision (it knows the thread and the turn).
+    assert out.get("reply_shell_actions") == [good, submit], out
+    assert not Path(manifests[0]).exists(), "manifest left behind"
+
+    spawns = _capture_spawns(wg, json.dumps({"result": "hi", "session_id": "s-8"}))
+    with _daemon_environment():
+        wg.send_message("hello", session_key="env-shell-2", model="sonnet")
+    assert "RETINUE_REPLY_SHELL_ACTIONS_FILE" not in spawns[0][1]["env"], "not a thread turn"
+
+
+def test_shell_actions_ride_on_the_stored_reply(wg):
+    """The thread worker stores the turn's shell actions on Ara's reply, and a
+    replayed transcript tells later turns what was handed over."""
+    conv = wg._new_conv("user", "reto", "t", "user", "type hello on the quest",
+                        via_edge=True)
+    action = {"kind": "keyboard-type", "id": "c" * 32, "text": "hello", "enter": True}
+    secret = {"kind": "keyboard-secret", "id": "d" * 32, "label": "Meta account",
+              "enter": False}
+    real = wg.send_message
+    wg.send_message = lambda *a, **k: {"response": "Typing it now.",
+                                       "reply_shell_actions": [action, secret]}
+    try:
+        with _daemon_environment():
+            assert wg._conv_worker(conv["id"], f"conv:{conv['id']}", push=False)
+    finally:
+        wg.send_message = real
+    stored = wg._load_conv(conv["id"])
+    reply = stored["messages"][-1]
+    assert reply["role"] == "assistant" and reply["shell_actions"] == [
+        dict(action, auto=False), dict(secret, auto=False)], reply
+    note = wg._conv_render_messages(stored, stored["messages"])
+    assert "type 5 characters + Enter: 'hello'" in note, note
+    assert "password-manager field for 'Meta account'" in note, note
+
+
+def test_sensitive_text_masked_purged_and_never_logged(wg):
+    """A sensitive typing action: stored for the phone, never in a replayed
+    transcript nor in the gateway's log, deleted once reported typed, and in
+    any case gone from every read after the TTL."""
+    import contextlib
+    import io
+    conv = wg._new_conv("user", "reto", "t", "user", "my PIN is 4711, type it",
+                        via_edge=True)
+    sens = {"kind": "keyboard-type", "id": "e" * 32, "text": "4711", "enter": True,
+            "sensitive": True}
+    real = wg.send_message
+    wg.send_message = lambda *a, **k: {"response": "Typing it now.",
+                                       "reply_shell_actions": [dict(sens)]}
+    log = io.StringIO()
+    try:
+        with _daemon_environment(), contextlib.redirect_stdout(log):
+            assert wg._conv_worker(conv["id"], f"conv:{conv['id']}", push=False)
+    finally:
+        wg.send_message = real
+    assert "4711" not in log.getvalue().replace("my PIN is 4711, type it", ""), \
+        "the sensitive text reached the log"
+    stored = wg._load_conv(conv["id"])
+    reply = stored["messages"][-1]
+    assert reply["shell_actions"][0]["text"] == "4711", "the phone still gets it"
+    note = wg._conv_render_messages(stored, [reply])
+    assert "4711" not in note and "sensitive text" in note, note
+    # The user's message shows its id, so Ara can offer to redact it.
+    user_msg = stored["messages"][0]
+    assert f"[message id: {user_msg['id']}]" in wg._conv_render_messages(stored, [user_msg])
+
+    # Reported typed: deleted from the file at once.
+    assert wg._conv_persist_purge(conv["id"], {sens["id"]}) is not None
+    raw = (wg.CONVERSATIONS_DIR / f"{conv['id']}.json").read_text()
+    assert "4711" not in raw.replace("my PIN is 4711, type it", ""), raw
+    gone = wg._load_conv(conv["id"])["messages"][-1]["shell_actions"][0]
+    assert gone["text"] is None and gone["purged"] is True, gone
+
+    # Not reported: no read after the TTL returns it, file rewritten or not.
+    conv2 = wg._new_conv("user", "reto", "t2", "user", "type the code")
+    wg._conv_add_message(conv2["id"], "assistant", "ok",
+                         shell_actions_=[dict(sens, id="f" * 32)])
+    path = wg.CONVERSATIONS_DIR / f"{conv2['id']}.json"
+    data = json.loads(path.read_text())
+    data["messages"][-1]["ts"] = "2000-01-01T00:00:00+00:00"   # long expired
+    path.write_text(json.dumps(data))
+    served = wg._load_conv(conv2["id"])["messages"][-1]["shell_actions"][0]
+    assert served["text"] is None and served["purged"], served
+    wg._conv_persist_purge(conv2["id"])
+    assert "4711" not in path.read_text()
+    print("ok: a sensitive text rides to the phone, never into a transcript or the "
+          "log, and is purged once typed or after the TTL")
+
+
+def test_redact_a_user_message(wg):
+    conv = wg._new_conv("user", "reto", "t", "user", "my password is hunter2")
+    stored = wg._load_conv(conv["id"])
+    mid = stored["messages"][0]["id"]
+    wg._conv_add_message(conv["id"], "assistant", "Typed.")
+    ara_id = wg._load_conv(conv["id"])["messages"][-1]["id"]
+    out, status, why = wg._conv_redact_message(conv["id"], ara_id)
+    assert out is None and status == 400 and "user's own" in why, why
+    out, status, why = wg._conv_redact_message(conv["id"], "0" * 12)
+    assert out is None and status == 404 and why == "no such message", why
+    out, status, why = wg._conv_redact_message(conv["id"], mid)
+    assert out is not None and status == 200 and why == "", why
+    raw = (wg.CONVERSATIONS_DIR / f"{conv['id']}.json").read_text()
+    assert "hunter2" not in raw, raw
+    m = wg._load_conv(conv["id"])["messages"][0]
+    assert m["text"] == wg.REDACTED_TEXT and m["redacted"] is True
+    note = wg._conv_render_messages(wg._load_conv(conv["id"]), [m])
+    assert "hunter2" not in note and "[message id:" not in note, note
+    print("ok: a user message is redacted for good, by its id, and only a user's")
+
+
+def test_only_a_dashboard_turn_can_type(wg):
+    """Only a turn the user started from the dashboard (a message that came
+    through the reverse proxy, `via_edge`) gets a shell-action manifest: not a
+    chat arrival, not a "user" message from inside the container. Whatever
+    such a turn returns anyway is dropped. And only a plain chat the user
+    opened lets plain text run without a tap."""
+    spawns = _capture_spawns(wg, json.dumps({"result": "hi", "session_id": "s-a"}))
+    with _daemon_environment():
+        wg.send_message("x", session_key="env-arrival", model="sonnet",
+                        reply_attachments=True, reply_shell_actions=False)
+    env = spawns[0][1]["env"]
+    assert "RETINUE_REPLY_ATTACHMENTS_FILE" in env, "files still ride"
+    assert "RETINUE_REPLY_SHELL_ACTIONS_FILE" not in env, "no typing for this turn"
+
+    seen = []
+    plain = {"kind": "keyboard-type", "id": "a" * 32, "text": "hello", "enter": False}
+    tab = {"kind": "keyboard-type", "id": "b" * 32, "text": "me@x.org\t ", "enter": False}
+    # A tab inside a line the user has seen, with no whitespace at an edge:
+    # only the tab itself keeps it from running by itself. A last turn sends
+    # it as the reply's first action, the one place it could run by itself.
+    inner_tab = {"kind": "keyboard-type", "id": "c" * 32, "text": "user\tpass",
+                 "enter": False}
+
+    def stub(*a, **k):
+        # Asked once the prompt is built (send_message); here nothing waits.
+        want = k.get("reply_shell_actions")
+        seen.append(want() if callable(want) else want)
+        return {"response": "Noted.",
+                "reply_shell_actions": [dict(x) for x in turn_actions]}
+
+    turn_actions = [plain, inner_tab, tab]
+
+    real = wg.send_message
+    wg.send_message = stub
+    try:
+        with _daemon_environment():
+            # The text on a line of its own, as auto-running needs it
+            # (_conv_text_was_shown).
+            dash = wg._new_conv("user", "reto", "t", "user", "type this:\nhello\nuser\tpass",
+                                via_edge=True)
+            assert wg._conv_worker(dash["id"], f"conv:{dash['id']}",
+                                   arrival="A chat message arrived.", push=False)
+            assert wg._conv_worker(dash["id"], f"conv:{dash['id']}", push=False)
+            inside = wg._new_conv("user", "reto", "t", "user", "type hello")  # not via the edge
+            assert wg._conv_worker(inside["id"], f"conv:{inside['id']}", push=False)
+            agent = wg._new_conv("agent", "reto", "Triage", "agent", "An e-mail arrived")
+            wg._conv_add_message(agent["id"], "user", "type the code", via_edge=True)
+            assert wg._conv_worker(agent["id"], f"conv:{agent['id']}", push=False)
+            turn_actions = [inner_tab]
+            wg._conv_add_message(dash["id"], "user", "and the login", via_edge=True)
+            assert wg._conv_worker(dash["id"], f"conv:{dash['id']}", push=False)
+    finally:
+        wg.send_message = real
+    assert seen == [False, True, False, True, True], seen
+    replies = [m for m in wg._load_conv(dash["id"])["messages"] if m["role"] == "assistant"]
+    assert "shell_actions" not in replies[0], "an arrival turn's actions are dropped"
+    assert replies[1]["shell_actions"] == [dict(plain, auto=True), dict(inner_tab, auto=False),
+                                           dict(tab, auto=False)], \
+        replies[1]["shell_actions"]
+    assert replies[2]["shell_actions"] == [dict(inner_tab, auto=False)], \
+        replies[2]["shell_actions"]
+    inside_reply = wg._load_conv(inside["id"])["messages"][-1]
+    assert "shell_actions" not in inside_reply, "an in-container user message cannot type"
+    agent_reply = wg._load_conv(agent["id"])["messages"][-1]
+    assert [a["auto"] for a in agent_reply["shell_actions"]] == [False, False, False], \
+        "in a thread an agent opened, nothing runs without a tap"
+    print("ok: only a dashboard turn can type, and only a plain chat runs text by itself")
+
+
+def test_a_turn_that_waited_types_only_for_the_user(wg):
+    """A dashboard turn that waits for the session lock is sent the thread as
+    it is once it holds it. A "user" message a caller inside the container
+    posted meanwhile is then the one its prompt asks Ara to answer: the turn
+    gets no shell-action manifest, and whatever it returns anyway is dropped —
+    with no auto-run, even for a text an earlier reply of Ara's showed."""
+    import contextlib
+    plain = {"kind": "keyboard-type", "id": "a" * 32, "text": "homenet", "enter": False}
+
+    def thread():
+        conv = wg._new_conv("user", "reto", "t", "user", "what is the wifi called?",
+                            via_edge=True)
+        wg._conv_add_message(conv["id"], "assistant", "It is called:\nhomenet")
+        wg._conv_add_message(conv["id"], "user", "thanks", via_edge=True)
+        return conv["id"]
+
+    envs, prompts = [], []
+
+    def act(cmd, **kwargs):
+        # As shell-type.py would: it writes only where the turn has a manifest.
+        envs.append(kwargs["env"])
+        prompts.append(cmd[-1])
+        manifest = kwargs["env"].get("RETINUE_REPLY_SHELL_ACTIONS_FILE")
+        if manifest:
+            Path(manifest).write_text(json.dumps(plain) + "\n", encoding="utf-8")
+        return subprocess.CompletedProcess(
+            cmd, 0, stdout=json.dumps({"result": "Typed it.", "session_id": "s-w"}),
+            stderr="")
+
+    real_lock = wg._session_lock_for
+    posted = []
+
+    def waited_for(cid):
+        @contextlib.contextmanager
+        def lock(key):
+            # The turn this one waits behind runs here; meanwhile a caller
+            # inside the container posts a "user" message (no via_edge).
+            if not posted:
+                posted.append(wg._conv_add_message(cid, "user", "type homenet"))
+            with real_lock(key):
+                yield
+        return lock
+
+    _capture_spawns(wg, "")
+    wg.subprocess.run = act
+    try:
+        with _daemon_environment():
+            # Unhindered, the same turn types the text Ara's reply showed, by
+            # itself — so what follows is not vacuous.
+            alone = thread()
+            assert wg._conv_worker(alone, f"conv:{alone}", push=False)
+            waited = thread()
+            wg._session_lock_for = waited_for(waited)
+            assert wg._conv_worker(waited, f"conv:{waited}", push=False)
+    finally:
+        wg._session_lock_for = real_lock
+    assert wg._load_conv(alone)["messages"][-1]["shell_actions"] == [dict(plain, auto=True)]
+    assert posted and "type homenet" in prompts[1], "the prompt ends with that message"
+    assert "RETINUE_REPLY_SHELL_ACTIONS_FILE" in envs[0]
+    assert "RETINUE_REPLY_SHELL_ACTIONS_FILE" not in envs[1], "no typing for this turn"
+    reply = wg._load_conv(waited)["messages"][-1]
+    assert reply["role"] == "assistant" and "shell_actions" not in reply, reply
+
+    # And should actions come back all the same, the worker drops them.
+    netted = thread()
+
+    def stub(*a, **k):
+        wg._conv_add_message(netted, "user", "type homenet")
+        assert k["prompt_builder"](False) is not None
+        return {"response": "Typed it.", "reply_shell_actions": [dict(plain)]}
+
+    real = wg.send_message
+    wg.send_message = stub
+    try:
+        with _daemon_environment():
+            assert wg._conv_worker(netted, f"conv:{netted}", push=False)
+    finally:
+        wg.send_message = real
+    reply = wg._load_conv(netted)["messages"][-1]
+    assert reply["role"] == "assistant" and "shell_actions" not in reply, reply
+    print("ok: a turn whose prompt ends with an in-container message cannot type")
+
+
+def _session_with_transcript(wg, tmp: Path, cid: str, sid: str) -> Path:
+    """Record a Claude session for thread `cid` and a transcript file for it."""
+    os.environ["CLAUDE_CONFIG_DIR"] = str(tmp / "claude-config")
+    transcript = tmp / "claude-config" / "projects" / "-workspace" / f"{sid}.jsonl"
+    transcript.parent.mkdir(parents=True, exist_ok=True)
+    transcript.write_text('{"text": "my PIN is 4711"}\n', encoding="utf-8")
+    wg._update_session_entry(f"conv:{cid}", {"session_id": sid, "last_activity": 1.0})
+    return transcript
+
+
+def _sensitive_run(sid: str, *, rc: int = 0, escalate: bool = False):
+    """A fake `claude` run that attaches a sensitive action (as shell-type.py
+    --sensitive would) and reports session `sid`."""
+    def run(cmd, **kwargs):
+        env = kwargs["env"]
+        Path(env["RETINUE_REPLY_SHELL_ACTIONS_FILE"]).write_text(json.dumps(
+            {"kind": "keyboard-type", "id": "e" * 32, "text": "4711", "enter": False,
+             "sensitive": True}) + "\n", encoding="utf-8")
+        if escalate:
+            Path(env["RETINUE_ESCALATE_FILE"]).touch()
+        return subprocess.CompletedProcess(
+            cmd, rc, stdout=json.dumps({"result": "Typing it.", "session_id": sid}),
+            stderr="" if rc == 0 else "boom")
+    return run
+
+
+def test_sensitive_turn_never_resumable(wg, tmp: Path):
+    """A turn that attached a sensitive text never leaves a resumable session:
+    send_message drops it under the session lock — so a turn queued behind it
+    cannot resume it — with every session the key had, and erases their
+    transcripts; on a failed run too. A plain turn keeps its session and
+    remembers the one it replaced."""
+    key = "conv:" + "1" * 32
+    old = _session_with_transcript(wg, tmp, "1" * 32, "11111111-0000-0000-0000-000000000000")
+    new = old.parent / "22222222-0000-0000-0000-000000000000.jsonl"
+    new.write_text("{}\n", encoding="utf-8")
+    _capture_spawns(wg, "")
+    wg.subprocess.run = _sensitive_run(new.stem)
+    with _daemon_environment():
+        out = wg.send_message("my PIN is 4711, type it", session_key=key, model="sonnet",
+                              reply_attachments=True)
+    assert out.get("session_reset") is True, out
+    assert wg._get_session_entry(key) == {}, "nothing to resume"
+    assert not old.exists() and not new.exists(), "every transcript erased"
+    assert out["reply_shell_actions"][0]["sensitive"] is True, "the phone still gets it"
+
+    # Failed run: the same.
+    key2 = "conv:" + "2" * 32
+    old2 = _session_with_transcript(wg, tmp, "2" * 32, "33333333-0000-0000-0000-000000000000")
+    wg.subprocess.run = _sensitive_run("44444444-0000-0000-0000-000000000000", rc=1)
+    with _daemon_environment():
+        out = wg.send_message("my PIN is 4711", session_key=key2, model="sonnet",
+                              reply_attachments=True)
+    assert "error" in out and wg._get_session_entry(key2) == {} and not old2.exists(), out
+
+    # A plain turn: recorded, with the session it replaced remembered.
+    key3 = "conv:" + "3" * 32
+    _session_with_transcript(wg, tmp, "3" * 32, "55555555-0000-0000-0000-000000000000")
+    wg._record_turn_session(key3, {"session_id": "66666666-0000-0000-0000-000000000000",
+                                   "last_activity": 2.0})
+    entry = wg._get_session_entry(key3)
+    assert entry["session_id"].startswith("6666") and \
+        entry["previous_session_ids"] == ["55555555-0000-0000-0000-000000000000"], entry
+    print("ok: a sensitive turn's session is never resumable, failed or not")
+
+
+def test_escalated_junior_sensitive_and_fresh_session(wg_tiered, tmp: Path):
+    """Junior attached a sensitive text, then escalated: her reply is discarded
+    but her session typed it, so the turn's session is dropped all the same —
+    and her own fresh session's transcript erased."""
+    wg = wg_tiered
+    key = "conv:" + "4" * 32
+    os.environ["CLAUDE_CONFIG_DIR"] = str(tmp / "claude-config")
+    proj = tmp / "claude-config" / "projects" / "-workspace"
+    proj.mkdir(parents=True, exist_ok=True)
+    junior_t = proj / "77777777-0000-0000-0000-000000000000.jsonl"
+    junior_t.write_text("{}\n", encoding="utf-8")
+    runs = []
+
+    def run(cmd, **kwargs):
+        runs.append(cmd)
+        if len(runs) == 1:
+            return _sensitive_run(junior_t.stem, escalate=True)(cmd, **kwargs)
+        return subprocess.CompletedProcess(
+            cmd, 0, stdout=json.dumps({"result": "senior", "session_id": "88888888-0000-0000-0000-000000000000"}),
+            stderr="")
+
+    _capture_spawns(wg, "")
+    wg.subprocess.run = run
+    with _daemon_environment():
+        out = wg.send_message("type my PIN", session_key=key, reply_attachments=True)
+    assert out.get("escalated") and out.get("session_reset"), out
+    assert "reply_shell_actions" not in out, "junior's actions go with her reply"
+    assert wg._get_session_entry(key) == {}
+    assert not junior_t.exists(), "junior's fresh session is erased"
+    print("ok: an escalated junior's sensitive action still ends the session")
+
+
+def test_a_new_session_gets_the_whole_thread(wg):
+    """A turn whose stored session went while it waited (reset, expired) starts
+    a new one — with the whole thread (restart_message), not the resumed
+    session's fragment."""
+    spawns = _capture_spawns(wg, json.dumps({"result": "ok", "session_id": "s-new"}))
+    with _daemon_environment():
+        wg.send_message("only the new bit", session_key="conv:" + "5" * 32, model="sonnet",
+                        restart_message="THE WHOLE THREAD", reply_attachments=True)
+    assert spawns[0][0][-1] == "THE WHOLE THREAD", spawns[0][0][-3:]
+    # A thread's prompt is built once the lock is held, for the session as it
+    # is then: what the turn read before waiting does not reach the model.
+    spawns.clear()
+    built = []
+
+    def build(fresh):
+        built.append(fresh)
+        return f"built fresh={fresh}"
+
+    with _daemon_environment():
+        wg.send_message("stale", session_key="conv:" + "6" * 32, model="sonnet",
+                        restart_message="stale too", prompt_builder=build)
+    assert spawns[0][0][-1] == "built fresh=False" and built == [False], (built, spawns[0][0][-1])
+    wg._record_turn_session("conv:" + "6" * 32, {"session_id": "s-6", "last_activity": wg._now_ts()})
+    spawns.clear(); built.clear()
+    with _daemon_environment():
+        wg.send_message("stale", session_key="conv:" + "6" * 32, model="sonnet",
+                        prompt_builder=build)
+    cmd = spawns[0][0]
+    assert cmd[cmd.index("--resume") + 1] == "s-6" and cmd[-1] == "built fresh=True", cmd[-4:]
+    assert built == [True, False], "and the whole thread, should the resume be refused"
+    print("ok: a new session is shown the whole thread, built under the lock")
+
+
+def test_redaction_reaches_every_copy(wg, tmp: Path):
+    """Redaction takes the text out of the message, its attachment files, a
+    title derived from it, the session log and the Claude session — and a turn
+    running meanwhile does not bring the session back."""
+    secret = "my PIN is 4711, type it"
+    blob = base64.b64encode(b"voice: four seven one one").decode()
+    conv = wg._new_conv("user", "reto", None, "user", secret,
+                        first_attachments=[{"data": blob, "filename": "memo.ogg",
+                                            "content_type": "audio/ogg"}])
+    cid = conv["id"]
+    stored = wg._load_conv(cid)
+    msg = stored["messages"][0]
+    att = msg["attachments"][0]
+    att_file = wg.CONVERSATION_ATTACHMENTS_DIR / cid / f"{att['id']}{att['suffix']}"
+    assert att_file.exists() and stored["title"] == secret
+    # As a dashboard turn logs them: naming their thread and message.
+    wg._append_entry(secret, "Typing it.", thread_id=cid, message_id=msg["id"])
+    wg._append_entry("something else", "ok", thread_id=cid, message_id="0" * 12)
+    other = wg._new_conv("user", "reto", "t", "user", "yes")
+    wg._append_entry(secret, "same words, another thread", thread_id=other["id"],
+                     message_id=wg._load_conv(other["id"])["messages"][0]["id"])
+    sid = "31111111-2222-3333-4444-555555555555"
+    transcript = _session_with_transcript(wg, tmp, cid, sid)
+
+    # Redacted from inside a running turn of the thread.
+    with wg._conv_pending_lock:
+        wg._conv_pending_turns[cid] = 1
+    try:
+        out, status, why = wg._conv_redact_message(cid, msg["id"])
+    finally:
+        with wg._conv_pending_lock:
+            wg._conv_pending_turns.pop(cid, None)
+    assert status == 200, why
+    after = wg._load_conv(cid)
+    assert after["title"] == wg.REDACTED_TEXT, after["title"]
+    assert "4711" not in json.dumps(after), after
+    assert not att_file.exists(), "the attachment file goes too"
+    log = wg._load_conversation(wg._today())
+    mine = [e for e in log if e.get("thread") == cid]
+    assert "4711" not in json.dumps(mine) and "something else" in json.dumps(mine), mine
+    theirs = [e for e in log if e.get("thread") == other["id"]]
+    assert theirs and theirs[0]["question"] == secret, "keyed by message: another thread's entry stays"
+    assert wg._get_session_entry(f"conv:{cid}") == {} and not transcript.exists()
+    # The running turn ends by recording its session: refused once, erased.
+    late = tmp / "claude-config" / "projects" / "-workspace" / ("4" * 8 + "-1111-2222-3333-444444444444.jsonl")
+    late.write_text("{}\n", encoding="utf-8")
+    wg._update_session_entry(f"conv:{cid}", {"session_id": late.stem, "last_activity": 2.0})
+    assert wg._get_session_entry(f"conv:{cid}") == {} and not late.exists()
+    # The next one records normally.
+    wg._update_session_entry(f"conv:{cid}", {"session_id": "fresh-0000", "last_activity": 3.0})
+    assert wg._get_session_entry(f"conv:{cid}").get("session_id") == "fresh-0000"
+    # A turn running when the redaction landed logs its question afterwards:
+    # it is logged redacted.
+    wg._append_entry(secret, "Typed, and deleted your message.", thread_id=cid,
+                     message_id=msg["id"])
+    late_entry = [e for e in wg._load_conversation(wg._today())
+                  if e.get("thread") == cid][-1]
+    assert late_entry["question"] == wg.REDACTED_TEXT, late_entry
+    print("ok: redaction reaches the title, attachments, session log and session")
+
+
+def test_redaction_erases_every_session_the_thread_had(wg, tmp: Path):
+    conv = wg._new_conv("user", "reto", "t", "user", "my PIN is 1234")
+    cid = conv["id"]
+    first = _session_with_transcript(wg, tmp, cid, "99999999-0000-0000-0000-000000000001")
+    second = first.parent / "99999999-0000-0000-0000-000000000002.jsonl"
+    second.write_text("{}\n", encoding="utf-8")
+    # The first session expired and was replaced; it still holds the PIN.
+    wg._record_turn_session(f"conv:{cid}", {"session_id": second.stem, "last_activity": 9.0})
+    mid = wg._load_conv(cid)["messages"][0]["id"]
+    assert wg._conv_redact_message(cid, mid)[1] == 200
+    assert not first.exists() and not second.exists(), "both transcripts erased"
+    print("ok: redaction erases every session a thread had")
+
+
+def test_legacy_messages_can_be_redacted(wg):
+    """A message stored before messages had ids gets a stable derived one."""
+    conv = wg._new_conv("user", "reto", "t", "user", "old one: 0000")
+    path = wg.CONVERSATIONS_DIR / f"{conv['id']}.json"
+    data = json.loads(path.read_text())
+    data["messages"][0].pop("id")
+    path.write_text(json.dumps(data))
+    c = wg._load_conv(conv["id"])
+    derived = wg._conv_message_id(c["messages"][0])
+    assert derived == wg._conv_message_id(wg._load_conv(conv["id"])["messages"][0]), "stable"
+    assert f"[message id: {derived}]" in wg._conv_render_messages(c, c["messages"])
+    out, status, why = wg._conv_redact_message(conv["id"], derived)
+    assert status == 200, why
+    assert "0000" not in path.read_text()
+    print("ok: a legacy message is redacted by its derived id")
+
+
+def test_sensitive_reply_neutral_title(wg):
+    """A title derived from the user's message may carry the very text typed:
+    a reply with a sensitive action replaces it, before any push."""
+    conv = wg._new_conv("user", "reto", None, "user", "Type my PIN 4711 on the TV",
+                        via_edge=True)
+    sens = {"kind": "keyboard-type", "id": "e" * 32, "text": "4711", "enter": False,
+            "sensitive": True}
+    pushed = []
+    real_send, real_push = wg.send_message, wg._push_conv_notification
+    wg.send_message = lambda *a, **k: {"response": "Typing it.", "reply_shell_actions": [dict(sens)]}
+    wg._push_conv_notification = lambda c, text, *a, **k: pushed.append(c.get("title")) or 1
+    try:
+        with _daemon_environment():
+            assert wg._conv_worker(conv["id"], f"conv:{conv['id']}", push=True)
+    finally:
+        wg.send_message, wg._push_conv_notification = real_send, real_push
+    after = wg._load_conv(conv["id"])
+    assert after["title"] == wg.SENSITIVE_THREAD_TITLE and "4711" not in after["title"]
+    assert pushed == [wg.SENSITIVE_THREAD_TITLE], pushed
+    assert after["messages"][-1]["shell_actions"][0]["auto"] is False, "a sensitive text waits for a tap"
+    print("ok: a sensitive reply gets a neutral title before it is pushed")
+
+
+
+def test_resumed_turn_sees_message_id_and_outcomes(wg):
+    """A resumed session gets only the new message — with its id, so Ara can
+    offer to redact it, and with what became of her last reply's actions."""
+    conv = wg._new_conv("user", "reto", "t", "user", "type hello on the quest")
+    action = {"kind": "keyboard-type", "id": "a" * 32, "text": "hello", "enter": False,
+              "auto": True}
+    wg._conv_add_message(conv["id"], "assistant", "Typing it.", shell_actions_=[action])
+    stored, found = wg._conv_record_shell_outcome(
+        conv["id"], action["id"], {"state": "error", "error": "not-connected"})
+    assert found
+    assert not wg._conv_record_shell_outcome(conv["id"], "b" * 32, {"state": "typed"})[1]
+    wg._conv_add_message(conv["id"], "user", "my PIN is 4711, type it")
+    c = wg._load_conv(conv["id"])
+    mid = c["messages"][-1]["id"]
+    prompt = wg._conv_engage_prompt(c, True)
+    assert prompt.startswith("my PIN is 4711, type it"), prompt
+    assert f"[message id: {mid}]" in prompt, prompt
+    assert "(not typed: not-connected)" in prompt, prompt
+    replay = wg._conv_engage_prompt(c, False)
+    assert f"[message id: {mid}]" in replay and "(not typed: not-connected)" in replay
+    print("ok: a resumed turn sees the new message's id and the last actions' outcomes")
+
+
+def test_outcome_purges_and_startup_sweep(wg):
+    """A sensitive text reported typed goes at once; at startup, an expired one
+    goes from the file and an unexpired one is scheduled."""
+    conv = wg._new_conv("user", "reto", "t", "user", "type the code")
+    sens = {"kind": "keyboard-type", "id": "e" * 32, "text": "4711", "enter": False,
+            "sensitive": True, "auto": True}
+    wg._conv_add_message(conv["id"], "assistant", "ok", shell_actions_=[dict(sens)])
+    _, found = wg._conv_record_shell_outcome(conv["id"], sens["id"], {"state": "typed"})
+    path = wg.CONVERSATIONS_DIR / f"{conv['id']}.json"
+    raw = json.loads(path.read_text())
+    a = raw["messages"][-1]["shell_actions"][0]
+    assert found and a["text"] is None and a["purged"] and a["outcome"]["state"] == "typed", a
+
+    old = wg._new_conv("user", "reto", "t", "user", "x")
+    young = wg._new_conv("user", "reto", "t", "user", "y")
+    for c, sid in ((old, "1" * 32), (young, "2" * 32)):
+        wg._conv_add_message(c["id"], "assistant", "ok", shell_actions_=[dict(sens, id=sid)])
+    p_old = wg.CONVERSATIONS_DIR / f"{old['id']}.json"
+    data = json.loads(p_old.read_text())
+    data["messages"][-1]["ts"] = "2000-01-01T00:00:00+00:00"
+    p_old.write_text(json.dumps(data))
+    waiting = wg._conv_sensitive_sweep()
+    assert "4711" not in p_old.read_text(), "expired: gone from the file at startup"
+    assert waiting >= 1, waiting
+    assert "4711" in (wg.CONVERSATIONS_DIR / f"{young['id']}.json").read_text(), \
+        "young: still there for the phone, deletion scheduled"
+    assert wg._CONV_SHELL_OUTCOME_RE.match(f"/conversations/{'a' * 32}/shell-actions/{'b' * 32}/outcome")
+    # Two in one thread: the purge of the first schedules the second.
+    two = wg._new_conv("user", "reto", "t", "user", "z")
+    wg._conv_add_message(two["id"], "assistant", "a", shell_actions_=[dict(sens, id="3" * 32)])
+    wg._conv_add_message(two["id"], "assistant", "b", shell_actions_=[dict(sens, id="4" * 32)])
+    p_two = wg.CONVERSATIONS_DIR / f"{two['id']}.json"
+    data = json.loads(p_two.read_text())
+    data["messages"][-2]["ts"] = "2000-01-01T00:00:00+00:00"   # the first, expired
+    p_two.write_text(json.dumps(data))
+    assert wg._conv_purge_and_reschedule(two["id"]) is True, "the second is still due"
+    stored = json.loads(p_two.read_text())["messages"]
+    assert stored[-2]["shell_actions"][0]["text"] is None
+    assert stored[-1]["shell_actions"][0]["text"] == "4711"
+    print("ok: a typed sensitive text goes at once; a restart leaves none behind")
+
+
 def test_dashboard_turn_below_frontier_gets_the_escalation_flag(wg_tiered):
     """With a frontier tier configured, a router-tier turn is handed the flag;
     the re-run on the frontier tier is not."""
@@ -332,6 +932,32 @@ def test_dashboard_turn_below_frontier_gets_the_escalation_flag(wg_tiered):
                           spawns[1][1]["env"]["RETINUE_REPLY_ATTACHMENTS_FILE"])
     assert junior_m != senior_m, "each spawn needs its own manifest"
     assert not Path(junior_m).exists() and not Path(senior_m).exists()
+
+    # Shell actions likewise: junior's are discarded with her reply.
+    spawns.clear()
+    junior_action = {"kind": "keyboard-key", "id": "e" * 32, "key": "enter"}
+    senior_action = {"kind": "keyboard-key", "id": "f" * 32, "key": "tab"}
+
+    def act_escalate_then_answer(cmd, **kwargs):
+        spawns.append((cmd, kwargs))
+        manifest = Path(kwargs["env"]["RETINUE_REPLY_SHELL_ACTIONS_FILE"])
+        if len(spawns) == 1:
+            manifest.write_text(json.dumps(junior_action) + "\n", encoding="utf-8")
+            Path(kwargs["env"]["RETINUE_ESCALATE_FILE"]).touch()
+        else:
+            manifest.write_text(json.dumps(senior_action) + "\n", encoding="utf-8")
+        return subprocess.CompletedProcess(
+            cmd, 0, stdout=json.dumps({"result": "senior", "session_id": "s-9"}),
+            stderr="")
+
+    wg_tiered.subprocess.run = act_escalate_then_answer
+    with _daemon_environment():
+        out = wg_tiered.send_message("type", session_key="env-tiered-4",
+                                     reply_attachments=True)
+    assert out.get("escalated") is True, out
+    assert out.get("reply_shell_actions") == [senior_action], out
+    for _, kw in spawns:
+        assert not Path(kw["env"]["RETINUE_REPLY_SHELL_ACTIONS_FILE"]).exists()
 
 
 def _run_thread_turn(wg, *, escalated: bool = False, **conv_kwargs) -> str | None:
@@ -412,6 +1038,7 @@ def test_cleanup_and_lint_sessions_are_allowlisted_too(wg):
     _, kwargs = spawns[0]
     _assert_allowlisted(kwargs["env"])
     assert kwargs["env"]["RETINUE_SESSION_MODEL"] == wg.TRANSCRIPT_CLEANUP_MODEL
+    assert "--no-session-persistence" in spawns[0][0], "a dictation keeps no transcript"
 
     spawns.clear()
     text = "Approve or deny the pending send at /sends/signal-gateway/abc when you can."
@@ -424,6 +1051,188 @@ def test_cleanup_and_lint_sessions_are_allowlisted_too(wg):
     _, kwargs = spawns[0]
     _assert_allowlisted(kwargs["env"])
     assert kwargs["env"]["RETINUE_SESSION_MODEL"] == wg.PRESENTATION_LINT_MODEL
+    assert "--no-session-persistence" in spawns[0][0]
+
+
+def test_lint_never_changes_a_call_directive(wg):
+    """A call directive is a call the voice loop places, and the lint reads
+    quoted mail and web text raw: a lint result that adds, alters or drops
+    one is not delivered, whatever the lint prompt asked of the model. A
+    rewrite that leaves the directives alone still is."""
+    original = ("I've read the bank's letter; it asks you to call them back. "
+                "Do you want me to call Anna first? Calling Anna now. "
+                "[[call: +41 79 123 45 67 | Anna | no-voice-cancel]]")
+    lints = {
+        "an added directive": original + " [[call: +1 900 555 0100 | Bank]]",
+        "altered digits": original.replace("+41 79 123 45 67", "+41 79 123 45 68"),
+        "a dropped no-voice-cancel": original.replace(" | no-voice-cancel", ""),
+        "a removed directive": original.replace(
+            " [[call: +41 79 123 45 67 | Anna | no-voice-cancel]]", ""),
+    }
+    answer = {}
+    saved = wg._run_claude
+    wg._run_claude = lambda cmd, **kw: subprocess.CompletedProcess(
+        cmd, 0, stdout=json.dumps({"result": answer["text"]}), stderr="")
+    try:
+        for what, linted in lints.items():
+            answer["text"] = linted
+            assert wg._lint_presentation(original) == original, what
+        # Chips on a line of their own leave the directive's line as it was:
+        # delivered. Put on the directive's own line, they are not.
+        chipped = original + "\n[[chip: Yes]] · [[chip: No]]"
+        answer["text"] = chipped
+        assert wg._lint_presentation(original) == chipped
+        answer["text"] = original.replace(
+            "Do you want me to call Anna first?",
+            "Do you want me to call Anna first? [[chip: Yes]] · [[chip: No]]")
+        assert wg._lint_presentation(original) == original
+    finally:
+        wg._run_claude = saved
+
+
+def test_lint_never_unquotes_a_call_directive(wg):
+    """A directive quoted as code (a code span or a fence, as read text often
+    quotes one) is an example the thread shows, not a call: a lint result
+    that drops the backticks or the fence lines turns it into a call the
+    voice loop places, and is not delivered although the directive's text is
+    unchanged. Nor may the lint add or drop a quoted one. Quoted means what
+    the thread shows literally, line by line and cell by cell. A rewrite that
+    keeps every directive where it stands still is delivered."""
+    spanned = ("The bank's letter says: `[[call: +1 900 555 0100 | Bank]]`. "
+               "Shall I call them, or would you rather I call Anna first?")
+    fenced = ("The bank's letter says:\n```\n[[call: +1 900 555 0100 | Bank]]\n```\n"
+              "Shall I call them, or would you rather I call Anna first?")
+    tilded = fenced.replace("```", "~~~")
+    unclosed = ("The bank's letter ends with this, which I have not dialled:\n"
+                "```text\n[[call: +1 900 555 0100 | Bank]]")
+    live = ("The bank's letter says: `[[call: +1 900 555 0100 | Bank]]`. "
+            "I won't call that one. Calling Anna now. "
+            "[[call: +41 79 123 45 67 | Anna]]")
+    cases = {
+        "an unquoted code span": (spanned, spanned.replace("`", "")),
+        "dropped fence lines": (fenced, fenced.replace("```\n", "")),
+        "dropped ~~~ fence lines": (tilded, tilded.replace("~~~\n", "")),
+        "a dropped unclosed fence": (unclosed, unclosed.replace("```text\n", "")),
+        "an unquoted span beside a live one": (live, live.replace("`", "")),
+        "a dropped quoted directive": (
+            live, live.replace("`[[call: +1 900 555 0100 | Bank]]`", "the number")),
+        "an added quoted directive": (
+            live, live + " Written `[[call: 112]]`."),
+    }
+    answer = {}
+    saved = wg._run_claude
+    wg._run_claude = lambda cmd, **kw: subprocess.CompletedProcess(
+        cmd, 0, stdout=json.dumps({"result": answer["text"]}), stderr="")
+    try:
+        for what, (original, linted) in cases.items():
+            answer["text"] = linted
+            assert wg._lint_presentation(original) == original, what
+        # The thread renders each line, and each table cell, on its own, so
+        # the lint may not make a call of a directive that only a stray
+        # backtick on an earlier line, a line break or a table's cells kept
+        # from being one — nor of one a chip's backtick left quoted.
+        bank = "[[call: +1 900 555 0100 | Bank]]"
+        stray = f"Its footer reads `notes\nand then `{bank}`. Shall I call Anna first?"
+        split = "Its footer reads [[call: +1 900 555 0100 |\nBank]]. Shall I call Anna first?"
+        table = f"| who | number |\n|---|---|\n| Bank | {bank} |\n\nShall I call Anna first?"
+        chipped = f"[[chip: a`b]] Its footer reads `{bank}`. Shall I call Anna first?"
+        per_line = {
+            "a span unquoted past a stray backtick": (stray, stray.replace(f"`{bank}`", bank)),
+            "a directive joined onto one line": (split, split.replace("|\nBank", "| Bank")),
+            "a directive taken out of a table": (
+                table, f"The bank: {bank}\n\nShall I call Anna first?"),
+            "a span unquoted after a chip": (chipped, chipped.replace(f"`{bank}`", bank)),
+        }
+        for what, (original, linted) in per_line.items():
+            assert wg._live_call_directives(original) == [], what
+            assert wg._live_call_directives(linted) == [bank], what
+            answer["text"] = linted
+            assert wg._lint_presentation(original) == original, what
+        # A directive the thread does show as a link is live wherever it
+        # stands: in a table cell of its own, or past a chip with a backtick.
+        assert wg._live_call_directives(
+            "| who | number |\n|---|---|\n| Bank | [[call: +1 900 555 0100]] |"
+        ) == ["[[call: +1 900 555 0100]]"]
+        assert wg._live_call_directives(f"[[chip: a`b]] {bank}` end") == [bank]
+        # The live directive and the quoted one both stay as they are, and
+        # the rest of the reply is rewritten: delivered.
+        lined = live.replace(" I won't call that one. ", "\nI won't call that one.\n")
+        rewritten = lined.replace("I won't call that one.",
+                                  "I won't call that number.")
+        answer["text"] = rewritten
+        assert wg._lint_presentation(lined) == rewritten
+        # Rewritten on a line that holds a directive, it is not delivered:
+        # what a lint may not touch is not left to how well the copy of the
+        # renderer above follows the bubble.
+        answer["text"] = live.replace("I won't call that one.",
+                                      "I won't call that number.")
+        assert wg._lint_presentation(live) == live
+    finally:
+        wg._run_claude = saved
+
+
+def test_lint_guard_reads_whitespace_as_the_bubble_does(wg):
+    """The thread's renderer is JavaScript, whose \\s is not Python's: it
+    holds U+00A0 and U+FEFF, and not \\x1c-\\x1f or \\x85. A lint result whose
+    fence line ends in a no-break space closes the fence in the bubble, and
+    one whose table separator ends in \\x1c or \\x85 is no separator there, so
+    in each the quoted directive becomes a call the voice loop places. The
+    guard reads them as the bubble does, and refuses them — as it refuses
+    any result that changes a fence or separator line beside a directive."""
+    bank = "[[call: +1 900 555 0100 | Bank]]"
+    spanned = (f"The bank's letter says: `{bank}`. "
+               "Shall I call them, or would you rather I call Anna first?")
+    ask = "\nShall I call them, or would you rather I call Anna first?"
+    lints = {
+        "a fence closed by a no-break space":
+            f"The bank's letter says:\n```\n```\u00a0\n{bank}\n```{ask}",
+        "a fence closed by a byte-order mark":
+            f"The bank's letter says:\n```\n```\ufeff\n{bank}\n```{ask}",
+        "a separator ending in \\x1c": f"The bank's letter says:\n{bank}\n|---|---|\x1c{ask}",
+        "a separator ending in \\x85": f"The bank's letter says:\n{bank}\n|---|---|\x85{ask}",
+    }
+    for what, linted in lints.items():
+        assert wg._live_call_directives(linted) == [bank], what
+    # Read as the bubble reads them, these are a separator and a fence, and
+    # the directive stays quoted.
+    assert wg._live_call_directives(f"| a | {bank} |\n|---|---|\u00a0") == []
+    assert wg._live_call_directives(f"```\u00a0\n{bank}\n```") == []
+    # Nor does a table cell's edge differ: \\x1c is no space to the bubble,
+    # so the header has three cells and the third of a row is shown.
+    assert wg._live_call_directives(
+        "| a | b |\x1c\n|---|---|\n| x | y | [[call: 0441234567]] |"
+    ) == ["[[call: 0441234567]]"]
+    # Nor is a chip that is none to the bubble taken for one, swallowing the
+    # directive after it: a dotless i in "chip", a prefill cut by U+2028.
+    assert wg._live_call_directives(f"[[ch\u0131p: Yes | {bank}") == [bank]
+    assert wg._live_call_directives(f"[[chip: Yes | a\u2028{bank}") == [bank]
+    answer = {}
+    saved = wg._run_claude
+    wg._run_claude = lambda cmd, **kw: subprocess.CompletedProcess(
+        cmd, 0, stdout=json.dumps({"result": answer["text"]}), stderr="")
+    try:
+        for what, linted in lints.items():
+            answer["text"] = linted
+            assert wg._lint_presentation(spanned) == spanned, what
+        # A fence or separator line next to a directive is left as it was,
+        # however the copy above reads it.
+        fenced = f"The bank's letter says:\n```\n{bank}\n```{ask}"
+        for what, linted in {
+            "a fence line changed": fenced.replace("```\n[[", "```text\n[["),
+            "a fence line added": fenced.replace("```\n[[", "```\n```\n```\n[["),
+            "a separator line changed": "| who | number |\n|:--|--:|\n| Bank | 1 |\n" + fenced,
+        }.items():
+            answer["text"] = linted
+            original = fenced if "separator" not in what else (
+                "| who | number |\n|---|---|\n| Bank | 1 |\n" + fenced)
+            assert wg._lint_presentation(original) == original, what
+        # Without any directive in the message, fences are no business of
+        # this gate.
+        plain = "Here is the snippet:\n```\nls -l\n```\nIt lists the files in /tmp."
+        answer["text"] = plain.replace("```\nls", "```sh\nls")
+        assert wg._lint_presentation(plain) == answer["text"]
+    finally:
+        wg._run_claude = saved
 
 
 def main():
@@ -438,7 +1247,25 @@ def main():
         test_refreshes_credentials_once_before_the_first_attempt(wg)
         test_dashboard_turn_env_is_allowlisted(wg)
         test_thread_turn_collects_reply_attachments(wg)
+        test_thread_turn_collects_shell_actions(wg)
+        test_shell_actions_ride_on_the_stored_reply(wg)
+        test_sensitive_text_masked_purged_and_never_logged(wg)
+        test_redact_a_user_message(wg)
+        test_only_a_dashboard_turn_can_type(wg)
+        test_a_turn_that_waited_types_only_for_the_user(wg)
+        test_sensitive_turn_never_resumable(wg, tmp)
+        test_a_new_session_gets_the_whole_thread(wg)
+        test_redaction_reaches_every_copy(wg, tmp)
+        test_redaction_erases_every_session_the_thread_had(wg, tmp)
+        test_legacy_messages_can_be_redacted(wg)
+        test_sensitive_reply_neutral_title(wg)
+        test_resumed_turn_sees_message_id_and_outcomes(wg)
+        test_outcome_purges_and_startup_sweep(wg)
+        os.environ.pop("CLAUDE_CONFIG_DIR", None)
         test_cleanup_and_lint_sessions_are_allowlisted_too(wg)
+        test_lint_never_changes_a_call_directive(wg)
+        test_lint_never_unquotes_a_call_directive(wg)
+        test_lint_guard_reads_whitespace_as_the_bubble_does(wg)
 
         wg_short = _load_gateway(
             tmp / "b", {"CLAUDE_SPAWN_ENOENT_DEADLINE_SECONDS": "5"})
@@ -448,6 +1275,8 @@ def main():
             tmp / "c", {"RETINUE_ROUTER_MODEL": "haiku",
                         "RETINUE_FRONTIER_MODEL": "opus"})
         test_dashboard_turn_below_frontier_gets_the_escalation_flag(wg_tiered)
+        test_escalated_junior_sensitive_and_fresh_session(wg_tiered, tmp)
+        os.environ.pop("CLAUDE_CONFIG_DIR", None)
 
         # Three distinct tiers, so every assertion below names exactly one.
         wg_dashboard = _load_gateway(

@@ -10,6 +10,7 @@ Configuration (environment):
     EGRESS_VIEWER_PORT       HTTP port to listen on (default 8080)
     EGRESS_VIEWER_PAGE_SIZE  rows per page (default 100)
 """
+import html
 import json
 import os
 import urllib.parse
@@ -91,8 +92,22 @@ def _load_anomalies(limit: int = 100) -> list[dict]:
     return entries
 
 
+# The viewer may be published on the dashboard's own host (see
+# docker-compose.override.example.yml), where its pages share the dashboard's
+# origin but not the gateway's Content-Security-Policy. So its pages carry a
+# fixed policy of their own, always enforced: they use no script, no image
+# and no font, only the inline style below, and the filter form submits to
+# the viewer itself. A request's parameters and the log's fields both reach
+# these pages, which is why the policy is the second line behind escaping,
+# not a replacement for it.
+PAGE_POLICY = ("default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; "
+               "base-uri 'none'; frame-ancestors 'none'")
+
+
 def _html_escape(value) -> str:
-    return str(value).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    # Quotes too: the same escape serves text and the double-quoted
+    # attributes the filter form writes request parameters back into.
+    return html.escape(str(value), quote=True)
 
 
 def _format_json(obj: dict) -> str:
@@ -207,10 +222,10 @@ def _index(params: dict) -> str:
 <tr class="{row_class}">
   <td class="mono">{_html_escape(ts)}</td>
   <td class="mono">{_html_escape(flow.get("method", ""))}</td>
-  <td>{host_link}:{flow.get("port", "")}</td>
+  <td>{host_link}:{_html_escape(flow.get("port", ""))}</td>
   <td class="mono small">{_html_escape(flow.get("path", "")[:120])}</td>
-  <td>{status}</td>
-  <td class="small">{flow.get("request_body", {}).get("size", 0)} / {flow.get("response_body", {}).get("size", 0)}</td>
+  <td>{_html_escape(status)}</td>
+  <td class="small">{_html_escape(flow.get("request_body", {}).get("size", 0))} / {_html_escape(flow.get("response_body", {}).get("size", 0))}</td>
   <td>{detail_link}</td>
 </tr>
 """)
@@ -286,6 +301,7 @@ class Handler(BaseHTTPRequestHandler):
         body = json.dumps(data, ensure_ascii=False, default=str).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -294,6 +310,8 @@ class Handler(BaseHTTPRequestHandler):
         body = html.encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Security-Policy", PAGE_POLICY)
+        self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)

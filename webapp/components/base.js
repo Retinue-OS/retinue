@@ -50,6 +50,26 @@ export function onFrameChange(fn) {
   return () => mq.removeEventListener('change', handler);
 }
 
+// ── Links from outside ────────────────────────────────────────────────────────
+// A link that came from outside (a news item's, a chat attachment's) as a page
+// may use it: an absolute http(s) URL with a host, or '' for none. That way it
+// leads to a web page and to nothing else — never into the dashboard itself,
+// as a relative reference would, and never to another kind of address. The
+// gateway holds such links to the same rule (web_link in
+// scripts/news_store.py).
+const WEB_LINK_RE = /^https?:\/\/[^\s/?#\\]+(?:[/?#]|$)/i;
+const CONTROL_RE = /[\u0000-\u001f\u007f]/;
+
+export function webLink(url) {
+  const s = typeof url === 'string' ? url.trim() : '';
+  if (!WEB_LINK_RE.test(s) || CONTROL_RE.test(s)) return '';
+  try {
+    return new URL(s).host ? s : '';
+  } catch (_err) {
+    return '';
+  }
+}
+
 // ── Files ─────────────────────────────────────────────────────────────────────
 // Types the gateway will serve with `Content-Disposition: inline`, i.e. that the
 // browser shows in place instead of saving. Mirrors _INLINE_SAFE_TYPES in

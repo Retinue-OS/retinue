@@ -9,7 +9,8 @@
 //           nested -/*/1. lists (with [ ]/[x] task items), pipe tables,
 //           horizontal rules
 //   inline: [label](url), bare http(s)/www URLs, **bold**, *italic*,
-//           ~~strikethrough~~, `code`
+//           ~~strikethrough~~, `code`, and two of the dashboard's own:
+//           [[chip: …]] (click-to-fill) and [[call: …]] (tap-to-dial)
 //
 // Safety: the input is HTML-escaped before any markup is generated, and only
 // http(s)/mailto/tel URLs and root-relative paths (/sends/…, never //host)
@@ -34,6 +35,69 @@ const SEP = String.fromCharCode(1); // sentinel absent from escaped text
 // swallow the closing ** into the href — a dead link, and one the bold pass can
 // no longer see either, because the anchor is stashed by then.
 const URL_TAIL_RE = /[.,;:!?)\]*]+$/;
+
+// [[call: <number> | <name> | no-voice-cancel]] — a call Ara offers or, in
+// the phone shell's voice conversation, places (conversation.js). The number
+// is written as people write numbers (spaces, dashes, dots, slashes,
+// parentheses); the name is optional, and so is the flag, which asks for a
+// call speech cannot cancel (a loud room, an emergency) — honoured only on a
+// second attempt at the number (calledBefore). Shared with the thread, which
+// finds the directive in a reply.
+const CALL_RE = /\[\[call:\s*([+0-9*#][0-9*# ().\/-]*?)\s*(?:\|\s*([^|\]]*?)\s*)?(?:\|\s*(no-voice-cancel)\s*)?\]\]/;
+
+// The dialable form of a written number: `+` and digits (plus `*`/`#`), 3–20
+// digits. Null when it is not one. The trunk zero some write in brackets after
+// the country code (+41 (0)79 …) is not dialled with it.
+export function callNumber(raw) {
+  const n = String(raw == null ? '' : raw)
+    .replace(/^(\+\d{1,3})\s*\(0\)/, '$1')
+    .replace(/[\s().\/-]/g, '');
+  if (!/^\+?[0-9*#]+$/.test(n)) return null;
+  const digits = n.replace(/[^0-9]/g, '').length;
+  return digits >= 3 && digits <= 20 ? n : null;
+}
+
+// The last call directive in a message, as {number, name, voiceCancel}, or
+// null. The last, because a reply that mentions a number first and then
+// places the call puts the directive at its end. Only a directive the bubble
+// shows as a call link counts, so the message is rendered as the bubble
+// renders it and the links are collected as they are made. One quoted as
+// code (a fence, or a code span, whose backticks pair within a line as the
+// bubble pairs them), split across lines, cut apart by a table's cells, or
+// otherwise left as text is shown literally, so it is no call either; and no
+// second parser imitating the renderer can drift from what the user sees.
+let callSink = null;
+
+const ENTITY = { amp: '&', lt: '<', gt: '>', quot: '"', '#39': "'" };
+
+export function callOf(text) {
+  const found = [];
+  callSink = found;
+  try {
+    renderMarkdown(text);
+  } finally {
+    callSink = null;
+  }
+  return found.length ? found[found.length - 1] : null;
+}
+
+// Whether an answer of Ara's before `messages[index]` already placed (or
+// tried to place) a call to `number`: the condition for a call speech cannot
+// cancel. A first attempt is always cancellable by voice, so a mistaken
+// directive never dials without the chance to say no. Only Ara's own answers
+// count: a message an agent pushed into the thread is not an attempt of hers,
+// nor is her reply to a chat arrival (`arrival`), which the loop never places.
+export function calledBefore(messages, index, number) {
+  const list = Array.isArray(messages) ? messages : [];
+  for (let i = Math.min(index, list.length) - 1; i >= 0; i -= 1) {
+    const m = list[i];
+    if (m && m.role === 'assistant' && !m.arrival) {
+      const c = callOf(m.text);
+      if (c && c.number === number) return true;
+    }
+  }
+  return false;
+}
 
 // A link into the dashboard itself — another thread, /sends/…, a project page —
 // navigates in place. In a standalone PWA a target="_blank" link is handed to a
@@ -93,6 +157,35 @@ export function renderInline(text) {
   s = s.replace(chip(/\[\[chip:\s*([^|\]]+?)\s*\]\]/),
     (m, code, text) => (code ? m : stash(
       `<button type="button" class="md-chip" data-fill="${text}">${text}</button>`)));
+  // [[call: +41 79 123 45 67 | Name]] — in a bubble a tap-to-dial link; in the
+  // phone shell's voice conversation the thread places the call itself. The
+  // label is the name (the number when there is none) behind a phone glyph,
+  // no words, so it reads the same in whatever language the message is in.
+  s = s.replace(chip(CALL_RE), (m, code, raw, written, third) => {
+    if (code) return m;
+    const num = callNumber(raw);
+    if (!num) return m;
+    // The flag written where the name goes, with no name before it, is the
+    // flag all the same: no contact is called "no-voice-cancel", and read as
+    // a name it would be shown and spoken as one while the flag went unheard.
+    const bare = !third && /^no-voice-cancel$/i.test(written || '');
+    const name = bare ? '' : written;
+    const flag = bare || third;
+    // callOf's collection: the name as written, since the text here is
+    // escaped and may hold a stashed chip's placeholder.
+    if (callSink) {
+      callSink.push({
+        number: num,
+        name: (name || '').replace(new RegExp(SEP + '\\d+' + SEP, 'g'), '')
+          .replace(/&(amp|lt|gt|quot|#39);/g, (_e, e) => ENTITY[e]).trim(),
+        voiceCancel: !flag,
+      });
+    }
+    // In the href a # would start the URI's fragment, and a tap on a service
+    // code (*100#) would dial it cut short. The number collected above stays
+    // as written, since placeCall takes it raw.
+    return stash(`<a class="md-call" href="tel:${num.replace(/#/g, '%23')}">\u{1F4DE} ${name || raw.trim()}</a>`);
+  });
   // `code` before any link: a code span is literal, so a URL inside one
   // (`https://schema.org/`) stays code instead of becoming a link with the
   // backticks left standing around it. Stashed, so no later pass — links,

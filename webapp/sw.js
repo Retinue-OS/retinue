@@ -36,6 +36,7 @@ const SHELL_ASSETS = [
   '/styles.css',
   '/layout.js',
   '/viewport.js',
+  '/sw-register.js',
   '/manifest.webmanifest',
   '/components/base.js',
   '/components/attention.js',
@@ -59,6 +60,7 @@ const SHELL_ASSETS = [
   '/components/speech.js',
   '/components/continuous.js',
   '/components/shell.js',
+  '/components/shell-keyboard.js',
   '/components/push.js',
   '/components/update.js',
   '/components/nav.js',
@@ -68,6 +70,8 @@ const SHELL_ASSETS = [
   '/components/device-store.js',
   '/components/instance-settings.js',
   '/components/viewer-page.js',
+  '/components/settings-page.js',
+  '/components/sync-health-page.js',
   '/icons/icon-192.png',
   '/icons/icon-512.png'
 ];
@@ -104,10 +108,20 @@ self.addEventListener('message', (e) => {
 // owner is gone is anybody's who asks for its place.
 //
 // Messages (page → worker):
-//   {type:'dictation', id, key, url, blob, orphan?}  start a job; acknowledged
-//       with 'dictation-started', answered with 'dictation-done' {id, key,
-//       text, error} to the owner once it is done. `orphan` (a recording
-//       handed off as its page unloads) starts it with no owner at all.
+//   {type:'dictation', id, key, url, blob, orphan?, send?, call?}  start a job;
+//       acknowledged with 'dictation-started', answered with 'dictation-done'
+//       {id, key, text, error, sent, unsent, call} to the owner once it is done.
+//       `orphan` (a recording handed off as its page unloads) starts it with
+//       no owner at all. `send` (a thread's messages URL) marks a dictation
+//       the user sent (➤, or a take of the continuous loop ending on a
+//       pause): it goes into that thread whether or not its page is still
+//       there — see "Sent dictations" below. `call` ({number, name}), with
+//       `send` only: the call the take cancelled in the continuous loop
+//       (components/conversation.js, CANCELLED_CALLS), sent along as
+//       `cancelled_call` as the page's own send would — while the take is
+//       fresh (DICT_CALL_FRESH_MS). 'dictation-done' also carries `at` (when
+//       the job was started) and `textAt` (when its transcript came, for the
+//       run that started it; none for a restart).
 //   {type:'dictation-adopt', keys} + a port  take over the jobs under these
 //       places whose owner is gone, restart any this worker was stopped in
 //       the middle of, and answer on the port with {jobs} — every job under
@@ -122,6 +136,63 @@ const DICT_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
 // job still marked running but absent here was being run by a worker that
 // has been stopped since, and is started again.
 const DICT_RUNNING = new Map();
+const DICT_SEND_TIMEOUT_MS = 30 * 1000;
+// A sent take's cancelled call (`call`) goes along only while the take is this
+// fresh: one sent later — a restart of a job the worker was stopped in, for
+// whichever page asks — goes out as words alone, or Ara could place a call
+// nobody is waiting for. Fresh counts from the transcript (`textAt`) for the
+// run that started the job, which sends it the moment it is in however long
+// the transcription took (up to DICT_TIMEOUT_MS), and from the recording
+// (`at`) for a restart, which sets no `textAt`: a take the worker was stopped
+// in is as old as its recording. The page keeps the same window for an
+// adopted take (components/conversation.js, CALL_FRESH_MS).
+const DICT_CALL_FRESH_MS = 90 * 1000;
+
+// ── Sent dictations ──────────────────────────────────────────────────────────
+// A dictation sent with ➤ (or a take of the continuous loop ending on a pause)
+// is a message to the thread it was recorded in, exactly as if it had been
+// typed there. The page that recorded it sends it once the transcript is in —
+// if that page is still there to do so. A page that is gone (a tab of the
+// navigation row, Home, a reload) cannot, so the worker does: the transcript
+// goes to the thread the job was recorded for (`send`, fixed when recording
+// started — never whatever thread is on screen now), and nothing lands in a
+// draft. The page that recorded it, still alive and still its owner, sends it
+// itself as before (it also carries anything typed in the box). The outcome
+// travels with the job: `sent` (in the thread; the page showing it just reads
+// the thread again) or `unsent` ('failed', or 'maybe' when the request got
+// no answer or the worker was stopped in the middle of it) — then the text
+// goes into the draft for review, with a note, as a dictation left there
+// always did. Only the dashboard's own message endpoint is ever posted to.
+function dictSendUrl(url) {
+  return typeof url === 'string' && /^\/conversations\/[^/?#]+\/messages$/.test(url) ? url : '';
+}
+
+// The call a sent take cancelled: {number, name} strings, or null. The
+// gateway checks the number itself; this keeps only the shape.
+function dictCall(call) {
+  if (!call || typeof call !== 'object' || typeof call.number !== 'string' || !call.number) return null;
+  return { number: call.number.slice(0, 32), name: typeof call.name === 'string' ? call.name.slice(0, 80) : '' };
+}
+
+async function dictSend(rec) {
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), DICT_SEND_TIMEOUT_MS);
+  const call = rec.call && Date.now() - (rec.textAt || rec.at || 0) < DICT_CALL_FRESH_MS ? rec.call : null;
+  try {
+    const res = await fetch(rec.send, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(call ? { message: rec.text, cancelled_call: call } : { message: rec.text }),
+      signal: ctl.signal,
+    });
+    return res.ok ? { sent: true } : { unsent: 'failed' };
+  } catch (err) {
+    // Aborted on the deadline: the request may have reached the thread.
+    return { unsent: err && err.name === 'AbortError' ? 'maybe' : 'failed' };
+  } finally {
+    clearTimeout(timer);
+  }
+}
 // Every store operation runs after the one before it, so a 'taken' never
 // overtakes the 'dictation' it answers.
 let dictQueue = Promise.resolve();
@@ -179,11 +250,19 @@ async function dictOwnerAlive(owner) {
   try { return !!(await self.clients.get(owner)); } catch (_e) { return false; }
 }
 
+function dictResult(type, rec) {
+  return {
+    type, id: rec.id, key: rec.key, state: rec.state, text: rec.text || '', error: rec.error || '',
+    sent: !!rec.sent, unsent: rec.unsent || '', send: !!rec.send, at: rec.at || 0, textAt: rec.textAt || 0,
+    call: rec.call || null,
+  };
+}
+
 async function dictNotify(rec) {
   if (!rec || !rec.owner) return;
   try {
     const c = await self.clients.get(rec.owner);
-    if (c) c.postMessage({ type: 'dictation-done', id: rec.id, key: rec.key, text: rec.text || '', error: rec.error || '' });
+    if (c) c.postMessage(dictResult('dictation-done', rec));
   } catch (_e) { /* the owner went: the result waits for the place */ }
 }
 
@@ -223,20 +302,62 @@ async function dictRun(rec, again, onStored) {
   } finally {
     clearTimeout(timer);
   }
+  // A sent dictation is the worker's to send unless the page that recorded
+  // it is still there, and still owns it (see "Sent dictations"). Whether
+  // that page is alive is asked before the write that decides it; should the
+  // owner change in between, the write goes by the record it reads — a job
+  // that page took back (restored from the back-forward cache) is its own.
+  let originAlive = true;
+  if (rec.send && text && !error) {
+    const before = await dictTx('readonly', (s) => s.get(rec.id)).catch(() => null);
+    if (before && before.owner && before.owner === before.origin) originAlive = await dictOwnerAlive(before.owner);
+    else if (before) originAlive = false;
+  }
   // The audio is spent once there is a transcript; a failed one is kept no
   // longer either — the note asks for the dictation again. The owner is
   // whoever holds the job at this moment (an adopt may have moved it). The
   // run counts as running until the outcome is stored, so no adopt in between
-  // starts it over.
-  const done = await dictUpdate(rec.id, (cur) => (cur && cur.run === token
-    ? { ...cur, state: 'done', text, error, blob: null } : null)).catch(() => null);
+  // starts it over — nor, while the worker sends it, hands its text out.
+  // When the transcript came, for the run that started the job only: the
+  // freshness of its cancelled call counts from here (DICT_CALL_FRESH_MS). A
+  // restart's comes late by however long the worker was stopped.
+  let selfSend = false;
+  const stamp = again ? {} : { textAt: Date.now() };
+  const done = await dictUpdate(rec.id, (cur) => {
+    if (!(cur && cur.run === token)) return null;
+    const pageSends = !!(cur.owner && cur.owner === cur.origin && originAlive);
+    selfSend = !!(cur.send && text && !error && !pageSends);
+    return selfSend
+      ? { ...cur, ...stamp, phase: 'sending', text, error, blob: null }
+      : { ...cur, ...stamp, state: 'done', text, error, blob: null };
+  }).catch(() => null);
+  if (!done || !selfSend) {
+    if (DICT_RUNNING.get(rec.id) === token) DICT_RUNNING.delete(rec.id);
+    if (done) await dictNotify(done);
+    return;
+  }
+  const outcome = await dictSend(done);
+  const settled = await dictUpdate(rec.id, (cur) => (cur && cur.run === token
+    ? { ...cur, state: 'done', phase: '', ...outcome } : null)).catch(() => null);
   if (DICT_RUNNING.get(rec.id) === token) DICT_RUNNING.delete(rec.id);
-  if (done) await dictNotify(done);
+  if (!settled) return;
+  // Sent with nobody to tell: nothing is left to hand out. A page opening the
+  // thread reads the message there.
+  if (settled.sent && !settled.owner) {
+    await dictTx('readwrite', (s) => s.delete(rec.id)).catch(() => {});
+    return;
+  }
+  await dictNotify(settled);
 }
 
 async function dictStart(d, source) {
-  const owner = d.orphan ? '' : ((source && source.id) || '');
-  const rec = { id: d.id, key: d.key, url: d.url, blob: d.blob, owner, state: 'running', at: Date.now() };
+  const origin = (source && source.id) || '';
+  const owner = d.orphan ? '' : origin;
+  const rec = {
+    id: d.id, key: d.key, url: d.url, blob: d.blob, owner, origin: d.orphan ? '' : origin,
+    send: dictSendUrl(d.send), state: 'running', at: Date.now(),
+  };
+  rec.call = rec.send ? dictCall(d.call) : null;
   // Acknowledged once stored, not before: a page whose job could not be
   // stored here (storage refused) hears nothing and transcribes it itself.
   await dictRun(rec, false, () => {
@@ -257,6 +378,12 @@ async function dictAdopt(keys, asker, port) {
     }
     if (!want.has(rec.key)) continue;
     if (rec.owner !== asker && await dictOwnerAlive(rec.owner)) continue;
+    // Stopped in the middle of sending it: whether it went is not known, and
+    // it is not sent a second time — the text goes to the draft with a note.
+    if (rec.state === 'running' && rec.phase === 'sending' && !DICT_RUNNING.has(rec.id)) {
+      await dictUpdate(rec.id, (cur) => (cur && cur.phase === 'sending' && !DICT_RUNNING.has(cur.id)
+        ? { ...cur, state: 'done', phase: '', unsent: 'maybe' } : null)).catch(() => {});
+    }
     // Taken over in one read-and-write: a run finishing in between would
     // otherwise be overwritten with the stale record read before it.
     let taken = null;
@@ -266,7 +393,7 @@ async function dictAdopt(keys, asker, port) {
       return cur.owner === asker ? null : taken;
     }).catch(() => { taken = null; });
     if (!taken) continue;
-    mine.push({ id: taken.id, key: taken.key, state: taken.state, text: taken.text || '', error: taken.error || '' });
+    mine.push(dictResult('job', taken));
     if (taken.state === 'running' && !DICT_RUNNING.has(taken.id) && taken.blob) restart.push(taken);
   }
   if (port) port.postMessage({ jobs: mine });

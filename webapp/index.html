@@ -101,12 +101,6 @@
     <retinue-shelf></retinue-shelf>
   </main>
 
-  <script>
-    // Register the service worker so the shell (and the last data) stay
-    // available offline.
-    if ('serviceWorker' in navigator) {
-      window.addEventListener('load', () => navigator.serviceWorker.register('/sw.js'));
-    }
-  </script>
+  <script src="/sw-register.js"></script>
 </body>
 </html>

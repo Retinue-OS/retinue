@@ -32,6 +32,20 @@ The summary is the excerpt the source itself published, truncated. Articles are
 read at the source; nothing is mirrored here, and no agent fetches article
 bodies.
 
+**The link is a web link, or the item has none.** `url` is where the headline
+on the news page leads, and it is text from outside: a feed's `<link>`, a link
+in a channel post, a newsletter's header. So it is an absolute `http://` or
+`https://` URL with a host, and nothing else — no relative reference, which
+would lead into the dashboard itself, and no other kind of address. One helper
+holds the rule, `news_store.web_link`, and everything that touches a link goes
+through it: the fetcher passes over a link that is none and resolves one
+written relative to the feed (below); the messenger and e-mail rail
+(`POST /internal/news`) files a post whose `url` is anything else without a
+link; `news-add.py` refuses it; `GET /news` serves an item that is already in
+the store with such a `url` without it; and the page renders the headline of
+an item without a link as text (`webLink` in `webapp/components/news.js`, the
+same rule).
+
 ## Ranking: one number, sampled now
 
 ```
@@ -100,6 +114,14 @@ park a feed. See `examples/chambers/hitchhiker/.news.json`.
 RSS 2.0, RSS 1.0/RDF and Atom all parse; the fetcher is stdlib-only
 (`urllib` + `xml.etree`) and one broken feed never stops the others.
 
+An entry's link is its `<link>` (in Atom the `alternate` one, else the first
+of another relation), and failing that its guid or id when that is a web link
+as it stands. A link that is no web link is passed over and the next candidate
+tried; an entry with none among them is no item. Some feeds write their links
+relative to themselves (`/2026/fest`): those are resolved against the feed's
+own URL — where the document was read from, after any redirect — so such a
+feed keeps its items.
+
 **A feed response is untrusted input.** The URL is owner-controlled chamber
 config, but the bytes it returns on any given hour are whatever the remote host
 sends, and the fetcher runs unattended. So a document that declares a **DTD** is
@@ -127,7 +149,9 @@ python3 /workspace/scripts/news-add.py \
 
 That keeps the "which channels are news vs. correspondence" question where it
 belongs — with whichever agent already reads that channel — instead of building
-a second inbound pipeline.
+a second inbound pipeline. `--url` has to be a web link (an absolute `http://`
+or `https://` URL); anything else is refused with exit code 2 and nothing is
+filed.
 
 **Newsletters (e-mail)** are the automatic version of that ad-hoc path. An
 address or `*@domain` declared a **news sender** in the triage policy is filed by
@@ -202,7 +226,7 @@ later without changing the store or the ranking.
 
 | Endpoint | Purpose |
 |---|---|
-| `GET /news?scope=feed\|read\|hidden\|all&limit=n` | ranked items, sampled now |
+| `GET /news?scope=feed\|read\|hidden\|all&limit=n` | ranked items, sampled now; an item's `url` is a web link or empty |
 | `GET /news/preferences` | `{markdown, updated}` — the Herald's memory |
 | `POST /news/preferences` | replace it (the user editing their own profile) |
 | `POST /news/feedback` | `{id?, signal, note?}`, signal `up\|down\|read\|hide\|note` |
