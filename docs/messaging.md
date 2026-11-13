@@ -90,6 +90,17 @@ nothing to go back to: it closes itself, or lands on the dashboard where the
 browser will not close it — never on the empty `/sends` list. **Deny** goes
 straight on to the next pending send, or, with none left, back the same way.
 
+A send queued from a dashboard thread (see below) also carries **Back to
+<thread title>** at the head of its approval and status pages. When that
+thread is where the tab came from — the latest history entry that is not a
+`/sends` page — the link is the browser's own Back; otherwise it opens the
+thread. Either way the thread opens at the message the reader was at when they
+tapped the approval link: the thread notes that place as the link is tapped
+(per tab, in `sessionStorage`), and the approval page hands it on in the
+shelf's restore format, so it holds even when the browser reloads the page
+rather than bringing it back from its cache. The automatic return after a
+decision hands it on the same way.
+
 ### Retracting a queued send
 
 Until the user decides, the agent that queued a send may take it back — the

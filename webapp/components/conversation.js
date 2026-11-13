@@ -135,6 +135,10 @@ import { setVoiceActive } from './shell.js';
 import { loadDraft, saveDraft, loadFiles, saveFiles } from './drafts.js';
 import { transcribe, handOff, adopt } from './dictation.js';
 
+// Where an approval link was tapped (_noteSendsReturn); read by the gateway's
+// /sends pages, which share this tab's sessionStorage.
+const SENDS_RETURN_KEY = 'retinue.sends.return';
+
 const LIST_URL = '/conversations';
 const POLL_MS = 4000;
 // How long a mic the loop wanted while the page was hidden (a wake in the
@@ -1303,6 +1307,27 @@ class RetinueConversation extends HTMLElement {
       if (r.bottom > top + 1) return { anchor: m.getAttribute('data-ts'), offset: Math.round(r.top - top) };
     }
     return { bottom: true };
+  }
+
+  // An approval link (/sends/…) tapped here: note which thread it was tapped
+  // in, where in it the reader was, and on which page, so the approval page's
+  // "Back to the thread" (web-gateway.py, _SENDS_BACK_JS) and its return after
+  // a decision land at this very place — also when the browser reloads the
+  // page instead of bringing it back from its cache. Per tab, like the shelf's
+  // own restore, which is the format the approval page hands it on in.
+  _noteSendsReturn(link) {
+    if (!this._id) return;
+    let url;
+    try { url = new URL(link.getAttribute('href'), location.href); } catch (_e) { return; }
+    if (url.origin !== location.origin || !/^\/sends\//.test(url.pathname)) return;
+    try {
+      sessionStorage.setItem(SENDS_RETURN_KEY, JSON.stringify({
+        id: this._id,
+        location: this.shelfLocation(),
+        href: `${location.pathname}${location.search}#conversation-${this._id}`,
+        at: Date.now(),
+      }));
+    } catch (_e) { /* no return place: the thread opens at its newest message */ }
   }
 
   // Put the thread back at a place shelfLocation() described. False when the
@@ -3019,7 +3044,9 @@ class RetinueConversation extends HTMLElement {
         const chip = e.target.closest('.md-chip');
         if (chip) { this._fillComposer(chip.getAttribute('data-fill') || ''); return; }
         const sbtn = e.target.closest('.speak');
-        if (sbtn) this._onSpeakButton(sbtn);
+        if (sbtn) { this._onSpeakButton(sbtn); return; }
+        const link = e.target.closest('a[href]');
+        if (link) this._noteSendsReturn(link);
       });
       // Where the reader is, kept as they scroll: the place a shelf item
       // restores to must be known after the element has left the page, when

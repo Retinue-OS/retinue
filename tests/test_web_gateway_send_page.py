@@ -575,6 +575,67 @@ def test_empty_list_after_a_decision_goes_back():
         assert wg._SENDS_LEAVE_JS in status
 
 
+def _write_thread(tmp: Path, cid: str, title: str) -> None:
+    import json as _json
+    convs = tmp / "convs"
+    convs.mkdir(parents=True, exist_ok=True)
+    (convs / f"{cid}.json").write_text(_json.dumps({"id": cid, "title": title, "messages": []}))
+
+
+def test_approval_page_links_back_to_the_asking_thread():
+    """The way back to the thread that queued the send: the browser's own Back
+    when that thread is where the tab came from, else a link to it — and both
+    hand over the place in the thread the approval link was tapped at."""
+    with tempfile.TemporaryDirectory() as tmp:
+        wg = _load_gateway(Path(tmp))
+        cid = "c" * 32
+        _write_thread(Path(tmp), cid, "Party <RSVP>")
+        out = wg._render_channel_send_html(_detail("pending", thread=cid),
+                                           "whatsapp-gateway", "a" * 32, None)
+        link = (f'<a href="/conversations.html#conversation-{cid}" id="back-thread" '
+                f'data-thread="{cid}">‹ Back to Party &lt;RSVP&gt;</a>')
+        assert f"<nav>{link}{wg._NAV_HOME}" in out
+        assert wg._SENDS_BACK_JS in out
+        # Back when the latest non-/sends entry is this thread, else the link.
+        assert "return threadOf(u)===id?entries[i]:null;" in wg._SENDS_BACK_JS
+        assert "window.navigation.traverseTo(entry.key)" in wg._SENDS_BACK_JS
+        assert "primeReturn(id);" in wg._SENDS_BACK_JS
+        # The place is handed over in the shelf's restore format.
+        assert "'retinue.shelf.restore'" in wg._SENDS_RETURN_JS.replace('"', "'")
+        assert "{key:'thread:'+id,location:r.location" in wg._SENDS_RETURN_JS
+        # The return after a decision hands it over too.
+        assert "primeReturn(threadOf(u));" in wg._SENDS_LEAVE_JS
+        # E-mail approval, and the status page after the decision, alike.
+        email = wg._render_send_single_html({"request_id": "42", "thread": cid}, "ari", None)
+        assert link in email
+        status = wg._render_channel_send_html(_detail("error", thread=cid, error="x"),
+                                              "whatsapp-gateway", "a" * 32, None)
+        assert link in status
+
+
+def test_no_backlink_without_a_live_thread():
+    with tempfile.TemporaryDirectory() as tmp:
+        wg = _load_gateway(Path(tmp))
+        none = wg._render_channel_send_html(_detail("pending"), "whatsapp-gateway", "a" * 32, None)
+        gone = wg._render_channel_send_html(_detail("pending", thread="d" * 32),
+                                            "whatsapp-gateway", "a" * 32, None)
+        bogus = wg._render_channel_send_html(_detail("pending", thread="../x"),
+                                             "whatsapp-gateway", "a" * 32, None)
+        for out in (none, gone, bogus):
+            assert 'id="back-thread"' not in out
+            assert wg._SENDS_BACK_JS not in out
+            assert f'<nav>{wg._NAV_HOME}<a href="/sends">' in out
+
+
+def test_thread_notes_where_an_approval_link_was_tapped():
+    src = (REPO_ROOT / "webapp" / "components" / "conversation.js").read_text(encoding="utf-8")
+    assert "const SENDS_RETURN_KEY = 'retinue.sends.return';" in src
+    with tempfile.TemporaryDirectory() as tmp:
+        assert _load_gateway(Path(tmp))._SENDS_RETURN_KEY == "retinue.sends.return"
+    assert "if (link) this._noteSendsReturn(link);" in src
+    assert "location: this.shelfLocation()," in src
+
+
 def main() -> int:
     tests = [test_sending_page_polls_with_spinner,
              test_sending_page_with_next_shows_button,
@@ -602,7 +663,10 @@ def main() -> int:
              test_index_row_names_the_event_time,
              test_messenger_page_is_unchanged,
              test_email_outcome_page_ends_like_a_messenger_send,
-             test_empty_list_after_a_decision_goes_back]
+             test_empty_list_after_a_decision_goes_back,
+             test_approval_page_links_back_to_the_asking_thread,
+             test_no_backlink_without_a_live_thread,
+             test_thread_notes_where_an_approval_link_was_tapped]
     failures = 0
     for test in tests:
         try:

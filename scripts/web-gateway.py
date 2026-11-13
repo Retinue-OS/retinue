@@ -3440,7 +3440,35 @@ def _all_pending() -> list[dict]:
 # followed it. A page opened on its own (a link from another app, another
 # site before it in the tab) has none, so it closes; where the browser
 # refuses that, the dashboard — never the empty /sends list.
-_SENDS_LEAVE_JS = (
+_SENDS_RETURN_KEY = "retinue.sends.return"
+_SHELF_RESTORE_KEY = "retinue.shelf.restore"
+
+# The place in the thread the approval link was tapped at. The thread writes
+# it as the link is tapped (conversation.js, _noteSendsReturn: thread id, its
+# shelfLocation() and the page it was open on); a way back hands it to the
+# thread page in the shelf's restore format (shelf-store.js setRestore, under
+# _SHELF_RESTORE_KEY), so the thread opens at that exact message whether the
+# browser brings the page back from its cache or loads it afresh.
+_SENDS_RETURN_JS = (
+    "  function sendsReturn(id){\n"
+    "    try{\n"
+    f"      var r=JSON.parse(sessionStorage.getItem({json.dumps(_SENDS_RETURN_KEY)})||'null');\n"
+    "      return r&&r.id===id?r:null;\n"
+    "    }catch(e){return null;}\n"
+    "  }\n"
+    "  function primeReturn(id){\n"
+    "    var r=id&&sendsReturn(id);\n"
+    "    if(!r||!r.location)return;\n"
+    f"    try{{sessionStorage.setItem({json.dumps(_SHELF_RESTORE_KEY)},JSON.stringify("
+    "{key:'thread:'+id,location:r.location,at:Date.now()}));}catch(e){}\n"
+    "  }\n"
+    "  function threadOf(u){\n"
+    "    var m=/^#conversation-([0-9a-f]{32})$/.exec(u.hash||'');\n"
+    "    return m?m[1]:null;\n"
+    "  }\n"
+)
+
+_SENDS_LEAVE_JS = _SENDS_RETURN_JS + (
     "  function closeOrHome(){\n"
     "    window.close();\n"
     "    setTimeout(function(){location.replace('/');},400);\n"
@@ -3453,6 +3481,7 @@ _SENDS_LEAVE_JS = (
     "        var u;\n"
     "        try{u=new URL(entries[i].url);}catch(e){continue;}\n"
     "        if(u.origin!==location.origin||/^\\/sends(\\/|$)/.test(u.pathname))continue;\n"
+    "        primeReturn(threadOf(u));\n"
     "        var t=nav.traverseTo(entries[i].key);\n"
     "        if(t&&t.committed){t.committed.catch(closeOrHome);}\n"
     "        return;\n"
@@ -3461,6 +3490,69 @@ _SENDS_LEAVE_JS = (
     "    closeOrHome();\n"
     "  }\n"
 )
+
+
+# "Back to the thread": the way to the dashboard thread that asked for the
+# approval. When that thread is where this tab came from — the latest
+# same-origin history entry that is not a /sends page — the tap is the
+# browser's own Back (traverseTo, which also steps over any approval and
+# status pages in between), so the thread is exactly as it was left. Otherwise
+# (no Navigation API, the approval opened from a push or another app) it is a
+# plain link to the thread, on the page it was open on when the link was
+# tapped there. Either way primeReturn() hands over the place in the thread.
+_SENDS_BACK_JS = (
+    "<script>\n(function(){\n"
+    + _SENDS_RETURN_JS
+    + "  var a=document.getElementById('back-thread');\n"
+      "  if(!a)return;\n"
+      "  var id=a.getAttribute('data-thread');\n"
+      "  var r=sendsReturn(id);\n"
+      "  if(r&&typeof r.href==='string'&&r.href.charAt(0)==='/'&&r.href.charAt(1)!=='/')a.href=r.href;\n"
+      "  function backEntry(){\n"
+      "    var nav=window.navigation;\n"
+      "    if(!nav||!nav.currentEntry||!nav.entries)return null;\n"
+      "    var entries=nav.entries();\n"
+      "    for(var i=nav.currentEntry.index-1;i>=0;i--){\n"
+      "      var u;\n"
+      "      try{u=new URL(entries[i].url);}catch(e){return null;}\n"
+      "      if(u.origin!==location.origin)return null;\n"
+      "      if(/^\\/sends(\\/|$)/.test(u.pathname))continue;\n"
+      "      return threadOf(u)===id?entries[i]:null;\n"
+      "    }\n"
+      "    return null;\n"
+      "  }\n"
+      "  a.addEventListener('click',function(e){\n"
+      "    if(e.defaultPrevented||e.button!==0||e.metaKey||e.ctrlKey||e.shiftKey||e.altKey)return;\n"
+      "    primeReturn(id);\n"
+      "    var entry=backEntry();\n"
+      "    if(!entry)return;\n"
+      "    e.preventDefault();\n"
+      "    var t=window.navigation.traverseTo(entry.key);\n"
+      "    if(t&&t.committed){t.committed.catch(function(){location.href=a.href;});}\n"
+      "  });\n"
+      "})();\n</script>\n"
+)
+
+
+def _thread_backlink(thread) -> str:
+    """The nav link back to the dashboard thread that queued this send, or ""
+    when it was queued outside one (or that thread is gone)."""
+    cid = send_origin.valid_thread(thread)
+    conv = _load_conv(cid) if cid else None
+    if conv is None:
+        return ""
+    title = html.escape(str(conv.get("title") or "").strip() or "the thread")
+    return (f'<a href="/conversations.html#conversation-{cid}" id="back-thread" '
+            f'data-thread="{cid}">‹ Back to {title}</a>')
+
+
+def _sends_nav(thread=None) -> str:
+    """The nav row of every /sends page: the way back to the asking thread
+    first, when there is one, then the dashboard and the list."""
+    back = _thread_backlink(thread)
+    return (f"<nav>{back}{_NAV_HOME}"
+            '<a href="/sends">↑ All pending sends</a></nav>\n'
+            + (_SENDS_BACK_JS if back else ""))
 
 
 def _render_sends_index_html(pending: list[dict], leave: bool = False) -> str:
@@ -3534,7 +3626,7 @@ def _render_send_single_html(detail: dict, account: str, next_url: str | None) -
         + f"<title>Retinue — Approve Send {rid}</title>\n"
         + "<body>\n"
         + "<h1>Approve Send</h1>\n"
-        + f'<nav>{_NAV_HOME}<a href="/sends">\u2191 All pending sends</a></nav>\n'
+        + _sends_nav(detail.get("thread"))
         + '<table class="answer">\n' + "\n".join(meta_rows) + "\n</table>\n"
         + f'<pre class="msg-body">{body}</pre>\n'
         + '<div class="actions">\n'
@@ -3589,7 +3681,7 @@ def _render_email_send_outcome_html(result: dict, account: str, request_id: str,
     return _render_send_status_html(
         title=f"E-mail send {html.escape(request_id)}", heading="E-mail send",
         meta_rows=meta_rows, body_html="", status="approved", notes=_MESSAGE_SEND_NOTES,
-        error="", next_url=next_url, poll_url=None)
+        error="", next_url=next_url, poll_url=None, thread=result.get("thread"))
 
 
 # ── Pending-send detail rendering ────────────────────────────────────────────
@@ -3982,7 +4074,8 @@ _MESSAGE_SEND_NOTES = {
 
 def _render_send_status_html(*, title: str, heading: str, meta_rows: list[str],
                              body_html: str, status: str, notes: dict, error: str,
-                             next_url: str | None, poll_url: str | None) -> str:
+                             next_url: str | None, poll_url: str | None,
+                             thread: str | None = None) -> str:
     """Render the status page of a decided send — every channel, e-mail included,
     so all of them end the same way once the user has decided.
 
@@ -4035,7 +4128,7 @@ def _render_send_status_html(*, title: str, heading: str, meta_rows: list[str],
           "</style>\n"
         + "<body>\n"
         + f"<h1>{heading}</h1>\n"
-        + f'<nav>{_NAV_HOME}<a href="/sends">↑ All pending sends</a></nav>\n'
+        + _sends_nav(thread)
         + '<table class="answer">\n' + "\n".join(meta_rows) + "\n</table>\n"
         + body_html
         + f'<div class="st-row"><div id="st-icon">{icon}</div>'
@@ -4176,14 +4269,14 @@ def _render_channel_send_html(detail: dict, channel: str, request_id: str, next_
             title=f"{label_e} {noun} {rid}", heading=f"{label_e} {noun.lower()}",
             meta_rows=meta_rows, body_html=body_html, status=status, notes=notes,
             error=detail.get("error") or "", next_url=next_url,
-            poll_url=f"/sends/{channel}/{request_id}/status")
+            poll_url=f"/sends/{channel}/{request_id}/status", thread=detail.get("thread"))
     return (
         _HTML_HEAD
         + f"<title>Retinue — Approve {label_e} {noun} {rid}</title>\n"
         + (_AGENDA_CSS if agenda else "")
         + "<body>\n"
         + f"<h1>Approve {label_e} {noun}</h1>\n"
-        + f'<nav>{_NAV_HOME}<a href="/sends">\u2191 All pending sends</a></nav>\n'
+        + _sends_nav(detail.get("thread"))
         + '<table class="answer">\n' + "\n".join(meta_rows) + "\n</table>\n"
         + body_html
         + _render_agenda_html(agenda)
