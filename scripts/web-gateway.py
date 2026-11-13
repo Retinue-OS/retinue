@@ -1293,9 +1293,15 @@ CHAT_LIST_REBUILD_TIMEOUT = float(os.environ.get("CHAT_LIST_REBUILD_TIMEOUT", "2
 CHAT_LIST_FAILURE_BACKOFF = float(os.environ.get("CHAT_LIST_FAILURE_BACKOFF", "10"))
 # Timeout for the one hop POST /chats/<id>/send makes to the channel gateway.
 CHAT_SEND_TIMEOUT = float(os.environ.get("CHAT_SEND_TIMEOUT", "30"))
-# How many images one chat send may carry; each is size-capped by
-# MAX_ATTACHMENT_BYTES like every other upload through this gateway.
+# How many attachments — files of any type; the name predates that — one chat
+# send may carry; each is size-capped by MAX_ATTACHMENT_BYTES like every other
+# upload through this gateway.
 CHAT_SEND_MAX_IMAGES = int(os.environ.get("CHAT_SEND_MAX_IMAGES", "5"))
+# ... and how large they may be together, decoded. The channel gateways take
+# one send as a single JSON body of at most 25 MiB (their
+# *_GATEWAY_MAX_BODY_BYTES), base64 included, so more than this would be
+# refused there after the whole upload; refused here it costs nothing.
+CHAT_SEND_MAX_BYTES = int(os.environ.get("CHAT_SEND_MAX_BYTES", str(16 * 1024 * 1024)))
 # How long a gateway's identity (mode + account, read from its /health) is
 # reused. Long on success — an account's mode and number do not change under a
 # running container — and short after a failed probe, so a gateway that was
@@ -12267,35 +12273,49 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(400, {"error": "invalid JSON"})
             return
         text = (payload.get("text") or "").strip()
-        # Optional images, in the gateways' own /send shape. Validated here —
-        # count, base64, decoded size — so a bad upload fails fast with a 400
-        # instead of a gateway round trip; the gateway persists the bytes into
-        # its ledger media store and reports the stored references back.
+        # Optional attachments — files of any type: a photo, a video, a PDF —
+        # in the gateways' own /send shape, under that shape's historical key
+        # `images`. Validated here — count, base64, decoded size — so a bad
+        # upload fails fast with a 400 instead of a gateway round trip; the
+        # gateway persists the bytes into its ledger media store and reports
+        # the stored references back.
         raw_images = payload.get("images") or []
         if not isinstance(raw_images, list):
             self._send_json(400, {"error": "'images' must be a list"})
             return
         if len(raw_images) > CHAT_SEND_MAX_IMAGES:
-            self._send_json(400, {"error": f"at most {CHAT_SEND_MAX_IMAGES} images per send"})
+            self._send_json(400, {"error": f"at most {CHAT_SEND_MAX_IMAGES} attachments per send"})
             return
         images = []
+        total = 0
         for img in raw_images:
             if not isinstance(img, dict) or not isinstance(img.get("data"), str):
-                self._send_json(400, {"error": "each image needs base64 'data'"})
+                self._send_json(400, {"error": "each attachment needs base64 'data'"})
                 return
             ctype = img.get("content_type")
             if ctype is not None and not isinstance(ctype, str):
-                self._send_json(400, {"error": "image content_type must be a string"})
+                self._send_json(400, {"error": "attachment content_type must be a string"})
+                return
+            fname = img.get("filename")
+            if fname is not None and not isinstance(fname, str):
+                self._send_json(400, {"error": "attachment filename must be a string"})
                 return
             try:
                 raw = base64.b64decode(img["data"], validate=True)
             except (ValueError, binascii.Error):
-                self._send_json(400, {"error": "invalid base64 image data"})
+                self._send_json(400, {"error": "invalid base64 attachment data"})
                 return
-            if len(raw) > MAX_ATTACHMENT_BYTES:
-                self._send_json(400, {"error": "image too large"})
+            total += len(raw)
+            if len(raw) > MAX_ATTACHMENT_BYTES or total > CHAT_SEND_MAX_BYTES:
+                self._send_json(400, {"error": "attachment too large"})
                 return
-            images.append({"content_type": (ctype or "").strip(), "data": img["data"]})
+            item = {"content_type": (ctype or "").strip(), "data": img["data"]}
+            # The name the file goes out under — what the recipient sees on a
+            # document. The gateway sanitizes it; absent, it derives one from
+            # the content type.
+            if fname and fname.strip():
+                item["filename"] = fname.strip()
+            images.append(item)
         if not text and not images:
             self._send_json(400, {"error": "empty text"})
             return

@@ -239,7 +239,8 @@ docstring). Pieces:
   author on every outbound bubble (you / Ara / your phone), inline media
   (images with a lightbox, voice-note and video players — see the Message
   contract below), a live composer (send, shared draft, one-tap clear ✕,
-  dictation, image attach — picked or pasted — with client-side downscale),
+  dictation, file attach — any type, picked or pasted; images are downscaled
+  client-side),
   quick-pattern chips,
   and the companion pane — swipe between panes on a phone, a draggable
   splitter on a wide screen. The composer row is the conversation composer's
@@ -460,9 +461,12 @@ The API, as the components consume it:
   agent that also calls approve has simulated the press, which nothing inside a
   shared container can stop.) The page shows an optimistic bubble and reconciles
   it with the response, and a failed send puts the words back into the composer.
-  `images` is `[{content_type, data(base64)}]`, at most 5, each at most
-  ~8 MB decoded (400 on violations); `text` may be absent when images are
-  sent. The returned `Message` (and later polls) carries the sent
+  `images` — the key predates the other file types — is the message's
+  attachments, files of any type (a photo, a video, a PDF):
+  `[{content_type, data(base64), filename?}]`, at most 5 and at most 16 MB
+  decoded together (`CHAT_SEND_MAX_BYTES`; 400 on violations); `filename` is
+  the name a document goes out under; `text` may be absent when attachments
+  are sent. The returned `Message` (and later polls) carries the sent
   attachments with proxied URLs and their sniffed dimensions. The client
   downscales picked photos before upload — longest edge 1600 px, JPEG — as
   the native clients do; animated GIFs pass through unchanged under the size
@@ -602,7 +606,7 @@ load of this device and browser:
   it back when its place opens again. Synchronous storage, so a write made as
   the page unloads (`pagehide`) is not lost; written on every change, so a page
   the system kills without an unload loses nothing either. Attachments (a
-  thread's picked files, a chat's staged images) are too large for it and go
+  thread's picked files, a chat's staged attachments) are too large for it and go
   to IndexedDB (`retinue-drafts`) when they are picked or dropped. A project
   edit is kept with the file version it was started from, so saving it on a
   later visit still answers 409 when the file changed meanwhile. A chat's
@@ -653,7 +657,7 @@ load of this device and browser:
   all, the note hedges and the mark stays for the next visit to look again.
   A first message, which has no thread to read, is looked for in the threads
   the user opened from that moment on. A chat message is looked for in the chat's own mirror on the
-  next visit; one carrying images is too large for a keepalive request and is
+  next visit; one carrying attachments is too large for a keepalive request and is
   the likelier to need it. A project command is taken as delivered.
 
 The page-side guard that held a tab or a Home press on such a page is gone,

@@ -29,11 +29,13 @@
 // either way the box is reserved before the bytes arrive, so a lazy load can
 // never shift the thread) and open full screen in a lightbox; audio renders
 // as a player above the transcript text (voice notes), video as an inline
-// player under the same box-reserve rules. The composer stages images too:
-// picked photos (the phone's own chooser offers the camera among the sources)
-// and images pasted into the box (a screenshot, clipboard.js) are downscaled
-// client-side, previewed above the input row, and sent as the `images` part
-// of POST /chats/<id>/send.
+// player under the same box-reserve rules. The composer stages attachments
+// too — files of any type, picked (the phone's own chooser offers the camera
+// among the sources) or pasted into the box (a screenshot, clipboard.js).
+// Images are downscaled client-side and previewed as thumbnails; a video, a
+// PDF or any other file goes as it is and is previewed as a named chip. All
+// of them are sent as the `images` part of POST /chats/<id>/send — the key's
+// name predates the other file types.
 //
 // The companion pane is the chat's own conversation with Ara: an ordinary
 // dashboard conversation (kind `companion`), named by `companion` on the chat
@@ -181,10 +183,13 @@ const KEEPALIVE_BYTES = 32 * 1024;
 const REC_SLICE_MS = 250;
 // Sticking distance: within this many px of the bottom counts as "at bottom".
 const NEAR_BOTTOM_PX = 40;
-// Outgoing images — the caps mirror the send endpoint (which answers 400 on
-// violations), so a doomed selection fails here instead of after the upload.
+// Outgoing attachments — the caps mirror the send endpoint (which answers 400
+// on violations), so a doomed selection fails here instead of after the
+// upload. MAX_SEND_BYTES is what one message's attachments may weigh
+// together: the channel gateway takes them as a single request.
 const MAX_IMAGES_PER_SEND = 5;
 const MAX_IMAGE_BYTES = 8 * 1024 * 1024;
+const MAX_SEND_BYTES = 16 * 1024 * 1024;
 // Client-side downscale before upload, as the native clients do: longest edge
 // to IMAGE_MAX_EDGE, re-encoded as JPEG at IMAGE_JPEG_QUALITY.
 const IMAGE_MAX_EDGE = 1600;
@@ -292,8 +297,9 @@ function fmtDay(iso) {
   return t.toLocaleDateString(undefined, opts);
 }
 
-// A staged image as it is kept on the device: everything but its object URL,
-// which belongs to the page that made it.
+// A staged attachment as it is kept on the device: everything but its object
+// URL, which belongs to the page that made it. Only an image has a size in
+// pixels.
 function imageRecord(im) {
   return { blob: im.blob, content_type: im.content_type, width: im.width, height: im.height, name: im.name };
 }
@@ -1539,8 +1545,8 @@ class RetinueChatPage extends HTMLElement {
   }
 
   // The attachment the bubble of a send on its way shows for one of the
-  // user's staged images: its preview's object URL, which this page created,
-  // so it is taken for the image although it is not the proxy's (mediaUrl).
+  // user's staged files: its preview's object URL, which this page created,
+  // so it is taken for the medium although it is not the proxy's (mediaUrl).
   _ownPreview(im, i) {
     const att = {
       id: `local-att-${this._localSeq}-${i}`,
@@ -1549,6 +1555,7 @@ class RetinueChatPage extends HTMLElement {
       width: im.width,
       height: im.height,
       name: im.name,
+      size: im.blob ? im.blob.size : undefined,
     };
     OWN_PREVIEWS.add(att);
     return att;
@@ -1842,20 +1849,29 @@ class RetinueChatPage extends HTMLElement {
     return err ? `<div class="attach-err" role="status">${esc(err)}</div>` : '';
   }
 
-  // Staged outgoing images: small thumbnails above the input row, each with
-  // its own remove — they ride along until the send (or their ✕) takes them.
+  // Staged outgoing attachments above the input row — an image as a small
+  // thumbnail, any other file as a chip with its name and size — each with
+  // its own remove: they ride along until the send (or their ✕) takes them.
   _imgPreviewsHtml() {
     if (!this._outImages.length) return '';
-    const items = this._outImages.map((im, i) =>
-      `<span class="imgp"><img src="${esc(im.url)}" alt="${esc(im.name || 'image')}">` +
-      `<button type="button" class="imgp-x" data-rmimg="${i}" ` +
-      `aria-label="Remove image">&#10005;</button></span>`).join('');
+    const items = this._outImages.map((im, i) => {
+      const isImage = String(im.content_type || '').startsWith('image/');
+      const name = im.name || (isImage ? 'image' : 'Attachment');
+      const size = fmtBytes(im.blob ? im.blob.size : 0);
+      const body = isImage
+        ? `<img src="${esc(im.url)}" alt="${esc(name)}">`
+        : `<span class="imgp-file" title="${esc(name)}"><span class="imgp-name">${esc(name)}</span>` +
+          `${size ? `<span class="imgp-size">${esc(size)}</span>` : ''}</span>`;
+      return `<span class="imgp">${body}` +
+        `<button type="button" class="imgp-x" data-rmimg="${i}" ` +
+        `aria-label="Remove ${esc(name)}">&#10005;</button></span>`;
+    }).join('');
     return `<div class="img-previews" data-previews>${items}</div>`;
   }
 
   // The paperclip, tucked INSIDE the text field exactly as the conversations
-  // composer tucks its own: a label over a hidden file input, images only since
-  // that is what the send endpoint carries. Inside rather than beside, because
+  // composer tucks its own: a label over a hidden file input, any file type
+  // (no `accept`), since the channels carry any. Inside rather than beside, because
   // a round control in the row costs the field 46px of a phone's width while
   // one inside costs only padding — and because the two composers should not
   // teach two different places to look for the same affordance.
@@ -1864,8 +1880,8 @@ class RetinueChatPage extends HTMLElement {
   // among its sources, so a separate camera button buys a shortcut at the price
   // of a whole control's width.
   _clipHtml() {
-    return `<label class="clip" title="Attach images (or paste one into the box)" aria-label="Attach images (or paste one into the box)">` +
-      `<input type="file" hidden multiple accept="image/*" data-attach>` +
+    return `<label class="clip" title="Attach files (or paste one into the box)" aria-label="Attach files (or paste one into the box)">` +
+      `<input type="file" hidden multiple data-attach>` +
       `<span aria-hidden="true">&#128206;</span></label>`;
   }
 
@@ -2628,22 +2644,28 @@ class RetinueChatPage extends HTMLElement {
     if (el) el.scrollTop = el.scrollHeight;
   }
 
-  // ── Staged outgoing images ─────────────────────────────────────────────────
+  // ── Staged outgoing attachments ────────────────────────────────────────────
+  // Any file may ride a chat message. An image is downscaled first, as the
+  // native clients do; a video, a PDF or anything else is staged as it is.
   async _addImages(files) {
     this._imgError = '';
     for (const file of files) {
-      if (!String(file.type || '').startsWith('image/')) {
-        this._imgError = `"${file.name}" is not an image.`;
-        continue;
-      }
       if (this._outImages.length >= MAX_IMAGES_PER_SEND) {
-        this._imgError = `Up to ${MAX_IMAGES_PER_SEND} images per message.`;
+        this._imgError = `Up to ${MAX_IMAGES_PER_SEND} attachments per message.`;
         break;
       }
       try {
-        const im = await this._prepareImage(file);
-        if (im.blob.size > MAX_IMAGE_BYTES) {
-          this._imgError = `"${file.name}" is too large.`;
+        const isImage = String(file.type || '').startsWith('image/');
+        const im = isImage ? await this._prepareImage(file)
+          : { blob: file, content_type: file.type || 'application/octet-stream' };
+        const staged = this._outImages.reduce((n, o) => n + (o.blob ? o.blob.size : 0), 0);
+        if ((isImage && im.blob.size > MAX_IMAGE_BYTES) || im.blob.size > MAX_SEND_BYTES) {
+          this._imgError = `"${file.name}" is too large to send here (up to ${fmtBytes(MAX_SEND_BYTES)}).`;
+          continue;
+        }
+        if (staged + im.blob.size > MAX_SEND_BYTES) {
+          this._imgError = `"${file.name}" doesn't fit: one message carries up to ` +
+            `${fmtBytes(MAX_SEND_BYTES)} of attachments.`;
           continue;
         }
         im.url = URL.createObjectURL(im.blob);
@@ -2726,14 +2748,19 @@ class RetinueChatPage extends HTMLElement {
     return false;
   }
 
-  // {content_type, data}: the payload item the send endpoint accepts. Base64
-  // via FileReader, so a large blob never hits a string-building loop.
+  // {content_type, data, filename?}: the payload item the send endpoint
+  // accepts. Base64 via FileReader, so a large blob never hits a
+  // string-building loop. A file goes out under its own name — it is what the
+  // recipient sees on a document; an image carries none, having been
+  // re-encoded here (the picked name's extension may no longer be true).
   _imagePayload(im) {
+    const named = im.name && !String(im.content_type || '').startsWith('image/');
     return new Promise((res, rej) => {
       const r = new FileReader();
       r.onload = () => res({
         content_type: im.content_type,
         data: String(r.result).split(',')[1] || '',
+        ...(named ? { filename: im.name } : {}),
       });
       r.onerror = () => rej(new Error('read'));
       r.readAsDataURL(im.blob);
@@ -3231,11 +3258,17 @@ const CSS = `
           cursor: pointer; font-size: 1rem; user-select: none;
           -webkit-tap-highlight-color: transparent; }
   .clip:hover { background: rgba(110, 168, 254, .2); }
-  /* Staged images: removable thumbnails riding above the input row. */
+  /* Staged attachments: removable thumbnails (images) and name chips (any
+     other file) riding above the input row. */
   .img-previews { display: flex; flex-wrap: wrap; gap: 8px; margin: 2px 0 10px; }
   .imgp { position: relative; }
   .imgp img { display: block; width: 56px; height: 56px; object-fit: cover;
               border-radius: 10px; background: var(--card-2, #1c2230); }
+  .imgp-file { display: flex; flex-direction: column; justify-content: center; gap: 2px;
+               box-sizing: border-box; height: 56px; max-width: 180px; padding: 0 18px 0 12px;
+               border-radius: 10px; background: var(--card-2, #1c2230); font-size: .78rem; }
+  .imgp-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .imgp-size { opacity: .7; font-size: .7rem; }
   .imgp-x { position: absolute; top: -6px; right: -6px; width: 22px; height: 22px;
             display: inline-flex; align-items: center; justify-content: center;
             border: 0; border-radius: 50%; padding: 0; cursor: pointer;
