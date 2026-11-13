@@ -230,7 +230,10 @@ chat state; the chat API adds no writer to any of it.
 Media stays where it is: attachment references are the gateways' token-gated
 `GET /media/<id>` URLs, and the web-gateway proxies them behind the dashboard's
 own auth (the same shape as the `/gateways/<slug>/qr` proxy), so images render
-inline in chat bubbles without exposing gateway tokens to the browser.
+inline in chat bubbles without exposing gateway tokens to the browser. A blob
+comes with the content type its sender declared, so the proxy decides from it
+what is served in place and what as a download (`docs/dashboard.md`,
+"Attachments").
 
 ### Retinue-side chat state
 
@@ -275,7 +278,10 @@ erased graphs on its next pass, and a short in-memory tombstone hides them
 until it has. The tombstone lists the records the gateways erased, by subject
 and message id; it is not a time cut-off. A later message from the same peer
 finds nothing and starts a new chat, even in the same second. Like a send, a
-delete is the user's own act and is accepted only through the reverse proxy.
+delete is the user's own act and is accepted only through the reverse proxy,
+and never when another site's page made the browser send it (a
+`Sec-Fetch-Site` other than `same-origin` or `none` is answered 403, as for a
+send and a pending send's approve or reject).
 The gateways' erase endpoint also requires `CHAT_ERASE_TOKEN`, a capability
 that agent sessions do not inherit (unlike the `*_GATEWAY_TOKEN`s they send
 with). Without it configured, deletion is refused. The
@@ -453,7 +459,17 @@ and what a model turn is *for*:
      them, so `delivered` is never set for a VIP's message no turn saw.
    - **What the message carried travels with it.** Attachments ride the rail in
      the `POST /message` shape and are materialized in the retinue container,
-     so a turn opens the photo rather than answering one it never saw.
+     so a turn opens the photo rather than answering one it never saw. The
+     note that tells the turn about them names each file by the path the
+     gateway gave it, its type and its size, never by the sender's file name.
+     The type is the one the sender's client declared, so it is kept only as
+     the bare `type/subtype` of one media type, without parameters, and as
+     `application/octet-stream` otherwise: text from outside never reads as
+     the framework's own words in a prompt. The chat note every companion
+     turn carries names the types of the recent messages' attachments under
+     the same rule: the chat listing keeps a stated type only as the essence
+     of one media type, the note reads it once more the same way, and a type
+     that is none is left out.
    - **One message, one notification.** The arrival's own Web Push already
      fired, deterministically and at once; the turn's note lands in the
      companion thread without pushing again.

@@ -701,6 +701,44 @@ def media_kind(content_type: str | None) -> str:
     return "file"
 
 
+# What a stated content type is kept as: printable ASCII on one line. Any run
+# of anything else — a line break, a tab, a control character, a character
+# outside ASCII — is one blank.
+_NOT_TYPE_TEXT_RE = re.compile(r"[^\x21-\x7e]+")
+# As long as a type/subtype pair can be (RFC 6838, 4.2: 127 characters each).
+_CONTENT_TYPE_MAX_LEN = 255
+
+
+def clean_content_type(value) -> str:
+    """A stated content type reduced to one clean line.
+
+    The type of an inbound medium is what the sender's client declared: a line
+    of text from outside. It is written to the blob's sidecar, stated in the
+    record and sent back as the ``Content-Type`` of ``GET /media/<id>``, and a
+    header is exactly one line. So a line break, a tab, a control character
+    or anything outside ASCII becomes a blank, the ends are trimmed and
+    overlong text is cut; when nothing is left, the type is the generic one.
+
+    That makes the text safe to keep and to put in a header. It does not make
+    it a valid media type: what a blob may be shown as is decided where it is
+    served to a browser, in the web gateway's media proxy."""
+    text = _NOT_TYPE_TEXT_RE.sub(" ", str(value or "")).strip()
+    return text[:_CONTENT_TYPE_MAX_LEN].rstrip() or "application/octet-stream"
+
+
+def _stored_content_type(d: Path, media_id: str) -> str:
+    """The content type a blob's ``.type`` sidecar holds, as one clean line.
+
+    Cleaned on the way out as on the way in (:func:`clean_content_type`),
+    because a sidecar written before the store did that holds whatever was
+    declared. A missing or unreadable sidecar is the generic type."""
+    try:
+        raw = (d / (media_id + ".type")).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        raw = ""
+    return clean_content_type(raw)
+
+
 def safe_file_name(name) -> str | None:
     """A sender-supplied file name reduced to something safe to show and save.
 
@@ -789,7 +827,9 @@ def store_media(store_dir: str | Path, data: bytes, content_type: str | None,
     The blob is keyed by ``token_hex(16)`` — never by an untrusted filename — so
     the id is path-safe by construction and reveals nothing about the sender. The
     ``content_type`` is written to a ``<id>.type`` sidecar so the serving endpoint
-    can set the right ``Content-Type`` without trusting anything client-supplied.
+    can set the ``Content-Type`` without asking the requesting client. It is
+    what the sender's client declared, so it is kept as one clean line
+    (:func:`clean_content_type`).
     For an image blob (detected by magic — see :func:`_image_dimensions`) the
     intrinsic size is written to a ``<id>.meta`` JSON sidecar
     (``{"width", "height"}``) so the chat surface can reserve the image box
@@ -813,8 +853,7 @@ def store_media(store_dir: str | Path, data: bytes, content_type: str | None,
     tmp = blob.with_suffix(".tmp")
     tmp.write_bytes(data or b"")
     os.replace(tmp, blob)
-    ct = (content_type or "application/octet-stream").strip() or "application/octet-stream"
-    _atomic_write(ct + "\n", d / (media_id + ".type"))
+    _atomic_write(clean_content_type(content_type) + "\n", d / (media_id + ".type"))
     name = safe_file_name(file_name)
     if name:
         _atomic_write(name + "\n", d / (media_id + ".name"))
@@ -831,7 +870,8 @@ def load_media(store_dir: str | Path, media_id: str) -> tuple[bytes, str] | None
     Validates the id against :data:`_MEDIA_ID_RE` before touching the filesystem,
     so a crafted ``media_id`` can never escape the media dir (path traversal). The
     content type falls back to ``application/octet-stream`` if the sidecar is
-    missing or unreadable.
+    missing or unreadable, and is one clean line whatever the sidecar holds
+    (:func:`clean_content_type`): the caller sends it as a response header.
     """
     if not _MEDIA_ID_RE.match(media_id or ""):
         return None
@@ -840,14 +880,7 @@ def load_media(store_dir: str | Path, media_id: str) -> tuple[bytes, str] | None
         data = (d / media_id).read_bytes()
     except OSError:
         return None
-    ct = "application/octet-stream"
-    try:
-        sidecar = (d / (media_id + ".type")).read_text(encoding="utf-8").strip()
-        if sidecar:
-            ct = sidecar
-    except OSError:
-        pass
-    return data, ct
+    return data, _stored_content_type(d, media_id)
 
 
 # A media reference's blob id: the URN a gateway records today, or the
@@ -878,12 +911,7 @@ def media_meta(store_dir: str | Path, media_id: str) -> dict | None:
         size = (d / media_id).stat().st_size
     except OSError:
         return None
-    meta: dict = {"size": int(size)}
-    try:
-        ct = (d / (media_id + ".type")).read_text(encoding="utf-8").strip()
-    except OSError:
-        ct = ""
-    meta["content_type"] = ct or "application/octet-stream"
+    meta: dict = {"size": int(size), "content_type": _stored_content_type(d, media_id)}
     try:
         name = safe_file_name((d / (media_id + ".name")).read_text(encoding="utf-8"))
         if name:

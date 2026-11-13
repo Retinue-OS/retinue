@@ -88,6 +88,14 @@ services:
       - ANTHROPIC_AUTH_TOKEN
       - ANTHROPIC_CUSTOM_HEADERS
       - ANTHROPIC_MODEL=${RETINUE_CLAUDE_MODEL}
+      # Family pins: Claude Code resolves the bare opus/sonnet/haiku/fable
+      # aliases through these, and the web gateway's model picker follows them
+      # (docs/dashboard.md). The container has no env_file, so they must be
+      # forwarded here or a pin in .env never reaches either.
+      - ANTHROPIC_DEFAULT_OPUS_MODEL
+      - ANTHROPIC_DEFAULT_SONNET_MODEL
+      - ANTHROPIC_DEFAULT_HAIKU_MODEL
+      - ANTHROPIC_DEFAULT_FABLE_MODEL
       - RETINUE_CLAUDE_MODEL
       - RETINUE_GATEWAY_USES_CLAUDE_OAUTH
       # Claude sign-in monitoring & browser re-login (docs/claude-auth.md):
@@ -364,6 +372,12 @@ services:
       - RETINUE_INSTANCE_NAME
       - RETINUE_INSTANCE_COLOR
       - RETINUE_INSTANCE_FILE
+      # The dashboard's Content-Security-Policy: report (the default: the
+      # browser reports what it would block, at GET /csp-report), enforce, or
+      # off; and where the reports are kept (default on the /root volume).
+      # See docs/dashboard.md, "The Content-Security-Policy".
+      - RETINUE_CSP
+      - RETINUE_CSP_REPORTS_FILE
       - SEND_APPROVAL_BASE_URL
       # Zone the approval pages render event times in; the containers run on
       # UTC, so without it a mis-zoned calendar entry reads as correct there.
@@ -1150,9 +1164,24 @@ services:
       - WHISPER_MODEL=base
       - STT_HTTP_PORT=8100
       - STT_TOKEN
-      # Constrain voice-note language detection to the languages actually spoken;
-      # reuses the same deployment setting the Signal gateway uses for text.
-      - STT_SUPPORTED_LANGUAGES=${SIGNAL_SUPPORTED_LANGUAGES:-}
+      # Constrain language detection to the languages actually spoken. Set
+      # STT_SUPPORTED_LANGUAGES to say it outright; left empty, the service takes
+      # the union of the channels' own settings below, since it transcribes for
+      # all of them and no single channel speaks for the deployment.
+      - STT_SUPPORTED_LANGUAGES
+      - SIGNAL_SUPPORTED_LANGUAGES
+      - WHATSAPP_SUPPORTED_LANGUAGES
+      - TELEGRAM_SUPPORTED_LANGUAGES
+      # The names the deployment dictates — people, organisations, medications —
+      # come from the life store on the same network (scripts/dictation_vocabulary.py)
+      # and bias every decode, for dashboard dictation and voice notes alike.
+      # Fail-open: an unreachable store costs the bias, not the transcription.
+      - QLEVER_LIFE_URL=http://qlever-life:7001
+      - STT_HOTWORDS=${STT_HOTWORDS:-1}
+      - DICTATION_HOTWORD_CHARS=${DICTATION_HOTWORD_CHARS:-600}
+      # Voice-activity filtering is on by default (silence is what makes Whisper
+      # invent text); set STT_VAD_FILTER=0 in .env to decode the raw audio instead.
+      - STT_VAD_FILTER=${STT_VAD_FILTER:-1}
     volumes:
       # Persist downloaded Whisper model weights across container recreation.
       - stt-models:/root/.cache/huggingface

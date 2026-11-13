@@ -29,7 +29,9 @@ lives in `webapp/` (baked into the image):
   scheduler-driven refresh job regenerates them. **Refreshing these is Ara's job**
   (currently mock data). The server serves them at `/data/` from
   `DASHBOARD_DATA_DIR` (default `webapp/data`), kept separate from the baked
-  shell so data can be written without rebuilding.
+  shell so data can be written without rebuilding. What agents write there
+  is answered as JSON only, the type the cards read; any other file is a
+  download (see "The Content-Security-Policy").
 - `webapp/sw.js` caches the shell so the dashboard opens with no
   connectivity.
 
@@ -55,9 +57,14 @@ stays as a second row under it. A tab always goes, whatever the page
 holds: a typed message, an unsaved project edit or a dictation on its way is
 kept on the device and waits in its field for the user to come back to the
 same place (`webapp/components/drafts.js`), and a dictation still being
-recorded or transcribed is finished by the service worker, its text landing
-in that field (`webapp/components/dictation.js`; webapp README, "Unsent
-input"). The tap used to be held instead, with a note popping up at the
+recorded or transcribed is finished by the service worker
+(`webapp/components/dictation.js`; webapp README, "Unsent input"). A review
+dictation (✓, or leaving with the mic live) lands in its field. A dictation
+the user sent (➤, or a take of the continuous loop ending on a pause) in an
+existing thread is a message, so the worker posts it into the thread it was
+recorded in; only a send that failed or may have failed brings its text to
+the field, with a note, and a first message (no thread yet) waits in its
+composer's field. The tap used to be held instead, with a note popping up at the
 bottom asking for a second press — which the phone keyboard, coming up with
 the note, made impossible by hiding the row; pop-up notes at the bottom of
 the screen are an anti-pattern here. While the phone keyboard is up the row steps aside on a
@@ -82,6 +89,168 @@ or a text field is focused) and re-checks on every visibility change, so even
 an always-open window picks a deploy up within moments of being looked at. The
 settings page shows the running shell version with a manual "Check for
 updates" as fallback.
+
+## The Content-Security-Policy
+
+Content from outside — a message, a mail, a file somebody sent — must never
+become a page, a script or a link of another scheme on the dashboard's origin;
+the gateway's escaping and its media rules (#402, #404; "Attachments" and
+"Media in a messenger chat" below) see to that. The Content-Security-Policy is
+the second line behind them: should markup from outside reach a page all the
+same, it cannot run script there, because scripts run only from the
+dashboard's own files. Every HTML response of the gateway carries it — the
+pages of `webapp/`, the pages the gateway builds itself (`/sends`,
+`/gateways`, `/claude-auth`, the session log) and its error pages. It is
+added where the handler's headers end, for any answer of type `text/html`, so
+no code path can forget it. The policy is built in one place,
+`scripts/content_policy.py`, with the page that needs each source:
+
+```
+default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline';
+img-src 'self'; media-src 'none'; font-src 'none';
+connect-src 'self'; frame-src 'none'; object-src 'none'; base-uri 'self';
+form-action 'self'; worker-src 'self'; manifest-src 'self';
+report-uri /csp-report
+```
+
+Scripts come from this origin only: no inline script, no handler attribute,
+no `javascript:` URL, no `eval`. Styles stay open (the components set style
+attributes; restricting styles is not the aim). Images come from this
+origin. No image or medium is loaded from another origin: the chat page
+shows an attachment that is a web link as a link to open (see
+"Attachments"), and the session log shows an image an answer names (a web
+address or a `data:` URL) as a link to it, or as its alt text, never as an
+image, as the dashboard's Markdown renderer does. Every page but one plays
+no audio or video, and every page but one frames nothing, so `media-src`
+and `frame-src` are `'none'`: markup that slipped into a page can then not
+frame another page of this origin either (an approval card, under a click
+meant for something else). No page loads a font.
+Three pages get more, each for itself alone (`PAGE_SOURCES` in the module;
+a source added to a directive that is `'none'` takes its place):
+the chat page (`/chat.html`) adds `blob:` to `img-src`, for its previews of
+the images about to be sent, which it makes itself as object URLs (no other
+page makes one), and gets `media-src 'self'`, for the messenger media it
+plays; it is the only page that plays any. (The briefing card would play
+audio on the start page, but `index.html` leaves it out for now; bringing it
+back means giving `index.html` `media-src 'self'` there.) The file viewer
+(`/viewer.html`) gets `frame-src 'self'`, for the attachment it shows in a
+frame; it is the only page that frames anything. `/sparql` (also served as
+`/sparql.html`) adds `data:` to `img-src`, for the icons in YASGUI's
+stylesheet. It needs nothing else: the vendored YASGUI compiles no strings.
+Two other policies stay as they were, separate and always enforced:
+`/settings-instance.html`'s `frame-ancestors` (who may frame it, see "The
+settings page") and the file viewer's own `frame-src 'self'`. Inside the
+Android shell, the bridge the app injects (`window.RetinueShell`) and the
+scripts it evaluates are the app's, not governed by a page's policy.
+
+The policy decides what a page loads and runs, not where a link takes the
+user: following a link is a navigation, which none of its directives
+restricts (`form-action` covers only where a form is sent). So the call
+directive's tap-to-dial `tel:` link (see "Speech-to-text (the `stt` service)
+and voice input") and the `mailto:` links work in every mode. What keeps a
+link of another scheme out of the pages is the markup's own rules, not the
+policy, and both renderers keep the same one. The dashboard's Markdown
+renderer makes links only of `http(s)`, `mailto:` and `tel:` URLs and of
+paths on this origin, and its call link only of a number it has checked
+(`webapp/components/markdown.js`). The session log (`/conversation`,
+`/conversation/<date>`) renders answers with markdown-it in
+`scripts/web-gateway.py`, which by itself would link any scheme but
+`javascript:`, `vbscript:`, `file:` and `data:` other than an image; the
+gateway drops every other link there and leaves its text
+(`_md_refuse_links`). The one scheme the policy itself stops is
+`javascript:`, which `script-src` blocks, and only in `enforce` mode: in
+`report` mode it reports it and stops nothing.
+
+**Three modes**, `RETINUE_CSP`:
+
+- `report` (the default) sends `Content-Security-Policy-Report-Only`: the
+  browser blocks nothing and reports what the policy would have blocked;
+- `enforce` sends `Content-Security-Policy`: the browser blocks it, and still
+  reports it;
+- `off` sends neither — a rollback, not a setting to keep.
+
+An unknown value counts as `report` and is named in the log. The mode and the
+policy are part of the service worker's shell hash: the worker serves the
+shell pages from its cache with the headers they were cached with, so a change
+reaches installed clients as a new worker, like a changed file.
+
+**The reports.** The policy names the gateway's own endpoint with
+`report-uri`. Not with `report-to`: Chromium, and so the Android shell's
+WebView, ignores `report-uri` once a policy names a `report-to` group and
+leaves delivery to the Reporting API, which in a headless Chromium delivered
+nothing within a minute, while `report-uri` arrives at once.
+`POST /csp-report` takes both formats all the same (`application/csp-report`,
+`application/reports+json`), at most 64 KiB with a `Content-Length`, behind
+the dashboard's sign-in and nothing more, and answers `204` or a fixed error;
+it reflects nothing. Each report is read for the page (its path), the
+directive, the blocked URL and the source line, query strings and fragments
+cut off; the distinct violations (page, directive, blocked URL) are counted,
+with when each was first and last seen, in one JSON file beside the
+conversations (`RETINUE_CSP_REPORTS_FILE`, default
+`/root/.retinue/csp-reports.json`), at most 200 of them (past that only
+`not_kept` grows). A new one is logged once, as `[web-gateway] CSP report: …`
+from a report-only policy and as `[web-gateway] CSP enforce: …` from an
+enforced one: the word is the report's disposition as the browser states it
+(`report` when it states none), so search the log for `[web-gateway] CSP `
+to find both. `GET /csp-report` lists them, latest first, with the mode and
+the policy.
+
+**From report to enforce.** Leave the mode on `report` for about a week of
+normal use, on every device and in the Android shell, its settings page
+included. Then read `GET /csp-report`:
+
+- empty, or only entries that are not the dashboard's (a browser extension's
+  script, a `chrome-extension:` or `moz-extension:` source): set
+  `RETINUE_CSP=enforce` and recreate the container; installed clients take the
+  new worker on their next visit;
+- an entry on a dashboard page that the page needs (a script it runs, a kind
+  of image it shows): fix the page, or add the source to
+  `scripts/content_policy.py` with the page that needs it (to `PAGE_SOURCES`
+  when only that page needs it), deploy, and give it another few days.
+
+Keep reading it after the switch: in `enforce` mode the browser still reports
+what it blocked.
+
+**What a page author keeps to.** No inline `<script>`: a script is a file
+under `webapp/` (a classic one where the page needs it at once, a module
+otherwise), and what a page needs to know goes into its markup as data
+attributes, as the gateway's own pages do (`webapp/gateway/`). No handler
+attributes (`onclick=`, `onload=`, …) in pages or in what the components
+render: listeners are added in script. No `javascript:` URLs, no `eval`,
+`new Function` or string timers, nothing from another origin. A page that
+cannot work without more gets it for that page alone, stated in
+`PAGE_SOURCES` of `scripts/content_policy.py` (as the chat page's `blob:`
+images, `/sparql`'s `data:` images and the file viewer's frame are), rather
+than a weaker policy for every page.
+`tests/test_webapp_no_inline_script.py` checks the pages, the components'
+markup and every page the gateway builds (its builders rendered, and its
+source for the error pages it writes in place), and that every script a page
+loads is a file in `webapp/`; `tests/test_web_gateway_csp.py` the header on
+every page in each mode.
+
+**No route serves bytes from outside as a script.** `script-src 'self'` is a
+boundary only while nothing on the origin answers bytes someone outside chose
+under a type a browser runs as a script or a worker (the JavaScript MIME
+types; every such answer forbids sniffing, so no other type runs). Thread
+attachments, messenger media through `/chats/media`, the life store's results
+on `/sparql` and the pairing-code proxy answer a script type as
+`application/octet-stream` (`_served_media_type` in the gateway); the
+letterbox share serves every file as a download anyway; `/data/` answers JSON
+and any other file as a download. `tests/test_web_gateway_no_script_types.py`
+asks each of them for every script type a sender might state.
+
+**Other services on the dashboard's host.** The policy reaches what the
+gateway answers and nothing else. A service the proxy routes to a path of the
+dashboard's host serves its pages on the dashboard's origin, so a script that
+runs there can do anything the dashboard can, approving a send included.
+Every such service must carry a policy of its own that runs no script from
+outside, or be published on a host of its own. Of those in the deployment
+example (`docker-compose.override.example.yml`), the updater answers JSON
+only, and the egress log viewer (`/egress`) sends a fixed, enforced policy on
+every page (`default-src 'none'; style-src 'unsafe-inline'; form-action
+'self'; base-uri 'none'; frame-ancestors 'none'`: its pages use no script,
+only inline style), forbids sniffing on every answer, and escapes what it
+writes into an attribute; `tests/test_egress_log_viewer.py` checks both.
 
 ## The home: the attention list
 
@@ -346,6 +515,20 @@ to one is released — so a hand-edited or older file can never make every
 attention call fail. The mode menu's *Follow the schedule* row names today's
 plan, and the holiday when there is one.
 
+**Focus is optional, per instance.** The modes suit a personal instance; on
+a shared one, or one with a single remit, a mood to follow makes no sense.
+`focus.json` `enabled` (on unless set to `false`) is the switch: the
+*Focus modes* card under Settings › This instance, `POST /attention/modes
+{enabled}`, or `scripts/attention-week.py off` / `on`. Off, one mode is in
+force at every moment (`attention.FOCUS_OFF_MODE`: every sphere admitted,
+anything time-sensitive rings, active items wait for a digest, passive ones are listed); the schedule
+changes nothing, a hand-set mode is refused (409) and a stored one released,
+the digests go out at the document's `digest_times` every day, and the
+home's header shows no mode and opens no menu, the sheet no Focus rules.
+Turning it off or on is a breakpoint like a mode change. The modes, the week,
+the holidays and the permits stay as they were, for when it is turned on
+again; `GET /attention` says which with `focus_enabled` (and `mode.enabled`).
+
 **The API** (behind the dashboard's auth like the rest): `GET /attention`
 (the sections, the mode, the next breakpoint, `degraded` naming a source the
 store could not answer for — read without the lock inbound messages and the
@@ -447,7 +630,16 @@ through **LiteLLM** (the shipped default), the offered list is managed **in
 LiteLLM itself**: the gateway reads `GET /model/info` (and `GET /v1/models`)
 and offers the concrete models the proxy currently serves. `retinue_picker: true`
 plus `retinue_label` still names a route; `retinue_picker: false` hides one.
-Plumbing routes (`retinue-claude`, wildcards) stay hidden. The list
+Plumbing routes (`retinue-claude`, wildcards) stay hidden. A **family pin**
+— `ANTHROPIC_DEFAULT_<FAMILY>_MODEL`, the variable Claude Code resolves the bare
+`opus`/`sonnet`/`haiku`/`fable` aliases through — also retargets that family's
+picker entry to the pinned concrete id (label kept), so one setting moves both
+the agents and the dashboard to a new release. Where the picker had several
+routes of that family, they become this one entry under the first one's
+label, since they would all name the same model. A thread that chose any
+other id of the family follows the pin. A pin the proxy does not route is
+ignored and logged once, and a family with a `retinue_picker: false` route
+stays out of the picker despite its pin. The list
 is cached briefly
 (`RETINUE_MODELS_CACHE_SECONDS`, default 60) and read from
 `RETINUE_LITELLM_URL` (default: `ANTHROPIC_BASE_URL`) with the credentials
@@ -562,6 +754,18 @@ message bubble, served by `GET /conversations/<id>/attachments/<att-id>` behind
 the dashboard's own auth. Prefer this over pushing a document via Signal when
 the user is already working in the dashboard.
 
+A file's name and type are what it was given where it came from — for a mail
+attachment, what the sender declared — and they are written into the
+download's headers and into the note that hands the file to Ara's turn. So
+the stored name is a base name without control characters (`attachment` when
+nothing is left) and the stored type is one media type, read strictly and
+written back from what was read, or `application/octet-stream`. Both are read
+again in the same way where they are used, so metadata stored before this
+keeps to it too: a name or a type from outside never becomes a header line of
+its own, and a type that does not read as one media type is a download. The
+note to Ara's turn names the type by its `type/subtype` alone; the parameters
+kept with it go only into the download's `Content-Type`.
+
 A file row has two links: its name opens the file to view — in the
 dashboard's file viewer (below) or, for a PDF a frame would not show whole,
 as the bare file; either way the file is fetched with `?inline=1`, answered
@@ -657,6 +861,64 @@ message, are stored the same way, and their on-disk paths are handed to Ara in
 her engage prompt — so she can actually open a file the user sends (a PDF, a
 CSV) rather than only knowing one exists. A message may be text, files, or both.
 The chat page's composer takes pasted images the same way (see `webapp/README.md`).
+
+**Media in a messenger chat** is another store under the same rule. A file a
+contact sends stays with the gateway that received it, together with the
+content type the sender's client declared, and the chat page loads it through
+the gateway's authenticated proxy, `GET /chats/media/<slug>/<media-id>`
+(docs/messenger-chats.md). That type comes from outside, as the bytes do, so
+the proxy reads it strictly and writes its own headers from it
+(`_chat_media_headers`):
+
+- **In place**: the images of `_INLINE_SAFE_TYPES`, which a bubble shows
+  through `<img>`; `audio/*` and `video/*`, which the chat's players load
+  (an XML type, `…+xml`, excepted); and a PDF or plain text, which a file row
+  opens in the browser's own viewer.
+- **As a download** (`Content-Disposition: attachment` and the letterbox
+  share's sandboxing `Content-Security-Policy`): everything else, so a file
+  from outside never becomes a page or a script of the dashboard. An image of
+  another type (SVG, TIFF, HEIC) still shows in the bubble, since `<img>` runs
+  nothing in it, and is saved when opened by itself; an HTML or XML file, a
+  script, an office document or an archive is a file row that saves it. Such
+  a file keeps its stated type, because the browser and the Android shell
+  take the saved file's extension, and the app that opens it, from the type —
+  except a script type, which goes out as `application/octet-stream` (see
+  "The Content-Security-Policy").
+
+A stated type that does not read as exactly one media type counts as
+`application/octet-stream`. The type sent is written from what was read (lower
+case, with its `charset` or `codecs` parameter and no other), never relayed as
+it came, and every answer, a relayed error included, carries
+`X-Content-Type-Options: nosniff`. The proxy does not know the name the sender
+gave the file, so a download is named after its URL and type
+(`<media-id>.docx`). The gateways' store keeps the stated type as one line of
+printable ASCII (`inbound_store.clean_content_type`), so it is exactly one
+header of their own `GET /media/<id>`, whatever was declared.
+
+An attachment's URL is the proxy's or a web link, never anything else. The
+references a chat's messages carry are text from outside as well: the
+gateways' ledger records and the notify rail (`POST /internal/chats/inbound`)
+keep what their callers wrote. The gateway makes a media reference
+(`urn:retinue:media:<channel>:<id>`, or the older
+`http://<service>:<port>/media/<id>`) into the proxy's URL, passes any other
+reference on only when it is an absolute `http(s)` URL with a host
+(`news_store.web_link`, the rule news links follow), and leaves the
+attachment without a URL otherwise (`_shape_chat_attachments`). The chat page
+holds to the same rule on its own: it renders a link, an image, a player or
+the lightbox only for a URL of the proxy (`/chats/media/<slug>/<media-id>`),
+a link for the proxy's URL or a web link, and the file's name as plain text
+for anything else, so a reference from outside never becomes script or a
+link of another scheme. A web link is only ever a link, whatever the
+attachment's type: an image, a voice note or a video there is a file row to
+open, never loaded into the page (the origin's Content-Security-Policy allows
+images and media from this origin only). Two further kinds of URL are
+rendered, neither of them ever as a link: the bubble of a send on its way
+previews the user's staged images from object URLs the page created, and a
+`data:image/…`, `data:audio/…` or `data:video/…` URL is taken for the
+`<img>`, `<audio>` or `<video>` of its own kind, and for an image's
+lightbox, when the attachment's type is of that kind as well. The gateway
+passes no `data:` URL on, and the policy allows none on the chat page; only
+the reference documents under `data/chats/`, a test corpus, use them.
 
 ## Push notifications
 
@@ -848,11 +1110,58 @@ The gateways are **clients** of it, so no ASR model is loaded anywhere else:
 - the **web-gateway** proxies dashboard voice input to it, exposing
   `POST /conversations/transcribe` to the PWA.
 
+### The dictation vocabulary
+
+The words an ASR model mangles are the proper nouns — people, practices,
+medications — and they are in the **life store** already, so that is where they
+are fetched from: one lean `VALUES`-bounded query for
+`vcard:Individual`/`schema:Person` names, then organisations, then drugs and
+therapies. Asking the store rather than one chamber's files is the point — a
+doctor in a care-provider list or a drug in a medication plan is as visible as a
+contact entry. The result is cached for five minutes, capped at 200 names
+(`DICTATION_NAME_LIMIT`), and **fail-open**: an unreachable store costs the
+hints, not the dictation.
+
+The query lives in `scripts/dictation_vocabulary.py` — a stdlib-only module that
+both processes needing the vocabulary import, each keeping its own cache:
+
+- the **STT service** turns the names into **Whisper hotwords** and biases every
+  decode with them, so the correction happens *before* the mishearing rather
+  than after it. It reads the store itself (`QLEVER_LIFE_URL`, same `agents`
+  network) instead of having the list pushed at it with each clip: the
+  vocabulary belongs to the deployment, not to one request, and this way an
+  inbound voice note gets the same bias as dashboard dictation — the messenger
+  gateways do not have to know the feature exists. `STT_HOTWORDS=0` turns it
+  off. Hotwords share Whisper's 224-token prompt window, so the list is capped
+  (`DICTATION_HOTWORD_CHARS`) and each rank gets a share of that budget
+  (`HOTWORD_SHARES`) — otherwise a store full of people would crowd the
+  medications out entirely. Only names' *words* are used (runs of three or more
+  letters in any script, two for Han, Kana and Hangul, where two characters are
+  a whole name; combining vowel signs as in Devanagari or Thai belong to the
+  word), since Whisper matches hotwords word-wise.
+- the **web gateway** hands the whole names to the cleanup pass below as
+  **spelling hints**.
+
+Hotwords bias, they don't constrain: a name the store knows in one spelling can
+still be heard as another name it also knows.
+
+Two decode settings in the service serve the same end. `vad_filter` (Silero,
+`STT_VAD_FILTER=0` to disable) drops non-speech — silence is what makes Whisper
+invent whole sentences, and decoding less audio is also faster; if the VAD model
+is unusable at runtime the service logs it once, disables it for the process and
+decodes on. `condition_on_previous_text=False` stops the repetition loops a
+window conditioned on the previous window's text can fall into. Which knobs the
+installed faster-whisper actually supports is probed from
+`MODEL.transcribe`'s signature — an older wheel biases through `initial_prompt`
+instead of `hotwords` — and the startup line reports what it resolved to.
+
+### The cleanup pass
+
 Dashboard voice input adds a **cleanup pass** on top: the raw transcript is run
 through a small model (`TRANSCRIPT_CLEANUP_MODEL`; unset it falls back to
 `RETINUE_CLAUDE_MODEL` — so a non-Anthropic deployment cleans up on its own
 backend — with `haiku` as the last resort) with the
-thread so far and the chambers' contact names as context, so what lands in the
+thread so far and the dictation vocabulary above as context, so what lands in the
 composer is already repaired. The messengers need none of this — there the agent reads
 the transcript and answers what was meant, while the dashboard is the one place
 that shows the user the raw text. Set `TRANSCRIPT_CLEANUP=0` to disable the pass
@@ -900,6 +1209,64 @@ carries the loop on: another message pushed into a thread in the mode may be
 read aloud, but never opens the mic. A mic the loop wants while the page is
 hidden (a wake in the background, an answer read in a pocket) waits up to
 60 s for the page to come back.
+An answer of Ara's to the loop's own turn that ends in a **call directive**
+(`[[call: <number> | <name>]]`, `.claude/skills/dashboard-composing` §7)
+places the call where the mic would open, when the page runs in a shell that
+can (`placeCall`, below): once the answer has been read, the composer shows
+the name and the number to be dialled with a **Cancel** button for 5 s while
+the mic is open as for any take, its no-speech timeout stretched past the
+call's wait (a mic that fails to open leaves the call to go ahead). Where the
+mic would not open because the user is writing, no call is placed either: the
+loop stops as it does there, and the directive stays a link. Speech (the
+detector's `speech`, so in any language) cancels the call, and the take goes
+on to Ara as the next turn, whatever ends it, carrying `cancelled_call: {number, name}`, from which the gateway writes a
+fixed agent-only note (`_cancelled_call_context`): the call was not made;
+unless the words mean to stop it, place it again as a second attempt with
+`no-voice-cancel`. A cancelling take whose transcript is empty is no turn:
+the call goes ahead at once, with Cancel by touch only. A cancelling take
+that would carry text or files from the box goes to review instead, like any
+take, and the call stays cancelled. A cancelling take the service worker
+sends because the page was left or frozen meanwhile (webapp README, "Unsent
+input") carries the call there all the same; one the worker could not send
+waits in the box with its note, and the call stays cancelled; so does one
+the page could not send (another turn still on the wire, a model pin
+refused): it waits in the box, and no later turn carries its call. Sent
+more than 90 s after its transcript came (a page opened later that takes
+the take over), or after it was recorded where the worker restarted it, it
+carries no call: its words go to Ara alone, and no call is placed again
+that nobody is waiting for. Cancel itself
+(by touch) cancels for good.
+Speech cancels only where the detector can hear the stream; a take sent by
+touch (➤) while the call waits cancels it all the same, and where the page
+cannot hear the stream (plain timers, above) the take that listened is not
+dropped when the call is due but sent (to review with text or files in the
+box) as a cancelling take, so its transcript decides. A call that would go
+ahead after an empty transcript while the page is hidden is dropped.
+Nobody speaking, the take is dropped, the mic released (up to 2 s), the number
+handed to the shell, and the voice flag let go once the shell has answered
+(10 s at most). A call the shell refuses, or does not answer in that time,
+leaves a note in the composer that the call to the number could not be
+placed; a call placed, or the dialer opened with the number, needs none. The
+flag `| no-voice-cancel` as a third part (or in the name's place, with no
+name) keeps the mic
+shut for those 5 s — for a loud room or an emergency — but only on a second
+attempt: unless an earlier answer of Ara's in the thread carried a directive
+for the same number (`calledBefore`), the flag is ignored. Only a directive
+the bubble shows as a call link is a call: `callOf` renders the reply as the
+bubble does and takes the last link. One quoted as code (a span, whose
+backticks pair within a line, or a ``` or ~~~ fence, closed or not), split
+across lines, or cut apart by a table's cells is shown as text, never placed.
+Leaving the thread, hiding the page (the mic open or not) or
+stopping the loop drops the call. Anywhere else — a typed thread, an older reply, a message pushed
+into the thread (an agent's included), Ara's reply to a chat message that
+arrived in a companion thread meanwhile (stored with `arrival: true`, never the
+loop's answer nor an earlier attempt), a browser — the directive is only a tap-to-dial `tel:` link (its `#`
+written `%23`, so a service code dials whole)
+(`webapp/components/markdown.js`, `callOf`; `tests/test_webapp_call_directive.py`).
+The presentation lint never delivers a result whose call directives differ
+from the original's, read as the bubble reads them (JavaScript's whitespace
+included), nor one that changes a line holding a directive, or a fence or
+table-separator line, in a message with one (`docs/model-routing.md`, phase 4).
 Entry points: the toggle, `/#new?voice=1` (the composer in the mode — its
 first take opens the thread, which continues in it) and a wake (`/?wake=1`
 or the shell's `wake` event), which opens the thread used in the mode within
@@ -908,12 +1275,26 @@ and only inside the shell do they open the mic by themselves; elsewhere (a
 link in a message, a reload) the conversation opens in the mode with a
 **Start talking** button. The detector listens for energy, not words, so it
 is language-agnostic.
+Ending it: the toggle, or **by voice** — the user tells Ara to switch the
+mode off (in any language; Ara reads the intent, the page reads no words),
+and her turn runs `conversation-push.py --end-continuous` (the thread is the
+turn's own, `RETINUE_THREAD_ID`). The gateway stamps the thread document
+`continuous_off` (ISO time); each device showing the thread in the mode
+leaves it on its next read, as if the toggle had been tapped (the mic closes,
+the shell's voice flag is released, and a call directive the answer ends in,
+or a call waiting to be placed, is not placed). The stamp acts once per device and only
+on a mode switched on before it (one minute of clock skew allowed), so a
+toggle the user presses afterwards stays on.
 
 Language handling (constrain detection to the languages the user speaks, and
-re-decode when a guess falls outside that set) lives entirely in the service via
-`STT_SUPPORTED_LANGUAGES`. An optional `STT_TOKEN` gates the endpoint
-(defence-in-depth; the service is not published to the host). Downloaded model
-weights persist in the `stt-models` volume.
+re-decode when a guess falls outside that set — carrying the same hotwords and
+settings into the second pass) lives entirely in the service.
+`STT_SUPPORTED_LANGUAGES` states the set outright; left unset it is the **union**
+of what the messenger channels declare (the `*_SUPPORTED_LANGUAGES` settings of
+Signal, WhatsApp and Telegram), because this one model transcribes for all of
+them and no single channel's setting speaks for the deployment. An optional
+`STT_TOKEN` gates the endpoint (defence-in-depth; the service is not published
+to the host). Downloaded model weights persist in the `stt-models` volume.
 
 ## Several instances: name and colour
 
@@ -951,10 +1332,26 @@ the name field's placeholder.
 Both are applied when the gateway serves the file — the baked webapp is never
 edited — and both are folded into the service worker's shell hash, so a change
 reaches installed clients like any shell edit, and a change on the Settings
-page reaches the very next response. An already-installed PWA may keep its old
-home-screen label and icon until the browser refreshes the manifest (Chrome
-checks about daily); reinstalling applies it at once. The Android shell is not
-held up by that: it fetches the manifest itself.
+page reaches the very next response.
+
+**The colour is in the icon URLs too.** An installed app keeps the icon it
+fetched for a URL: desktop Chrome, since 143 ("predictable app updating"),
+refreshes an installed PWA's icons only when the manifest names other icon
+URLs, and the Windows taskbar, the Start menu and the macOS dock show the
+shortcut icons Chrome made from those at install. So with a colour in force
+every icon reference the shell makes carries it as a version —
+`/icons/icon-192.png?v=cb6cfe` in the manifest, in every page's `rel="icon"`
+and `apple-touch-icon` link, and in the service worker's precache list and
+notification icon. The gateway ignores the query and serves the colour in
+force. A new colour means new URLs, which the browser takes as a new icon the
+next time it checks the manifest (on a launch of the app; Chrome may ask the
+user to confirm a changed icon). The stock colour keeps the plain URLs.
+
+An already-installed PWA may keep its old home-screen label and icon until the
+browser has checked the manifest; reinstalling applies it at once. A pinned
+taskbar entry that still shows the old icon after Chrome's update is Windows'
+icon cache; unpinning and pinning it again refreshes it. The Android shell is
+not held up by any of that: it fetches the manifest itself.
 
 ## The settings page
 
@@ -964,7 +1361,8 @@ held up by that: it fetches the manifest itself.
   notifications, the voice timeouts, the layout, the shelf size, and the
   dashboard version with a manual update check.
 - **This instance** — what is the same on every device: the instance's name
-  and colour (see above), the agent models, the system pages
+  and colour (see above), whether it follows focus modes (see "The home"),
+  the agent models, the system pages
   (`components/instance-settings.js`, `<retinue-instance-settings>`).
 
 Inside the Android app there is one settings page for the user, the app's own
@@ -1022,17 +1420,231 @@ The contract the two sides share (web side: `webapp/components/shell.js`):
 
 | Direction | What |
 |---|---|
-| User agent | ` RetinueShell/4 (Android)` appended (` RetinueShell/3` before the app's own settings page and the per-device preferences, `/2` before the endpoint members, `/1` before the Health Connect members; the page feature-detects every member rather than parsing the version). |
+| User agent | ` RetinueShell/6 (Android)` appended (` RetinueShell/5` before `placeCall`, ` RetinueShell/4` before the keyboard members, ` RetinueShell/3` before the app's own settings page and the per-device preferences, `/2` before the endpoint members, `/1` before the Health Connect members; the page feature-detects every member rather than parsing the version). |
 | `window.RetinueShell` | Installed at document start, configured origin only: `platform`, `version`, `setVoiceActive(bool)` and `openSettings(section?)`, which opens the app's settings: from RetinueShell/4 its own page (the gear calls it when `settingsPage` is true), before that the native screens behind Settings → Phone shell (shown only when the object exists; the card is the first on the page there). `setVoiceActive(true)` means *a voice conversation is engaged: keep the screen on and pause the wake phrase*. The page asserts it before it asks for the mic (the wake detector must release it first) and keeps it asserted for as long as a continuous conversation is going — through transcription, Ara's answer and its reading, not only while the mic is open — and sends `false` once the loop stops (mode off, no speech, leaving the thread, an error). Wake detection being paused for the whole conversation is intended. |
 | Endpoints (RetinueShell/3) | The shell holds a list of Retinue servers (address, client certificate, sign-in, health switch) and shows one; the app's settings page lists, edits and switches them (RetinueShell/3: the Settings page's Phone shell card lists them in a menu and switches between them). `endpoints()` → a JSON string `[{"id": str, "label": str, "current": bool}]` — the label is the instance's own name, the manifest `short_name` the shell fetched with that endpoint's certificate or password (the host while it is unknown; the host appended when two names collide); no URLs, the other servers being none of the current page's business. `selectEndpoint(id)` asks the shell to show that server (it loads that dashboard's start page, so the page is left). `openSettings("endpoints")` opens the app's settings at the endpoint list, or at the editor straight away with one endpoint. The page may ask; it can never write an address, certificate or password — whatever origin the shell is pointed at receives its bridge, microphone, certificate and password, so that stays in the app. An `endpoints` event (`detail.type`) says the list changed while a page is open; the card re-renders. The shell's one base URL of earlier builds is the first endpoint after an update. |
 | Health Connect (RetinueShell/2) | Further members on `window.RetinueShell`: `healthConnectAvailable()` → `"true"`/`"false"`; `healthSync()` — a deliberate sync now, returns at once (a deliberate sync always runs, whatever the interval); `healthSyncStatus()` → a JSON string `{"available": bool, "permissions": "granted"\|"partial"\|"none", "last_sync_at": ISO\|null, "last_result": "ok"\|"error"\|"skipped"\|null, "last_error": str\|null, "last_count": int\|null, "min_interval_minutes": int, "auto_on_resume": bool, "enabled": bool}` (`enabled`, RetinueShell/3: the current endpoint's own health switch, set in the shell's editor — off, nothing is read or sent for that server, a sync asked for is `skipped` with reason `disabled`, and the card shows one line and *Edit endpoint* instead of the controls; an older shell omits the field and uploads for its one server); `setHealthSyncInterval(minutes)`; `setHealthAutoSync(bool)`. The shell reads the phone's Health Connect store through its Changes API and uploads what it returns, unaltered, as one JSON file per delivery by **WebDAV `PUT` to `/inbox/<name>`** — the letterbox share below, with the WebView's own client certificate and cookies — where a chamber that declares the file type in its `accepts` takes it (docs/scheduling.md); the framework knows nothing about the data. On resume the shell syncs on its own at most every `min_interval_minutes` (default 5) while `auto_on_resume` holds. From RetinueShell/4 the app's settings page has these controls, beside the endpoint's switch, and the dashboard shows none; with RetinueShell/3, Settings → Phone shell shows, only where `healthConnectAvailable()` is true, "Update health data now", the last sync (from `healthSyncStatus()` and the events), the auto-sync toggle and the interval. Every member is feature-detected (`webapp/components/shell.js`): an older shell simply shows none of it. |
 | Settings page and per-device preferences (RetinueShell/4) | `settingsPage: true`: the app has a settings page of its own (see "The settings page"), and the gear opens it. `deviceSettings()` → a JSON string `{key: value}` of the per-device preferences the app holds for every endpoint; `setDeviceSetting(key, value)` writes one (`null` removes it; a key the app does not take is ignored). `components/device-store.js` is the only caller. |
-| Shell → page | `window.dispatchEvent(new CustomEvent('retinue-shell', {detail: {type}}))`, `type` `wake`, `home`, `health-sync`, `endpoints` or `device-settings` (with `keys`, the per-device preferences that changed). A `health-sync` event carries `state`: `started`, `done` (with `count`), `error` (with `error`) or `skipped` (with `reason`: `interval`, `no-permission`, `unavailable`, `no-backend-support`, `disabled`); it, `endpoints` and `device-settings` are information only — no page navigates on them. The home answers in place: `wake` opens continuous conversation (the thread used in the mode in the last 15 minutes, else a new one), `home` unwinds every open thread or composer back to the list at `/`, closes a sheet and scrolls the list to its top. Other dashboard pages answer by loading `/?wake=1` or `/`, always: unsent input on the page (a draft, an unsaved project edit, a dictation or send under way) never holds either back — it is kept on the device and waits in its field, a dictation finished by the service worker (webapp README, "Unsent input"). |
+| Keyboard (RetinueShell/5) | The shell can be paired with another device — a VR headset, a TV, a computer — as a **Bluetooth keyboard** (Android's `BluetoothHidDevice`), and type into it; pairing, the device's keyboard layout and a live keyboard are the app's own screen. `keyboardStatus()` → a JSON string `{"available": bool, "enabled": bool, "connected": bool, "host": {"name"}\|null, "layout": str}` (the device's name only — its Bluetooth address stays in the app). `keyboardType(text, optsJson)` types `text` (opts `{"id", "enter"}`) — a line break as **Shift+Enter** (a new line in chat apps and text areas, but a submit in a terminal or a one-line field), a tab as Tab; `keyboardKey(name, optsJson)` (opts `{"id"}`) presses one of `enter`, `tab`, `backspace`, `escape`, `up`, `down`, `left`, `right`, `home`, `end`, `delete`, `space`; `keyboardSecret(optsJson)` (opts `{"id", "label", "enter"}`) opens a **native** field in the shell, labelled and naming the device it types into, that the user's password manager fills by autofill (or the user types) — the shell types it and overwrites its own copy, and the secret never reaches the page, the server or Ara; `keyboardOpen()` opens the app's keyboard screen (refused as `not-enabled`, as typing is, while the app's *may type* switch for this server is off — that switch is on the app's settings page); `keyboardCancel()` stops what is being typed (its outcome: `error` `cancelled`) and closes an open secret dialog (`secret-cancelled`) — but never interrupts a secret being typed, which only the phone's own Stop can. Before anything that can act on the device — a text with Enter, a line break or a tab, an empty text or one with whitespace at either end (Python's set), and any key — the shell asks on the phone itself, in a confirmation it draws; plain one-line text without Enter and without whitespace at its edges it types at once in its default (one-line) mode — after the user pressed Stop on the phone's strip, and on a device set to ask every time, it asks about that too. With the app's *may type* switch for this server off the answer is `not-enabled`, at once. Only a confirmation the user declines or does not answer ends late: as `error` `cancelled`, the same as `keyboardCancel()`, up to 25 s (a text) or 12 s (a key) after the call. The shell takes typing, keys and the secret dialog only while it is in front — resumed, focused and unlocked (otherwise `error` `not-in-front`), and with no secret dialog open (otherwise `busy`; one dialog at a time) — and types into the device the user connected, never another one that connects by itself; typing it started runs to its end unless stopped, the phone kept awake meanwhile. An `id` is echoed in the request's events when it is 1–64 of `A–Z a–z 0–9 . _ : -`, and dropped otherwise. A call with invalid arguments throws; every other request with an id gets exactly one final event (a secret dialog nobody answers closes itself after ten minutes). Outcomes come as `keyboard` events (below). Callers: `components/shell-keyboard.js` through `shell.js`; what drives them is a reply's shell actions (see "Shell actions"). |
+| Shell → page | `window.dispatchEvent(new CustomEvent('retinue-shell', {detail: {type}}))`, `type` `wake`, `home`, `health-sync`, `endpoints`, `device-settings` (with `keys`, the per-device preferences that changed), `keyboard` (RetinueShell/5: `state` `typed` with `count` (a key press too), `error` with `error` — `not-enabled`, `not-connected`, `not-in-front`, `too-long`, `unsupported-char`, `busy`, `cancelled`, `failed` —, `secret-typed`, `secret-cancelled`, or `status` when the connection changed; `id` names the action where there is one) or `call` (what became of a `placeCall`, see Phone calls below). A `health-sync` event carries `state`: `started`, `done` (with `count`), `error` (with `error`) or `skipped` (with `reason`: `interval`, `no-permission`, `unavailable`, `no-backend-support`, `disabled`); it, `endpoints`, `device-settings`, `keyboard` and `call` are information only — no page navigates on them. The home answers in place: `wake` opens continuous conversation (the thread used in the mode in the last 15 minutes, else a new one), `home` unwinds every open thread or composer back to the list at `/`, closes a sheet and scrolls the list to its top. Other dashboard pages answer by loading `/?wake=1` or `/`, always: unsent input on the page (a draft, an unsaved project edit, a dictation or send under way) never holds either back — it is kept on the device and waits in its field; a dictation is finished by the service worker, which puts a review dictation into its field and posts one the user had sent into its thread (webapp README, "Unsent input"). |
 | Pages without the web app's code | The gateway's own pages (`/sends`, `/claude-auth`) do not load `components/shell.js`, so nothing on them answers `wake` or `home`. The shell handles that itself: when the page in front is not one of the dashboard's, a Home press loads `/` and a wake loads `/?wake=1` instead of dispatching the event. |
 | `/sync-health` | The link target for "update your health data" in threads: `https://<dashboard origin>/sync-health#sync` (the origin is `CONVERSATION_BASE_URL`'s). Same origin, so the shell opens it in place. A static page — a GET never changes server state; the fragment is the instruction, and the server never sees it. In the shell with `#sync` it calls `healthSync()`, says "Health data update triggered", and after a moment goes back (`history.back()`, or `/` when opened cold); a `done` arriving first is shown before it leaves, an `error` or `skipped` stays on screen with *Update now* and *Back*. The fragment is dropped from the address once read, so a reload starts nothing. In the shell without `#sync`: a short explanation, the last sync and *Update now*. In a browser on Android: the Ara app is needed, and an **Open in Ara app** link — an intent link the page builds from `location`, never from configuration: `intent://open?url=<percent-encoded https://<origin>/sync-health#sync>#Intent;scheme=retinue-shell;package=os.retinue.ara;S.browser_fallback_url=<percent-encoded https://<origin>/sync-health>;end`. The app opens the URL only when its origin is exactly the one it is configured for, and otherwise says so and connects nowhere (no Android App Links, no Play services). On a desktop: the explanation only. The page loads `shell.js`, so `wake` and `home` work on it, and it is in the service worker's shell cache like every page. |
 | Cold wake | With no page loaded the shell loads `/?wake=1`; the home treats it as a wake and drops the flag from the address. A wake should reach the page once it is resumed; one that arrives while the page is hidden still waits (up to 60 s) for it to come to the front before the mic opens. |
 | Speech output | A `speechSynthesis` / `SpeechSynthesisUtterance` stand-in over the native TTS when the WebView has none; `webapp/components/speech.js` is unchanged. |
+| Phone calls (RetinueShell/6) | `placeCall(number)` on `window.RetinueShell`: the shell calls the number without a tap (`ACTION_CALL`, on speakerphone — the user may not be holding the phone) when *Call directly by voice* is on for the endpoint (a switch per endpoint, in the app's settings under *This app with <endpoint>* → *Phone calls*, off for a new endpoint), Android's phone-call permission is granted, and a voice conversation is engaged (`setVoiceActive(true)`) — never outside one, so no page can dial behind the user's back. The shell normalises the number (separators, a leading `tel:` and the `(0)` of `+44 (0)20` dropped); it must then be an optional `+` followed by digits, `*` and `#`, with 3 to 20 digits and at most 32 characters. It answers with a `retinue-shell` event `{type: "call", state, reason?, number?}`: `placed` (with `number`); `dialer` — the dialer opened with the number instead (with `number`), for an emergency number (Android lets no app call those directly; `reason: "emergency"`), a service code — any number with `*` or `#`, which always opens the dialer (`service-code`) —, with the switch off (`disabled`) or without the permission (`no-permission`); or `refused` (`invalid-number`, `not-in-voice`, `no-telephony`, or `failed` with `number`). An empty string is answered `refused` / `invalid-number`; `placeCall()` and `placeCall(null)` send nothing. The web side (`shell.js`: `canPlaceCall`, `placeCall`, `onCall`) uses it only for the call directive of the continuous loop's own answer (above), and lets the voice flag go on any answer, whatever its state. |
 | Files | A file the WebView cannot show (a PDF, anything served as `attachment`) reaches the shell's download listener, which follows the `Content-Disposition` as a browser does. `inline` — a PDF row's name link (`?inline=1`; images and text open in the dashboard's file viewer, see "Attachments") — means *view*: the shell opens it in the phone's app for the type from a private copy, so no copy lands in Downloads (none installed: it saves it there and says so). Anything else — the ↓ link — is saved to Downloads. The name is the header's (`filename*`, then `filename`); the attachment URL ends in it too (see "Attachments"). |
+
+### Shell actions: typing on a paired device
+
+A reply of Ara's may carry **shell actions**: text for the device the Android
+shell types on as a Bluetooth keyboard (RetinueShell/5, above). It is how
+Retinue reaches a device that cannot run it — a VR headset, a TV, someone
+else's computer: the user says "type the text above" in a thread, and the
+phone types it there.
+
+- **Agent side.** Inside a dashboard-thread turn, `scripts/shell-type.py`
+  attaches an action to the reply being written — a text (`--enter` to press
+  Enter after it), `--key <name>`, or `--secret "<label>"` — by appending one
+  ASCII JSON line to the turn's manifest, `RETINUE_REPLY_SHELL_ACTIONS_FILE`.
+  A text goes in a file Ara writes with her Write tool, exactly as it is to
+  be typed, so no shell ever parses it (the one trailing line break a file
+  usually ends with is dropped; `-` reads stdin the same way, for another
+  program's output):
+
+  ```sh
+  scripts/shell-type.py [--sensitive] [--enter] --file /tmp/type-<thread id>.txt
+  ```
+
+  On the command line every quoting can be ended by the text itself: inside
+  `"…"` bash expands `$`, backticks and `\` (`Pa$$w0rd!` typed with the
+  shell's PID in it, `$(…)` run in the container), an apostrophe ends `'…'`,
+  and a line `EOF` ends a `<<'EOF'` heredoc early, after which the text's
+  remaining lines run as commands with the agent's tokens — a passage from an
+  e-mail or a page can be written to do just that. So the docs offer only
+  `--file`, and `--sensitive` refuses a text on the command line (exit 2,
+  nothing written, the text not echoed): it would be in the process list and
+  the transcript, so a sensitive text comes from `--file` or `-` (stdin).
+  With `--sensitive` the CLI deletes the file when it ends, also
+  when it refuses the call (outside a turn, a bad combination of flags, a
+  file that is no text), so the code does not stay in the container.
+  It is the sibling of `conversation-push.py --reply-attach`
+  (RETINUE_REPLY_ATTACHMENTS_FILE) and follows the same rules: a fresh
+  manifest per spawn, only the kept run's is read, so an escalated junior's
+  actions go with her discarded reply; outside a thread turn the CLI refuses.
+  Only a turn the **user** started **from the dashboard** gets the manifest
+  (`_conv_turn_may_type`): its message came through the reverse proxy
+  (`via_edge`, set by the dashboard's own endpoints, never for a request
+  another site's page made the browser send, `Sec-Fetch-Site` other than
+  `same-origin` or `none`: `POST /conversations`, `…/<id>/messages` and the
+  outcome call below answer it 403, as the sign-in endpoints do; a sent
+  dictation the service worker posts for a page that was left is the
+  dashboard's own, `same-origin`, so it counts as the user's message), so
+  neither a chat
+  arrival — someone else's words — nor a "user" message an in-container
+  agent posted can make the phone type; the gateway drops any action such a
+  turn produced anyway. It is decided again once the turn holds the session
+  lock, when its prompt is built from the thread as it is then: a turn that
+  waited behind another, and whose prompt would end with a "user" message
+  posted from inside the container meanwhile, gets no manifest either (it
+  still answers the dashboard message, without typing). `scripts/shell_actions.py` validates in both places
+  (kinds, a 32-hex `id`, text ≤ 4000 characters without control characters,
+  line or paragraph separators or bidi controls, a known key, a one-line
+  label ≤ 80; at most 10 per reply, which the CLI enforces as it writes).
+- **Stored** on the reply as `shell_actions`:
+  `{kind: "keyboard-type", id, text, enter, sensitive}`, `{kind:
+  "keyboard-key", id, key}`, `{kind: "keyboard-secret", id, label, enter}`,
+  each with `auto` — whether the page may run it without a tap, decided by
+  the gateway: only in a plain chat the user opened (`_conv_allows_auto_run`;
+  never in a companion thread or a thread an agent opened, whose turns carry
+  other people's words), only plain one-line text
+  (`shell_actions.runs_by_itself`: no Enter, line break or tab, no key, no
+  sensitive text, no password-manager field, not only whitespace nor
+  starting or ending with it), only a text that already stands verbatim, as
+  a whole line (edge whitespace aside), in the thread as it was when the turn
+  started, up to the message it answers — one of the user's messages sent
+  from the dashboard (`via_edge`) or an earlier reply of Ara's
+  (`_conv_text_was_shown`), so nothing Ara read meanwhile, nor a message the
+  turn itself posted, types by itself — and only a reply's first action, so
+  no text is put together from pieces, and none is typed ahead of an earlier
+  action that waits for a tap (an Enter confirmed later would run a line the
+  user never saw; the page, too, runs no later one by itself) — and none
+  at all when the user wrote again while the turn ran: if any user message
+  stands after the one the reply answers (the newest it covered, else the
+  one it was started for) by the time the reply is stored, every action
+  waits for a tap, since that message ("no, don't type that") was never read
+  by the reply; `_conv_add_message` checks it under the lock it appends
+  with, so none can land in between. What plain
+  characters do is the device's affair: a letter can be an app's shortcut
+  there, which is why a piece of a line does not count — and, once the page reports
+  it, `outcome` (`{state: typed | error | secret-typed | secret-cancelled,
+  error?, at}`, `POST /conversations/<id>/shell-actions/<action id>/outcome`,
+  through the reverse proxy only, never cross-site). An action once typed stays typed: a later
+  Retype that does not type (a confirmation declined, say) is kept beside it
+  as `last_attempt` and told to Ara as *typed (a later retype: …)*, since
+  what the first one did on the device stands (`shell_actions.record_outcome`).
+  Transcripts shown to later turns note each action with its outcome
+  (`shell_actions.describe`); a resumed session is told the outcomes of its
+  own last reply's actions. An `error` `cancelled` is told as *stopped, or
+  declined or not confirmed in time on the phone*: the page's Stop and the
+  phone's confirmation (Keyboard, above) end the same way, so it never
+  reads as the user's refusal.
+- **Passwords, PINs and codes** can be typed two ways:
+  - `shell-type.py --sensitive --file <path>` (a file holding the code, which
+    the CLI deletes, also when it refuses the call) — one the user
+    dictated, or one Ara fetched (an SMS code). The text reaches the
+    phone, but the dashboard shows it only as `••••••` (no reveal) and types
+    it only on the user's tap, a replayed transcript never carries it
+    (`shell_actions.describe`), and it is **deleted from the stored reply** as soon as the page reports
+    it typed (the `outcome` call above) and in any case after
+    `SENSITIVE_TTL_SECONDS` (two minutes): every read of a thread
+    (`_load_conv`) purges an expired text before anything sees it, a timer
+    per due text rewrites the file, a startup sweep
+    (`_conv_sensitive_sweep`) does both for whatever a restart left, and the
+    page drops its own copy at the same mark. A purged action keeps `kind`,
+    `id`, `enter`, `sensitive` and gets `purged: true`, `text: null`; the row
+    says *Text deleted* and nothing can retype it. A thread title derived
+    from one of the user's messages becomes *Typing on a paired device*, so
+    the thread list and pushes do not carry it. A reply that is only shell
+    actions (no text, no file) is pushed as *Ready to type on your device*,
+    never with what it types.
+  - The turn's Claude session holds the text verbatim (the user's message,
+    Ara's own command), so it is **never resumed**: `send_message` decides
+    so under the thread's session lock, before any queued turn can resume it
+    — whether the run succeeded or failed, and for a sensitive action in an
+    escalated junior's discarded run too — and drops the binding with every
+    session id the thread ever had, erasing their transcripts
+    (`_record_turn_session`, `previous_session_ids`). The next turn starts a
+    fresh session, shown the thread as stored: Ara's command and the typed
+    text are masked there, but **the user's own message still reads as they
+    wrote it until it is redacted.** A spawn that raises still drops it, and
+    a restart that cut a turn short leaves nothing resumable either: at
+    startup, a leftover shell-action manifest (named with its session key's
+    tag) that holds a sensitive text drops that key's sessions
+    (`_sweep_stale_shell_manifests`). A turn queued behind another builds its
+    prompt only once it holds the session lock, for the user message it was
+    started for — and is skipped when a turn before it of the same kind
+    (one that may type, or one that may not) already answered it; an arrival
+    answers no user message, so a dashboard message that landed meanwhile
+    keeps its own turn, manifest and all. A turn whose message another
+    turn's reply already follows is shown the whole thread. Ara never repeats such a text in her
+    reply. When the user dictated it, she offers to **redact** that message:
+    `conversation-push.py --thread <id> --redact-message <message id>` (every
+    user message shows its `[message id: …]` to Ara — one stored before
+    messages had ids gets one derived from its time and role; `POST
+    /internal/conversations/<id>/redact`, token-gated) replaces its text with
+    *[deleted by request]* for good — only after the user approves, which
+    stays the prompt's rule; the endpoint itself takes a redaction only from
+    inside a turn of that thread the user started from the dashboard after
+    that message (409 otherwise). Redaction also deletes the message's
+    attachment files, a thread title derived from it, the session-log
+    entries of that message — entries name their thread and message, and one
+    a turn running at that moment writes later is logged redacted; entries
+    written before entries named their message are not reached — and every
+    Claude session the thread has had since this version, the latest 100 (a
+    turn running at that moment has its session refused once). The session
+    log never records a prompt as a question: a message without text is
+    logged as what it carried (`[attachment: …]`). The one-shot model calls that see the user's
+    words (dictation cleanup, the presentation lint) keep no transcript
+    (`--no-session-persistence`). What no redaction reaches: the model
+    provider processed the text, and push notifications already delivered.
+  - `--secret "<label>"` — the convenient path for a password the user keeps
+    in a password manager. It carries a label only; the shell asks for the
+    secret in its own native field (autofill), naming the device it types
+    into, types it and overwrites its own copy. Ara and the server learn only
+    `secret-typed` or `secret-cancelled`.
+- **Page side** (`components/shell-keyboard.js`, rendered by
+  `conversation.js` under the bubble). Outside the shell the row only says the
+  Ara app is needed. Inside it, each action gets a button — *Type N
+  characters on <device>*, *Type ••••••*, *Retype*, *Password from manager:
+  <label>*, each saying *+ Enter* (×N) for every Enter it presses, line
+  breaks included — above it, for a text, the **text itself** as it will be
+  typed (line breaks marked ⏎, tabs ⇥), so a tap confirms what the user
+  sees; and the outcome line from the `keyboard` events (*Typed on
+  Quest 3 ✓*, *Not typed: no device connected* with *Open keyboard*, *Not
+  typed: typing is off in the Ara app (for this server, or the keyboard
+  itself)* with *Open settings* — the app's settings page holds the server's
+  switch and the way to the keyboard screen, which the app refuses while
+  that switch is off); after a reload the row shows the stored outcome. An
+  action the app never answers is given up on after 30 s and 0.1 s a
+  character (a text) or 15 s (a key): the row says *No answer from the Ara
+  app — check the device before you retype*, the next action starts, and
+  nothing is reported, as nobody knows what the device took — an answer that
+  comes later still reaches the row and the gateway. *Stop* on a row that
+  still says it is typing an action the page no longer runs settles it the
+  same way. While the phone asks before
+  an Enter, a line break, a tab, a key, an empty text or a text with
+  whitespace at either end (Python's set; `phoneConfirms`, which follows
+  the app's `onlyWrites` rule), the row says
+  *Waiting for confirmation on the phone…* instead of *Typing…*; a
+  `cancelled` reads *Not typed: stopped, or not confirmed on the phone*.
+  The phone may also ask about a plain one-line text, an automatic run
+  included (after the Stop on its strip, or on a device set to ask every
+  time; the row, which cannot tell, says *Typing…*); its `cancelled` up to
+  25 s later is an ordinary end — reported, worded as above, offered for
+  *Retype*, never run by itself again.
+  Actions run **one after
+  another** — the next starts on the previous one's final event, the app
+  refusing a second one while it types — and *Stop* ends the one running (a
+  text being typed, or an open password dialog — never a password being
+  typed) and drops the rest. A confirmation on the phone declined or not
+  answered in time (`cancelled`) drops the rest too, as do `not-enabled`,
+  `not-in-front` and `not-connected`, and a password dialog closed on the
+  phone without a password (`secret-cancelled`: Cancel, back, or its own
+  close after ten minutes): what waited was meant to follow the action that
+  did not run (a text after a Tab is for the field the Tab moves to, a Tab
+  after a password for the field after it), so it is reported `cancelled`
+  rather than typed into whatever has focus. The outcomes are reported to the gateway from the module,
+  not the thread view, so leaving the thread mid-text loses none. A
+  `keyboard-type` action runs **by itself once**: only when the gateway
+  marked it `auto`, only when its message arrives live in the thread open
+  and visible on this device (not on opening the thread, a reload, a history
+  read, or coming back to a page that was hidden — what arrived meanwhile
+  waits for a tap), only within two minutes of the message's time, and only
+  if this device has not run its `id` before (a bounded list in localStorage
+  — only the app's one WebView can type at all). Everything else waits for
+  the user's tap, and the page checks the rule of `runs_by_itself` again
+  (`needsTap`). Retype is
+  always a tap, and impossible once a sensitive text is deleted.
 
 `manifest.webmanifest` declares `launch_handler: {client_mode:
 "focus-existing"}`, so a second launch of the installed PWA brings its open

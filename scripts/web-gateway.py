@@ -66,12 +66,28 @@ Projects (dashboard project pages):
                                          and {context: "..."}. A non-quiet append
                                          un-archives the thread unless it is
                                          muted.
+  POST /conversations/<id>/shell-actions/<action id>/outcome
+                                      -> the dashboard reports what became of
+                                         a shell action (body {state, error?}),
+                                         stored on it for Ara's later turns; a
+                                         sensitive text reported typed is
+                                         deleted from the stored reply at once.
+  POST /internal/conversations/<id>/redact
+                                      -> a retinue agent redacts one of the
+                                         user's messages (body {message_id}),
+                                         on the user's request. Same token gate.
   POST /internal/conversations/<id>/flags
                                       -> a retinue agent sets {archived, muted}
                                          (either or both). Same token gate. The
                                          only way to set `muted`, which is what
                                          keeps a thread archived when new
-                                         messages are filed into it.
+                                         messages are filed into it. Also
+                                         {continuous_off: true}: the user asked
+                                         Ara (by voice) to end continuous
+                                         conversation; the thread is stamped
+                                         `continuous_off` (now, ISO) and every
+                                         device showing it in the mode leaves
+                                         it on its next read.
 
 The life store (behind the dashboard's sign-in; read-only):
   GET|POST /sparql                    -> SPARQL 1.1 Protocol: query=<SPARQL>
@@ -90,7 +106,9 @@ The life store (behind the dashboard's sign-in; read-only):
 News feed (dashboard news page; see scripts/news_store.py):
   GET  /news                          -> {"generated", "items": [...]} ranked at
                                          read time. ?scope=feed|read|hidden|all
-                                         (default feed), ?limit=<n>.
+                                         (default feed), ?limit=<n>. An item's
+                                         "url" is an absolute http(s) link, or
+                                         empty.
   GET  /news/preferences              -> {"markdown", "updated"} — the Herald's
                                          memory of what the user cares about.
   POST /news/preferences              -> replace it (body {markdown}); the user
@@ -197,6 +215,9 @@ Messenger chats (the deterministic chat mirror; see scripts/chat_state.py):
                                          entirely through /conversations/<id>.
   GET  /chats/media/<slug>/<media-id> -> authenticated proxy for ledger media
                                          (the gateways' token-gated /media/<id>).
+                                         Served in place only as an inline-safe
+                                         image, audio, video, PDF or plain
+                                         text; anything else is a download.
   POST /internal/chats/inbound        -> the gateways' notify rail: one message
                                          event (arrival or own-device echo).
                                          Feeds the overlay, keeps chat state,
@@ -253,6 +274,7 @@ Conversation log:
 
 import base64
 import binascii
+import fnmatch
 import hashlib
 import html
 import hmac
@@ -284,12 +306,15 @@ import attention_store
 import build_stamp
 import claude_auth
 import agent_models
+import content_policy
 import chat_state as chat_state_mod
 import contacts as contacts_mod
+import dictation_vocabulary
 import email_client as ec
 import send_origin
 import inbound_store
 import session_env
+import shell_actions
 import gateway_auth
 import instance_branding
 import letterbox
@@ -410,6 +435,10 @@ def _default_thread_model() -> str:
 # through the same proxy that advertised the id, so the picker cannot offer a
 # model that isn't served. The list is cached for RETINUE_MODELS_CACHE_SECONDS
 # (default 60); on a failed refresh the last good list keeps serving.
+#
+# A family pin (ANTHROPIC_DEFAULT_<FAMILY>_MODEL, the variable Claude Code
+# resolves the bare `fable`/`opus`/… aliases through) retargets that family's
+# picker entry to the pinned concrete id — see _apply_family_pins.
 #
 # Deployments not routing through LiteLLM keep the static sources:
 # RETINUE_CONVERSATION_MODELS (an inline JSON array — an explicit override
@@ -730,6 +759,123 @@ def _coerce_litellm_models(parsed: object, listed_ids: list[str] | None = None) 
     return models
 
 
+# ── Family pins: one setting for agents and the picker ────────────────────────
+# Claude Code resolves the bare aliases `opus`/`sonnet`/`haiku`/`fable` (agent
+# files with `model: fable`, `--model sonnet`) through
+# ANTHROPIC_DEFAULT_<FAMILY>_MODEL. A deployment pins one to mean "the current
+# <family>" — typically a release newer than the baked CLI knows. The picker's
+# labelled entry for that family follows the same pin, so a new release is one
+# setting, not that setting plus a hand-edited route id in litellm/config.yaml.
+# The entry still carries the CONCRETE pinned id, never the alias: a thread
+# records the model it actually ran on, and a later pin change moves it only
+# because the thread's family pin moved (see _conv_model), not by reinterpreting
+# a stored name.
+_MODEL_FAMILIES = ("opus", "sonnet", "haiku", "fable")
+_warned_unserved_pins: set[str] = set()
+
+
+def _model_family(mid: str | None) -> str:
+    """The Claude family a model id belongs to (`claude-fable-5-2` -> fable), or ""."""
+    cid = _resolve_route_model(str(mid or "")).split("/")[-1].strip().lower()
+    for fam in _MODEL_FAMILIES:
+        if cid == f"claude-{fam}" or cid.startswith(f"claude-{fam}-"):
+            return fam
+    return ""
+
+
+def _family_pins() -> dict[str, str]:
+    """family -> pinned concrete id, from ANTHROPIC_DEFAULT_<FAMILY>_MODEL.
+
+    A pin naming a model outside its family (e.g. the sonnet alias pointed at
+    a local model) is not a "current <family>" statement and is ignored here."""
+    pins = {}
+    for fam in _MODEL_FAMILIES:
+        val = os.environ.get(f"ANTHROPIC_DEFAULT_{fam.upper()}_MODEL", "").strip()
+        if val and _model_family(val) == fam:
+            pins[fam] = val
+    return pins
+
+
+def _proxy_serves(parsed: object, mid: str) -> bool:
+    """Whether a /model/info body has a route for `mid` (by name or wildcard)."""
+    if not isinstance(parsed, dict):
+        return False
+    for item in parsed.get("data") or []:
+        if not isinstance(item, dict):
+            continue
+        name = _litellm_model_id(item)
+        if name and (name == mid or ("*" in name and fnmatch.fnmatchcase(mid, name))):
+            return True
+    return False
+
+
+def _hidden_families(parsed: object) -> set[str]:
+    """Families with a route the operator hid with `retinue_picker: false`."""
+    if not isinstance(parsed, dict):
+        return set()
+    hidden = set()
+    for item in parsed.get("data") or []:
+        if not isinstance(item, dict):
+            continue
+        info = item.get("model_info")
+        if isinstance(info, dict) and info.get(_LITELLM_PICKER_FLAG) is False:
+            fam = _model_family(_litellm_model_id(item))
+            if fam:
+                hidden.add(fam)
+    return hidden
+
+
+def _apply_family_pins(models: list[dict], parsed: object) -> list[dict]:
+    """Retarget each pinned family's picker entry to its pin.
+
+    The first entry of a pinned family keeps its label and takes the pinned id;
+    further entries of that family collapse into it (they would otherwise all
+    name the same model). A pinned family with no entry gets one, labelled by
+    the family name. A pin the proxy does not serve changes nothing — the
+    picker must never offer a model that isn't routed — and is logged once.
+    A family the operator hid with an explicit `retinue_picker: false` route
+    stays out of the picker: the pin moves what the family means, it does not
+    override a deliberate hide."""
+    pins = _family_pins()
+    if not pins:
+        return models
+    hidden = _hidden_families(parsed)
+    served = {}
+    for fam, pin in pins.items():
+        routed = _proxy_serves(parsed, pin)
+        served[fam] = routed and fam not in hidden
+        if not routed and pin not in _warned_unserved_pins:
+            _warned_unserved_pins.add(pin)
+            print(f"[web-gateway] ANTHROPIC_DEFAULT_{fam.upper()}_MODEL={pin!r} "
+                  "is not served by LiteLLM; the picker keeps its configured "
+                  f"{fam} entry", flush=True)
+    out, done = [], set()
+    for m in models:
+        fam = _model_family(m["id"])
+        if fam and served.get(fam):
+            if fam in done:
+                continue
+            done.add(fam)
+            m = {**m, "id": pins[fam]}
+        out.append(m)
+    for fam, pin in pins.items():
+        if served[fam] and fam not in done:
+            out.append({"id": pin, "label": fam.capitalize()})
+    return out
+
+
+def _family_pin_equivalent(mid: str | None) -> str | None:
+    """The offered pinned id for a stored choice of a pinned family, or None.
+
+    A thread pinned to `claude-fable-5-1` meant "Fable"; once the deployment
+    pins Fable to 5.2 the picker no longer offers 5.1, and without this the
+    thread would silently fall back to the default model (Opus)."""
+    pin = _family_pins().get(_model_family(mid))
+    if pin and _model_offered(pin):
+        return pin
+    return None
+
+
 def _fetch_litellm_json(path: str) -> object:
     url = _LITELLM_URL.rstrip("/") + path
     req = urllib.request.Request(
@@ -852,7 +998,7 @@ def _fetch_litellm_models() -> list[dict]:
     except (OSError, ValueError):
         # /v1/models is enrichment; /model/info alone still yields a list.
         listed = None
-    models = _coerce_litellm_models(info, listed)
+    models = _apply_family_pins(_coerce_litellm_models(info, listed), info)
     try:
         tags = _fetch_ollama_models()
     except (OSError, ValueError):
@@ -1193,7 +1339,8 @@ TRANSCRIBE_TIMEOUT = float(os.environ.get("TRANSCRIBE_TIMEOUT", "120"))
 # the dashboard — unlike Signal, where the agent reads the transcript and answers
 # what was meant — every recognition error is the user's to repair by hand. We
 # run the transcript through a small model first, with the thread so far and the
-# user's contact names as context (that is what fixes mangled names). Best
+# dictation vocabulary (names from the life store: people, organisations,
+# medications) as context — that is what fixes mangled names. Best
 # effort: any failure returns the raw transcript unchanged.
 TRANSCRIPT_CLEANUP = os.environ.get("TRANSCRIPT_CLEANUP", "1").strip().lower() not in ("0", "false", "no")
 # An explicit TRANSCRIPT_CLEANUP_MODEL always wins; otherwise fall back to
@@ -1256,6 +1403,9 @@ _CONV_READ_RE = re.compile(r"^/conversations/([0-9a-f]{32})/read/?$")
 _CONV_ARCHIVE_RE = re.compile(r"^/conversations/([0-9a-f]{32})/archive/?$")
 _CONV_UNARCHIVE_RE = re.compile(r"^/conversations/([0-9a-f]{32})/unarchive/?$")
 _CONV_MODEL_RE = re.compile(r"^/conversations/([0-9a-f]{32})/model/?$")
+_CONV_SHELL_OUTCOME_RE = re.compile(
+    r"^/conversations/([0-9a-f]{32})/shell-actions/([0-9a-f]{32})/outcome/?$")
+_INTERNAL_CONV_REDACT_RE = re.compile(r"^/internal/conversations/([0-9a-f]{32})/redact/?$")
 # The attention model's writes: the mode, the rules, and the actions on one
 # item (its id travels in the body — chat ids and project URIs carry
 # characters no path segment should).
@@ -1270,6 +1420,13 @@ _ATTENTION_POST_RE = re.compile(r"^/attention/(?:items/)?(mode|modes|permits|adm
 # endpoints report disabled and the dashboard hides its opt-in button.
 PUSH_DIR = Path(os.environ.get("PUSH_DIR", str(CONVERSATIONS_DIR.parent / "push")))
 push_notify.init(PUSH_DIR)
+
+# What the browsers report of the Content-Security-Policy (POST /csp-report,
+# scripts/content_policy.py): one small file beside the conversations, so it
+# is on the persistent volume and outlives a rebuild, and out of /data/, which
+# the agents write and the pages read.
+CSP_REPORTS_FILE = Path(os.environ.get("RETINUE_CSP_REPORTS_FILE")
+                        or str(CONVERSATIONS_DIR.parent / "csp-reports.json"))
 
 # ── Attention (the home screen's model) ────────────────────────────────────
 # What the dashboard shows first is no longer three cards but one list of what
@@ -1389,6 +1546,9 @@ def _news_ingest_authorized(provided: str) -> bool:
 
 # Recoloured icons, keyed by (path, colour): the recolouring is a pure-Python
 # pixel pass, so it runs once per icon per configured colour, not per request.
+# The pages and the manifest name them with the colour as a version
+# (/icons/icon-192.png?v=cb6cfe); the query is not read here, the colour in
+# force is what is served.
 _BRANDED_ICON_CACHE: dict[tuple[str, str], bytes] = {}
 
 # Where the Android app serves its own settings page from (a reserved address
@@ -1448,6 +1608,11 @@ def _shell_hash() -> str:
     # Only when set, so an unbranded deployment keeps the hash it always had.
     if instance_branding.branded():
         entries.append(f"branding:{instance_branding.signature()}")
+    # So is the Content-Security-Policy: the worker serves the shell pages
+    # from its cache with the headers they were cached with, so a changed mode
+    # (RETINUE_CSP) or policy reaches an installed client only with a new
+    # worker, as a changed file does.
+    entries.append(f"csp:{content_policy.signature()}")
     signature = "\n".join(entries)
     cached = _SHELL_HASH_CACHE.get(signature)
     if cached is not None:
@@ -1487,6 +1652,13 @@ _STATIC_CONTENT_TYPES = {
     ".ico": "image/x-icon",
     ".woff2": "font/woff2",
 }
+# What /data/ answers with. The directory holds what the deployment's agents
+# write (DASHBOARD_DATA_DIR) — content of the deployment, not of the shell —
+# and the cards read JSON from it, nothing else. So a page, a script, a
+# stylesheet or an SVG an agent left there is never served as one on the
+# dashboard's origin: any other file is application/octet-stream, as a
+# download.
+_DATA_CONTENT_TYPES = {".json": "application/json; charset=utf-8"}
 # Conversations are keyed by requester identity. Requests that carry no
 # "on-behalf-of" identity share this default key.
 DEFAULT_SESSION_KEY = "Web"
@@ -1685,7 +1857,61 @@ _conversations_lock = threading.Lock()
 # rest of the document. Answers are model output that can quote untrusted text
 # (e-mail, messages), so this is also the XSS boundary for the log pages.
 _md = MarkdownIt("commonmark", {"html": False}).enable("table")
-_URL_RE = re.compile(r'https?://[^\s<]+')
+# A bare URL in an answer's text, as the session log page links it. It is
+# matched in the text as written (entities decoded), so an angle bracket ends
+# it like a blank does; trailing sentence punctuation is left outside.
+_URL_RE = re.compile(r'https?://[^\s<>]+')
+_URL_TAIL = '.,;:!?)"\''
+# A tag of markdown-it's output. With raw HTML off it writes only its own
+# tags, and it escapes every attribute value (& < > "), so a tag is a "<"
+# followed by everything up to the next ">".
+_MD_TAG_RE = re.compile(r'(<[^>]*>)')
+# Elements whose text is never linked: a link already is one, and code is
+# shown as written.
+_MD_NO_LINK_RE = re.compile(r'<(/?)(a|code|pre)\b', re.IGNORECASE)
+# An image of markdown-it's output, and its attributes (each value escaped by
+# markdown-it). An answer is model output, so an image in it would be fetched
+# from wherever the model pointed, and the page's Content-Security-Policy
+# (img-src, scripts/content_policy.py) blocks any image from another origin
+# or a data: URL anyway. The log shows an image as a link to it instead, as
+# the dashboard's own Markdown renderer does (webapp/components/markdown.js).
+_MD_IMG_RE = re.compile(r'<img\s')
+_MD_ATTR_RE = re.compile(r'([a-z]+)="([^"]*)"')
+# Where such a link may point: the web, or a path on this origin (a second
+# slash or a backslash would make it another origin), as markdown.js allows.
+_MD_IMG_LINK_RE = re.compile(r'(?i)(?:https?://|/(?![/\\]))')
+# Where an answer's own link may point: the web, a mail address, a telephone
+# number or a path on this origin, the rule of the dashboard's Markdown
+# renderer (markdown.js). markdown-it itself refuses only javascript:,
+# vbscript:, file: and data: other than an image, so without this a link of
+# any other scheme in model output, which can quote outside text, would be a
+# link on this origin; inside the Android shell some of them open another
+# app. The href is markdown-it's normalised one, in which a backslash is
+# already percent-encoded and so cannot make it another origin.
+_MD_LINK_RE = re.compile(r'(?i)(?:https?://|mailto:|tel:|/(?![/\\]))')
+
+
+def _md_refuse_links(state) -> None:
+    """Drop every link whose href ``_MD_LINK_RE`` refuses, keeping its
+    text: the text of a refused link reads as text, as an image whose URL is
+    refused reads as its alt text. A link never holds another link, but an
+    image inside one is a token of its own and is left to _image_as_link."""
+    for block in state.tokens:
+        if block.type != "inline" or not block.children:
+            continue
+        kept, refused = [], []
+        for tok in block.children:
+            if tok.type == "link_open":
+                refused.append(not _MD_LINK_RE.match(tok.attrGet("href") or ""))
+                if refused[-1]:
+                    continue
+            elif tok.type == "link_close" and refused and refused.pop():
+                continue
+            kept.append(tok)
+        block.children = kept
+
+
+_md.core.ruler.push("refuse_links", _md_refuse_links)
 
 # ── Async job store ───────────────────────────────────────────────────────────
 # POST /message can request async handling; the request returns a job handle
@@ -1748,18 +1974,61 @@ def _run_job(job_id: str, message: str, display_question: str | None,
 
 
 def _render_answer(raw: str) -> str:
-    """Render Markdown to HTML; auto-link bare http/https URLs as <a href=URL>URL</a>."""
+    """Render Markdown to HTML; auto-link bare http/https URLs as <a href=URL>URL</a>.
+
+    The links are added to the rendered HTML, and only ever between its tags:
+    a URL inside a tag (an image's src, alt or title, a link's href) belongs
+    to that tag, and text inside a link, a code span or a code block is left
+    as it is. The answer is text from the model, which may quote anything, so
+    a URL is written back escaped, for the href attribute and for the text,
+    and nothing in it can become markup."""
     rendered = _md.render(raw)
-    # Split on existing <a> tags so we never double-link markdown-rendered links.
-    parts = re.split(r'(<a\b[^>]*>.*?</a>)', rendered, flags=re.DOTALL)
+    out: list[str] = []
+    depth = {"a": 0, "code": 0, "pre": 0}
+    for i, part in enumerate(_MD_TAG_RE.split(rendered)):
+        if i % 2 and _MD_IMG_RE.match(part):
+            out.append(_image_as_link(part, inside_link=depth["a"] > 0))
+        elif i % 2:  # a tag
+            m = _MD_NO_LINK_RE.match(part)
+            if m and not part.endswith("/>"):
+                name = m.group(2).lower()
+                depth[name] = max(0, depth[name] + (-1 if m.group(1) else 1))
+            out.append(part)
+        elif not any(depth.values()) and _URL_RE.search(html.unescape(part)):
+            out.append(_linkify_text(html.unescape(part)))
+        else:
+            out.append(part)
+    return "".join(out)
 
-    def _linkify(text: str) -> str:
-        def _sub(m: re.Match) -> str:
-            url = m.group(0).rstrip('.,;:!?)')
-            return f'<a href="{url}">{url}</a>'
-        return _URL_RE.sub(_sub, text)
 
-    return ''.join(_linkify(p) if i % 2 == 0 else p for i, p in enumerate(parts))
+def _image_as_link(tag: str, inside_link: bool) -> str:
+    """markdown-it's <img> ``tag`` as a link to the image, its alt text (or
+    the URL) as the link's text; only the text inside another link, or where
+    the URL is neither a web address nor a path on this origin. The values
+    are markdown-it's, already escaped for an attribute and for text."""
+    attrs = dict(_MD_ATTR_RE.findall(tag))
+    src = attrs.get("src", "")
+    text = attrs.get("alt") or src
+    if inside_link or not _MD_IMG_LINK_RE.match(src):
+        return attrs.get("alt", "")
+    title = f' title="{attrs["title"]}"' if "title" in attrs else ""
+    return f'<a href="{src}"{title}>{text}</a>'
+
+
+def _linkify_text(text: str) -> str:
+    """Plain ``text`` as HTML, its bare http(s) URLs as links."""
+    out: list[str] = []
+    pos = 0
+    for m in _URL_RE.finditer(text):
+        url = m.group(0).rstrip(_URL_TAIL)
+        if not url.split("://", 1)[1]:
+            continue
+        out.append(html.escape(text[pos:m.start()], quote=False))
+        out.append(f'<a href="{html.escape(url, quote=True)}">'
+                   f'{html.escape(url, quote=False)}</a>')
+        pos = m.start() + len(url)
+    out.append(html.escape(text[pos:], quote=False))
+    return "".join(out)
 
 
 def _now_ts() -> float:
@@ -1806,15 +2075,93 @@ _erased_session_keys: dict[str, float] = {}
 _ERASED_SESSION_KEYS_MAX = 1000
 
 
-def _update_session_entry(session_key: str, entry: dict) -> None:
+# Session keys whose session a running turn must not record: the thread was
+# reset (_reset_session) while that turn was under way — the user had a
+# message redacted from inside it. One-shot: the turn's late write is refused
+# and its transcript erased, and the key is cleared when the turn's worker
+# ends (_conv_worker), so the next session records normally.
+_reset_session_keys: set[str] = set()
+
+
+# How many earlier session ids an entry remembers (_entry_session_ids): every
+# session a key has used, so a reset can erase all their transcripts, not only
+# the current one — a session replaced after the idle window still holds what
+# was said in it.
+_SESSION_HISTORY_MAX = 100
+
+
+def _entry_session_ids(entry: dict | None) -> list[str]:
+    """Every Claude session id a state entry knows: its current one and those
+    it replaced (`previous_session_ids`)."""
+    if not isinstance(entry, dict):
+        return []
+    ids = [str(x) for x in entry.get("previous_session_ids") or [] if x]
+    if entry.get("session_id"):
+        ids.append(str(entry["session_id"]))
+    return list(dict.fromkeys(ids))
+
+
+def _record_turn_session(session_key: str, entry: dict, *, drop: bool = False,
+                         also_forget: "list[str] | tuple[str, ...]" = ()) -> bool:
+    """Record the session a turn ended in — or, with `drop`, never resume it.
+
+    The one place a turn's session is written to the state file, under the
+    session lock its turn holds (send_message), so no later turn of the key
+    can resume it in between. `drop` (the turn typed a sensitive text): the
+    key's entry goes with every session id it ever had, and their transcripts
+    are erased; so does a key reset while the turn ran (_reset_session_keys,
+    one-shot) or erased for good (_erased_session_keys). `also_forget`: further
+    session ids the turn produced and nobody resumes (an escalated junior's
+    fresh session). Returns whether the entry was recorded."""
+    forget = [str(x) for x in also_forget if x]
     with _state_lock:
         erased = session_key in _erased_session_keys
-        if not erased:
-            state = _load_state()
-            state[session_key] = entry
+        reset = session_key in _reset_session_keys
+        _reset_session_keys.discard(session_key)
+        state = _load_state()
+        previous = state.get(session_key)
+        if erased or reset or drop:
+            forget += _entry_session_ids(previous) + _entry_session_ids(entry)
+            if state.pop(session_key, None) is not None:
+                _save_state(state)
+            recorded = False
+        else:
+            history = _entry_session_ids(previous)
+            current = str(entry.get("session_id") or "")
+            history = [x for x in history if x != current][-_SESSION_HISTORY_MAX:]
+            stored = dict(entry)
+            if history:
+                stored["previous_session_ids"] = history
+            state[session_key] = stored
             _save_state(state)
-    if erased:
-        _forget_claude_session(str((entry or {}).get("session_id") or ""))
+            recorded = True
+    for session_id in dict.fromkeys(forget):
+        _forget_claude_session(session_id)
+    return recorded
+
+
+def _update_session_entry(session_key: str, entry: dict) -> None:
+    _record_turn_session(session_key, entry)
+
+
+def _reset_session(session_key: str, *, running: bool = False) -> None:
+    """Never resume any Claude session of the key again, and erase their
+    transcripts — the current one and every one it replaced.
+
+    For a thread whose sessions hold a text they must not keep: a message the
+    user had redacted. The next turn starts a fresh session and is shown the
+    thread as stored, where that text is gone. `running`: a turn of this
+    thread is under way and records its session only after this returns —
+    refuse that write once as well (_reset_session_keys)."""
+    with _state_lock:
+        if running:
+            _reset_session_keys.add(session_key)
+        state = _load_state()
+        entry = state.pop(session_key, None)
+        if entry is not None:
+            _save_state(state)
+    for session_id in _entry_session_ids(entry):
+        _forget_claude_session(session_id)
 
 
 def _session_lock_for(session_key: str) -> threading.Lock:
@@ -1938,23 +2285,49 @@ def _save_conversation(entries: list[dict], date_str: str) -> None:
         json.dump(entries, f, ensure_ascii=False)
 
 
-def _append_entry(question: str, answer: str) -> tuple[str, str]:
+# Thread messages the user had redacted (_conv_redact_message), by (thread id,
+# message id): a turn that was already running — or queued — when the
+# redaction landed logs its question only when it ends, from a copy taken when
+# it started; the log entry gets REDACTED_TEXT instead. Keyed by message, not
+# by text, so another "yes" elsewhere is left alone. In memory: a turn does
+# not outlive the process.
+_redacted_messages: dict[tuple[str, str], float] = {}
+_REDACTED_MESSAGES_MAX = 1000
+
+
+def _note_redacted(thread_id: str, message_id: str) -> None:
+    with _conversation_lock:
+        _redacted_messages[(thread_id, message_id)] = time.time()
+        while len(_redacted_messages) > _REDACTED_MESSAGES_MAX:
+            _redacted_messages.pop(next(iter(_redacted_messages)))
+
+
+def _append_entry(question: str, answer: str, *, thread_id: str | None = None,
+                  message_id: str | None = None) -> tuple[str, str]:
     """Append one Q&A entry and return (date_str, anchor).
 
     Guarded by `_conversation_lock` so parallel sessions don't lose entries when
-    appending to the same per-day file concurrently.
+    appending to the same per-day file concurrently. A dashboard turn names the
+    thread message its question is (`thread`, `message`), so a redaction finds
+    exactly that entry; one the user had redacted meanwhile is logged as
+    REDACTED_TEXT (_note_redacted).
     """
     with _conversation_lock:
+        if thread_id and message_id and (thread_id, message_id) in _redacted_messages:
+            question = REDACTED_TEXT
         date_str = _today()
         entries = _load_conversation(date_str)
         ts_ms = int(_now_ts() * 1000)
         anchor = f"entry-{ts_ms}"
-        entries.append({
+        entry = {
             "anchor": anchor,
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "question": question,
             "answer": answer,
-        })
+        }
+        if thread_id and message_id:
+            entry["thread"], entry["message"] = thread_id, message_id
+        entries.append(entry)
         _save_conversation(entries, date_str)
         return date_str, anchor
 
@@ -2103,6 +2476,121 @@ def _derive_title(text: str) -> str:
 
 
 def _load_conv(cid: str) -> dict | None:
+    """A thread as stored, with every expired sensitive shell-action text
+    already gone (_conv_purge_sensitive): whatever reads a thread — the
+    dashboard, a replay to Ara, a write that saves it back — never sees a
+    sensitive text older than shell_actions.SENSITIVE_TTL_SECONDS, whether or
+    not the file has been rewritten yet."""
+    conv = _load_conv_raw(cid)
+    if conv is not None:
+        _conv_purge_sensitive(conv)
+    return conv
+
+
+def _conv_purge_sensitive(conv: dict, ids: "set[str] | None" = None) -> bool:
+    """Delete sensitive shell-action texts from `conv` in place: the expired
+    ones, or exactly `ids`. True when anything went (scripts/shell_actions.py)."""
+    now = time.time()
+    changed = False
+    for m in conv.get("messages") or []:
+        if isinstance(m, dict) and m.get("shell_actions"):
+            changed = shell_actions.purge_sensitive(m, now, ids=ids) or changed
+    return changed
+
+
+def _conv_persist_purge(cid: str, ids: "set[str] | None" = None) -> dict | None:
+    """Purge sensitive texts (expired, or `ids`) from the stored file too.
+    Returns the thread, or None when there is none."""
+    with _conversations_lock:
+        conv = _load_conv_raw(cid)
+        if conv is None:
+            return None
+        changed = _conv_purge_sensitive(conv)
+        if ids:
+            changed = _conv_purge_sensitive(conv, ids) or changed
+        if changed:
+            _save_conv(conv)
+        return conv
+
+
+def _conv_schedule_purge(cid: str, delay: float) -> None:
+    """Rewrite thread `cid` without its expired sensitive texts in `delay`
+    seconds (a second's margin added), and again for the next one due
+    (_conv_purge_and_reschedule)."""
+    t = threading.Timer(max(0.0, delay) + 1, _conv_purge_and_reschedule, args=(cid,))
+    t.daemon = True
+    t.start()
+
+
+def _conv_next_expiry(conv: dict, now: float) -> float | None:
+    """Seconds until the thread's next sensitive text expires, or None."""
+    soonest = None
+    for m in conv.get("messages") or []:
+        if not isinstance(m, dict):
+            continue
+        for a in m.get("shell_actions") or []:
+            if (isinstance(a, dict) and a.get("sensitive")
+                    and a.get("text") is not None):
+                left = (shell_actions.SENSITIVE_TTL_SECONDS
+                        - shell_actions.age_seconds(m.get("ts"), now))
+                soonest = left if soonest is None else min(soonest, left)
+    return soonest
+
+
+def _conv_purge_and_reschedule(cid: str) -> bool:
+    """Delete the thread's expired sensitive texts from its file, and schedule
+    the next deletion while one is still due. True when one is."""
+    conv = _conv_persist_purge(cid)
+    if conv is None:
+        return False
+    left = _conv_next_expiry(conv, time.time())
+    if left is None:
+        return False
+    _conv_schedule_purge(cid, left)
+    return True
+
+
+def _conv_sensitive_sweep() -> int:
+    """At startup: delete every expired sensitive text from the stored
+    threads, and schedule the deletion of those not yet expired — the timers
+    of the process before a restart are gone. Returns how many threads still
+    hold one."""
+    waiting = 0
+    for path in CONVERSATIONS_DIR.glob("*.json"):
+        if _CONV_ID_RE.fullmatch(path.stem) and _conv_purge_and_reschedule(path.stem):
+            waiting += 1
+    return waiting
+
+
+def _conv_record_shell_outcome(cid: str, action_id: str,
+                               outcome: dict) -> tuple[dict | None, bool]:
+    """Store `outcome` (shell_actions.normalize_outcome) on the shell action
+    `action_id` of thread `cid`, and delete its text if it was a sensitive
+    one reported typed. An action already typed keeps that outcome when a
+    later Retype does not type (shell_actions.record_outcome). Returns
+    (thread, whether the action exists); the thread is None when there is
+    none."""
+    with _conversations_lock:
+        conv = _load_conv_raw(cid)
+        if conv is None:
+            return None, False
+        _conv_purge_sensitive(conv)
+        found = False
+        for m in conv.get("messages") or []:
+            for a in (m.get("shell_actions") or []) if isinstance(m, dict) else []:
+                if isinstance(a, dict) and a.get("id") == action_id:
+                    shell_actions.record_outcome(
+                        a, outcome, datetime.now(timezone.utc).isoformat())
+                    found = True
+        if not found:
+            return conv, False
+        if outcome["state"] == "typed":
+            _conv_purge_sensitive(conv, {action_id})
+        _save_conv(conv)
+        return conv, True
+
+
+def _load_conv_raw(cid: str) -> dict | None:
     # Re-validate here so the path guard dominates the open() in this scope.
     if not _CONV_ID_RE.fullmatch(cid):
         return None
@@ -2174,7 +2662,9 @@ def _conv_summary(conv: dict) -> dict:
         "pending_since": conv.get("pending_since"),
         "pending_status": conv.get("pending_status"),
         "message_count": len(messages),
-        "last_preview": _derive_title(last.get("text", "")),
+        # The conversation list's row shows words, as the attention row and
+        # the push do: a call directive as its name, never markup and number.
+        "last_preview": _derive_title(attention_store.markup_words(last.get("text", ""))),
     }
 
 
@@ -2263,13 +2753,19 @@ def _store_attachment_blob(cid: str, blob: bytes, filename, content_type) -> dic
     (base64 payloads from the internal API and the composer) and
     _store_reply_files (files Ara attaches to her own reply) both end here, so
     naming, size cap and metadata shape cannot drift apart. An empty or
-    oversized blob is refused (None). An image's intrinsic ``width``/``height``
+    oversized blob is refused (None). The name is kept as a base name without
+    control characters (_attachment_name) and the type only as one media type
+    (_stated_media_type), application/octet-stream otherwise. An image's
+    intrinsic ``width``/``height``
     (sniffed by magic, the same parser the chat store uses) is recorded when
     found, so the dashboard reserves its inline preview's box before the bytes
     arrive."""
     if not blob or len(blob) > MAX_ATTACHMENT_BYTES:
         return None
-    content_type = str(content_type or "application/octet-stream")
+    # Name and type come from whoever attached the file — a mail sender's
+    # attachment name, a messenger client's type — and are later written into
+    # the download's headers and the note of Ara's turn: kept as one line.
+    content_type = _stated_media_type(content_type)
     suffix = Path(os.path.basename(str(filename or ""))).suffix
     if not re.fullmatch(r"\.[A-Za-z0-9]{1,8}", suffix):
         suffix = mimetypes.guess_extension(content_type) or ""
@@ -2277,7 +2773,7 @@ def _store_attachment_blob(cid: str, blob: bytes, filename, content_type) -> dic
     conv_dir = CONVERSATION_ATTACHMENTS_DIR / cid
     conv_dir.mkdir(parents=True, exist_ok=True)
     (conv_dir / f"{att_id}{suffix}").write_bytes(blob)
-    filename = os.path.basename(str(filename or "attachment")) or "attachment"
+    filename = _attachment_name(filename)
     meta = {
         "id": att_id,
         "filename": filename,
@@ -2359,6 +2855,105 @@ def _read_reply_manifest(path: Path | None) -> list[str]:
     return [line.strip() for line in raw.splitlines() if line.strip()]
 
 
+def _read_reply_shell_actions(path: Path | None, cid: str = "") -> list[dict]:
+    """The shell actions a session attached to its own reply, and the manifest gone.
+
+    The sibling of _read_reply_manifest for scripts/shell-type.py: one JSON
+    action per line at RETINUE_REPLY_SHELL_ACTIONS_FILE, consumed exactly once
+    and read like any session-controlled path. Every line is validated again
+    here (shell_actions.normalize — the CLI's own check, so a hand-written
+    line gets no further than the CLI would); a bad line costs that action,
+    never the reply."""
+    if path is None:
+        return []
+    try:
+        raw = _read_regular_file(path, shell_actions.MAX_MANIFEST_BYTES,
+                                 follow=False).decode("utf-8", errors="replace")
+    except FileNotFoundError:
+        return []
+    except OSError as exc:
+        print(f"[web-gateway] shell action manifest {path} unreadable: {exc}",
+              flush=True)
+        return []
+    finally:
+        path.unlink(missing_ok=True)
+    actions, problems = shell_actions.parse_manifest(raw)
+    for problem in problems:
+        print(f"[web-gateway] {cid or 'reply'}: shell action dropped — {problem}",
+              flush=True)
+    return actions
+
+
+_SHELL_MANIFEST_PREFIX = "retinue-reply-shell-actions-"
+
+
+def _session_key_tag(session_key: str) -> str:
+    return hashlib.sha256(session_key.encode("utf-8")).hexdigest()[:16]
+
+
+def _sweep_stale_shell_manifests() -> int:
+    """At startup, before any turn runs: shell-action manifests a restart left
+    behind. One holding a sensitive text belongs to a turn that typed it in a
+    session this gateway would resume — that key's sessions are dropped, like
+    a completed turn's (_record_turn_session) — and every one is deleted.
+    Returns how many keys were dropped.
+
+    Every key is dropped before anything is deleted, and each entry is dealt
+    with on its own: an entry with a manifest's name that cannot be read or
+    deleted (a directory, another user's file) must not stop the sweep, nor
+    leave resumable the session of a real manifest beside it."""
+    tmp = Path(tempfile.gettempdir())
+    by_tag = {_session_key_tag(k): k for k in _load_state()}
+    paths = list(tmp.glob(_SHELL_MANIFEST_PREFIX + "*"))
+    dropped = 0
+    for path in paths:
+        rest = path.name[len(_SHELL_MANIFEST_PREFIX):]
+        tag = rest.split("-", 1)[0]
+        try:
+            if _manifest_has_sensitive(path) and tag in by_tag:
+                _record_turn_session(by_tag[tag], {}, drop=True)
+                dropped += 1
+        except OSError as exc:
+            print(f"[web-gateway] stale shell manifest {path} not checked: {exc}",
+                  flush=True)
+    for path in paths:
+        try:
+            path.unlink(missing_ok=True)
+        except OSError as exc:
+            print(f"[web-gateway] stale shell manifest {path} not deleted: {exc}",
+                  flush=True)
+    return dropped
+
+
+def _manifest_has_sensitive(path: Path | None) -> bool:
+    """Whether a shell-action manifest lists a sensitive text — read for that
+    only, from a run whose reply is discarded (an escalated junior's)."""
+    if path is None:
+        return False
+    try:
+        raw = _read_regular_file(path, shell_actions.MAX_MANIFEST_BYTES,
+                                 follow=False).decode("utf-8", errors="replace")
+    except OSError:
+        return False
+    actions, _ = shell_actions.parse_manifest(raw)
+    return any(a.get("sensitive") for a in actions)
+
+
+def _session_id_of(result) -> str:
+    """The session id a `claude -p --output-format=json` run reported, or ""."""
+    try:
+        data = json.loads(getattr(result, "stdout", "") or "")
+    except (TypeError, ValueError):
+        return ""
+    sid = data.get("session_id") if isinstance(data, dict) else None
+    return str(sid) if sid else ""
+
+
+def _session_was_reset(session_key: str) -> bool:
+    with _state_lock:
+        return session_key in _reset_session_keys or session_key in _erased_session_keys
+
+
 def _store_reply_files(cid: str, paths: list[str]) -> list[dict]:
     """Store the files a session attached to its own reply in thread ``cid``.
 
@@ -2431,8 +3026,10 @@ def _store_message_files(raw_files) -> list[dict]:
     MESSAGE_FILES_DIR with a server-generated name, so an untrusted filename
     never becomes a path component; only a plain short extension (derived from
     the filename, else the content type) survives, since a file extension is
-    what lets the reading session type the file. Malformed or oversized items
-    are skipped. Returns ``[{"path", "content_type", "size"}, ...]``."""
+    what lets the reading session type the file. The content type is kept as
+    its bare type/subtype (_media_essence), application/octet-stream when the
+    stated text is none. Malformed or oversized items are skipped. Returns
+    ``[{"path", "content_type", "size"}, ...]``."""
     stored: list[dict] = []
     if not isinstance(raw_files, list):
         return stored
@@ -2445,7 +3042,10 @@ def _store_message_files(raw_files) -> list[dict]:
             continue
         if not blob or len(blob) > MAX_ATTACHMENT_BYTES:
             continue
-        content_type = str(item.get("content_type") or "application/octet-stream")
+        # The type is what the sender's client declared, passed on by the
+        # messenger gateway as it came, and the note below puts it into the
+        # answering session's prompt: it is kept only as a bare type/subtype.
+        content_type = _media_essence(item.get("content_type"))
         suffix = Path(os.path.basename(str(item.get("filename") or ""))).suffix
         if not re.fullmatch(r"\.[A-Za-z0-9]{1,8}", suffix):
             suffix = mimetypes.guess_extension(content_type) or ""
@@ -2461,7 +3061,11 @@ def _message_files_note(stored: list[dict]) -> str:
     """A note listing the files a /message request carried, with their on-disk
     paths — the counterpart of _conv_attachment_note for gateway-forwarded
     files. The untrusted original filename is deliberately absent: the reading
-    session needs only the server-named path, type and size."""
+    session needs only the server-named path, type and size. The note is part
+    of the session's prompt, so nothing from outside may reach it as text of
+    its own: the path is the server's, the type was reduced to its bare
+    type/subtype when the file was stored (_store_message_files), the size
+    is a number."""
     if not stored:
         return ""
     lines = [
@@ -2484,13 +3088,225 @@ _INLINE_SAFE_TYPES = frozenset({
 })
 
 
+# What never belongs in a file name that is shown or sent: the C0 and C1
+# control characters, line breaks among them, and Unicode's own line and
+# paragraph separators.
+_NAME_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f\u2028\u2029]")
+
+
+def _attachment_name(filename) -> str:
+    """A thread attachment's name as it may be stored, shown and sent.
+
+    The name is whatever the file was called where it came from — for a mail
+    attachment, what its sender declared — and it is written into the
+    download's Content-Disposition and listed in the note of Ara's turn, each
+    one line. It is a base name: what stands before the last slash is a path
+    of the place it came from, and a backslash counts as a slash, since the
+    client that saves the download may take it for one (as
+    inbound_store.safe_file_name does for a messenger file). Control
+    characters are dropped; "attachment" when nothing usable is left. Applied
+    where a name is stored and again where it is used, so a name stored
+    before this keeps to it too."""
+    name = str(filename or "").replace("\\", "/").rsplit("/", 1)[-1]
+    name = _NAME_CONTROL_RE.sub("", name).strip()
+    return "attachment" if name in ("", ".", "..") else name
+
+
 def _content_disposition(filename: str, inline: bool = False) -> str:
     """Build a Content-Disposition header that survives non-ASCII filenames
-    (RFC 6266: an ASCII fallback plus a UTF-8 ``filename*``)."""
+    (RFC 6266: an ASCII fallback plus a UTF-8 ``filename*``). The name goes
+    through _attachment_name first, so the header is one line of ASCII
+    whatever was stored."""
+    filename = _attachment_name(filename)
     ascii_name = filename.encode("ascii", "replace").decode("ascii").replace('"', "'")
     quoted = urllib.parse.quote(filename, safe="")
     kind = "inline" if inline else "attachment"
     return f"{kind}; filename=\"{ascii_name}\"; filename*=UTF-8''{quoted}"
+
+
+# ── What a messenger medium is served as ──────────────────────────────────────
+# A file a messenger contact sends is kept by the gateway that received it,
+# together with the content type the sender's client declared, and reaches the
+# browser through the media proxy (/chats/media/…) on the dashboard's own
+# origin. That type is input from outside, as the bytes are. So it is read
+# strictly, and it decides only whether the file is shown in place or handed
+# over as a download: a file from outside never becomes a page or a script of
+# the dashboard. The rule is the thread attachments' (_INLINE_SAFE_TYPES
+# above), widened by the two kinds the chat's players load:
+#
+#   in place   the types of _INLINE_SAFE_TYPES, and audio and video. The chat
+#              shows images through <img> and plays the others through <audio>
+#              and <video>; a PDF or a text file opens from its file row in
+#              the browser's own viewer.
+#   download   everything else: ``Content-Disposition: attachment`` and a
+#              sandboxing policy, the letterbox share's, as the second line
+#              for a client that renders the file anyway. The stated type
+#              stays. An image of another type (SVG, TIFF, …) is still shown
+#              by the chat's <img>, where nothing in it runs, and a document
+#              or an archive is saved under the extension, and opened by the
+#              app, that the browser and the Android shell derive from the
+#              type: as application/octet-stream a .docx would be saved as
+#              .bin.
+#
+# A stated type that does not read as exactly one media type says nothing
+# reliable and counts as application/octet-stream. Every answer forbids
+# sniffing, so the type sent is the type used.
+
+# The two names of a media type are RFC 6838 restricted names (4.2): a letter
+# or digit, then at most 126 more characters of a small set. Matched on the
+# lower-cased text.
+_MEDIA_NAME = r"[a-z0-9][a-z0-9!#$&^_.+-]{0,126}"
+_MEDIA_ESSENCE_RE = re.compile(_MEDIA_NAME + "/" + _MEDIA_NAME)
+# A parameter (RFC 9110, 5.6.6 and 8.3.1): ";", then nothing or name=value,
+# the value a token or a quoted string of printable ASCII. The only whitespace
+# allowed is blanks around the ";".
+_HTTP_TOKEN = r"[A-Za-z0-9!#$%&'*+.^_`|~-]+"
+_HTTP_TOKEN_RE = re.compile(_HTTP_TOKEN)
+_MEDIA_PARAM_RE = re.compile(
+    r" *; *(?:(" + _HTTP_TOKEN + r")=(?:(" + _HTTP_TOKEN
+    + r')|"((?:[ !#-\[\]-~]|\\[ -~])*)"))?')
+# Far longer than any type a client states.
+_MEDIA_TYPE_MAX_LEN = 1024
+# The parameters passed on: the two a browser reads to decode what it was
+# given. Whatever else a sender attached to the type stays behind.
+_MEDIA_PARAMS_KEPT = ("charset", "codecs")
+# What a download is answered with besides ``attachment``: should a client
+# render the file all the same, it does so without scripts, without this
+# origin and without loading anything (the letterbox share's policy,
+# scripts/webdav_share.py).
+_DOWNLOAD_CSP = "sandbox; default-src 'none'"
+
+
+def _parse_media_type(stated) -> tuple[str, dict] | None:
+    """Read one stated content type strictly: ``(type/subtype, parameters)``.
+
+    The essence comes back lower-cased, the parameters as ``{name: value}``
+    with lower-cased names and unquoted values, the first of a repeated name
+    winning. Blanks and tabs around the whole value are no part of it and are
+    dropped. None for anything that is not exactly one media type — an empty
+    value, a comma-separated list, a control character or a tab inside, a
+    character outside ASCII, a parameter without a value — so the caller
+    never has to guess what an odd value was meant to say."""
+    if not isinstance(stated, str) or len(stated) > _MEDIA_TYPE_MAX_LEN:
+        return None
+    text = stated.strip(" \t")
+    if not (text.isascii() and text.isprintable()):
+        return None
+    essence = _MEDIA_ESSENCE_RE.match(text.lower())
+    if not essence:
+        return None
+    params: dict = {}
+    pos = essence.end()
+    while pos < len(text):
+        param = _MEDIA_PARAM_RE.match(text, pos)
+        if not param:
+            return None
+        name, token, quoted = param.groups()
+        if name:
+            value = token if token is not None else re.sub(r"\\(.)", r"\1", quoted)
+            params.setdefault(name.lower(), value)
+        pos = param.end()
+    return essence.group(0), params
+
+
+def _media_type_header(essence: str, params: dict) -> str:
+    """A parsed media type written back as a ``Content-Type`` value.
+
+    Built from the parsed parts, never from the text that was received: the
+    essence, then the parameters of _MEDIA_PARAMS_KEPT that carry a value,
+    quoted where the value is not a token."""
+    out = essence
+    for name in _MEDIA_PARAMS_KEPT:
+        value = params.get(name)
+        if not value:
+            continue
+        if not _HTTP_TOKEN_RE.fullmatch(value):
+            value = '"' + re.sub(r'([\\"])', r"\\\1", value) + '"'
+        out += f"; {name}={value}"
+    return out
+
+
+def _stated_media_type(stated) -> str:
+    """A stated content type as one media type, or application/octet-stream.
+
+    For a type that came from outside and is kept, shown or handed on as
+    text: read strictly (_parse_media_type) and written back from what was
+    read (_media_type_header), so the result is one line of a type's own
+    characters, whatever was declared."""
+    parsed = _parse_media_type(stated)
+    return _media_type_header(*parsed) if parsed else "application/octet-stream"
+
+
+# What a browser runs as a script or a worker: the JavaScript MIME types
+# (WHATWG MIME Sniffing, "JavaScript MIME type"). The page's
+# Content-Security-Policy (scripts/content_policy.py) lets scripts run from
+# this origin only, which is a boundary only while nothing on the origin
+# answers bytes chosen outside under one of these types: a <script src> or a
+# worker pointed at such an answer would run it as the dashboard's own. Under
+# nosniff, every answer here, no other type is run as a script, so a route
+# that serves bytes from outside (a thread attachment, a messenger file, a
+# store's result) answers these as application/octet-stream instead.
+_SCRIPT_MEDIA_TYPES = frozenset({
+    "application/ecmascript", "application/javascript", "application/x-ecmascript",
+    "application/x-javascript", "text/ecmascript", "text/javascript",
+    "text/javascript1.0", "text/javascript1.1", "text/javascript1.2",
+    "text/javascript1.3", "text/javascript1.4", "text/javascript1.5", "text/jscript",
+    "text/livescript", "text/x-ecmascript", "text/x-javascript",
+})
+
+
+def _served_media_type(stated) -> str:
+    """A content type from outside as a route of this origin may answer with
+    it: one media type, written back from what was read (_stated_media_type),
+    and never a script type (_SCRIPT_MEDIA_TYPES), which becomes
+    application/octet-stream."""
+    parsed = _parse_media_type(stated)
+    if not parsed or parsed[0] in _SCRIPT_MEDIA_TYPES:
+        return "application/octet-stream"
+    return _media_type_header(*parsed)
+
+
+def _media_essence(stated) -> str:
+    """A stated content type as its bare ``type/subtype``, or
+    application/octet-stream.
+
+    For a type that is written into a prompt. A parameter's quoted value may
+    hold any printable text, sentences included, so a prompt names only the
+    essence; the parameters kept by _stated_media_type belong in a
+    Content-Type header, where a browser reads them."""
+    parsed = _parse_media_type(stated)
+    return parsed[0] if parsed else "application/octet-stream"
+
+
+def _chat_media_headers(stated) -> dict:
+    """The headers a relayed messenger blob is answered with.
+
+    ``stated`` is what the storing gateway's answer carried as Content-Type:
+    the list of its header values, None when it sent none. More than one is
+    not a statement of one type and is read like an unreadable one. See the
+    section comment above for the rule; an XML type under audio/ or video/
+    (a ``+xml`` subtype) is no medium a player loads, and a browser may take
+    any ``+xml`` type for an XML document, so it is a download like the rest.
+    The file name the sender gave is not known here (it is in the gateway's
+    store and in the ledger record), so a download goes out without one and
+    is named after the URL and the type. A script type is never sent: such a
+    file is application/octet-stream (_SCRIPT_MEDIA_TYPES)."""
+    parsed = _parse_media_type(stated[0]) if stated and len(stated) == 1 else None
+    if parsed and parsed[0] in _SCRIPT_MEDIA_TYPES:
+        # Never a script of this origin; a download, saved as bytes.
+        parsed = None
+    essence, params = parsed or ("application/octet-stream", {})
+    major, _, minor = essence.partition("/")
+    in_place = essence in _INLINE_SAFE_TYPES or (
+        major in ("audio", "video") and not minor.endswith("+xml"))
+    headers = {
+        "Content-Type": _media_type_header(essence, params),
+        "X-Content-Type-Options": "nosniff",
+    }
+    if not in_place:
+        headers["Content-Disposition"] = "attachment"
+        headers["Content-Security-Policy"] = _DOWNLOAD_CSP
+    return headers
 
 
 def _new_conv(initiator: str, owner: str, title: str | None,
@@ -2501,10 +3317,17 @@ def _new_conv(initiator: str, owner: str, title: str | None,
               model: str | None = None,
               agent: str | None = None,
               context: str | None = None,
-              chat: str | None = None) -> dict:
+              chat: str | None = None,
+              via_edge: bool = False) -> dict:
     now = datetime.now(timezone.utc).isoformat()
     cid = uuid.uuid4().hex
-    first_msg = {"role": first_role, "text": first_text, "ts": now}
+    first_msg = {"role": first_role, "text": first_text, "ts": now,
+                 "id": uuid.uuid4().hex[:12]}
+    if via_edge:
+        # Written by the user through the reverse proxy (the dashboard), not
+        # by an in-container caller: only such a message may start a turn
+        # that types on their device (_conv_turn_may_type).
+        first_msg["via_edge"] = True
     atts = _store_attachments(cid, first_attachments or [])
     if atts:
         first_msg["attachments"] = atts
@@ -2581,7 +3404,11 @@ def _conv_add_message(cid: str, role: str, text: str, *,
                       cost_usd: float | None = None,
                       agent: str | None = None,
                       context: str | None = None,
-                      wake: bool = False) -> dict | None:
+                      shell_actions_: list[dict] | None = None,
+                      reply_to: str | None = None,
+                      via_edge: bool = False,
+                      wake: bool = False,
+                      arrival: bool = False) -> dict | None:
     """Append a message to a thread and update its flags. Returns the thread.
 
     `model_name`/`cost_usd` carry the answering turn's metadata (short model
@@ -2592,7 +3419,22 @@ def _conv_add_message(cid: str, role: str, text: str, *,
     stored with the message and replayed to Ara's sessions, never rendered to
     the user — see _conv_context_note. `stored_attachments` is metadata of
     files already written to the thread's store (_store_reply_files), appended
-    after whatever `attachments` stores.
+    after whatever `attachments` stores. `shell_actions_` are the validated
+    shell actions (text for the user's paired keyboard device) Ara's reply
+    carries — scripts/shell_actions.py; the dashboard hands them to the
+    Android app. `reply_to` is the id of the user message such a reply
+    answers: when any user message stands after it by the time the reply is
+    stored, the user wrote again while the turn ran ("no, don't type that"),
+    so none of the actions runs without a tap (`auto` False). That is
+    checked here, under the lock, so no message can land between the check
+    and the append.
+
+    `arrival` marks Ara's reply to a turn nobody in the thread asked for: a
+    chat message that arrived in a companion thread's chat (_conv_worker's
+    `arrival`). The dashboard's voice loop takes only a reply without it as
+    the answer to the user's spoken turn, so a call directive that a
+    correspondent's text steered into such a reply is never placed
+    (webapp/components/conversation.js, _maybeAutoplay).
 
     `wake` marks an append that carries something new for the user (an agent
     filing an inbound message into an existing thread). Such an append
@@ -2609,7 +3451,10 @@ def _conv_add_message(cid: str, role: str, text: str, *,
         conv = _load_conv(cid)
         if conv is None:
             return None
-        message = {"role": role, "text": text, "ts": now}
+        message = {"role": role, "text": text, "ts": now,
+                   "id": uuid.uuid4().hex[:12]}
+        if via_edge:
+            message["via_edge"] = True   # see _new_conv
         lang = _detect_lang(text)
         if lang:
             message["lang"] = lang
@@ -2623,6 +3468,24 @@ def _conv_add_message(cid: str, role: str, text: str, *,
             message["agent"] = agent
         if context:
             message["context"] = context
+        if shell_actions_:
+            message["shell_actions"] = list(shell_actions_)
+            if reply_to is not None:
+                thread = [m for m in conv.get("messages", []) if isinstance(m, dict)]
+                ids = [_conv_message_id(m) for m in thread]
+                # A message the reply answers that is no longer found leaves
+                # nothing to tell the newer ones by, so all of them count.
+                later = thread[ids.index(reply_to) + 1:] if reply_to in ids else thread
+                if any(m.get("role") == "user" for m in later):
+                    message["shell_actions"] = [dict(a, auto=False)
+                                                for a in shell_actions_]
+            if any(a.get("sensitive") for a in shell_actions_):
+                # The file loses the text by itself even if nobody reads the
+                # thread again; a restart in between is covered by
+                # _conv_sensitive_sweep at startup.
+                _conv_schedule_purge(cid, shell_actions.SENSITIVE_TTL_SECONDS)
+        if arrival:
+            message["arrival"] = True
         conv.setdefault("messages", []).append(message)
         conv["updated"] = now
         if wake and conv.get("archived") and not conv.get("muted"):
@@ -2639,6 +3502,116 @@ def _conv_add_message(cid: str, role: str, text: str, *,
                 conv.pop("pending_error", None)
         _save_conv(conv)
         return conv
+
+
+REDACTED_TEXT = "[deleted by request]"
+
+
+def _conv_redact_message(cid: str, message_id: str) -> tuple[dict | None, int, str]:
+    """Replace one user message's text with REDACTED_TEXT, for good.
+
+    For a message in which the user dictated a password Ara then typed on
+    their device: the text, its language tag and its attachments (metadata
+    and files) go; the message stays in place, so the thread still reads in
+    order. Every other copy the system keeps goes with it: a thread title
+    derived from that text, the session-log entry whose question it was
+    (_redact_session_log), and the thread's Claude session, whose transcript
+    holds it verbatim (_reset_session — the next turn replays the redacted
+    thread instead). Only user messages, and only by the id the transcript
+    shows. Returns (thread, 200, "") or (None, HTTP status, reason)."""
+    with _conversations_lock:
+        conv = _load_conv(cid)
+        if conv is None:
+            return None, 404, "not found"
+        target = next((m for m in conv.get("messages") or []
+                       if isinstance(m, dict) and _conv_message_id(m) == message_id), None)
+        if target is None:
+            return None, 404, "no such message"
+        if target.get("role") != "user":
+            return None, 400, "only the user's own messages can be redacted"
+        original = str(target.get("text") or "")
+        atts = target.get("attachments") or []
+        target["id"] = message_id   # a derived id becomes the stored one
+        target["text"] = REDACTED_TEXT
+        target["redacted"] = True
+        for key in ("lang", "attachments", "context"):
+            target.pop(key, None)
+        if original and conv.get("title") == _derive_title(original):
+            conv["title"] = _derive_title(REDACTED_TEXT)
+        _save_conv(conv)
+    _delete_attachment_files(cid, atts)
+    _redact_session_log(cid, message_id, target.get("ts"))
+    with _conv_pending_lock:
+        running = _conv_pending_turns.get(cid, 0) > 0
+    _reset_session(CONV_SESSION_KEY_PREFIX + cid, running=running)
+    return conv, 200, ""
+
+
+def _conv_redaction_refused(cid: str, message_id: str) -> str:
+    """Why an agent may not redact `message_id` now, or "" when it may: only
+    from inside a turn of this thread that the user started from the dashboard
+    after that message — the turn answering their "yes, delete it". That the
+    user approved stays the prompt's rule; this keeps a redaction from coming
+    out of nowhere (another thread's turn, a scheduled job, a script)."""
+    with _conv_pending_lock:
+        running = _conv_pending_turns.get(cid, 0) > 0
+    if not running:
+        return "a redaction is made from inside a turn of this thread"
+    conv = _load_conv(cid)
+    if conv is None:
+        return "not found"
+    messages = [m for m in conv.get("messages") or [] if isinstance(m, dict)]
+    ids = [_conv_message_id(m) for m in messages]
+    if message_id not in ids:
+        return "no such message"
+    latest = _conv_latest_user_message(messages)
+    if latest is None or latest.get("via_edge") is not True:
+        return "the turn was not started by the user from the dashboard"
+    if ids.index(_conv_message_id(latest)) <= ids.index(message_id):
+        return "the user has written nothing since that message"
+    return ""
+
+
+def _delete_attachment_files(cid: str, atts: list) -> None:
+    """Delete the stored files behind attachment metadata of thread `cid`."""
+    for att in atts if isinstance(atts, list) else []:
+        if not isinstance(att, dict):
+            continue
+        att_id, suffix = str(att.get("id") or ""), str(att.get("suffix") or "")
+        if not re.fullmatch(r"[0-9a-f]{32}", att_id) or \
+                not re.fullmatch(r"(\.[A-Za-z0-9]{1,8})?", suffix):
+            continue
+        (CONVERSATION_ATTACHMENTS_DIR / cid / f"{att_id}{suffix}").unlink(missing_ok=True)
+
+
+def _redact_session_log(thread_id: str, message_id: str, ts: object) -> int:
+    """Replace the question of the session-log entries (/conversation/<day>)
+    that are message `message_id` of thread `thread_id` with REDACTED_TEXT —
+    a dashboard turn logs the message it answers so (_append_entry), and one
+    still running logs it redacted (_note_redacted). The entry is written when
+    the turn ends, so the message's own UTC day and the next one are searched.
+    Entries written before entries named their message are left alone.
+    Returns how many entries changed."""
+    try:
+        day = datetime.fromisoformat(str(ts).replace("Z", "+00:00")).astimezone(timezone.utc)
+        days = [day.strftime("%Y-%m-%d"), (day + timedelta(days=1)).strftime("%Y-%m-%d")]
+    except (TypeError, ValueError):
+        days = [_today()]
+    _note_redacted(thread_id, message_id)
+    changed = 0
+    with _conversation_lock:
+        for date_str in days:
+            entries = _load_conversation(date_str)
+            hit = 0
+            for entry in entries:
+                if (isinstance(entry, dict) and entry.get("thread") == thread_id
+                        and entry.get("message") == message_id):
+                    entry["question"] = REDACTED_TEXT
+                    hit += 1
+            if hit:
+                _save_conversation(entries, date_str)
+                changed += hit
+    return changed
 
 
 def _valid_model_id(model: str | None, refresh: bool = False) -> str | None:
@@ -2767,8 +3740,12 @@ def _bind_conv_key(key: str, cid: str, ephemeral: bool = False) -> None:
 
 
 def _conv_model(conv: dict) -> str | None:
-    """The validated model a thread should run on, or None for the default."""
-    return _valid_model_id(conv.get("model"))
+    """The validated model a thread should run on, or None for the default.
+
+    A stored choice the picker no longer offers because its family's pin moved
+    on (Fable 5.1 -> 5.2) follows the pin rather than dropping to the default."""
+    stored = conv.get("model")
+    return _valid_model_id(stored) or _family_pin_equivalent(stored)
 
 
 # Threads that predate the model tiers carry no pin, because back then they
@@ -2858,9 +3835,13 @@ def _conv_attachment_note(conv: dict, msg: dict) -> str:
     for att in atts:
         stored_name = str(att.get("id", "")) + str(att.get("suffix", ""))
         path = CONVERSATION_ATTACHMENTS_DIR / cid / stored_name
+        # Name and type as they are stored, read again: the note is part of
+        # the turn's prompt, and metadata stored before both were kept as one
+        # line may hold anything. The type is named by its essence alone; the
+        # parameters it is stored with are for the download's header.
         lines.append(
-            f"- {att.get('filename', 'attachment')} "
-            f"({att.get('content_type', 'application/octet-stream')}, "
+            f"- {_attachment_name(att.get('filename'))} "
+            f"({_media_essence(att.get('content_type'))}, "
             f"{att.get('size', 0)} bytes) — saved at {path}"
         )
     who = "The user" if msg.get("role") == "user" else "This message"
@@ -2885,6 +3866,87 @@ def _conv_context_note(msg: dict) -> str:
             "not shown to the user:\n" + ctx + "]")
 
 
+def _conv_shell_actions_note(msg: dict) -> str:
+    """The shell actions a reply carried (scripts/shell-type.py), for Ara's
+    transcript, so a later turn knows what was handed to the user's keyboard
+    device. Never the text of a sensitive action (shell_actions.describe), and
+    a password-manager action carries only its label."""
+    lines = [line for line in (shell_actions.describe(a)
+                               for a in msg.get("shell_actions") or []
+                               if isinstance(a, dict)) if line]
+    if not lines:
+        return ""
+    return ("\n\n[This reply carried shell actions for the user's paired keyboard "
+            "device (scripts/shell-type.py):\n" + "\n".join(lines) + "]")
+
+
+def _conv_shell_outcome_note(messages: list) -> str:
+    """For a resumed session: what became of the shell actions its own last
+    reply carried, which it has not been told — the page reports outcomes
+    after the reply (shell_actions.describe; never a sensitive text)."""
+    for m in reversed(messages):
+        if isinstance(m, dict) and m.get("role") == "assistant":
+            lines = [line for line in (shell_actions.describe(a)
+                                       for a in m.get("shell_actions") or []
+                                       if isinstance(a, dict)) if line]
+            if not lines:
+                return ""
+            return ("\n\n[What became of the shell actions your last reply carried:\n"
+                    + "\n".join(lines) + "]")
+    return ""
+
+
+def _conv_message_id(msg: dict) -> str:
+    """A message's id: the one it was stored with, or — for a message stored
+    before messages had ids — one derived from its time and role, which
+    never change (so it is the same on every read)."""
+    mid = msg.get("id") if isinstance(msg, dict) else None
+    if isinstance(mid, str) and re.fullmatch(r"[0-9a-f]{12,32}", mid):
+        return mid
+    seed = f"{msg.get('ts', '')}|{msg.get('role', '')}" if isinstance(msg, dict) else ""
+    return hashlib.sha256(seed.encode("utf-8")).hexdigest()[:12]
+
+
+def _conv_message_id_note(msg: dict) -> str:
+    """A user message's id, so Ara can redact it on request
+    (conversation-push.py --thread <id> --redact-message <message id>)."""
+    if msg.get("role") != "user" or msg.get("redacted"):
+        return ""
+    return f" [message id: {_conv_message_id(msg)}]"
+
+
+_CANCELLED_CALL_NUMBER_RE = re.compile(r"\+?[0-9*#]{3,24}")
+
+
+def _cancelled_call_context(value) -> str | None:
+    """The note for a voice take that cancelled a call by being spoken.
+
+    In the phone shell's voice conversation a call Ara placed waits 5 s with
+    the mic open, and any speech cancels it (webapp/components/conversation.js,
+    CANCELLED_CALLS); the take that did is sent in any case, carrying
+    `cancelled_call: {number, name}`. Only its words can tell whether the user
+    meant to stop the call, so Ara is told — in wording fixed here, the
+    client supplying nothing but a validated number and a short name."""
+    if not isinstance(value, dict):
+        return None
+    number = str(value.get("number") or "").strip()
+    if not _CANCELLED_CALL_NUMBER_RE.fullmatch(number):
+        return None
+    name = " ".join(str(value.get("name") or "").replace("|", " ").replace("]", " ").split())[:80]
+    who = f"{name} ({number})" if name else number
+    return (
+        f"This voice take cancelled the call to {who}: it was heard while the "
+        "call waited to be placed, so the call was NOT made. Judge from the "
+        "words whether the user meant to stop it. If not — background noise, a "
+        "word to someone else, an affirmation, or a request that still wants "
+        "the call — place it again at once without asking: this is a second "
+        "attempt, so end your reply with "
+        f"[[call: {number} | {name} | no-voice-cancel]] and say it cannot be "
+        "stopped by voice this time. If they did mean to stop it (or asked for "
+        "something else instead), do not call; act on what they said."
+    )
+
+
 # How a message's author is named when a transcript is replayed to Ara.
 _CONV_ROLE_LABEL = {"user": "User", "assistant": "You (Ara)", "agent": "Retinue agent"}
 
@@ -2895,6 +3957,7 @@ def _conv_render_messages(conv: dict, messages: list) -> str:
     return "\n".join(
         f"{_CONV_ROLE_LABEL.get(m.get('role'), m.get('role'))}: "
         f"{m.get('text', '')}{_conv_attachment_note(conv, m)}{_conv_context_note(m)}"
+        f"{_conv_shell_actions_note(m)}{_conv_message_id_note(m)}"
         for m in messages
     )
 
@@ -3023,7 +4086,11 @@ def _conv_chat_note(conv: dict) -> str:
             text = " ".join(str(m.get("text") or "").split())
             atts = m.get("attachments") or []
             if atts:
-                kinds = sorted({a.get("type") for a in atts if a.get("type")})
+                # The note is part of the prompt, so a type is named here
+                # only as the essence of one media type, whichever path
+                # handed the attachment on; anything else is left out.
+                parsed = (_parse_media_type(a.get("type")) for a in atts)
+                kinds = sorted({p[0] for p in parsed if p})
                 label = f"{len(atts)} attachment" + ("s" if len(atts) > 1 else "")
                 if kinds:
                     label += ": " + ", ".join(kinds)
@@ -3171,8 +4238,10 @@ def _conv_engage_prompt(conv: dict, fresh: bool,
         )
     if fresh:
         unseen = _conv_unseen_messages(messages)
+        outcome_note = _conv_shell_outcome_note(messages)
         if len(unseen) <= 1:
-            return ((latest + note + _conv_context_note(latest_msg) + chat_note)
+            return ((latest + note + _conv_context_note(latest_msg)
+                     + _conv_message_id_note(latest_msg) + outcome_note + chat_note)
                     or latest)
         return (
             "These messages arrived in this thread since your last reply, "
@@ -3181,7 +4250,7 @@ def _conv_engage_prompt(conv: dict, fresh: bool,
             "Reply to the user's latest message in your own voice, taking the "
             "others into account. If they approve a concrete action, carry it "
             "out with your tools and confirm what you did."
-            + chat_note
+            + outcome_note + chat_note
         )
     # The transcript already carries each message's own attachment note, so the
     # latest message's files need no second mention here.
@@ -3194,9 +4263,6 @@ def _conv_engage_prompt(conv: dict, fresh: bool,
         "invitation), carry it out with your tools and confirm what you did."
         + _conv_project_note(conv) + chat_note
     )
-
-
-_CHIP_MARKUP_RE = re.compile(r"\[\[chip:[^\]]*\]\]\s*(?:·\s*)?")
 
 
 def _push_conv_notification(conv: dict, text: str, urgency: str | None = None) -> int:
@@ -3223,8 +4289,9 @@ def _push_conv_notification(conv: dict, text: str, urgency: str | None = None) -
               "notifies nobody", flush=True)
         return 0
     title = conv.get("title") or instance_branding.display_name()
-    # The notification shows words, not the chip markup the thread renders.
-    body = " ".join(_CHIP_MARKUP_RE.sub("", str(text or "")).split())
+    # The notification shows words, not the chip and call markup the thread
+    # renders (attention_store.markup_words, as the row's preview does).
+    body = " ".join(attention_store.markup_words(text).split())
     if len(body) > 160:
         body = body[:157].rstrip() + "…"
     push_notify.notify_async(title, body, url=f"/#conversation-{cid}", tag=cid,
@@ -3252,7 +4319,10 @@ def _conv_worker(cid: str, session_key: str, *, arrival: str | None = None,
     whether the gateway may flip the message's `delivered` flag.
     """
     ok = False
+    skipped = False
     reply_atts: list[dict] = []
+    reply_actions: list[dict] = []
+    reply_to: str | None = None
     with _conv_pending_lock:
         _conv_pending_turns[cid] = _conv_pending_turns.get(cid, 0) + 1
     try:
@@ -3261,17 +4331,19 @@ def _conv_worker(cid: str, session_key: str, *, arrival: str | None = None,
         if conv is None:
             return False
         messages = conv.get("messages", [])
+        # The user message this turn was started for (none for an arrival).
+        target = None if arrival else _conv_latest_user_message(messages)
+        target_id = _conv_message_id(target) if target else None
         latest = (ARRIVAL_QUESTION if arrival
-                  else (messages[-1]["text"] if messages else ""))
+                  else _conv_display_question(target or (messages[-1] if messages else {})))
         resume = (CHAT_COMPANION_RESUME
                   or (conv.get("kind") or "chat") != "companion")
         fresh = resume and _session_is_fresh(_get_session_entry(session_key),
                                              session_key)
+        # What a stand-in for send_message sees; the real one builds the
+        # prompt again under the session lock (build_prompt below), with the
+        # whole thread for a session that turns out not to be resumable.
         prompt = _conv_engage_prompt(conv, fresh, arrival)
-        # The resumed prompt sends only what the session has not seen, so if the
-        # resume is refused the turn must fall back to the full transcript — not
-        # to a fragment whose context is missing.
-        restart = _conv_engage_prompt(conv, False, arrival) if fresh else None
         # An explicit per-thread choice wins; an escalated thread without one
         # stays with Ara senior (the frontier tier) rather than re-paying a
         # junior turn plus an escalation on every message. Otherwise the
@@ -3283,13 +4355,68 @@ def _conv_worker(cid: str, session_key: str, *, arrival: str | None = None,
             chosen = FRONTIER_MODEL
         elif chosen is None and DASHBOARD_MODEL:
             chosen = _default_thread_model()
+        may_type = _conv_turn_may_type(messages, arrival)
+        # Whether the turn may still type once it holds the session lock
+        # (build_prompt below): the prompt it is then sent ends with the
+        # newest message of the thread, which need not be the one it was
+        # started for. Once False it stays False.
+        typing_ok = [may_type]
+
+        covered: list = [None]
+
+        def build_prompt(fresh_now: bool) -> str | None:
+            # Read again once the turn holds the session lock: what it waited
+            # behind may have answered this turn's message already, redacted
+            # one, reset the session — or deleted the thread.
+            current = _load_conv(cid)
+            if current is None:
+                return None
+            msgs = current.get("messages", [])
+            if target_id and _conv_is_covered(cid, msgs, target_id, may_type):
+                return None
+            # The prompt reaches the end of the thread, so this turn answers
+            # the newest user message of its own kind — the kind that decided
+            # may_type — and every one of that kind before it. A message of
+            # the other kind keeps its own turn: one sent from the dashboard
+            # must still be answered by a turn that may type, an in-container
+            # one by a turn that may not. An arrival answers no user message.
+            same = [m for m in msgs if isinstance(m, dict) and m.get("role") == "user"
+                    and (m.get("via_edge") is True) == may_type]
+            covered[0] = (_conv_message_id(same[-1])
+                          if same and not arrival else None)
+            # Another turn replied after this turn's message without answering
+            # it (it was of the other kind, or it failed): a resumed session's
+            # "what is new since your last reply" would then be that reply, so
+            # the session is shown the whole thread instead.
+            if fresh_now and target_id and _conv_replied_after(msgs, target_id):
+                fresh_now = False
+            # The prompt asks Ara to reply to the newest user message. One a
+            # caller inside the container posted while this turn waited is not
+            # the user's, yet it would be the one answered: such a turn may no
+            # longer type, though the dashboard message it started for is
+            # still covered (and answered, without typing).
+            typing_ok[0] = typing_ok[0] and _conv_turn_may_type(msgs, arrival)
+            return _conv_engage_prompt(current, fresh_now, arrival)
+
         result = send_message(prompt, display_question=latest, session_key=session_key,
-                              model=chosen, restart_message=restart,
+                              model=chosen, restart_message=None,
                               resume=resume,
-                              reply_attachments=True, thread_id=cid)
+                              reply_attachments=True,
+                              # Only a turn the user started, from the
+                              # dashboard, may type on their paired device —
+                              # asked once the prompt is built, as it is then.
+                              reply_shell_actions=lambda: may_type and typing_ok[0],
+                              thread_id=cid, prompt_builder=build_prompt,
+                              display_message_id=target_id)
+        if result.get("skipped"):
+            skipped = True
+        elif "error" not in result and covered[0]:
+            _conv_note_covered(cid, covered[0], may_type)
         if result.get("escalated"):
             _conv_set_flags(cid, escalated=True)
-        if "error" in result:
+        if skipped:
+            reply = None
+        elif "error" in result:
             reply = ("Sorry, I couldn't reply just now "
                      f"({result['error']}). Please try again.")
         else:
@@ -3297,6 +4424,43 @@ def _conv_worker(cid: str, session_key: str, *, arrival: str | None = None,
             # Files the session attached to its own reply (conversation-push.py
             # --reply-attach) ride on this very message.
             reply_atts = _store_reply_files(cid, result.get("reply_files") or [])
+            # And the shell actions (scripts/shell-type.py): text the user's
+            # phone types on the device it is paired with as a keyboard.
+            reply_actions = list(result.get("reply_shell_actions") or [])
+            if not (may_type and typing_ok[0]) and reply_actions:
+                print(f"[web-gateway] conversation {cid}: {len(reply_actions)} shell "
+                      "action(s) of a turn that may not type dropped", flush=True)
+                reply_actions = []
+            # Whether the page may run each without a tap is decided here,
+            # once (the page runs by itself only what carries auto: true):
+            # never in a thread where other people's words reach the turn.
+            # What the user has seen is the thread as it stood when the turn
+            # started, up to the message it answers: whatever the turn itself
+            # posted meanwhile (a "user" message from inside the container, a
+            # push) came out of what Ara read, not from the user's screen. And
+            # only a reply's first action can run by itself, so no text can be
+            # put together from pieces that each stand somewhere in the
+            # thread, and none is typed ahead of an earlier action that waits
+            # for a tap: the device would take them in the wrong order, and an
+            # Enter the user confirms later would run a line they never saw.
+            thread_auto = _conv_allows_auto_run(conv)
+            upto = next((i for i, m in enumerate(messages) if m is target), -1)
+            shown = messages[:upto + 1]
+            for i, action in enumerate(reply_actions):
+                action["auto"] = bool(i == 0 and thread_auto
+                                      and shell_actions.runs_by_itself(action)
+                                      and _conv_text_was_shown(shown, action.get("text")))
+            # Those marks were decided on the thread as the turn found it. A
+            # user message that lands after the one this turn answered (the
+            # newest it covered, else the one it was started for) is a word
+            # the reply never read, perhaps "no, don't type that":
+            # _conv_add_message then holds every action for a tap, checked
+            # under the lock it appends with.
+            reply_to = covered[0] or target_id
+            if any(a.get("sensitive") for a in reply_actions):
+                # A title derived from the user's message may carry the very
+                # text typed; it reaches the thread list and every push.
+                _conv_neutral_title(cid)
             # The lint enforces the dashboard-composing form (chips for
             # options, no bare URLs) on the way out — the net under whichever
             # model composed the reply. Error replies above skip it: they are
@@ -3305,7 +4469,7 @@ def _conv_worker(cid: str, session_key: str, *, arrival: str | None = None,
             text = result.get("response") or ""
             reply = (_lint_presentation(text or "(no reply)",
                                         kind=conv.get("kind") or "chat")
-                     if text or not reply_atts else "")
+                     if text or not (reply_atts or reply_actions) else "")
     except Exception as exc:  # noqa: BLE001 - always surface a turn back to the UI
         print(f"[web-gateway] conversation {cid} worker failed: {exc!r}", flush=True)
         reply = f"Sorry, an error occurred: {exc}"
@@ -3322,20 +4486,173 @@ def _conv_worker(cid: str, session_key: str, *, arrival: str | None = None,
             _conv_pending_turns[cid] = still_running
         else:
             _conv_pending_turns.pop(cid, None)
+    if skipped:
+        # The turn before answered this turn's message too (or the thread
+        # went): no reply of its own, and no "(no reply)" either.
+        _conv_set_flags(cid, pending=bool(still_running))
+        return True
     conv = _conv_add_message(cid, "assistant", reply, unread=True,
                              pending=bool(still_running),
                              stored_attachments=reply_atts,
+                             shell_actions_=reply_actions,
+                             reply_to=reply_to,
                              model_name=result.get("model_name"),
-                             cost_usd=result.get("cost_usd"))
+                             cost_usd=result.get("cost_usd"),
+                             arrival=bool(arrival))
+    if not still_running:
+        # A reset asked for while this turn ran (a redaction) is consumed by
+        # the turn's session write (_record_turn_session); a turn that wrote
+        # none leaves it here. A sensitive text's session was already dropped
+        # inside send_message, under the session lock.
+        with _state_lock:
+            _reset_session_keys.discard(session_key)
     if conv is None:
         # Nothing was stored, so nothing has accounted for whatever prompted
         # this turn. Saying otherwise would let a gateway mark an inbound
         # message delivered against a reply that does not exist.
         return False
     if push:
+        # A reply that is only shell actions still says something: a fixed
+        # phrase, never the text to type, which may be a sensitive one and must
+        # not reach a push.
         _push_conv_notification(
-            conv, reply or ", ".join(a["filename"] for a in reply_atts))
+            conv, reply or ", ".join(a["filename"] for a in reply_atts)
+            or ("Ready to type on your device" if reply_actions else ""))
     return ok
+
+
+def _conv_latest_user_message(messages: list) -> dict | None:
+    for m in reversed(messages or []):
+        if isinstance(m, dict) and m.get("role") == "user":
+            return m
+    return None
+
+
+def _conv_display_question(msg: dict) -> str:
+    """What the session log records as a turn's question: the message's text,
+    or what it carried when it has none — never the prompt, which for a
+    replayed thread holds everything said in it."""
+    text = str((msg or {}).get("text") or "").strip()
+    if text:
+        return text
+    # A stored name is what the file was called where it came from, so it is
+    # read again here as at every other use (_attachment_name): a base name
+    # on one line, also for metadata stored before names were cleaned.
+    names = [_attachment_name(a.get("filename")) for a in (msg or {}).get("attachments") or []
+             if isinstance(a, dict)]
+    return f"[attachment: {', '.join(names)}]" if names else "[no text]"
+
+
+# Per thread and kind of turn — one that may type (its message came from the
+# dashboard) or one that may not — the newest user message of that kind a
+# completed turn's prompt covered: a turn of the same kind queued behind it
+# whose own message is no newer has nothing left to answer (it would
+# otherwise answer it twice, or be sent Ara's own reply as "what is new").
+# Kept apart by kind, since a position in the thread covers every message
+# before it: a turn that may not type must never answer away a dashboard
+# message whose own turn would have typed, nor the reverse. In memory: a
+# queued turn does not outlive the process.
+_conv_covered: dict[tuple[str, bool], str] = {}
+_conv_covered_lock = threading.Lock()
+_CONV_COVERED_MAX = 2000
+
+
+def _conv_note_covered(cid: str, message_id: str, may_type: bool) -> None:
+    key = (cid, bool(may_type))
+    with _conv_covered_lock:
+        _conv_covered.pop(key, None)
+        _conv_covered[key] = message_id
+        while len(_conv_covered) > _CONV_COVERED_MAX:
+            _conv_covered.pop(next(iter(_conv_covered)))
+
+
+def _conv_is_covered(cid: str, messages: list, target_id: str,
+                     may_type: bool) -> bool:
+    """Whether a completed turn of the same kind already answered the
+    message `target_id`."""
+    with _conv_covered_lock:
+        covered = _conv_covered.get((cid, bool(may_type)))
+    if not covered:
+        return False
+    ids = [_conv_message_id(m) for m in messages or [] if isinstance(m, dict)]
+    if target_id not in ids or covered not in ids:
+        return False
+    return ids.index(target_id) <= ids.index(covered)
+
+
+def _conv_replied_after(messages: list, target_id: str) -> bool:
+    """Whether a reply of Ara's stands after the message `target_id`."""
+    ids = [_conv_message_id(m) for m in messages or [] if isinstance(m, dict)]
+    if target_id not in ids:
+        return False
+    later = [m for m in messages if isinstance(m, dict)][ids.index(target_id) + 1:]
+    return any(m.get("role") == "assistant" for m in later)
+
+
+def _conv_turn_may_type(messages: list, arrival: str | None) -> bool:
+    """Whether this turn may attach shell actions: one the user started, by a
+    message that reached the gateway through the reverse proxy (`via_edge`,
+    set by the dashboard's own endpoints) — not a chat arrival, and not a
+    "user" message an in-container agent posted."""
+    if arrival:
+        return False
+    # The user message the turn answers: the latest one — an agent's push or
+    # an arrival's reply may have landed after it.
+    m = _conv_latest_user_message(messages)
+    return bool(m) and m.get("via_edge") is True
+
+
+def _conv_allows_auto_run(conv: dict) -> bool:
+    """Whether actions in this thread may run without a tap at all: only in a
+    plain chat the user opened. A companion thread carries a correspondent's
+    messages into every turn, an agent's thread (triage, an alert) the words
+    it was opened with — text that must never type by itself."""
+    return ((conv.get("kind") or "chat") == "chat"
+            and conv.get("initiator", "user") == "user")
+
+
+def _conv_text_was_shown(messages: list, text: object) -> bool:
+    """Whether `text` stands verbatim, as a whole line, in `messages` — the
+    thread as the user saw it before this turn: their own messages sent from
+    the dashboard (`via_edge`) or Ara's earlier replies. A text that runs
+    without a tap must be one the user could have read ("type the text
+    above"), not one that came out of something Ara read meanwhile; a "user"
+    message posted from inside the container is not the user's. A whole line
+    (its edge whitespace aside), not any piece of one: otherwise a single
+    letter — an app's shortcut on the device — or a command cut out of a
+    sentence would count as seen."""
+    if not isinstance(text, str) or not text.strip():
+        return False
+    text = text.strip()
+    for m in messages or []:
+        if not isinstance(m, dict):
+            continue
+        if m.get("role") == "user" and m.get("via_edge") is not True:
+            continue
+        if m.get("role") not in ("user", "assistant"):
+            continue
+        lines = re.split(r"\r\n|\r|\n", str(m.get("text") or ""))
+        if any(line.strip() == text for line in lines):
+            return True
+    return False
+
+
+SENSITIVE_THREAD_TITLE = "Typing on a paired device"
+
+
+def _conv_neutral_title(cid: str) -> None:
+    """Replace a thread title derived from one of the user's messages — it may
+    carry a password typed in this thread — with SENSITIVE_THREAD_TITLE."""
+    with _conversations_lock:
+        conv = _load_conv(cid)
+        if conv is None:
+            return
+        derived = {_derive_title(str(m.get("text") or ""))
+                   for m in conv.get("messages") or []
+                   if isinstance(m, dict) and m.get("role") == "user"}
+        if conv.get("title") in derived:
+            conv["title"] = SENSITIVE_THREAD_TITLE
+            _save_conv(conv)
 
 
 def _start_conv_turn(cid: str) -> None:
@@ -3439,41 +4756,20 @@ def _all_pending() -> list[dict]:
     return items
 
 
-# The way out of the /sends pages once nothing is left to decide: back to the
-# page the approval link was tapped on — the dashboard opens it in place
-# (#359), so that is the latest same-origin history entry that is not a
-# /sends page (Navigation API), however many approval and status pages
-# followed it. A page opened on its own (a link from another app, another
-# site before it in the tab) has none, so it closes; where the browser
-# refuses that, the dashboard — never the empty /sends list.
-_SENDS_LEAVE_JS = (
-    "  function closeOrHome(){\n"
-    "    window.close();\n"
-    "    setTimeout(function(){location.replace('/');},400);\n"
-    "  }\n"
-    "  function leave(){\n"
-    "    var nav=window.navigation;\n"
-    "    if(nav&&nav.currentEntry&&nav.entries){\n"
-    "      var entries=nav.entries();\n"
-    "      for(var i=nav.currentEntry.index-1;i>=0;i--){\n"
-    "        var u;\n"
-    "        try{u=new URL(entries[i].url);}catch(e){continue;}\n"
-    "        if(u.origin!==location.origin||/^\\/sends(\\/|$)/.test(u.pathname))continue;\n"
-    "        var t=nav.traverseTo(entries[i].key);\n"
-    "        if(t&&t.committed){t.committed.catch(closeOrHome);}\n"
-    "        return;\n"
-    "      }\n"
-    "    }\n"
-    "    closeOrHome();\n"
-    "  }\n"
-)
+# The script of the /sends pages (webapp/gateway/sends.js): the way out once
+# nothing is left to decide, the approval card's button lock and the status
+# page's polling. A file of the dashboard's own, never script in the page,
+# since the pages' Content-Security-Policy runs scripts only from such files
+# (docs/dashboard.md, "The Content-Security-Policy"); what a page needs to
+# know is written into its markup, which the script reads.
+_SENDS_SCRIPT = '<script src="/gateway/sends.js"></script>\n'
 
 
 def _render_sends_index_html(pending: list[dict], leave: bool = False) -> str:
     """The list of pending sends. With `leave`, the empty list a decision lands
     on when nothing is left to decide goes straight back to where the approval
-    link was tapped (_SENDS_LEAVE_JS); the list itself is only what shows
-    without scripting."""
+    link was tapped (``data-sends-leave``, read by _SENDS_SCRIPT); the list
+    itself is only what shows without scripting."""
     if pending:
         rows = []
         for p in pending:
@@ -3498,12 +4794,11 @@ def _render_sends_index_html(pending: list[dict], leave: bool = False) -> str:
     return (
         _HTML_HEAD
         + "<title>Retinue — Pending Sends</title>\n"
-        + "<body>\n"
+        + ("<body data-sends-leave>\n" if leave else "<body>\n")
         + "<h1>Pending Sends</h1>\n"
         + f'<nav>{_NAV_HOME}<a href="/conversation">Session log</a></nav>\n'
         + body + "\n"
-        + ("<script>\n(function(){\n" + _SENDS_LEAVE_JS + "  leave();\n})();\n</script>\n"
-           if leave else "")
+        + (_SENDS_SCRIPT if leave else "")
         + "</body>\n</html>\n"
     )
 
@@ -3550,27 +4845,7 @@ def _render_send_single_html(detail: dict, account: str, next_url: str | None) -
           f'<button type="submit" id="btn-reject" class="btn btn-deny">Deny</button></form>\n'
         + f'  <a href="{skip}" id="btn-skip" class="btn btn-skip">Skip</a>\n'
         + "</div>\n"
-        + "<script>\n"
-          "(function(){\n"
-          "  function lockButtons(activeLabel){\n"
-          "    ['btn-approve','btn-reject'].forEach(function(id){\n"
-          "      var btn=document.getElementById(id);\n"
-          "      if(!btn)return;\n"
-          "      btn.disabled=true;\n"
-          "      btn.style.opacity='0.5';\n"
-          "      btn.style.cursor='not-allowed';\n"
-          "    });\n"
-          "    var skip=document.getElementById('btn-skip');\n"
-          "    if(skip){skip.style.pointerEvents='none';skip.style.opacity='0.5';}\n"
-          "    var active=document.getElementById(activeLabel);\n"
-          "    if(active){active.textContent='Processing...';}\n"
-          "  }\n"
-          "  var fa=document.getElementById('form-approve');\n"
-          "  if(fa){fa.addEventListener('submit',function(){lockButtons('btn-approve');});}\n"
-          "  var fr=document.getElementById('form-reject');\n"
-          "  if(fr){fr.addEventListener('submit',function(){lockButtons('btn-reject');});}\n"
-          "})();\n"
-          "</script>\n"
+        + _SENDS_SCRIPT
         + "</body>\n</html>\n"
     )
 
@@ -4044,62 +5319,25 @@ def _render_send_status_html(*, title: str, heading: str, meta_rows: list[str],
         + f'<nav>{_NAV_HOME}<a href="/sends">↑ All pending sends</a></nav>\n'
         + '<table class="answer">\n' + "\n".join(meta_rows) + "\n</table>\n"
         + body_html
-        + f'<div class="st-row"><div id="st-icon">{icon}</div>'
+        # What the script needs to know, for it to read (_SENDS_SCRIPT): the
+        # status, where to go next, where to poll, and the notes to show.
+        + '<div class="st-row" id="st-row"'
+        + "".join(f' {name}="{html.escape(value, quote=True)}"'
+                  for name, value in (("data-status", status),
+                                      ("data-next", next_url),
+                                      ("data-poll", poll_url),
+                                      ("data-note-done", notes["done"]),
+                                      ("data-note-rejected", notes["rejected"]),
+                                      ("data-note-retracted", notes["retracted"]),
+                                      ("data-note-error", notes["error"]))
+                  if value)
+        + f'><div id="st-icon">{icon}</div>'
         + f'<p id="st-note" class="meta">{html.escape(note)}</p></div>\n'
         + '<div class="actions">\n'
         + f'  <a id="st-next" href="{html.escape(next_url or "/sends")}" class="btn btn-skip"'
         + f' style="{"" if next_url else "display:none"}">Next pending send</a>\n'
         + "</div>\n"
-        + "<script>\n"
-          "(function(){\n"
-        + f"  var status={json.dumps(status)};\n"
-        + f"  var nextUrl={json.dumps(next_url)};\n"
-        + f"  var pollUrl={json.dumps(poll_url)};\n"
-        + f"  var noteDone={json.dumps(notes['done'])};\n"
-        + f"  var noteRejected={json.dumps(notes['rejected'])};\n"
-        + f"  var noteRetracted={json.dumps(notes['retracted'])};\n"
-        + f"  var noteError={json.dumps(notes['error'])};\n"
-        + "  var icon=document.getElementById('st-icon');\n"
-          "  var note=document.getElementById('st-note');\n"
-          "  var nextBtn=document.getElementById('st-next');\n"
-          "  function showNext(){if(nextUrl&&nextBtn){nextBtn.href=nextUrl;nextBtn.style.display='';}}\n"
-          "  function advance(){\n"
-          "    if(nextUrl){location=nextUrl;return;}\n"
-          "    leave();\n"
-          "  }\n"
-        + _SENDS_LEAVE_JS
-        + "  function terminal(st,err){\n"
-          "    if(st==='approved'){\n"
-          "      icon.innerHTML='<div class=\"check\">✓</div>';\n"
-          "      note.textContent=noteDone;\n"
-          "      setTimeout(advance,1500);\n"
-          "    }else if(st==='rejected'){\n"
-          "      icon.innerHTML='<div class=\"cross\">✕</div>';\n"
-          "      note.textContent=noteRejected;\n"
-          "      showNext();\n"
-          "    }else if(st==='retracted'){\n"
-          "      icon.innerHTML='<div class=\"cross\">✕</div>';\n"
-          "      note.textContent=noteRetracted;\n"
-          "      showNext();\n"
-          "    }else{\n"
-          "      icon.innerHTML='<div class=\"cross\">✕</div>';\n"
-          "      note.textContent=noteError+(err||'unknown error');\n"
-          "      showNext();\n"
-          "    }\n"
-          "  }\n"
-          "  function poll(){\n"
-          "    fetch(pollUrl,{cache:'no-store'}).then(function(r){return r.json();}).then(function(b){\n"
-          "      if(b.status&&b.status!=='sending'&&b.status!=='pending'){\n"
-          "        if('next' in b){nextUrl=b.next;}\n"
-          "        terminal(b.status,b.error);\n"
-          "      }else{setTimeout(poll,1500);}\n"
-          "    }).catch(function(){setTimeout(poll,3000);});\n"
-          "  }\n"
-          "  if(status==='sending'){setTimeout(poll,1200);}\n"
-          "  else if(status==='approved'){setTimeout(advance,1500);}\n"
-          "  else{showNext();}\n"
-          "})();\n"
-          "</script>\n"
+        + _SENDS_SCRIPT
         + "</body>\n</html>\n"
     )
 
@@ -4200,27 +5438,7 @@ def _render_channel_send_html(detail: dict, channel: str, request_id: str, next_
           f'<button type="submit" id="btn-reject" class="btn btn-deny">Deny</button></form>\n'
         + skip_btn
         + "</div>\n"
-        + "<script>\n"
-          "(function(){\n"
-          "  function lockButtons(activeLabel){\n"
-          "    ['btn-approve','btn-reject'].forEach(function(id){\n"
-          "      var btn=document.getElementById(id);\n"
-          "      if(!btn)return;\n"
-          "      btn.disabled=true;\n"
-          "      btn.style.opacity='0.5';\n"
-          "      btn.style.cursor='not-allowed';\n"
-          "    });\n"
-          "    var skip=document.getElementById('btn-skip');\n"
-          "    if(skip){skip.style.pointerEvents='none';skip.style.opacity='0.5';}\n"
-          "    var active=document.getElementById(activeLabel);\n"
-          "    if(active){active.textContent='Processing...';}\n"
-          "  }\n"
-          "  var fa=document.getElementById('form-approve');\n"
-          "  if(fa){fa.addEventListener('submit',function(){lockButtons('btn-approve');});}\n"
-          "  var fr=document.getElementById('form-reject');\n"
-          "  if(fr){fr.addEventListener('submit',function(){lockButtons('btn-reject');});}\n"
-          "})();\n"
-          "</script>\n"
+        + _SENDS_SCRIPT
         + "</body>\n</html>\n"
     )
 
@@ -4338,11 +5556,10 @@ def _render_gateways_html(statuses: list[dict]) -> str:
                 '<div class="qr-wrap">'
                 # Hidden until a refresh actually delivers an image: while the
                 # gateway is still generating the code, /qr answers JSON and a
-                # visible <img> would render as a broken-image icon.
+                # visible <img> would render as a broken-image icon. The page's
+                # script shows it once one loads (webapp/gateway/gateways.js).
                 f'<img class="qr" alt="pairing QR for {label_e}" src="/gateways/{slug}/qr" '
-                'style="display:none" '
-                "onload=\"this.style.display=''\" "
-                'onerror="this.style.display=\'none\'">'
+                'style="display:none">'
                 '<p class="qr-note meta">If no code shows yet, the gateway is still generating one — '
                 'this page refreshes automatically.</p>'
                 f"<p>{html.escape(_pairing_hint(slug))}</p>"
@@ -4366,18 +5583,12 @@ def _render_gateways_html(statuses: list[dict]) -> str:
         cards.append('<section class="gw-card">' + "\n".join(rows) + "</section>")
     if not cards:
         cards.append("<section><p>No messenger gateways are configured in this deployment.</p></section>")
-    refresh_js = (
-        "<script>\n"
-        "setInterval(function(){\n"
-        "  document.querySelectorAll('img.qr').forEach(function(img){\n"
-        "    var u=new URL(img.getAttribute('src'),location);\n"
-        "    u.searchParams.set('ts',Date.now());\n"
-        "    img.src=u.toString();\n"
-        "  });\n"
-        "}, 20000);\n"
-        "setTimeout(function(){location.reload();}, 60000);\n"
-        "</script>\n"
-    ) if any_qr else '<meta http-equiv="refresh" content="60">\n'
+    # With a code to scan, the page's script (a file of the dashboard's own:
+    # docs/dashboard.md, "The Content-Security-Policy") shows each code once
+    # it loads, fetches a fresh one every 20 s and reloads the page after a
+    # minute; without one, a plain refresh does.
+    refresh_js = ('<script src="/gateway/gateways.js"></script>\n' if any_qr
+                  else '<meta http-equiv="refresh" content="60">\n')
     return (
         _HTML_HEAD
         + "<title>Retinue — Messenger Gateways</title>\n"
@@ -4568,45 +5779,10 @@ def _render_claude_auth_html(status: dict) -> str:
         "from any shell in the container.</p></section>"
     )
 
-    flow_js = (
-        "<script>\n"
-        "var attempt=null;\n"
-        "function setResult(msg,bad){var el=document.getElementById('result');"
-        "if(!el)return;el.textContent=msg;el.style.color=bad?'var(--high)':'var(--ok)';}\n"
-        # Grace period before polling: the container needs a moment to go
-        # down, or the first poll still reaches the old gateway and reloads
-        # straight into the dying one.
-        "function pollBack(){setTimeout(function(){setInterval(function(){"
-        "fetch('/claude-auth/status',{cache:'no-store'}).then(function(r){"
-        "if(r.ok)location.reload();}).catch(function(){});},3000);},8000);}\n"
-        "var startBtn=document.getElementById('start');\n"
-        "if(startBtn)startBtn.onclick=function(){var b=this;b.disabled=true;"
-        "fetch('/claude-auth/login/start',{method:'POST'})"
-        ".then(function(r){return r.json().then(function(d){return{r:r,d:d};});})"
-        ".then(function(x){if(!x.r.ok)throw new Error(x.d.error||('HTTP '+x.r.status));"
-        "attempt=x.d.attempt;document.getElementById('authlink').href=x.d.url;"
-        "document.getElementById('flow').style.display='';b.style.display='none';"
-        "setResult('');})"
-        ".catch(function(e){setResult('Could not start the sign-in: '+e.message,true);"
-        "b.disabled=false;});};\n"
-        "var finishBtn=document.getElementById('finish');\n"
-        "if(finishBtn)finishBtn.onclick=function(){var b=this;"
-        "var code=document.getElementById('code').value.trim();"
-        "if(!code){setResult('Paste the code first.',true);return;}\n"
-        "b.disabled=true;"
-        "fetch('/claude-auth/login/finish',{method:'POST',"
-        "headers:{'Content-Type':'application/json'},"
-        "body:JSON.stringify({attempt:attempt,code:code,"
-        "restart:document.getElementById('restart').checked})})"
-        ".then(function(r){return r.json().then(function(d){return{r:r,d:d};});})"
-        ".then(function(x){if(!x.r.ok||!x.d.ok)throw new Error(x.d.error||('HTTP '+x.r.status));"
-        "if(x.d.restarting){setResult('Signed in. Restarting the agent container — "
-        "this page reconnects automatically…');pollBack();}"
-        "else{setResult('Signed in. Reloading…');"
-        "setTimeout(function(){location.reload();},1200);}})"
-        ".catch(function(e){setResult('Sign-in failed: '+e.message,true);b.disabled=false;});};\n"
-        "</script>\n"
-    )
+    # The sign-in flow's script (webapp/gateway/claude-auth.js): a file of the
+    # dashboard's own, since the pages' Content-Security-Policy runs scripts
+    # only from such files (docs/dashboard.md, "The Content-Security-Policy").
+    flow_js = '<script src="/gateway/claude-auth.js"></script>\n'
 
     return (
         _HTML_HEAD
@@ -4757,8 +5933,23 @@ def send_message(message: str, display_question: str | None = None,
                  restart_message: str | None = None,
                  resume: bool = True,
                  reply_attachments: bool = False,
-                 thread_id: str | None = None) -> dict:
+                 reply_shell_actions=None,
+                 thread_id: str | None = None,
+                 prompt_builder=None,
+                 display_message_id: str | None = None) -> dict:
     """Send message to the session for `session_key` (resume or new) and return result.
+
+    `prompt_builder(fresh)` (a dashboard thread's), when given, builds the
+    prompt once this key's session lock is held — from the thread as it is
+    then, for a session that is still `fresh` (resumable) or not — and so
+    replaces `message`/`restart_message`. A turn queued behind another must
+    not send what it read before waiting: a message redacted meanwhile, or a
+    resumed session's fragment where the session has since gone. It returns
+    None when nothing is left to answer (the turn before answered this
+    turn's message too, or the thread is gone); the result is then
+    {"skipped": True} and no model runs.
+    `display_message_id` names the thread message `display_question` is, so
+    the session log can be redacted by message, not by text.
 
     `resume=False` starts a new session even when the stored one is still
     fresh (a companion thread's turn — see CHAT_COMPANION_RESUME).
@@ -4796,7 +5987,16 @@ def send_message(message: str, display_question: str | None = None,
     --reply-attach appends to it), and the paths the run whose reply is kept
     listed come back as "reply_files". Fresh per spawn, so a run whose reply is
     discarded — junior's before an escalation, a refused resume — takes its
-    files with it.
+    files with it. The same turn gets a second manifest,
+    RETINUE_REPLY_SHELL_ACTIONS_FILE (scripts/shell-type.py), under the same
+    rules; its validated actions come back as "reply_shell_actions".
+    `reply_shell_actions` (default: as `reply_attachments`) withholds that
+    second manifest alone: a turn nobody asked for — a chat arrival — gets
+    none, so nothing it read can make the user's phone type
+    (_conv_worker). It may be a callable, asked once `prompt_builder` has
+    built the prompt: whether a turn may type can change while it waits for
+    the lock, since the prompt then ends with whatever reached the thread
+    meanwhile.
 
     `thread_id` is the dashboard thread the turn answers, handed to every
     spawn as RETINUE_THREAD_ID: the push CLIs stamp it on the sends they
@@ -4807,6 +6007,16 @@ def send_message(message: str, display_question: str | None = None,
     # and queued requests don't occupy a worker slot), then acquire a worker slot
     # to bound the number of concurrent `claude` subprocesses.
     with _session_lock_for(session_key):
+        if prompt_builder is not None:
+            # Built once the lock is held but before a worker slot is taken
+            # (the build reads files; the slot bounds `claude` processes).
+            # None: nothing is left for this turn to answer.
+            fresh_now = resume and _session_is_fresh(_get_session_entry(session_key),
+                                                     session_key)
+            message = prompt_builder(fresh_now)
+            if message is None:
+                return {"skipped": True}
+            restart_message = prompt_builder(False) if fresh_now else None
         with _worker_pool:
             state = _get_session_entry(session_key)
 
@@ -4870,6 +6080,11 @@ def send_message(message: str, display_question: str | None = None,
             # Every spawn's manifest, so all of them are cleaned up; the last
             # one belongs to the run whose reply is kept.
             manifests: list[Path] = []
+            action_manifests: list[Path] = []
+            if callable(reply_shell_actions):
+                reply_shell_actions = bool(reply_shell_actions())
+            want_shell_actions = (reply_attachments if reply_shell_actions is None
+                                  else reply_shell_actions)
 
             def _spawn(cmd: list[str], run_model: str):
                 # The session's environment is built from the allowlist in
@@ -4883,19 +6098,33 @@ def send_message(message: str, display_question: str | None = None,
                 # below the frontier tier — senior has nobody to escalate to.
                 offer_flag = (escalate_flag is not None
                               and not _same_model(run_model, FRONTIER_MODEL))
-                manifest = None
+                manifest = action_manifest = None
                 if reply_attachments:
                     manifest = (Path(tempfile.gettempdir())
                                 / f"retinue-reply-attachments-{uuid.uuid4().hex}")
                     manifests.append(manifest)
+                if want_shell_actions:
+                    # Named with its key's tag, so a restart that cut the turn
+                    # short can still tell whose session it tainted
+                    # (_sweep_stale_shell_manifests).
+                    action_manifest = (Path(tempfile.gettempdir())
+                                       / f"{_SHELL_MANIFEST_PREFIX}{_session_key_tag(session_key)}"
+                                         f"-{uuid.uuid4().hex}")
+                    action_manifests.append(action_manifest)
                 env = session_env.build(
                     model=run_model,
                     escalate_file=escalate_flag if offer_flag else None,
                     reply_attachments_file=manifest,
+                    reply_shell_actions_file=action_manifest,
                     thread_id=thread_id)
                 return _run_claude(cmd, capture_output=True, text=True,
                                    cwd="/workspace", env=env)
 
+            # Known before the spawns, so the finally below can act on them
+            # whatever raises in between.
+            orphaned: list[str] = []
+            tainted = False
+            completed = False
             try:
                 # Remember the resume point and prompt the final first-pass run
                 # used, so an escalated re-run replays exactly that turn on the
@@ -4918,8 +6147,13 @@ def send_message(message: str, display_question: str | None = None,
                         result = _spawn(_build_cmd(run_resume, run_prompt, effective_model),
                                         effective_model)
                 else:
+                    # A new session — none stored, or the stored one went
+                    # (expired, or reset by another turn while this one waited
+                    # for the lock): it has seen nothing, so it gets the whole
+                    # thread when the caller has one, not a resumed session's
+                    # "what is new" fragment.
                     session_action = "new"
-                    run_resume, run_prompt = None, message
+                    run_resume, run_prompt = None, restart_message or message
                     result = _spawn(_build_cmd(run_resume, run_prompt, effective_model),
                                     effective_model)
 
@@ -4928,23 +6162,52 @@ def send_message(message: str, display_question: str | None = None,
                     escalate_flag.unlink(missing_ok=True)
                     if result.returncode == 0:
                         escalated = True
+                        junior_session = _session_id_of(result)
+                        if junior_session and junior_session != run_resume:
+                            # Junior's own fresh session: discarded with her
+                            # reply, so its transcript goes too.
+                            orphaned.append(junior_session)
                         print(f"[web-gateway] {session_key}: junior escalated — "
                               f"re-running on {FRONTIER_MODEL}", flush=True)
                         result = _spawn(
                             _build_cmd(run_resume, run_prompt, FRONTIER_MODEL),
                             FRONTIER_MODEL)
 
-                # Only the kept run's manifest is read; the discarded runs' ones
-                # are dropped unread. A failed run's files go with its reply.
+                # Only the kept run's manifest is read for its contents; the
+                # discarded runs' ones are dropped. A failed run's files go
+                # with its reply. Every run's shell actions are checked for a
+                # sensitive text, though, failed and discarded ones included:
+                # a session that had one holds it verbatim, and is never
+                # resumed (below).
                 reply_files = (_read_reply_manifest(manifests[-1])
                                if manifests and result.returncode == 0 else [])
+                kept_actions = (_read_reply_shell_actions(action_manifests[-1],
+                                                          session_key)
+                                if action_manifests else [])
+                tainted = (any(a.get("sensitive") for a in kept_actions)
+                           or any(_manifest_has_sensitive(path)
+                                  for path in action_manifests[:-1]))
+                reply_actions = kept_actions if result.returncode == 0 else []
+                completed = True
             finally:
+                # A spawn that raised (the senior re-run, say) leaves no reply
+                # — but a run before it may have typed a sensitive text, in a
+                # session this key would resume: dropped all the same.
+                if not completed and (tainted or any(
+                        _manifest_has_sensitive(path) for path in action_manifests)):
+                    _record_turn_session(session_key, {}, drop=True, also_forget=orphaned)
                 # Every spawn's manifest goes, whatever happened — a spawn
                 # that raised included.
-                for stale in manifests:
+                for stale in manifests + action_manifests:
                     stale.unlink(missing_ok=True)
 
             if result.returncode != 0:
+                # A failed run records no session; but one that typed a
+                # sensitive text, or whose key a redaction reset meanwhile,
+                # must not leave a resumable session or transcript behind.
+                if tainted or _session_was_reset(session_key):
+                    _record_turn_session(session_key, {}, drop=True,
+                                         also_forget=orphaned + [_session_id_of(result)])
                 err_detail = result.stderr.strip()
                 # Claude often writes the real failure (e.g. OAuth expiry)
                 # to stdout as JSON even though it exits non-zero.
@@ -4974,6 +6237,9 @@ def send_message(message: str, display_question: str | None = None,
             try:
                 data = json.loads(result.stdout)
             except json.JSONDecodeError:
+                if tainted:
+                    _record_turn_session(session_key, {}, drop=True,
+                                         also_forget=orphaned)
                 return {
                     "error": "could not parse claude output",
                     "raw": result.stdout[:500],
@@ -4985,7 +6251,12 @@ def send_message(message: str, display_question: str | None = None,
                 "last_activity": _now_ts(),
                 "usage": _usage_snapshot(data),
             }
-            _update_session_entry(session_key, new_state)
+            # Recorded (or dropped) here, under this key's session lock: a
+            # turn queued behind this one cannot resume a session that typed
+            # a sensitive text, because it never sees it recorded.
+            _record_turn_session(
+                session_key, new_state, drop=tainted,
+                also_forget=[x for x in orphaned if x != new_state["session_id"]])
             # A resumed session reports usage summed over all its turns; the
             # bubble gets only this turn's share (an escalated re-run resumes
             # from the same point, so the same baseline applies).
@@ -5009,58 +6280,36 @@ def send_message(message: str, display_question: str | None = None,
             }
             if escalated:
                 out["escalated"] = True
+            if tainted:
+                out["session_reset"] = True
             if reply_files:
                 out["reply_files"] = reply_files
+            if reply_actions:
+                out["reply_shell_actions"] = reply_actions
 
             if response_text:
                 shown_question = display_question or message
-                date_str, anchor = _append_entry(shown_question, response_text)
+                date_str, anchor = _append_entry(shown_question, response_text,
+                                                 thread_id=thread_id,
+                                                 message_id=display_message_id)
                 if CONVERSATION_BASE_URL:
                     out["entry_url"] = f"{CONVERSATION_BASE_URL}/conversation/{date_str}#{anchor}"
 
             return out
 
 
+# ── Dictation vocabulary ──────────────────────────────────────────────────────
+
+# Whole names from the life store, as spelling hints for the transcript-repair
+# model. The same module biases the decoder itself inside the STT service, from
+# its own cache — see scripts/dictation_vocabulary.py.
+
+
+def _dictation_names() -> list[str]:
+    return dictation_vocabulary.vocabulary("web-gateway")[0]
+
+
 # ── Transcript cleanup ────────────────────────────────────────────────────────
-
-# The names in the address book — the people the user is likely to dictate
-# about, and the words Whisper most often mangles: every contact's name, plus
-# the literal objects of any *name predicate in a hand-kept Turtle file beside
-# them (`…name "X"` covers foaf/schema/kb spellings, `:fn "X"` the vCard one).
-# Cached against the source files' mtimes.
-_NAME_LITERAL_RE = re.compile(r'(?:[Nn]ame|:fn)\s+"([^"\n]{2,80})"')
-_contact_names_cache: tuple[float, list[str]] | None = None
-_contact_names_lock = threading.Lock()
-
-
-def _contact_names(limit: int = 200) -> list[str]:
-    global _contact_names_cache
-    try:
-        dirs = [loc["dir"] for loc in _CONTACTS.locations()]
-        turtle = sorted(p for d in dirs for p in d.glob("*.ttl"))
-        stamp = sum(p.stat().st_mtime for d in dirs for p in list(d.glob("*.nt")) + list(d.glob("*.ttl")))
-    except OSError:
-        return []
-    with _contact_names_lock:
-        if _contact_names_cache and _contact_names_cache[0] == stamp:
-            return _contact_names_cache[1]
-        names: list[str] = []
-        seen: set[str] = set()
-        found = [r["name"] for r in _CONTACTS.all() if r.get("name")]
-        for path in turtle:
-            try:
-                found += _NAME_LITERAL_RE.findall(path.read_text(encoding="utf-8", errors="replace"))
-            except OSError:
-                continue
-        for name in found:
-            key = name.casefold()
-            if key not in seen:
-                seen.add(key)
-                names.append(name)
-        names = names[:limit]
-        _contact_names_cache = (stamp, names)
-        return names
-
 
 _CLEANUP_SYSTEM_PROMPT = (
     "You repair speech-recognition transcripts. The user dictated a message; a "
@@ -5096,7 +6345,7 @@ def _cleanup_transcript(raw: str, thread_id: str = "") -> str:
     if not TRANSCRIPT_CLEANUP or not raw.strip():
         return raw
     parts = []
-    names = _contact_names()
+    names = _dictation_names()
     if names:
         parts.append("Names the user may have dictated (use the exact spelling):\n"
                      + ", ".join(names))
@@ -5109,6 +6358,9 @@ def _cleanup_transcript(raw: str, thread_id: str = "") -> str:
     cmd = [
         "claude", "-p", "--output-format=json",
         "--model", TRANSCRIPT_CLEANUP_MODEL,
+        # One-shot: nothing resumes it, so no transcript is kept — it would
+        # hold what the user dictated (a password, say) and the thread context where no redaction reaches it.
+        "--no-session-persistence",
         # A correction pass needs no tools, no MCP servers and no project
         # context — excluding them is what keeps it cheap and fast.
         "--allowed-tools", "",
@@ -5151,7 +6403,9 @@ _LINT_SYSTEM_PROMPT = (
     "phone dashboard. The dashboard renders Markdown plus one extra "
     "affordance, the reply chip: [[chip: Label | prefill text]] — an inline "
     "click-to-fill button; clicking it drops the prefill into the composer "
-    "for the user to review and send themselves, it never auto-sends.\n\n"
+    "for the user to review and send themselves, it never auto-sends. A "
+    "[[call: number | name]] token is a phone call the assistant places; "
+    "never add, change or remove one.\n\n"
     "Return the message below with ONLY these presentation rules enforced, "
     "changing nothing else:\n\n"
     "1. Options get chips. When the message asks the user to choose, confirm "
@@ -5183,6 +6437,120 @@ _LINT_SYSTEM_PROMPT = (
 # unchanged), or a `/path` token (relative URLs like /sends).
 _LINT_URLISH_RE = re.compile(r"https?://|\w\.\w|/\w")
 
+# The thread's renderer (webapp/components/markdown.js), as far as it decides
+# which call directives become call links: its fence lines (FENCE_RE), the
+# lines that open a block of their own rather than a table (HEADING_RE,
+# QUOTE_RE, LIST_RE, HR_RE), a table's separator row (TABLE_SEP_RE), and the
+# inline patterns of renderInline that run before the call link — the two
+# chip forms, each skipping a code span met first — and CALL_RE itself.
+# Its regular expressions are JavaScript's, whose \s, trim() and `.` differ
+# from Python's: \s and trim() hold U+00A0 and U+FEFF but not \x1c-\x1f or
+# \x85, and `.` stops at \r, U+2028 and U+2029 as well as \n. A copy that
+# read any of these otherwise would let a lint result through whose quoted
+# directive the bubble shows as a call, so the copy spells them out
+# (_JS_S, _JS_DOT, _js_trim). Its case-blind matching folds ASCII only, as
+# JavaScript's does without the u flag, where Python's would also fold a
+# dotless i into the i of "chip".
+_JS_SPACE = ("\t\n\v\f\r \u00a0\u1680" + "".join(map(chr, range(0x2000, 0x200b)))
+             + "\u2028\u2029\u202f\u205f\u3000\ufeff")
+_JS_S = r"[\t\n\v\f\r \u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000\ufeff]"
+_JS_DOT = r"[^\n\r\u2028\u2029]"
+
+
+def _js_re(pattern: str, flags: int = 0):
+    """`pattern`, written with JavaScript's \\s, compiled to match as there."""
+    return re.compile(pattern.replace(r"\s", _JS_S), flags | re.ASCII)
+
+
+def _js_trim(s: str) -> str:
+    """String.prototype.trim()."""
+    return s.strip(_JS_SPACE)
+
+
+_LINT_FENCE_RE = _js_re(r"^(?:```|~~~)\s*([A-Za-z0-9_.+-]*)\s*$")
+_LINT_OWN_BLOCK_RE = _js_re(
+    r"^(?:#{1,6}\s+|>|\s*(?:[-*+]|[0-9]+[.)])\s+|\s*(?:-{3,}|\*{3,}|_{3,})\s*$)")
+_LINT_TABLE_SEP_RE = _js_re(r"^\s*\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)+\|?\s*$")
+_LINT_CODE = r"(`[^`]+`)|"
+_LINT_CHIP_RES = (
+    _js_re(_LINT_CODE + r"\[\[chip:\s*([^|\]]+?)\s*\|\s*(" + _JS_DOT + r"+?)\s*\]\]", re.I),
+    _js_re(_LINT_CODE + r"\[\[chip:\s*([^|\]]+?)\s*\]\]", re.I),
+)
+_LINT_CALL_RE = _js_re(
+    _LINT_CODE + r"\[\[call:\s*([+0-9*#][0-9*# ().\/-]*?)\s*(?:\|\s*([^|\]]*?)\s*)?"
+    r"(?:\|\s*(no-voice-cancel)\s*)?\]\]", re.I)
+# The lines a lint result must leave exactly as they were whenever the
+# message holds a call directive (_call_frame): each line with one, and each
+# that is, or could be read as, a fence or a table's separator — drawn wider
+# than the renderer draws them, so that a future difference between it and
+# the copy above cannot make a quoted directive a call either.
+_LOOSE_SEP_RE = re.compile(r"[\s\ufeff|:-]*--[\s\ufeff|:-]*")
+
+
+def _table_cells(line: str) -> list:
+    """A table row's cells, split as splitTableRow() splits them."""
+    s = _js_trim(line)
+    s = s[1:] if s.startswith("|") else s
+    s = s[:-1] if s.endswith("|") else s
+    return [_js_trim(c.replace("\\|", "|")) for c in re.split(r"(?<!\\)\|", s)]
+
+
+def _inline_segments(text: str) -> list:
+    """The pieces of a message the thread renders inline, each on its own:
+    every line outside a fence (a fence runs from an opening ``` or ~~~ line
+    to the next fence line of either kind, or to the end of the text), and in
+    a table each cell the table shows. A message keeps its line breaks, so no
+    inline markup — a code span, a directive — reaches across one."""
+    lines, out, i = text.split("\n"), [], 0
+    while i < len(lines):
+        line = lines[i]
+        if _LINT_FENCE_RE.match(line):
+            i += 1
+            while i < len(lines) and not _LINT_FENCE_RE.match(lines[i]):
+                i += 1
+            i += 1
+        elif ("|" in line and not _LINT_OWN_BLOCK_RE.match(line)
+                and i + 1 < len(lines) and _LINT_TABLE_SEP_RE.match(lines[i + 1])):
+            head = _table_cells(line)
+            out.extend(head)
+            i += 2
+            while i < len(lines) and "|" in lines[i] and _js_trim(lines[i]):
+                # A row's cells beyond the header's are not shown.
+                out.extend(_table_cells(lines[i])[:len(head)])
+                i += 1
+        else:
+            out.append(line)
+            i += 1
+    return out
+
+
+def _live_call_directives(text: str) -> list:
+    """The call directives in `text` that the thread would act on, in order:
+    those its renderer turns into call links, which callOf()
+    (webapp/components/markdown.js) collects. Each line, or table cell, is
+    rendered on its own; in it the chips go first, then a directive counts
+    unless a code span met first holds it. One quoted as code, split across
+    lines or cut apart by a table's cells is an example or debris the bubble
+    shows literally rather than a call. An invalid number counts all the
+    same: it changes no other directive's standing, and a lint that alters
+    one is refused rather than delivered."""
+    found = []
+    for seg in _inline_segments(text):
+        for chip_re in _LINT_CHIP_RES:
+            seg = chip_re.sub(lambda m: m.group(0) if m.group(1) else "\x01", seg)
+        found.extend(m.group(0) for m in _LINT_CALL_RE.finditer(seg) if not m.group(1))
+    return found
+
+
+def _call_frame(text: str) -> list:
+    """The lines of `text` a lint may not change beside a call directive, in
+    order: those that hold one, and every fence-like or separator-like line
+    (_LOOSE_SEP_RE)."""
+    return [line for line in text.split("\n")
+            if "[[call:" in line.lower() or "```" in line or "~~~" in line
+            or _LOOSE_SEP_RE.fullmatch(line)]
+
+
 def _lint_presentation(text: str, *, kind: str = "chat") -> str:
     """Enforce the dashboard-composing form on an agent→user message.
 
@@ -5207,6 +6575,9 @@ def _lint_presentation(text: str, *, kind: str = "chat") -> str:
     cmd = [
         "claude", "-p", "--output-format=json",
         "--model", PRESENTATION_LINT_MODEL,
+        # One-shot: nothing resumes it, so no transcript is kept — it would
+        # hold Ara's reply where no redaction reaches it.
+        "--no-session-persistence",
         # A lint pass needs no tools, no MCP servers and no project context —
         # excluding them is what keeps it cheap and fast.
         "--allowed-tools", "",
@@ -5248,6 +6619,26 @@ def _lint_presentation(text: str, *, kind: str = "chat") -> str:
     if (not linted
             or len(linted) < len(raw) * PRESENTATION_LINT_MIN_KEEP
             or len(linted) > len(raw) * PRESENTATION_LINT_MAX_GROWTH + 200):
+        return text
+    # A call directive is a phone call the voice loop places, and the lint
+    # reads the reply raw, quoted mail or web text included. That it never
+    # adds, changes or removes one is therefore not left to its prompt: a
+    # result whose directives differ from the original's in any way is not
+    # delivered. The directives compared are the live ones, outside code: the
+    # text of a quoted directive survives a lint that only drops its
+    # backticks or fence lines, and the call it then becomes would be placed.
+    # The count of all of them, quoted ones included, is compared as well, so
+    # the lint cannot add or drop a quoted one either. And whatever the copy
+    # of the renderer makes of a message, the lint may change no line that
+    # holds a directive, nor any fence or separator line, in one that holds
+    # any (_call_frame).
+    has_call = "[[call:" in raw.lower() or "[[call:" in linted.lower()
+    if (_live_call_directives(raw) != _live_call_directives(linted)
+            or len(attention_store.CALL_MARKUP_RE.findall(raw))
+            != len(attention_store.CALL_MARKUP_RE.findall(linted))
+            or (has_call and _call_frame(raw) != _call_frame(linted))):
+        print("[web-gateway] presentation lint changed a call directive — "
+              "delivering the text unchanged", flush=True)
         return text
     return linted
 
@@ -5728,6 +7119,12 @@ MAX_PREFERENCES_BYTES = 64 * 1024
 
 def _news_payload(scope: str, limit: int | None) -> dict:
     items = news_store.ranked(scope=scope, limit=limit)
+    # An item's link is where its headline on the news page leads. Every
+    # producer files only a web link, and the same rule is applied on the way
+    # out, so an item that is already in the store with anything else — filed
+    # before the rule, or written by hand — leaves without a link.
+    for item in items:
+        item["url"] = news_store.web_link(item.get("url"))
     return {
         "generated": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "scope": scope,
@@ -6046,8 +7443,13 @@ def _chat_media_meta_lookup(references) -> dict:
         if not att:
             continue
         meta = out.setdefault(att, {})
-        if _bval(b, "ct"):
-            meta["type"] = _bval(b, "ct")
+        # The type is what the sender declared, and records written before
+        # the gateways cleaned it may hold any text. It goes to the page and,
+        # through the companion note, into a prompt, so it is kept only as
+        # the essence of one media type, and a type that is none is dropped.
+        parsed = _parse_media_type(_bval(b, "ct"))
+        if parsed:
+            meta["type"] = parsed[0]
         if _bval(b, "name"):
             meta["name"] = _bval(b, "name")
         for key, var in (("size", "size"), ("width", "w"), ("height", "h")):
@@ -6076,19 +7478,33 @@ def _shape_chat_attachments(urls: list[str], serving_slug: str | None = None,
     the channel's other gateways when the named one answers 404, so a wrong
     first guess costs a request, never the picture. Only a channel with no
     gateway at all leaves it None; a legacy record then falls back to the
-    service name it recorded, and a host-free one is passed through verbatim
-    and plainly fails to load — there is nobody to ask.
+    service name it recorded, and a host-free one gets no url — there is
+    nobody to ask, and the page shows the file by its name.
+
+    A reference that is no media reference is text from outside: the
+    gateways' ledger records and the notify rail carry what their callers
+    wrote, and the page puts an attachment's url into an href or a src. It
+    is passed on only when it is an absolute http(s) URL, by the rule news
+    links are held to (``news_store.web_link``); anything else, another
+    scheme or a reference into the dashboard itself among it, gives an
+    attachment without a url, and its id is a digest rather than the text.
 
     ``meta`` is what the gateways stated about the blobs
     (:func:`_chat_media_meta_lookup`), keyed by the reference as recorded."""
     out = []
     for url in urls:
-        if not url:
+        if not url or not isinstance(url, str):
             continue
         media_id, legacy_slug = _parse_media_reference(url)
         slug = serving_slug or legacy_slug
-        public = f"/chats/media/{slug}/{media_id}" if (media_id and slug) else url
-        att: dict = {"id": media_id or public, "url": public}
+        if media_id and slug:
+            public = f"/chats/media/{slug}/{media_id}"
+        else:
+            public = news_store.web_link(url)
+        att: dict = {"id": media_id or public
+                     or hashlib.sha256(url.encode("utf-8", "replace")).hexdigest()[:32]}
+        if public:
+            att["url"] = public
         stated = (meta or {}).get(url) or {}
         if stated.get("type"):
             att["type"] = stated["type"]
@@ -7623,8 +9039,7 @@ def _delete_conversation(cid: str) -> bool:
         entry = state.pop(session_key, None)
         if entry is not None:
             _save_state(state)
-    session_id = str((entry or {}).get("session_id") or "")
-    if session_id:
+    for session_id in _entry_session_ids(entry):
         _forget_claude_session(session_id)
     return existed
 
@@ -8094,8 +9509,9 @@ def _media_gateways(channel: str, account: str | None = None,
     stored them), else an account-derived stamp, else the channel's gateways
     in registry order. Control-mode gateways are left out — ledger media is
     inbox-only by construction, and the media handler refuses them anyway.
-    A channel with no gateway at all yields nothing, and the reference is then
-    passed through as it is: there is nobody to ask."""
+    A channel with no gateway at all yields nothing; a host-free reference
+    then gets no url (see :func:`_shape_chat_attachments`): there is nobody
+    to ask."""
     ranked: list = []
     seen: set = set()
 
@@ -9237,10 +10653,13 @@ def _attention_day(focus: dict, day) -> dict:
 
 def _attention_mode_summary(focus: dict, now: datetime) -> dict:
     mode = attention_policy.mode_at(focus, now)
-    scheduled_id = attention_policy.scheduled_id(focus, now)
-    scheduled = focus["modes"][scheduled_id]
+    enabled = attention_policy.focus_enabled(focus)
+    # With focus off nothing is scheduled: the one mode is in force for good.
+    scheduled = focus["modes"][attention_policy.scheduled_id(focus, now)] if enabled else mode
     until = attention_policy.scheduled_until(focus, now)
+    manual = bool(attention_policy.manual_of(focus))
     return {
+        "enabled": enabled,
         "id": mode["id"], "name": mode["name"], "blurb": mode.get("blurb", ""),
         "threshold": mode["threshold"], "admits": list(mode["admits"]),
         "admit_tags": list(mode.get("admit_tags") or []),
@@ -9248,9 +10667,9 @@ def _attention_mode_summary(focus: dict, now: datetime) -> dict:
         "with_subject": bool(mode.get("with_subject")),
         "subject": mode.get("subject"),
         "label": attention_policy.mode_label(mode),
-        "manual": bool(focus.get("manual")),
-        "manual_until": focus.get("manual_until") if focus.get("manual") else None,
-        "breaks": [b for b in (focus.get("breaks") or []) if focus.get("manual")],
+        "manual": manual,
+        "manual_until": focus.get("manual_until") if manual else None,
+        "breaks": [b for b in (focus.get("breaks") or []) if manual],
         "scheduled": {"id": scheduled["id"], "name": scheduled["name"],
                       "until": until.isoformat() if until else None},
         "day": _attention_day(focus, now.date()),
@@ -9289,6 +10708,9 @@ def _attention_payload(items: list[dict], degraded: list[str], focus: dict, prof
         "now": now.isoformat(),
         "timezone": str(now.tzinfo),
         "mode": _attention_mode_summary(focus, now),
+        # Whether this instance follows focus modes at all (focus.json
+        # `enabled`): off, the home shows no mode chip and no menu.
+        "focus_enabled": attention_policy.focus_enabled(focus),
         "modes": [{"id": m["id"], "name": m["name"], "blurb": m.get("blurb", ""),
                    "threshold": m["threshold"], "admits": list(m["admits"]),
                    "admit_tags": list(m.get("admit_tags") or []),
@@ -9322,11 +10744,44 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):  # suppress default access log noise
         pass
 
-    def _send_json(self, status: int, body: dict) -> None:
+    # ── The Content-Security-Policy on every HTML response ───────────────────
+    # Every answer that is a page (text/html) carries the policy of
+    # scripts/content_policy.py in the mode RETINUE_CSP names, whichever code
+    # path wrote it: the static pages, the pages the gateway builds, a
+    # download that happens to be HTML, and http.server's own error pages
+    # (send_error). So it is added where the headers end rather than by each
+    # page's code, which could forget it. A response that is not a page needs
+    # none: a policy governs the document it arrives with. A page of webapp/
+    # that needs more than the others (content_policy.PAGE_SOURCES: /sparql,
+    # the chat page, the file viewer) is named by _serve_static_file, which
+    # serves it under each of its paths.
+
+    def send_header(self, keyword, value):
+        if keyword.lower() == "content-type":
+            self._csp_page = str(value).split(";", 1)[0].strip().lower() == "text/html"
+        super().send_header(keyword, value)
+
+    def end_headers(self):
+        page, self._csp_for = getattr(self, "_csp_for", None), None
+        if getattr(self, "_csp_page", False):
+            self._csp_page = False
+            for name, value in content_policy.headers(page):
+                super().send_header(name, value)
+        super().end_headers()
+
+    def _send_json(self, status: int, body: dict,
+                   headers: dict[str, str] | None = None) -> None:
         payload = json.dumps(body, ensure_ascii=False).encode()
+        headers = dict(headers or {})
+        # The API's answers carry text from outside (messages, names, files'
+        # notes): sniffing would let a browser take one for something else,
+        # so the type sent is the type used.
+        headers.setdefault("X-Content-Type-Options", "nosniff")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(payload)))
+        for name, value in headers.items():
+            self.send_header(name, value)
         self.end_headers()
         self.wfile.write(payload)
 
@@ -9358,12 +10813,18 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def _serve_static_file(self, path: Path, base: Path, cache: str = "no-cache",
-                           transform=None, headers: dict | None = None) -> bool:
+                           transform=None, headers: dict | None = None,
+                           types: dict | None = None) -> bool:
         """Serve a file from within ``base``, guarding against path traversal.
 
         ``transform`` rewrites the bytes on the response only (the instance
         branding); the file on disk is never touched. ``headers`` are sent
-        as well (a page's framing policy).
+        as well (a page's framing policy). ``types`` maps the suffixes this
+        directory may answer with to their types, in place of
+        _STATIC_CONTENT_TYPES; a file of any other suffix is a download
+        (/data/, below). Every answer forbids sniffing, so the type sent is
+        the type a browser uses: a file is run as a script only where it is
+        served as one.
         Returns True if a file was sent, False otherwise (caller emits 404)."""
         try:
             full = path.resolve()
@@ -9377,12 +10838,23 @@ class Handler(BaseHTTPRequestHandler):
             return False
         if transform is not None:
             data = transform(data)
-        ctype = _STATIC_CONTENT_TYPES.get(full.suffix.lower(), "application/octet-stream")
+        # Which page of webapp/ this is, for its policy (end_headers).
+        self._csp_for = full.name if full.parent == WEBAPP_DIR.resolve() else None
+        headers = dict(headers or {})
+        if types is None:
+            ctype = _STATIC_CONTENT_TYPES.get(full.suffix.lower(), "application/octet-stream")
+        else:
+            ctype = types.get(full.suffix.lower())
+            if ctype is None:
+                ctype = "application/octet-stream"
+                headers["Content-Disposition"] = "attachment"
+                headers["Content-Security-Policy"] = _DOWNLOAD_CSP
         self.send_response(200)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Cache-Control", cache)
-        for name, value in (headers or {}).items():
+        self.send_header("X-Content-Type-Options", "nosniff")
+        for name, value in headers.items():
             self.send_header(name, value)
         self.end_headers()
         self.wfile.write(data)
@@ -9439,8 +10911,13 @@ class Handler(BaseHTTPRequestHandler):
         except (OSError, ValueError):
             self._send_json(404, {"error": "not found"})
             return
-        ctype = meta.get("content_type") or "application/octet-stream"
-        inline = inline and ctype.split(";", 1)[0].strip().lower() in _INLINE_SAFE_TYPES
+        # The stored type is read again, so metadata stored before it was
+        # kept as one media type is never written into a header as it is: a
+        # type that does not read as one is application/octet-stream, and so
+        # a download. So is a script type: the file is the sender's, never a
+        # script of this origin (_SCRIPT_MEDIA_TYPES).
+        ctype = _served_media_type(meta.get("content_type"))
+        inline = inline and ctype.split(";", 1)[0] in _INLINE_SAFE_TYPES
         self.send_response(200)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(data)))
@@ -9479,8 +10956,12 @@ class Handler(BaseHTTPRequestHandler):
                 transform=instance_branding.brand_html,
                 headers={"Content-Security-Policy": f"frame-ancestors 'self' {APP_SETTINGS_ORIGIN}"})
         if path.startswith("/data/"):
+            # What the deployment's agents wrote, for the cards to read: it is
+            # answered only as the passive type the dashboard reads from here,
+            # JSON, and anything else as a download (_DATA_CONTENT_TYPES).
             rel = path[len("/data/"):]
-            return self._serve_static_file(DASHBOARD_DATA_DIR / rel, DASHBOARD_DATA_DIR, cache="no-store")
+            return self._serve_static_file(DASHBOARD_DATA_DIR / rel, DASHBOARD_DATA_DIR,
+                                           cache="no-store", types=_DATA_CONTENT_TYPES)
         rel = path.lstrip("/")
         if not rel:
             return False
@@ -9564,8 +11045,11 @@ class Handler(BaseHTTPRequestHandler):
         with resp:
             ctype = resp.headers.get("Content-Type") or "application/octet-stream"
             # No result format is HTML; never let one render on this origin.
+            # Nor is one a script: a result holds whatever the chambers hold,
+            # so it is never answered as a type a browser would run.
             if "html" in ctype.lower():
                 ctype = "text/plain; charset=utf-8"
+            ctype = _served_media_type(ctype)
             self.send_response(resp.getcode())
             self.send_header("Content-Type", ctype)
             if resp.headers.get("Content-Length"):
@@ -9591,17 +11075,23 @@ class Handler(BaseHTTPRequestHandler):
         the browser to install the new worker and drop the stale cache. The file
         (baked, read-only) is never mutated on disk — the substitution is done on
         the response only. Served no-cache so the worker itself is always
-        revalidated."""
+        revalidated. With an instance colour in force, its icon paths (the
+        precache list, the notification icon) carry the colour like every
+        other icon reference (instance_branding.brand_icon_refs)."""
         sw = WEBAPP_DIR / "sw.js"
         try:
             text = sw.read_text(encoding="utf-8")
         except OSError:
             return False
-        body = text.replace("__SHELL_HASH__", _shell_hash()).encode("utf-8")
+        text = instance_branding.brand_icon_refs(text.replace("__SHELL_HASH__", _shell_hash()))
+        body = text.encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "text/javascript; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-cache")
+        # As for every other file of the dashboard's own (_serve_static_file):
+        # this responder does not go through that one, so it says it itself.
+        self.send_header("X-Content-Type-Options", "nosniff")
         self.end_headers()
         self.wfile.write(body)
         return True
@@ -9645,8 +11135,54 @@ class Handler(BaseHTTPRequestHandler):
         if not self._serve_inbox():
             self.send_error(501, "Unsupported method ('HEAD')")
 
+    def _handle_csp_report(self) -> None:
+        """POST /csp-report: what a browser reports of the
+        Content-Security-Policy (scripts/content_policy.py), in either of its
+        two formats. Behind the dashboard's sign-in like every path, and
+        nothing more: the browser sends it with the page's own credentials.
+
+        The answer says nothing of what was sent, only whether it was taken:
+        204, or a fixed error. A body is read only up to a small limit and
+        only with a Content-Length."""
+        if not content_policy.report_format(self.headers.get("Content-Type")):
+            self._send_json(415, {"error": "send application/csp-report or "
+                                           "application/reports+json"})
+            return
+        if self.headers.get("Transfer-Encoding"):
+            self._send_json(411, {"error": "send the report with a Content-Length"})
+            return
+        raw_length = (self.headers.get("Content-Length") or "").strip()
+        if not raw_length.isascii() or not raw_length.isdigit():
+            self._send_json(411, {"error": "send the report with a Content-Length"})
+            return
+        length = int(raw_length) if len(raw_length) <= 18 else content_policy.REPORT_MAX_BYTES + 1
+        if length > content_policy.REPORT_MAX_BYTES:
+            self._send_json(413, {"error": "too large for a report"})
+            return
+        violations = content_policy.parse_reports(self.headers.get("Content-Type"),
+                                                  self.rfile.read(length))
+        if violations is None:
+            self._send_json(400, {"error": "not a report"})
+            return
+        try:
+            new = content_policy.record(CSP_REPORTS_FILE, violations)
+        # ValueError as well: the fields are cleaned of what UTF-8 cannot
+        # encode, but should one slip through, the reports are lost, never
+        # the answer.
+        except (OSError, ValueError) as exc:
+            print(f"[web-gateway] CSP reports not kept: {exc}", flush=True)
+            new = []
+        for v in new:
+            print(content_policy.log_line(v), flush=True)
+        self.send_response(204)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
     def do_POST(self):
         if self._serve_inbox():
+            return
+        if self.path.split("?", 1)[0] == content_policy.REPORT_PATH:
+            self._handle_csp_report()
             return
         if self.path.split("?", 1)[0] in ("/sparql", "/sparql/"):
             self._handle_sparql()
@@ -9721,6 +11257,10 @@ class Handler(BaseHTTPRequestHandler):
         if internal_flags_match:
             self._handle_agent_conversation_flags(internal_flags_match.group(1))
             return
+        internal_redact_match = _INTERNAL_CONV_REDACT_RE.match(self.path)
+        if internal_redact_match:
+            self._handle_agent_conversation_redact(internal_redact_match.group(1))
+            return
         if self.path.split("?", 1)[0].rstrip("/") == "/push/subscribe":
             self._handle_push_subscribe()
             return
@@ -9781,6 +11321,11 @@ class Handler(BaseHTTPRequestHandler):
         if model_match:
             self._handle_conversation_model(model_match.group(1))
             return
+        shell_outcome_match = _CONV_SHELL_OUTCOME_RE.match(self.path)
+        if shell_outcome_match:
+            self._handle_conversation_shell_outcome(shell_outcome_match.group(1),
+                                                    shell_outcome_match.group(2))
+            return
         action = _SEND_ACTION_RE.match(self.path)
         if action:
             self._handle_send_action(action.group(1), action.group(2), action.group(3))
@@ -9839,7 +11384,12 @@ class Handler(BaseHTTPRequestHandler):
         POST .../approve here would simply queue its own send and then approve
         it, which would leave the send gate closing nothing at all. Reject is
         gated too — it cannot cause a send, but suppressing a message the user
-        meant to allow is equally not an agent's call."""
+        meant to allow is equally not an agent's call. Another site's page
+        is refused before that: it reaches here through the proxy with the
+        user's credentials, so the edge gate alone would let it decide."""
+        if not self._claude_auth_same_origin():
+            self._send_json(403, {"error": "cross-site request rejected"})
+            return
         ok, reason = self._request_from_edge(
             f"{verb} of pending send {account}/{request_id}")
         if not ok:
@@ -10085,7 +11635,11 @@ class Handler(BaseHTTPRequestHandler):
         if not text or not source:
             self._send_json(400, {"error": "text and source are required"})
             return
-        url = (payload.get("url") or "").strip()
+        # The link is whatever the caller found in a message from outside, and
+        # this endpoint is open by default: only a web link is kept
+        # (news_store.web_link). Anything else is dropped and the item filed
+        # without a link, as a post that carries none is.
+        url = news_store.web_link(payload.get("url"))
         lang = (payload.get("lang") or None)
         channel = (payload.get("channel") or "").strip() or "messenger"
         # A broadcast message is not a titled article: derive a short title from
@@ -10129,6 +11683,24 @@ class Handler(BaseHTTPRequestHandler):
     # Dashboard-side routes sit behind the edge auth like /conversations; the
     # two /internal/chats/* routes are for in-container callers (the gateways'
     # rail, agent draft staging).
+
+    def _via_edge(self) -> bool:
+        """Whether this request came through the reverse proxy — quietly, for
+        marking what it writes (see _request_from_edge for the refusing gate
+        and what the distinction is worth). A request another site's page
+        made the browser send also passes the reverse proxy, with the user's
+        credentials, but its words are not the user's: it is never marked."""
+        if not self._claude_auth_same_origin():
+            return False
+        try:
+            peer = self.client_address[0]
+        except Exception:  # noqa: BLE001
+            peer = None
+        try:
+            local = self.connection.getsockname()[0]
+        except Exception:  # noqa: BLE001
+            local = None
+        return _classify_request_origin(peer, local)[0]
 
     def _request_from_edge(self, what: str) -> tuple[bool, str]:
         """Gate for the endpoints that act with the user's own authority.
@@ -10367,7 +11939,8 @@ class Handler(BaseHTTPRequestHandler):
                     learned += attention_policy.correct(item, profile, patch, now)
                     effect = attention_policy.reevaluate(item, focus, profile, now, "the contact card")
                 _attention_persist(item)
-            if name and payload.get("permit"):
+            if name and payload.get("permit") and attention_policy.focus_enabled(focus):
+                # With focus off there is no mode to hold a permit for.
                 mode_id = attention_policy.mode_at(focus, now)["id"]
                 if attention_policy.set_permit(profile, name, mode_id, True, now, focus["modes"]):
                     learned.append(f"{name} may interrupt in {focus['modes'][mode_id]['name']}")
@@ -10497,7 +12070,11 @@ class Handler(BaseHTTPRequestHandler):
         if chat_id is None:
             return
         # Erasure is the user's own act, like a send: an agent can archive or
-        # mute, never destroy. Same edge-origin gate as POST /chats/<id>/send.
+        # mute, never destroy. Same gates as POST /chats/<id>/send, the
+        # cross-site one included.
+        if not self._claude_auth_same_origin():
+            self._send_json(403, {"error": "cross-site request rejected"})
+            return
         ok, reason = self._request_from_edge(f"chat delete of {chat_id}")
         if not ok:
             self._send_json(403, {
@@ -10672,6 +12249,13 @@ class Handler(BaseHTTPRequestHandler):
         it without waiting for the store."""
         chat_id = self._chat_id_or_404(raw_id)
         if chat_id is None:
+            return
+        # Another site's page can make the browser POST here through the proxy
+        # with the user's credentials (a text/plain form body that is valid
+        # JSON needs no preflight), and its peer is then the proxy's: the edge
+        # gate below cannot tell it from the send press.
+        if not self._claude_auth_same_origin():
+            self._send_json(403, {"error": "cross-site request rejected"})
             return
         ok, reason = self._request_from_edge(f"chat send to {chat_id}")
         if not ok:
@@ -10886,7 +12470,10 @@ class Handler(BaseHTTPRequestHandler):
             "message_id": (str(payload.get("message_id") or "").strip() or None),
             "ts": ts,
             "text": str(payload.get("text") or ""),
-            "attachments": [u for u in (payload.get("attachments") or []) if u],
+            # References are text; what is not cannot name a blob and would
+            # only break the listing it is read back into.
+            "attachments": [u for u in (payload.get("attachments") or [])
+                            if u and isinstance(u, str)],
         }
         if _chat_record_erased(chat_id, message_id=entry["message_id"]):
             # A late or repeated event for a message the user just erased —
@@ -11059,10 +12646,20 @@ class Handler(BaseHTTPRequestHandler):
         """Authenticated proxy for a ledger media blob.
 
         The gateways serve their media token-gated on the internal network;
-        this passes the registry token and relays bytes and Content-Type (the
+        this passes the registry token and relays the bytes (the
         /gateways/<slug>/qr proxy precedent), so chat bubbles render media
         with no gateway token in the browser. The route regex already pins the
         media id to 32 hex chars.
+
+        The type is not relayed as it comes. A gateway hands a blob back
+        under the content type its sender declared, so the answer's headers
+        are written by _chat_media_headers from that statement: images of the
+        inline-safe types, audio and video, PDF and plain text are served in
+        place, anything else as a download, and nothing is left to sniffing.
+        That holds for a relayed error as well: whatever a gateway answers
+        goes out under the same rule. The proxy's own refusals (an unknown or
+        control-mode gateway, none reachable) are JSON written here, and they
+        forbid sniffing too, so no answer of this route is left to it.
 
         The slug reaching here is inbox by construction — it comes from a
         ledger attachment reference (or the media resolver's first pick), and
@@ -11072,14 +12669,15 @@ class Handler(BaseHTTPRequestHandler):
         mode (an unreachable gateway) still serves, since this is a read of
         the user's own media behind the dashboard's own auth and blocking it
         would only break image rendering during a health blip."""
+        nosniff = {"X-Content-Type-Options": "nosniff"}
         _slug, gw = _channel_gateway(slug)
         if not gw:
-            self._send_json(404, {"error": "unknown gateway"})
+            self._send_json(404, {"error": "unknown gateway"}, nosniff)
             return
         if _gateway_identity(_slug, gw).get("mode") == "control":
             print(f"[web-gateway] refusing chat media from control-mode gateway "
                   f"{_slug!r}", flush=True)
-            self._send_json(404, {"error": "not found"})
+            self._send_json(404, {"error": "not found"}, nosniff)
             return
         # The named gateway first. A 404 from it is that gateway stating it does
         # not hold the blob — so its channel's other gateways are asked in turn
@@ -11089,17 +12687,17 @@ class Handler(BaseHTTPRequestHandler):
         channel = _slug_channel(_slug)
         candidates = [(_slug, gw)] + [
             (s, g) for s, g in _media_gateways(channel or "") if s != _slug]
-        data, content_type, status = b"", "application/json", 404
+        data, stated, status = b"", None, 404
         unreachable, answered = None, False
         for i, (cand_slug, cand_gw) in enumerate(candidates):
             try:
                 with _gateway_request(cand_gw, f"/media/{media_id}", CHAT_SEND_TIMEOUT) as resp:
                     data = resp.read()
-                    content_type = resp.headers.get("Content-Type", "application/octet-stream")
+                    stated = resp.headers.get_all("Content-Type")
                     status = resp.status
             except urllib.error.HTTPError as exc:
                 data = exc.read()
-                content_type = exc.headers.get("Content-Type", "application/json")
+                stated = exc.headers.get_all("Content-Type")
                 status = exc.code
             except Exception as exc:  # noqa: BLE001
                 unreachable = exc
@@ -11111,10 +12709,14 @@ class Handler(BaseHTTPRequestHandler):
                 print(f"[web-gateway] chat media {media_id} not at {cand_slug}; "
                       f"asking {candidates[i + 1][0]}", flush=True)
         if not answered:
-            self._send_json(502, {"error": f"gateway unreachable: {unreachable}"})
+            self._send_json(502, {"error": f"gateway unreachable: {unreachable}"},
+                            nosniff)
             return
         self.send_response(status)
-        self.send_header("Content-Type", content_type)
+        # The type and what goes with it, from the gateway's statement and
+        # never the statement itself (see _chat_media_headers).
+        for name, value in _chat_media_headers(stated).items():
+            self.send_header(name, value)
         self.send_header("Content-Length", str(len(data)))
         if status == 200:
             # Ledger media is immutable — cache privately so a re-opened chat
@@ -11279,6 +12881,9 @@ class Handler(BaseHTTPRequestHandler):
         digest goes out — except a switch into Focused: that holds on to
         what waits, and only what the focus lets through rings."""
         mode_id = payload.get("mode")
+        if mode_id and not attention_policy.focus_enabled(focus):
+            self._send_json(409, {"error": "focus is off on this instance — turn it on in Settings first"})
+            return
         if mode_id is not None and mode_id != "" and mode_id not in focus["modes"]:
             self._send_json(400, {"error": "unknown mode"})
             return
@@ -11326,11 +12931,16 @@ class Handler(BaseHTTPRequestHandler):
             items, degraded = _attention_items(profile, now)
         self._send_json(200, _attention_payload(items, degraded, focus, profile, now))
 
-    def _handle_reevaluate(self, focus: dict, profile: dict, now: datetime, why: str) -> list[str]:
-        """After a rule change, push what it releases; returns their ids."""
+    def _handle_reevaluate(self, focus: dict, profile: dict, now: datetime, why: str,
+                           skip: set | None = None) -> list[str]:
+        """After a rule change, push what it releases; returns their ids.
+        ``skip``: items a digest has just carried, which must not ring again
+        one by one."""
         items, _degraded = _attention_items(profile, now)
         pushed = []
         for item in items:
+            if skip and item["id"] in skip:
+                continue
             effect = attention_policy.reevaluate(item, focus, profile, now, why)
             if effect is None:
                 continue
@@ -11380,7 +12990,15 @@ class Handler(BaseHTTPRequestHandler):
         pushed: list[str] = []
         if changes:
             _ATTENTION.save_focus(focus)
-            pushed = self._handle_reevaluate(focus, profile, now, "the Focus rule")
+            if payload.get("enabled") is not None and any(c.startswith("focus modes ") for c in changes):
+                # Focus turned on or off is a change of mode like any other:
+                # a breakpoint, what was held arriving as one digest.
+                items, _degraded = _attention_items(profile, now)
+                digest = _attention_breakpoint(items, focus, now, "focus turned " + ("on" if payload["enabled"] else "off"))
+                carried = {i["id"] for i in (digest or {}).get("items") or []}
+            else:
+                carried = set()
+            pushed = self._handle_reevaluate(focus, profile, now, "the Focus rule", skip=carried)
         self._send_json(200, {"changed": changes, "mode": _attention_mode_summary(focus, now),
                               "focus": focus, "pushed": pushed})
 
@@ -11615,7 +13233,13 @@ class Handler(BaseHTTPRequestHandler):
         composer, `raw_text` what Whisper actually heard. A `?thread=<id>` query
         param gives the cleanup pass the thread as context; `?cleanup=0` skips
         the pass. Access is the dashboard's own edge auth; the hop to the STT
-        service carries the shared Bearer token."""
+        service carries the shared Bearer token.
+
+        Nothing about the deployment's vocabulary travels on this hop: the STT
+        service reads the same life store this gateway does and biases its own
+        decode (scripts/dictation_vocabulary.py). Sending the names with every
+        clip would repeat a list that changes daily, and would leave the voice
+        notes the messenger gateways transcribe without any bias at all."""
         if not STT_SERVICE_URL:
             self._send_json(503, {"error": "transcription not configured"})
             return
@@ -11688,6 +13312,11 @@ class Handler(BaseHTTPRequestHandler):
 
     def _handle_conversation_create(self) -> None:
         """User opens a new thread from the dashboard and Ara replies (async)."""
+        # Another site's page could otherwise post words in the user's name
+        # (a text/plain form body that is valid JSON needs no preflight).
+        if not self._claude_auth_same_origin():
+            self._send_json(403, {"error": "cross-site request rejected"})
+            return
         payload = self._read_json_body()
         if payload is None:
             self._send_json(400, {"error": "invalid JSON"})
@@ -11727,12 +13356,15 @@ class Handler(BaseHTTPRequestHandler):
         conv = _new_conv("user", owner, title, "user", message,
                          first_attachments=attachments, kind=kind,
                          project=project, project_title=project_title,
-                         model=model)
+                         model=model, via_edge=self._via_edge())
         _start_conv_turn(conv["id"])
         self._send_json(201, _conv_set_flags(conv["id"], pending=True) or conv)
 
     def _handle_conversation_reply(self, cid: str) -> None:
         """User replies within an existing thread; Ara answers (async)."""
+        if not self._claude_auth_same_origin():   # see _handle_conversation_create
+            self._send_json(403, {"error": "cross-site request rejected"})
+            return
         payload = self._read_json_body()
         if payload is None:
             self._send_json(400, {"error": "invalid JSON"})
@@ -11743,7 +13375,9 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(400, {"error": "empty message"})
             return
         conv = _conv_add_message(cid, "user", message, unread=False,
-                                 attachments=attachments)
+                                 attachments=attachments,
+                                 context=_cancelled_call_context(payload.get("cancelled_call")),
+                                 via_edge=self._via_edge())
         if conv is None:
             self._send_json(404, {"error": "not found"})
             return
@@ -11756,6 +13390,40 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(404, {"error": "not found"})
             return
         self._send_json(200, conv)
+
+    def _handle_conversation_shell_outcome(self, cid: str, action_id: str) -> None:
+        """The dashboard reports what became of a shell action on the paired
+        device: body {"state": "typed" | "error" | "secret-typed" |
+        "secret-cancelled", "error": <the shell's error key>}.
+
+        The outcome is stored on the action, so Ara's later turns learn it
+        (shell_actions.describe). A sensitive text (shell-type.py --sensitive)
+        reported typed is deleted from the stored reply at once; the action
+        keeps its kind, id and marks, so the page can say "Text deleted" and
+        nothing can type it again. Behind the dashboard's own auth like every
+        /conversations/ call, and only through the reverse proxy: what the
+        page saw happen is the page's to say, not an in-container caller's,
+        nor another site's page (it could purge a code before it is typed)."""
+        if not self._claude_auth_same_origin():
+            self._send_json(403, {"error": "cross-site request rejected"})
+            return
+        ok, reason = self._request_from_edge(f"shell-action outcome for {cid}")
+        if not ok:
+            self._send_json(403, {"error": "forbidden", "reason": reason})
+            return
+        payload = self._read_json_body()
+        if payload is None:
+            self._send_json(400, {"error": "invalid JSON"})
+            return
+        outcome = shell_actions.normalize_outcome(payload)
+        if outcome is None:
+            self._send_json(400, {"error": "invalid outcome"})
+            return
+        conv, found = _conv_record_shell_outcome(cid, action_id, outcome)
+        if conv is None or not found:
+            self._send_json(404, {"error": "not found"})
+            return
+        self._send_json(200, {"status": "ok"})
 
     def _handle_conversation_model(self, cid: str) -> None:
         """Switch a thread's model mid-conversation; takes effect next turn.
@@ -11821,6 +13489,12 @@ class Handler(BaseHTTPRequestHandler):
             return
         flags = {key: bool(payload[key])
                  for key in ("archived", "muted") if key in payload}
+        # Ending continuous conversation is an event, not a state: the stamp
+        # says when Ara was asked to, and a device leaves the mode if it was
+        # switched on before that moment (webapp/components/conversation.js,
+        # _contEndedByAra). Switching it on again later is the user's call.
+        if payload.get("continuous_off") is True:
+            flags["continuous_off"] = datetime.now(timezone.utc).isoformat()
         if not flags:
             self._send_json(400, {"error": "no flags given"})
             return
@@ -11829,6 +13503,27 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(404, {"error": "not found"})
             return
         self._send_json(200, _conv_summary(conv))
+
+    def _handle_agent_conversation_redact(self, cid: str) -> None:
+        """A retinue agent redacts one of the user's messages — on the user's
+        request, e.g. the message in which they dictated a password Ara typed
+        (conversation-push.py --redact-message). Body {"message_id"}."""
+        payload = self._agent_conversation_payload()
+        if payload is None:
+            return
+        mid = str(payload.get("message_id") or "")
+        if not re.fullmatch(r"[0-9a-f]{12,32}", mid):
+            self._send_json(400, {"error": "invalid message_id"})
+            return
+        why_not = _conv_redaction_refused(cid, mid)
+        if why_not:
+            self._send_json(409, {"error": why_not})
+            return
+        conv, status, reason = _conv_redact_message(cid, mid)
+        if conv is None:
+            self._send_json(status, {"error": reason})
+            return
+        self._send_json(200, {"status": "redacted", "message_id": mid})
 
     def _agent_conversation_payload(self) -> dict | None:
         """Authorize an agent conversation call and return its JSON body.
@@ -12126,6 +13821,12 @@ class Handler(BaseHTTPRequestHandler):
                 # outside make the same comparison (build_stamp.py).
                 "build": build_stamp.build_info(),
             })
+            return
+        if self.path.split("?", 1)[0] == content_policy.REPORT_PATH:
+            # What the browsers reported of the Content-Security-Policy: the
+            # page to read before switching RETINUE_CSP from report to enforce.
+            self._send_json(200, content_policy.summary(CSP_REPORTS_FILE),
+                            {"Cache-Control": "private, no-store"})
             return
         job_match = _JOB_RE.match(self.path)
         if job_match:
@@ -12476,13 +14177,17 @@ class Handler(BaseHTTPRequestHandler):
         self._send_json(200, body)
 
     def _claude_auth_same_origin(self) -> bool:
-        """CSRF guard for the sign-in endpoints. The dashboard's basic-auth
+        """CSRF guard for the sign-in endpoints, for the conversation
+        endpoints whose messages count as the user's own (`via_edge`, which
+        lets a turn type on the paired device), and for the endpoints that act
+        with the user's own authority (a chat send or delete, a pending send's
+        approve or reject; see _request_from_edge). The dashboard's basic-auth
         credential is ambient — the browser attaches it to cross-site requests
-        too — and these POSTs change authentication state and can restart the
-        container. Every current browser stamps Sec-Fetch-Site; when the
-        header is absent (curl, older engines) we allow, which is the status
-        quo of the other POST routes."""
-        site = self.headers.get("Sec-Fetch-Site", "")
+        too — and these POSTs change authentication state, can restart the
+        container, or speak for the user. Every current browser stamps
+        Sec-Fetch-Site; when the header is absent (curl, older engines) we
+        allow, which is the status quo of the other POST routes."""
+        site = (self.headers.get("Sec-Fetch-Site") or "").strip().lower()
         return site in ("", "same-origin", "none")
 
     def _handle_claude_login_start(self) -> None:
@@ -12531,9 +14236,10 @@ class Handler(BaseHTTPRequestHandler):
     def _handle_gateway_qr(self, slug: str) -> None:
         """Proxy a gateway's pairing QR (adding the token) to the /gateways page.
 
-        Passes the gateway's own response through verbatim — a PNG when a code
-        is ready, JSON progress/errors otherwise — so the page's <img> either
-        renders the code or falls back to its "not ready yet" note."""
+        Passes the gateway's own response through — a PNG when a code is
+        ready, JSON progress/errors otherwise — so the page's <img> either
+        renders the code or falls back to its "not ready yet" note; a type
+        that is neither goes out as application/octet-stream."""
         _slug, gw = _channel_gateway(slug)
         if not gw:
             self._send_json(404, {"error": "unknown gateway"})
@@ -12550,10 +14256,18 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as exc:  # noqa: BLE001
             self._send_json(502, {"error": f"gateway unreachable: {exc}"})
             return
+        # The page shows the code through <img> and nothing else: the image,
+        # or the JSON progress the gateway answers before there is one. Any
+        # other type the gateway states is not passed on as a type of this
+        # origin, and nothing is left to sniffing.
+        content_type = _served_media_type(content_type)
+        if content_type.split(";", 1)[0] not in ("image/png", "application/json"):
+            content_type = "application/octet-stream"
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
         self.end_headers()
         self.wfile.write(data)
 
@@ -12597,7 +14311,21 @@ if __name__ == "__main__":
     # The attention model's clock: breakpoints (digest times, scheduled mode
     # changes) and the half-hourly sweep run here, with no browser open.
     threading.Thread(target=_attention_tick_loop, name="attention-tick", daemon=True).start()
+    # Sensitive shell-action texts outlive no restart (scripts/shell_actions.py).
+    # In the background: until it is through, every read purges by itself.
+    def _sweep_sensitive() -> None:
+        try:
+            _conv_sensitive_sweep()
+        except Exception as exc:  # noqa: BLE001
+            print(f"[web-gateway] sensitive-text sweep skipped: {exc}", flush=True)
+    threading.Thread(target=_sweep_sensitive, name="sensitive-sweep", daemon=True).start()
+    # Before serving, so it never meets a manifest of a turn of this process.
+    try:
+        _sweep_stale_shell_manifests()
+    except Exception as exc:  # noqa: BLE001
+        print(f"[web-gateway] stale shell-manifest sweep skipped: {exc}", flush=True)
     _warn_if_arrival_turns_are_open()
     server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
-    print(f"[web-gateway] listening on port {PORT} (max concurrency {MAX_CONCURRENCY})", flush=True)
+    print(f"[web-gateway] listening on port {PORT} (max concurrency {MAX_CONCURRENCY}; "
+          f"Content-Security-Policy: {content_policy.mode()})", flush=True)
     server.serve_forever()

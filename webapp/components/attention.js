@@ -10,6 +10,9 @@
 //   POST /attention/mode              {mode} by hand, or {mode: null} to follow the schedule
 //   POST /attention/modes             {mode, only_admitted} — whether this mode's list shows
 //                                     only what it admits (the rest folds into "Not now")
+// On an instance with focus turned off (`focus_enabled: false`, Settings ›
+// This instance) the header carries no mode and opens no menu: one mode is
+// in force for good, and there is nothing to choose.
 //   (the sheet, components/attention-sheet.js, carries the per-item actions)
 // One of them is also a gesture here: a row swiped to the right is marked
 // done (POST /attention/items/done, the sheet's *Mark done* / *Mark handled*),
@@ -345,7 +348,7 @@ class RetinueAttention extends HTMLElement {
     switch (act) {
       case 'open': this._openItem(id); break;
       case 'info': e.stopPropagation(); openAttentionSheet(id); break;
-      case 'mode-menu': this._menu = !this._menu; this.render(); break;
+      case 'mode-menu': this._menu = !this._menu && !!(this._data && this._data.focus_enabled !== false); this.render(); break;
       case 'set-mode': this._setMode(el.getAttribute('data-mode'), el.getAttribute('data-subject'), el.getAttribute('data-project')); break;
       case 'close-menu': this._menu = false; this.render(); break;
       case 'toggle-held': this._heldOpen = !this._heldOpen; prefSet('held', this._heldOpen); this.render(); break;
@@ -587,6 +590,11 @@ class RetinueAttention extends HTMLElement {
       return `<header><span class="mode-head"><span class="mode-when">` +
         `${this._state === 'offline' ? 'Offline' : '&#8230;'}</span></span>${right}</header>`;
     }
+    if (d.focus_enabled === false || mode.enabled === false) {
+      // Focus is off on this instance: no mood to show, no menu to open.
+      return `<header><span class="mode-head" title="${esc(mode.blurb || '')}">` +
+        `<span class="mode-name">${esc(this.heading)}</span></span>${right}</header>`;
+    }
     const schedUntil = (mode.scheduled || {}).until;
     const until = mode.manual
       ? (mode.manual_until ? `by hand until ${esc(fmtWhen(mode.manual_until))}` : 'set by hand')
@@ -705,7 +713,7 @@ class RetinueAttention extends HTMLElement {
       ? `<div class="toast" role="status"><span class="t">Marked done${u.title ? ` · ${esc(u.title)}` : ''}</span>` +
         `<button data-act="undo">Undo</button></div>` : '';
     root.innerHTML = `<style>${CSS}</style><section class="card" aria-label="${esc(this.heading)}">${head}<div class="content">${body}${foot}</div></section>` +
-      toast + (this._menu ? this._menuHtml() : '');
+      toast + (this._menu && this._data && this._data.focus_enabled !== false ? this._menuHtml() : '');
   }
 }
 

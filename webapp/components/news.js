@@ -1,5 +1,6 @@
 // News card and news page: broadcast-style inbound, ranked by how much it
-// matters to you right now, every item a link to where it was published.
+// matters to you right now, every item a reference to where it was published
+// (its headline a link there, when the item has one).
 //
 // The element reads the gateway's live endpoint:
 //   GET /news?scope=feed&limit=n  ->  { generated, items: [...] }
@@ -20,7 +21,7 @@
 // generalizes it into the profile on its next run (scripts/news-curate.py).
 
 import {
-  esc, fmtAge, isWideFrame, onFrameChange,
+  esc, fmtAge, isWideFrame, onFrameChange, webLink,
   viewPref, setViewPref, viewToggleHtml, VIEW_TOGGLE_CSS,
 } from './base.js';
 import { renderMarkdown, MD_CSS } from './markdown.js';
@@ -59,7 +60,7 @@ const CSS = `
   li.top { border-left-color: var(--accent, #6ea8fe); }
   li.reading { outline: 1px solid var(--accent, #6ea8fe); }
   li.done { opacity: .55; }
-  a.headline { color: var(--fg, #e7ebf2); font-weight: 600; text-decoration: none;
+  .headline { color: var(--fg, #e7ebf2); font-weight: 600; text-decoration: none;
        display: block; }
   a.headline:hover { text-decoration: underline; }
   .meta { display: block; color: var(--muted, #8b93a3); font-size: .78rem; margin-top: 3px; }
@@ -103,7 +104,16 @@ function ageLabel(item) {
   return age || '';
 }
 
-function itemLi(item, opts) {
+// An item's link is text that came from outside (a feed, a channel post), and
+// the headline leads wherever it says, so the page holds to the rule the
+// gateway files and serves items by (web_link in scripts/news_store.py): an
+// absolute http(s) URL with a host, or no link at all (webLink in base.js,
+// shared with the chat page's attachments). Whatever else an item carries as
+// `url` is never put into an href, where a relative reference would lead into
+// the dashboard itself.
+export { webLink };
+
+export function itemLi(item, opts) {
   const meta = [];
   if (item.source) meta.push(esc(item.source));
   const age = ageLabel(item);
@@ -118,10 +128,15 @@ function itemLi(item, opts) {
   const summary = opts.summary && item.summary
     ? `<span class="summary">${esc(item.summary)}</span>` : '';
   // target=_blank so the dashboard (a PWA, often the only open window) is not
-  // navigated away from; rel guards the opener.
-  return `<li class="${cls}" data-id="${esc(item.id)}">` +
-    `<a class="headline" href="${esc(item.url)}" target="_blank" rel="noopener noreferrer"` +
-    ` data-act="read" data-id="${esc(item.id)}">${esc(item.title)}</a>` +
+  // navigated away from; rel guards the opener. An item without a link — a
+  // channel post that carried none — has nowhere to lead, so its headline is
+  // text: an empty href would be a link to this page itself.
+  const link = webLink(item.url);
+  const headline = link
+    ? `<a class="headline" href="${esc(link)}" target="_blank" rel="noopener noreferrer"` +
+      ` data-act="read" data-id="${esc(item.id)}">${esc(item.title)}</a>`
+    : `<span class="headline">${esc(item.title)}</span>`;
+  return `<li class="${cls}" data-id="${esc(item.id)}">${headline}` +
     `<span class="meta">${meta.join(' · ')}</span>${why}${summary}` +
     `<div class="acts">` +
     `<button data-act="up" data-id="${esc(item.id)}" title="More like this">&#128077;</button>` +

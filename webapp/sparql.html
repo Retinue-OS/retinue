@@ -51,17 +51,7 @@
     <retinue-shelf></retinue-shelf>
   </main>
 
-  <script>
-    // The endpoint as a program would call it, with this host in it.
-    document.querySelector('[data-curl]').textContent =
-      `curl -u <user> -H 'Accept: text/csv' ${location.origin}/sparql \\\n` +
-      `  --data-urlencode 'query=SELECT ?class (COUNT(?s) AS ?n) WHERE { ?s a ?class } GROUP BY ?class'`;
-  </script>
-  <script>
-    // Register the service worker so this page gets the shared shell too.
-    if ('serviceWorker' in navigator) {
-      window.addEventListener('load', () => navigator.serviceWorker.register('/sw.js'));
-    }
-  </script>
+  <script src="/sparql-curl.js"></script>
+  <script src="/sw-register.js"></script>
 </body>
 </html>

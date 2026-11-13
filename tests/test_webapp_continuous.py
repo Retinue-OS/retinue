@@ -29,6 +29,7 @@ import {
   Vad, VAD_DEFAULTS, rms, pickWakeThread, WAKE_WINDOW_MS,
   modeEntries, isContinuous, setContinuous, touchContinuous, forgetContinuous, MODE_KEY,
   voiceTimeouts, setVoiceTimeouts, DEFAULT_SILENCE_MS, DEFAULT_NO_SPEECH_MS,
+  endedByAra, noteAraOff, ARA_OFF_SKEW_MS,
 } from './continuous.mjs';
 
 // ── A scripted localStorage ──────────────────────────────────────────────────
@@ -382,6 +383,44 @@ ok('a blocked storage gives the defaults and never throws', () => {
   } finally {
     globalThis.localStorage = saved;
   }
+});
+
+// ── Ara ends the mode (conversation-push.py --end-continuous) ───────────────
+ok('Ara ending the mode switches off a thread turned on before her stamp', () => {
+  store.clear();
+  const on = Date.parse('2026-11-12T10:00:00Z');
+  setContinuous('t9', true, on);
+  const stamp = '2026-11-12T10:05:00+00:00';
+  assert.equal(endedByAra(modeEntries().t9, stamp), true);
+});
+ok('a device clock a little ahead of the server still ends it', () => {
+  store.clear();
+  const stamp = '2026-11-12T10:05:00+00:00';
+  setContinuous('t9', true, Date.parse(stamp) + ARA_OFF_SKEW_MS - 1000);
+  assert.equal(endedByAra(modeEntries().t9, stamp), true);
+});
+ok('each stamp acts once: switched on again afterwards, the mode stays on', () => {
+  store.clear();
+  const stamp = '2026-11-12T10:05:00+00:00';
+  setContinuous('t9', true, Date.parse('2026-11-12T10:00:00Z'));
+  assert.equal(endedByAra(modeEntries().t9, stamp), true);
+  setContinuous('t9', false);
+  noteAraOff('t9', stamp);
+  // The user taps the loop button again, seconds later (within the skew).
+  setContinuous('t9', true, Date.parse(stamp) + 5000);
+  assert.equal(modeEntries().t9.offSeen, stamp, 'toggling keeps what was seen');
+  assert.equal(endedByAra(modeEntries().t9, stamp), false);
+  // A later request from Ara is a new stamp, and acts again.
+  assert.equal(endedByAra(modeEntries().t9, '2026-11-12T10:30:00+00:00'), true);
+});
+ok('no stamp, a bad stamp, or a thread not in the mode: nothing to end', () => {
+  store.clear();
+  setContinuous('t9', true, 1000);
+  assert.equal(endedByAra(modeEntries().t9, ''), false);
+  assert.equal(endedByAra(modeEntries().t9, 'not a date'), false);
+  setContinuous('t9', false);
+  assert.equal(endedByAra(modeEntries().t9, '2026-11-12T10:05:00+00:00'), false);
+  assert.equal(endedByAra(undefined, '2026-11-12T10:05:00+00:00'), false);
 });
 
 console.log(`${passed} checks passed`);
