@@ -12,6 +12,8 @@
 //   #form-approve, #form-reject   the approval card: lock both buttons once
 //                                 one is pressed, so a slow answer is not
 //                                 met with a second decision
+//   #back-thread[data-thread]     the way back to the thread that asked:
+//                                 Back when it is where the tab came from
 //   #st-row[data-status]          the status page of a decided send: poll
 //                                 while it is sending, then say how it ended
 //                                 and move on
@@ -27,23 +29,60 @@
   // followed it. A page opened on its own (a link from another app, another
   // site before it in the tab) has none, so it closes; where the browser
   // refuses that, the dashboard, never the empty /sends list.
+  // The place in the thread the approval link was tapped at. The thread
+  // writes it as the link is tapped (conversation.js, _noteSendsReturn: the
+  // thread id, its shelfLocation() and the page it was open on); a way back
+  // hands it to the thread page in the shelf's restore format (shelf-store.js
+  // setRestore), so the thread opens at that exact message whether the
+  // browser brings the page back from its cache or loads it afresh.
+  var SENDS_RETURN_KEY = 'retinue.sends.return';
+  var SHELF_RESTORE_KEY = 'retinue.shelf.restore';
+
+  function sendsReturn(id) {
+    try {
+      var r = JSON.parse(sessionStorage.getItem(SENDS_RETURN_KEY) || 'null');
+      return r && r.id === id ? r : null;
+    } catch (e) { return null; }
+  }
+  function primeReturn(id) {
+    var r = id && sendsReturn(id);
+    if (!r || !r.location) return;
+    try {
+      sessionStorage.setItem(SHELF_RESTORE_KEY, JSON.stringify(
+        { key: 'thread:' + id, location: r.location, at: Date.now() }));
+    } catch (e) { /* the thread opens at its newest message */ }
+  }
+  function threadOf(u) {
+    var m = /^#conversation-([0-9a-f]{32})$/.exec(u.hash || '');
+    return m ? m[1] : null;
+  }
+
   function closeOrHome() {
     window.close();
     setTimeout(function () { location.replace('/'); }, 400);
   }
 
-  function leave() {
+  // The latest same-origin history entry that is not a /sends page, or null.
+  function originEntry() {
     var nav = window.navigation;
-    if (nav && nav.currentEntry && nav.entries) {
-      var entries = nav.entries();
-      for (var i = nav.currentEntry.index - 1; i >= 0; i--) {
-        var u;
-        try { u = new URL(entries[i].url); } catch (e) { continue; }
-        if (u.origin !== location.origin || /^\/sends(\/|$)/.test(u.pathname)) continue;
-        var t = nav.traverseTo(entries[i].key);
-        if (t && t.committed) { t.committed.catch(closeOrHome); }
-        return;
-      }
+    if (!nav || !nav.currentEntry || !nav.entries) return null;
+    var entries = nav.entries();
+    for (var i = nav.currentEntry.index - 1; i >= 0; i--) {
+      var u;
+      try { u = new URL(entries[i].url); } catch (e) { continue; }
+      if (u.origin !== location.origin || /^\/sends(\/|$)/.test(u.pathname)) continue;
+      return { entry: entries[i], url: u };
+    }
+    return null;
+  }
+
+  function leave() {
+    var o = originEntry();
+    if (o) {
+      primeReturn(threadOf(o.url));
+      var t = window.navigation.traverseTo(o.entry.key);
+      if (t && t.committed) { t.committed.catch(closeOrHome); }
+      return;
     }
     closeOrHome();
   }
@@ -51,6 +90,30 @@
   if (document.body.hasAttribute('data-sends-leave')) {
     leave();
     return;
+  }
+
+  // "Back to the thread" (#back-thread): the way to the dashboard thread that
+  // asked for the approval. When that thread is where this tab came from, the
+  // tap is the browser's own Back (traverseTo, stepping over any approval and
+  // status pages in between), so the thread is exactly as it was left.
+  // Otherwise (no Navigation API, the approval opened from a push or another
+  // app) it stays a plain link to the thread, on the page it was open on when
+  // the approval link was tapped. Either way the place in it is handed over.
+  var back = document.getElementById('back-thread');
+  if (back) {
+    var backId = back.getAttribute('data-thread');
+    var noted = sendsReturn(backId);
+    if (noted && typeof noted.href === 'string' && noted.href.charAt(0) === '/' &&
+        noted.href.charAt(1) !== '/') back.href = noted.href;
+    back.addEventListener('click', function (e) {
+      if (e.defaultPrevented || e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
+      primeReturn(backId);
+      var o = originEntry();
+      if (!o || threadOf(o.url) !== backId) return;
+      e.preventDefault();
+      var t = window.navigation.traverseTo(o.entry.key);
+      if (t && t.committed) { t.committed.catch(function () { location.href = back.href; }); }
+    });
   }
 
   // The approval card.

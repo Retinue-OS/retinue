@@ -4759,6 +4759,29 @@ def _all_pending() -> list[dict]:
 _SENDS_SCRIPT = '<script src="/gateway/sends.js"></script>\n'
 
 
+def _thread_backlink(thread) -> str:
+    """The nav link back to the dashboard thread that queued this send, or ""
+    when it was queued outside one (or that thread is gone)."""
+    cid = send_origin.valid_thread(thread)
+    conv = _load_conv(cid) if cid else None
+    if conv is None:
+        return ""
+    title = html.escape(str(conv.get("title") or "").strip() or "the thread")
+    return (f'<a href="/conversations.html#conversation-{cid}" id="back-thread" '
+            f'data-thread="{cid}">‹ Back to {title}</a>')
+
+
+def _sends_nav(thread=None) -> str:
+    """The nav row of every /sends page: the way back to the asking thread
+    first, when there is one, then the dashboard and the list.
+
+    The link (#back-thread) is a plain link to the thread; _SENDS_SCRIPT makes
+    it the browser's own Back when that thread is where the tab came from, and
+    hands the thread the place its approval link was tapped at."""
+    return (f"<nav>{_thread_backlink(thread)}{_NAV_HOME}"
+            '<a href="/sends">↑ All pending sends</a></nav>\n')
+
+
 def _render_sends_index_html(pending: list[dict], leave: bool = False) -> str:
     """The list of pending sends. With `leave`, the empty list a decision lands
     on when nothing is left to decide goes straight back to where the approval
@@ -4829,7 +4852,7 @@ def _render_send_single_html(detail: dict, account: str, next_url: str | None) -
         + f"<title>Retinue — Approve Send {rid}</title>\n"
         + "<body>\n"
         + "<h1>Approve Send</h1>\n"
-        + f'<nav>{_NAV_HOME}<a href="/sends">\u2191 All pending sends</a></nav>\n'
+        + _sends_nav(detail.get("thread"))
         + '<table class="answer">\n' + "\n".join(meta_rows) + "\n</table>\n"
         + f'<pre class="msg-body">{body}</pre>\n'
         + '<div class="actions">\n'
@@ -4864,7 +4887,7 @@ def _render_email_send_outcome_html(result: dict, account: str, request_id: str,
     return _render_send_status_html(
         title=f"E-mail send {html.escape(request_id)}", heading="E-mail send",
         meta_rows=meta_rows, body_html="", status="approved", notes=_MESSAGE_SEND_NOTES,
-        error="", next_url=next_url, poll_url=None)
+        error="", next_url=next_url, poll_url=None, thread=result.get("thread"))
 
 
 # ── Pending-send detail rendering ────────────────────────────────────────────
@@ -5257,7 +5280,8 @@ _MESSAGE_SEND_NOTES = {
 
 def _render_send_status_html(*, title: str, heading: str, meta_rows: list[str],
                              body_html: str, status: str, notes: dict, error: str,
-                             next_url: str | None, poll_url: str | None) -> str:
+                             next_url: str | None, poll_url: str | None,
+                             thread: str | None = None) -> str:
     """Render the status page of a decided send — every channel, e-mail included,
     so all of them end the same way once the user has decided.
 
@@ -5310,7 +5334,7 @@ def _render_send_status_html(*, title: str, heading: str, meta_rows: list[str],
           "</style>\n"
         + "<body>\n"
         + f"<h1>{heading}</h1>\n"
-        + f'<nav>{_NAV_HOME}<a href="/sends">↑ All pending sends</a></nav>\n'
+        + _sends_nav(thread)
         + '<table class="answer">\n' + "\n".join(meta_rows) + "\n</table>\n"
         + body_html
         # What the script needs to know, for it to read (_SENDS_SCRIPT): the
@@ -5414,14 +5438,14 @@ def _render_channel_send_html(detail: dict, channel: str, request_id: str, next_
             title=f"{label_e} {noun} {rid}", heading=f"{label_e} {noun.lower()}",
             meta_rows=meta_rows, body_html=body_html, status=status, notes=notes,
             error=detail.get("error") or "", next_url=next_url,
-            poll_url=f"/sends/{channel}/{request_id}/status")
+            poll_url=f"/sends/{channel}/{request_id}/status", thread=detail.get("thread"))
     return (
         _HTML_HEAD
         + f"<title>Retinue — Approve {label_e} {noun} {rid}</title>\n"
         + (_AGENDA_CSS if agenda else "")
         + "<body>\n"
         + f"<h1>Approve {label_e} {noun}</h1>\n"
-        + f'<nav>{_NAV_HOME}<a href="/sends">\u2191 All pending sends</a></nav>\n'
+        + _sends_nav(detail.get("thread"))
         + '<table class="answer">\n' + "\n".join(meta_rows) + "\n</table>\n"
         + body_html
         + _render_agenda_html(agenda)

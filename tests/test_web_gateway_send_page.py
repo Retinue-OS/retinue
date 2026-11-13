@@ -131,7 +131,8 @@ def test_approved_page_shows_check_and_advances():
         assert "else if (status === 'approved') { setTimeout(advance, 1500); }" in SENDS_JS
         # With nothing left, back to the page the link was tapped on: the
         # latest history entry that is not a /sends page.
-        assert "nav.traverseTo(entries[i].key)" in SENDS_JS
+        assert "return { entry: entries[i], url: u };" in SENDS_JS
+        assert "window.navigation.traverseTo(o.entry.key)" in SENDS_JS
         assert ("if (u.origin !== location.origin || /^\\/sends(\\/|$)/.test(u.pathname)) continue;"
                 in SENDS_JS)
         # Opened on its own: close, else the dashboard — never the /sends list.
@@ -608,6 +609,67 @@ def test_empty_list_after_a_decision_goes_back():
         assert "if (nextUrl) { location = nextUrl; return; }\n    leave();" in SENDS_JS
 
 
+def _write_thread(tmp: Path, cid: str, title: str) -> None:
+    import json as _json
+    convs = tmp / "convs"
+    convs.mkdir(parents=True, exist_ok=True)
+    (convs / f"{cid}.json").write_text(_json.dumps({"id": cid, "title": title, "messages": []}))
+
+
+def test_approval_page_links_back_to_the_asking_thread():
+    """The way back to the thread that queued the send: the browser's own Back
+    when that thread is where the tab came from, else a link to it — and both
+    hand over the place in the thread the approval link was tapped at."""
+    with tempfile.TemporaryDirectory() as tmp:
+        wg = _load_gateway(Path(tmp))
+        cid = "c" * 32
+        _write_thread(Path(tmp), cid, "Party <RSVP>")
+        out = wg._render_channel_send_html(_detail("pending", thread=cid),
+                                           "whatsapp-gateway", "a" * 32, None)
+        link = (f'<a href="/conversations.html#conversation-{cid}" id="back-thread" '
+                f'data-thread="{cid}">‹ Back to Party &lt;RSVP&gt;</a>')
+        assert f"<nav>{link}{wg._NAV_HOME}" in out
+        assert SENDS_SCRIPT_TAG in out
+        # The script: Back when the latest non-/sends entry is this thread,
+        # else the plain link; the place is handed over in the shelf's restore
+        # format, by the return after a decision too.
+        assert "var back = document.getElementById('back-thread');" in SENDS_JS
+        assert "if (!o || threadOf(o.url) !== backId) return;" in SENDS_JS
+        assert "primeReturn(backId);" in SENDS_JS
+        assert "var SHELF_RESTORE_KEY = 'retinue.shelf.restore';" in SENDS_JS
+        assert "{ key: 'thread:' + id, location: r.location, at: Date.now() }" in SENDS_JS
+        assert "primeReturn(threadOf(o.url));" in SENDS_JS
+        # No script in the page itself (the Content-Security-Policy).
+        assert "<script>" not in out
+        # E-mail approval, and the status page after the decision, alike.
+        email = wg._render_send_single_html({"request_id": "42", "thread": cid}, "ari", None)
+        assert link in email
+        status = wg._render_channel_send_html(_detail("error", thread=cid, error="x"),
+                                              "whatsapp-gateway", "a" * 32, None)
+        assert link in status
+
+
+def test_no_backlink_without_a_live_thread():
+    with tempfile.TemporaryDirectory() as tmp:
+        wg = _load_gateway(Path(tmp))
+        none = wg._render_channel_send_html(_detail("pending"), "whatsapp-gateway", "a" * 32, None)
+        gone = wg._render_channel_send_html(_detail("pending", thread="d" * 32),
+                                            "whatsapp-gateway", "a" * 32, None)
+        bogus = wg._render_channel_send_html(_detail("pending", thread="../x"),
+                                             "whatsapp-gateway", "a" * 32, None)
+        for out in (none, gone, bogus):
+            assert 'id="back-thread"' not in out
+            assert f'<nav>{wg._NAV_HOME}<a href="/sends">' in out
+
+
+def test_thread_notes_where_an_approval_link_was_tapped():
+    src = (REPO_ROOT / "webapp" / "components" / "conversation.js").read_text(encoding="utf-8")
+    assert "const SENDS_RETURN_KEY = 'retinue.sends.return';" in src
+    assert "var SENDS_RETURN_KEY = 'retinue.sends.return';" in SENDS_JS
+    assert "if (link) this._noteSendsReturn(link);" in src
+    assert "location: this.shelfLocation()," in src
+
+
 def main() -> int:
     tests = [test_sending_page_polls_with_spinner,
              test_sending_page_with_next_shows_button,
@@ -635,7 +697,10 @@ def main() -> int:
              test_index_row_names_the_event_time,
              test_messenger_page_is_unchanged,
              test_email_outcome_page_ends_like_a_messenger_send,
-             test_empty_list_after_a_decision_goes_back]
+             test_empty_list_after_a_decision_goes_back,
+             test_approval_page_links_back_to_the_asking_thread,
+             test_no_backlink_without_a_live_thread,
+             test_thread_notes_where_an_approval_link_was_tapped]
     failures = 0
     for test in tests:
         try:
