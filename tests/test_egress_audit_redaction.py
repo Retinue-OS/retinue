@@ -15,7 +15,9 @@ strings, URL paths and bodies before writing. What these pin down:
   credential fields, numeric OTPs and PINs, and percent-encoded names and
   values;
 - ordinary content is left alone, and the names of redacted fields stay
-  visible, so the log still shows that a credential travelled.
+  visible, so the log still shows that a credential travelled;
+- a body the proxy streamed through is logged as streamed, with its declared
+  size and no text.
 
     python3 tests/test_egress_audit_redaction.py
 """
@@ -171,6 +173,21 @@ def test_ordinary_content_is_untouched():
     assert addon._redact_text(text) == text
 
 
+def test_a_streamed_body_is_logged_by_size():
+    flow = _flow("/repo.git/git-upload-pack", [("Content-Length", "12")], b"",
+                 [("Transfer-Encoding", "chunked")], None)
+    flow.request.stream = True
+    flow.request.content = None
+    flow.response.stream = True
+    _, entry = _logged(flow)
+    assert entry["request_body"] == {"present": True, "streamed": True,
+                                     "truncated": True, "size": 12, "text": ""}
+    assert entry["response_body"]["streamed"] and entry["response_body"]["size"] is None
+    # A buffered body is recorded as before.
+    _, entry = _logged(_flow("/", [], b"abc", [], b"de"))
+    assert "streamed" not in entry["request_body"] and entry["request_body"]["size"] == 3
+
+
 def main() -> int:
     test_the_oauth_refresh_keeps_no_token()
     test_a_truncated_body_is_still_redacted()
@@ -182,6 +199,7 @@ def main() -> int:
     test_numeric_credentials()
     test_percent_encoded_names_and_values()
     test_ordinary_content_is_untouched()
+    test_a_streamed_body_is_logged_by_size()
     print("all egress-audit redaction tests passed")
     return 0
 

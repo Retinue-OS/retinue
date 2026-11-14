@@ -8,6 +8,14 @@ day named YYYY-MM-DD.ndjson.
 Bodies are truncated to EGRESS_AUDIT_BODY_LIMIT bytes so the log stays
 small enough to review.
 
+Bodies above the proxy's `stream_large_bodies` threshold (set by the
+entrypoint from EGRESS_AUDIT_STREAM_THRESHOLD) are streamed straight through
+and never held in memory, so the addon does not see them: such a body is
+logged as `streamed`, with its size taken from Content-Length when the sender
+declared one. Buffering them instead held every byte of a large download or
+`git clone` in the proxy at once, and Python does not hand that memory back
+to the OS, so the proxy kept its peak size and starved the host.
+
 Credentials are redacted before anything is written — not only in headers
 but in query strings and bodies too. The log is read by the egress log viewer
 and the anomaly agent, so a credential that lands in it is a credential
@@ -136,6 +144,27 @@ def _now() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
+def _declared_size(headers) -> int | None:
+    for name, value in headers.fields:
+        if name.lower() == b"content-length":
+            try:
+                return int(value)
+            except ValueError:
+                return None
+    return None
+
+
+def _body(message) -> dict:
+    """The log record for a request's or response's body.
+
+    A streamed body (see the module docstring) has no content to sample: it is
+    recorded as streamed, with the size its sender declared, if any."""
+    if getattr(message, "stream", False):
+        return {"present": True, "streamed": True, "truncated": True,
+                "size": _declared_size(message.headers), "text": ""}
+    return _truncate(message.content)
+
+
 def _truncate(body: bytes | None, limit: int = BODY_LIMIT) -> dict:
     if body is None:
         return {"present": False, "truncated": False, "size": 0, "text": ""}
@@ -187,11 +216,11 @@ class EgressAuditAddon:
             "query": _redact_text(query) if query else None,
             "http_version": req.http_version,
             "request_headers": _headers(req.headers),
-            "request_body": _truncate(req.content),
+            "request_body": _body(req),
             "response_status": resp.status_code,
             "response_reason": resp.reason,
             "response_headers": _headers(resp.headers),
-            "response_body": _truncate(resp.content),
+            "response_body": _body(resp),
             "duration_ms": duration_ms,
         }
 
