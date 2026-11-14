@@ -18,6 +18,8 @@ import contextlib
 import html.parser
 import importlib.util
 import os
+import shutil
+import subprocess
 import sys
 import tempfile
 import types
@@ -674,6 +676,147 @@ def test_thread_notes_where_an_approval_link_was_tapped():
     assert "try { sessionStorage.removeItem(SENDS_RETURN_KEY); }" in SENDS_JS
 
 
+# The return note's life, run for real (node): sends.js is loaded into a stub
+# page with a sessionStorage, a history and a clock the harness controls.
+_RETURN_HARNESS = r"""
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import vm from 'node:vm';
+
+const SRC = fs.readFileSync(process.argv[2], 'utf8');
+const ID = 'c'.repeat(32), OTHER = 'd'.repeat(32);
+const NOTE = 'retinue.sends.return', RESTORE = 'retinue.shelf.restore';
+const MIN = 60 * 1000, NOW = 1700000000000;
+const ORIGIN = 'https://dash.example';
+const PLACE = { anchor: 'm7', offset: 12 };
+
+// One page load of a /sends page. opts: note (the stored return note), leave
+// (the empty list after a decision), backId (the page's #back-thread), from
+// (the thread the tab came from, null for none). Returns what the page did.
+function load(opts) {
+  const store = new Map();
+  if (opts.note) store.set(NOTE, JSON.stringify(opts.note));
+  const sessionStorage = {
+    getItem: (k) => (store.has(k) ? store.get(k) : null),
+    setItem: (k, v) => { store.set(k, String(v)); },
+    removeItem: (k) => { store.delete(k); },
+  };
+  const out = { store, traversed: [], prevented: false, back: null };
+  let click = null;
+  if (opts.backId) {
+    out.back = {
+      href: '/conversations.html#conversation-' + opts.backId,
+      getAttribute: (n) => (n === 'data-thread' ? opts.backId : null),
+      addEventListener: (type, fn) => { if (type === 'click') click = fn; },
+    };
+  }
+  const entries = [];
+  if (opts.from) {
+    entries.push({ key: 'k-thread', url: ORIGIN + '/conversations.html#conversation-' + opts.from });
+  }
+  entries.push({ key: 'k-send', url: ORIGIN + '/sends/acct/1' });
+  const navigation = {
+    currentEntry: { index: entries.length - 1 },
+    entries: () => entries,
+    traverseTo: (key) => { out.traversed.push(key); return { committed: Promise.resolve() }; },
+  };
+  class FakeDate extends Date { static now() { return NOW; } }
+  const window = { navigation, close() {} };
+  const context = {
+    window, sessionStorage, navigation, URL, JSON, Date: FakeDate,
+    location: { origin: ORIGIN, href: ORIGIN + '/sends/acct/1', replace() {} },
+    document: {
+      body: { hasAttribute: (n) => n === 'data-sends-leave' && !!opts.leave },
+      getElementById: (id) => (id === 'back-thread' ? out.back : null),
+    },
+    setTimeout: () => 0, fetch: () => new Promise(() => {}),
+  };
+  vm.runInNewContext(SRC, context);
+  out.click = () => click({
+    defaultPrevented: false, button: 0,
+    preventDefault() { out.prevented = true; },
+  });
+  out.restore = () => JSON.parse(store.get(RESTORE) || 'null');
+  return out;
+}
+const note = (ageMs, id = ID) => ({
+  id, location: PLACE, href: '/?x=1#conversation-' + id, at: NOW - ageMs,
+});
+let passed = 0;
+function check(name, fn) { fn(); passed++; }
+
+check('Back link, live note, thread is where the tab came from', () => {
+  const p = load({ note: note(5 * MIN), backId: ID, from: ID });
+  assert.equal(p.back.href, '/?x=1#conversation-' + ID);
+  assert.ok(p.store.has(NOTE), 'reading the note does not use it up');
+  p.click();
+  assert.deepEqual(p.restore(), { key: 'thread:' + ID, location: PLACE, at: NOW });
+  assert.ok(!p.store.has(NOTE), 'the way back uses the note up');
+  assert.deepEqual(p.traversed, ['k-thread']);
+  assert.ok(p.prevented);
+});
+
+check('Back link, live note, opened on its own: the plain link, place handed over', () => {
+  const p = load({ note: note(5 * MIN), backId: ID, from: null });
+  p.click();
+  assert.deepEqual(p.restore(), { key: 'thread:' + ID, location: PLACE, at: NOW });
+  assert.ok(!p.store.has(NOTE));
+  assert.deepEqual(p.traversed, []);
+  assert.ok(!p.prevented);
+});
+
+check('the note lives up to 30 minutes, not at 30', () => {
+  const live = load({ note: note(30 * MIN - 1), backId: ID, from: ID });
+  live.click();
+  assert.ok(live.restore());
+  const gone = load({ note: note(30 * MIN), backId: ID, from: ID });
+  assert.equal(gone.back.href, '/conversations.html#conversation-' + ID,
+    'an expired note does not move the link');
+  assert.ok(!gone.store.has(NOTE), 'an expired note is cleared when read');
+  gone.click();
+  assert.equal(gone.restore(), null, 'no place handed over');
+  assert.deepEqual(gone.traversed, ['k-thread'], 'Back still goes back');
+});
+
+check('a note of another thread is left alone', () => {
+  const p = load({ note: note(MIN, OTHER), backId: ID, from: ID });
+  p.click();
+  assert.equal(p.restore(), null);
+  assert.ok(p.store.has(NOTE));
+});
+
+check('the automatic return hands the place over and uses the note up', () => {
+  const p = load({ note: note(5 * MIN), leave: true, from: ID });
+  assert.deepEqual(p.restore(), { key: 'thread:' + ID, location: PLACE, at: NOW });
+  assert.ok(!p.store.has(NOTE));
+  assert.deepEqual(p.traversed, ['k-thread']);
+});
+
+check('the automatic return with an expired note just goes back', () => {
+  const p = load({ note: note(31 * MIN), leave: true, from: ID });
+  assert.equal(p.restore(), null);
+  assert.ok(!p.store.has(NOTE));
+  assert.deepEqual(p.traversed, ['k-thread']);
+});
+
+console.log(`${passed} return-note checks passed`);
+"""
+
+
+def test_return_note_lapses_and_is_used_up():
+    node = shutil.which("node")
+    if not node:
+        print("SKIP: node is not installed; the return-note behaviour test needs it")
+        return
+    with tempfile.TemporaryDirectory() as tmp:
+        harness = Path(tmp) / "harness.mjs"
+        harness.write_text(_RETURN_HARNESS, encoding="utf-8")
+        proc = subprocess.run(
+            [node, str(harness), str(REPO_ROOT / "webapp" / "gateway" / "sends.js")],
+            capture_output=True, text=True)
+        assert proc.returncode == 0, proc.stderr or proc.stdout
+
+
 def main() -> int:
     tests = [test_sending_page_polls_with_spinner,
              test_sending_page_with_next_shows_button,
@@ -704,7 +847,8 @@ def main() -> int:
              test_empty_list_after_a_decision_goes_back,
              test_approval_page_links_back_to_the_asking_thread,
              test_no_backlink_without_a_live_thread,
-             test_thread_notes_where_an_approval_link_was_tapped]
+             test_thread_notes_where_an_approval_link_was_tapped,
+             test_return_note_lapses_and_is_used_up]
     failures = 0
     for test in tests:
         try:
