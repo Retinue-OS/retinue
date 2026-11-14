@@ -22,31 +22,34 @@
 // so everything it looks for is already there. Written for old WebViews
 // too, like the inline scripts were: no modules, no arrow functions.
 (function () {
-  // The way out of the /sends pages once nothing is left to decide: back to
-  // the page the approval link was tapped on. The dashboard opens it in place
-  // (#359), so that is the latest same-origin history entry that is not a
-  // /sends page (Navigation API), however many approval and status pages
-  // followed it. A page opened on its own (a link from another app, another
-  // site before it in the tab) has none, so it closes; where the browser
-  // refuses that, the dashboard, never the empty /sends list.
   // The place in the thread the approval link was tapped at. The thread
   // writes it as the link is tapped (conversation.js, _noteSendsReturn: the
   // thread id, its shelfLocation() and the page it was open on); a way back
   // hands it to the thread page in the shelf's restore format (shelf-store.js
   // setRestore), so the thread opens at that exact message whether the
   // browser brings the page back from its cache or loads it afresh.
+  //
+  // The note is for the visit that tap began: a way back uses it up, and one
+  // left behind (the reader went back by other means) lapses, so an approval
+  // opened later in this tab does not land at a place long left.
   var SENDS_RETURN_KEY = 'retinue.sends.return';
+  var SENDS_RETURN_TTL_MS = 30 * 60 * 1000;
   var SHELF_RESTORE_KEY = 'retinue.shelf.restore';
 
   function sendsReturn(id) {
     try {
       var r = JSON.parse(sessionStorage.getItem(SENDS_RETURN_KEY) || 'null');
-      return r && r.id === id ? r : null;
+      if (!r || r.id !== id) return null;
+      if (Date.now() - (r.at || 0) < SENDS_RETURN_TTL_MS) return r;
+      sessionStorage.removeItem(SENDS_RETURN_KEY);
+      return null;
     } catch (e) { return null; }
   }
   function primeReturn(id) {
     var r = id && sendsReturn(id);
-    if (!r || !r.location) return;
+    if (!r) return;
+    try { sessionStorage.removeItem(SENDS_RETURN_KEY); } catch (e) { /* lapses */ }
+    if (!r.location) return;
     try {
       sessionStorage.setItem(SHELF_RESTORE_KEY, JSON.stringify(
         { key: 'thread:' + id, location: r.location, at: Date.now() }));
@@ -57,6 +60,13 @@
     return m ? m[1] : null;
   }
 
+  // The way out of the /sends pages once nothing is left to decide: back to
+  // the page the approval link was tapped on. The dashboard opens it in place
+  // (#359), so that is the latest same-origin history entry that is not a
+  // /sends page (Navigation API), however many approval and status pages
+  // followed it. A page opened on its own (a link from another app, another
+  // site before it in the tab) has none, so it closes; where the browser
+  // refuses that, the dashboard, never the empty /sends list.
   function closeOrHome() {
     window.close();
     setTimeout(function () { location.replace('/'); }, 400);

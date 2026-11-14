@@ -112,7 +112,8 @@ tapped the approval link: the thread notes that place as the link is tapped
 (per tab, in `sessionStorage`), and the approval page hands it on in the
 shelf's restore format, so it holds even when the browser reloads the page
 rather than bringing it back from its cache. The automatic return after a
-decision hands it on the same way.
+decision hands it on the same way. The note is for that visit only: a way
+back uses it up, and one left behind lapses after half an hour.
 
 ### Retracting a queued send
 
