@@ -169,6 +169,18 @@ class AuthMonitorEngine:
         self.remind_broken = remind_broken
         self.remind_warn = remind_warn
 
+    def _open(self, entry: dict, level: str, reason: str, now: float) -> None:
+        """Open the incident's thread at `level`."""
+        title = ("Claude sign-in broken" if level == "broken"
+                 else "Claude sign-in expires soon")
+        message = broken_message(reason) if level == "broken" else warn_message(reason)
+        thread_id = self.notifier.open_thread(
+            title, message, attention=BROKEN_ATTENTION if level == "broken" else WARN_ATTENTION)
+        if thread_id:
+            entry.update(thread_id=thread_id, notified=True,
+                         last_notice=now, level=level)
+        # else: backend unreachable — retry on the next tick
+
     def step(self, status: dict, now: float | None = None) -> None:
         now = time.time() if now is None else now
         level = level_of(status)
@@ -192,22 +204,21 @@ class AuthMonitorEngine:
             print(f"{LOG} sign-in {level.upper()}: {reason}", flush=True)
 
         if not entry.get("notified"):
-            title = ("Claude sign-in broken" if level == "broken"
-                     else "Claude sign-in expires soon")
-            message = broken_message(reason) if level == "broken" else warn_message(reason)
-            thread_id = self.notifier.open_thread(
-                title, message, attention=BROKEN_ATTENTION if level == "broken" else WARN_ATTENTION)
-            if thread_id:
-                entry.update(thread_id=thread_id, notified=True,
-                             last_notice=now, level=level)
-            # else: backend unreachable — retry on the next tick
+            self._open(entry, level, reason, now)
             return
 
         if level != entry.get("level"):
             # warn → broken (the predicted outage arrived) or broken → warn
             # (partial recovery): say so right away, in the same thread.
-            if self.notifier.append(entry["thread_id"], change_message(level, reason),
-                                    attention=BROKEN_ATTENTION if level == "broken" else WARN_ATTENTION):
+            sent = self.notifier.append(entry["thread_id"], change_message(level, reason),
+                                        attention=BROKEN_ATTENTION if level == "broken" else WARN_ATTENTION)
+            if sent == conversation_notify.DELETED:
+                # The user deleted the earlier notice — their answer on that
+                # one. A change of severity is news it did not carry (a
+                # warning dismissed must not silence the outage it
+                # predicted), so it opens a thread of its own.
+                self._open(entry, level, reason, now)
+            elif sent:
                 entry.update(level=level, last_notice=now)
             return
 

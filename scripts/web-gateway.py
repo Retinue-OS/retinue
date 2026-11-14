@@ -13593,9 +13593,10 @@ class Handler(BaseHTTPRequestHandler):
 
     def _handle_conversation_delete(self, cid: str) -> None:
         """Erase a thread for good (no body): its messages, attachments,
-        attention state, key bindings and every Claude session it used —
-        see _delete_conversation — and leave a tombstone so it stays deleted
-        (410 to every later read, append and keyed open).
+        attention state and every Claude session it used — see
+        _delete_conversation — and leave a tombstone so it stays deleted (410
+        to every later read, append and keyed open). Its key bindings stay,
+        pointing at the tombstone, which is what answers a keyed open.
 
         The user's own act, like a chat delete: an agent may archive or mute
         a thread, never erase one, or a manipulated turn could erase the

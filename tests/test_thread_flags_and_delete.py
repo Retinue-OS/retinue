@@ -215,6 +215,14 @@ def test_delete_erases(gw: Gateway):
     status, body = gw.call("POST", f"/conversations/{cid}/delete")
     check("deleting again is a no-op success", status == 200 and body.get("deleted") is True)
 
+    notify = _load("conversation_notify_under_test", "conversation_notify.py")
+    notifier = notify.ConversationNotifier(base_url=gw.base + "/internal/conversations",
+                                           token=TOKEN, log_prefix="[test]")
+    check("the monitors' notifier hears a deleted thread as such",
+          notifier.append(cid, "Still down.") == notify.DELETED)
+    live = gw.open_thread("A live incident")
+    check("…and a live one as delivered", notifier.append(live, "Still down.") is True)
+
 
 def _run_push(mod, argv, error=None, response=None):
     captured = {}

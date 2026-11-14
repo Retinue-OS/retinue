@@ -993,8 +993,12 @@ chats' words:
   carry the same flag (`POST /chats/<id>/flags`).
 - **Delete** — the Archived tab's tray, two taps, no Undo
   (`POST /conversations/<id>/delete`): the thread's messages, attachments,
-  attention state, idempotency-key bindings and every Claude session it used
-  are erased; a turn still running cannot write any of it back. It is the
+  attention state and every Claude session it used are erased; a turn still
+  running cannot write any of it back. Its idempotency-key bindings are the
+  one thing kept (they hold nothing but the key's hash and the thread id):
+  they now point at the tombstone below, which is how a redelivered open
+  under the same key is told the thread was deleted. A chat's companion,
+  erased with its chat, loses its bindings instead. It is the
   user's own act, like a chat delete — accepted only from the dashboard
   through the reverse proxy (403 otherwise), never for a chat's companion
   (409, it goes with its chat), and with no agent path at all: a manipulated
@@ -1012,7 +1016,10 @@ redelivered open under the key that created it opens nothing in its place.
 `conversation-push.py` reports a 410 as the user's decision (exit 0), not as a
 failure; the monitors' notifier and the Ask-Ara connector's audit (which opens
 a fresh thread for what is asked next) treat it the same way, and triage
-resolves the message instead of proposing it again. Without the tombstone,
+resolves the message instead of proposing it again. Reminders into a deleted
+incident thread stay quiet, but news it did not carry is not swallowed: a
+sign-in warning the user deleted that turns into an outage opens a thread of
+its own. Without the tombstone,
 "gone" would read as "start over" and bring back exactly what was deleted.
 
 Agents set the flags through `POST /internal/conversations/<id>/flags`:

@@ -1530,9 +1530,13 @@ class RetinueConversation extends HTMLElement {
           this._stopPolling();
           // No conversation to carry on: the loop stops (a wake into a
           // deleted thread would otherwise hold the shell's voice flag for
-          // good), and the thread leaves the mode for wakes to come.
+          // good), and the thread leaves the mode for wakes to come. One the
+          // user deleted (here, or on another device) takes its local draft
+          // with it too — left behind, it would count as unsent input for
+          // good and hold back every shell update.
           this._listenOnOpen = false;
-          forgetContinuous(id);
+          if (res.status === 410) forgetThread(id);
+          else forgetContinuous(id);
           this._contDisengage();
           this.render();
         }

@@ -25,6 +25,13 @@ DEFAULT_BACKEND_URL = os.environ.get(
 DEFAULT_BACKEND_TOKEN = os.environ.get("CONVERSATION_BACKEND_TOKEN", "").strip()
 
 
+# What append() answers when the thread is one the user deleted: truthy, so a
+# caller that only asks "did it land?" treats it as handled (no retry on every
+# tick), and distinct, so a caller with news the deleted thread did not carry
+# can open a thread of its own.
+DELETED = "deleted"
+
+
 class ConversationNotifier:
     """Posts to the dashboard-conversation backend (Web Push fans out there)."""
 
@@ -71,7 +78,7 @@ class ConversationNotifier:
         return (body or {}).get("id")
 
     def append(self, thread_id: str, message: str,
-               attention: dict | None = None, quiet: bool = False) -> bool:
+               attention: dict | None = None, quiet: bool = False) -> bool | str:
         # quiet: a record, not a request for attention — no unread badge, no
         # Web Push, and the thread stays archived if the user put it there.
         payload: dict = {"message": message}
@@ -80,4 +87,6 @@ class ConversationNotifier:
         if quiet:
             payload["quiet"] = True
         body = self._post(f"{self.base_url}/{thread_id}/messages", payload)
+        if body is not None and body.get("deleted") is True:
+            return DELETED
         return body is not None
