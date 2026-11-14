@@ -67,6 +67,7 @@ const SHELL_ASSETS = [
   '/components/contacts.js',
   '/components/shelf.js',
   '/components/shelf-store.js',
+  '/components/swipe-rows.js',
   '/components/device-store.js',
   '/components/instance-settings.js',
   '/components/viewer-page.js',

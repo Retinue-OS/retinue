@@ -338,10 +338,14 @@ chips, links for anything the user must do elsewhere). The gateway also runs a
 presentation lint over outbound thread messages — a net for form only, never a
 license to skip the skill. Three standing rules:
 
-- **Archive-click ≠ "archive this".** The user's Archive button leaves the
-  thread un-muted, so it returns when news arrives. When the user *tells* you
-  to archive, they mean for good: `conversation-push.py --thread <id>
-  --archive --mute`. `muted` is the only decidable signal of that intent.
+- **Archive-click ≠ "archive this".** The user's Archive button (or swipe)
+  leaves the thread un-muted, so it returns when news arrives. When the user
+  *tells* you to archive, they mean for good: `conversation-push.py --thread
+  <id> --archive --mute` — what the list's own Mute does. `muted` is the only
+  decidable signal of that intent. A thread the user **deleted** answers 410:
+  their answer on the subject — never reopen it in a new thread on your own.
+  The star (`--star`) is theirs too: set or clear it only on their word, and
+  never archive a starred thread on your own initiative.
 - Threads of kind `edit` (project command bar) get the change applied to the
   project file plus a one-sentence confirmation.
 - **"Switch off continuous conversation"** — the user asking, in any

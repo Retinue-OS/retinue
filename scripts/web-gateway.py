@@ -41,6 +41,22 @@ Projects (dashboard project pages):
                                          content on a concurrent change.
   POST /conversations/<id>/messages   -> user reply (body {message}); async reply.
   POST /conversations/<id>/read       -> clear the thread's unread flag.
+  POST /conversations/<id>/archive    -> the thread bar's Archive (`muted`
+                                         untouched: news brings it back).
+  POST /conversations/<id>/unarchive  -> back in the list, `muted` cleared.
+  POST /conversations/<id>/flags      -> the Threads page's swipe and tray: set
+                                         {archived, muted, starred} (any of
+                                         them, booleans). `starred` sorts the
+                                         thread first in its list and nothing
+                                         else. Archiving settles the attention
+                                         item, unarchiving reopens it.
+  POST /conversations/<id>/delete     -> erase the thread for good (no body);
+                                         the user's own act, accepted only
+                                         through the reverse proxy (403
+                                         otherwise), never for a chat's
+                                         companion (409). Leaves a tombstone:
+                                         every later read, append, flag write
+                                         or keyed open of it answers 410 Gone.
   POST /internal/conversations        -> a retinue agent opens a thread that needs
                                          the user's decision. Token-gated via
                                          CONVERSATION_BACKEND_TOKEN (header
@@ -77,11 +93,12 @@ Projects (dashboard project pages):
                                          user's messages (body {message_id}),
                                          on the user's request. Same token gate.
   POST /internal/conversations/<id>/flags
-                                      -> a retinue agent sets {archived, muted}
-                                         (either or both). Same token gate. The
-                                         only way to set `muted`, which is what
-                                         keeps a thread archived when new
-                                         messages are filed into it. Also
+                                      -> a retinue agent sets {archived, muted,
+                                         starred} (any of them). Same token
+                                         gate. `muted` is what keeps a thread
+                                         archived when new messages are filed
+                                         into it; `starred` is the user's mark,
+                                         set only on their word. Also
                                          {continuous_off: true}: the user asked
                                          Ara (by voice) to end continuous
                                          conversation; the thread is stamped
@@ -151,8 +168,10 @@ Messenger chats (the deterministic chat mirror; see scripts/chat_state.py):
                                          percent-encoded; the key is split off
                                          at the FIRST colon.
   POST /chats/<id>/read               -> advance the read watermark (body {ts}).
-  POST /chats/<id>/flags              -> set {archived, muted} (either or both,
-                                         booleans). Archived leaves the active
+  POST /chats/<id>/flags              -> set {archived, muted, starred} (any of
+                                         them, booleans). `starred` sorts the
+                                         chat first in its list, nothing else.
+                                         Archived leaves the active
                                          list; a new message brings it back
                                          unless it is muted, so hiding a chat
                                          for good is both together. Archiving
@@ -1396,6 +1415,8 @@ _INTERNAL_CONV_FLAGS_RE = re.compile(r"^/internal/conversations/([0-9a-f]{32})/f
 _CONV_READ_RE = re.compile(r"^/conversations/([0-9a-f]{32})/read/?$")
 _CONV_ARCHIVE_RE = re.compile(r"^/conversations/([0-9a-f]{32})/archive/?$")
 _CONV_UNARCHIVE_RE = re.compile(r"^/conversations/([0-9a-f]{32})/unarchive/?$")
+_CONV_FLAGS_RE = re.compile(r"^/conversations/([0-9a-f]{32})/flags/?$")
+_CONV_DELETE_RE = re.compile(r"^/conversations/([0-9a-f]{32})/delete/?$")
 _CONV_MODEL_RE = re.compile(r"^/conversations/([0-9a-f]{32})/model/?$")
 _CONV_SHELL_OUTCOME_RE = re.compile(
     r"^/conversations/([0-9a-f]{32})/shell-actions/([0-9a-f]{32})/outcome/?$")
@@ -2652,6 +2673,9 @@ def _conv_summary(conv: dict) -> dict:
         # is the flag that silences it. Independent of `archived` — either can
         # be set alone.
         "muted": bool(conv.get("muted")),
+        # The user's mark: the thread sorts above the rest of whichever list
+        # it is in. Nothing else — not its attention, not its push.
+        "starred": bool(conv.get("starred")),
         "pending": bool(conv.get("pending")),
         "pending_since": conv.get("pending_since"),
         "pending_status": conv.get("pending_status"),
@@ -3679,18 +3703,32 @@ def _conv_already_says(cid: str, message: str, payload: dict,
                for m in (conv.get("messages") or []))
 
 
-def _conv_for_key(key: str) -> str | None:
-    """The live thread already opened under `key`, or None.
-
-    A binding whose thread has since been deleted counts as unbound: a removed
-    thread must not silently swallow the next message about the same item."""
+def _conv_key_binding(key: str) -> str | None:
+    """The thread id `key` is bound to, live or not."""
     try:
         cid = _conv_key_path(key).read_text(encoding="utf-8").strip()
     except OSError:
         return None
-    if not _CONV_ID_RE.match(cid) or _load_conv(cid) is None:
+    return cid if _CONV_ID_RE.match(cid) else None
+
+
+def _conv_for_key(key: str) -> str | None:
+    """The live thread already opened under `key`, or None.
+
+    A binding whose thread has since vanished counts as unbound: a removed
+    thread must not silently swallow the next message about the same item.
+    One the user deleted is the exception — see _deleted_conv_for_key."""
+    cid = _conv_key_binding(key)
+    if cid is None or _load_conv(cid) is None:
         return None
     return cid
+
+
+def _deleted_conv_for_key(key: str) -> str | None:
+    """The thread `key` opened, if the user has deleted it since: the open is
+    then answered 410 rather than raising the thread again."""
+    cid = _conv_key_binding(key)
+    return cid if cid and _conv_deleted_at(cid) else None
 
 
 def _prune_ephemeral_conv_keys() -> None:
@@ -3794,6 +3832,18 @@ def materialise_pre_tier_model_pins() -> int:
             migrated += 1
     marker.write_text(target + "\n", encoding="utf-8")
     return migrated
+
+
+def _conv_archive_attention(cid: str, conv: dict, archived: bool) -> None:
+    """Archiving settles the thread's attention item; bringing it back reopens
+    it — on the list, never pushed again for that. Only what archiving itself
+    settled comes back, as on the chat path: a thread the user had marked
+    done, then archived, stays done."""
+    if conv.get("initiator") == "agent" or conv.get("attention"):
+        if archived:
+            _attention_mark(f"thread:{cid}", "done", "archived")
+        elif (conv.get("attention") or {}).get("done_how") == "archived":
+            _attention_mark(f"thread:{cid}", "open", "archived")
 
 
 def _conv_set_flags(cid: str, **flags) -> dict | None:
@@ -8034,6 +8084,7 @@ def _chats_payload() -> dict:
             "unread": count,
             "archived": bool(doc.get("archived")),
             "muted": bool(doc.get("muted")),
+            "starred": bool(doc.get("starred")),
             # Whose chat this is, once the user has said: the contact card, or
             # null while it is only a handle. `unknown_sender` is the other
             # half — nothing on the rail vouched for the last sender (no VIP)
@@ -8996,24 +9047,65 @@ def _forget_claude_session(session_id: str) -> int:
     return removed
 
 
-def _delete_conversation(cid: str) -> bool:
-    """Erase one conversation thread: its file, attachments, idempotency-key
-    bindings and Claude session. Returns whether the thread existed.
+# Threads the user deleted (POST /conversations/<id>/delete): one file per id
+# holding the moment of deletion and nothing else — thread ids are random, so
+# a tombstone says nothing about what the thread held. It is what keeps a
+# deleted thread deleted. Without it, "gone" reads as "start over": triage
+# re-collects a message whose proposal thread is missing and opens a fresh
+# one, and a redelivered keyed open finds its binding dangling and opens
+# another. With it, every such caller is told 410 — the user dismissed this —
+# and opens nothing in its place. Kept for good (ids are never reused); a
+# companion erased with its chat leaves none, since the chat's own deletion
+# already refuses everything about it.
+_CONV_TOMBSTONES_DIR = CONVERSATIONS_DIR / ".deleted"
+
+
+def _conv_deleted_at(cid: str) -> str | None:
+    """When the user deleted thread `cid`, or None if they did not."""
+    if not _CONV_ID_RE.fullmatch(cid or ""):
+        return None
+    try:
+        return (_CONV_TOMBSTONES_DIR / cid).read_text(encoding="utf-8").strip() or "unknown"
+    except OSError:
+        return None
+
+
+def _conv_write_tombstone(cid: str) -> str:
+    """Record that the user deleted thread `cid`; returns the deletion time."""
+    now = datetime.now(timezone.utc).isoformat()
+    _CONV_TOMBSTONES_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = _CONV_TOMBSTONES_DIR / f"{cid}.tmp"
+    tmp.write_text(now + "\n", encoding="utf-8")
+    tmp.replace(_CONV_TOMBSTONES_DIR / cid)
+    return now
+
+
+def _delete_conversation(cid: str, *, by_user: bool = False) -> bool:
+    """Erase one conversation thread: its file (messages and attention state
+    with it), attachments, idempotency-key bindings and Claude session.
+    Returns whether the thread existed.
 
     Used for a deleted chat's companion thread, which quotes the chat and so
-    is part of what "no traces" covers. A turn still running for it finds the
-    thread gone and has nowhere to write (``_conv_add_message`` answers None
-    for a missing thread)."""
+    is part of what "no traces" covers, and — `by_user` — for the user's own
+    Delete. That one leaves a tombstone (written before the file goes, under
+    the same lock every write takes, so no reader sees neither) and keeps the
+    key bindings, which then point at the tombstone: a redelivered open under
+    the key that created the thread is told it was deleted instead of
+    opening it again. A turn still running for the thread finds it gone and
+    has nowhere to write (``_conv_add_message`` answers None for a missing
+    thread)."""
     if not _CONV_ID_RE.fullmatch(cid or ""):
         return False
     with _conversations_lock:
         path = CONVERSATIONS_DIR / f"{cid}.json"
         existed = path.exists()
+        if by_user:
+            _conv_write_tombstone(cid)
         path.unlink(missing_ok=True)
     shutil.rmtree(CONVERSATION_ATTACHMENTS_DIR / cid, ignore_errors=True)
     with _conv_keys_lock:
         try:
-            bindings = [p for p in _CONV_KEYS_DIR.iterdir() if p.is_file()]
+            bindings = [] if by_user else [p for p in _CONV_KEYS_DIR.iterdir() if p.is_file()]
         except OSError:
             bindings = []
         for binding in bindings:
@@ -9297,6 +9389,7 @@ def _chat_messages_payload(chat_id: str, before: str | None = None) -> dict:
             "unread": 0,
             "archived": bool(doc.get("archived")),
             "muted": bool(doc.get("muted")),
+            "starred": bool(doc.get("starred")),
             "last": None if newest is None else {
                 "ts": newest["ts"],
                 "direction": newest["direction"],
@@ -11311,6 +11404,14 @@ class Handler(BaseHTTPRequestHandler):
         if unarchive_match:
             self._handle_conversation_archive(unarchive_match.group(1), False)
             return
+        conv_flags_match = _CONV_FLAGS_RE.match(self.path)
+        if conv_flags_match:
+            self._handle_conversation_flags(conv_flags_match.group(1))
+            return
+        conv_delete_match = _CONV_DELETE_RE.match(self.path)
+        if conv_delete_match:
+            self._handle_conversation_delete(conv_delete_match.group(1))
+            return
         model_match = _CONV_MODEL_RE.match(self.path)
         if model_match:
             self._handle_conversation_model(model_match.group(1))
@@ -11766,7 +11867,9 @@ class Handler(BaseHTTPRequestHandler):
         self._send_json(200, {"id": chat_id, "last_read": doc["last_read"]})
 
     def _handle_chat_flags(self, raw_id: str) -> None:
-        """Set one chat's `archived` / `muted` flags (body {archived?, muted?}).
+        """Set one chat's `archived` / `muted` / `starred` flags (body
+        {archived?, muted?, starred?}). `starred` sorts the chat first in its
+        list and touches nothing else, attention included.
 
         The two carry the dashboard-conversation semantics verbatim (see
         chat_state): archived leaves the active list, and a new inbound message
@@ -11797,7 +11900,7 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(400, {"error": "invalid JSON"})
             return
         flags: dict[str, bool] = {}
-        for name in ("archived", "muted"):
+        for name in ("archived", "muted", "starred"):
             if name not in payload:
                 continue
             if not isinstance(payload[name], bool):
@@ -11805,14 +11908,16 @@ class Handler(BaseHTTPRequestHandler):
                 return
             flags[name] = payload[name]
         if not flags:
-            self._send_json(400, {"error": "archived and/or muted (boolean) is required"})
+            self._send_json(400, {"error": "archived, muted and/or starred (boolean) is required"})
             return
         before = _CHAT_STATE.get(chat_id)
         doc = _CHAT_STATE.set_flags(chat_id, **flags)
         # The list is cached; a chat just archived must leave it now, not on
         # the next refresh window.
         _chats_cache_invalidate()
-        if doc.get("archived"):
+        # A star is no attention signal: only archiving and muting settle the
+        # item or bring it back.
+        if doc.get("archived") and ("archived" in flags or "muted" in flags):
             _attention_mark(f"chat:{chat_id}", "done", "archived")
         elif "archived" in flags and (before.get("attention") or {}).get("done_how") == "archived":
             # Only what archiving settled comes back; a chat with nothing
@@ -11820,7 +11925,8 @@ class Handler(BaseHTTPRequestHandler):
             _attention_mark(f"chat:{chat_id}", "open", "archived")
         self._send_json(200, {"id": chat_id,
                               "archived": bool(doc.get("archived")),
-                              "muted": bool(doc.get("muted"))})
+                              "muted": bool(doc.get("muted")),
+                              "starred": bool(doc.get("starred"))})
 
     def _handle_chat_contact(self, raw_id: str) -> None:
         """The contact card: say who this number is, and where they belong
@@ -13359,7 +13465,7 @@ class Handler(BaseHTTPRequestHandler):
                                  context=_cancelled_call_context(payload.get("cancelled_call")),
                                  via_edge=self._via_edge())
         if conv is None:
-            self._send_json(404, {"error": "not found"})
+            self._send_conv_missing(cid)
             return
         _start_conv_turn(cid)
         self._send_json(200, _load_conv(cid) or conv)
@@ -13367,7 +13473,7 @@ class Handler(BaseHTTPRequestHandler):
     def _handle_conversation_read(self, cid: str) -> None:
         conv = _conv_set_flags(cid, unread=False, read_at=datetime.now(timezone.utc).isoformat())
         if conv is None:
-            self._send_json(404, {"error": "not found"})
+            self._send_conv_missing(cid)
             return
         self._send_json(200, conv)
 
@@ -13401,7 +13507,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         conv, found = _conv_record_shell_outcome(cid, action_id, outcome)
         if conv is None or not found:
-            self._send_json(404, {"error": "not found"})
+            self._send_conv_missing(cid)
             return
         self._send_json(200, {"status": "ok"})
 
@@ -13426,7 +13532,7 @@ class Handler(BaseHTTPRequestHandler):
         # thread's tier, so it also clears a standing escalation.
         conv = _conv_set_flags(cid, model=raw, escalated=False)
         if conv is None:
-            self._send_json(404, {"error": "not found"})
+            self._send_conv_missing(cid)
             return
         self._send_json(200, _conv_summary(conv))
 
@@ -13435,40 +13541,111 @@ class Handler(BaseHTTPRequestHandler):
         dashboard card's active list but stay available in the dedicated
         all-conversations view (and via GET /conversations?archived=1).
 
-        This is the dashboard's own button, i.e. the user archiving a thread
+        This is the thread bar's own button, i.e. the user archiving a thread
         by hand — it leaves `muted` untouched, so a thread archived this way
         comes back when something new is filed into it. Archiving *for good*
-        is the muted variant, which an agent sets via /internal/… when the
-        user asks for the thread to be archived and stay archived."""
-        conv = _conv_set_flags(cid, archived=archived)
+        is the muted variant: the list's Mute (POST …/flags), or an agent via
+        /internal/… when the user asks for the thread to stay archived.
+        Unarchiving is the list's Restore: back in the list, and `muted`
+        cleared with it, so the two ways back in never disagree."""
+        flags = {"archived": archived} if archived else {"archived": False, "muted": False}
+        conv = _conv_set_flags(cid, **flags)
+        if conv is None:
+            self._send_conv_missing(cid)
+            return
+        _conv_archive_attention(cid, conv, archived)
+        self._send_json(200, _conv_summary(conv))
+
+    def _handle_conversation_flags(self, cid: str) -> None:
+        """The user sets a thread's `archived` / `muted` / `starred` flags —
+        the Threads page's swipe and its tray (body {archived?, muted?,
+        starred?}, booleans; at least one).
+
+        The same flags and the same meaning as /chats/<id>/flags, except that
+        a thread's `muted` stays independent of `archived` on the server (an
+        agent may mute a thread the user keeps in the list); the tray's Mute
+        sends both. `starred` sorts the thread to the top of its list and
+        touches nothing else — not its attention, not its push. Archiving
+        settles the attention item and restoring reopens what archiving
+        settled, exactly as the thread bar's button does."""
+        payload = self._read_json_body()
+        if payload is None:
+            self._send_json(400, {"error": "invalid JSON"})
+            return
+        flags: dict[str, bool] = {}
+        for name in ("archived", "muted", "starred"):
+            if name not in payload:
+                continue
+            if not isinstance(payload[name], bool):
+                self._send_json(400, {"error": f"{name} must be a boolean"})
+                return
+            flags[name] = payload[name]
+        if not flags:
+            self._send_json(400, {"error": "archived, muted and/or starred (boolean) is required"})
+            return
+        conv = _conv_set_flags(cid, **flags)
+        if conv is None:
+            self._send_conv_missing(cid)
+            return
+        if "archived" in flags:
+            _conv_archive_attention(cid, conv, flags["archived"])
+        self._send_json(200, _conv_summary(conv))
+
+    def _handle_conversation_delete(self, cid: str) -> None:
+        """Erase a thread for good (no body): its messages, attachments,
+        attention state and every Claude session it used — see
+        _delete_conversation — and leave a tombstone so it stays deleted (410
+        to every later read, append and keyed open). Its key bindings stay,
+        pointing at the tombstone, which is what answers a keyed open.
+
+        The user's own act, like a chat delete: an agent may archive or mute
+        a thread, never erase one, or a manipulated turn could erase the
+        record of what it did — the cowork threads are the audit trail of
+        what outside sessions asked. So the same gates as /chats/<id>/delete:
+        same-origin, and only through the reverse proxy. What the thread
+        caused elsewhere (sent messages, queued sends, events, memories,
+        filed documents) is not touched."""
+        if not self._claude_auth_same_origin():
+            self._send_json(403, {"error": "cross-site request rejected"})
+            return
+        ok, reason = self._request_from_edge(f"thread delete of {cid}")
+        if not ok:
+            self._send_json(403, {
+                "error": "deleting a conversation is the user's own action and is "
+                         "accepted only from the dashboard through the reverse proxy",
+                "detail": reason,
+            })
+            return
+        if _conv_deleted_at(cid):
+            self._send_json(200, {"deleted": True, "id": cid})
+            return
+        conv = _load_conv(cid)
         if conv is None:
             self._send_json(404, {"error": "not found"})
             return
-        # Archiving settles the thread's attention item; bringing it back
-        # reopens it — on the list, never pushed again for that. Only what
-        # archiving itself settled comes back, as on the chat path: a thread
-        # the user had marked done, then archived, stays done.
-        if conv.get("initiator") == "agent" or conv.get("attention"):
-            if archived:
-                _attention_mark(f"thread:{cid}", "done", "archived")
-            elif (conv.get("attention") or {}).get("done_how") == "archived":
-                _attention_mark(f"thread:{cid}", "open", "archived")
-        self._send_json(200, _conv_summary(conv))
+        if conv.get("kind") == "companion":
+            # A companion belongs to its chat, which still points at it; it
+            # goes when the chat is deleted, and not on its own.
+            self._send_json(409, {"error": "a chat's companion thread is deleted with its chat"})
+            return
+        _delete_conversation(cid, by_user=True)
+        print(f"[web-gateway] deleted thread {cid} at the user's request", flush=True)
+        self._send_json(200, {"deleted": True, "id": cid})
 
     def _handle_agent_conversation_flags(self, cid: str) -> None:
-        """A retinue agent sets a thread's `archived`/`muted` flags.
+        """A retinue agent sets a thread's `archived`/`muted`/`starred` flags.
 
-        The agent-side counterpart to the dashboard's archive button, and the
-        only way `muted` can be set today (there is deliberately no UI for it
-        yet): when the user tells Ara to archive a thread, she archives *and*
-        mutes it, so a later inbound message does not resurrect it. Either flag
-        may also be set on its own — muting a thread the user keeps active is
-        a valid request."""
+        The agent-side counterpart to the Threads page's swipe and tray: when
+        the user tells Ara to archive a thread, she archives *and* mutes it,
+        so a later inbound message does not resurrect it. Either flag may also
+        be set on its own — muting a thread the user keeps active is a valid
+        request. `starred` is the user's mark: an agent sets or clears it only
+        when the user asks. There is no agent path to delete a thread."""
         payload = self._agent_conversation_payload()
         if payload is None:
             return
         flags = {key: bool(payload[key])
-                 for key in ("archived", "muted") if key in payload}
+                 for key in ("archived", "muted", "starred") if key in payload}
         # Ending continuous conversation is an event, not a state: the stamp
         # says when Ara was asked to, and a device leaves the mode if it was
         # switched on before that moment (webapp/components/conversation.js,
@@ -13480,7 +13657,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         conv = _conv_set_flags(cid, **flags)
         if conv is None:
-            self._send_json(404, {"error": "not found"})
+            self._send_conv_missing(cid)
             return
         self._send_json(200, _conv_summary(conv))
 
@@ -13504,6 +13681,18 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(status, {"error": reason})
             return
         self._send_json(200, {"status": "redacted", "message_id": mid})
+
+    def _send_conv_missing(self, cid: str) -> None:
+        """The answer for a thread that is not there: 410 Gone when the user
+        deleted it (see _conv_deleted_at), 404 when it never was. The
+        difference is the point — an agent told 410 knows the user dismissed
+        the subject, and opens nothing in its place."""
+        deleted_at = _conv_deleted_at(cid)
+        if deleted_at:
+            self._send_json(410, {"error": "the user deleted this conversation",
+                                  "id": cid, "deleted": True, "deleted_at": deleted_at})
+        else:
+            self._send_json(404, {"error": "not found"})
 
     def _agent_conversation_payload(self) -> dict | None:
         """Authorize an agent conversation call and return its JSON body.
@@ -13603,6 +13792,12 @@ class Handler(BaseHTTPRequestHandler):
         if key:
             with _conv_keys_lock:
                 existing = _conv_for_key(key)
+                gone = _deleted_conv_for_key(key) if existing is None else None
+            if gone is not None:
+                # The user deleted the thread this key opened: what it was
+                # about is dismissed, and a repeat must not raise it again.
+                self._send_conv_missing(gone)
+                return
             if existing is not None:
                 # Word-for-word what the thread already holds: a redelivery,
                 # absorbed here without a model call. Anything else has to be
@@ -13621,6 +13816,10 @@ class Handler(BaseHTTPRequestHandler):
                 if existing is not None:
                     self._send_json(200, self._reuse_thread(
                         existing, key, message, payload, context, agent, quiet))
+                    return
+                gone = _deleted_conv_for_key(key)
+                if gone is not None:
+                    self._send_conv_missing(gone)
                     return
                 conv = _new_conv("agent", owner, title, "agent", message,
                                  first_attachments=payload.get("attachments"),
@@ -13723,7 +13922,7 @@ class Handler(BaseHTTPRequestHandler):
         # The load also supplies the thread's kind for the presentation lint.
         target = _load_conv(cid)
         if target is None:
-            self._send_json(404, {"error": "not found"})
+            self._send_conv_missing(cid)
             return
         if message:
             message = _lint_presentation(message,
@@ -13744,7 +13943,7 @@ class Handler(BaseHTTPRequestHandler):
                                  attachments=attachments, wake=not quiet,
                                  agent=agent, context=context)
         if conv is None:
-            self._send_json(404, {"error": "not found"})
+            self._send_conv_missing(cid)
             return
         body = {"id": conv["id"], "title": conv["title"]}
         if not quiet:
@@ -13935,7 +14134,7 @@ class Handler(BaseHTTPRequestHandler):
         if conv_match:
             conv = _load_conv(conv_match.group(1))
             if conv is None:
-                self._send_json(404, {"error": "not found"})
+                self._send_conv_missing(conv_match.group(1))
             else:
                 self._send_json(200, conv)
             return

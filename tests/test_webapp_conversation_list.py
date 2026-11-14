@@ -248,6 +248,39 @@ await ok('a thread\'s project is its own line, not part of the meta', async () =
   card.disconnectedCallback();
 });
 
+// ── Star and swipe ───────────────────────────────────────────────────────────
+// A starred thread leads its list (each group still newest first, as the API
+// sends it), and carries the mark; the full page's tiles swipe, with the tray
+// the row's own state calls for — the chats page's words.
+await ok('starred threads lead the list, and wear the star', async () => {
+  const C = 'c'.repeat(32);
+  const card = await mount({ threads: [thread(A), thread(B, { starred: true }), thread(C)] });
+  const html = card._tabsHtml();
+  const order = [...html.matchAll(/data-open="([0-9a-f]{32})"/g)].map((m) => m[1]);
+  assert.deepEqual(order, [B, A, C]);
+  const tiles = html.split('<button ').slice(1);
+  assert.ok(tiles[0].includes('aria-label="Starred"'), 'the starred tile carries the mark');
+  assert.ok(!tiles[1].includes('aria-label="Starred"'), 'the others do not');
+  card.disconnectedCallback();
+});
+
+await ok('the full page\'s tiles swipe, each with its own state\'s tray', async () => {
+  const card = await mount({ full: true, threads: [
+    thread(A), thread(B, { archived: true, muted: true, starred: true })] });
+  const html = card._tabsHtml();
+  const rows = html.split('<div class="swipe" ').slice(1);
+  assert.equal(rows.length, 2, 'every tile is a swipe row');
+  const [active, archived] = [rows.find((r) => r.includes(A)), rows.find((r) => r.includes(B))];
+  assert.ok(active.includes('data-quick="archive"') && archived.includes('data-quick="restore"'),
+    'a swipe right archives an active thread and restores an archived one');
+  const acts = (r) => [...r.matchAll(/data-act="(\w+)"/g)].map((m) => m[1]);
+  assert.deepEqual(acts(active), ['star', 'archive', 'mute']);
+  assert.deepEqual(acts(archived), ['unstar', 'restore', 'unmute', 'delete']);
+  assert.ok(!active.includes('data-open'), 'a tap reaches the thread through the gesture, not data-open');
+  assert.ok(archived.includes('muted'), 'the tile says it is muted');
+  card.disconnectedCallback();
+});
+
 console.log(`${passed} checks passed`);
 process.exit(0);
 """

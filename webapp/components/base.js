@@ -50,6 +50,15 @@ export function onFrameChange(fn) {
   return () => mq.removeEventListener('change', handler);
 }
 
+// ── The star ──────────────────────────────────────────────────────────────────
+// Starred rows first, each group in the order it came (the lists' recency).
+// The one thing a star does to a list — threads, chats and a project's threads
+// alike; the APIs keep their documented order and the client does this.
+export function starredFirst(list) {
+  const rows = Array.isArray(list) ? list : [];
+  return rows.filter((r) => r && r.starred).concat(rows.filter((r) => !(r && r.starred)));
+}
+
 // ── Links from outside ────────────────────────────────────────────────────────
 // A link that came from outside (a news item's, a chat attachment's) as a page
 // may use it: an absolute http(s) URL with a host, or '' for none. That way it

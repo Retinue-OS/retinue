@@ -23,6 +23,7 @@ spec.loader.exec_module(cam)
 class FakeNotifier:
     def __init__(self, fail=False):
         self.fail = fail
+        self.deleted = set()  # thread ids the user deleted (append answers DELETED)
         self.opened = []    # (title, message)
         self.appended = []  # (thread_id, message)
         self.quiet_flags = []  # one per append, in order
@@ -36,6 +37,8 @@ class FakeNotifier:
     def append(self, thread_id, message, attention=None, quiet=False):
         if self.fail:
             return False
+        if thread_id in self.deleted:
+            return cam.conversation_notify.DELETED
         self.appended.append((thread_id, message))
         self.quiet_flags.append(quiet)
         return True
@@ -109,6 +112,35 @@ def test_escalation_appends_immediately():
     e.step(BROKEN, now=600 + 7 * 3600)
     assert len(n.appended) == 2 and "Reminder" in n.appended[1][1]
     assert n.quiet_flags == [False, False]
+
+
+def test_escalation_after_the_warning_was_deleted_opens_a_fresh_thread():
+    # The user deleted the "expires soon" notice — their answer on the
+    # warning. The outage it predicted is news all the same: it must not
+    # vanish into the deleted thread.
+    n = FakeNotifier()
+    e = _engine(n)
+    e.step(EXPIRING, now=0)
+    e.step(EXPIRING, now=300)
+    assert [t for t, _ in n.opened] == ["Claude sign-in expires soon"]
+    n.deleted.add("thread-1")
+    e.step(BROKEN, now=600)
+    assert [t for t, _ in n.opened] == ["Claude sign-in expires soon", "Claude sign-in broken"]
+    assert e.state["thread_id"] == "thread-2" and e.state["level"] == "broken"
+    # …and the broken cadence goes on in the new thread.
+    e.step(BROKEN, now=600 + 7 * 3600)
+    assert n.appended and n.appended[-1][0] == "thread-2"
+
+
+def test_reminders_into_a_deleted_thread_stay_quiet():
+    # Same severity, same subject: a deleted notice stays dismissed.
+    n = FakeNotifier()
+    e = _engine(n)
+    e.step(BROKEN, now=0)
+    e.step(BROKEN, now=300)
+    n.deleted.add("thread-1")
+    e.step(BROKEN, now=300 + 7 * 3600)
+    assert len(n.opened) == 1 and n.appended == []
 
 
 def test_recovery_reports_in_same_thread_and_resets():

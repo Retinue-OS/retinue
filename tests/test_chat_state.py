@@ -272,6 +272,17 @@ def test_flags_and_note_message():
         assert doc["archived"] and doc["muted"]
         doc = store.set_flags(cid, archived=False)
         assert not doc["archived"] and doc["muted"], "muted must survive un-archive"
+        assert doc["starred"] is False, "no star by default"
+        doc = store.set_flags(cid, starred=True)
+        assert doc["starred"] and not doc["archived"], "a star moves nothing"
+        doc = store.set_flags(cid, muted=True)
+        assert doc["starred"] and doc["archived"], "muting keeps the star"
+        doc = store.set_flags(cid, archived=False, muted=False)
+        assert doc["starred"], "restoring keeps the star"
+        doc = store.set_flags(cid, starred=False)
+        assert not doc["starred"]
+        doc = store.set_flags(cid, archived=True, muted=True)
+        doc = store.set_flags(cid, archived=False)
         doc = store.note_message(cid, name="Mara Meier", group=False,
                                  gateway="signal-gateway-personal",
                                  sender="+41794456312", sender_name="Mara Meier")

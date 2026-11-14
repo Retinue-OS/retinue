@@ -299,10 +299,11 @@ taps).
   "All chats →" link); on the wide frame the card sits in **its own region
   above the Conversations card, behind a draggable splitter** (the
   `layout.js` set: drag, double-click reset, snap closed, per-device
-  persistence), scrolling internally. A `pinned` flag (pin-to-top, as the
-  clients have) is a possible later addition to the chat state; deferred
-  until recency-plus-archive proves insufficient. A dedicated `chats.html`
-  lists every chat behind an Active/Archived filter; each chat has its own
+  persistence), scrolling internally. Pin-to-top, as the clients have it, is
+  the `starred` flag the chat state carries (shared with the dashboard
+  threads): a starred chat leads whichever list it is in. A dedicated
+  `chats.html` lists every chat behind an Active/Archived filter, its rows
+  swiped (archive, restore, star, mute, delete); each chat has its own
   page/panel.
 - The **chat pane** renders like a messenger client: bubbles left/right, day
   separators, sender labels in groups, media inline. Outbound bubbles carry
@@ -604,8 +605,8 @@ serving logic, `webapp/`, `scripts/`). Phases 1–4 have shipped.
 5. **Summaries & forking:** the summarizer job, summary on the chat page,
    fork actions on both sides, `--origin-chat`.
 6. **Polish:** reactions & quoted replies in the UI (#130), archive/mute
-   controls on the chat page, a per-chat assist setting, optional `pinned`,
-   group niceties.
+   controls on the chat page (✅), a per-chat assist setting, ✅ `starred`
+   (pin-to-top, shared with the threads), group niceties.
 
 ## Open questions
 

@@ -1308,7 +1308,7 @@ class RetinueChatPage extends HTMLElement {
         : `${ch} &middot; ${esc(key)}`);
     return `<header class="chat-head">` +
       avatarHtml(c) +
-      `<div class="head-txt"><div class="head-name">${esc(c.name)}</div>` +
+      `<div class="head-txt"><div class="head-name">${this._starHtml()}${esc(c.name)}</div>` +
       `<small class="head-sub">${sub}</small></div>` +
       `<nav class="pane-tabs" role="tablist" aria-label="Pane">` +
       `<button role="tab" data-pane-tab="chat" aria-selected="true">Chat</button>` +
@@ -1320,8 +1320,14 @@ class RetinueChatPage extends HTMLElement {
       this._menuHtml() + `</header>`;
   }
 
-  // The chat's menu, at the header's right end: the attention sheet, Archive
-  // and Mute. They used to take a ⓘ in the header and a row of switches under
+  // The star in front of a starred chat's name: the mark the chat list shows.
+  _starHtml() {
+    return (this._chat || {}).starred
+      ? '<span class="star-mark" role="img" aria-label="Starred" title="Starred">&#9733;</span> ' : '';
+  }
+
+  // The chat's menu, at the header's right end: the attention sheet, Star,
+  // Archive and Mute. They used to take a ⓘ in the header and a row of switches under
   // it — a whole row on a phone for two controls that are rarely touched. The
   // button carries a dot while the chat is archived or muted, so the state
   // stays visible with the menu shut.
@@ -1370,13 +1376,13 @@ class RetinueChatPage extends HTMLElement {
     }
   }
 
-  // The menu's switches, under Attention details: Archive and Mute. Each
-  // shows the state it is in and offers the other:
+  // The menu's switches, under Attention details: Star, Archive and Mute.
+  // Each shows the state it is in and offers the other:
   // "Archive" / "Archived · Unarchive". The flags mean what they mean on
-  // threads — an archived chat comes back when a message arrives unless it
-  // is muted; muting archives too and silences its push — and
-  // POST /chats/<id>/flags settles or reopens the chat's attention item with
-  // the archive.
+  // threads — a starred chat leads the chat list and nothing else; an
+  // archived chat comes back when a message arrives unless it is muted;
+  // muting archives too and silences its push — and POST /chats/<id>/flags
+  // settles or reopens the chat's attention item with the archive.
   _switchesHtml() {
     const c = this._chat || {};
     const sw = (flag, on, offLabel, onLabel, hint) =>
@@ -1384,6 +1390,7 @@ class RetinueChatPage extends HTMLElement {
       `title="${esc(hint)}">` +
       (on ? `<b>${esc(onLabel)}</b> · Un${esc(offLabel.toLowerCase())}` : esc(offLabel)) + `</button>`;
     return `<div class="items" data-flags>` +
+      sw('starred', !!c.starred, 'Star', 'Starred', 'Keeps the chat at the top of the chat list') +
       sw('archived', !!c.archived, 'Archive', 'Archived',
          'Leaves the chat list; comes back when a message arrives, unless muted') +
       sw('muted', !!c.muted, 'Mute', 'Muted', 'Archived, no push, and a new message does not bring it back') +
@@ -1398,7 +1405,13 @@ class RetinueChatPage extends HTMLElement {
       });
       if (!res.ok) throw new Error(String(res.status));
       const out = await res.json();
-      if (this._chat) { this._chat.archived = !!out.archived; this._chat.muted = !!out.muted; }
+      if (this._chat) {
+        this._chat.archived = !!out.archived;
+        this._chat.muted = !!out.muted;
+        this._chat.starred = !!out.starred;
+      }
+      const name = this.shadowRoot.querySelector('.head-name');
+      if (name && this._chat) name.innerHTML = this._starHtml() + esc(this._chat.name);
       // Muted: off the shelf, whatever put it there. Archived: not waiting.
       if (out.muted) shelf.muted(this._shelfKey());
       else if (flag === 'archived' && out.archived) {
@@ -2948,6 +2961,7 @@ const CSS = `
         border: 2px solid var(--bg, #0b0d12); box-sizing: content-box; }
   .head-txt { flex: 1; min-width: 0; }
   .head-name { font-weight: 650; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .head-name .star-mark { color: #e3b341; font-size: .9em; }
   .head-sub { display: block; color: var(--muted, #8b93a3); font-size: .74rem;
               overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .pane-tabs { flex: none; display: flex; background: var(--card-2, #1c2230);

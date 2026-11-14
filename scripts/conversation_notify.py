@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import os
+import urllib.error
 import urllib.request
 
 _PORT = os.environ.get("WEB_GATEWAY_PORT", "8080")
@@ -22,6 +23,13 @@ DEFAULT_BACKEND_URL = os.environ.get(
     "CONVERSATION_BACKEND_URL", f"http://localhost:{_PORT}/internal/conversations"
 ).rstrip("/")
 DEFAULT_BACKEND_TOKEN = os.environ.get("CONVERSATION_BACKEND_TOKEN", "").strip()
+
+
+# What append() answers when the thread is one the user deleted: truthy, so a
+# caller that only asks "did it land?" treats it as handled (no retry on every
+# tick), and distinct, so a caller with news the deleted thread did not carry
+# can open a thread of its own.
+DELETED = "deleted"
 
 
 class ConversationNotifier:
@@ -44,6 +52,15 @@ class ConversationNotifier:
         try:
             with urllib.request.urlopen(req, timeout=self.timeout) as resp:
                 return json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            if exc.code == 410:
+                # The user deleted the thread: their answer on it, not a
+                # failure to retry on every tick. Nothing was written.
+                print(f"{self.log_prefix} the user deleted that thread; nothing written",
+                      flush=True)
+                return {"deleted": True}
+            print(f"{self.log_prefix} conversation post failed: {exc}", flush=True)
+            return None
         except Exception as exc:  # noqa: BLE001 - callers retry on the next tick
             print(f"{self.log_prefix} conversation post failed: {exc}", flush=True)
             return None
@@ -61,7 +78,7 @@ class ConversationNotifier:
         return (body or {}).get("id")
 
     def append(self, thread_id: str, message: str,
-               attention: dict | None = None, quiet: bool = False) -> bool:
+               attention: dict | None = None, quiet: bool = False) -> bool | str:
         # quiet: a record, not a request for attention — no unread badge, no
         # Web Push, and the thread stays archived if the user put it there.
         payload: dict = {"message": message}
@@ -70,4 +87,6 @@ class ConversationNotifier:
         if quiet:
             payload["quiet"] = True
         body = self._post(f"{self.base_url}/{thread_id}/messages", payload)
+        if body is not None and body.get("deleted") is True:
+            return DELETED
         return body is not None

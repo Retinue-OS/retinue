@@ -77,9 +77,15 @@ distraction-free list of what wants attention, so the news lives only on its
 own page (`news.html`), one tap away in the navigation row. *Threads* is `conversations.html`, which lists
 every thread with an Active/Archived/Edits/Cowork filter — the last two being
 where the otherwise hidden kinds (project edit commands, and the Ask-Ara
-connector's cowork audit threads) are reachable. Threads can be archived from
-inside a thread (`POST /conversations/<id>/archive`, `…/unarchive`); archived
-threads drop off the active list but stay on that page.
+connector's cowork audit threads) are reachable. Its tiles swipe like the
+Chats page's rows — one gesture for both lists (`components/swipe-rows.js`):
+a swipe right archives an active thread or restores an archived one at once,
+a swipe left (or a long press) opens a tray of Star · Archive · Mute, or
+Star · Restore · Mute/Unmute · Delete. A commit that takes a row out of view
+offers Undo for a few seconds. The open thread's bar keeps its Archive button
+and has a ☆/★ beside it. Archived threads drop off the active list but stay
+on that page; what each action means is in "Archived, muted, starred,
+deleted" below.
 
 Shell updates apply themselves: the service worker versions itself from a
 content hash the gateway stamps into `/sw.js`, and
@@ -956,7 +962,7 @@ still work exactly as before. Set `VAPID_SUBJECT` to the operator's contact
 address; deleting the stored key invalidates every existing subscription, so
 devices would need to re-enable.
 
-## Archived + muted
+## Archived, muted, starred, deleted
 
 Archived and unread is a contradiction: the thread claims
 to want attention while being invisible. So when an agent files something new
@@ -964,18 +970,70 @@ into an archived thread (`POST /internal/conversations/<id>/messages`, the
 `--thread` path of `conversation-push.py`), the gateway **un-archives it** — the
 message would otherwise be lost, which is exactly what happened before this
 existed. The opt-out is the separate **`muted`** flag: a muted thread stays
-where it is, however much arrives. `muted` is independent of `archived` (either
-can be set alone) and has no dashboard control on purpose — it is set from an
-agent via `POST /internal/conversations/<id>/flags`:
+where it is, however much arrives. These are the chats' flags, with the
+chats' words:
+
+- **Archive** — the thread bar's button and the Threads page's swipe right
+  (`POST /conversations/<id>/archive`, or `…/flags` `{archived: true}`): out of
+  the list until something new is filed into it. `muted` is untouched.
+- **Mute** — the tray's (`…/flags` `{archived: true, muted: true}`): out of the
+  list, and it stays out. On the server `muted` stays independent of
+  `archived` — an agent may mute a thread the user keeps in the list — so the
+  tray sends both.
+- **Unmute** — the next message brings the thread back; until then it stays
+  archived.
+- **Restore** — the swipe right on the Archived tab, the tray's, and the
+  thread bar's *Unarchive* alike: back in the list, and `muted` cleared, so
+  the ways back in never disagree.
+- **Star** (`starred`) — the user's mark: the thread sorts above the rest of
+  whichever list it is in (Active, Archived, Edits, Cowork, the project
+  page's), each group still newest first. It is independent of everything
+  else — archive, mute, restore and a wake all leave it — and it is no
+  attention signal: no importance, no delivery, nothing on the home. Chats
+  carry the same flag (`POST /chats/<id>/flags`).
+- **Delete** — the Archived tab's tray, two taps, no Undo
+  (`POST /conversations/<id>/delete`): the thread's messages, attachments,
+  attention state and every Claude session it used are erased; a turn still
+  running cannot write any of it back. Its idempotency-key bindings are the
+  one thing kept (they hold nothing but the key's hash and the thread id):
+  they now point at the tombstone below, which is how a redelivered open
+  under the same key is told the thread was deleted. A chat's companion,
+  erased with its chat, loses its bindings instead. It is the
+  user's own act, like a chat delete — accepted only from the dashboard
+  through the reverse proxy (403 otherwise), never for a chat's companion
+  (409, it goes with its chat), and with no agent path at all: a manipulated
+  turn must not be able to erase the record of what it did, and the cowork
+  threads are the audit trail of what outside sessions asked. What the thread
+  caused elsewhere stays: sent messages, sends still queued on `/sends` (whose
+  decision note then has nowhere to go), calendar events, memories, filed
+  documents.
+
+**A deleted thread stays deleted.** The gateway keeps a tombstone per deleted
+thread under `CONVERSATIONS_DIR/.deleted/` — its id and the deletion time,
+nothing else — and every later read, append, flag write and keyed open of it
+answers **410 Gone**: an agent's `--thread <id>` writes nothing, and a
+redelivered open under the key that created it opens nothing in its place.
+`conversation-push.py` reports a 410 as the user's decision (exit 0), not as a
+failure; the monitors' notifier and the Ask-Ara connector's audit (which opens
+a fresh thread for what is asked next) treat it the same way, and triage
+resolves the message instead of proposing it again. Reminders into a deleted
+incident thread stay quiet, but news it did not carry is not swallowed: a
+sign-in warning the user deleted that turns into an outage opens a thread of
+its own. Without the tombstone,
+"gone" would read as "start over" and bring back exactly what was deleted.
+
+Agents set the flags through `POST /internal/conversations/<id>/flags`:
 
 ```bash
 # archive for good — what to run when the user says "archive this conversation"
 python3 /workspace/scripts/conversation-push.py --thread <id> --archive --mute
-# also: --unarchive, --unmute; flags are their own call, never mixed with a message
+# also: --unarchive, --unmute, --star/--unstar (only on the user's word);
+# flags are their own call, never mixed with a message. There is no --delete.
 ```
 
-The behavioural rule this implies for Ara — Archive-click vs "archive this" —
-is in `CLAUDE.md`, since it applies on ordinary turns.
+The behavioural rules this implies for Ara — Archive-click vs "archive this",
+and a deleted thread being the user's answer — are in `CLAUDE.md`, since they
+apply on ordinary turns.
 
 ## The shelf (minimized pages)
 

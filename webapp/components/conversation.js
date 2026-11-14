@@ -85,6 +85,7 @@
 //                     own state (an address bar entry, say).
 //   retinue-sent      a message went out: {id, conversation}.
 //   retinue-archived  the thread was archived or restored: {id, archived}.
+//   retinue-starred   the thread was starred or unstarred: {id, starred}.
 //   retinue-thread    the thread was (re)read: {id, conversation}.
 //   retinue-open      the read-aloud bar asks for another thread: {id} — it
 //                     follows the user out of a thread and offers a way back.
@@ -400,6 +401,17 @@ export function hasUnsentInput() {
     if ((d.text && d.text.trim()) || (d.files && d.files.length)) return true;
   }
   return false;
+}
+
+// The thread `id` was deleted: what this device keeps for it goes too — its
+// draft (which would otherwise count as unsent input for good, holding back
+// every shell update) and its continuous-mode entry.
+export function forgetThread(id) {
+  const key = String(id);
+  DRAFTS.delete(key);
+  saveDraft(storeKey(key), null);
+  saveFiles(storeKey(key), []);
+  forgetContinuous(key);
 }
 
 // Leaving the page: every draft is written as it stands (they are written as
@@ -1118,7 +1130,8 @@ class RetinueConversation extends HTMLElement {
     this._loadSeq = 0;       // reads issued: only the newest one commits
     this._pickerStale = false; // a refused pick to put back, even under focus
     this._adopting = false;  // the id is being set from within (a created thread)
-    this._missing = false;   // the id points at no thread (the read said 404)
+    this._missing = false;   // the id points at no thread (the read said 404 or 410)
+    this._deleted = false;   // …because the user deleted it (410)
     // Voice: record a message (server transcribes) — the recorder is one per
     // element, its job (see VOICE_JOBS) belongs to the conversation.
     this._recState = 'idle'; // idle | acquiring | recording
@@ -1503,21 +1516,27 @@ class RetinueConversation extends HTMLElement {
         return { status: r.status, ok: r.ok, doc: r.ok ? await r.json() : null };
       });
       if (this._id !== id || seq !== this._loadSeq) return false;
-      if (res.status === 404) {
+      if (res.status === 404 || res.status === 410) {
         // Deleted, or a stale link: nothing to show, poll or reply to — a
         // document read earlier is gone with it, or the bar and the reply
         // row would go on as if it were there. A re-point
-        // (attributeChangedCallback) starts afresh.
+        // (attributeChangedCallback) starts afresh. 410 is the user's own
+        // Delete (on this device or another), and the thread says so.
         if (!this._missing) {
           this._missing = true;
+          this._deleted = res.status === 410;
           this._thread = null;
           this._threadSig = '';
           this._stopPolling();
           // No conversation to carry on: the loop stops (a wake into a
           // deleted thread would otherwise hold the shell's voice flag for
-          // good), and the thread leaves the mode for wakes to come.
+          // good), and the thread leaves the mode for wakes to come. One the
+          // user deleted (here, or on another device) takes its local draft
+          // with it too — left behind, it would count as unsent input for
+          // good and hold back every shell update.
           this._listenOnOpen = false;
-          forgetContinuous(id);
+          if (res.status === 410) forgetThread(id);
+          else forgetContinuous(id);
           this._contDisengage();
           this.render();
         }
@@ -1707,12 +1726,18 @@ class RetinueConversation extends HTMLElement {
     const t = this._thread;
     if (!t) {
       if (bar === 'actions') return leadOnly;
-      const title = this._missing ? 'Conversation not found' : '&#8230;';
+      const title = this._missing
+        ? (this._deleted ? 'Conversation deleted' : 'Conversation not found') : '&#8230;';
       return `<div class="thread-bar">${back}<span class="bar-title muted" data-title>${title}</span></div>`;
     }
     const archiveBtn = t.archived
       ? '<button class="pill" data-unarchive>Unarchive</button>'
       : '<button class="pill" data-archive>Archive</button>';
+    // The user's mark: the thread leads the Threads list while it is on.
+    const starBtn = `<button class="iconbtn star-btn${t.starred ? ' on' : ''}" data-star ` +
+      `aria-pressed="${!!t.starred}" aria-label="Star" ` +
+      `title="${t.starred ? 'Starred — first in the Threads list. Tap to unstar' : 'Star: keep it at the top of the Threads list'}">` +
+      `${t.starred ? '&#9733;' : '&#9734;'}</button>`;
     const autoBtn = speechAvailable()
       ? `<button class="iconbtn${autoplay ? ' on' : ''}" data-autoplay ` +
         `title="Speak Ara's replies as they arrive" aria-label="Speak replies as they arrive" ` +
@@ -1743,7 +1768,7 @@ class RetinueConversation extends HTMLElement {
     // meet them right after the title they belong to.
     return `<div class="thread-bar">${back}` +
       `<span class="bar-title" data-title>${esc(t.title || 'Conversation')}</span>` +
-      `<span class="bar-thread" role="group" aria-label="Conversation">${archiveBtn}${minBtn}</span>` +
+      `<span class="bar-thread" role="group" aria-label="Conversation">${starBtn}${archiveBtn}${minBtn}</span>` +
       `<span class="bar-actions" role="group" aria-label="Conversation settings">` +
       `<span data-picker>${this._modelPickerHtml()}</span>` +
       `${attentionBtn}${this._contBtnHtml()}${autoBtn}</span></div>`;
@@ -1776,7 +1801,8 @@ class RetinueConversation extends HTMLElement {
     const t = this._thread;
     if (this._missing) {
       return `<div class="thread"><div class="empty"><span class="e-ico" aria-hidden="true">&#x1F4AC;</span>` +
-        `<p>This conversation is no longer here.</p></div></div>`;
+        `<p>${this._deleted ? 'You deleted this conversation.' : 'This conversation is no longer here.'}</p>` +
+        `</div></div>`;
     }
     if (!t) return `<div class="thread"></div>`;
     // A thread about a project leads back to it — the way home from a
@@ -3340,6 +3366,29 @@ class RetinueConversation extends HTMLElement {
     this._partialUpdate();
   }
 
+  // Star or unstar the open thread (POST /conversations/<id>/flags). The list
+  // around it hears of it (retinue-starred) and re-sorts.
+  async _star() {
+    if (!this._id || !this._thread) return;
+    const key = this._key();
+    const starred = !this._thread.starred;
+    try {
+      const res = await fetch(`/conversations/${encodeURIComponent(key)}/flags`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ starred }),
+      });
+      if (!res.ok) throw new Error(String(res.status));
+      const out = await res.json();
+      const target = this._liveFor(key);
+      if (target) {
+        target._loadSeq += 1; // a read in flight would put the old flag back
+        if (target._thread) target._thread.starred = !!out.starred;
+        target._emit('retinue-starred', { id: key, starred: !!out.starred });
+        target.render();
+      }
+    } catch (_err) { /* the button keeps the last known state; a later read reconciles */ }
+  }
+
   async _archive(archived) {
     if (this._busy || !this._id) return;
     const key = this._key();
@@ -3363,7 +3412,11 @@ class RetinueConversation extends HTMLElement {
       }
       if (target) {
         target._loadSeq += 1; // a read in flight would put the old flag back
-        if (target._thread) target._thread.archived = archived;
+        if (target._thread) {
+          target._thread.archived = archived;
+          // Unarchive is the list's Restore: the mute goes with the archive.
+          if (!archived) target._thread.muted = false;
+        }
         target._emit('retinue-archived', { id: key, archived });
       }
     } catch (_err) {
@@ -3498,6 +3551,8 @@ class RetinueConversation extends HTMLElement {
     if (back) back.addEventListener('click', () => this._emit('retinue-back', { id: this._id }));
     const att = root.querySelector('[data-attention]');
     if (att) att.addEventListener('click', () => openAttentionSheet(`thread:${this._id}`, { here: true }));
+    const star = root.querySelector('[data-star]');
+    if (star) star.addEventListener('click', () => this._star());
     const arch = root.querySelector('[data-archive]');
     if (arch) arch.addEventListener('click', () => this._archive(true));
     const unarch = root.querySelector('[data-unarchive]');
@@ -3888,6 +3943,7 @@ const CSS = `
              justify-content: center; padding: 0; }
   .iconbtn:hover { border-color: var(--accent, #6ea8fe); color: var(--accent, #6ea8fe); }
   .iconbtn.on { border-color: var(--accent, #6ea8fe); color: var(--accent, #6ea8fe); }
+  .iconbtn.star-btn.on { border-color: #e3b341; color: #e3b341; }
   .pill { background: transparent; border: 1px solid var(--line, rgba(231, 235, 242, .08));
           border-radius: 999px; color: var(--muted, #8b93a3); cursor: pointer;
           padding: 6px 12px; font-size: .78rem; white-space: nowrap; }

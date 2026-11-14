@@ -41,6 +41,13 @@ keep it archived" is expressed. Set the flags (no message) with:
 
     conversation-push.py --thread 42ecb0113a3d48ac87be514cfaf99a7c --archive --mute
 
+--star / --unstar set the user's own mark (the thread sorts first in its list);
+only on the user's word. There is no way to delete a thread from here: that is
+the user's act, on the dashboard. A thread the user deleted answers 410 to
+every append, flag change or keyed open — reported below, exit status 0,
+nothing written. It is their answer on the subject: do not reopen it in a new
+thread on your own.
+
 Redact one of the user's own messages — on their request, typically the one in
 which they dictated a password you then typed (shell-type.py --sensitive). The
 replayed transcript shows each user message's id as [message id: …]:
@@ -234,6 +241,11 @@ def main() -> int:
                         help="mute --thread: keep it where it is when news is filed into it")
     parser.add_argument("--unmute", dest="muted", action="store_false",
                         help="unmute --thread")
+    parser.add_argument("--star", dest="starred", action="store_true", default=None,
+                        help="star --thread (it sorts first in its list) — only when "
+                             "the user asks")
+    parser.add_argument("--unstar", dest="starred", action="store_false",
+                        help="clear --thread's star — only when the user asks")
     parser.add_argument("--end-continuous", dest="end_continuous", action="store_true",
                         help="end continuous conversation (the hands-free voice loop) in "
                              "--thread on every device showing it in the mode — for when "
@@ -316,7 +328,8 @@ def main() -> int:
         return _redact(args, vars(parser.parse_args([])))
 
     message = args.message.strip()
-    flags_only = args.archived is not None or args.muted is not None or args.end_continuous
+    flags_only = (args.archived is not None or args.muted is not None
+                  or args.starred is not None or args.end_continuous)
     if not args.thread and args.end_continuous and not args.url:
         # A dashboard turn knows its own thread: the one the user just spoke in.
         args.thread = os.environ.get("RETINUE_THREAD_ID") or None
@@ -339,13 +352,15 @@ def main() -> int:
         print("conversation-push: --project applies only to a new thread", file=sys.stderr)
         return 2
     if flags_only and not args.thread:
-        print("conversation-push: --archive/--mute/--end-continuous need --thread", file=sys.stderr)
+        print("conversation-push: --archive/--mute/--star/--end-continuous need --thread",
+              file=sys.stderr)
         return 2
     # Flag changes are their own request; mixing them with a message would make
     # the ordering (does the append wake the thread before or after the mute?)
     # implicit. Send the flags first, then the message.
     if flags_only and (message or args.attach):
-        print("conversation-push: --archive/--mute/--end-continuous cannot be combined with a message",
+        print("conversation-push: --archive/--mute/--star/--end-continuous cannot be combined "
+              "with a message",
               file=sys.stderr)
         return 2
     # Context rides with a message; on a flags-only call there is no message
@@ -366,6 +381,8 @@ def main() -> int:
             payload["archived"] = args.archived
         if args.muted is not None:
             payload["muted"] = args.muted
+        if args.starred is not None:
+            payload["starred"] = args.starred
         if args.end_continuous:
             payload["continuous_off"] = True
     else:
@@ -466,6 +483,14 @@ def main() -> int:
             break
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")
+            if exc.code == 410:
+                # Not a failure to retry or alert about: the user deleted the
+                # thread, which is their decision on everything it was about.
+                print(detail)
+                print("conversation-push: the user deleted this thread — nothing was "
+                      "written. That is their answer on the subject: do not reopen "
+                      "it in a new thread.", file=sys.stderr)
+                return 0
             print(f"conversation-push: HTTP {exc.code}: {detail}", file=sys.stderr)
             return 1
         except (urllib.error.URLError, OSError) as exc:

@@ -686,14 +686,23 @@ def _audit_thread_id() -> str | None:
         return cid
 
 
+def _forget_audit_thread(cid: str) -> None:
+    """Drop today's audit-thread marker if it still names `cid`."""
+    day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    marker = STATE_DIR / f"thread-{day}.json"
+    with _audit_lock:
+        try:
+            if json.loads(marker.read_text()).get("id") == cid:
+                marker.unlink()
+        except Exception as exc:  # noqa: BLE001
+            log(f"audit: could not forget thread {cid}: {exc}")
+
+
 def _audit(question: str, context: str, status: str, answer: str,
            confirm: dict | None = None) -> None:
     if not AUDIT:
         return
     try:
-        cid = _audit_thread_id()
-        if not cid:
-            return
         lines = [f"**Asked:** {question}"]
         if context:
             lines.append(f"*Context:* {context}")
@@ -703,8 +712,21 @@ def _audit(question: str, context: str, status: str, answer: str,
             target = (f"[a thread of its own]({confirm['url']})"
                       if confirm.get("url") else f"thread `{confirm['id']}`")
             lines += ["", f"*Stated facts put to the user to confirm in {target}.*"]
-        _gateway_post(f"/internal/conversations/{cid}/messages",
-                      {"message": "\n".join(lines), "quiet": True})
+        for attempt in (1, 2):
+            cid = _audit_thread_id()
+            if not cid:
+                return
+            try:
+                _gateway_post(f"/internal/conversations/{cid}/messages",
+                              {"message": "\n".join(lines), "quiet": True})
+                return
+            except urllib.error.HTTPError as exc:
+                if exc.code != 410 or attempt == 2:
+                    raise
+                # The user deleted today's audit thread. That record is gone
+                # as they wished; what is asked from now on is still audited,
+                # in a fresh thread.
+                _forget_audit_thread(cid)
     except Exception as exc:  # noqa: BLE001 — auditing must never break answering
         log(f"audit: append failed: {exc}")
 

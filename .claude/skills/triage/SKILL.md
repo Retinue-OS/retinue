@@ -256,7 +256,12 @@ status. Reconcile in both directions:
      since), then post the updated proposal into it with `conversation-push.py
      --thread <id>`, which un-archives it, and stamp `updated` and `last_nudge`
      on the record. If it no longer needs them, resolve it as pass 3 does.
-   - **Thread gone** (deleted, or no id recorded) → there is nothing to
+   - **Thread deleted by the user** (the read answers **410**, `deleted:
+     true`) → that is the user's decision on the message, as an archived *and*
+     muted thread is: never re-propose and never open a new thread for it.
+     Resolve it out of the INBOX exactly as pass 3 does and write `resolved`,
+     recording the deleted thread as the reason.
+   - **Thread gone** (no id recorded, or a 404) → there is nothing to
      re-open. Re-collect the message as if it were untracked: it goes through
      Phases 2–4 and gets a new proposal thread (or a place in the omnibus),
      reusing the status file.
@@ -831,10 +836,11 @@ project file, a newer status entry on the same subject). If the subject is
 resolved, do **not** nudge: mark its entries `resolved` with a
 `resolved_reason` naming the evidence, and archive the conversation with
 `conversation-push.py --thread <id> --archive` (no message, so nothing is
-pushed). An omnibus thread carries several unrelated subjects, so check them
-entry by entry: resolve the settled ones, nudge for the rest, and archive the
-thread only once none is left. When the state cannot be checked, nudge as
-usual.
+pushed) — unless the thread is **starred** (`starred: true` on its summary):
+that is the user keeping it at hand, so it stays where it is. An omnibus
+thread carries several unrelated subjects, so check them entry by entry:
+resolve the settled ones, nudge for the rest, and archive the thread only
+once none is left. When the state cannot be checked, nudge as usual.
 
 **Write the nudge in the conversation's language.** A nudge is written into an
 existing thread, so it follows the language of that thread's own messages
