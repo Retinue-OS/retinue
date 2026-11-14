@@ -1440,7 +1440,7 @@ class RetinueConversation extends HTMLElement {
 
   // An approval link (/sends/…) tapped here: note which thread it was tapped
   // in, where in it the reader was, and on which page, so the approval page's
-  // "Back to the thread" (web-gateway.py, _SENDS_BACK_JS) and its return after
+  // "Back to the thread" (gateway/sends.js, #back-thread) and its return after
   // a decision land at this very place — also when the browser reloads the
   // page instead of bringing it back from its cache. Per tab, like the shelf's
   // own restore, which is the format the approval page hands it on in.

@@ -668,6 +668,10 @@ def test_thread_notes_where_an_approval_link_was_tapped():
     assert "var SENDS_RETURN_KEY = 'retinue.sends.return';" in SENDS_JS
     assert "if (link) this._noteSendsReturn(link);" in src
     assert "location: this.shelfLocation()," in src
+    # The note is for that visit only: used up by the way back, and lapsing
+    # when left behind.
+    assert "if (Date.now() - (r.at || 0) < SENDS_RETURN_TTL_MS) return r;" in SENDS_JS
+    assert "try { sessionStorage.removeItem(SENDS_RETURN_KEY); }" in SENDS_JS
 
 
 def main() -> int:
