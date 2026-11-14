@@ -16,7 +16,9 @@ The chats list and the threads list are curated in two different ways.
 - **Threads** (`conversations.html`) can only be archived from *inside* a
   thread, with the Archive pill in its bar. To clear five finished threads you
   have to open each one, archive it, and go back each time. Restoring works the
-  same way: Archived tab, open, Unarchive, back.
+  same way: Archived tab, open, Unarchive, back. And a thread cannot be
+  deleted at all: a turn that went wrong, or something private dictated into
+  the wrong thread, stays on the server for good, archived at best.
 
 There is also no way to keep a thread at hand. The list is sorted by recency
 only. A thread you keep returning to, such as a long-running topic with Ara,
@@ -29,21 +31,14 @@ flag has been "deliberately deferred" since the chat surface shipped
 ### 1. Threads swipe exactly like chats
 
 The thread tiles on `conversations.html` get the chats page's gesture, with
-the same parameters, colours and words:
+the same parameters, colours and words. After this proposal both lists have
+the same tray:
 
 | Tab | Swipe right | Swipe left (tray) |
 |---|---|---|
 | Active | **archive** at once | Star · Archive · Mute |
-| Archived | **restore** at once | Star · Restore · Mute *or* Unmute |
-| Edits, Cowork | archive or restore, whichever the row's own state calls for | the same tray as the row's state |
-
-For comparison, here is the chats tray after this proposal. The only
-difference is Delete, which exists only for chats:
-
-| Tab | Swipe right | Swipe left (tray) |
-|---|---|---|
-| Active | archive at once | Star · Archive · Mute |
-| Archived | restore at once | Star · Restore · Mute *or* Unmute · Delete |
+| Archived | **restore** at once | Star · Restore · Mute *or* Unmute · Delete |
+| Edits, Cowork (threads only) | archive or restore, whichever the row's own state calls for | the same tray as the row's state |
 
 **The gesture** is the one `chats.js` already implements, unchanged:
 
@@ -79,6 +74,8 @@ difference is Delete, which exists only for chats:
 - **Restore** puts the thread back in the list and clears `muted`. This is the
   same as on chats. The thread bar's *Unarchive* pill gets the same meaning,
   so the two ways back in never disagree.
+- **Delete** (Archived tab) erases the thread for good. It asks for a second
+  tap, as on chats. See section 3.
 
 This gives threads a mute control in the dashboard. Until now that was
 deliberately left to agents ("no UI for it *yet*",
@@ -109,10 +106,82 @@ Mute and Restore:
 
 *Undo* writes back the flags the row had before, so undoing a Restore of a
 muted chat archives and mutes it again. Star and Unstar get no toast,
-because nothing leaves the list. Delete gets none either; its two-tap confirm
-stays as it is.
+because nothing leaves the list. Delete gets none on either list. It erases,
+so it asks for a second tap instead.
 
-### 3. Star: a user's mark, shared by threads and chats
+### 3. Delete threads, as chats are deleted
+
+**Why.** The first draft kept Delete for chats only. Its reason was that a
+chat mirrors other people's messages, while a thread is the record of work
+with Ara. That is no reason to keep a thread the user wants gone: a turn that
+went wrong, a private detail dictated into the wrong thread, a test, a cowork
+exchange nobody needs. Threads are the user's own data, so the user decides.
+
+**Where.** Delete sits where it sits on chats: last in the Archived tab's
+tray. The first tap arms it ("Delete for good?"), the second deletes, and
+anything else disarms it. There is no Undo. Delete is not in the Active tab
+or the thread bar, so a thread is archived before it can be deleted. That
+friction is deliberate, and it is the same on chats. In the Edits and Cowork
+tabs, an archived row offers Delete too.
+
+**What goes.** Everything the thread holds. The gateway already has the
+function: `_delete_conversation`, which today erases a deleted chat's
+companion thread. It removes:
+
+- the thread file, with its messages and its attention state;
+- its attachments;
+- its idempotency-key bindings;
+- every Claude session the thread ever used, transcripts included.
+
+A turn still running when the thread is deleted has nowhere to write, and its
+session is erased instead of recorded (`_erased_session_keys`). The thread
+leaves both lists, the home's attention list, the project page, and the
+minimized-pages shelf on the device it was deleted from. Other devices drop
+it at their next refresh. A view that still has it open shows "You deleted
+this conversation."
+
+**What stays.** Delete erases a conversation, not what it caused. These
+remain:
+
+- messages already sent;
+- sends still waiting on `/sends`. The user still decides those, and the note
+  that would report the decision has no thread to go to, so it is dropped;
+- calendar events, stored memories, project edits, files the Archivist
+  filed, and commits.
+
+The armed button's hint says so: "Erase this thread and its attachments.
+What it already did stays done."
+
+**Only the user deletes.** `POST /conversations/<id>/delete` passes the same
+gates as chat delete: the same-origin check, and it is accepted only from the
+dashboard through the reverse proxy (`_request_from_edge`). There is no
+internal endpoint and no `conversation-push.py --delete`. An agent may archive
+or mute a thread; it may never erase one. Otherwise a prompt-injected turn
+could erase the record of what it did, and cowork threads are the audit trail
+of what outside sessions asked. Unlike chat delete, thread delete needs no
+erase capability. A thread lives only in the retinue container, so Delete
+never answers "not set up".
+
+**Deleted stays deleted.** Today a thread only vanishes with its chat, and
+triage reads "thread gone" as "start over". After `TRIAGE_STALL_DAYS` it
+re-collects the message and opens a fresh proposal thread. With user
+deletion, that would bring back exactly what was deleted. So the gateway
+keeps a tombstone for every deleted thread: its id and deletion time,
+nothing else. Thread ids are random, so the tombstone says nothing about the
+content. With it:
+
+- `GET /conversations/<id>` answers **410 Gone** (`{deleted: true,
+  deleted_at}`) instead of 404.
+- An agent's append (`--thread <id>`) also gets 410 and opens nothing in its
+  place. `conversation-push.py` reports that the user deleted the thread.
+- A redelivered open under the idempotency key that created the thread is
+  absorbed and creates nothing. The binding stays and points at the
+  tombstone.
+- Triage reads 410 as the user's decision on the message, the same as an
+  archived-and-muted thread: it resolves the message and never re-proposes
+  it. Only "no thread id recorded" still means re-collect.
+
+### 4. Star: a user's mark, shared by threads and chats
 
 **Meaning.** ★ means *"keep this one at hand"*. It is a property of the list,
 not of attention.
@@ -127,7 +196,7 @@ not of attention.
   Archived tab.
 - The star is **independent** of everything else. Archive, Restore, Mute and
   Unmute leave it as it is. A thread that comes back on its own keeps it.
-  Deleting a chat erases the chat, star included.
+  Deleting a thread or a chat erases it, star included.
 - The star is **not an attention signal**. It changes no importance, no
   delivery decision, no push and nothing on the home list. The home keeps its
   own swipe right, which means *Done*. A thread's importance is the attention
@@ -187,21 +256,36 @@ instruction from the user still archives it.
 11. In every tab of both lists, and on the project page's thread list,
     starred rows come first. Within each group, the order is by recency.
 12. Archive, Restore, Mute, Unmute and an agent's wake never change
-    `starred`. Deleting a chat removes it with its star.
+    `starred`. Deleting a thread or chat removes it with its star.
 13. `starred` has no effect on the attention list, the attention model or
     push.
 14. Agents set or clear `starred` only on the user's instruction. An archive
     an agent does on its own initiative skips starred threads.
 15. Chats and threads use one gesture implementation, not two copies, so
     the two lists cannot drift apart.
+16. In the Archived tab, the tray offers Delete on threads as on chats. The
+    first tap arms it, the second deletes, anything else disarms it, and
+    there is no Undo.
+17. Deleting a thread erases its messages, attachments, attention state,
+    key bindings and every Claude session transcript. A turn still running
+    cannot write any of it back. The thread disappears from every tab of the
+    Threads page, the home, the project page and the shelf.
+18. Thread delete is accepted only from the dashboard through the reverse
+    proxy. From inside the container it is refused with 403, and agents
+    have no other way to it.
+19. A deleted thread stays deleted. Reads and agent appends answer 410, a
+    redelivered keyed open creates nothing, and triage resolves the message
+    instead of proposing it again.
+20. Deleting a thread leaves what it caused: sent messages, queued sends,
+    calendar events, memories and filed documents stay.
 
 ## Mockups
 
 [Interactive prototype](https://claude.ai/artifact/MTRSKZypNS7fL4ZfJ9w7Bh)
 — swipe the rows on a phone, or drag them with a mouse. It covers the
-Threads and Chats tabs, Active/Archived, Star, the thread bar's ☆, the chat
-page's ⋮ switches, Undo, and a *Simulate new messages* button that shows
-Archive and Mute behaving differently. The prototype is private for now;
+Threads and Chats tabs, Active/Archived, Star, Delete on both lists, the
+thread bar's ☆, the chat page's ⋮ switches, Undo, and a *Simulate new
+messages* button that shows Archive and Mute behaving differently. The prototype is private for now;
 ask the owner for access.
 
 ## Out of scope
@@ -209,16 +293,13 @@ ask the owner for access.
 - **Swipe on the home and the project page.** The home's swipe right is
   *Done* and stays that way. The project page's thread list gets the ★ mark
   and the star-first order, but no gesture.
-- **Deleting threads.** Chats have Delete because a chat's messages are other
-  people's data, mirrored here. A thread is the record of work with Ara.
-  Deleting threads would be a separate decision.
 - **An unread-only or starred-only filter.** If stars become many, a filter
   could follow. Star-first ordering should come first.
 - **Multi-select and bulk actions.**
 
 ## Implementation notes (non-binding)
 
-**Phasing — three PRs, each one shippable:**
+**Phasing — four PRs, each one shippable:**
 
 1. **One gesture module.** Extract `chats.js`'s swipe into
    `webapp/components/swipe-rows.js`: the drag state machine
@@ -231,6 +312,8 @@ ask the owner for access.
    `tests/test_webapp_conversation_list.py`, with scripted pointer events.
    It covers axis lock, the commit threshold, the tray snap, click
    suppression and the drag-time render hold. Nothing tests these today.
+   The two-tap confirm (`_confirmDelete`, `_arm`) moves into the module too,
+   so threads reuse it in PR 3.
 2. **Threads swipe and Undo.** `conversations.js` wraps each tile:
    `<div class="swipe" data-id data-quick>` holds the quick underlay, the
    tray and the tile, so the tray's buttons sit beside the tile's `<button>`
@@ -243,7 +326,24 @@ ask the owner for access.
    `/unarchive` stay. `/unarchive` also clears `muted`, so it matches
    *Restore*. The Undo toast goes into the gesture module, so chats get it in
    the same PR.
-3. **Star.**
+3. **Delete.**
+   - `POST /conversations/<id>/delete` copies `_handle_chat_delete`'s gates
+     (`_claude_auth_same_origin`, `_request_from_edge`) and calls
+     `_delete_conversation`. For a user's delete, that function keeps the
+     key bindings and writes the tombstone. One file per id under
+     `CONVERSATIONS_DIR/deleted/` is enough, and it is written under
+     `_conversations_lock` before the thread file goes.
+   - Reads, agent appends, flag writes and keyed opens consult the
+     tombstone and answer 410.
+   - `conversation-push.py` turns 410 into a plain message and a non-zero
+     exit, and never retries it as a new thread.
+   - `conversation.js` shows "You deleted this conversation" on 410, where
+     it now says "Conversation not found".
+   - `shelf-store.js` gets a `deleted` case that drops the item and
+     suppresses it, as `muted` does.
+   - The triage skill's "Thread gone" branch splits in two: 410 resolves
+     the message, and only a missing id re-collects it.
+4. **Star.**
    - Threads: a `starred` field in the conversation JSON, `starred` in
      `_conv_summary`, and accepted by both `/conversations/<id>/flags` and
      `/internal/conversations/<id>/flags`. `conversation-push.py` gets
@@ -258,14 +358,17 @@ ask the owner for access.
 **Docs to update with the code:**
 
 - `docs/dashboard.md`: the Threads page, plus "Archived + muted" becomes
-  "Archived, muted, starred".
+  "Archived, muted, starred, deleted".
 - `webapp/README.md`: the `starred` field in both summaries, and the
   "pinned deferred" note.
 - `docs/messenger-chats.md`: the roadmap's "optional `pinned`" item.
-- The triage skill: skip starred threads on its own archives.
+- The triage skill: skip starred threads on its own archives, and treat a
+  deleted thread (410) as the user's decision.
 - `CLAUDE.md`'s "Archive-click ≠ archive this" rule gains "or a swipe".
   Muting from the tray is now the user's own "archive for good", so `muted`
-  remains the decidable signal.
+  remains the decidable signal. Add one line next to it: a thread the user
+  deleted is their answer, and no agent reopens its subject in a new thread
+  on its own initiative.
 
 **Tests on the server side:** extend `tests/test_chat_state.py` and
 `tests/test_chat_api.py` (`test_archive_and_mute`) to show the star survives
@@ -275,3 +378,13 @@ mute and restore. Add a thread-flags test covering:
 - the star surviving archive, wake and restore;
 - `/unarchive` clearing `muted`;
 - the internal endpoint and `--star`.
+
+Add a thread-delete test covering:
+
+- the 403 from inside the container, like
+  `test_delete_from_inside_the_container_is_refused` for chats;
+- erasure of the file, attachments and session transcripts, including a
+  turn that finishes after the delete;
+- the 410 answers: on read, on an agent append, and on a redelivered keyed
+  open that must create nothing;
+- the attention item leaving the home list.
