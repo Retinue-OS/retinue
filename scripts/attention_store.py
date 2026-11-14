@@ -253,6 +253,20 @@ def thread_wants_attention(conv: dict) -> bool:
     return bool(conv.get("unread"))
 
 
+def own_project_thread(conv: dict) -> bool:
+    """A thread the user opened about a project, not settled: archived and
+    marked-done threads drop out as any thread does. The home keeps it on
+    the list for as long as its project is listed (fold_projects), read or
+    not, so a conversation about running work does not vanish once Ara's
+    reply has been read. Only the gateway's list asks; the life-store emit
+    keeps to thread_wants_attention."""
+    if conv.get("archived") or (conv.get("kind") or "chat") != "chat":
+        return False
+    if conv.get("initiator") == "agent" or not conv.get("project"):
+        return False
+    return (conv.get("attention") or {}).get("state", "open") != "done"
+
+
 def thread_item(conv: dict, profile: dict) -> dict:
     """A conversation thread as a policy item, display fields included."""
     first = _first_message(conv)
@@ -523,7 +537,7 @@ def project_item(row: dict, state_block: dict | None, profile: dict, now: dateti
     return item
 
 
-def fold_projects(items: list[dict]) -> list[dict]:
+def fold_projects(items: list[dict], projects_known: bool = True) -> list[dict]:
     """One row per thing: a project that an open thread is about — the
     wake-up recurring-projects opened, a question an agent asked about it —
     shows as that thread, not beside it. The thread carries the news and
@@ -531,13 +545,35 @@ def fold_projects(items: list[dict]) -> list[dict]:
     nobody has a thread open about stays its own row. A thread the user
     opened about a project is theirs, not the project's: the project stays
     the item, the thread shows while Ara's reply lies unread, as any of
-    their threads does."""
-    claimed = {i["project"] for i in items
+    their threads does.
+
+    The user's own thread about a project stays listed beside it for as long
+    as the project is listed (own_project_thread), and is in the project's
+    spheres unless it declares its own, so its row reads as part of that
+    work. When the project is done, paused or gone, the thread is listed only
+    while Ara's reply lies unread. ``projects_known`` is False when the
+    projects could not be read (the store down): then no thread is dropped
+    for a project the list cannot see."""
+    projects = {i["id"]: i for i in items if i.get("kind") == "project"}
+    kept = []
+    for i in items:
+        if i.get("kind") == "thread" and i.get("own") and i.get("project"):
+            listed = projects.get(i["project"])
+            if listed is None and projects_known and not i.get("unread"):
+                continue
+            # A sphere declared for the thread ("message") or corrected by the
+            # user ("you") wins over the project's.
+            if listed is not None and i.get("sphere_from") in (None, "project"):
+                i["sphere"] = listed.get("sphere") or i["sphere"]
+                i["tags"] = list(listed.get("tags") or [])
+                i["sphere_from"] = "project"
+        kept.append(i)
+    claimed = {i["project"] for i in kept
                if i.get("kind") == "thread" and i.get("project") and not i.get("own")
                and i.get("state", "open") == "open"}
     if not claimed:
-        return items
-    return [i for i in items if not (i.get("kind") == "project" and i["id"] in claimed)]
+        return kept
+    return [i for i in kept if not (i.get("kind") == "project" and i["id"] in claimed)]
 
 
 def _humanize(uri: str) -> str:
@@ -589,7 +625,7 @@ def default_emit_path(chambers_dir: Path) -> Path:
 __all__ = [
     "AttentionStore", "DEFAULT_CHAT_SPHERE", "DEFAULT_SPHERES", "DEFAULT_DIRECT_IMPORTANCE",
     "DEFAULT_GROUP_IMPORTANCE", "zone",
-    "thread_wants_attention", "thread_item", "chat_wants_attention", "chat_is_unknown",
+    "thread_wants_attention", "own_project_thread", "thread_item", "chat_wants_attention", "chat_is_unknown",
     "chat_screened", "chat_item",
     "project_item", "fold_projects", "block_for", "subject_iri", "emit", "default_emit_path",
 ]

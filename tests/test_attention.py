@@ -590,6 +590,51 @@ def test_zone():
                 os.environ[n] = v
 
 
+def test_own_project_thread_stays_with_its_project():
+    """The user's own thread about a running project stays on the home after
+    Ara's reply is read, in the project's spheres, and is shown or folded as
+    the project is; once the project is no longer listed it goes, unless the
+    projects could not be read."""
+    import attention_store as S
+    conv = {"id": "t1", "initiator": "user", "kind": "chat", "project": "urn:p", "unread": False}
+    assert not S.thread_wants_attention(conv) and S.own_project_thread(conv)
+    assert not S.own_project_thread(dict(conv, archived=True))
+    assert not S.own_project_thread(dict(conv, attention={"state": "done"}))
+    assert not S.own_project_thread(dict(conv, project=None))
+    assert not S.own_project_thread(dict(conv, initiator="agent"))
+
+    def thread(**kw):
+        base = dict(id="thread:t1", own=True, project="urn:p", unread=False, released=True,
+                    sphere="admin", sphere_from=None)
+        base.update(kw)
+        return item(**base)
+    proj = item(id="urn:p", kind="project", sphere="plazi", tags=["research"], released=True)
+    out = S.fold_projects([thread(), proj])
+    t = next(i for i in out if i["id"] == "thread:t1")
+    assert [i["id"] for i in out] == ["thread:t1", "urn:p"], "the project stays its own row"
+    assert t["sphere"] == "plazi" and t["tags"] == ["research"] and t["sphere_from"] == "project"
+    # A sphere declared for the thread wins.
+    t = S.fold_projects([thread(sphere_from="message"), proj])[0]
+    assert t["sphere"] == "admin"
+    # Project gone: a read thread goes; unread stays; store down keeps it.
+    assert [i["id"] for i in S.fold_projects([thread()])] == []
+    assert [i["id"] for i in S.fold_projects([thread(unread=True)])] == ["thread:t1"]
+    assert [i["id"] for i in S.fold_projects([thread()], projects_known=False)] == ["thread:t1"]
+
+    # Read, it is shown as its project is: Focused on plazi shows it, Focused
+    # on nothing folds it; unread, it is never folded.
+    focus, profile = A.default_focus(), A.default_profile()
+    now = at(9, 0)
+    t = S.fold_projects([thread(), proj])[0]
+    s = A.sections([t], focus, profile, now)
+    assert [i["id"] for i in s["not_now"]] == ["thread:t1"], s
+    focus_plazi = dict(focus, manual="focused", subject="plazi")
+    s = A.sections([t], focus_plazi, profile, now)
+    assert [i["id"] for i in s["next"]] == ["thread:t1"], s
+    s = A.sections([dict(t, unread=True)], focus, profile, now)
+    assert [i["id"] for i in s["next"]] == ["thread:t1"], s
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:

@@ -304,6 +304,20 @@ def test_user_thread_never_gated(base, wg):
     assert where == "next" and row["importance_from"] == "your thread", row
     status, _ = _http(base, "POST", f"/conversations/{conv['id']}/read")
     assert _find(_sections(base), "thread:" + conv["id"])[0] is None
+    # A thread the user opened about a running project stays after the read,
+    # in the project's sphere, until it is archived.
+    status, pconv = _http(base, "POST", "/conversations",
+                          {"message": "What is left on the VAT return?", "project": PROJECT})
+    assert status == 201
+    wg._conv_add_message(pconv["id"], "assistant", "Two receipts.", unread=True, pending=False)
+    _http(base, "POST", f"/conversations/{pconv['id']}/read")
+    _mode(base, "chores")
+    where, row = _find(_sections(base), "thread:" + pconv["id"])
+    assert where == "next" and row["sphere"] == "admin", (where, row)
+    assert _find(_sections(base), PROJECT)[0] is not None, "the project keeps its own row"
+    _http(base, "POST", f"/conversations/{pconv['id']}/archive")
+    assert _find(_sections(base), "thread:" + pconv["id"])[0] is None
+    _mode(base, "focused")
     print("ok test_user_thread_never_gated")
 
 

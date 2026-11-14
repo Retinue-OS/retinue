@@ -10004,7 +10004,8 @@ def _attention_thread_items(profile: dict) -> list[dict]:
         if not _CONV_ID_RE.match(path.stem):
             continue
         conv = _load_conv(path.stem)
-        if conv is None or not attention_store.thread_wants_attention(conv):
+        if conv is None or not (attention_store.thread_wants_attention(conv)
+                                or attention_store.own_project_thread(conv)):
             continue
         items.append(attention_store.thread_item(conv, profile))
     return items
@@ -10068,7 +10069,7 @@ def _attention_items(profile: dict, now: datetime) -> tuple[list[dict], list[str
         except Exception as exc:  # noqa: BLE001 - transport/parse: degrade, do not fail
             print(f"[web-gateway] attention: {name} unavailable ({exc})", flush=True)
             degraded.append(name)
-    return attention_store.fold_projects(items), degraded
+    return attention_store.fold_projects(items, projects_known="projects" not in degraded), degraded
 
 
 def _attention_chat_row_from_state(chat_id: str, state: dict) -> dict:

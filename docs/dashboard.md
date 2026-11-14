@@ -399,6 +399,12 @@ alert).
 `_push_conv_notification` and `_chat_push_notification` are called only when
 the decision is *push* (`Urgency: high`); a held item badges the dashboard but
 stays quiet. The user's own threads with Ara are never gated — they asked.
+Such a thread is listed while Ara's reply lies unread; one the user opened
+about a project (from its page, or linked to it) stays listed for as long as
+that project is, read or not, until it is archived or marked done. Once read
+it takes the project's spheres (unless it declared its own), so a Focused
+scope shows or folds it exactly as it does the project
+(`attention_store.own_project_thread`, `fold_projects`).
 Breakpoints — the day plan's digest times (08:00, 12:00, 17:00, 21:00 on a
 shipped workday, 09:00 and 18:00 on a day off) and the scheduled mode changes
 (leaving *Rest* excepted: the morning digest opens the day) —
