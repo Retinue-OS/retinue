@@ -1689,9 +1689,11 @@ def expired(item: dict, now: datetime) -> bool:
 def shown_anyway(item: dict, mode: dict, profile: dict, now: datetime) -> bool:
     """What a mode that lists only the admitted still shows: critical, what
     the mode admits (sphere, tag or permit), what the user pulled or put
-    back, and their own threads with Ara."""
+    back, and their own threads with Ara while her reply lies unread. Once
+    read, the user's own thread about a project is shown as its project is
+    (attention_store.fold_projects gives it the project's spheres)."""
     return (level(item, now) == "critical" or admitted(item, mode, profile)
-            or bool(item.get("pulled")) or bool(item.get("own")))
+            or bool(item.get("pulled")) or bool(item.get("own") and item.get("unread", True)))
 
 
 # ---- views ------------------------------------------------------------------------------
