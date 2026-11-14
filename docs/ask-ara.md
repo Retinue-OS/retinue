@@ -32,7 +32,9 @@ allowlist plus the prompt, **not a sandbox**. It runs on the router tier and
 escalates to the frontier tier like any door turn (`docs/model-routing.md`);
 `ARA_MCP_MODEL` pins it instead. Every exchange is appended to a per-day
 dashboard thread of kind `cowork`, quietly (no unread badge, no Web Push), as an
-audit trail the user reads when curious.
+audit trail the user reads when curious. The user may delete that day's thread
+(the Threads page's Cowork tab); what is asked afterwards goes to a fresh one,
+since a deleted record is no reason to stop recording.
 
 **Stated facts go to the user, not into memory.** A client often *tells* as
 much as it asks — "I just filed the return", "the meeting moved to Friday". The

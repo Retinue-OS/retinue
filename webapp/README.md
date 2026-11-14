@@ -148,7 +148,14 @@ The same gateway also backs the conversation-tabs card with a small JSON API
   body, MediaRecorder MIME type in `Content-Type`); returns `{"text","lang"}`.
 - `POST /conversations/<id>/read`     — clear a thread's unread badge.
 - `POST /conversations/<id>/archive`  — archive a thread (drop from active list).
-- `POST /conversations/<id>/unarchive`— restore an archived thread.
+- `POST /conversations/<id>/unarchive`— restore an archived thread (and clear
+  `muted`, as the list's Restore does).
+- `POST /conversations/<id>/flags`    — the Threads page's swipe and tray:
+  `{archived?, muted?, starred?}` (booleans, at least one); answers the
+  thread's summary.
+- `POST /conversations/<id>/delete`   — erase a thread for good (no body);
+  accepted only through the reverse proxy, never for a chat's companion. A
+  deleted thread answers 410 Gone from then on.
 
 Ara answers asynchronously, so the open conversation polls itself until the
 reply lands (faster while a turn is pending), and the card polls the list.
@@ -159,10 +166,30 @@ persistent `/root` volume (`/root/.retinue/conversations`); the
 
 On the home the element is a `viewer` only — threads open from the attention
 list's rows. *Threads* in the navigation row leads to `conversations.html`, a
-dedicated page that lists every thread with an Active/Archived filter (the
-same `retinue-conversations` element with the `full` attribute). Archiving is done from inside a thread; archived threads
-leave the active list but remain on that page and via
-`GET /conversations?archived=1`.
+dedicated page that lists every thread with an Active/Archived/Edits/Cowork
+filter (the same `retinue-conversations` element with the `full` attribute).
+Its tiles swipe exactly like the chats page's rows — one implementation,
+`components/swipe-rows.js`, so the two lists cannot drift apart:
+
+| Tab | Swipe right | Swipe left (tray) |
+|---|---|---|
+| Active | archive at once | Star · Archive · Mute |
+| Archived | restore at once | Star · Restore · Mute *or* Unmute · Delete |
+| Edits, Cowork | archive or restore, as the row's state calls for | the tray for the row's state |
+
+A long press, a right-click or the context-menu key opens the tray without
+swiping; the click a swipe ends in never opens the thread, and a tap on an
+open tile closes its tray. **Archive** is the thread bar's button (out of the
+list until something new is filed into it), **Mute** keeps it out
+(`{archived, muted}` together), **Unmute** lets the next message bring it
+back, **Restore** brings it back and clears the mute — and so does the thread
+bar's *Unarchive*. A commit that takes a row out of view offers **Undo** for
+6 s (the home list's toast), writing back exactly the flags the row had.
+**Delete** asks for a second tap and cannot be undone. **Star** keeps a thread
+at the top of whichever list it is in — `starredFirst` in `base.js` sorts the
+client side, starred first, each group still newest first — and does nothing
+else; the open thread's bar has a ☆/★ for it too. Archived threads stay
+reachable on that page and via `GET /conversations?archived=1`.
 
 The wide layout itself is resizable, VS Code style (`layout.js`): the
 boundaries between conversations, news and the projects column are draggable
@@ -220,16 +247,19 @@ docstring). Pieces:
   the whole `chats.html` page: avatar, channel mark, last-message preview,
   unread badge, non-archived chats ordered by last activity; the full page
   adds an Active/Archived filter like the conversations page, and rows that
-  swipe (pointer events, so touch, pen and mouse drag alike; a long press,
-  right-click or the context-menu key opens the same shelf). On *Active*, a
-  swipe right archives at once and a swipe left uncovers **Archive** (out of
+  swipe (`components/swipe-rows.js`, shared with the threads page: pointer
+  events, so touch, pen and mouse drag alike; a long press, right-click or
+  the context-menu key opens the same tray). On *Active*, a swipe right
+  archives at once and a swipe left uncovers **Star**, **Archive** (out of
   the list until it speaks again) and **Mute** (out of the list, and the next
-  message does not bring it back), both `POST /chats/<id>/flags`. Muting
+  message does not bring it back), all `POST /chats/<id>/flags`. Muting
   archives — the server's rule — so both land under *Archived*, where a swipe
-  right restores at once and a swipe left uncovers **Restore**, **Mute** /
-  **Unmute** (stays archived) and **Delete** (`POST /chats/<id>/delete`,
-  armed by a first tap, done by a second). The dashboard card stays a glance
-  and carries none of it. In the wide
+  right restores at once and a swipe left uncovers **Star**, **Restore**,
+  **Mute** / **Unmute** (stays archived) and **Delete**
+  (`POST /chats/<id>/delete`, armed by a first tap, done by a second). What
+  takes a row out of view offers Undo for a few seconds; a starred chat leads
+  whichever list it is in. The dashboard card stays a glance and carries
+  none of it. In the wide
   layout the card has its own fixed-height region above the conversations
   (`--chats-h`), resizable and snap-closable at a third `layout.js` splitter
   (`data-splitter="chats"`). The card refreshes on an ambient cadence and
@@ -260,9 +290,10 @@ docstring). Pieces:
   the chat is a row of — for a chat opened cold (a notification, a
   bookmark). The header's ⋮ menu holds
   *Attention details* — the chat's attention sheet, with the contact card —
-  and the **Archive** / **Mute** switches, the same `POST /chats/<id>/flags`
-  the list's swipe actions use; a dot on the ⋮ shows an archived or muted
-  chat with the menu shut. What the companion pane does sits behind a **?**
+  and the **Star** / **Archive** / **Mute** switches, the same
+  `POST /chats/<id>/flags` the list's swipe actions use; a starred chat's
+  name carries a ★, and a dot on the ⋮ shows an archived or muted chat with
+  the menu shut. What the companion pane does sits behind a **?**
   in its bar rather than on a row of its own. While the phone keyboard is up —
   `data-keyboard` on `<html>`, which `viewport.js` sets when a text field
   has focus and the visible frame is well short of its keyboard-less height
@@ -325,7 +356,7 @@ The API, as the components consume it:
 
 - `GET /chats` — `{generated, chats: [ChatSummary]}`, ordered by last
   activity. A `ChatSummary` is `{id, channel, account, key, name, group,
-  members?, unread, archived, muted, companion, instructed, last, draft,
+  members?, unread, archived, muted, starred, companion, instructed, last, draft,
   messages}`.
 
   A chat is one peer **on one account**, and `id` names both:
@@ -361,10 +392,12 @@ The API, as the components consume it:
   and a new inbound message **un-archives** an archived chat unless it is
   muted — the server's rule, applied on the notify rail. `muted` silences
   that chat's Web Push and keeps an archived chat archived; setting it also
-  sets `archived`, so a caller never has to send both. `POST
-  /chats/<id>/flags` (body `{archived?, muted?}`, either or both) is the one
-  way in, and the answer carries the flags as they ended up — a client reads
-  them back rather than assuming what it asked for.
+  sets `archived`, so a caller never has to send both. `starred` is the
+  user's mark: the chat sorts first in whichever list it is in, and nothing
+  else changes — mute, restore and an arrival all leave it. `POST
+  /chats/<id>/flags` (body `{archived?, muted?, starred?}`, any of them) is
+  the one way in, and the answer carries the flags as they ended up — a
+  client reads them back rather than assuming what it asked for.
 
   `POST /chats/<id>/delete` (no body) is not a flag but an erasure: every
   inbox gateway of the channel is asked to erase the chat (its own
@@ -406,8 +439,8 @@ The API, as the components consume it:
   user wants the chat in their list is this flag's. A subscribed channel one
   keeps only for its content is `news` + `ignored` **and** muted — three
   separate statements, because a list one both reads as news and answers in is
-  `news` + `quieted` and stays visible. No pinning yet: favourites-on-top would
-  be a later `pinned` flag, deliberately deferred. A store outage is answered
+  `news` + `quieted` and stays visible. Favourites-on-top is the `starred`
+  flag above, shared with the threads. A store outage is answered
   from the last good list for up to `CHAT_LIST_STALE_SECONDS` (10 min by
   default), then with an honest 502 (the page shows it; the card keeps its
   last state).

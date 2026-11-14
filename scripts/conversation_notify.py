@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import os
+import urllib.error
 import urllib.request
 
 _PORT = os.environ.get("WEB_GATEWAY_PORT", "8080")
@@ -44,6 +45,15 @@ class ConversationNotifier:
         try:
             with urllib.request.urlopen(req, timeout=self.timeout) as resp:
                 return json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            if exc.code == 410:
+                # The user deleted the thread: their answer on it, not a
+                # failure to retry on every tick. Nothing was written.
+                print(f"{self.log_prefix} the user deleted that thread; nothing written",
+                      flush=True)
+                return {"deleted": True}
+            print(f"{self.log_prefix} conversation post failed: {exc}", flush=True)
+            return None
         except Exception as exc:  # noqa: BLE001 - callers retry on the next tick
             print(f"{self.log_prefix} conversation post failed: {exc}", flush=True)
             return None

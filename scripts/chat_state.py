@@ -260,6 +260,10 @@ class ChatStateStore:
             "draft_version": 0,
             "archived": False,
             "muted": False,
+            # The user's mark: the chat sorts above the rest of its list.
+            # Independent of the two above — muting, restoring and an arrival
+            # all leave it as it is.
+            "starred": False,
             "name": None,
             "group": None,
             "gateway": None,
@@ -604,9 +608,10 @@ class ChatStateStore:
             return doc
 
     def set_flags(self, chat_id: str, *, archived: bool | None = None,
-                  muted: bool | None = None) -> dict:
-        """Set a chat's two user-facing flags, which say where the user wants
-        the chat on their screen and nothing else. (Whether a message is
+                  muted: bool | None = None, starred: bool | None = None) -> dict:
+        """Set a chat's user-facing flags, which say where the user wants
+        the chat on their screen and nothing else. `starred` puts it at the
+        top of whichever list it is in, and is independent of the other two. (Whether a message is
         *worked* follows the sender's VIP status in the triage policy: a chat
         is a place, and the user's interest is in a person.)
 
@@ -628,6 +633,8 @@ class ChatStateStore:
                 doc["muted"] = bool(muted)
                 if muted:
                     doc["archived"] = True
+            if starred is not None:
+                doc["starred"] = bool(starred)
             self._write(doc)
             return doc
 

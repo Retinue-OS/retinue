@@ -5,6 +5,8 @@
 //   GET  /conversations                 list of active threads (tabs)
 //   GET  /conversations?archived=1      list of archived threads
 //   GET  /conversations?all=1&kind=…    the normally hidden kinds (full page)
+//   POST /conversations/<id>/flags      archive, mute, star (the full page's swipe)
+//   POST /conversations/<id>/delete     erase a thread for good (its tray)
 //
 // A thread can also be opened by a retinue agent that needs a decision (via the
 // gateway's token-gated /internal/conversations endpoint); such threads simply
@@ -24,7 +26,22 @@
 // shows the most recent active threads (capped at MAX_CARD_THREADS) plus a link
 // to the dedicated all-conversations page, so the dashboard stays uncluttered.
 // With the `full` attribute (used on conversations.html) it shows every thread
-// with an Active/Archived filter and no cap. With `viewer` (the home page,
+// with an Active/Archived filter and no cap, and its tiles swipe like the
+// chats page's rows (components/swipe-rows.js — one gesture for both):
+//
+//   Active tab    swipe right  archive at once
+//                 swipe left   reveal Star · Archive · Mute
+//   Archived tab  swipe right  restore at once
+//                 swipe left   reveal Star · Restore · Mute (Unmute) · Delete
+//
+// (the Edits and Cowork tabs list both states, and each row offers what its
+// own state calls for). The words mean what they mean on chats: Archive is
+// the thread bar's button — out until something new is filed into it — Mute
+// keeps it out, Restore brings it back and clears the mute, Star keeps it at
+// the top of its list and does nothing else. What takes a row out of view
+// offers Undo for a few seconds. Delete erases the thread for good — the
+// gateway accepts it only from the dashboard — and asks for a second tap.
+// With `viewer` (the home page,
 // whose list is the attention list) it renders nothing at all until a thread
 // or the composer is opened by hash, and then only that view.
 //
@@ -44,10 +61,12 @@
 // last rendered state stays on screen).
 
 import {
-  esc, fmtAge, isWideFrame, onFrameChange,
+  esc, fmtAge, isWideFrame, onFrameChange, starredFirst,
   viewPref, setViewPref, viewToggleHtml, VIEW_TOGGLE_CSS,
 } from './base.js';
-import { hasUnsentInput } from './conversation.js';
+import { forgetThread, hasUnsentInput } from './conversation.js';
+import { shelf } from './shelf-store.js';
+import { SwipeRows, SWIPE_CSS, STAR_MARK, offerUndo, starButtonHtml } from './swipe-rows.js';
 import { modeEntries, pickWakeThread, setContinuous } from './continuous.js';
 import { claimShellEvents, inShell } from './shell.js';
 
@@ -68,6 +87,17 @@ const COMPOSER_HASH_RE = /^#new(?:\?(.*))?$/;
 // its own column, so it is lifted there (see _shownThreads).
 const MAX_CARD_THREADS = 5;
 const POLL_MS = 4000;
+// What the tray's and the swipe's words send to POST /conversations/<id>/flags
+// — the chats page's words, meaning the same.
+const THREAD_FLAGS = {
+  archive: { archived: true },
+  mute: { archived: true, muted: true },
+  // Stays archived — it only lets the next message bring the thread back.
+  unmute: { muted: false },
+  restore: { archived: false, muted: false },
+  star: { starred: true },
+  unstar: { starred: false },
+};
 
 class RetinueConversations extends HTMLElement {
   constructor() {
@@ -95,11 +125,20 @@ class RetinueConversations extends HTMLElement {
     // poll. The epoch is how such an answer is recognised and dropped: every
     // local change goes through _changed(), never a bare refresh().
     this._epoch = 0;
+    this._flagging = false;  // a flag write or a delete is on the wire
+    this._swipe = null;      // the full page's row gesture (swipe-rows.js)
   }
 
   connectedCallback() {
     if (!this.shadowRoot) this.attachShadow({ mode: 'open' });
     this._full = this.hasAttribute('full');
+    if (this._full && !this._swipe) {
+      this._swipe = new SwipeRows(this, {
+        onQuick: (id, action, el) => this._setFlags(id, action, el),
+        onTap: (id) => this._openThread(id),
+        isBusy: () => this._flagging,
+      });
+    }
     this._viewer = this.hasAttribute('viewer');
     // List rows vs reflowing tiles — a per-device choice (see base.js).
     this._view = viewPref('conversations');
@@ -133,6 +172,7 @@ class RetinueConversations extends HTMLElement {
       this.addEventListener('retinue-created', (e) => this._onCreated(e.detail || {}));
       this.addEventListener('retinue-archived', (e) => this._onArchived(e.detail || {}));
       this.addEventListener('retinue-sent', () => this._changed());
+      this.addEventListener('retinue-starred', () => this._changed());
       this.addEventListener('retinue-open', (e) => {
         const id = e.detail && e.detail.id;
         if (id) this._openThread(id);
@@ -255,6 +295,7 @@ class RetinueConversations extends HTMLElement {
     this._offFrame = null;
     if (this._onShell) window.removeEventListener('retinue-shell', this._onShell);
     this._onShell = null;
+    if (this._swipe) this._swipe.disconnect();
   }
 
   // Bring the view in line with the address bar after the browser has already
@@ -345,9 +386,11 @@ class RetinueConversations extends HTMLElement {
   // dashboard card in the wide layout, where the list is a scroll box of its own
   // and a cap would only leave the column half empty. Only the phone layout,
   // where every row lengthens the page, keeps the cap.
+  // Starred threads lead, each group still newest first — before any cap.
   _shownThreads() {
+    const threads = starredFirst(this._threads);
     return (this._full || isWideFrame())
-      ? this._threads : this._threads.slice(0, MAX_CARD_THREADS);
+      ? threads : threads.slice(0, MAX_CARD_THREADS);
   }
 
   // The list changed on the server because of something done here (a send, an
@@ -405,23 +448,134 @@ class RetinueConversations extends HTMLElement {
       }
     }
     const tabsEl = root.querySelector('.tabs');
-    if (tabsEl) {
+    // A rebuild under a finger mid-swipe would drop the tile it drags; the
+    // next tick picks the change up (the signature is left stale for it).
+    if (tabsEl && !(this._swipe && this._swipe.dragging)) {
       const sig = this._listSignature();
       if (sig !== this._listSig) {
         tabsEl.innerHTML = this._tabsHtml() + this._emptyHtml();
         this._listSig = sig;
         const allLink = root.querySelector('.all-link');
         if (allLink && !this._full) allLink.innerHTML = this._allLinkLabel();
-        tabsEl.querySelectorAll('[data-open]').forEach((el) =>
-          el.addEventListener('click', () => this._openThread(el.getAttribute('data-open'))));
+        this._wireRows(tabsEl);
       }
     }
+  }
+
+  // The rows' own wiring, after every rebuild of the list: a tap opens a
+  // thread; on the full page the tiles swipe and their trays act.
+  _wireRows(scope) {
+    scope.querySelectorAll('[data-open]').forEach((el) =>
+      el.addEventListener('click', () => this._openThread(el.getAttribute('data-open'))));
+    if (!this._swipe) return;
+    this._swipe.wire(scope);
+    scope.querySelectorAll('.tray [data-act]').forEach((btn) =>
+      btn.addEventListener('click', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        const el = btn.closest('.swipe');
+        const id = el && el.dataset.id;
+        const act = btn.getAttribute('data-act');
+        if (!id) return;
+        if (act === 'delete') { if (this._swipe.confirm(id, btn)) this._deleteThread(id); }
+        else this._setFlags(id, act, el);
+      }));
+  }
+
+  // The swipe's and the tray's actions. `action` is one of THREAD_FLAGS, or
+  // a flags object: Undo writes back exactly the flags the row had. The row
+  // leaves (or joins) the scope at once, from the gateway's own answer, and
+  // the refresh that follows confirms it.
+  async _setFlags(id, action, el = null) {
+    const flags = typeof action === 'string' ? THREAD_FLAGS[action] : action;
+    if (!id || !flags || this._flagging) return;
+    const t0 = this._threads.find((t) => t.id === id);
+    const before = t0 ? { archived: !!t0.archived, muted: !!t0.muted } : null;
+    this._flagging = true;
+    try {
+      const res = await fetch(`/conversations/${encodeURIComponent(id)}/flags`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(flags),
+      });
+      if (res.status === 410) { this._dropThread(id); return; } // deleted elsewhere
+      if (!res.ok) throw new Error(String(res.status));
+      const t = await res.json();
+      // The minimized-pages shelf (issue #282) follows, as from the thread
+      // bar: a muted thread leaves it whatever put it there; archiving drops
+      // only what was parked by itself.
+      const key = `thread:${id}`;
+      if (t.muted && t.archived) shelf.muted(key);
+      else if (t.archived) shelf.archived(key, true, t.pending ? String(t.pending_since || 'pending') : '');
+      const scope = this._full ? this._scope : 'active';
+      const leaves = (scope === 'active' && t.archived) || (scope === 'archived' && !t.archived);
+      this._threads = leaves
+        ? this._threads.filter((x) => x.id !== id)
+        : this._threads.map((x) => (x.id === id ? Object.assign({}, x, t) : x));
+      if (this._swipe) this._swipe.reset();
+      this._listSig = '';
+      this._partialUpdate();
+      this._changed();
+      const said = { archive: 'Archived', mute: 'Muted', restore: 'Restored' }[action];
+      if (said && before) {
+        offerUndo(`${said} · ${t.title || 'Conversation'}`, () => this._setFlags(id, before));
+      }
+    } catch (_err) {
+      // Left as it was; a tile swiped out slides back, and the next swipe or
+      // tap can retry.
+      if (el && this._swipe) this._swipe.slide(el, 0);
+    } finally {
+      this._flagging = false;
+    }
+  }
+
+  // Delete, after its second tap: the gateway erases the thread and keeps it
+  // erased. What this device keeps for it goes too (its draft, its shelf
+  // item, its continuous-mode entry). Refused (403) anywhere but the
+  // dashboard behind the reverse proxy — the button then says so.
+  async _deleteThread(id) {
+    if (!id || this._flagging) return;
+    this._flagging = true;
+    const busy = this._swipe && this._swipe.rowEl(id);
+    if (busy) busy.classList.add('busy');
+    try {
+      const res = await fetch(`/conversations/${encodeURIComponent(id)}/delete`, { method: 'POST' });
+      if (!res.ok && res.status !== 410) throw new Error(String(res.status));
+      this._dropThread(id);
+    } catch (err) {
+      const el = this._swipe && this._swipe.rowEl(id);
+      if (el) {
+        el.classList.remove('busy');
+        el.classList.add('failed');
+        const btn = el.querySelector('.tray [data-act="delete"]');
+        if (btn) {
+          btn.classList.remove('confirm');
+          const refused = err && err.message === '403';
+          btn.textContent = refused ? 'Delete refused' : 'Retry delete';
+          if (refused) btn.title = 'Deleting is accepted only from the dashboard, through its own address';
+        }
+      }
+    } finally {
+      this._flagging = false;
+    }
+  }
+
+  // The thread is gone (deleted here, or elsewhere and found out now).
+  _dropThread(id) {
+    forgetThread(id);
+    shelf.muted(`thread:${id}`);
+    this._threads = this._threads.filter((t) => t.id !== id);
+    if (this._swipe) this._swipe.reset();
+    this._listSig = '';
+    this._partialUpdate();
+    this._changed();
   }
 
   // Switch the full-page thread filter and reload that scope.
   _setScope(scope) {
     if (this._scope === scope) return;
     this._scope = scope;
+    if (this._swipe) this._swipe.reset();
     this._threads = [];
     this.render();
     this._changed(); // a refresh of the old scope in flight must not land here
@@ -593,7 +747,7 @@ class RetinueConversations extends HTMLElement {
   _listSignature() {
     return JSON.stringify(this._threads.map((t) => [
       t.id, t.title, t.initiator, t.updated, !!t.unread, !!t.pending, t.last_preview,
-      t.kind || '', t.project_title || '',
+      t.kind || '', t.project_title || '', !!t.starred, !!t.archived, !!t.muted,
     ]));
   }
 
@@ -689,6 +843,7 @@ class RetinueConversations extends HTMLElement {
         t.initiator === 'agent' ? 'Retinue' : 'You',
         t.updated ? fmtAge(t.updated) : '',
         t.archived ? 'archived' : '',
+        t.muted ? 'muted' : '',
       ].filter(Boolean).join(' · ');
       // The project gets its own line: in the meta (which never wraps) a long
       // project title widened the auto column until it pushed the thread's
@@ -698,21 +853,44 @@ class RetinueConversations extends HTMLElement {
       // Edit-command threads only ever appear under the Edits filter (or on
       // their project's page) — badge them so their nature is obvious there.
       const editTag = t.kind === 'edit' ? '<span class="tag-edit">edit</span>' : '';
-      return `<button class="tab${t.unread ? ' unread' : ''}" data-open="${esc(t.id)}">` +
-        `<span class="t-title">${t.unread ? '<span class="dot"></span>' : ''}` +
+      const inner =
+        `<span class="t-title">${t.starred ? STAR_MARK : ''}` +
+        `${t.unread ? '<span class="dot" role="img" aria-label="Unread"></span>' : ''}` +
         editTag +
         `<span class="t-name">${esc(t.title || 'Conversation')}</span></span>` +
-        `<small class="t-meta">${esc(meta)}</small>` +
+        `<small class="t-meta">${esc(meta)}` +
+        `${t.muted ? ' <span class="mute-mark" aria-hidden="true">&#128277;</span>' : ''}</small>` +
         proj +
-        (t.last_preview ? `<small class="t-prev">${esc(t.last_preview)}</small>` : '') +
-        `</button>`;
+        (t.last_preview ? `<small class="t-prev">${esc(t.last_preview)}</small>` : '');
+      if (!this._swipe) {
+        return `<button class="tab${t.unread ? ' unread' : ''}" data-open="${esc(t.id)}">${inner}</button>`;
+      }
+      // The full page: the tile slides over its quick action and its tray.
+      // A tap reaches the thread through the gesture (it swallows the click
+      // a swipe ends in), so the tile carries no data-open of its own.
+      const quick = t.archived ? 'restore' : 'archive';
+      const act = (label, set, title) =>
+        `<button type="button" class="${set}" data-act="${set}" title="${title}">${label}</button>`;
+      const tray = starButtonHtml(!!t.starred, (set) => `data-act="${set}"`) + (t.archived
+        ? act('Restore', 'restore', 'Put this thread back in the list') +
+          (t.muted
+            ? act('Unmute', 'unmute', 'Stay archived, but come back when something new arrives')
+            : act('Mute', 'mute', 'Keep it out of the list, even when something new arrives')) +
+          act('Delete', 'delete', 'Erase this thread and its attachments. What it already did stays done')
+        : act('Archive', 'archive', 'Out of the list until something new arrives') +
+          act('Mute', 'mute', 'Out of the list, and something new does not bring it back'));
+      return `<div class="swipe" data-id="${esc(t.id)}" data-quick="${quick}">` +
+        `<div class="quick ${quick}" aria-hidden="true">${quick === 'archive' ? 'Archive' : 'Restore'}</div>` +
+        `<div class="tray">${tray}</div>` +
+        `<button type="button" class="tab row${t.unread ? ' unread' : ''}" draggable="false">${inner}</button>` +
+        `</div>`;
     }).join('');
   }
 
   _wire() {
     const root = this.shadowRoot;
-    root.querySelectorAll('[data-open]').forEach((el) =>
-      el.addEventListener('click', () => this._openThread(el.getAttribute('data-open'))));
+    const tabs = root.querySelector('.tabs');
+    if (tabs) this._wireRows(tabs);
     const nw = root.querySelector('[data-new]');
     if (nw) nw.addEventListener('click', () => this._openComposer());
     root.querySelectorAll('[data-scope]').forEach((el) =>
@@ -785,6 +963,15 @@ const CSS = `
     .tab:hover { outline: 1px solid var(--accent, #6ea8fe); }
   }
   .tab.unread { box-shadow: inset 3px 0 0 0 var(--accent, #6ea8fe); }
+  /* The full page's tiles swipe (swipe-rows.js): the tile slides over its
+     quick action and its tray, inside a wrapper that is the grid cell. */
+  ${SWIPE_CSS}
+  .swipe { border-radius: 14px; }
+  .swipe > .tab { width: 100%; height: 100%; }
+  @media (hover: hover) {
+    .swipe > .tab:hover { outline-offset: -1px; }
+  }
+  .t-meta .mute-mark { font-size: .9em; }
   .t-title { display: flex; align-items: center; gap: 7px; min-width: 0; font-weight: 600; }
   /* Titles are what the list is read for, so give them a second line before
      cutting: agent-opened threads carry a whole subject line, and one line of

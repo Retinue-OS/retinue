@@ -2212,6 +2212,25 @@ def test_archive_and_mute(base, wg):
     assert status == 400, "a body with no flag is refused"
     status, _ = _http(base, "POST", flags_path, {"archived": "yes"})
     assert status == 400, "a non-boolean flag is refused"
+
+    # The star: the user's mark, sorting the chat first in its list. It
+    # rides through mute, an arrival and restore untouched, and is no
+    # attention signal — starring an archived chat settles nothing anew.
+    status, body = _http(base, "POST", flags_path, {"starred": True})
+    assert status == 200 and body["starred"] is True, body
+    status, body = _http(base, "POST", flags_path, {"muted": True})
+    assert body["starred"] is True, "muting keeps the star"
+    _http(base, "POST", flags_path, {"muted": False})
+    _http(base, "POST", rail, dict(event, message_id="h5", text="starred and back"))
+    status, body = _http(base, "POST", flags_path, {"archived": False, "muted": False})
+    assert body["starred"] is True, "restoring keeps the star"
+    status, body = _http(base, "GET", "/chats")
+    c = next(c for c in body["chats"] if c["id"] == cid)
+    assert c["starred"] is True, c
+    status, body = _http(base, "POST", flags_path, {"starred": "yes"})
+    assert status == 400, "a non-boolean star is refused"
+    status, body = _http(base, "POST", flags_path, {"starred": False})
+    assert status == 200 and body["starred"] is False, body
     print("PASS test_archive_and_mute")
 
 
