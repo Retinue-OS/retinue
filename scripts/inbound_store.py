@@ -68,10 +68,14 @@ those containers ship no third-party RDF library.
 """
 from __future__ import annotations
 
+import base64
 import json
+import mimetypes
 import os
 import re
 import secrets
+import shutil
+import tempfile
 import threading
 import time
 from collections import OrderedDict
@@ -751,6 +755,69 @@ def safe_file_name(name) -> str | None:
         ext = ("." + ext) if dot and len(ext) <= 12 else ""
         text = (stem if ext else text)[:200 - len(ext)] + ext
     return text
+
+
+# Each outbound attachment is materialized in a directory of its own, so the
+# file can carry the sender's name for it: the channel shows the recipient the
+# basename of what it was handed, and a document called "wa-push-k3x9.pdf"
+# says nothing.
+OUTBOUND_DIR_PREFIX = "retinue-out-"
+
+
+def materialize_outbound(entry, tmp_dir: str | Path | None = None) -> tuple[Path, str, str | None]:
+    """Write one /send attachment entry to disk, for the channel to send.
+
+    ``entry`` is an item of the /send payload's ``images`` list — the key is
+    historical, it carries a file of any type: ``{"data": <base64>,
+    "filename": ..., "content_type": ...}``, the last two optional. Returns
+    ``(path, content_type, name)``: the file, under its own (sanitized) name
+    so the recipient sees what the sender called it; its content type, the
+    declared one or else read off the name; and the name as given, None when
+    the entry carried none. An entry with neither name nor type is treated as
+    a JPEG, which is what such entries were before other files could be sent.
+
+    Raises ValueError on a malformed entry. Remove the file again with
+    :func:`discard_outbound`."""
+    if not isinstance(entry, dict):
+        raise ValueError("each attachment must be an object with base64 'data'")
+    data_b64 = entry.get("data")
+    if not data_b64 or not isinstance(data_b64, str):
+        raise ValueError("attachment entry missing base64 'data'")
+    try:
+        raw = base64.b64decode(data_b64, validate=True)
+    except ValueError as exc:  # binascii.Error subclasses ValueError
+        raise ValueError(f"invalid base64 attachment data: {exc}") from exc
+    name = safe_file_name(entry.get("filename"))
+    declared = entry.get("content_type")
+    declared = declared.split(";", 1)[0].strip().lower() if isinstance(declared, str) else ""
+    if name:
+        on_disk = name
+    elif declared:
+        on_disk = "attachment" + (mimetypes.guess_extension(declared) or ".bin")
+    else:
+        on_disk = "image.jpg"
+    content_type = declared or mimetypes.guess_type(on_disk)[0] or "application/octet-stream"
+    folder = Path(tempfile.mkdtemp(prefix=OUTBOUND_DIR_PREFIX,
+                                   dir=str(tmp_dir) if tmp_dir else None))
+    path = folder / on_disk
+    try:
+        path.write_bytes(raw)
+    except OSError:
+        shutil.rmtree(folder, ignore_errors=True)
+        raise
+    return path, content_type, name
+
+
+def discard_outbound(path: str | Path) -> None:
+    """Remove a file :func:`materialize_outbound` wrote, with its directory.
+
+    Any other path is simply unlinked, so a caller can hand over every
+    temporary file of a send without telling the two kinds apart."""
+    path = Path(path)
+    if path.parent.name.startswith(OUTBOUND_DIR_PREFIX):
+        shutil.rmtree(path.parent, ignore_errors=True)
+    else:
+        path.unlink(missing_ok=True)
 
 
 def store_media(store_dir: str | Path, data: bytes, content_type: str | None,

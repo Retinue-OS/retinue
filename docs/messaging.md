@@ -17,7 +17,7 @@ Use the client script:
 python3 /workspace/scripts/signal-push.py "Agent: failed to send reply to Mara — check scheduler.log"
 
 # A briefing with a chart, German voice, to a specific number
-python3 /workspace/scripts/signal-push.py --lang de --image /tmp/glucose.png \
+python3 /workspace/scripts/signal-push.py --lang de --attach /tmp/glucose.png \
   "Guten Morgen! Hier ist dein Tagesbriefing …"
 
 # Text only, no voice note
@@ -25,10 +25,23 @@ python3 /workspace/scripts/signal-push.py --no-voice "Quick note"
 ```
 
 Each push delivers the text body **plus a spoken rendering** of it (same
-Piper/ffmpeg pipeline as replies) and any `--image` attachments. The gateway
+Piper/ffmpeg pipeline as replies) and any `--attach` attachments. The gateway
 owns the Signal account, so this is the correct "from" identity for all Signal
 traffic — inbound and outbound, both the system's own messages and the user's
 personal chats.
+
+**Attachments are files of any type** on Signal, WhatsApp and Telegram alike:
+`--attach PATH` (repeatable; `--image` is the flag's older name and still
+works) sends an image, a video, a PDF or any other document, and the recipient
+sees it under the file's own name. Each channel presents it natively — an image
+or a video inline, anything else as a document; on WhatsApp a video that ffmpeg
+cannot read still goes out, as a document. The first attachment carries the
+message text as its caption where the channel has captions. One send carries
+about 18 MB of attachments in total (the gateways' `*_GATEWAY_MAX_BODY_BYTES`,
+25 MiB of base64 JSON by default); a larger one is refused with a 413 rather
+than truncated. On the wire the list is the `/send` payload's `images` key — a
+historical name, kept so a CLI and a gateway from different builds still
+understand each other; each entry is `{data, filename?, content_type?}`.
 
 To **resolve a name to a Signal number before sending** (the contact-lookup
 step), read the gateway's roster — it works in scheduled/headless sessions and
@@ -175,8 +188,9 @@ live only in that container, never in agent context, and there is no
 # Text to the default recipient
 python3 /workspace/scripts/whatsapp-push.py "Agent: reply to Mara failed — check scheduler.log"
 
-# With an image, to a specific number
-python3 /workspace/scripts/whatsapp-push.py --recipient +15551234567 --image /tmp/chart.png "Summary"
+# With attachments, to a specific number
+python3 /workspace/scripts/whatsapp-push.py --recipient +15551234567 \
+  --attach /tmp/chart.png --attach /tmp/report.pdf "Summary"
 ```
 
 Resolve a name to a WhatsApp number with `scripts/whatsapp-contacts.py` (same
@@ -191,7 +205,7 @@ matching no entry (and no `*` wildcard) defaults to `verify` (fail-safe). Who ma
 message *in* to drive the system is the separate inbound control (the
 accepted-requesters allowlist, control mode only). Pending WhatsApp sends appear
 on `/sends` alongside e-mail and Signal ones. There is no voice/Piper rendering
-on WhatsApp (text plus optional image attachments only).
+on WhatsApp (text plus optional attachments only).
 
 ## Telegram (the same model)
 
@@ -208,8 +222,8 @@ thin CLI:
 # Text to the default recipient
 python3 /workspace/scripts/telegram-push.py "Agent: reply to Mara failed — check scheduler.log"
 
-# With an image, to a specific chat (chat_id or @username)
-python3 /workspace/scripts/telegram-push.py --recipient @mara --image /tmp/chart.png "Summary"
+# With an attachment, to a specific chat (chat_id or @username)
+python3 /workspace/scripts/telegram-push.py --recipient @mara --attach /tmp/clip.mp4 "Summary"
 ```
 
 Resolve a name with `scripts/telegram-contacts.py` — same recent-chats-first,
@@ -223,7 +237,7 @@ group or channel) answers 404, a failing client 502. Outbound is gated by `TELEG
 `TELEGRAM_ACCOUNT`), not the recipient chat; since it is the user's own account,
 the fail-safe default means every send needs approval unless a policy entry grants
 it. Pending Telegram sends appear on `/sends` with the others. Text plus optional
-image attachments only.
+attachments only (no voice rendering).
 
 ## SMS (the same model, opt-in)
 
