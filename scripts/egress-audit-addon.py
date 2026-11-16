@@ -34,8 +34,10 @@ that host only, `*.example.com` matches the domain and every subdomain). It
 is for clients that pin their provider's certificate and refuse the audit CA,
 such as end-to-end-encrypted storage tools. Empty by default. Each such
 connection is still logged, once when it opens, with `"tls_passthrough":
-true`, method `TUNNEL`, the client, host and port; path, headers and bodies
-are not visible to the proxy and stay empty.
+true`, method `TUNNEL`, the client, host, port and SNI; path, headers and
+bodies are not visible to the proxy and stay empty. The match is made on the
+proxy's actual destination (the CONNECT target); an SNI, when sent, must be
+listed as well, so a client cannot borrow a listed name to tunnel elsewhere.
 """
 import json
 import os
@@ -217,9 +219,17 @@ def _empty_body() -> dict:
 class EgressAuditAddon:
     def tls_clienthello(self, data: tls.ClientHelloData) -> None:
         """Forward a passthrough host's TLS stream unopened, and log that."""
+        # The decision is bound to the proxy's real destination (the CONNECT
+        # target), never to the client-chosen SNI alone: otherwise a client
+        # could CONNECT anywhere with an allowlisted SNI and tunnel unopened,
+        # logged under the wrong host. An SNI that is present must be listed
+        # too; a mismatch is intercepted as usual.
         server = data.context.server
-        host = data.client_hello.sni or (server.address[0] if server.address else None)
-        if not is_passthrough(host):
+        target = server.address[0] if server.address else None
+        sni = data.client_hello.sni
+        if not is_passthrough(target):
+            return
+        if sni and not is_passthrough(sni):
             return
         data.ignore_connection = True
         client = data.context.client
@@ -228,10 +238,11 @@ class EgressAuditAddon:
             "client_ip": client.peername[0] if client.peername else None,
             "method": "TUNNEL",
             "scheme": "https",
-            "host": host,
+            "host": target,
             "port": server.address[1] if server.address else None,
             "path": "",
             "query": None,
+            "sni": sni,
             "tls_passthrough": True,
             "request_headers": {},
             "request_body": _empty_body(),

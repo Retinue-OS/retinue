@@ -43,7 +43,9 @@ def _load_addon(passthrough: str | None, log_dir: str):
     return module
 
 
-def _hello(sni, address=("203.0.113.7", 443)):
+def _hello(sni, address=None):
+    if address is None:
+        address = (sni or "203.0.113.7", 443)
     ns = types.SimpleNamespace
     return ns(
         client_hello=ns(sni=sni),
@@ -89,6 +91,21 @@ def test_listed_host_passes_and_is_logged():
     assert e["host"] == "eu.storage.example" and e["port"] == 443
     assert e["client_ip"] == "172.18.0.5"
     assert e["path"] == "" and e["request_body"]["size"] == 0
+    assert e["sni"] == "eu.storage.example"
+
+
+def test_sni_cannot_borrow_a_listed_name():
+    log_dir = tempfile.mkdtemp()
+    addon = _load_addon("*.storage.example", log_dir).EgressAuditAddon()
+    # CONNECT to an unlisted host with a listed SNI: intercepted, not logged.
+    spoof = _hello("eu.storage.example", address=("evil.example", 443))
+    addon.tls_clienthello(spoof)
+    assert spoof.ignore_connection is False
+    # CONNECT to a listed host with an unlisted SNI: intercepted as well.
+    mismatch = _hello("evil.example", address=("eu.storage.example", 443))
+    addon.tls_clienthello(mismatch)
+    assert mismatch.ignore_connection is False
+    assert _entries(log_dir) == []
 
 
 def test_no_sni_falls_back_to_address():
@@ -106,6 +123,23 @@ def test_empty_by_default():
     module.EgressAuditAddon().tls_clienthello(hello)
     assert hello.ignore_connection is False
     assert _entries(log_dir) == []
+
+
+def test_passthrough_entry_opens_in_viewer():
+    """A passthrough row has an empty path; its `view` link must still work."""
+    log_dir = tempfile.mkdtemp()
+    _load_addon("*.storage.example", log_dir).EgressAuditAddon().tls_clienthello(
+        _hello("eu.storage.example"))
+    entry = _entries(log_dir)[0]
+    os.environ["EGRESS_AUDIT_LOG_DIR"] = log_dir
+    spec = importlib.util.spec_from_file_location(
+        "egress_log_viewer_pt", REPO_ROOT / "scripts" / "egress-log-viewer.py")
+    viewer = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(viewer)
+    # parse_qs drops the blank `path=` of the index link, so it arrives absent.
+    page = viewer._flow_detail({"ts": [entry["ts"]], "host": [entry["host"]]})
+    assert "Flow not found" not in page, page
+    assert "tls_passthrough" in page
 
 
 if __name__ == "__main__":
