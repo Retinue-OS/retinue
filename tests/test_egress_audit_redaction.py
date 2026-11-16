@@ -38,6 +38,7 @@ def _load_addon():
     if "mitmproxy" not in sys.modules:
         mitm = types.ModuleType("mitmproxy")
         mitm.http = types.SimpleNamespace(Headers=object, HTTPFlow=object)
+        mitm.tls = types.SimpleNamespace(ClientHelloData=object)
         sys.modules["mitmproxy"] = mitm
     spec = importlib.util.spec_from_file_location("egress_audit_addon", ADDON)
     module = importlib.util.module_from_spec(spec)

@@ -1299,6 +1299,9 @@ services:
       - EGRESS_AUDIT_LOG_DIR=/var/log/retinue/egress
       - EGRESS_AUDIT_BODY_LIMIT=65536
       - EGRESS_CERT_DIR=/etc/egress-audit/certs
+      # Hosts whose TLS is forwarded unopened (certificate-pinning clients);
+      # comma-separated, `*.example.com` for a domain. Empty by default.
+      - EGRESS_AUDIT_TLS_PASSTHROUGH=${EGRESS_AUDIT_TLS_PASSTHROUGH:-}
     volumes:
       # CA is shared with retinue through this persistent volume. It is
       # generated automatically by the retinue entrypoint on first start.

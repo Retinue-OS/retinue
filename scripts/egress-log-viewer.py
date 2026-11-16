@@ -243,8 +243,10 @@ def _index(params: dict) -> str:
 def _flow_detail(params: dict) -> str:
     ts = params.get("ts", [None])[0]
     host = params.get("host", [None])[0]
-    path = params.get("path", [None])[0]
-    if not (ts and host and path):
+    # TLS-passthrough entries carry an empty path, so only ts and host are
+    # required; a missing path parameter means "".
+    path = params.get("path", [""])[0]
+    if not (ts and host):
         return _page("Flow not found", "<p>Missing parameters.</p>")
 
     flow: dict | None = None
