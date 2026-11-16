@@ -27,6 +27,15 @@ cut off mid-JSON:
 
 Redaction keeps the name and replaces only the value, so the log still shows
 *that* a credential travelled, and where.
+
+TLS passthrough: EGRESS_AUDIT_TLS_PASSTHROUGH lists hosts whose TLS
+connections are forwarded unopened (comma-separated; `example.com` matches
+that host only, `*.example.com` matches the domain and every subdomain). It
+is for clients that pin their provider's certificate and refuse the audit CA,
+such as end-to-end-encrypted storage tools. Empty by default. Each such
+connection is still logged, once when it opens, with `"tls_passthrough":
+true`, method `TUNNEL`, the client, host and port; path, headers and bodies
+are not visible to the proxy and stay empty.
 """
 import json
 import os
@@ -35,7 +44,7 @@ import time
 import urllib.parse
 from pathlib import Path
 
-from mitmproxy import http
+from mitmproxy import http, tls
 
 
 LOG_DIR = Path(os.environ.get("EGRESS_AUDIT_LOG_DIR", "/var/log/retinue/egress"))
@@ -164,7 +173,75 @@ def _headers(headers: http.Headers) -> dict:
     return {k: v[0] if len(v) == 1 else v for k, v in result.items()}
 
 
+def _parse_passthrough(spec: str) -> tuple[frozenset, tuple]:
+    """Split the passthrough list into exact hosts and wildcard domains."""
+    exact: set[str] = set()
+    domains: list[str] = []
+    for item in spec.split(","):
+        item = item.strip().lower().rstrip(".")
+        if not item:
+            continue
+        if item.startswith("*."):
+            domains.append(item[2:])
+        else:
+            exact.add(item)
+    return frozenset(exact), tuple(domains)
+
+
+PASSTHROUGH_EXACT, PASSTHROUGH_DOMAINS = _parse_passthrough(
+    os.environ.get("EGRESS_AUDIT_TLS_PASSTHROUGH", "")
+)
+
+
+def is_passthrough(host: str | None) -> bool:
+    """True when TLS to `host` is forwarded without interception."""
+    if not host:
+        return False
+    host = host.lower().rstrip(".")
+    if host in PASSTHROUGH_EXACT:
+        return True
+    return any(host == d or host.endswith("." + d) for d in PASSTHROUGH_DOMAINS)
+
+
+def _write(entry: dict) -> None:
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    log_file = LOG_DIR / f"{time.strftime('%Y-%m-%d')}.ndjson"
+    with open(log_file, "a", encoding="utf-8") as f:
+        f.write(json.dumps(entry, ensure_ascii=False, default=str) + "\n")
+
+
+def _empty_body() -> dict:
+    return {"present": False, "truncated": False, "size": 0, "text": ""}
+
+
 class EgressAuditAddon:
+    def tls_clienthello(self, data: tls.ClientHelloData) -> None:
+        """Forward a passthrough host's TLS stream unopened, and log that."""
+        server = data.context.server
+        host = data.client_hello.sni or (server.address[0] if server.address else None)
+        if not is_passthrough(host):
+            return
+        data.ignore_connection = True
+        client = data.context.client
+        _write({
+            "ts": _now(),
+            "client_ip": client.peername[0] if client.peername else None,
+            "method": "TUNNEL",
+            "scheme": "https",
+            "host": host,
+            "port": server.address[1] if server.address else None,
+            "path": "",
+            "query": None,
+            "tls_passthrough": True,
+            "request_headers": {},
+            "request_body": _empty_body(),
+            "response_status": 0,
+            "response_reason": "",
+            "response_headers": {},
+            "response_body": _empty_body(),
+            "duration_ms": None,
+        })
+
     def response(self, flow: http.HTTPFlow) -> None:
         req = flow.request
         resp = flow.response
@@ -195,10 +272,7 @@ class EgressAuditAddon:
             "duration_ms": duration_ms,
         }
 
-        LOG_DIR.mkdir(parents=True, exist_ok=True)
-        log_file = LOG_DIR / f"{time.strftime('%Y-%m-%d')}.ndjson"
-        with open(log_file, "a", encoding="utf-8") as f:
-            f.write(json.dumps(entry, ensure_ascii=False, default=str) + "\n")
+        _write(entry)
 
 
 addons = [EgressAuditAddon()]
