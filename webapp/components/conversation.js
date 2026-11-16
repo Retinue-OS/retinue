@@ -3969,8 +3969,13 @@ const CSS = `
              cursor: pointer; font-size: .95rem; display: inline-flex; align-items: center;
              justify-content: center; padding: 0; }
   .iconbtn:hover { border-color: var(--accent, #6ea8fe); color: var(--accent, #6ea8fe); }
-  .iconbtn.on { border-color: var(--accent, #6ea8fe); color: var(--accent, #6ea8fe); }
-  .iconbtn.star-btn.on { border-color: #e3b341; color: #e3b341; }
+  /* On is filled, not outlined: an outline in the accent is what hover
+     already shows, so a tap would change nothing until the pointer left. */
+  .iconbtn.on { background: var(--accent, #6ea8fe); border-color: var(--accent, #6ea8fe);
+                color: #0b0d12; }
+  .iconbtn.on:hover { filter: brightness(1.08); }
+  .iconbtn.star-btn.on { background: transparent; border-color: #e3b341; color: #e3b341; }
+  .iconbtn.star-btn.on:hover { filter: none; }
   .pill { background: transparent; border: 1px solid var(--line, rgba(231, 235, 242, .08));
           border-radius: 999px; color: var(--muted, #8b93a3); cursor: pointer;
           padding: 6px 12px; font-size: .78rem; white-space: nowrap; }
