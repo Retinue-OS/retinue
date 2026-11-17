@@ -122,7 +122,7 @@
 //   GET  /conversation-models           the offered models (once per page)
 
 import { esc, fmtAge, framesWholePdf, INLINE_SAFE_TYPES, softKeyboard, visibleHeight } from './base.js';
-import { renderMarkdown, MD_CSS, callOf, calledBefore } from './markdown.js';
+import { renderMarkdown, MD_CSS, callOf, calledBefore, copyableMarkdown } from './markdown.js';
 import { canRecord, micErrorText, recordingRowHtml, statusRowHtml, Waveform, VOICE_CSS } from './voice.js';
 import { pastedFiles, pastedText } from './clipboard.js';
 import { Reader, speechAvailable } from './speech.js';
@@ -1866,11 +1866,17 @@ class RetinueConversation extends HTMLElement {
       const who = (m.role !== 'user' && m.agent) ? m.agent : defaultWho;
       const speakBtn = (canSpeak && m.role !== 'user' && (m.text || '').trim())
         ? this._speakBtnHtml(t, m, idx) : '';
+      // Every answer carries a quiet "Copy" in its header: the whole reply as
+      // Markdown, to paste into a document or another chat.
+      const md = m.role !== 'user' ? copyableMarkdown(m.text) : '';
+      const copyBtn = md
+        ? `<button class="copy msg-copy" type="button" data-copy="${esc(md)}" ` +
+          `title="Copy the answer as Markdown">Copy</button>` : '';
       const mark = ` data-ts="${esc(m.ts || '')}"${m.role === 'user' ? '' : ' data-ara'}`;
       return `<div class="msg ${cls}${reading}"${mark}><div class="msg-head">` +
         `<small class="who">${esc(who)}</small>` +
         this._metaHtml(m) +
-        speakBtn + `</div>` +
+        speakBtn + copyBtn + `</div>` +
         `<div class="bubble">${this._renderBubble(m.text)}` +
         this._attachmentsHtml(t.id, m.attachments) +
         this._shellActionsHtml(m) +
@@ -4120,6 +4126,12 @@ const CSS = `
   .code-copy { position: absolute; top: 6px; right: 6px; padding: 2px 8px; font-size: .7rem;
                opacity: .85; }
   .code-wrap:hover .code-copy, .code-copy:focus { opacity: 1; }
+  /* The answer's own copy: a small link in the header, not a filled button. */
+  .msg-copy { align-self: center; margin-left: auto; background: none; padding: 0;
+              color: var(--accent, #6ea8fe); font-weight: 500; font-size: .72rem;
+              text-decoration: underline; text-underline-offset: 2px; opacity: .8; }
+  .msg-copy:hover, .msg-copy:focus { opacity: 1; }
+  .msg-copy.done { background: none; color: var(--ok, #57c785); text-decoration: none; }
   .bubble.pending { color: var(--muted, #8b93a3); font-style: italic; }
   .pending-help { display: block; margin-top: 4px; font-size: .72rem; line-height: 1.35; color: var(--muted, #8b93a3); }
   .msg-head { display: flex; align-items: center; gap: 6px; }

@@ -123,6 +123,25 @@ function anchor(url, label) {
   return `<a href="${url}" target="_blank" rel="noopener noreferrer">${label}</a>`;
 }
 
+// The Markdown of a whole message as a reader would paste it elsewhere: the
+// dashboard's own directives go — a [[chip: …]] is a button of this app, not
+// content — and a [[call: …]] becomes the name and number it dials. Code
+// spans keep any directive they quote, as the renderer does. Lines left empty
+// by a removed directive collapse, so a trailing row of chips leaves no gap.
+export function copyableMarkdown(text) {
+  const keep = (re) => new RegExp('(`[^`]+`)|' + re.source, 'gi');
+  let s = String(text == null ? '' : text);
+  s = s.replace(keep(/\[\[chip:[^\]]*\]\]/), (m, code) => code || '');
+  s = s.replace(keep(CALL_RE), (m, code, number, written) => {
+    if (code) return code;
+    // The flag in the name's place is no name (as in renderInline).
+    const name = /^no-voice-cancel$/i.test(written || '') ? '' : written;
+    return name ? `${name} (${number})` : number;
+  });
+  // Only blank runs collapse: trailing spaces elsewhere may be a hard break.
+  return s.replace(/\n[ \t]*\n(?:[ \t]*\n)+/g, '\n\n').trim();
+}
+
 // Render inline Markdown on one text segment. The text is escaped first, so
 // the result is safe. Bare domains without a scheme are deliberately NOT
 // auto-linked (too easily confused with filenames) — write them as explicit
