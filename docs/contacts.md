@@ -374,6 +374,13 @@ the chat's peer:
 - **VIP** is a switch on the card, and it is the person's. So is the
   **instruction**, a text field beside it, with *Copy from…* for an
   instruction another person already carries.
+- **A handle the book already gives to someone** needs no card at all: the
+  chat is linked to its owner by itself — on its next arrival or outbound
+  message, at startup, after any write to a person, and every
+  `CHAT_AUTOLINK_SECONDS` (300) for persons filed outside the gateway (the
+  CLI, a hand edit). Only an exact owner counts; the same number on another
+  channel stays a suggestion. A chat that already has a card is never
+  touched.
 - **Removing the card** unlinks the handle. The person stays: they are more
   than this chat. Erasing a chat does not erase the person either.
 

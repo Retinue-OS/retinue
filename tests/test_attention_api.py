@@ -737,6 +737,35 @@ def test_legacy_cards_are_filed(base, wg):
     print("ok test_legacy_cards_are_filed")
 
 
+def test_known_handle_links_itself(base, wg):
+    """A chat whose handle a person already owns is linked to them on arrival,
+    without the card; a card the user removed is not filled in again."""
+    real_commit = wg._contact_commit
+    wg._contact_commit = lambda record, verb: None
+    try:
+        num = "+41791000155"
+        wg._CONTACTS.create("private", "Ivo Brandt", [("signal", num)])
+        chat = "signal:" + num
+        _inbound(base, num, None, "Hi.", "2026-09-05T15:00:00Z",
+                 gate={"forward": True, "vip": False, "reason": "open"})
+        doc = wg._CHAT_STATE.get(chat)
+        assert doc["name"] == "Ivo Brandt" and doc["contact"]["person"], doc
+        # Removing the card takes the handle off the person: no relink.
+        status, out = _http(base, "POST", f"/chats/{urllib.parse.quote(chat, safe='')}/contact", {"name": ""})
+        assert status == 200, out
+        _inbound(base, num, None, "Again.", "2026-09-05T15:05:00Z",
+                 gate={"forward": True, "vip": False, "reason": "open"})
+        assert not wg._CHAT_STATE.get(chat)["contact"]
+        # A person filed later (the CLI) links the chat at the next sweep.
+        wg._CONTACTS.create("private", "Ivo B.", [("signal", num)])
+        assert wg._chats_autolink() == 1
+        assert wg._CHAT_STATE.get(chat)["name"] == "Ivo B."
+        _http(base, "POST", "/attention/items/done", {"id": "chat:" + chat})
+    finally:
+        wg._contact_commit = real_commit
+    print("ok test_known_handle_links_itself")
+
+
 def test_a_person_in_several_spheres(base, wg):
     """A customer who is also a friend: every sphere of theirs counts for a
     mode, until the triage judges a message to be about one of them."""
@@ -1658,6 +1687,7 @@ def main():
         test_a_person_carries_attention_and_vip(base, wg)
         test_review_fixes(base, wg)
         test_legacy_cards_are_filed(base, wg)
+        test_known_handle_links_itself(base, wg)
         test_a_message_judgement_is_its_own(base, wg)
         test_vip_always_rings(base, wg)
         test_spheres_are_a_word_away(base, wg)
