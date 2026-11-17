@@ -104,6 +104,12 @@ PAGE_POLICY = ("default-src 'none'; style-src 'unsafe-inline'; form-action 'self
                "base-uri 'none'; frame-ancestors 'none'")
 
 
+def _body_size(body) -> str:
+    # A streamed body without Content-Length is logged with size None.
+    size = (body or {}).get("size", 0)
+    return "?" if size is None else str(size)
+
+
 def _html_escape(value) -> str:
     # Quotes too: the same escape serves text and the double-quoted
     # attributes the filter form writes request parameters back into.
@@ -225,7 +231,7 @@ def _index(params: dict) -> str:
   <td>{host_link}:{_html_escape(flow.get("port", ""))}</td>
   <td class="mono small">{_html_escape(flow.get("path", "")[:120])}</td>
   <td>{_html_escape(status)}</td>
-  <td class="small">{_html_escape(flow.get("request_body", {}).get("size", 0))} / {_html_escape(flow.get("response_body", {}).get("size", 0))}</td>
+  <td class="small">{_html_escape(_body_size(flow.get("request_body")))} / {_html_escape(_body_size(flow.get("response_body")))}</td>
   <td>{detail_link}</td>
 </tr>
 """)
