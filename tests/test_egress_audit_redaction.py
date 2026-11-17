@@ -17,7 +17,8 @@ strings, URL paths and bodies before writing. What these pin down:
 - ordinary content is left alone, and the names of redacted fields stay
   visible, so the log still shows that a credential travelled;
 - a body the proxy streamed through is logged as streamed, with its declared
-  size and no text.
+  size and no text, and the anomaly scanner reads such a record — one with
+  no size included — without failing.
 
     python3 tests/test_egress_audit_redaction.py
 """
@@ -30,6 +31,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 ADDON = REPO_ROOT / "scripts" / "egress-audit-addon.py"
+SCANNER = REPO_ROOT / "scripts" / "egress-anomaly-agent.py"
 
 ACCESS = "sk-ant-oat01-" + "A" * 40
 REFRESH = "sk-ant-ort01-" + "B" * 40
@@ -188,6 +190,29 @@ def test_a_streamed_body_is_logged_by_size():
     assert "streamed" not in entry["request_body"] and entry["request_body"]["size"] == 3
 
 
+def test_the_scanner_reads_streamed_records():
+    spec = importlib.util.spec_from_file_location("egress_anomaly_agent", SCANNER)
+    scanner = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(scanner)
+    flow = _flow("/repo.git/git-upload-pack", [("Content-Length", "5000000")], b"",
+                 [("Transfer-Encoding", "chunked")], None)
+    flow.request.stream = True
+    flow.request.content = None
+    flow.response.stream = True
+    _, entry = _logged(flow)
+    with tempfile.TemporaryDirectory() as tmp:
+        state = scanner.State(Path(tmp) / "state.json")
+        details = {a["type"]: a["reason"] for a in scanner._scan(entry, state)}
+    assert details["large_request"] == "Request body 5000000 bytes", details
+    assert details["large_response"] == "Response body streamed, size undeclared", details
+    # A small buffered body raises nothing.
+    _, entry = _logged(_flow("/", [], b"abc", [], b"de"))
+    with tempfile.TemporaryDirectory() as tmp:
+        state = scanner.State(Path(tmp) / "state.json")
+        kinds = {a["type"] for a in scanner._scan(entry, state)}
+    assert not kinds & {"large_request", "large_response"}, kinds
+
+
 def main() -> int:
     test_the_oauth_refresh_keeps_no_token()
     test_a_truncated_body_is_still_redacted()
@@ -200,6 +225,7 @@ def main() -> int:
     test_percent_encoded_names_and_values()
     test_ordinary_content_is_untouched()
     test_a_streamed_body_is_logged_by_size()
+    test_the_scanner_reads_streamed_records()
     print("all egress-audit redaction tests passed")
     return 0
 
