@@ -56,6 +56,19 @@ ok('a directive quoted as code stays', () => {
     'Write `[[chip: Yes]]` to offer one.');
 });
 
+ok('a number the renderer would not dial stays as written', () => {
+  assert.equal(copyableMarkdown('[[call: 12 | Mara]]'), '[[call: 12 | Mara]]');
+});
+
+ok('backticks pairing only across lines guard nothing', () => {
+  assert.equal(copyableMarkdown('a `b\n[[chip: X]] c` d'), 'a `b\n c` d');
+});
+
+ok('a final hard break survives, blank edges go', () => {
+  assert.equal(copyableMarkdown('\n\nline  '), 'line  ');
+  assert.equal(copyableMarkdown('line  \n\n[[chip: X]]\n'), 'line  ');
+});
+
 ok('nothing gives an empty string', () => {
   assert.equal(copyableMarkdown(null), '');
   assert.equal(copyableMarkdown('[[chip: Only]]'), '');

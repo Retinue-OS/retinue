@@ -129,17 +129,21 @@ function anchor(url, label) {
 // spans keep any directive they quote, as the renderer does. Lines left empty
 // by a removed directive collapse, so a trailing row of chips leaves no gap.
 export function copyableMarkdown(text) {
-  const keep = (re) => new RegExp('(`[^`]+`)|' + re.source, 'gi');
+  // A code span never crosses a line: the renderer reads line by line.
+  const keep = (re) => new RegExp('(`[^`\\n]+`)|' + re.source, 'gi');
   let s = String(text == null ? '' : text);
   s = s.replace(keep(/\[\[chip:[^\]]*\]\]/), (m, code) => code || '');
   s = s.replace(keep(CALL_RE), (m, code, number, written) => {
     if (code) return code;
+    // A number the renderer would not dial stays as written in the bubble.
+    if (!callNumber(number)) return m;
     // The flag in the name's place is no name (as in renderInline).
     const name = /^no-voice-cancel$/i.test(written || '') ? '' : written;
     return name ? `${name} (${number})` : number;
   });
   // Only blank runs collapse: trailing spaces elsewhere may be a hard break.
-  return s.replace(/\n[ \t]*\n(?:[ \t]*\n)+/g, '\n\n').trim();
+  return s.replace(/\n[ \t]*\n(?:[ \t]*\n)+/g, '\n\n')
+    .replace(/^(?:[ \t]*\n)+/, '').replace(/(?:\n[ \t]*)+$/, '').replace(/^[ \t]+$/, '');
 }
 
 // Render inline Markdown on one text segment. The text is escaped first, so
