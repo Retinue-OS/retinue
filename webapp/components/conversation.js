@@ -122,7 +122,7 @@
 //   GET  /conversation-models           the offered models (once per page)
 
 import { esc, fmtAge, framesWholePdf, INLINE_SAFE_TYPES, softKeyboard, visibleHeight } from './base.js';
-import { renderMarkdown, MD_CSS, callOf, calledBefore } from './markdown.js';
+import { renderMarkdown, MD_CSS, callOf, calledBefore, copyableMarkdown } from './markdown.js';
 import { canRecord, micErrorText, recordingRowHtml, statusRowHtml, Waveform, VOICE_CSS } from './voice.js';
 import { pastedFiles, pastedText } from './clipboard.js';
 import { Reader, speechAvailable } from './speech.js';
@@ -798,8 +798,14 @@ function plainForSpeech(text) {
     .trim();
 }
 
-async function copyToClipboard(btn, root) {
-  const text = btn.getAttribute('data-copy') || '';
+// Whether an answer holds anything besides chips — a cheap test for showing
+// its Copy link; what the link copies is copyableMarkdown's, on the tap.
+function hasCopyableText(text) {
+  return String(text || '').replace(/\[\[chip:[^\]]*(?:\][^\]]+)*\]\]/gi, '').trim() !== '';
+}
+
+async function copyToClipboard(btn, root, given) {
+  const text = given != null ? given : (btn.getAttribute('data-copy') || '');
   let ok = true;
   try {
     await navigator.clipboard.writeText(text);
@@ -1866,11 +1872,18 @@ class RetinueConversation extends HTMLElement {
       const who = (m.role !== 'user' && m.agent) ? m.agent : defaultWho;
       const speakBtn = (canSpeak && m.role !== 'user' && (m.text || '').trim())
         ? this._speakBtnHtml(t, m, idx) : '';
+      // Every answer carries a quiet "Copy" in its header: the whole reply as
+      // Markdown, to paste into a document or another chat. The text is made
+      // on the tap (copyableMarkdown), not on every render; a reply that is
+      // nothing but chips has nothing to copy and no link.
+      const copyBtn = (m.role !== 'user' && hasCopyableText(m.text))
+        ? `<button class="copy msg-copy" type="button" data-copy-msg="${idx}" ` +
+          `title="Copy the answer as Markdown">Copy</button>` : '';
       const mark = ` data-ts="${esc(m.ts || '')}"${m.role === 'user' ? '' : ' data-ara'}`;
       return `<div class="msg ${cls}${reading}"${mark}><div class="msg-head">` +
         `<small class="who">${esc(who)}</small>` +
         this._metaHtml(m) +
-        speakBtn + `</div>` +
+        speakBtn + copyBtn + `</div>` +
         `<div class="bubble">${this._renderBubble(m.text)}` +
         this._attachmentsHtml(t.id, m.attachments) +
         this._shellActionsHtml(m) +
@@ -3591,6 +3604,11 @@ class RetinueConversation extends HTMLElement {
     if (threadEl) {
       threadEl.addEventListener('click', (e) => {
         const btn = e.target.closest('.copy');
+        if (btn && btn.hasAttribute('data-copy-msg')) {
+          const m = ((this._thread && this._thread.messages) || [])[Number(btn.getAttribute('data-copy-msg'))];
+          copyToClipboard(btn, root, copyableMarkdown(m ? m.text : ''));
+          return;
+        }
         if (btn) { copyToClipboard(btn, root); return; }
         const chip = e.target.closest('.md-chip');
         if (chip) { this._fillComposer(chip.getAttribute('data-fill') || ''); return; }
@@ -4120,6 +4138,12 @@ const CSS = `
   .code-copy { position: absolute; top: 6px; right: 6px; padding: 2px 8px; font-size: .7rem;
                opacity: .85; }
   .code-wrap:hover .code-copy, .code-copy:focus { opacity: 1; }
+  /* The answer's own copy: a small link in the header, not a filled button. */
+  .msg-copy { align-self: center; margin-left: auto; background: none; padding: 0;
+              color: var(--accent, #6ea8fe); font-weight: 500; font-size: .72rem;
+              text-decoration: underline; text-underline-offset: 2px; opacity: .8; }
+  .msg-copy:hover, .msg-copy:focus { opacity: 1; }
+  .msg-copy.done { background: none; color: var(--ok, #57c785); text-decoration: none; }
   .bubble.pending { color: var(--muted, #8b93a3); font-style: italic; }
   .pending-help { display: block; margin-top: 4px; font-size: .72rem; line-height: 1.35; color: var(--muted, #8b93a3); }
   .msg-head { display: flex; align-items: center; gap: 6px; }
