@@ -125,25 +125,100 @@ function anchor(url, label) {
 
 // The Markdown of a whole message as a reader would paste it elsewhere: the
 // dashboard's own directives go — a [[chip: …]] is a button of this app, not
-// content — and a [[call: …]] becomes the name and number it dials. Code
-// spans keep any directive they quote, as the renderer does. Lines left empty
-// by a removed directive collapse, so a trailing row of chips leaves no gap.
+// content — and a [[call: …]] becomes the name and number it dials. Which
+// spans are directives is the renderer's call, not a second parser's (see
+// callOf): every "[[" in the source is tagged with its index, the message is
+// rendered as the bubble renders it, and renderInline reports the tag of each
+// directive it turns into a chip or a call link. One quoted as code, inside a
+// fence, split across lines, or with a number it will not dial stays as
+// written, exactly as the bubble shows it. Everything else is the source as
+// written, fences included; only a line left empty by removed chips goes.
+let directiveSink = null;
+const TAG_OPEN = '';
+const TAG_CLOSE = '';
+const TAG_BEFORE = new RegExp(TAG_OPEN + '(\\d+)' + TAG_CLOSE + '$');
+const GONE = '';
+
+// Called by renderInline's directive passes with the escaped string and the
+// match's offset in it: the tag right before the match names the source span.
+function sinkDirective(str, offset, kind) {
+  if (!directiveSink) return;
+  const tag = TAG_BEFORE.exec(str.slice(Math.max(0, offset - 24), offset));
+  if (tag) directiveSink.set(Number(tag[1]), kind);
+}
+
+const SOURCE_RE = {
+  chip: /\[\[chip:\s*([^|\]]+?)\s*\|\s*(.+?)\s*\]\]/iy,
+  chipShort: /\[\[chip:\s*([^|\]]+?)\s*\]\]/iy,
+  call: new RegExp(CALL_RE.source, 'iy'),
+};
+
 export function copyableMarkdown(text) {
-  // A code span never crosses a line: the renderer reads line by line.
-  const keep = (re) => new RegExp('(`[^`\\n]+`)|' + re.source, 'gi');
-  let s = String(text == null ? '' : text);
-  s = s.replace(keep(/\[\[chip:[^\]]*\]\]/), (m, code) => code || '');
-  s = s.replace(keep(CALL_RE), (m, code, number, written) => {
-    if (code) return code;
-    // A number the renderer would not dial stays as written in the bubble.
-    if (!callNumber(number)) return m;
-    // The flag in the name's place is no name (as in renderInline).
-    const name = /^no-voice-cancel$/i.test(written || '') ? '' : written;
-    return name ? `${name} (${number})` : number;
-  });
-  // Only blank runs collapse: trailing spaces elsewhere may be a hard break.
-  return s.replace(/\n[ \t]*\n(?:[ \t]*\n)+/g, '\n\n')
-    .replace(/^(?:[ \t]*\n)+/, '').replace(/(?:\n[ \t]*)+$/, '').replace(/^[ \t]+$/, '');
+  const src = String(text == null ? '' : text);
+  // A source holding the tag characters themselves cannot be tagged safely.
+  if (/[-]/.test(src) || !src.includes('[[')) return trimBlankEdges(src);
+  const starts = [];
+  const tagged = src.replace(/\[\[/g, (_m, at) =>
+    `${TAG_OPEN}${starts.push(at) - 1}${TAG_CLOSE}[[`);
+  const found = new Map();
+  directiveSink = found;
+  try {
+    renderMarkdown(tagged);
+  } finally {
+    directiveSink = null;
+  }
+  const edits = [];
+  for (const [n, kind] of [...found].sort((x, y) => x[0] - y[0])) {
+    const re = SOURCE_RE[kind];
+    re.lastIndex = starts[n];
+    const m = re.exec(src);
+    if (!m) continue;
+    let start = m.index;
+    let end = start + m[0].length;
+    if (edits.length && start < edits[edits.length - 1].end) continue;
+    let repl;
+    if (kind === 'call') {
+      const written = m[2];
+      const name = !m[3] && /^no-voice-cancel$/i.test(written || '') ? '' : written;
+      repl = name ? `${name} (${m[1]})` : m[1];
+    } else {
+      // A chip takes the spaces before it along, or a line ending in chips
+      // would end in spaces — a hard break nobody wrote; at a line's start
+      // it takes the spaces after it instead.
+      while (start > 0 && /[ \t]/.test(src[start - 1])) start -= 1;
+      if (start === 0 || src[start - 1] === '\n') {
+        while (end < src.length && /[ \t]/.test(src[end])) end += 1;
+      }
+      repl = GONE;
+    }
+    edits.push({ start, end, repl });
+  }
+  let out = '';
+  let at = 0;
+  for (const e of edits) {
+    out += src.slice(at, Math.max(at, e.start)) + e.repl;
+    at = Math.max(at, e.end);
+  }
+  out += src.slice(at);
+  // A line that held nothing but chips goes, and with it one of the two blank
+  // lines that would otherwise meet around it.
+  const lines = out.split('\n');
+  const kept = [];
+  for (let i = 0; i < lines.length; i += 1) {
+    const line = lines[i];
+    if (!line.includes(GONE)) { kept.push(line); continue; }
+    const rest = line.replaceAll(GONE, '');
+    if (rest.trim() !== '') { kept.push(rest); continue; }
+    const prevBlank = !kept.length || kept[kept.length - 1].trim() === '';
+    if (prevBlank && i + 1 < lines.length && lines[i + 1].trim() === '') i += 1;
+  }
+  return trimBlankEdges(kept.join('\n'));
+}
+
+// Blank lines at either end go; spaces on the first and last content lines
+// (an indent, a final hard break) stay.
+function trimBlankEdges(s) {
+  return s.replace(/^(?:[ \t]*\n)+/, '').replace(/(?:\n[ \t]*)+$/, '').replace(/^[ \t]+$/, '');
 }
 
 // Render inline Markdown on one text segment. The text is escaped first, so
@@ -171,23 +246,24 @@ export function renderInline(text) {
   // chip's own label and prefill may still hold backticks.
   const chip = (re) => new RegExp('(`[^`]+`)|' + re.source, 'gi');
   s = s.replace(chip(/\[\[chip:\s*([^|\]]+?)\s*\|\s*(.+?)\s*\]\]/),
-    (m, code, label, fill) => (code ? m : stash(
-      `<button type="button" class="md-chip" data-fill="${fill}">${label}</button>`)));
+    (m, code, label, fill, at, str) => (code ? m : (sinkDirective(str, at, 'chip'), stash(
+      `<button type="button" class="md-chip" data-fill="${fill}">${label}</button>`))));
   // Shorthand: [[chip: Text]] with no "|" — the text is used as BOTH the label
   // and the prefill. Runs after the two-part form above, so any [[chip: …]] left
   // here has no separator. This avoids the silent failure where a missing "|"
   // left the whole marker as raw literal text in the bubble.
   s = s.replace(chip(/\[\[chip:\s*([^|\]]+?)\s*\]\]/),
-    (m, code, text) => (code ? m : stash(
-      `<button type="button" class="md-chip" data-fill="${text}">${text}</button>`)));
+    (m, code, text, at, str) => (code ? m : (sinkDirective(str, at, 'chipShort'), stash(
+      `<button type="button" class="md-chip" data-fill="${text}">${text}</button>`))));
   // [[call: +41 79 123 45 67 | Name]] — in a bubble a tap-to-dial link; in the
   // phone shell's voice conversation the thread places the call itself. The
   // label is the name (the number when there is none) behind a phone glyph,
   // no words, so it reads the same in whatever language the message is in.
-  s = s.replace(chip(CALL_RE), (m, code, raw, written, third) => {
+  s = s.replace(chip(CALL_RE), (m, code, raw, written, third, at, str) => {
     if (code) return m;
     const num = callNumber(raw);
     if (!num) return m;
+    sinkDirective(str, at, 'call');
     // The flag written where the name goes, with no name before it, is the
     // flag all the same: no contact is called "no-voice-cancel", and read as
     // a name it would be shown and spoken as one while the flag went unheard.

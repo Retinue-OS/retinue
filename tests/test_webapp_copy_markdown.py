@@ -61,12 +61,33 @@ ok('a number the renderer would not dial stays as written', () => {
 });
 
 ok('backticks pairing only across lines guard nothing', () => {
-  assert.equal(copyableMarkdown('a `b\n[[chip: X]] c` d'), 'a `b\n c` d');
+  assert.equal(copyableMarkdown('a `b\n[[chip: X]] c` d'), 'a `b\nc` d');
 });
 
 ok('a final hard break survives, blank edges go', () => {
   assert.equal(copyableMarkdown('\n\nline  '), 'line  ');
   assert.equal(copyableMarkdown('line  \n\n[[chip: X]]\n'), 'line  ');
+});
+
+ok('a chip whose prefill holds a link is removed like the bubble shows it', () => {
+  assert.equal(copyableMarkdown('[[chip: Reply | see [the doc](/x) ]] tail'), 'tail');
+});
+
+ok('inline chips at a line end leave no hard break', () => {
+  assert.equal(copyableMarkdown('Pick one: [[chip: A]] [[chip: B]]\nNext line'), 'Pick one:\nNext line');
+  assert.equal(copyableMarkdown('Say [[chip: Yes]] now'), 'Say now');
+});
+
+ok('directives inside a fence stay, and so do its blank lines', () => {
+  const fenced = 'Example:\n\n```\n[[chip: Yes]]\n[[call: +41 79 123 45 67 | Mara]]\n```';
+  assert.equal(copyableMarkdown(fenced), fenced);
+  const code = '```py\na = 1\n\n\n\nb = 2\n```';
+  assert.equal(copyableMarkdown(code), code);
+  assert.equal(copyableMarkdown(code + '\n\n[[chip: Run]]'), code);
+});
+
+ok('directive case follows the renderer', () => {
+  assert.equal(copyableMarkdown('Go [[CHIP: Yes]]'), 'Go');
 });
 
 ok('nothing gives an empty string', () => {

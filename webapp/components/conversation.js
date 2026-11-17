@@ -798,8 +798,14 @@ function plainForSpeech(text) {
     .trim();
 }
 
-async function copyToClipboard(btn, root) {
-  const text = btn.getAttribute('data-copy') || '';
+// Whether an answer holds anything besides chips — a cheap test for showing
+// its Copy link; what the link copies is copyableMarkdown's, on the tap.
+function hasCopyableText(text) {
+  return String(text || '').replace(/\[\[chip:[^\]]*(?:\][^\]]+)*\]\]/gi, '').trim() !== '';
+}
+
+async function copyToClipboard(btn, root, given) {
+  const text = given != null ? given : (btn.getAttribute('data-copy') || '');
   let ok = true;
   try {
     await navigator.clipboard.writeText(text);
@@ -1867,10 +1873,11 @@ class RetinueConversation extends HTMLElement {
       const speakBtn = (canSpeak && m.role !== 'user' && (m.text || '').trim())
         ? this._speakBtnHtml(t, m, idx) : '';
       // Every answer carries a quiet "Copy" in its header: the whole reply as
-      // Markdown, to paste into a document or another chat.
-      const md = m.role !== 'user' ? copyableMarkdown(m.text) : '';
-      const copyBtn = md
-        ? `<button class="copy msg-copy" type="button" data-copy="${esc(md)}" ` +
+      // Markdown, to paste into a document or another chat. The text is made
+      // on the tap (copyableMarkdown), not on every render; a reply that is
+      // nothing but chips has nothing to copy and no link.
+      const copyBtn = (m.role !== 'user' && hasCopyableText(m.text))
+        ? `<button class="copy msg-copy" type="button" data-copy-msg="${idx}" ` +
           `title="Copy the answer as Markdown">Copy</button>` : '';
       const mark = ` data-ts="${esc(m.ts || '')}"${m.role === 'user' ? '' : ' data-ara'}`;
       return `<div class="msg ${cls}${reading}"${mark}><div class="msg-head">` +
@@ -3597,6 +3604,11 @@ class RetinueConversation extends HTMLElement {
     if (threadEl) {
       threadEl.addEventListener('click', (e) => {
         const btn = e.target.closest('.copy');
+        if (btn && btn.hasAttribute('data-copy-msg')) {
+          const m = ((this._thread && this._thread.messages) || [])[Number(btn.getAttribute('data-copy-msg'))];
+          copyToClipboard(btn, root, copyableMarkdown(m ? m.text : ''));
+          return;
+        }
         if (btn) { copyToClipboard(btn, root); return; }
         const chip = e.target.closest('.md-chip');
         if (chip) { this._fillComposer(chip.getAttribute('data-fill') || ''); return; }
