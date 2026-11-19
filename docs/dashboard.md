@@ -1243,12 +1243,15 @@ while (loudest frame under twice the quietest), is taken for a louder room (a
 fan, an engine), not a voice — a gain control can squeeze speech above the
 threshold with no dip, but a voice still swings: the floor jumps to it, and
 if it was all the take had heard, the take goes back to waiting. Only a take
-that ends on a pause after speech is transcribed and sent, on the same path
+that ends on a pause after speech (or reaches the cap still voiced, below) is transcribed and sent, on the same path
 as ➤; the loop waits for the answer, and repeats. Every other end goes to the
 draft for review, never out — and the two are told apart by ear: a soft
 low gong for a take on its way, a short rising whistle for one kept for
-review without a tap (`takeCue`; a dropped take and ✓ stay silent): a take that runs to the 120 s cap without
-falling silent, and one whose no-speech window closes after a run was taken
+review without a tap (`takeCue`; a dropped take and ✓ stay silent): a take that runs to the length
+cap (default 10 min, 1–30 min per device under Settings → Voice, kept in the
+page's own storage) with no dip below the threshold since speech began — a
+voice dips between words, a room does not — so it may not have been a voice
+(one that did dip is sent as if it had ended on a pause), and one whose no-speech window closes after a run was taken
 back as the room (it may have been a voice). No speech within the no-speech timeout (default 8 s)
 closes the mic with the mode kept on (the mic button resumes); leaving the
 thread or hiding the page ends listening. Where the page cannot hear the
@@ -1263,7 +1266,7 @@ while the loop reads its answer ends the loop (the mode stays on), as the
 bar's ✕ does. An engaged loop that has nothing going on for 90 s — no mic,
 no take on its way, no answer awaited or playing — lets go, and so does one
 whose thread turns out deleted (which also drops it from the wake's
-choice). Both timeouts are
+choice). The timeouts are
 per device (Settings → Voice). Only an answer to the element's own turn
 carries the loop on: another message pushed into a thread in the mode may be
 read aloud, but never opens the mic. A mic the loop wants while the page is

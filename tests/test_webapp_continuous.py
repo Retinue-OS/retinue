@@ -28,7 +28,7 @@ import assert from 'node:assert/strict';
 import {
   Vad, VAD_DEFAULTS, rms, pickWakeThread, WAKE_WINDOW_MS,
   modeEntries, isContinuous, setContinuous, touchContinuous, forgetContinuous, MODE_KEY,
-  voiceTimeouts, setVoiceTimeouts, DEFAULT_SILENCE_MS, DEFAULT_NO_SPEECH_MS,
+  voiceTimeouts, setVoiceTimeouts, DEFAULT_SILENCE_MS, DEFAULT_NO_SPEECH_MS, DEFAULT_MAX_TAKE_MS,
   endedByAra, noteAraOff, ARA_OFF_SKEW_MS,
   takeCue, TAKE_CUES,
 } from './continuous.mjs';
@@ -162,6 +162,24 @@ ok('a take that never falls silent ends at the length cap', () => {
   const evs = run(vad, 500, 20000, (t) => ((t % 350) < 250 ? SPEECH : QUIET));
   assert.deepEqual(evs.map((e) => [e.type, e.reason || '']), [['speech', ''], ['end', 'max']]);
   assert.equal(evs[1].t, 10000);
+  // Its level kept dipping between words: a voice that went on, sent as is.
+  assert.equal(evs[1].voiced, true);
+});
+
+ok('a take that reaches the cap without a dip since speech began is not voiced', () => {
+  // Speech, then a level that swings (so it is never taken for the room)
+  // but never once falls under the threshold: nothing tells it from a room.
+  const vad = new Vad({ silenceMs: 1500, noSpeechMs: 8000, maxMs: 10000 });
+  run(vad, 0, 500, QUIET);
+  const evs = run(vad, 500, 20000, (t) => ((t % 700) < 350 ? SPEECH : SPEECH * 3));
+  const end = evs.find((e) => e.type === 'end');
+  assert.equal(end.reason, 'max');
+  assert.ok(!end.voiced);
+});
+
+ok('the default length cap is ten minutes', () => {
+  assert.equal(DEFAULT_MAX_TAKE_MS, 600000);
+  assert.equal(VAD_DEFAULTS.maxMs, DEFAULT_MAX_TAKE_MS);
 });
 
 ok('a room that gets louder for good is not speech, and no take ends in it', () => {
@@ -356,15 +374,21 @@ ok('a corrupt stored map reads as empty', () => {
 // ── Voice settings ───────────────────────────────────────────────────────────
 ok('voice timeouts default, store, and clamp', () => {
   store.clear();
-  assert.deepEqual(voiceTimeouts(), { silenceMs: DEFAULT_SILENCE_MS, noSpeechMs: DEFAULT_NO_SPEECH_MS });
+  assert.deepEqual(voiceTimeouts(), { silenceMs: DEFAULT_SILENCE_MS, noSpeechMs: DEFAULT_NO_SPEECH_MS, maxMs: DEFAULT_MAX_TAKE_MS });
   assert.equal(DEFAULT_SILENCE_MS, 1500);
   assert.equal(DEFAULT_NO_SPEECH_MS, 8000);
-  assert.deepEqual(setVoiceTimeouts({ silenceMs: 2000 }), { silenceMs: 2000, noSpeechMs: 8000 });
-  assert.deepEqual(setVoiceTimeouts({ noSpeechMs: 12000 }), { silenceMs: 2000, noSpeechMs: 12000 });
-  assert.deepEqual(setVoiceTimeouts({ silenceMs: 10, noSpeechMs: 999999 }), { silenceMs: 500, noSpeechMs: 30000 });
+  const M = DEFAULT_MAX_TAKE_MS;
+  assert.deepEqual(setVoiceTimeouts({ silenceMs: 2000 }), { silenceMs: 2000, noSpeechMs: 8000, maxMs: M });
+  assert.deepEqual(setVoiceTimeouts({ noSpeechMs: 12000 }), { silenceMs: 2000, noSpeechMs: 12000, maxMs: M });
+  assert.deepEqual(setVoiceTimeouts({ silenceMs: 10, noSpeechMs: 999999 }), { silenceMs: 500, noSpeechMs: 30000, maxMs: M });
+  // The length cap: minutes, from one to thirty.
+  assert.equal(setVoiceTimeouts({ maxMs: 300000 }).maxMs, 300000);
+  assert.equal(setVoiceTimeouts({ maxMs: 5000 }).maxMs, 60000);
+  assert.equal(setVoiceTimeouts({ maxMs: 99 * 60000 }).maxMs, 30 * 60000);
+  assert.equal(setVoiceTimeouts({ maxMs: NaN }).maxMs, M);
   // Nonsense falls back to the defaults rather than to zero.
   assert.deepEqual(setVoiceTimeouts({ silenceMs: NaN, noSpeechMs: -3 }),
-    { silenceMs: DEFAULT_SILENCE_MS, noSpeechMs: DEFAULT_NO_SPEECH_MS });
+    { silenceMs: DEFAULT_SILENCE_MS, noSpeechMs: DEFAULT_NO_SPEECH_MS, maxMs: DEFAULT_MAX_TAKE_MS });
   store.set('retinue-voice-silence-ms', 'abc');
   assert.equal(voiceTimeouts().silenceMs, DEFAULT_SILENCE_MS);
 });
@@ -376,7 +400,7 @@ ok('a blocked storage gives the defaults and never throws', () => {
     setItem() { throw new Error('blocked'); },
   };
   try {
-    assert.deepEqual(voiceTimeouts(), { silenceMs: DEFAULT_SILENCE_MS, noSpeechMs: DEFAULT_NO_SPEECH_MS });
+    assert.deepEqual(voiceTimeouts(), { silenceMs: DEFAULT_SILENCE_MS, noSpeechMs: DEFAULT_NO_SPEECH_MS, maxMs: DEFAULT_MAX_TAKE_MS });
     assert.deepEqual(modeEntries(), {});
     setContinuous('x', true);
     assert.equal(isContinuous('x'), false);

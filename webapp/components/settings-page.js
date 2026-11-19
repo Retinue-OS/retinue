@@ -39,14 +39,19 @@ show();
 // seconds, kept in milliseconds, clamped to what the loop accepts.
 const silence = document.querySelector('[data-voice-silence]');
 const noSpeech = document.querySelector('[data-voice-nospeech]');
+// The length cap is shown in minutes.
+const maxTake = document.querySelector('[data-voice-max]');
 const showVoice = (t) => {
   silence.value = String(t.silenceMs / 1000);
   noSpeech.value = String(t.noSpeechMs / 1000);
+  if (maxTake) maxTake.value = String(t.maxMs / 60000);
 };
 silence.addEventListener('change', () =>
   showVoice(setVoiceTimeouts({ silenceMs: Number(silence.value) * 1000 })));
 noSpeech.addEventListener('change', () =>
   showVoice(setVoiceTimeouts({ noSpeechMs: Number(noSpeech.value) * 1000 })));
+if (maxTake) maxTake.addEventListener('change', () =>
+  showVoice(setVoiceTimeouts({ maxMs: Number(maxTake.value) * 60000 })));
 showVoice(voiceTimeouts());
 
 // An app without a page of its own (RetinueShell/3 and older): the Phone

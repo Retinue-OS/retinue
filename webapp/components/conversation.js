@@ -3321,7 +3321,7 @@ class RetinueConversation extends HTMLElement {
     }, noSpeechMs));
     this._contTimers.push(setTimeout(() => {
       if (this._mediaRecorder === mr) this._finishRecording('review');
-    }, VAD_DEFAULTS.maxMs));
+    }, voiceTimeouts().maxMs));
   }
 
   // Text or files waiting in this conversation's box.
@@ -3356,10 +3356,11 @@ class RetinueConversation extends HTMLElement {
     }
     // What began as speech was the room getting louder (continuous.js).
     else if (ev.type === 'noise') this._vadHeard = false;
-    // A pause after speech ends the take and sends it. Any other end goes
-    // to the draft for the user to read first — one that ran to the length
-    // cap never fell silent (a voice that did not stop, or a room the
-    // detector could not tell from one), and one that ended 'unsure' had
+    // A pause after speech ends the take and sends it, and so does the
+    // length cap reached while it was plainly still a voice (`voiced`: the
+    // level kept dipping between words). Any other end goes to the draft
+    // for the user to read first — one that ran to the cap with no such
+    // dips (a room the detector could not tell from a voice), and one that ended 'unsure' had
     // its speech taken back as the room, perhaps wrongly: nothing unheard
     // is sent on a guess, and nothing said is thrown away on one.
     // So does a take that would carry text or files the user put in the box
@@ -3370,7 +3371,8 @@ class RetinueConversation extends HTMLElement {
     // with text or files in the box, which go to review as above.
     else if (ev.type === 'end') {
       const cancelled = CANCELLED_CALLS.has(this._key());
-      this._finishRecording((cancelled || ev.reason === 'silence') && !this._draftHasInput() ? 'send' : 'review');
+      const spoken = ev.reason === 'silence' || (ev.reason === 'max' && ev.voiced);
+      this._finishRecording((cancelled || spoken) && !this._draftHasInput() ? 'send' : 'review');
     }
     // Nobody spoke: the mic closes, the mode stays on, and nothing is sent
     // (no "no speech detected" note either — silence was the answer).

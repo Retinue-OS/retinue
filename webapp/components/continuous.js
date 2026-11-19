@@ -27,10 +27,18 @@ export const SILENCE_KEY = 'retinue-voice-silence-ms';
 export const NO_SPEECH_KEY = 'retinue-voice-nospeech-ms';
 export const DEFAULT_SILENCE_MS = 1500;
 export const DEFAULT_NO_SPEECH_MS = 8000;
+// How long one take may run at most (the detector's length cap). Long enough
+// for a thought spoken out in one go; a take that reaches it while it was
+// still plainly a voice is sent all the same (Vad, reason 'max' with
+// `voiced`). Kept in this page's own storage, not in the app's device
+// store: an app that does not list the key would refuse it there.
+export const MAX_TAKE_KEY = 'retinue-voice-max-ms';
+export const DEFAULT_MAX_TAKE_MS = 10 * 60 * 1000;
 // Bounds, so a typo cannot cut every sentence in half or leave the mic open
 // for minutes.
 const SILENCE_RANGE = [500, 5000];
 const NO_SPEECH_RANGE = [2000, 30000];
+const MAX_TAKE_RANGE = [60 * 1000, 30 * 60 * 1000];
 
 function storage() {
   try { return typeof localStorage !== 'undefined' ? localStorage : null; } catch (_e) { return null; }
@@ -45,19 +53,25 @@ function clampMs(value, [lo, hi], fallback) {
 export function voiceTimeouts() {
   let silence = null;
   let noSpeech = null;
+  let maxTake = null;
   try {
     silence = deviceGet(SILENCE_KEY);
     noSpeech = deviceGet(NO_SPEECH_KEY);
   } catch (_e) { /* blocked storage: defaults */ }
+  try {
+    const ls = storage();
+    maxTake = ls ? ls.getItem(MAX_TAKE_KEY) : null;
+  } catch (_e) { /* blocked storage: default */ }
   return {
     silenceMs: clampMs(silence, SILENCE_RANGE, DEFAULT_SILENCE_MS),
     noSpeechMs: clampMs(noSpeech, NO_SPEECH_RANGE, DEFAULT_NO_SPEECH_MS),
+    maxMs: clampMs(maxTake, MAX_TAKE_RANGE, DEFAULT_MAX_TAKE_MS),
   };
 }
 
 // Store either timeout (milliseconds); returns what is in force afterwards,
 // clamped, so the settings field can show the value actually used.
-export function setVoiceTimeouts({ silenceMs, noSpeechMs } = {}) {
+export function setVoiceTimeouts({ silenceMs, noSpeechMs, maxMs } = {}) {
   try {
     if (silenceMs !== undefined) {
       deviceSet(SILENCE_KEY, String(clampMs(silenceMs, SILENCE_RANGE, DEFAULT_SILENCE_MS)));
@@ -66,6 +80,10 @@ export function setVoiceTimeouts({ silenceMs, noSpeechMs } = {}) {
       deviceSet(NO_SPEECH_KEY, String(clampMs(noSpeechMs, NO_SPEECH_RANGE, DEFAULT_NO_SPEECH_MS)));
     }
   } catch (_e) { /* not kept: the defaults go on applying */ }
+  try {
+    const ls = storage();
+    if (ls && maxMs !== undefined) ls.setItem(MAX_TAKE_KEY, String(clampMs(maxMs, MAX_TAKE_RANGE, DEFAULT_MAX_TAKE_MS)));
+  } catch (_e) { /* not kept: the default goes on applying */ }
   return voiceTimeouts();
 }
 
@@ -208,11 +226,15 @@ export function pickWakeThread(entries, now, windowMs = WAKE_WINDOW_MS) {
 //   {type: 'noise'}             what began as speech was the room getting
 //                               louder: back to waiting, nothing was heard
 //   {type: 'end', reason}       the take is over: 'silence' after speech;
-//                               'max' when it ran to the length cap; or
+//                               'max' when it ran to the length cap (with
+//                               `voiced: true` when it was still speech
+//                               that swings, as a voice does — sent like
+//                               'silence'; without it, for review); or
 //                               'unsure' when the no-speech window closed
 //                               after a run was taken back as the room. Only
-//                               'silence' is a take to send unseen: the
-//                               others go to the user to read first
+//                               'silence' and a voiced 'max' are takes to
+//                               send unseen: the others go to the user to
+//                               read first
 //   {type: 'timeout'}           no speech within noSpeechMs, and nothing
 //                               taken back: close the mic
 export const VAD_DEFAULTS = {
@@ -229,7 +251,7 @@ export const VAD_DEFAULTS = {
   // phone's own speaker, a tap on the case is shorter.
   minSpeechMs: 120,
   // One take is at most this long, whatever the room does.
-  maxMs: 120000,
+  maxMs: DEFAULT_MAX_TAKE_MS,
   // Floor adaptation per frame: towards a quieter level quickly, towards a
   // louder (non-speech) level slowly.
   floorDown: 0.3,
@@ -335,7 +357,13 @@ export class Vad {
       this._learn(lv);
       if (now - this._lastVoice >= o.silenceMs) return this._done({ type: 'end', reason: 'silence' });
     }
-    if (elapsed >= o.maxMs) return this._done({ type: 'end', reason: 'max' });
+    // At the cap: still speaking, and the level has dipped since speech
+    // began — the gaps between words a voice has and a fan has not — is a
+    // voice that just went on; anything else may be the room.
+    if (elapsed >= o.maxMs) {
+      const voiced = this.state === 'speaking' && this.heard && this._dipped;
+      return this._done(voiced ? { type: 'end', reason: 'max', voiced: true } : { type: 'end', reason: 'max' });
+    }
     return null;
   }
 
