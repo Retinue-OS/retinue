@@ -285,6 +285,23 @@ batch). Per-channel push defaults stay: a messenger message pushes, a mail does
 not, unless the person's card says otherwise. Group flags unchanged. Open
 question 3 asks when.
 
+### Relation to #382 (declarative per-contact rules)
+
+Issue #382 proposes rules on the contact — match, extract, show a card with a
+copy box, ring, expire — for senders whose handling is fixed and must be
+instant, the bank's 3-D Secure SMS above all. It fits this design unchanged
+and is not blocked by it: the rules live on the contact, and the contact *is*
+the relationship dossier; they run in the gateway's inbound path, which this
+design keeps. What the issue calls the *attention item* is here the
+relationship's pending state and its row: a rule's `card` is the row's
+subtitle, `importance`/`due` its pending fields, and `expire` clears the
+pending state and redacts the copy value in the stream — in the store, as the
+issue already proposes, since the stream is the store's view. A `ruled` gate
+class sits beside `vip` and `instructed` on the single sender axis. The copy
+box is a message decoration like the backlink chip. #382 can be built before
+any phase here; it is the part of "I sent you a code" that needs more than a
+mirror.
+
 ## What this replaces, what it keeps
 
 **Replaced:** the Chats page (by Contacts); dashboard threads as a separate
