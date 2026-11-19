@@ -162,19 +162,8 @@ ok('a take that never falls silent ends at the length cap', () => {
   const evs = run(vad, 500, 20000, (t) => ((t % 350) < 250 ? SPEECH : QUIET));
   assert.deepEqual(evs.map((e) => [e.type, e.reason || '']), [['speech', ''], ['end', 'max']]);
   assert.equal(evs[1].t, 10000);
-  // Its level kept dipping between words: a voice that went on, sent as is.
-  assert.equal(evs[1].voiced, true);
-});
-
-ok('a take that reaches the cap without a dip since speech began is not voiced', () => {
-  // Speech, then a level that swings (so it is never taken for the room)
-  // but never once falls under the threshold: nothing tells it from a room.
-  const vad = new Vad({ silenceMs: 1500, noSpeechMs: 8000, maxMs: 10000 });
-  run(vad, 0, 500, QUIET);
-  const evs = run(vad, 500, 20000, (t) => ((t % 700) < 350 ? SPEECH : SPEECH * 3));
-  const end = evs.find((e) => e.type === 'end');
-  assert.equal(end.reason, 'max');
-  assert.ok(!end.voiced);
+  // A hard limit: plainly a voice or not, the cap is never a take to send.
+  assert.equal(evs[1].voiced, undefined);
 });
 
 ok('the default length cap is ten minutes', () => {

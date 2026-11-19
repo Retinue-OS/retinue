@@ -1243,15 +1243,15 @@ while (loudest frame under twice the quietest), is taken for a louder room (a
 fan, an engine), not a voice — a gain control can squeeze speech above the
 threshold with no dip, but a voice still swings: the floor jumps to it, and
 if it was all the take had heard, the take goes back to waiting. Only a take
-that ends on a pause after speech (or reaches the cap still voiced, below) is transcribed and sent, on the same path
+that ends on a pause after speech is transcribed and sent, on the same path
 as ➤; the loop waits for the answer, and repeats. Every other end goes to the
 draft for review, never out — and the two are told apart by ear: a soft
 low gong for a take on its way, a short rising whistle for one kept for
 review without a tap (`takeCue`; a dropped take and ✓ stay silent): a take that runs to the length
 cap (default 10 min, 1–30 min per device under Settings → Voice, kept in the
-page's own storage) with no dip below the threshold since speech began — a
-voice dips between words, a room does not — so it may not have been a voice
-(one that did dip is sent as if it had ended on a pause), and one whose no-speech window closes after a run was taken
+page's own storage) without falling silent — a hard limit, voice or not, so an
+open mic that catches a phone call or a talk in the room never becomes a long
+turn for Ara to act on (a take that cancelled a call included), and one whose no-speech window closes after a run was taken
 back as the room (it may have been a voice). No speech within the no-speech timeout (default 8 s)
 closes the mic with the mode kept on (the mic button resumes); leaving the
 thread or hiding the page ends listening. Where the page cannot hear the
@@ -1282,7 +1282,7 @@ call's wait (a mic that fails to open leaves the call to go ahead). Where the
 mic would not open because the user is writing, no call is placed either: the
 loop stops as it does there, and the directive stays a link. Speech (the
 detector's `speech`, so in any language) cancels the call, and the take goes
-on to Ara as the next turn, whatever ends it, carrying `cancelled_call: {number, name}`, from which the gateway writes a
+on to Ara as the next turn, whatever ends it short of the length cap (that one goes to review, the call staying cancelled), carrying `cancelled_call: {number, name}`, from which the gateway writes a
 fixed agent-only note (`_cancelled_call_context`): the call was not made;
 unless the words mean to stop it, place it again as a second attempt with
 `no-voice-cancel`. A cancelling take whose transcript is empty is no turn:

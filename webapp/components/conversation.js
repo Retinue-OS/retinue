@@ -3356,23 +3356,24 @@ class RetinueConversation extends HTMLElement {
     }
     // What began as speech was the room getting louder (continuous.js).
     else if (ev.type === 'noise') this._vadHeard = false;
-    // A pause after speech ends the take and sends it, and so does the
-    // length cap reached while it was plainly still a voice (`voiced`: the
-    // level kept dipping between words). Any other end goes to the draft
-    // for the user to read first — one that ran to the cap with no such
-    // dips (a room the detector could not tell from a voice), and one that ended 'unsure' had
+    // A pause after speech ends the take and sends it. Any other end goes
+    // to the draft for the user to read first — one that ran to the length
+    // cap (Settings → Voice) is never sent unseen, voice or not: an open mic
+    // that caught a phone call or a talk in the room must not become a long
+    // turn for Ara to act on; and one that ended 'unsure' had
     // its speech taken back as the room, perhaps wrongly: nothing unheard
     // is sent on a guess, and nothing said is thrown away on one.
     // So does a take that would carry text or files the user put in the box
     // before it: the send takes the whole draft, which they have not seen
     // go together with what they said.
-    // A take that cancelled a call goes out whatever ended it, as only its
-    // transcript can tell whether the user meant to stop the call; but not
-    // with text or files in the box, which go to review as above.
+    // A take that cancelled a call goes out whatever ended it short of the
+    // cap, as only its transcript can tell whether the user meant to stop
+    // the call; but not at the cap, nor with text or files in the box,
+    // which go to review as above (the call staying cancelled).
     else if (ev.type === 'end') {
       const cancelled = CANCELLED_CALLS.has(this._key());
-      const spoken = ev.reason === 'silence' || (ev.reason === 'max' && ev.voiced);
-      this._finishRecording((cancelled || spoken) && !this._draftHasInput() ? 'send' : 'review');
+      const send = ev.reason === 'silence' || (cancelled && ev.reason !== 'max');
+      this._finishRecording(send && !this._draftHasInput() ? 'send' : 'review');
     }
     // Nobody spoke: the mic closes, the mode stays on, and nothing is sent
     // (no "no speech detected" note either — silence was the answer).

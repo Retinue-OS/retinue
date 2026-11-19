@@ -28,9 +28,10 @@ export const NO_SPEECH_KEY = 'retinue-voice-nospeech-ms';
 export const DEFAULT_SILENCE_MS = 1500;
 export const DEFAULT_NO_SPEECH_MS = 8000;
 // How long one take may run at most (the detector's length cap). Long enough
-// for a thought spoken out in one go; a take that reaches it while it was
-// still plainly a voice is sent all the same (Vad, reason 'max' with
-// `voiced`). Kept in this page's own storage, not in the app's device
+// for a thought spoken out in one go. It is a hard limit: a take that
+// reaches it is never sent unseen, whatever it sounded like — a phone call
+// or a conversation in the room, picked up by an open mic, must not turn
+// into a long, confusing turn for Ara to act on. Kept in this page's own storage, not in the app's device
 // store: an app that does not list the key would refuse it there.
 export const MAX_TAKE_KEY = 'retinue-voice-max-ms';
 export const DEFAULT_MAX_TAKE_MS = 10 * 60 * 1000;
@@ -226,15 +227,11 @@ export function pickWakeThread(entries, now, windowMs = WAKE_WINDOW_MS) {
 //   {type: 'noise'}             what began as speech was the room getting
 //                               louder: back to waiting, nothing was heard
 //   {type: 'end', reason}       the take is over: 'silence' after speech;
-//                               'max' when it ran to the length cap (with
-//                               `voiced: true` when it was still speech
-//                               that swings, as a voice does — sent like
-//                               'silence'; without it, for review); or
+//                               'max' when it ran to the length cap; or
 //                               'unsure' when the no-speech window closed
 //                               after a run was taken back as the room. Only
-//                               'silence' and a voiced 'max' are takes to
-//                               send unseen: the others go to the user to
-//                               read first
+//                               'silence' is a take to send unseen: the
+//                               others go to the user to read first
 //   {type: 'timeout'}           no speech within noSpeechMs, and nothing
 //                               taken back: close the mic
 export const VAD_DEFAULTS = {
@@ -357,13 +354,7 @@ export class Vad {
       this._learn(lv);
       if (now - this._lastVoice >= o.silenceMs) return this._done({ type: 'end', reason: 'silence' });
     }
-    // At the cap: still speaking, and the level has dipped since speech
-    // began — the gaps between words a voice has and a fan has not — is a
-    // voice that just went on; anything else may be the room.
-    if (elapsed >= o.maxMs) {
-      const voiced = this.state === 'speaking' && this.heard && this._dipped;
-      return this._done(voiced ? { type: 'end', reason: 'max', voiced: true } : { type: 'end', reason: 'max' });
-    }
+    if (elapsed >= o.maxMs) return this._done({ type: 'end', reason: 'max' });
     return null;
   }
 
