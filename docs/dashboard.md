@@ -1248,8 +1248,8 @@ as ➤; the loop waits for the answer, and repeats. Every other end goes to the
 draft for review, never out — and the two are told apart by ear: a soft
 low gong for a take on its way, a short rising whistle for one kept for
 review without a tap (`takeCue`; a dropped take and ✓ stay silent): a take that runs to the length
-cap (default 10 min, 1–30 min per device under Settings → Voice, kept in the
-page's own storage) without falling silent — a hard limit, voice or not, so an
+cap (default 4 min, 1–30 min per device under Settings → Voice, kept in the
+page's own storage; three soft ticks half a minute before it, `warn`) without falling silent — a hard limit, voice or not, so an
 open mic that catches a phone call or a talk in the room never becomes a long
 turn for Ara to act on (a take that cancelled a call included), and one whose no-speech window closes after a run was taken
 back as the room (it may have been a voice). No speech within the no-speech timeout (default 8 s)

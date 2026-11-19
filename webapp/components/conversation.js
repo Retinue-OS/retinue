@@ -3319,9 +3319,13 @@ class RetinueConversation extends HTMLElement {
       if (this._mediaRecorder !== mr || this._recTouched) return;
       this._finishRecording('review');
     }, noSpeechMs));
+    const { maxMs } = voiceTimeouts();
+    this._contTimers.push(setTimeout(() => {
+      if (this._mediaRecorder === mr) cue('warn');
+    }, Math.max(0, maxMs - VAD_DEFAULTS.warnBeforeMs)));
     this._contTimers.push(setTimeout(() => {
       if (this._mediaRecorder === mr) this._finishRecording('review');
-    }, voiceTimeouts().maxMs));
+    }, maxMs));
   }
 
   // Text or files waiting in this conversation's box.
@@ -3356,6 +3360,8 @@ class RetinueConversation extends HTMLElement {
     }
     // What began as speech was the room getting louder (continuous.js).
     else if (ev.type === 'noise') this._vadHeard = false;
+    // Half a minute to the length cap: tell the speaker by ear.
+    else if (ev.type === 'warn') cue('warn');
     // A pause after speech ends the take and sends it. Any other end goes
     // to the draft for the user to read first — one that ran to the length
     // cap (Settings → Voice) is never sent unseen, voice or not: an open mic

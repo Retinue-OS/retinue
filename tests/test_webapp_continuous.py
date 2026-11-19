@@ -30,7 +30,7 @@ import {
   modeEntries, isContinuous, setContinuous, touchContinuous, forgetContinuous, MODE_KEY,
   voiceTimeouts, setVoiceTimeouts, DEFAULT_SILENCE_MS, DEFAULT_NO_SPEECH_MS, DEFAULT_MAX_TAKE_MS,
   endedByAra, noteAraOff, ARA_OFF_SKEW_MS,
-  takeCue, TAKE_CUES,
+  takeCue, TAKE_CUES, TAKE_WARN_BEFORE_MS,
 } from './continuous.mjs';
 
 // ── A scripted localStorage ──────────────────────────────────────────────────
@@ -160,14 +160,32 @@ ok('a take that never falls silent ends at the length cap', () => {
   run(vad, 0, 500, QUIET);
   // Speech has gaps between words: 250 ms of voice, 100 ms between.
   const evs = run(vad, 500, 20000, (t) => ((t % 350) < 250 ? SPEECH : QUIET));
+  // (The default warning lead, 30 s, exceeds this short cap: it warned in
+  // the quiet lead-in, right after the warm-up.)
   assert.deepEqual(evs.map((e) => [e.type, e.reason || '']), [['speech', ''], ['end', 'max']]);
   assert.equal(evs[1].t, 10000);
-  // A hard limit: plainly a voice or not, the cap is never a take to send.
-  assert.equal(evs[1].voiced, undefined);
+
 });
 
-ok('the default length cap is ten minutes', () => {
-  assert.equal(DEFAULT_MAX_TAKE_MS, 600000);
+ok('the warning tone comes once, half a minute before the cap', () => {
+  const vad = new Vad({ silenceMs: 1500, noSpeechMs: 8000, maxMs: 240000 });
+  run(vad, 0, 500, QUIET);
+  const evs = run(vad, 500, 250000, (t) => ((t % 350) < 250 ? SPEECH : QUIET));
+  assert.deepEqual(evs.map((e) => [e.type, e.reason || '']), [['speech', ''], ['warn', ''], ['end', 'max']]);
+  assert.equal(evs[1].t, 210000);
+  assert.equal(evs[2].t, 240000);
+});
+
+ok('a take that ends on a pause before the warning hears no warning', () => {
+  const vad = new Vad({ silenceMs: 1500, noSpeechMs: 8000, maxMs: 240000 });
+  run(vad, 0, 500, QUIET);
+  const evs = run(vad, 500, 60000, (t) => (t < 20000 && (t % 350) < 250 ? SPEECH : QUIET));
+  assert.deepEqual(evs.map((e) => e.type), ['speech', 'end']);
+});
+
+ok('the default length cap is four minutes, the warning at three and a half', () => {
+  assert.equal(DEFAULT_MAX_TAKE_MS, 240000);
+  assert.equal(DEFAULT_MAX_TAKE_MS - TAKE_WARN_BEFORE_MS, 210000);
   assert.equal(VAD_DEFAULTS.maxMs, DEFAULT_MAX_TAKE_MS);
 });
 

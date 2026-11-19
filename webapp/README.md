@@ -850,7 +850,8 @@ Threads can be spoken as well as typed, with no streaming and split by direction
   the dictation's ➤ path (transcribe, send), the loop waits for the answer,
   and goes round again — only for an answer to its own turn: other messages
   pushed into the thread may be read, but do not open the mic. A take that
-  reaches the length cap (10 min by default, 1–30 min under Settings → Voice)
+  reaches the length cap (4 min by default, 1–30 min under Settings → Voice;
+  three soft ticks sound half a minute before it)
   goes to the draft for review, never out — a hard limit, so an open mic that
   catches a phone call or a talk in the room is not sent to Ara. Each take's
   end is heard as well as seen (`continuous.js`, `takeCue`): a soft low gong

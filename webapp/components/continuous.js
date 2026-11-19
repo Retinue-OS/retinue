@@ -34,7 +34,11 @@ export const DEFAULT_NO_SPEECH_MS = 8000;
 // into a long, confusing turn for Ara to act on. Kept in this page's own storage, not in the app's device
 // store: an app that does not list the key would refuse it there.
 export const MAX_TAKE_KEY = 'retinue-voice-max-ms';
-export const DEFAULT_MAX_TAKE_MS = 10 * 60 * 1000;
+export const DEFAULT_MAX_TAKE_MS = 4 * 60 * 1000;
+// This long before the cap a soft warning tone sounds (event `warn`), so a
+// speaker who is not looking can wrap up or pause before the take is cut
+// off and kept back.
+export const TAKE_WARN_BEFORE_MS = 30 * 1000;
 // Bounds, so a typo cannot cut every sentence in half or leave the mic open
 // for minutes.
 const SILENCE_RANGE = [500, 5000];
@@ -224,6 +228,8 @@ export function pickWakeThread(entries, now, windowMs = WAKE_WINDOW_MS) {
 // States: 'waiting' (mic open, no speech yet), 'speaking', 'done'. feed()
 // returns the event a frame caused, or null:
 //   {type: 'speech'}            speech began (once per take, unless retracted)
+//   {type: 'warn'}              the cap is TAKE_WARN_BEFORE_MS away (once
+//                               per take): play the warning tone
 //   {type: 'noise'}             what began as speech was the room getting
 //                               louder: back to waiting, nothing was heard
 //   {type: 'end', reason}       the take is over: 'silence' after speech;
@@ -249,6 +255,7 @@ export const VAD_DEFAULTS = {
   minSpeechMs: 120,
   // One take is at most this long, whatever the room does.
   maxMs: DEFAULT_MAX_TAKE_MS,
+  warnBeforeMs: TAKE_WARN_BEFORE_MS,
   // Floor adaptation per frame: towards a quieter level quickly, towards a
   // louder (non-speech) level slowly.
   floorDown: 0.3,
@@ -277,6 +284,7 @@ export class Vad {
     this._runMax = null;     // …and its loudest
     this._retracted = false; // a run was taken back as the room in this take
     this._dipped = false;    // a frame fell below it since speech began
+    this._warned = false;    // the cap's warning has been given
   }
 
   threshold() {
@@ -295,6 +303,12 @@ export class Vad {
       return null;
     }
     if (this.floor == null) this.floor = lv;
+    // The cap draws near. This frame only warns; the next one is judged as
+    // usual (nothing here depends on seeing every frame).
+    if (!this._warned && elapsed >= o.maxMs - o.warnBeforeMs) {
+      this._warned = true;
+      return { type: 'warn' };
+    }
     let above = lv > this.threshold();
     if (above) {
       if (this._aboveSince == null) this._startRun(now, lv);
@@ -446,10 +460,13 @@ export function chime() {
 // will get no answer. Only these two get a cue: a take dropped because
 // nobody spoke stays silent, as silence was the answer.
 //   'sent' — a soft low gong: transcribed and on its way to Ara.
+//   'warn' — three soft ticks: the length cap is half a minute away.
 //   'kept' — a short rising whistle: recording stopped, nothing was sent;
 //            the transcript waits in the box.
 export const TAKE_CUES = Object.freeze({
   sent: [{ freq: 392, at: 0, peak: 0.22, decay: 0.9 }, { freq: 392 * 2.76, at: 0, peak: 0.05, decay: 0.5 }],
+  // Three soft, even ticks: the cap is half a minute away.
+  warn: [{ freq: 660, at: 0, peak: 0.1, decay: 0.08 }, { freq: 660, at: 0.18, peak: 0.1, decay: 0.08 }, { freq: 660, at: 0.36, peak: 0.1, decay: 0.08 }],
   kept: [{ freq: 1100, to: 1900, at: 0, peak: 0.12, decay: 0.16 }, { freq: 1100, to: 1900, at: 0.2, peak: 0.12, decay: 0.16 }],
 });
 
