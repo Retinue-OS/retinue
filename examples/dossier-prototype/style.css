@@ -235,3 +235,41 @@ code{font-family:"Source Code Pro","DejaVu Sans Mono",Menlo,monospace;font-size:
 .pick-list .menu-row.new{align-items:center}
 .pick-list .menu-row.new .pick-input{margin:0}
 .menu-row .kind{font-size:14px;color:#8b93a3}
+/* the dashboard's chrome: navigation row, page bar, shelf */
+.nav{display:flex;align-items:stretch;gap:4px;border-bottom:1px solid rgba(231,235,242,.08);padding:4px 8px 0}
+.nav-tabs{flex:1;min-width:0;display:flex;gap:2px;overflow-x:auto;scrollbar-width:none}
+.nav-tab{flex:1 0 auto;font:inherit;font-size:12.5px;font-weight:500;color:#8b93a3;background:none;border:0;border-bottom:2px solid transparent;margin-bottom:-1px;padding:8px 5px 9px;cursor:pointer;position:relative;white-space:nowrap}
+.nav-tab:hover{color:#e7ebf2}
+.nav-tab.on{color:#e7ebf2;font-weight:650;border-bottom-color:#6ea8fe}
+.nav-tab.stub,.nav-icon.stub{opacity:.55}
+.nav-badge{position:absolute;top:3px;right:0;background:#e08a2e;color:#0b0d12;font-size:9.5px;font-weight:700;border-radius:8px;padding:0 4px;line-height:14px}
+.nav-icon{flex:none;width:32px;font:inherit;font-size:15px;color:#8b93a3;background:none;border:0;cursor:pointer}
+.nav-back{flex:none;align-self:center;width:30px;height:30px;margin:0 6px 2px 0;border-radius:50%;background:#1c2230;color:#e7ebf2;font:inherit;font-size:20px;line-height:1;border:0;cursor:pointer;padding:0 2px 2px 0}
+.v-head{padding:10px 10px 8px 14px;border-bottom:1px solid rgba(231,235,242,.06)}
+.bar-btn{font:inherit;font-size:18px;color:#8b93a3;background:none;border:0;cursor:pointer;padding:2px 6px;line-height:1;position:relative}
+.bar-btn:hover{color:#e7ebf2}
+.bar-btn.flagged::after{content:"";position:absolute;right:2px;top:2px;width:6px;height:6px;border-radius:50%;background:#6ea8fe}
+.model-pick{font:inherit;font-size:11px;color:#cbd3dd;background:#151922;border:1px solid #2a323b;border-radius:10px;padding:3px 6px;max-width:72px}
+.menu-wrap{position:relative}
+.page-menu{position:absolute;right:0;top:calc(100% + 4px);min-width:190px;background:#1c2230;border:1px solid rgba(231,235,242,.14);border-radius:14px;box-shadow:0 16px 40px rgba(0,0,0,.6);padding:6px;display:flex;flex-direction:column;gap:2px;z-index:6}
+.page-menu button{text-align:left;min-height:38px;padding:0 10px;border:0;border-radius:8px;background:transparent;color:#e7ebf2;font:inherit;font-size:13px;cursor:pointer}
+.page-menu button:hover{background:rgba(231,235,242,.08)}
+.star-mark{color:#ffb86b}
+.muted-mark{font-size:12px;opacity:.8}
+.shelf{position:relative;border-top:1px solid rgba(231,235,242,.08);background:#0b0d12;padding:0 4px}
+.sh-row{display:flex;gap:6px;overflow-x:auto;scrollbar-width:none;padding:6px 4px 4px}
+.sh-it{position:relative;flex:none;width:48px;height:48px;display:flex;align-items:center;justify-content:center;border-radius:14px;background:none;border:0;cursor:pointer;padding:0}
+.sh-it.on{background:rgba(231,235,242,.07)}
+.sh-ico{width:38px;height:38px;display:flex;align-items:center;justify-content:center;font-weight:650;font-size:14px;color:#fff;border-radius:50%}
+.sh-ico.thr{background:#24324d;color:#6ea8fe}
+.sh-ico.proj{border-radius:11px;background:#2d2a22;color:#f0a35e}
+.sh-count{position:absolute;right:2px;top:1px;min-width:19px;height:19px;padding:0 5px;border-radius:10px;background:#6ea8fe;color:#0b0d12;font-size:10.5px;font-weight:700;display:flex;align-items:center;justify-content:center;border:2px solid #0b0d12}
+.sh-ara{position:absolute;right:1px;bottom:2px;height:17px;border-radius:9px;border:2px solid #0b0d12;display:flex;align-items:center;justify-content:center;gap:2px}
+.sh-ara i{width:3.5px;height:3.5px;border-radius:50%;background:#6ea8fe}
+.sh-ara.working{padding:0 4px;background:#1c2230;box-shadow:inset 0 0 0 1px rgba(110,168,254,.6)}
+.sh-ara.ready{width:15px;height:15px;right:4px;bottom:3px;background:#57c785}
+.sh-menu{position:absolute;bottom:calc(100% + 6px);left:8px;min-width:210px;padding:6px;background:#1c2230;border:1px solid rgba(231,235,242,.14);border-radius:14px;box-shadow:0 16px 40px rgba(0,0,0,.6);display:flex;flex-direction:column;gap:2px;z-index:5}
+.sh-mt{padding:8px 10px 6px;font-size:11.5px;color:#8b93a3;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.sh-menu button{text-align:left;min-height:38px;padding:0 10px;border:0;border-radius:8px;background:transparent;color:#e7ebf2;font:inherit;font-size:13px;cursor:pointer}
+.sh-menu button:hover{background:rgba(231,235,242,.08)}
+.tabs,.tab,.badge{display:none}

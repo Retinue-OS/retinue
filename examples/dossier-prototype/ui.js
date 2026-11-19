@@ -64,9 +64,10 @@
   class App {
     constructor(rootEl) {
       this.root = rootEl; this.engine = new root.DossierEngine();
-      this.sim = new root.Simulation(this.engine, { onChange: () => this.renderAll() });
+      this.sim = new root.Simulation(this.engine, { onChange: () => this.renderAll(), ui: this });
       this.sheet = null; this.view = null; this.draft = null; this.toast = null; this.menu = false; this.otherOpen = false; this.waitingOpen = false;
       this.list = 'home'; this.dossierFilter = 'active'; this.to = {}; this.select = null; this.picker = null;
+      this.shelf = []; this.shelfMenu = null; this.pageMenu = false; this.model = 'Ara'; // the shelf and the page bar live on the device, as on the dashboard
       this.files = {}; this.rec = null; this.job = null; this.attachError = ''; this.wave = new Waveform(() => this.phoneEl);
       this.sttUrl = null; this.cloudOk = false; try { this.cloudOk = localStorage.getItem('attention-voice-cloud') === '1'; } catch (_e) { /* no storage */ }
       this.localRecognition = null; // null = unknown, then true/false
@@ -74,6 +75,7 @@
       this.phoneEl = rootEl.querySelector('#phone'); this.deckEl = rootEl.querySelector('#deck');
       this.buildDeck(); this.probeVoice();
       rootEl.addEventListener('click', (e) => this.onClick(e));
+      rootEl.addEventListener('contextmenu', (e) => { const it = e.target.closest('[data-shelfmenu]'); if (!it) return; e.preventDefault(); this.sim.viewerActed(); this.shelfMenu = this.shelfMenu === it.dataset.shelfmenu ? null : it.dataset.shelfmenu; this.renderAll(); });
       rootEl.addEventListener('change', (e) => { if (e.target.matches('[data-file]')) { this.addFiles(e.target.dataset.id, e.target.files); return; } this.onInput(e); });
       rootEl.addEventListener('input', (e) => {
         if (e.target.id === 'composer') { const src = this.draft && this.draft.id === e.target.dataset.id && this.draft.tab === e.target.dataset.tab ? this.draft.source : 'typed'; this.draft = { id: e.target.dataset.id, tab: e.target.dataset.tab, text: e.target.value, source: src === 'typed' ? 'typed' : src }; }
@@ -226,17 +228,59 @@
           ${total ? '' : '<div class="empty">Nothing wants your attention.</div>'}
         </div>`;
     }
+    // ---- the dashboard's chrome: navigation row, page bar, shelf -----------------------
+    // The navigation row at the top of every page (webapp/components/nav.js): the
+    // places as text tabs — Home · Contacts · Dossiers · News — then the pending
+    // sends and the settings gear; on a drill-down it starts with the back button.
+    navHtml() {
+      const e = this.engine; const places = [['home', 'Home'], ['contacts', 'Contacts'], ['dossiers', 'Dossiers'], ['news', 'News']];
+      const cur = this.view ? null : this.list;
+      const back = this.view ? `<button class="nav-back" data-act="back" aria-label="Back">‹</button>` : '';
+      const tabs = places.map(([k, l]) => `<button class="nav-tab${cur === k ? ' on' : ''}${k === 'news' ? ' stub' : ''}" data-act="list" data-list="${k}" ${k === 'news' ? 'title="Not part of this prototype"' : ''}>${l}${k === 'contacts' && e.inboxCount() ? `<span class="nav-badge">${e.inboxCount()}</span>` : ''}</button>`).join('');
+      return `<nav class="nav" aria-label="Dashboard">${back}<div class="nav-tabs">${tabs}</div><button class="nav-icon stub" title="Pending sends (none in this prototype)" aria-label="Pending sends">⇪</button><button class="nav-icon stub" title="Settings (not part of this prototype)" aria-label="Settings">⚙</button></nav>`;
+    }
+    // The shelf at the foot of every page (webapp/components/shelf.js): minimized
+    // dossiers as a row of icons — top right a relationship's unread count, bottom
+    // right Ara: ··· while she works, a green dot once she has answered.
+    shelfHtml() {
+      if (!this.shelf.length) return '';
+      const e = this.engine;
+      const items = this.shelf.map((s) => {
+        const it = e.byId.get(s.id); if (!it) return '';
+        const peer = isPeer(it); const initials = it.title.split(/\s+/).map((w) => w[0]).join('').slice(0, 2).toUpperCase();
+        const ico = peer ? `<span class="sh-ico av" style="background:${SPHERE_COLORS[it.sphere] || '#9aa5b1'}">${esc(initials)}</span>` : it.kind === 'ara' || it.kind === 'standing' ? `<span class="sh-ico thr">${KIND_GLYPH[it.kind]}</span>` : `<span class="sh-ico proj">${KIND_GLYPH.topic}</span>`;
+        const unread = peer ? it.stream.filter((m) => m.who === 'in' && m.t > s.at).length : 0;
+        const araTurns = it.stream.filter((m) => m.who === 'ara' && m.t > s.at).length;
+        const count = unread ? `<span class="sh-count">${unread}</span>` : '';
+        const ara = s.working ? '<span class="sh-ara working"><i></i><i></i><i></i></span>' : araTurns ? '<span class="sh-ara ready"></span>' : '';
+        const cur = this.view && this.view.id === s.id;
+        return `<button class="sh-it${cur ? ' on' : ''}" data-act="shelf-open" data-id="${esc(it.id)}" data-shelfmenu="${esc(it.id)}" title="${esc(it.title)}" aria-label="${esc(it.title)}">${ico}${count}${ara}</button>`;
+      }).join('');
+      const menu = this.shelfMenu ? (() => { const it = e.byId.get(this.shelfMenu); return it ? `<div class="sh-menu" data-stop="1"><div class="sh-mt">${esc(it.title)}</div><button data-act="shelf-open" data-id="${esc(it.id)}">Open</button><button data-act="shelf-close" data-id="${esc(it.id)}">Close</button><button data-act="shelf-close-quiet">Close all quiet ones</button></div>` : ''; })() : '';
+      return `<div class="shelf" aria-label="Minimized pages">${menu}<div class="sh-row">${items}</div></div>`;
+    }
+    // Minimize the open dossier onto the shelf (the – in its bar); the shelf is per device, like the real one.
+    shelve(id) {
+      const it = this.engine.byId.get(id); if (!it) return false;
+      if (!this.shelf.some((s) => s.id === id)) this.shelf.unshift({ id, at: this.engine.now, working: false });
+      if (this.view && this.view.id === id) { this.view = null; this.draft = null; this.select = null; }
+      this.engine.emit({ kind: 'action', item: it, text: `${it.title} minimized onto the shelf.` });
+      return true;
+    }
+    unshelve(id) { this.shelf = this.shelf.filter((s) => s.id !== id); this.shelfMenu = null; }
     renderPhone() {
       const e = this.engine; const mode = e.mode();
       const until = e.manualMode ? 'by hand' : `until ${hhmm(e.scheduledUntil())}`;
       const banner = this.banner ? `<div class="banner ${this.banner.urgency}" data-act="dismiss-banner"><span class="bell">🔔</span><div><div class="b-title">${esc(this.banner.title)}<span class="b-urg">Urgency: ${esc(this.banner.urgency)}${this.banner.topic ? ' · Topic: ' + esc(this.banner.topic) : ''}</span></div><div class="b-body">${esc(this.banner.body)}</div></div></div>` : '';
       const toast = this.toast ? `<div class="toast">${esc(this.toast)}</div>` : '';
-      const titles = { home: 'Home', contacts: 'Contacts', dossiers: 'Dossiers' };
-      const nav = `<nav class="tabs">${['home', 'contacts', 'dossiers'].map((k) => `<button class="tab${this.list === k ? ' on' : ''}" data-act="list" data-list="${k}">${titles[k]}${k === 'contacts' && e.inboxCount() ? `<span class="badge">${e.inboxCount()}</span>` : ''}</button>`).join('')}</nav>`;
+      const titles = { home: 'Home', contacts: 'Contacts', dossiers: 'Dossiers', news: 'News' };
+      const body = this.list === 'news' ? '<div class="ph-body"><div class="empty">The news feed is not part of this prototype; it stays as it is on the dashboard.</div></div>' : this.listHtml();
       const list = `<div class="ph-head"><div class="ph-title">${titles[this.list]}</div><button class="mode-chip" data-act="mode-menu" style="border-color:${mode.color}"><span class="dot" style="background:${mode.color}"></span>${esc(mode.name)} · ${until} ▾</button></div>
-        ${banner}${this.listHtml()}${nav}`;
+        ${banner}${body}`;
       this.phoneEl.innerHTML = `<div class="phone"><div class="screen">
+        ${this.navHtml()}
         ${this.view ? banner + this.viewHtml() : list}
+        ${this.shelfHtml()}
         ${toast}
         ${this.menu ? this.modeMenu() : ''}
         ${this.sheet ? this.sheetHtml() : ''}
@@ -246,7 +290,7 @@
     }
 
     // ---- the dossier page -------------------------------------------------------------
-    openView(id) { const item = this.engine.byId.get(id); if (!item) return; this.engine.ensureOpening(id); this.view = { id }; this.sheet = null; this.menu = false; this.select = null; if (!this.draft || this.draft.id !== id) this.draft = null; }
+    openView(id) { const item = this.engine.byId.get(id); if (!item) return; this.engine.ensureOpening(id); this.view = { id }; this.sheet = null; this.menu = false; this.pageMenu = false; this.shelfMenu = null; this.select = null; if (!this.draft || this.draft.id !== id) this.draft = null; }
     // Whom the composer addresses: 'chat' = the participants over their channel, 'ara' = Ara.
     addressee(item) { if (!isPeer(item)) return 'ara'; return this.to[item.id] || 'chat'; }
     bubble(item, m, idx) {
@@ -282,8 +326,13 @@
       let foot = '';
       if (item.state === 'open' && item.actor === 'you' && item.kind !== 'standing') foot = `<div class="v-foot"><button class="btn" data-act="later" data-when="next" data-id="${esc(item.id)}">Later · ${esc(e.nextBreakpointText())}</button>${item.kind === 'topic' ? `<button class="btn" data-act="rest" data-id="${esc(item.id)}">Rest</button>` : ''}<button class="btn" data-act="do" data-id="${esc(item.id)}">${peer ? 'Nothing pending' : 'Done'}</button></div>`;
       else if (item.state === 'resting') foot = `<div class="v-foot"><button class="btn" data-act="reopen" data-id="${esc(item.id)}">Wake it up</button></div>`;
+      // The page's own bar, the second row under the navigation (webapp/components/chat-page.js's header):
+      // title and state, then minimize (–), the model picker, and the ⋮ menu with Attention details, Star, Mute.
+      const models = ['Ara', 'Ara jr.']; const picker = `<select class="model-pick" data-act="model" aria-label="Model answering Ara's turns" title="Which model answers Ara's turns in this dossier">${models.map((m) => `<option${this.model === m ? ' selected' : ''}>${esc(m)}</option>`).join('')}</select>`;
+      const flagged = item.muted || item.starred;
+      const pageMenu = this.pageMenu ? `<div class="page-menu" data-stop="1"><button data-act="open" data-id="${esc(item.id)}">ⓘ Attention details</button><button data-act="star" data-id="${esc(item.id)}">${item.starred ? '★ Unstar' : '☆ Star'}</button><button data-act="mute" data-id="${esc(item.id)}">${item.muted ? '🔔 Unmute' : '🔕 Mute'}</button>${item.kind === 'topic' && item.state === 'open' ? `<button data-act="rest" data-id="${esc(item.id)}">Rest</button>` : ''}${item.state === 'open' && item.kind !== 'standing' ? `<button data-act="do" data-id="${esc(item.id)}">${peer ? 'Nothing pending' : 'Done'}</button>` : ''}</div>` : '';
       return `<div class="view">
-        <div class="v-head"><button class="back" data-act="back" aria-label="Back">‹</button><div class="v-titles"><div class="v-title">${KIND_GLYPH[item.kind]} ${esc(item.title)}</div><div class="v-sub">${esc(sub)} · <span style="color:${item.state === 'open' ? LEVEL_COLORS[lvl] : '#8b93a3'}">${esc(status)}</span></div></div><button class="info" data-act="open" data-id="${esc(item.id)}" title="Importance, urgency, delivery — and their corrections">ⓘ</button></div>
+        <div class="v-head"><div class="v-titles"><div class="v-title">${item.starred ? '<span class="star-mark">★</span> ' : ''}${KIND_GLYPH[item.kind]} ${esc(item.title)}${item.muted ? ' <span class="muted-mark" title="Muted">🔕</span>' : ''}</div><div class="v-sub">${esc(sub)} · <span style="color:${item.state === 'open' ? LEVEL_COLORS[lvl] : '#8b93a3'}">${esc(status)}</span></div></div><button class="bar-btn" data-act="shelve" data-id="${esc(item.id)}" title="Minimize to the shelf" aria-label="Minimize">–</button>${picker}<div class="menu-wrap"><button class="bar-btn${flagged ? ' flagged' : ''}" data-act="page-menu" title="More" aria-label="More">⋮</button>${pageMenu}</div></div>
         <div class="bubbles" id="bubbles">${bubbles || '<div class="empty">Nothing yet.</div>'}</div>
         ${selBar}${draftCard}${chips}${composer}${foot}</div>`;
     }
@@ -502,6 +551,7 @@
       const dlg = this.engine._dialogue(item);
       if (intent && !files.length && this.draft && this.draft.id === id && this.draft.tab === 'chat' && this.draft.text && !(dlg && dlg.replies && dlg.replies[text])) { this.rewriteDraft(id, intent, text); return; }
       const r = this.engine.say(id, text, files); if (!r) return;
+      this._justAsked = id;
       if (r.draft) { this.draft = { id, tab: 'chat', text: r.draft, source: 'ara' }; this.to[id] = 'chat'; }
       const d = this.engine._dialogue(item); const rec = d && d.replies && d.replies[text]; if (rec && rec.note) this.showToast(rec.note);
     }
@@ -511,6 +561,7 @@
       if (act === 'seek') { const pt = el.getBoundingClientRect(); const rel = (ev.clientX - pt.left) / pt.width; const minute = Math.round(((rel * 720 - 20) / 680) * DAY); this.sim.seek(minute); this.sheet = null; this.menu = false; this.view = null; this.draft = null; this.select = null; this.picker = null; this.seenPushes = e.pushes.length; this.banner = null; this.renderAll(); return; }
       const stop = ev.target.closest('[data-stop]');
       if ((act === 'close-sheet' || act === 'close-menu' || act === 'close-picker') && stop && el !== ev.target.closest('.x')) return; // clicks inside the sheet do not close it
+      if (act !== 'page-menu' && !ev.target.closest('.page-menu')) this.pageMenu = false; // any press outside the ⋮ menu shuts it
       switch (act) {
         case 'toggle-play': this.sim.toggle(); break;
         case 'step': this.sim.step(); break;
@@ -520,10 +571,21 @@
         case 'mode-menu': this.sim.viewerActed(); this.menu = !this.menu; break;
         case 'close-menu': this.menu = false; break;
         case 'set-mode': this.sim.viewerActed(); e.setManualMode(el.dataset.mode || null); this.menu = false; break;
-        case 'list': this.sim.viewerActed(); this.list = el.dataset.list; this.view = null; break;
+        case 'list': this.sim.viewerActed(); this.list = el.dataset.list; this.view = null; this.pageMenu = false; this.shelfMenu = null; break;
+        // the page bar and the shelf
+        case 'shelve': this.sim.viewerActed(); this.shelve(id); break;
+        case 'page-menu': this.sim.viewerActed(); this.pageMenu = !this.pageMenu; break;
+        case 'star': this.sim.viewerActed(); e.star(id, !e.byId.get(id).starred); this.pageMenu = false; break;
+        case 'mute': this.sim.viewerActed(); e.mute(id, !e.byId.get(id).muted); this.pageMenu = false; break;
+        case 'shelf-open': this.sim.viewerActed(); if (this.shelfMenu) { this.shelfMenu = null; this.openView(id); break; } this.openView(id); break;
+        case 'shelf-close': this.unshelve(id); break;
+        case 'shelf-close-quiet': { const keep = this.shelf.filter((s) => { const it = e.byId.get(s.id); return it && (s.working || it.stream.some((m) => (m.who === 'ara' || m.who === 'in') && m.t > s.at)); }); this.shelf = keep; this.shelfMenu = null; break; }
         case 'dossier-filter': this.sim.viewerActed(); this.dossierFilter = el.dataset.filter; break;
         case 'view': this.sim.viewerActed(); this.sheet = null; this.picker = null; this.openView(id); break;
-        case 'back': this.view = null; this.draft = null; this.select = null; if (this.rec) this.stopRecording('abort'); break;
+        case 'back': { const leaving = this.view && e.byId.get(this.view.id); this.view = null; this.draft = null; this.select = null; this.pageMenu = false; if (this.rec) this.stopRecording('abort');
+          // Leaving while Ara is "answering" (a chip just tapped) parks the page on the shelf by itself; here Ara answers at once, so the automatic item simply shows her dot.
+          if (leaving && this._justAsked === leaving.id && !this.shelf.some((s) => s.id === leaving.id)) { this.shelf.unshift({ id: leaving.id, at: this.engine.now - 1, working: false, automatic: true }); }
+          this._justAsked = null; break; }
         case 'to': this.sim.viewerActed(); this.to[id] = el.dataset.to; break;
         case 'chip': this.sim.viewerActed(); this.converse(id, el.dataset.label); break;
         case 'send': this.send(id, el.dataset.tab); return;
@@ -565,6 +627,7 @@
       if (el.dataset.act === 'speed') { this.sim.speed = Number(el.value); return; }
       if (el.dataset.act === 'cloud-ok') { this.cloudOk = !!el.checked; try { localStorage.setItem('attention-voice-cloud', this.cloudOk ? '1' : '0'); } catch (_e) { /* no storage */ } this.renderVoiceLine(); return; }
       if (el.dataset.act === 'sel') { this.onClick({ target: el }); return; }
+      if (el.dataset.act === 'model') { this.sim.viewerActed(); this.model = el.value; this.showToast(`${el.value} answers the next turn in this dossier.`); this.renderAll(); return; }
       if (el.dataset.act === 'lead') { this.sim.viewerActed(); this.engine.correct(el.dataset.id, { lead: Number(el.value) }); this.renderAll(); }
       if (el.dataset.act === 'due-set') { this.sim.viewerActed(); this.engine.correct(el.dataset.id, { due: el.value === 'none' ? null : Number(el.value) }); this.renderAll(); }
     }

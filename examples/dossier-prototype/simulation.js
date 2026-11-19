@@ -15,13 +15,13 @@
     { at: t(7, 8),   who: 'you', action: { type: 'reply', id: 'rel:Mum', text: 'Just up ☕ — I’ll call you in ten minutes.' }, text: 'The dossier opens on her message, Ara’s remark beside it, and a composer addressed to her. You reply, then call her. Nothing pending — the row leaves the home and sits in Contacts like any quiet chat; nothing to archive.' },
     { at: t(7, 40),  who: 'narrator', text: 'Ara opens a topic: the physio appointment at 15:30, confirmed. Importance 4 with a two-hour lead time: eight hours out it is merely active, so it waits for the 08:00 digest instead of ringing.' },
     { at: t(8, 0),   who: 'narrator', text: 'The 08:00 batch and the morning digest, one push. Inbox Zero judged the parking mail: importance 1, archive once you have decided about the card — the proposal is in its stream, nowhere else. Deep work begins: nothing but critical rings before 12:00. The Müller quote is time-sensitive and tops the Active list; Deep work admits no customers, so it did not ring, but it is the obvious place to start.' },
-    { at: t(8, 20),  who: 'you', text: 'You work on the quote. This is the nudge working as intended: the most urgent important thing, visible, not shouting.' },
+    { at: t(8, 20),  who: 'you', action: { type: 'shelve', id: 'thr-quote' }, text: 'You open the quote, read Ara’s draft, and minimize it (the – in its bar) onto the shelf at the foot of the screen, to come back to between other things. This is the nudge working as intended: the most urgent important thing, visible, not shouting.' },
     { at: t(8, 40),  who: 'narrator', text: 'Anna asks about dinner on Friday. Friends are not admitted in Deep work; the invitation is held for 12:00.' },
     { at: t(9, 15),  who: 'narrator', text: 'Anna writes again, into the same dossier. The repeat policy for friends is off and her message classifies the same, so nothing escalates; a fixed five-minute window would have rewarded impatience.' },
     { at: t(10, 5),  who: 'narrator', text: 'Beat Frei, a customer, wants a view on a contract clause by tomorrow noon. Time-sensitive, but Deep work admits no customers: held for 12:00. The half-hourly sweep re-checks it every thirty minutes; a permit for Beat would have let it ring.' },
     { at: t(10, 40), who: 'narrator', text: 'The home server’s backup failed; Ara opens a topic. Critical is declared, never derived, and it rings in every mode.' },
     { at: t(10, 42), who: 'you', action: { type: 'later', id: 'thr-backup', when: 'next' }, text: 'You glance at it and tap Later: the alert waits for the 12:00 breakpoint. Even a critical dossier bends to you.' },
-    { at: t(11, 30), who: 'you', action: { type: 'chip', id: 'thr-quote', label: 'Send it' }, text: 'You open the quote: Ara has the draft ready and offers Show, Send, Change. You tap Send it; she sends the PDF to Müller AG and files it as an event. Done, five and a half hours before the deadline — the topic moves to Done on the Dossiers page.' },
+    { at: t(11, 30), who: 'you', action: { type: 'chip', id: 'thr-quote', label: 'Send it' }, text: 'You reopen the quote from the shelf, where you left it: Ara offers Show, Send, Change. You tap Send it; she sends the PDF to Müller AG and files it as an event. Done, five and a half hours before the deadline — the topic moves to Done on the Dossiers page; its shelf icon carries Ara’s green dot until you close it.' },
     { at: t(12, 0),  who: 'narrator', text: 'Midday digest: one push instead of four. Open mode for lunch admits every sphere, so Now shows exactly what may interrupt: Beat’s clause, the invoice run and the snoozed backup alert. Anna’s dinner, merely active, sits below.' },
     { at: t(12, 10), who: 'you', action: { type: 'reply', id: 'rel:Anna Keller', text: 'Yes to Friday, 19:00 — and I’ll bring the projector.' }, text: 'You are in the mood for people, not contracts: you open Anna’s dossier, take Ara’s drafted yes from the composer and send it. The clause keeps its place; nothing nags.' },
     { at: t(12, 40), who: 'you', action: { type: 'chip', id: 'thr-backup', label: 'Delete old snapshots' }, text: 'In the backup topic Ara names the culprit: old snapshots. One tap and she deletes them and restarts the job. Done.' },
@@ -63,6 +63,7 @@
       this.beatHold = opts.beatHold != null ? opts.beatHold : 3200; // ms to dwell on a beat while playing
       this.playing = false; this.hold = 0; this.viewerDriving = false; this.ended = false; this.last = null; this.raf = null;
       this.onChange = opts.onChange || (() => {});
+      this.ui = opts.ui || null; // the phone, for actions that live on the device (the shelf); absent in a headless replay
       this.raf = opts.raf || null;
       engine.on((ev) => this.feed.push({ t: ev.t, who: ev.push ? 'push' : ev.kind === 'learn' ? 'learn' : ev.kind === 'action' ? 'you' : 'system', text: ev.text, item: ev.item, push: ev.push }));
     }
@@ -82,6 +83,7 @@
         case 'permit': return e.permit(a.sender, a.mode, a.on);
         case 'reply': return item && item.state === 'open' ? e.sendChat(a.id, a.text) : false;
         case 'chip': case 'say': return item && item.state === 'open' && (!item.chips || item.chips.includes(a.label) || a.type === 'say') ? !!e.say(a.id, a.type === 'chip' ? a.label : a.text) : false;
+        case 'shelve': return item && item.state === 'open' ? (this.ui ? this.ui.shelve(a.id) : true) : false;
         case 'reference': { if (!item) return false; const m = item.stream.find((x) => x.who === 'in' && (!a.from || x.from === a.from) && (!a.contains || (x.text || '').includes(a.contains))); return m && !m.links.length ? !!e.reference(a.id, [m.uid], a.target, a.comment) : false; }
         default: return false;
       }

@@ -30,6 +30,13 @@ dossier (`&to=ara` addresses the composer to Ara on a relationship),
 `&details=1` opens its details sheet, `&chip=<label>` taps a chip on load,
 `&other=1` expands *Other spheres*.
 
+The chrome is the dashboard's as it is today, so the layout can be judged
+with every feature in place: the navigation row and the shelf frame every
+page; the page bar keeps minimize, the model picker and the ⋮ menu. The shelf
+is used by the story at 08:20 (the quote is minimized) and 11:30 (reopened from
+there and sent); a dossier left while Ara is answering parks itself there with
+her dot, as on the dashboard.
+
 ## What changed against the attention prototype
 
 | | Attention prototype | Dossier prototype |
@@ -60,7 +67,7 @@ goes into a new dossier with a comment.
 | `dialogues.js` | Canned Ara: per topic and per relationship (her remarks in the stream, drafts into the composer), and Inbox Zero's proposals per mail sender with their chips (`resolve` takes the mail out of the inbox, `dossier` opens a topic with it). |
 | `engine.js` | The dossier engine: the attention arithmetic unchanged (level table, modes, permits, breakpoints, sweep, corrections), on dossiers instead of items — relationships with a pending state, topics with active / waiting / resting / done, the batch, the one-dossier rule for mail, references with backlinks. |
 | `simulation.js` | The scripted day: the same external events, the same choices, narrated under the new model; two added beats for Inbox Zero's proposal and the gesture. |
-| `ui.js`, `style.css`, `index.html` | The phone: Home · Contacts · Dossiers tabs, the dossier page (messages, mail cards, Ara's remarks and events in one stream; the *to* switch; ⋯ → select → *Add to dossier…*), the details sheet, and the deck. |
+| `ui.js`, `style.css`, `index.html` | The phone with the dashboard's chrome: the **navigation row** at the top of every page (Home · Contacts · Dossiers · News, the pending-sends icon and the gear; the back button on a drill-down), the **page bar** under it (title and state, minimize –, the model picker, the ⋮ menu with Attention details · Star · Mute · Rest · Done), the dossier page (messages, mail cards, Ara's remarks and events in one stream; the *to* switch; ⋯ → select → *Add to dossier…*), the details sheet, and the **shelf** at the foot (minimized dossiers as icons with the unread count top right and Ara's dot bottom right; right-click or long-press for Open · Close · Close all quiet ones). News, sends and settings are stubs: unchanged by the design. |
 
 The schedule, spheres, contacts and lead times are the attention prototype's
 examples; a deployment names its own. Everyone in the story is fictional.

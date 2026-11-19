@@ -233,7 +233,13 @@
 
     // ---- delivery -------------------------------------------------------------
     _release(item, by) { item.released = true; item.releasedBy = by; item.releasedAt = this.now; item.snoozedUntil = null; }
-    _push(item, urgency, why) { const rec = { at: this.now, kind: 'item', title: item.title, body: item.body, urgency, itemId: item.id }; this.pushes.push(rec); item.pushed.push(this.now); this.emit({ kind: 'push', item, push: rec, text: `Push (Urgency: ${urgency}) — ${item.title}: ${why}.` }); }
+    _push(item, urgency, why) {
+      if (item.muted) { item.pushed.push(this.now); return this.emit({ kind: 'system', item, text: `${item.title} would push (${why}) — muted, so it is only listed.` }); }
+      const rec = { at: this.now, kind: 'item', title: item.title, body: item.body, urgency, itemId: item.id }; this.pushes.push(rec); item.pushed.push(this.now); this.emit({ kind: 'push', item, push: rec, text: `Push (Urgency: ${urgency}) — ${item.title}: ${why}.` });
+    }
+    // The two flags the page bar's menu carries: starred leads every list; muted is listed, never pushed.
+    star(id, on) { const item = this.byId.get(id); if (!item || !!item.starred === !!on) return false; item.starred = !!on; this.emit({ kind: 'action', item, text: `${item.title} ${on ? 'starred — it leads its lists' : 'unstarred'}.` }); return true; }
+    mute(id, on) { const item = this.byId.get(id); if (!item || !!item.muted === !!on) return false; item.muted = !!on; this.emit({ kind: 'action', item, text: `${item.title} ${on ? 'muted — listed, never pushed' : 'unmuted'}.` }); return true; }
     _arrive(item, at) {
       item.arrived = at; const mode = this.mode(); const lvl = this.level(item); item.lastLevel = lvl;
       const src = item.kind === 'relationship' || item.kind === 'group' ? `${item.channel}, ${item.sender}` : item.kind === 'ara' ? `topic opened by ${item.agent}` : 'topic';
@@ -426,16 +432,18 @@
       const key = (i) => [-rank(this.level(i)), -i.importance, i.due == null ? Infinity : i.due - this.now];
       const cmp = (a, b) => { const ka = key(a), kb = key(b); for (let k = 0; k < 3; k++) if (ka[k] !== kb[k]) return ka[k] - kb[k]; return a.title.localeCompare(b.title); };
       now.sort(cmp); active.sort(cmp); other.sort(cmp); waiting.sort((a, b) => (a.waiting_since || 0) - (b.waiting_since || 0));
+      for (const l of [now, active, other, waiting]) l.sort((a, b) => (b.starred ? 1 : 0) - (a.starred ? 1 : 0));
       return { now, active, other, waiting, mode };
     }
+    _starredFirst(list) { return list.sort((a, b) => ((b.starred ? 1 : 0) - (a.starred ? 1 : 0)) || (b.lastActivity - a.lastActivity)); }
     sections() { const h = this.home(); return { now: h.now, next: h.active.concat(h.other).filter((i) => i.released), held: h.active.concat(h.other).filter((i) => !i.released), waiting: h.waiting, mode: h.mode }; }
     // Contacts: every relationship, by latest message.
-    contacts() { return this.items.filter((i) => i.kind === 'relationship' || i.kind === 'group').sort((a, b) => b.lastActivity - a.lastActivity); }
+    contacts() { return this._starredFirst(this.items.filter((i) => i.kind === 'relationship' || i.kind === 'group')); }
     // Dossiers: topics, Ara topics and standing ones, by state.
     dossiers(filter = 'active') {
       const all = this.items.filter((i) => i.kind === 'topic' || i.kind === 'ara' || i.kind === 'standing');
       const pick = filter === 'resting' ? all.filter((i) => i.state === 'resting') : filter === 'done' ? all.filter((i) => i.state === 'done') : all.filter((i) => i.state === 'open' || i.state === 'quiet');
-      return pick.sort((a, b) => b.lastActivity - a.lastActivity);
+      return this._starredFirst(pick);
     }
     kindLabel(item) { return KIND_LABEL[item.kind] || item.kind; }
     stats() {
