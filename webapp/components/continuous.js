@@ -421,6 +421,52 @@ export function chime() {
   return new Promise((resolve) => setTimeout(resolve, 260));
 }
 
+// How a take of the loop ended, for the ear: the screen may be dark or out
+// of reach (a phone by the bed), and without a sound the user cannot tell a
+// take that went to Ara from one that was kept in the box for review and
+// will get no answer. Only these two get a cue: a take dropped because
+// nobody spoke stays silent, as silence was the answer.
+//   'sent' — a soft low gong: transcribed and on its way to Ara.
+//   'kept' — a short rising whistle: recording stopped, nothing was sent;
+//            the transcript waits in the box.
+export const TAKE_CUES = Object.freeze({
+  sent: [{ freq: 392, at: 0, peak: 0.22, decay: 0.9 }, { freq: 392 * 2.76, at: 0, peak: 0.05, decay: 0.5 }],
+  kept: [{ freq: 1100, to: 1900, at: 0, peak: 0.12, decay: 0.16 }, { freq: 1100, to: 1900, at: 0.2, peak: 0.12, decay: 0.16 }],
+});
+
+// Which cue, if any, a take of the loop gets when its recording stops:
+// `goes` it is sent, `kept` it has audio that lands in the draft, `byTouch`
+// the user ended it on the row (they see what happened; ➤ still gets the gong).
+export function takeCue({ goes, kept, byTouch } = {}) {
+  if (goes) return 'sent';
+  if (kept && !byTouch) return 'kept';
+  return null;
+}
+
+// Plays a take cue (TAKE_CUES). Best effort: no Web Audio, no cue.
+export function cue(kind) {
+  const notes = TAKE_CUES[kind];
+  const ctx = notes ? audioContext() : null;
+  if (!ctx) return;
+  try {
+    if (ctx.state === 'suspended' && ctx.resume) ctx.resume().catch(() => {});
+    const t0 = ctx.currentTime + 0.02;
+    notes.forEach(({ freq, to, at, peak, decay }) => {
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = 'sine';
+      osc.frequency.setValueAtTime(freq, t0 + at);
+      if (to) osc.frequency.exponentialRampToValueAtTime(to, t0 + at + decay);
+      gain.gain.setValueAtTime(0.0001, t0 + at);
+      gain.gain.exponentialRampToValueAtTime(peak, t0 + at + 0.01);
+      gain.gain.exponentialRampToValueAtTime(0.0001, t0 + at + decay);
+      osc.connect(gain).connect(ctx.destination);
+      osc.start(t0 + at);
+      osc.stop(t0 + at + decay + 0.02);
+    });
+  } catch (_e) { /* a missing cue must not break the loop */ }
+}
+
 // Feeds a Vad from a live stream: an AnalyserNode over it, sampled on a
 // timer (not animation frames — those stop when the screen is covered, and a
 // take must still end). `onEvent` gets each event feed() returns. start()

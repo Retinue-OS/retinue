@@ -30,6 +30,7 @@ import {
   modeEntries, isContinuous, setContinuous, touchContinuous, forgetContinuous, MODE_KEY,
   voiceTimeouts, setVoiceTimeouts, DEFAULT_SILENCE_MS, DEFAULT_NO_SPEECH_MS,
   endedByAra, noteAraOff, ARA_OFF_SKEW_MS,
+  takeCue, TAKE_CUES,
 } from './continuous.mjs';
 
 // ── A scripted localStorage ──────────────────────────────────────────────────
@@ -421,6 +422,27 @@ ok('no stamp, a bad stamp, or a thread not in the mode: nothing to end', () => {
   setContinuous('t9', false);
   assert.equal(endedByAra(modeEntries().t9, '2026-11-12T10:05:00+00:00'), false);
   assert.equal(endedByAra(undefined, '2026-11-12T10:05:00+00:00'), false);
+});
+
+// ── Take cues: heard, not seen ───────────────────────────────────────────────
+ok('a take that goes to Ara gets the gong, by voice or by ➤', () => {
+  assert.equal(takeCue({ goes: true, kept: true }), 'sent');
+  assert.equal(takeCue({ goes: true, kept: true, byTouch: true }), 'sent');
+});
+
+ok('a take kept for review without a tap (length cap, unsure, page hidden) gets the whistle', () => {
+  assert.equal(takeCue({ goes: false, kept: true }), 'kept');
+});
+
+ok('a take dropped (nobody spoke, ✕) or ended by ✓ gets no cue', () => {
+  assert.equal(takeCue({ goes: false, kept: false }), null);
+  assert.equal(takeCue({ goes: false, kept: true, byTouch: true }), null);
+  assert.equal(takeCue(), null);
+});
+
+ok('the two cues differ in pitch, so they are told apart by ear', () => {
+  assert.ok(TAKE_CUES.sent[0].freq < 500 && TAKE_CUES.kept[0].freq > 1000);
+  assert.ok(TAKE_CUES.kept.every((n) => n.to > n.freq), 'the whistle rises');
 });
 
 console.log(`${passed} checks passed`);

@@ -131,7 +131,7 @@ import { shelf, goLive, takeRestore, threadFacts } from './shelf-store.js';
 import {
   isContinuous, setContinuous, touchContinuous, forgetContinuous, voiceTimeouts, Vad, VAD_DEFAULTS, LevelMeter,
   modeEntries, endedByAra, noteAraOff,
-  chime, primeAudio,
+  chime, primeAudio, cue, takeCue,
 } from './continuous.js';
 import {
   setVoiceActive, canPlaceCall, placeCall, onCall,
@@ -1162,6 +1162,7 @@ class RetinueConversation extends HTMLElement {
     this._vadLive = null;    // …which hears the stream (true), cannot (false), or is not up yet
     this._contTimers = [];   // the plain timers standing in for a meter that cannot hear
     this._recTouched = false; // the user has touched the recording row of this take
+    this._recByTouch = false; // this take was ended for review by the row's ✓
     this._listenOnOpen = false; // open the mic once the thread is read
     this._contArmed = false; // the next answer is to this element's own turn (see _contEngage)
     this._contPending = null; // {loop}: a listen asked for while the page was hidden
@@ -2767,6 +2768,8 @@ class RetinueConversation extends HTMLElement {
     this._recIntent = null;
     const aborted = this._recAborted;
     this._recAborted = false;
+    const byTouch = this._recByTouch;
+    this._recByTouch = false;
     // A take that cancelled a call and does not go out (✕, ✓, leaving):
     // nobody is told, and the call stays cancelled.
     if (aborted || intent !== 'send' || !chunks.length) CANCELLED_CALLS.delete(key);
@@ -2780,6 +2783,10 @@ class RetinueConversation extends HTMLElement {
     if (wasTake) {
       const goes = !aborted && intent === 'send' && chunks.length;
       const here = this.isConnected && this._key() === key;
+      // Heard, not seen: a gong when the take goes to Ara, a whistle when
+      // it stopped without going and waits in the box (continuous.js, takeCue).
+      const kind = takeCue({ goes, kept: !aborted && !!chunks.length, byTouch });
+      if (kind) cue(kind);
       // A take sent by touch (➤) while a call waits is the user answering
       // it, heard by the detector or not: it cancels the call as speech
       // does, and its transcript decides, as for speech (an empty one lets
@@ -3646,7 +3653,7 @@ class RetinueConversation extends HTMLElement {
     const recAbort = root.querySelector('[data-rec-abort]');
     if (recAbort) recAbort.addEventListener('click', () => this._abortRecording());
     const recCheck = root.querySelector('[data-rec-check]');
-    if (recCheck) recCheck.addEventListener('click', () => this._finishRecording('review'));
+    if (recCheck) recCheck.addEventListener('click', () => { if (this._recState === 'recording' && !this._recIntent) this._recByTouch = true; this._finishRecording('review'); });
     const recSend = root.querySelector('[data-rec-send]');
     if (recSend) recSend.addEventListener('click', () => this._finishRecording('send'));
     const modelSel = root.querySelector('[data-model]');

@@ -1245,7 +1245,9 @@ threshold with no dip, but a voice still swings: the floor jumps to it, and
 if it was all the take had heard, the take goes back to waiting. Only a take
 that ends on a pause after speech is transcribed and sent, on the same path
 as ➤; the loop waits for the answer, and repeats. Every other end goes to the
-draft for review, never out: a take that runs to the 120 s cap without
+draft for review, never out — and the two are told apart by ear: a soft
+low gong for a take on its way, a short rising whistle for one kept for
+review without a tap (`takeCue`; a dropped take and ✓ stay silent): a take that runs to the 120 s cap without
 falling silent, and one whose no-speech window closes after a run was taken
 back as the room (it may have been a voice). No speech within the no-speech timeout (default 8 s)
 closes the mic with the mode kept on (the mic button resumes); leaving the
