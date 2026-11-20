@@ -97,6 +97,10 @@
     { id: 'prj-brochure',  title: 'Brochure translation', sphere: 'customers', importance: 3, current_actor: 'Publisher', waiting_since: days(-2), kind: 'customer request' },
     // Resting with a cadence: the recurring-projects job wakes it on the day.
     { id: 'prj-invoices',  title: 'Monthly invoice run', sphere: 'customers', tags: ['admin', 'finance'], importance: 4, recurring: 'monthly', next_due: t(18, 0), remind_before: 1 * DAY, current_actor: 'you', paused: true, wakeAt: t(8, 0), kind: 'invoice run' },
+    // A parent topic with two sub-topics (`within`): the engagement, and the pieces of work inside it.
+    { id: 'prj-crr',       title: 'CRR data platform', sphere: 'customers', importance: 4, current_actor: 'you', kind: 'customer request', participants: ['Beat Frei', 'Studio Nord'], body: 'The engagement with Frei Bau AG and Studio Nord: one dossier for the whole, the pieces of work within it.' },
+    { id: 'prj-crr-import', title: 'CRR: import pipeline', within: 'prj-crr', importance: 4, expected_by: days(8, 17, 0), remind_before: 5 * DAY, current_actor: 'you', kind: 'customer request', participants: ['Beat Frei'] },
+    { id: 'prj-crr-docs',   title: 'CRR: handover documentation', within: 'prj-crr', importance: 3, current_actor: 'Studio Nord', waiting_since: days(-4), kind: 'customer request', participants: ['Studio Nord'] },
     // Resting without a date ("someday") and a done one: visible on the Dossiers page only.
     { id: 'prj-garden',    title: 'Rain barrel for the garden', sphere: 'family', importance: 2, current_actor: 'you', paused: true, kind: 'admin chore' },
     { id: 'prj-website',   title: 'Website relaunch', sphere: 'customers', importance: 3, current_actor: 'you', resolved: true, doneAt: days(-9, 15, 0), kind: 'customer request' },

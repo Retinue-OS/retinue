@@ -67,7 +67,7 @@
       this.sim = new root.Simulation(this.engine, { onChange: () => this.renderAll(), ui: this });
       this.sheet = null; this.view = null; this.draft = null; this.toast = null; this.menu = false; this.otherOpen = false; this.waitingOpen = false;
       this.list = 'home'; this.dossierFilter = 'active'; this.to = {}; this.select = null; this.picker = null;
-      this.shelf = []; this.shelfMenu = null; this.pageMenu = false; this.model = 'Ara'; // the shelf and the page bar live on the device, as on the dashboard
+      this.shelf = []; this.shelfMenu = null; this.pageMenu = false; this.model = 'Ara'; this.treeOpen = {}; this.focusMenuOpen = false; // the shelf and the page bar live on the device, as on the dashboard
       this.files = {}; this.rec = null; this.job = null; this.attachError = ''; this.wave = new Waveform(() => this.phoneEl);
       this.sttUrl = null; this.cloudOk = false; try { this.cloudOk = localStorage.getItem('attention-voice-cloud') === '1'; } catch (_e) { /* no storage */ }
       this.localRecognition = null; // null = unknown, then true/false
@@ -214,19 +214,37 @@
         return `<div class="ph-body">${rows.map((i) => this.contactRow(i)).join('') || '<div class="empty">Nobody yet.</div>'}<p class="list-hint">Every person and group, by latest message. A new sender appears here the moment they write — nothing to triage first.</p></div>`;
       }
       if (this.list === 'dossiers') {
-        const rows = e.dossiers(this.dossierFilter);
+        const tree = e.dossierTree(this.dossierFilter);
         const f = (k, l) => `<button class="seg${this.dossierFilter === k ? ' on' : ''}" data-act="dossier-filter" data-filter="${k}">${l}</button>`;
-        return `<div class="segs">${f('active', 'Active')}${f('resting', 'Resting')}${f('done', 'Done')}</div><div class="ph-body">${rows.map((i) => this.dossierRow(i)).join('') || '<div class="empty">Nothing here.</div>'}</div>`;
+        const walk = (n) => { const open = this.treeOpen[n.item.id]; const kids = n.children.length ? `<button class="tree-toggle" data-act="tree-toggle" data-id="${esc(n.item.id)}">${open ? '▾' : '▸'} ${n.children.length} within${open ? '' : ' · ' + e.pendingDescendants(n.item) + ' pending'}</button>${open ? n.children.map((k) => `<div class="tree-child">${walk(k)}</div>`).join('') : ''}` : ''; return this.dossierRow(n.item) + kids; };
+        return `<div class="segs">${f('active', 'Active')}${f('resting', 'Resting')}${f('done', 'Done')}</div><div class="ph-body">${tree.map(walk).join('') || '<div class="empty">Nothing here.</div>'}<p class="list-hint">A topic may sit within one parent topic; the focus on a dossier covers what is within it.</p></div>`;
       }
       const h = e.home(); const total = h.now.length + h.active.length + h.other.length + h.waiting.length;
-      const scope = h.mode.admits.length ? `ACTIVE · ${h.mode.name.toUpperCase()}` : 'ACTIVE';
-      return `<div class="ph-body">
+      const f = e.focus(); const a = h.aperture; const ai = e.apertureIndex();
+      const widen = ai < U.APERTURES.length - 1 ? `<button class="below-row" data-act="aperture" data-aperture="${U.APERTURES[ai + 1].id}">+ ${h.below.length} below the aperture — widen to “${esc(U.APERTURES[ai + 1].name)}”</button>` : '';
+      return `${this.focusBar()}<div class="ph-body">
           ${section('NOW', h.now, 'now')}
-          ${section(scope, h.active, 'active')}
-          ${collapsible('OTHER SPHERES', h.other, 'other', this.otherOpen)}
+          ${f ? section(`IN FOCUS · ${esc(h.focusText.toUpperCase())}`, h.focus, 'active') : ''}
+          ${section(f ? `OUTSIDE · ${esc(a.name.toUpperCase())}` : 'PENDING', h.outside, 'active')}
+          ${h.below.length ? widen : ''}
           ${collapsible('WAITING ON OTHERS', h.waiting, 'waiting', this.waitingOpen)}
           ${total ? '' : '<div class="empty">Nothing wants your attention.</div>'}
         </div>`;
+    }
+    // The two controls under the mode chip: the focus (what you are on) and the aperture (how far out you see).
+    focusBar() {
+      const e = this.engine; const f = e.focus(); const a = e.aperture(); const until = e.override.apertureUntil;
+      const notches = U.APERTURES.map((n) => `<button class="notch${n.id === a.id ? ' on' : ''}" data-act="aperture" data-aperture="${n.id}" title="${esc(n.blurb)}" aria-label="${esc(n.name)}">${n.glyph}</button>`).join('');
+      const left = until != null ? ` <small class="snap">· ${Math.max(0, until - e.now)} min</small>` : '';
+      return `<div class="focus-bar"><button class="focus-chip${e.override.focus !== undefined ? ' hand' : ''}" data-act="focus-menu" title="What you are on">⌖ ${esc(e.focusText(f))} ▾</button><div class="aperture" title="How far outside the focus you see">${notches}<span class="ap-name">${esc(a.name)}${left}</span></div></div>`;
+    }
+    // The focus picker: flow, the spheres, the dossiers with something pending (with or without their relations).
+    focusMenu() {
+      const e = this.engine; const f = e.focus(); const cur = (x) => (JSON.stringify(x || null) === JSON.stringify(f || null) ? ' on' : '');
+      const spheres = root.Backends.SPHERES.map((s) => `<button class="menu-row${cur({ spheres: [s], tags: [] })}" data-act="set-focus" data-focus='${JSON.stringify({ spheres: [s], tags: [] })}'><span class="dot" style="background:${SPHERE_COLORS[s]}"></span><span><b>${esc(s)}</b><small>the sphere</small></span></button>`).join('');
+      const ds = e.items.filter((i) => (i.kind === 'topic' || i.kind === 'ara') && i.state === 'open' && !i.within).sort((x, y) => y.lastActivity - x.lastActivity).slice(0, 6);
+      const dossiers = ds.map((d) => `<div class="menu-pair"><button class="menu-row${cur({ dossier: d.id, related: false })}" data-act="set-focus" data-focus='${JSON.stringify({ dossier: d.id, related: false })}'><span class="kind">${KIND_GLYPH[d.kind]}</span><span><b>${esc(d.title)}</b><small>${e.children(d.id).length ? `with what is within it` : 'this dossier'}</small></span></button><button class="menu-row rel${cur({ dossier: d.id, related: true })}" data-act="set-focus" data-focus='${JSON.stringify({ dossier: d.id, related: true })}' title="Plus its parent, siblings and every dossier sharing a participant">+ related</button></div>`).join('');
+      return `<div class="overlay" data-act="close-menu"><div class="menu" data-stop="1"><div class="menu-head">Focus — what you are on</div><button class="menu-row${cur(null)}" data-act="set-focus" data-focus="null"><span class="dot" style="background:#3a4250"></span><span><b>Flow</b><small>no focus: only the aperture decides</small></span></button>${spheres}<div class="menu-head">Dossiers</div>${dossiers}${e.override.focus !== undefined ? `<button class="menu-row follow" data-act="release-focus"><span class="dot" style="background:${e.mode().color}"></span><span><b>Back to ${esc(e.mode().name)}'s preset</b><small>${esc(e.focusText(e.mode().focus))}</small></span></button>` : ''}</div></div>`;
     }
     // ---- the dashboard's chrome: navigation row, page bar, shelf -----------------------
     // The navigation row at the top of every page (webapp/components/nav.js): the
@@ -283,6 +301,7 @@
         ${this.shelfHtml()}
         ${toast}
         ${this.menu ? this.modeMenu() : ''}
+        ${this.focusMenuOpen ? this.focusMenu() : ''}
         ${this.sheet ? this.sheetHtml() : ''}
         ${this.picker ? this.pickerHtml() : ''}
       </div></div>`;
@@ -315,7 +334,9 @@
       const e = this.engine; const item = e.byId.get(this.view.id); if (!item) { this.view = null; return ''; }
       e.ensureOpening(item.id);
       const peer = isPeer(item); const to = this.addressee(item); const lvl = e.level(item);
-      const sub = peer ? `${e.kindLabel(item)} · ${item.channel}${item.org ? ` · ${item.org}` : ''}` : item.kind === 'ara' ? `topic with Ara${item.agent && item.agent !== 'Ara' ? ` (opened by ${item.agent})` : ''}` : item.kind === 'standing' ? 'standing dossier · Ara' : `topic${item.participants ? ` · with ${item.participants.join(', ')}` : ''}`;
+      const sub = peer ? `${e.kindLabel(item)} · ${item.channel}${item.org ? ` · ${item.org}` : ''}` : item.kind === 'ara' ? `topic with Ara${item.agent && item.agent !== 'Ara' ? ` (opened by ${item.agent})` : ''}` : item.kind === 'standing' ? 'standing dossier · Ara' : `topic${item.within ? ` within ${e.byId.get(item.within).title}` : ''}${item.participants ? ` · with ${item.participants.join(', ')}` : ''}`;
+      const kids = e.children(item.id); const parent = e.parentOf(item);
+      const treeLine = parent || kids.length ? `<div class="tree-line">${parent ? `<button class="backlink" data-act="view" data-id="${esc(parent.id)}">↑ ${esc(parent.title)}</button>` : ''}${kids.map((k) => `<button class="backlink kid${k.state === 'open' ? ' pend' : ''}" data-act="view" data-id="${esc(k.id)}">↳ ${esc(k.title)} <small>${esc(e.stateText(k))}</small></button>`).join('')}</div>` : '';
       const status = e.stateText(item) + (item.state === 'open' && item.actor === 'you' ? ` · ${lvl} · ${e.urgencyShort(item)}` : '');
       const bubbles = [...item.stream].sort((a, b) => a.t - b.t).map((m, i) => this.bubble(item, m, i)).join('');
       const chatDraft = peer && this.draft && this.draft.id === item.id && this.draft.tab === 'chat' && this.draft.text ? this.draft : null;
@@ -333,7 +354,7 @@
       const pageMenu = this.pageMenu ? `<div class="page-menu" data-stop="1"><button data-act="open" data-id="${esc(item.id)}">ⓘ Attention details</button><button data-act="star" data-id="${esc(item.id)}">${item.starred ? '★ Unstar' : '☆ Star'}</button><button data-act="mute" data-id="${esc(item.id)}">${item.muted ? '🔔 Unmute' : '🔕 Mute'}</button>${item.kind === 'topic' && item.state === 'open' ? `<button data-act="rest" data-id="${esc(item.id)}">Rest</button>` : ''}${item.state === 'open' && item.kind !== 'standing' ? `<button data-act="do" data-id="${esc(item.id)}">${peer ? 'Nothing pending' : 'Done'}</button>` : ''}</div>` : '';
       return `<div class="view">
         <div class="v-head"><div class="v-titles"><div class="v-title">${item.starred ? '<span class="star-mark">★</span> ' : ''}${KIND_GLYPH[item.kind]} ${esc(item.title)}${item.muted ? ' <span class="muted-mark" title="Muted">🔕</span>' : ''}</div><div class="v-sub">${esc(sub)} · <span style="color:${item.state === 'open' ? LEVEL_COLORS[lvl] : '#8b93a3'}">${esc(status)}</span></div></div><button class="bar-btn" data-act="shelve" data-id="${esc(item.id)}" title="Minimize to the shelf" aria-label="Minimize">–</button>${picker}<div class="menu-wrap"><button class="bar-btn${flagged ? ' flagged' : ''}" data-act="page-menu" title="More" aria-label="More">⋮</button>${pageMenu}</div></div>
-        <div class="bubbles" id="bubbles">${bubbles || '<div class="empty">Nothing yet.</div>'}</div>
+        ${treeLine}<div class="bubbles" id="bubbles">${bubbles || '<div class="empty">Nothing yet.</div>'}</div>
         ${selBar}${draftCard}${chips}${composer}${foot}</div>`;
     }
     // Ara rewrites the draft to the participants: rule-based here, a model turn in a deployment.
@@ -375,20 +396,20 @@
         <div class="sheet-head"><div><div class="sheet-title">Add to dossier</div><div class="sheet-src">${n} message${n === 1 ? '' : 's'} from ${esc(src.title)} — referenced, not copied</div></div><button class="x" data-act="close-picker" aria-label="Close">✕</button></div>
         <input id="pick-comment" class="pick-input" type="text" placeholder="A comment on the selection (optional)" value="${esc(p.comment || '')}">
         <div class="pick-list">${targets.map((t) => `<button class="menu-row" data-act="pick-target" data-target="${esc(t.id)}"><span class="kind">${KIND_GLYPH[t.kind]}</span><span><b>${esc(t.title)}</b><small>${esc(e.stateText(t))} · ${esc(e.kindLabel(t))}</small></span></button>`).join('')}
-          <div class="menu-row new"><span class="kind">＋</span><span style="flex:1"><input id="pick-title" class="pick-input" type="text" placeholder="New dossier — its title" value="${esc(p.title || '')}"></span><button class="btn tiny primary" data-act="pick-new">Create</button></div></div>
+          <div class="menu-row new"><span class="kind">＋</span><span style="flex:1"><input id="pick-title" class="pick-input" type="text" placeholder="New dossier — its title" value="${esc(p.title || '')}"><select class="select small" data-act="pick-within" aria-label="Within"><option value="">at the top</option>${e.items.filter((i) => i.kind === 'topic' && i.state !== 'done').map((t) => `<option value="${esc(t.id)}"${p.within === t.id ? ' selected' : ''}>within ${esc(t.title)}</option>`).join('')}</select></span><button class="btn tiny primary" data-act="pick-new">Create</button></div></div>
       </div></div>`;
     }
     modeMenu() {
       const e = this.engine; const cur = e.mode(); const sched = e.scheduledMode();
-      const rows = Object.values(e.modes).map((m) => `<button class="menu-row${cur.id === m.id ? ' on' : ''}" data-act="set-mode" data-mode="${m.id}"><span class="dot" style="background:${m.color}"></span><span><b>${esc(m.name)}</b><small>${esc(m.blurb)}</small></span></button>`).join('');
-      return `<div class="overlay" data-act="close-menu"><div class="menu" data-stop="1"><div class="menu-head">Focus mode</div>${rows}<button class="menu-row follow${e.manualMode ? '' : ' on'}" data-act="set-mode" data-mode=""><span class="dot" style="background:${sched.color}"></span><span><b>Follow the schedule</b><small>${esc(sched.name)} until ${hhmm(e.scheduledUntil())}</small></span></button></div></div>`;
+      const rows = Object.values(e.modes).map((m) => `<button class="menu-row${cur.id === m.id ? ' on' : ''}" data-act="set-mode" data-mode="${m.id}"><span class="dot" style="background:${m.color}"></span><span><b>${esc(m.name)}</b><small>${esc(m.blurb)} · ${esc(U.APERTURES.find((a) => a.id === m.aperture).name)}</small></span></button>`).join('');
+      return `<div class="overlay" data-act="close-menu"><div class="menu" data-stop="1"><div class="menu-head">Mode — a preset of focus and aperture</div>${rows}<button class="menu-row follow${e.manualMode ? '' : ' on'}" data-act="set-mode" data-mode=""><span class="dot" style="background:${sched.color}"></span><span><b>Follow the schedule</b><small>${esc(sched.name)} until ${hhmm(e.scheduledUntil())}</small></span></button></div></div>`;
     }
     sheetHtml() {
       const e = this.engine; const item = e.byId.get(this.sheet); if (!item) return '';
       const mode = e.mode(); const lvl = e.level(item); const x = e.explain(item); const peer = isPeer(item);
-      const src = `${e.kindLabel(item)} · ${peer ? `${item.channel} · ${item.sender}` : item.kind === 'ara' ? `opened by ${item.agent}` : e.stateText(item)}${item.count > 1 ? ` · ${item.count} messages` : ''}`;
+      const src = `${e.kindLabel(item)}${item.within ? ` within ${e.byId.get(item.within).title}` : ''} · ${peer ? `${item.channel} · ${item.sender}` : item.kind === 'ara' ? `opened by ${item.agent}` : e.stateText(item)}${item.count > 1 ? ` · ${item.count} messages` : ''}`;
       const hasPermit = item.sender && e.profile.permits[mode.id].includes(item.sender);
-      const admitsSphere = mode.admits.includes(item.sphere);
+      const admitsSphere = !!(mode.focus && mode.focus.spheres && mode.focus.spheres.includes(item.sphere));
       const day = Math.floor(e.now / DAY) * DAY; const at = (d, h) => day + d * DAY + h * 60;
       const dueOpts = [[null, 'no deadline'], [at(0, 17), 'today 17:00'], [at(1, 12), 'tomorrow 12:00'], [at(1, 17), 'tomorrow 17:00'], [at(3, 17), 'in 3 days'], [at(7, 17), 'in a week'], [at(14, 17), 'in two weeks'], [at(28, 17), 'in four weeks']].filter(([v]) => v == null || v > e.now);
       if (item.due != null && !dueOpts.some(([v]) => v === item.due)) dueOpts.splice(1, 0, [item.due, whenText(item.due, e.now)]);
@@ -411,7 +432,7 @@
         <div class="fields">
           <div class="field"><div class="f-label">Importance</div><div class="f-value">${esc(x.importance)}</div><div class="f-ctl"><button class="btn tiny" data-act="imp" data-delta="-1" data-id="${esc(item.id)}">−</button><button class="btn tiny" data-act="imp" data-delta="1" data-id="${esc(item.id)}">+</button><span class="f-note">corrects the prior for ${esc(item.sender || item.kindLabel)}</span></div></div>
           <div class="field"><div class="f-label">Urgency</div><div class="f-value">${esc(x.urgency)}</div><div class="f-ctl">${item.critical ? '<span class="f-note">critical is declared, not derived</span>' : `<span class="f-k">deadline</span> ${dueSel}${item.due != null ? `<button class="btn tiny" data-act="due" data-delta="-1440" data-id="${esc(item.id)}">−1 day</button><button class="btn tiny" data-act="due" data-delta="1440" data-id="${esc(item.id)}">+1 day</button>` : ''}<span class="f-break"></span><span class="f-k">lead</span> ${leadSel}<span class="f-note">the lead corrects every “${esc(item.kindLabel)}”</span>`}</div></div>
-          <div class="field"><div class="f-label">Delivery</div><div class="f-value">level <b style="color:${LEVEL_COLORS[lvl]}">${esc(lvl)}</b> · ${esc(x.delivery)}</div><div class="f-ctl">${item.sender ? `<button class="btn tiny${hasPermit ? ' on' : ''}" data-act="permit" data-id="${esc(item.id)}">${hasPermit ? `Revoke ${esc(item.sender)}’s ${esc(mode.name)} permit` : `Let ${esc(item.sender)} interrupt in ${esc(mode.name)}`}</button>` : ''}<button class="btn tiny${admitsSphere ? ' on' : ''}" data-act="admit" data-id="${esc(item.id)}">${admitsSphere ? `Stop admitting ${esc(item.sphere)} in ${esc(mode.name)}` : `Admit ${esc(item.sphere)} in ${esc(mode.name)}`}</button><span class="f-note">a Focus rule, importance untouched</span></div></div>
+          <div class="field"><div class="f-label">Delivery</div><div class="f-value">level <b style="color:${LEVEL_COLORS[lvl]}">${esc(lvl)}</b> · ${esc(x.delivery)}</div><div class="f-ctl">${item.sender ? `<button class="btn tiny${hasPermit ? ' on' : ''}" data-act="permit" data-id="${esc(item.id)}">${hasPermit ? `Revoke ${esc(item.sender)}’s ${esc(mode.name)} permit` : `Let ${esc(item.sender)} interrupt in ${esc(mode.name)}`}</button>` : ''}<button class="btn tiny${admitsSphere ? ' on' : ''}" data-act="admit" data-id="${esc(item.id)}">${admitsSphere ? `Take ${esc(item.sphere)} out of ${esc(mode.name)}'s focus` : `Put ${esc(item.sphere)} into ${esc(mode.name)}'s focus`}</button>${item.kind === 'topic' || item.kind === 'ara' ? `<button class="btn tiny" data-act="set-focus" data-focus='${JSON.stringify({ dossier: item.within || item.id, related: false })}'>Focus on ${item.within ? 'its parent' : 'this'}</button>` : ''}<span class="f-note">a Focus rule, importance untouched</span></div></div>
         </div>
         ${actions}
       </div></div>`;
@@ -513,9 +534,10 @@
       this.deckEl.querySelector('#state').innerHTML = `
         <h3>System state</h3>
         <div class="mode-card" style="border-left-color:${mode.color}"><div class="mode-name">${esc(mode.name)} <small>${e.manualMode ? 'set by hand' : `scheduled until ${hhmm(e.scheduledUntil())}`}</small></div>
-          <div class="kv"><span>admits</span><div>${chips(mode.admits, (s) => SPHERE_COLORS[s])}${mode.admitTags.length ? ` <span class="muted">+ tag${mode.admitTags.length > 1 ? 's' : ''}</span> ${chips(mode.admitTags, (s) => SPHERE_COLORS[s])}` : ''}</div></div>
+          <div class="kv"><span>focus</span><div>${(() => { const f = e.focus(); return f && f.spheres ? chips(f.spheres, (s) => SPHERE_COLORS[s]) + (f.tags.length ? ` <span class="muted">+ tag</span> ${chips(f.tags, (s) => SPHERE_COLORS[s])}` : '') : `<span class="pill">${esc(e.focusText(f))}</span>`; })()}${e.override.focus !== undefined ? ' <span class="muted">set by hand</span>' : ''}</div></div>
+          <div class="kv"><span>aperture</span><div><span class="pill">${esc(e.aperture().glyph)} ${esc(e.aperture().name)}</span> <span class="muted">${esc(e.aperture().blurb)}</span>${e.override.apertureUntil != null ? ` <span class="muted">· snaps back ${hhmm(e.override.apertureUntil)}</span>` : ''}</div></div>
           <div class="kv"><span>permits</span><div>${chips(p.permits[mode.id])}</div></div>
-          <div class="kv"><span>breaks through</span><div>${esc(mode.threshold)} and above</div></div>
+          <div class="kv"><span>rings</span><div>critical always; otherwise what is listed and time-sensitive</div></div>
           <div class="kv"><span>next breakpoint</span><div>${esc(e.nextBreakpointText())} — digest and Inbox Zero batch</div></div></div>
         <div class="nums">${num(st.itemPushes, 'pushes')}${num(st.digests, 'digests')}${num(st.now, 'now')}${num(st.active, 'active')}${num(st.waiting, 'waiting')}${num(st.inbox, 'in the inbox')}${num(st.done, 'settled')}${num(st.corrections, 'corrections')}</div>
         <details class="profile" open><summary>Dossiers</summary>
@@ -569,7 +591,7 @@
         case 'resume': this.sim.resume(); break;
         case 'dismiss-banner': this.banner = null; break;
         case 'mode-menu': this.sim.viewerActed(); this.menu = !this.menu; break;
-        case 'close-menu': this.menu = false; break;
+        case 'close-menu': this.menu = false; this.focusMenuOpen = false; break;
         case 'set-mode': this.sim.viewerActed(); e.setManualMode(el.dataset.mode || null); this.menu = false; break;
         case 'list': this.sim.viewerActed(); this.list = el.dataset.list; this.view = null; this.pageMenu = false; this.shelfMenu = null; break;
         // the page bar and the shelf
@@ -581,6 +603,12 @@
         case 'shelf-close': this.unshelve(id); break;
         case 'shelf-close-quiet': { const keep = this.shelf.filter((s) => { const it = e.byId.get(s.id); return it && (s.working || it.stream.some((m) => (m.who === 'ara' || m.who === 'in') && m.t > s.at)); }); this.shelf = keep; this.shelfMenu = null; break; }
         case 'dossier-filter': this.sim.viewerActed(); this.dossierFilter = el.dataset.filter; break;
+        case 'tree-toggle': this.sim.viewerActed(); this.treeOpen[id] = !this.treeOpen[id]; break;
+        // focus and aperture
+        case 'focus-menu': this.sim.viewerActed(); this.focusMenuOpen = !this.focusMenuOpen; this.menu = false; break;
+        case 'set-focus': this.sim.viewerActed(); e.setFocus(el.dataset.focus === 'null' ? null : JSON.parse(el.dataset.focus)); this.focusMenuOpen = false; this.sheet = null; break;
+        case 'release-focus': this.sim.viewerActed(); e.releaseFocus(); this.focusMenuOpen = false; break;
+        case 'aperture': this.sim.viewerActed(); e.setAperture(el.dataset.aperture); break;
         case 'view': this.sim.viewerActed(); this.sheet = null; this.picker = null; this.openView(id); break;
         case 'back': { const leaving = this.view && e.byId.get(this.view.id); this.view = null; this.draft = null; this.select = null; this.pageMenu = false; if (this.rec) this.stopRecording('abort');
           // Leaving while Ara is "answering" (a chip just tapped) parks the page on the shelf by itself; here Ara answers at once, so the automatic item simply shows her dot.
@@ -613,7 +641,7 @@
         case 'pick': if (!this.select || !this.select.uids.length) return; this.picker = { srcId: id, uids: this.select.uids.slice(), comment: '', title: '' }; break;
         case 'close-picker': this.picker = null; break;
         case 'pick-target': { const p = this.picker; if (!p) return; const tgt = e.reference(p.srcId, p.uids, el.dataset.target, p.comment); this.picker = null; this.select = null; if (tgt) this.showToast(`Added to “${tgt.title}” — the message shows the backlink.`); break; }
-        case 'pick-new': { const p = this.picker; if (!p) return; const title = (p.title || '').trim(); if (!title) { this.showToast('Give the new dossier a title.'); break; } const tgt = e.reference(p.srcId, p.uids, { title }, p.comment); this.picker = null; this.select = null; if (tgt) this.showToast(`New dossier “${tgt.title}” opened.`); break; }
+        case 'pick-new': { const p = this.picker; if (!p) return; const title = (p.title || '').trim(); if (!title) { this.showToast('Give the new dossier a title.'); break; } const tgt = e.reference(p.srcId, p.uids, { title, within: p.within || null }, p.comment); this.picker = null; this.select = null; if (tgt) this.showToast(`New dossier “${tgt.title}” opened.`); break; }
         case 'imp': { this.sim.viewerActed(); const it = e.byId.get(id); const v = Math.max(0, Math.min(5, it.importance + Number(el.dataset.delta))); if (v !== it.importance) e.correct(id, { importance: v }); break; }
         case 'due': { this.sim.viewerActed(); const it = e.byId.get(id); const d = el.dataset.delta; e.correct(id, { due: d === 'none' ? null : (it.due != null ? it.due : e.now) + Number(d) }); break; }
         case 'permit': { this.sim.viewerActed(); const it = e.byId.get(id); const m = e.mode(); e.permit(it.sender, m.id, !e.profile.permits[m.id].includes(it.sender)); break; }
@@ -627,6 +655,7 @@
       if (el.dataset.act === 'speed') { this.sim.speed = Number(el.value); return; }
       if (el.dataset.act === 'cloud-ok') { this.cloudOk = !!el.checked; try { localStorage.setItem('attention-voice-cloud', this.cloudOk ? '1' : '0'); } catch (_e) { /* no storage */ } this.renderVoiceLine(); return; }
       if (el.dataset.act === 'sel') { this.onClick({ target: el }); return; }
+      if (el.dataset.act === 'pick-within') { if (this.picker) this.picker.within = el.value || null; return; }
       if (el.dataset.act === 'model') { this.sim.viewerActed(); this.model = el.value; this.showToast(`${el.value} answers the next turn in this dossier.`); this.renderAll(); return; }
       if (el.dataset.act === 'lead') { this.sim.viewerActed(); this.engine.correct(el.dataset.id, { lead: Number(el.value) }); this.renderAll(); }
       if (el.dataset.act === 'due-set') { this.sim.viewerActed(); this.engine.correct(el.dataset.id, { due: el.value === 'none' ? null : Number(el.value) }); this.renderAll(); }

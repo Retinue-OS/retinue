@@ -104,6 +104,27 @@
       },
       free: { text: 'Noted.', chips: ['Ask for a status'] },
     },
+    'prj-crr': {
+      summary: 'Two pieces of work within: the import pipeline (yours), the handover docs (Studio Nord)',
+      opening: 'The CRR engagement: the import pipeline is yours, due in a week; the handover documentation waits on Studio Nord since four days. Beat Frei is in both the engagement and the pipeline.',
+      chips: ['Status of the pieces', 'Fine'],
+      replies: { 'Status of the pieces': { text: 'Import pipeline: schema done, loader half-way, due 11 September. Handover documentation: Studio Nord promised a draft this week.', chips: ['Fine'] }, 'Fine': { text: 'Noted.' } },
+      free: { text: 'Noted. The pieces have their own dossiers below this one.', chips: ['Status of the pieces'] },
+    },
+    'prj-crr-import': {
+      summary: 'Schema done, loader half-way; due 11 September',
+      opening: 'The import pipeline for CRR: schema done, the loader half-way. Due 11 September; Beat wants a demo before the signing.',
+      chips: ['Show the plan', 'Fine'],
+      replies: { 'Show the plan': { text: 'Loader this week, validation next Monday, demo for Beat on Tuesday.', chips: ['Fine'] }, 'Fine': { text: 'Noted.' } },
+      free: { text: 'Noted.', chips: ['Show the plan'] },
+    },
+    'prj-crr-docs': {
+      summary: 'Draft promised this week by Studio Nord',
+      opening: 'Waiting on Studio Nord for the handover documentation since four days; they promised a draft this week.',
+      chips: ['Nudge them', 'Fine, wait'],
+      replies: { 'Nudge them': { text: 'I will have the Secretary draft a short reminder; you approve it before it goes out.', chips: ['Fine, wait'] }, 'Fine, wait': { text: 'Waiting.', chips: ['Nudge them'] } },
+      free: { text: 'Noted.', chips: ['Nudge them'] },
+    },
     'prj-garden': { summary: 'Resting, no date', opening: 'Resting since July, no date. Wake it when you want to.', chips: [] },
     'prj-website': { summary: 'Done on 25 August', opening: 'Done on 25 August; the site is live.', chips: [] },
   };

@@ -273,3 +273,26 @@ code{font-family:"Source Code Pro","DejaVu Sans Mono",Menlo,monospace;font-size:
 .sh-menu button{text-align:left;min-height:38px;padding:0 10px;border:0;border-radius:8px;background:transparent;color:#e7ebf2;font:inherit;font-size:13px;cursor:pointer}
 .sh-menu button:hover{background:rgba(231,235,242,.08)}
 .tabs,.tab,.badge{display:none}
+
+/* focus and aperture */
+.focus-bar{display:flex;align-items:center;gap:8px;padding:0 12px 8px}
+.focus-chip{font:inherit;font-size:12px;color:#e7ebf2;background:#151922;border:1px solid #2a323b;border-radius:14px;padding:5px 11px;cursor:pointer;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:55%}
+.focus-chip.hand{border-color:#c9a0ff}
+.aperture{margin-left:auto;display:flex;align-items:center;gap:2px;background:#151922;border:1px solid #2a323b;border-radius:14px;padding:2px 8px 2px 4px}
+.notch{font:inherit;font-size:13px;color:#4a5563;background:none;border:0;cursor:pointer;padding:2px 3px;line-height:1}
+.notch.on{color:#6ea8fe}
+.notch:hover{color:#e7ebf2}
+.ap-name{font-size:10.5px;color:#8b93a3;margin-left:4px;white-space:nowrap}
+.snap{color:#e08a2e}
+.below-row{display:block;width:100%;font:inherit;font-size:11.5px;color:#8b93a3;background:#10141b;border:1px dashed #1f2630;border-radius:10px;padding:8px 12px;margin:2px 0 10px;cursor:pointer;text-align:left}
+.below-row:hover{color:#e7ebf2;border-color:#6ea8fe}
+.menu-pair{display:flex;gap:4px;margin:0 0 6px}
+.menu-pair .menu-row{margin:0}
+.menu-pair .menu-row.rel{flex:none;font-size:11.5px;color:#c9a0ff;padding:8px 10px}
+/* the tree */
+.tree-toggle{display:block;font:inherit;font-size:11px;color:#8b93a3;background:none;border:0;cursor:pointer;padding:0 0 6px 24px;text-align:left}
+.tree-child{margin-left:18px;border-left:2px solid #1f2630;padding-left:6px}
+.tree-line{display:flex;flex-wrap:wrap;gap:4px;padding:6px 12px 0}
+.tree-line .backlink.kid{color:#8b93a3;border-color:#2a323b;background:none}
+.tree-line .backlink.kid.pend{color:#e7ebf2;border-color:#6ea8fe}
+.tree-line .backlink small{color:#8b93a3;margin-left:3px}

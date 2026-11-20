@@ -107,6 +107,28 @@ nudges: a topic quiet for two weeks gets one question in its own stream,
 nearly that already. A resting dossier wakes on its date
 (`recurring-projects`, unchanged) or on a new message in it.
 
+### Nesting — a topic within a topic
+
+A dossier is not a folder: it holds *references* (a message belongs to one
+dossier and is referenced from many, each time with a comment), it is ordered
+by time, and it carries participants, state and deadline. But topics do
+**nest**: a topic may name one parent topic, `within:` (today's `goal:`,
+renamed). An engagement holds its pieces of work; the TreatmentBank migration
+sits within the Plazi engagement. Rules:
+
+- One parent at most, a topic only — relationships and standing dossiers have
+  none, and no dossier *contains* a relationship (a person's messages in a
+  sub-dossier still belong to the relationship; containment of messages is by
+  reference, containment of topics by tree, and the two never mix).
+- A child inherits the parent's sphere and importance unless it says
+  otherwise. Opening a child is an event in the parent's stream, and the
+  parent's page links its children with their states; a child's page links
+  its parent.
+- The parent's row shows its children's pending count; the Dossiers page
+  shows the tree, children collapsed. The focus on a dossier (below) covers
+  its descendants.
+- The gesture's *New dossier…* offers *within* a topic; `--within` on the CLI.
+
 ### Stream and events
 
 A dossier's page shows its stream, newest at the bottom like a chat, with a
@@ -243,14 +265,55 @@ traffic has no inbox and is not in Inbox Zero.
 
 ## The home and the lists
 
+### Focus and aperture
+
+The attention model has two controls folded into one knob, the mode chip with
+its presets. Pulled apart they answer the "eight minutes while the update
+reboots" case — a glance at what else is going on, without switching pages or
+modes, and without having to remember to switch back:
+
+- **Focus — what you are on.** Nothing (flow), one or more spheres, or **one
+  dossier** with its descendants. That is today's *Focused* scope (sphere ⊃
+  dossier), promoted to a chip in the home's header: `⌖ CRR data platform ▾`.
+  A dossier focus has a **related** variant: plus its parent, its siblings and
+  every dossier sharing a participant with it — Guido's Signal message shows
+  during CRR work because he is in CRR, whatever it is about.
+- **Aperture — how far outside the focus you see.** Inside the focus
+  everything pending is listed. Outside, the aperture sets the bar, and the
+  bar is the level the arithmetic already computes, so the notches are the
+  levels: **only this** (critical), **+ urgent** (time-sensitive), **+
+  active**, **everything**. A segmented chip on the phone, a slider on a wide
+  screen.
+
+The **mode is a preset** of (focus, aperture, permits), set by the schedule as
+today: *Deep work* = flow, only this; *Open* = flow, everything; *Social* =
+friends + family, only this. The hand controls deviate from the preset for the
+stint; a mode change — by schedule or by hand — clears them.
+
+**Widening is temporary, narrowing sticks.** A hand-widened aperture snaps back
+to the preset a few minutes after the last touch (a setting, 8 min by default)
+and the chip counts down; a narrowing holds until the mode changes. So the
+reboot case never needs a second gesture.
+
+**One rule for delivery and the list.** A dossier is *listed* when it is in
+the focus, or at or above the aperture's bar, or its sender holds a permit for
+the mode. What is listed *rings* from time-sensitive; critical rings always.
+The aperture governs the ring as the list — they are one thing, the mode; a
+list-only aperture would make two things with one name behave differently.
+**Looking is delivery:** what the wider aperture shows is released, as *pull*
+is today, and does not return in the next digest; new arrivals outside do.
+
 **Home** = dossiers that want something, using the attention arithmetic
 unchanged (`docs/attention-model.md`):
 
-1. **Now** — admitted by the current mode.
-2. **Active** — the rest, the current mode's spheres first, then *Other
-   spheres* collapsed. Importance, deadline and who holds the ball as
-   decoration on the row; the subtitle is the newest message or event.
-3. **Waiting** — collapsed, with ages.
+1. **Now** — rings in the mode in force.
+2. **In focus** — the rest of what the focus covers. Importance, deadline and
+   who holds the ball as decoration on the row; the subtitle is the newest
+   message or event.
+3. **Outside** — above the aperture; then one line, *+ n below the aperture —
+   widen to "+ urgent"*: one tap widens a notch, so what widening would buy is
+   always known.
+4. **Waiting** — collapsed, with ages.
 
 A **relationship appears on the home only while something is pending** in it
 (a message classified with a deadline or an actor), and leaves it when that is
@@ -267,8 +330,8 @@ newest message's preview and channel, unread badge, and the chip of any topic
 with something pending that references their messages. Search, edit and *+ New
 contact* stay.
 
-**Dossiers** (today's Projects page) = everything, behind *Active · Resting ·
-Done* and search.
+**Dossiers** (today's Projects page) = everything, as a tree (children
+collapsed), behind *Active · Resting · Done* and search.
 
 **No archive.** Topics close or rest; relationships are only ever sorted.
 **Mute** stays (silences pushes). Swipe right on any row = done (closes a
@@ -331,12 +394,15 @@ news rail.
    composer (Ara turns).
 5. **Inbox Zero.** The standing dossier, the early auto-resolutions, triage
    output as events; the omnibus retires.
-6. **Home on dossiers.** States and attention fields on frontmatter, the home
-   as above, Contacts and Dossiers pages; attention items retire; existing
-   threads migrate as Ara-only topics (read-only history); the chats' companion
-   threads fold into the relationships.
-7. **Mappings** with a brief, filed by the VIP turn or the batch.
-8. **One sender axis** (if open question 3 says yes).
+6. **Home on dossiers.** States and attention fields on frontmatter, `within:`
+   for the tree, the home as above, Contacts and Dossiers pages; attention
+   items retire; existing threads migrate as Ara-only topics (read-only
+   history); the chats' companion threads fold into the relationships.
+7. **Focus and aperture.** The two chips over the mode presets in
+   `focus.json`, the snap-back, the *below the aperture* line; the modes'
+   `admits` and `threshold` become `focus` and `aperture`.
+8. **Mappings** with a brief, filed by the VIP turn or the batch.
+9. **One sender axis** (if open question 3 says yes).
 
 ## Open questions
 
@@ -353,3 +419,8 @@ news rail.
    after the user's answer to Ara's question?
 6. **Several pending things with one person.** Separate topics by design;
    confirm that a relationship never needs more than one pending state.
+7. **Snap-back.** Eight minutes after the last widening, or at the next
+   breakpoint, whichever is sooner? And should a widening the user acted on
+   (opened a dossier, replied) hold longer?
+8. **Related.** Participants are the one relation used; should a reference
+   (a dossier quoting one of the focused dossier's messages) count too?
