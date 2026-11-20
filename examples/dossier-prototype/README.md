@@ -51,6 +51,7 @@ her dot, as on the dashboard.
 | Archive | archive + mute | **none** — a settled relationship sinks in Contacts; a topic is done or rests |
 | Forwarding | — | **the gesture**: ⋯ on a message → select → *Add to dossier…* with a comment → one event, a backlink under the message |
 | Mode | four presets, each an allow-list of spheres and a threshold | still the four presets — now of **focus** (flow · spheres · one dossier, with or without its relations) and **aperture** (only this · + urgent · + active · everything); two chips under the mode chip override the preset for the stint, a widening snaps back after eight minutes |
+| Quoting | a digest line names the mail; the content is a question to Ara | a referenced message is **quoted in place** — Inbox Zero's proposals, the gesture's events: folded to its first lines, a tap unfolds body and attachments, ↗ opens it in its dossier |
 | Hierarchy | projects flat (`goal:` unused by the UI) | **topics nest**: `within` one parent; the Dossiers page is a tree, a dossier's page links its parent and children, the focus on a dossier covers what is within it |
 
 The story's morning is focused work: at 08:30 the focus goes onto the CRR

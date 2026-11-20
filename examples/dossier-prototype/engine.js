@@ -153,7 +153,8 @@
         this._classify(x.item, x.triage, this.now, 'the batch');
         lines.push({ item: x.item, entry: x.entry, proposal: p.proposal || 'archive', chips: p.chips || [] });
       }
-      const ev = { who: 'event', author: 'agent:Ara', kind: 'turn', t: this.now, text: `Batch at ${hhmm(this.now)} — ${due.length} mail${due.length === 1 ? '' : 's'} judged:`, proposals: lines.map((l) => ({ from: l.item.title, subject: l.entry.subject, uid: l.entry.uid, proposal: l.proposal, importance: l.item.importance, due: l.item.due })), links: [] };
+      // The batch quotes every mail it judged: the proposal sits under the message itself, so nothing has to be asked for.
+      const ev = { who: 'event', author: 'agent:Ara', kind: 'turn', t: this.now, text: `Batch at ${hhmm(this.now)} — ${due.length} mail${due.length === 1 ? '' : 's'} judged:`, proposals: lines.map((l) => ({ quote: this._quote(l.item, l.entry), proposal: l.proposal, importance: l.item.importance, due: l.item.due })), links: [] };
       iz.stream.push(ev); this._touch(iz); iz.state = 'open'; iz.actor = 'you'; iz.released = true; iz.releasedBy = 'batch';
       iz.chips = [].concat(...lines.map((l) => l.chips)); iz.body = this._inboxBody(iz);
       this.emit({ kind: 'system', item: iz, text: `Inbox Zero (${reason}): ${lines.map((l) => `${l.item.title} → ${l.proposal}`).join('; ')}. The proposals are in its stream; what you deal with elsewhere leaves the inbox by itself.` });
@@ -427,7 +428,8 @@
       if (r.chips) iz.chips = [...new Set([...(iz.chips || []), ...r.chips])];
       return r;
     }
-    _quote(item, entry) { return { from: entry.from || item.title, channel: item.channel, t: entry.t, text: entry.text, subject: entry.subject || null, mail: !!entry.mail, uid: entry.uid, dossier: item.id }; }
+    // A quote: the message itself, carried by an event or an Ara turn — rendered in place, unfolded on a tap, never paraphrased.
+    _quote(item, entry) { return { from: entry.from || item.title, channel: item.channel, t: entry.t, text: entry.text, subject: entry.subject || null, mail: !!entry.mail, attachments: entry.attachments || [], uid: entry.uid, dossier: item.id, dossierTitle: item.title }; }
     // A relationship's pending state is settled; the dossier stays.
     _settle(item, how) { if (item.state !== 'open') return; item.state = item.kind === 'relationship' || item.kind === 'group' ? 'quiet' : 'done'; item.doneAt = this.now; item.doneHow = how; this.doneToday += 1; }
     // Send to the dossier's human participants (a relationship's channel); the pending state is settled.

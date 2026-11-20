@@ -155,6 +155,16 @@ link, so the file reads without the gateway); the life store gets
 `kb:DossierEvent` with `kb:references` to the message IRIs, so "which dossiers
 quote this message" is one query.
 
+**A referenced message is quoted in place, never paraphrased.** Wherever an
+event or an Ara turn carries a reference — the gesture's event, Inbox Zero's
+proposals, a digest line, a merge proposal — the stream renders the message
+itself: sender, channel, time, the first lines; a tap unfolds the whole (a
+mail's body, its attachments as chips, media inline), a second tap folds it;
+↗ opens it in its own dossier. So "show me that mail" is never a turn: the
+content is one tap away where it was mentioned. Ara's turns may quote the same
+way (`kb:references` on the turn), and the Secretary's reply proposals quote
+the message they answer.
+
 **The composer** writes to Ara by default (today's thread turn). A dossier with
 human participants has a channel switch — *to Ara* / *to the participants*
 (mail, Signal, …) — and an outbound message sent from a dossier is a message
@@ -251,9 +261,11 @@ the existing receipt rules. The gateway does this on its next pass.
 
 **What remains gets a proposal.** Ara's pass (the existing cadence: VIP
 senders soon, the rest in the daily run) adds one event to Inbox Zero per
-batch: each mail a referenced line with its proposed resolution and an inline
-*more* chip, one bulk chip to apply them all. "Tell me more about this offer"
-is a turn right there and its answer an event; if it becomes a decision, the
+batch: each mail **quoted** (folded to its first lines; a tap unfolds body and
+attachments) with its proposed resolution under it and its chips, one bulk chip
+to apply them all. Reading the mail costs no turn; "what does this offer
+actually mean for me" is a turn right there and its answer an event; if it
+becomes a decision, the
 gesture makes a topic of it. Ignored proposals do not pile up: the next batch
 restates only what is still in the inbox, and the dossier's row shows *n mails
 waiting* with the oldest's age.
