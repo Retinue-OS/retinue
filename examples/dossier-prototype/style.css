@@ -221,19 +221,21 @@ code{font-family:"Source Code Pro","DejaVu Sans Mono",Menlo,monospace;font-size:
 .ev-t{margin-left:auto}
 .ev-comment{color:#e7ebf2;margin-top:4px;font-size:13px}
 .ev-text{color:#cbd3dd;margin-top:4px}
-.quote{display:flex;align-items:stretch;background:#151922;border-left:3px solid #6ea8fe;border-radius:6px;margin-top:6px;overflow:hidden}
-.q-body{flex:1;min-width:0;text-align:left;font:inherit;color:#cbd3dd;background:none;border:0;padding:6px 8px;cursor:pointer}
-.q-body:hover{background:#1a1f2a}
-.q-jump{flex:none;font:inherit;font-size:13px;color:#8b93a3;background:none;border:0;border-left:1px solid #1f2630;padding:0 9px;cursor:pointer}
-.q-jump:hover{color:#6ea8fe}
-.q-from{display:block;font-size:10.5px;color:#8b93a3}
-.q-subj{display:block;font-weight:600;font-size:12px;margin-top:2px}
-.q-text{display:block;font-size:12.5px;margin-top:2px;white-space:pre-wrap}
-.q-text.clamp{display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}
-.q-more{display:inline-block;font-size:10.5px;color:#6ea8fe;margin:3px 8px 0 0}
-.quote.open .q-body{background:#10141b}
 .prop{margin-top:6px}
-.prop .quote{margin-top:0;border-radius:6px 6px 0 0}
+/* embedded objects: the object's own block, live, inside a bubble or an event */
+.embeds{display:flex;flex-direction:column;gap:6px;margin-top:6px}
+.embed{border:1px solid #2a323b;border-radius:12px;background:#0f131a;overflow:hidden}
+.embed.msg{padding:0 0 6px}
+.embed-from{display:block;width:100%;text-align:left;font:inherit;font-size:10.5px;color:#8b93a3;background:#151922;border:0;border-bottom:1px solid #1f2630;padding:5px 10px;cursor:pointer}
+.embed-from:hover{color:#e7ebf2}
+.embed.msg .bub-wrap{padding:6px 8px 0}
+.embed.msg .bub{max-width:100%;font-size:12.5px}
+.embed.row-embed .row{margin:0;border-radius:11px;background:transparent}
+.embed.row-embed .row:hover{background:#1a1f2a}
+.embed.gone{padding:8px 10px;font-size:11.5px;color:#8b93a3;font-style:italic}
+.bub.wide{max-width:96%}
+.bub.in.ara .embeds .bub.in{background:#1f2630;border:0}
+.p-what{display:block;font-size:11.5px;color:#cbd3dd;margin-top:4px;padding:0 4px}
 .p-what{display:block;font-size:11.5px;color:#cbd3dd;margin-top:2px}
 .to-row{display:flex;align-items:center;gap:6px;margin:0 0 6px;font-size:11px}
 .to-label{color:#8b93a3;text-transform:uppercase;letter-spacing:.8px;font-size:10px}

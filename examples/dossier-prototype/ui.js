@@ -67,7 +67,7 @@
       this.sim = new root.Simulation(this.engine, { onChange: () => this.renderAll(), ui: this });
       this.sheet = null; this.view = null; this.draft = null; this.toast = null; this.menu = false; this.otherOpen = false; this.waitingOpen = false;
       this.list = 'home'; this.dossierFilter = 'active'; this.to = {}; this.select = null; this.picker = null;
-      this.shelf = []; this.shelfMenu = null; this.pageMenu = false; this.model = 'Ara'; this.treeOpen = {}; this.focusMenuOpen = false; this.quoteOpen = {}; // the shelf and the page bar live on the device, as on the dashboard
+      this.shelf = []; this.shelfMenu = null; this.pageMenu = false; this.model = 'Ara'; this.treeOpen = {}; this.focusMenuOpen = false; // the shelf and the page bar live on the device, as on the dashboard
       this.files = {}; this.rec = null; this.job = null; this.attachError = ''; this.wave = new Waveform(() => this.phoneEl);
       this.sttUrl = null; this.cloudOk = false; try { this.cloudOk = localStorage.getItem('attention-voice-cloud') === '1'; } catch (_e) { /* no storage */ }
       this.localRecognition = null; // null = unknown, then true/false
@@ -312,28 +312,34 @@
     openView(id) { const item = this.engine.byId.get(id); if (!item) return; this.engine.ensureOpening(id); this.view = { id }; this.sheet = null; this.menu = false; this.pageMenu = false; this.shelfMenu = null; this.select = null; if (!this.draft || this.draft.id !== id) this.draft = null; }
     // Whom the composer addresses: 'chat' = the participants over their channel, 'ara' = Ara.
     addressee(item) { if (!isPeer(item)) return 'ara'; return this.to[item.id] || 'chat'; }
-    bubble(item, m, idx) {
-      const e = this.engine; const sel = this.select && this.select.id === item.id;
+    bubble(item, m, idx, embedded) {
+      const e = this.engine; const sel = !embedded && this.select && this.select.id === item.id;
       const links = (m.links || []).length ? `<div class="backlinks">${m.links.map((l) => `<button class="backlink" data-act="view" data-id="${esc(l.id)}">▣ ${esc(l.title)}</button>`).join('')}</div>` : '';
       const selBox = sel && (m.who === 'in' || m.who === 'out') ? `<label class="selbox"><input type="checkbox" data-act="sel" data-uid="${m.uid}"${this.select.uids.includes(m.uid) ? ' checked' : ''}></label>` : '';
-      const hold = !sel && (m.who === 'in' || m.who === 'out') ? `<button class="hold" data-act="select" data-id="${esc(item.id)}" data-uid="${m.uid}" title="Add to a dossier…">⋯</button>` : '';
+      const hold = !sel && !embedded && (m.who === 'in' || m.who === 'out') ? `<button class="hold" data-act="select" data-id="${esc(item.id)}" data-uid="${m.uid}" title="Add to a dossier…">⋯</button>` : '';
       if (m.who === 'in' || m.who === 'out') {
         const mail = m.mail ? `<div class="mail-card"><div class="mail-subj">✉ ${esc(m.subject || '(no subject)')}</div><div class="mail-from">${m.who === 'in' ? esc(m.from || item.title) : 'you'}${m.archived ? ` · <i>left the inbox: ${esc(m.archived)}</i>` : m.inbox ? ' · <i>in the inbox</i>' : ''}</div></div>` : '';
         return `<div class="bub-wrap ${m.who}">${selBox}<div class="bub ${m.who}${m.mail ? ' mail' : ''}">${m.who === 'in' && m.from && !m.mail ? `<div class="bub-from">${esc(m.from)}</div>` : ''}${mail}${m.text ? `<div class="bub-text">${esc(m.text)}</div>` : ''}${attachmentsHtml(m.attachments)}<div class="bub-t">${m.who === 'in' ? esc(m.from || item.title) : 'you'} · ${esc(item.channel || '')} · ${esc(whenText(m.t, e.now))}</div>${links}</div>${hold}</div>`;
       }
-      if (m.who === 'ara' || m.who === 'you') return `<div class="bub ${m.who === 'ara' ? 'in ara' : 'out toara'}">${m.text ? `<div class="bub-text">${esc(m.text)}</div>` : ''}${attachmentsHtml(m.attachments)}<div class="bub-t">${m.who === 'ara' ? (m.agent ? esc(m.agent) : 'Ara') : 'you → Ara'} · ${esc(whenText(m.t, e.now))}</div></div>`;
+      if (m.who === 'ara' || m.who === 'you') return `<div class="bub ${m.who === 'ara' ? 'in ara' : 'out toara'}${(m.refs || []).length ? ' wide' : ''}">${m.text ? `<div class="bub-text">${esc(m.text)}</div>` : ''}${attachmentsHtml(m.attachments)}${this.embedsHtml(m.refs)}<div class="bub-t">${m.who === 'ara' ? (m.agent ? esc(m.agent) : 'Ara') : 'you → Ara'} · ${esc(whenText(m.t, e.now))}</div></div>`;
       if (m.who === 'event') {
-        const quotes = (m.messages || []).map((q) => this.quoteHtml(q)).join('');
-        const props = (m.proposals || []).map((p) => `<div class="prop">${this.quoteHtml(p.quote)}<span class="p-what">→ ${esc(p.proposal)} · importance ${p.importance}${p.due != null ? ` · due ${esc(whenText(p.due, e.now))}` : ''}</span></div>`).join('');
+        const quotes = this.embedsHtml(m.messages) + this.embedsHtml(m.refs);
+        const props = (m.proposals || []).map((p) => `<div class="prop">${this.embedsHtml([p.quote])}<span class="p-what">→ ${esc(p.proposal)} · importance ${p.importance}${p.due != null ? ` · due ${esc(whenText(p.due, e.now))}` : ''}</span></div>`).join('');
         const who = m.author === 'you' ? 'you' : m.author.replace(/^(agent|job):/, (x, k) => (k === 'job' ? 'job ' : ''));
         return `<div class="event"><div class="ev-head"><span class="ev-kind">${esc(m.kind || 'event')}</span><span class="ev-who">${esc(who)}</span><span class="ev-t">${esc(whenText(m.t, e.now))}</span></div>${m.comment ? `<div class="ev-comment">${esc(m.comment)}</div>` : ''}${m.text ? `<div class="ev-text">${esc(m.text)}</div>` : ''}${quotes}${props}${(m.links || []).length ? `<div class="backlinks">${m.links.map((l) => `<button class="backlink" data-act="view" data-id="${esc(l.id)}">▣ ${esc(l.title)}</button>`).join('')}</div>` : ''}</div>`;
       }
       return '';
     }
-    // A quoted message, in place: folded to its first lines, unfolded on a tap (a mail's whole body, its attachments as chips); ↗ jumps to it in its dossier.
-    quoteHtml(q) {
-      const e = this.engine; const open = !!this.quoteOpen[q.uid]; const long = q.mail || (q.text || '').length > 140 || (q.attachments || []).length;
-      return `<div class="quote${open ? ' open' : ''}"><button class="q-body" data-act="quote-toggle" data-uid="${q.uid}" title="${open ? 'Fold' : 'Unfold'}"><span class="q-from">${esc(q.from)} · ${esc(q.channel)} · ${esc(whenText(q.t, e.now))}</span>${q.mail ? `<span class="q-subj">✉ ${esc(q.subject)}</span>` : ''}<span class="q-text${open ? '' : ' clamp'}">${esc(q.text)}</span>${open ? attachmentsHtml(q.attachments) : (q.attachments || []).length ? `<span class="q-more">📎 ${q.attachments.length}</span>` : ''}${long && !open ? '<span class="q-more">… unfold</span>' : ''}</button><button class="q-jump" data-act="view" data-id="${esc(q.dossier)}" title="Open in ${esc(q.dossierTitle || 'its dossier')}" aria-label="Open in its dossier">↗</button></div>`;
+    // Embedding: a referenced object appears as its own block, live — a message as the bubble its
+    // stream shows (read-only, with where it is from), a dossier as the row its list page shows.
+    // Nothing is copied or paraphrased; a tap opens the object where it lives.
+    embedsHtml(refs) {
+      const e = this.engine; if (!refs || !refs.length) return '';
+      return `<div class="embeds">${refs.map((r) => {
+        const x = e.resolve(r); if (!x) return '<div class="embed gone">— no longer there —</div>';
+        if (x.message) return `<div class="embed msg"><button class="embed-from" data-act="view" data-id="${esc(x.dossier.id)}">${KIND_GLYPH[x.dossier.kind]} ${esc(x.dossier.title)} · ${esc(e.kindLabel(x.dossier))} ↗</button>${this.bubble(x.dossier, x.message, 0, true)}</div>`;
+        const d = x.dossier; return `<div class="embed row-embed">${isPeer(d) ? this.contactRow(d) : d.state === 'open' && d.actor === 'you' ? this.row(d, 'active') : this.dossierRow(d)}</div>`;
+      }).join('')}</div>`;
     }
     viewHtml() {
       const e = this.engine; const item = e.byId.get(this.view.id); if (!item) { this.view = null; return ''; }
@@ -609,7 +615,6 @@
         case 'shelf-close-quiet': { const keep = this.shelf.filter((s) => { const it = e.byId.get(s.id); return it && (s.working || it.stream.some((m) => (m.who === 'ara' || m.who === 'in') && m.t > s.at)); }); this.shelf = keep; this.shelfMenu = null; break; }
         case 'dossier-filter': this.sim.viewerActed(); this.dossierFilter = el.dataset.filter; break;
         case 'tree-toggle': this.sim.viewerActed(); this.treeOpen[id] = !this.treeOpen[id]; break;
-        case 'quote-toggle': this.sim.viewerActed(); this.quoteOpen[el.dataset.uid] = !this.quoteOpen[el.dataset.uid]; break;
         // focus and aperture
         case 'focus-menu': this.sim.viewerActed(); this.focusMenuOpen = !this.focusMenuOpen; this.menu = false; break;
         case 'set-focus': this.sim.viewerActed(); e.setFocus(el.dataset.focus === 'null' ? null : JSON.parse(el.dataset.focus)); this.focusMenuOpen = false; this.sheet = null; break;

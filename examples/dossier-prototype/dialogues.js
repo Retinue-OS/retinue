@@ -53,7 +53,7 @@
       opening: 'The tax office wants the signed 2025 income statement, the balance sheet and the depreciation schedule by 30 September. Your accountant has all three; I can draft the cover note.',
       chips: ['Ask the accountant', 'Draft the cover note', 'What do they need exactly?'],
       replies: {
-        'What do they need exactly?': { text: 'The signed 2025 income statement and balance sheet, plus the depreciation schedule — the letter is quoted above.', chips: ['Ask the accountant', 'Draft the cover note'] },
+        'What do they need exactly?': { text: 'The signed 2025 income statement and balance sheet, plus the depreciation schedule — the letter itself is above, in the first event.', chips: ['Ask the accountant', 'Draft the cover note'] },
         'Ask the accountant': { text: 'Asked Frau Zeller for the three documents; she usually answers within a day. This dossier waits on her now — her reply will land here.', waitOn: 'the accountant' },
         'Draft the cover note': { text: 'Drafted: reference to their letter, the three enclosures, your signature line. I will send it with the documents once they arrive.', chips: ['Ask the accountant'] },
       },
@@ -106,9 +106,10 @@
     },
     'prj-crr': {
       summary: 'Two pieces of work within: the import pipeline (yours), the handover docs (Studio Nord)',
-      opening: 'The CRR engagement: the import pipeline is yours, due in a week; the handover documentation waits on Studio Nord since four days. Beat Frei is in both the engagement and the pipeline.',
+      opening: 'The CRR engagement: two pieces of work within it, and Beat Frei is in both the engagement and the pipeline.',
+      embed: ['prj-crr-import', 'prj-crr-docs'],
       chips: ['Status of the pieces', 'Fine'],
-      replies: { 'Status of the pieces': { text: 'Import pipeline: schema done, loader half-way, due 11 September. Handover documentation: Studio Nord promised a draft this week.', chips: ['Fine'] }, 'Fine': { text: 'Noted.' } },
+      replies: { 'Status of the pieces': { text: 'Import pipeline: schema done, loader half-way, due 11 September. Handover documentation: Studio Nord promised a draft this week.', embed: ['prj-crr-import', 'prj-crr-docs'], chips: ['Fine'] }, 'Fine': { text: 'Noted.' } },
       free: { text: 'Noted. The pieces have their own dossiers below this one.', chips: ['Status of the pieces'] },
     },
     'prj-crr-import': {
@@ -233,7 +234,7 @@
       proposal: 'open a dossier — 2025 statement due 30 September, importance 5',
       chips: ['Open the tax dossier', 'Just archive the letter'],
       replies: {
-        'Open the tax dossier': { text: 'Opened “Tax statement 2025” with the letter as its first event; the letter leaves the inbox and shows the backlink.', dossier: { id: 'top-tax', title: 'Tax statement 2025', body: 'The 2025 statement for the tax office, due 30 September.', comment: 'Letter via ePost, 3 Sept. The accountant has the documents.' } },
+        'Open the tax dossier': { text: 'Opened a dossier with the letter as its first event; the letter leaves the inbox and shows the backlink.', dossier: { id: 'top-tax', title: 'Tax statement 2025', body: 'The 2025 statement for the tax office, due 30 September.', comment: 'Letter via ePost, 3 Sept. The accountant has the documents.' } },
         'Just archive the letter': { text: 'Archived. The deadline stays on the tax office’s relationship until you settle it.', resolve: 'archived' },
       },
     },

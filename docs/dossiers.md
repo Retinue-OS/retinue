@@ -155,15 +155,20 @@ link, so the file reads without the gateway); the life store gets
 `kb:DossierEvent` with `kb:references` to the message IRIs, so "which dossiers
 quote this message" is one query.
 
-**A referenced message is quoted in place, never paraphrased.** Wherever an
-event or an Ara turn carries a reference — the gesture's event, Inbox Zero's
-proposals, a digest line, a merge proposal — the stream renders the message
-itself: sender, channel, time, the first lines; a tap unfolds the whole (a
-mail's body, its attachments as chips, media inline), a second tap folds it;
-↗ opens it in its own dossier. So "show me that mail" is never a turn: the
-content is one tap away where it was mentioned. Ara's turns may quote the same
-way (`kb:references` on the turn), and the Secretary's reply proposals quote
-the message they answer.
+**A referenced object is embedded, live, as its own block.** A reference is an
+address, never a copy or a paraphrase, and wherever an event or an Ara turn
+carries one — the gesture's event, Inbox Zero's proposals, a merge proposal,
+Ara's overview of an engagement — the stream renders the object the way its
+own page does: a **message** as the bubble its dossier shows (mail card,
+attachments, media; read-only, headed by where it is from), a **dossier** as
+the row the Dossiers or Contacts page shows, with its current state, and a
+**relationship** as its Contacts row. The block is the same component in both
+places, so it is as current as the list — a dossier embedded in yesterday's
+turn shows today's state — and a tap opens the object where it lives. "Show
+me that mail" is therefore never a turn: the mail is already in the message
+that mentioned it. Ara's turns carry `kb:references` to the same end; the
+Secretary's reply proposals embed the message they answer. A reference whose
+object is gone renders as a short tombstone.
 
 **The composer** writes to Ara by default (today's thread turn). A dossier with
 human participants has a channel switch — *to Ara* / *to the participants*
@@ -261,9 +266,9 @@ the existing receipt rules. The gateway does this on its next pass.
 
 **What remains gets a proposal.** Ara's pass (the existing cadence: VIP
 senders soon, the rest in the daily run) adds one event to Inbox Zero per
-batch: each mail **quoted** (folded to its first lines; a tap unfolds body and
-attachments) with its proposed resolution under it and its chips, one bulk chip
-to apply them all. Reading the mail costs no turn; "what does this offer
+batch: each mail **embedded** as its own bubble, with its proposed resolution
+under it and its chips, one bulk chip to apply them all. Reading the mail costs
+no turn; "what does this offer
 actually mean for me" is a turn right there and its answer an event; if it
 becomes a decision, the
 gesture makes a topic of it. Ignored proposals do not pile up: the next batch

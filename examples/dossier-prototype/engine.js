@@ -386,7 +386,7 @@
       if (item.kind === 'standing') { if (!item.stream.length) item.stream.push({ who: 'ara', text: item.body, t: this.now }); if (!item.chips) item.chips = []; return item; }
       if (item.kind === 'topic' && item.state !== 'open') { item.chips = []; return item; }
       const opening = d && d.opening ? d.opening : (item.kind === 'relationship' || item.kind === 'group' ? null : item.body);
-      if (opening) item.stream.push({ who: 'ara', text: this._fill(opening, item), t: item.kind === 'topic' && item.arrived != null && item.arrived > 0 ? item.arrived : this.now });
+      if (opening) item.stream.push({ who: 'ara', text: this._fill(opening, item), t: item.kind === 'topic' && item.arrived != null && item.arrived > 0 ? item.arrived : this.now, refs: d && d.embed ? d.embed.map((id) => this.ref(id)).filter((x) => this.byId.has(x.id)) : [] });
       item.chips = d && d.chips ? d.chips.slice() : [];
       return item;
     }
@@ -398,7 +398,7 @@
       const inboxReply = item.kind === 'standing' ? this._inboxReply(item, text) : null;
       const filed = attachments.length ? `Filed ${attachments.map((a) => a.name).join(', ')} with this dossier.` : '';
       const r = inboxReply || (d && d.replies && d.replies[text]) || (text ? (d && d.free) || { text: 'Noted. I keep this with the dossier.' } : { text: filed || 'Noted.' });
-      const reply = { who: 'ara', text: (text && filed ? filed + ' ' : '') + this._fill(r.text, item), t: this.now };
+      const reply = { who: 'ara', text: (text && filed ? filed + ' ' : '') + this._fill(r.text, item), t: this.now, refs: r.embed ? r.embed.map((id) => this.ref(id)).filter((x) => this.byId.has(x.id)) : [] };
       item.stream.push(reply); if (!inboxReply) item.chips = r.chips ? r.chips.slice() : (r.done || r.later || r.waitOn ? [] : item.chips);
       const short = (x) => (x.length > 70 ? x.slice(0, 67) + '…' : x);
       this.emit({ kind: 'action', item, text: `${item.title} — you, to Ara: “${short(text)}”${attachments.length ? ` + ${attachments.length} file${attachments.length === 1 ? '' : 's'}` : ''} · Ara: “${short(reply.text)}”` });
@@ -422,14 +422,16 @@
         this._settle(x.item, 'handed over'); this._leaveInbox(x.entry, `referenced in “${topic.title}”`);
         this._arrive(topic, this.now);
         this.emit({ kind: 'action', item: topic, text: `New dossier “${topic.title}” with the mail from ${x.item.title} as its first event; the mail shows the backlink.` });
-        iz.stream.push({ who: 'event', author: 'agent:Ara', kind: 'status', t: this.now, text: `Opened “${topic.title}” — importance ${topic.importance}, ${this.urgencyShort(topic)}.`, links: [{ id: topic.id, title: topic.title }] });
+        iz.stream.push({ who: 'event', author: 'agent:Ara', kind: 'status', t: this.now, text: `Opened a dossier for it:`, refs: [this.ref(topic.id)], links: [] });
       }
       if (iz.chips) iz.chips = iz.chips.filter((c) => !(D[hit.sender].chips || []).includes(c) || (r.keep && r.keep.includes(c)));
       if (r.chips) iz.chips = [...new Set([...(iz.chips || []), ...r.chips])];
       return r;
     }
-    // A quote: the message itself, carried by an event or an Ara turn — rendered in place, unfolded on a tap, never paraphrased.
-    _quote(item, entry) { return { from: entry.from || item.title, channel: item.channel, t: entry.t, text: entry.text, subject: entry.subject || null, mail: !!entry.mail, attachments: entry.attachments || [], uid: entry.uid, dossier: item.id, dossierTitle: item.title }; }
+    // A reference is an address, never a copy: the renderer embeds the object's own block, live.
+    _quote(item, entry) { return { type: 'message', dossier: item.id, uid: entry.uid }; }
+    ref(id) { return { type: 'dossier', id }; }
+    resolve(r) { if (!r) return null; if (r.type === 'dossier') { const d = this.byId.get(r.id); return d ? { dossier: d } : null; } const d = this.byId.get(r.dossier); const m = d && d.stream.find((x) => x.uid === r.uid); return m ? { dossier: d, message: m } : null; }
     // A relationship's pending state is settled; the dossier stays.
     _settle(item, how) { if (item.state !== 'open') return; item.state = item.kind === 'relationship' || item.kind === 'group' ? 'quiet' : 'done'; item.doneAt = this.now; item.doneHow = how; this.doneToday += 1; }
     // Send to the dossier's human participants (a relationship's channel); the pending state is settled.
@@ -450,7 +452,7 @@
       if (!tgt && target && target.title) {
         const parent = target.within ? this.byId.get(target.within) : null;
         tgt = this._add(this._newItem({ id: `top-${++this.seq}`, kind: 'topic', title: target.title, body: comment || '', sphere: parent ? parent.sphere : src.sphere, tags: [], importance: parent ? parent.importance : src.importance, importanceFrom: parent ? 'inherited' : 'prior', due: null, kindLabel: 'admin chore', participants: [src.title], within: parent ? parent.id : null }));
-        if (parent) { parent.stream.push({ who: 'event', author: 'you', kind: 'status', t: this.now, text: `Opened the sub-dossier “${tgt.title}”.`, links: [{ id: tgt.id, title: tgt.title }] }); this._touch(parent); }
+        if (parent) { parent.stream.push({ who: 'event', author: 'you', kind: 'status', t: this.now, text: 'Opened a sub-dossier:', refs: [this.ref(tgt.id)], links: [] }); this._touch(parent); }
         this._arrive(tgt, this.now);
       }
       if (!tgt) return null;
