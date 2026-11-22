@@ -21,26 +21,30 @@ data it carries and keeps what it records on the device.
 
 ## Principle: security does not depend on where the app is loaded from
 
-An app never runs on the dashboard's origin. A page there shares the
-dashboard's sign-in and can act in any of its pages (approving a pending send
-included); no header tells such a page's requests from the dashboard's own.
-A permission list that is only a promise is not a permission.
+An app never runs **as** the dashboard's origin. A page with that origin
+shares the dashboard's sign-in and can act in any of its pages (approving a
+pending send included); no header tells such a page's requests from the
+dashboard's own. A permission list that is only a promise is not a
+permission. (The dashboard still runs apps — in a sandboxed frame with an
+opaque origin, see "Hosts".)
 
 So every app call reaches Retinue **through a host, with a capability token
 bound to that app**, and the gateway enforces the app's granted capabilities
 on every call, whatever origin, device or path the app was loaded from:
 
-- the app runs on an origin of its own (the extension's, the Android app's
-  per-app WebView origin, or wherever it is hosted);
+- the app runs on an origin of its own (an opaque origin in the dashboard's
+  sandboxed frame, the extension's, the Android app's per-app WebView origin,
+  or wherever it is hosted);
 - the host holds the token; the app's own script never sees it;
 - the gateway's app API accepts **only** such tokens, never the dashboard's
   sign-in, and refuses anything beyond the token's capabilities;
 - the endpoints that act with the user's authority (send approval, sign-in,
   settings) accept no app token at all.
 
-The **browser extension is built first**, because it admits no shortcut: it
-cannot borrow the dashboard's sign-in, so the token path has to be complete
-before anything works. The Android app then reuses the same path.
+Three hosts share this one path: **the dashboard**, the **browser
+extension** and the **Ara Android app**. The extension is the test that keeps
+the path honest: it cannot borrow the dashboard's sign-in, so nothing works
+unless the token path is complete.
 
 ## What a chamber ships
 
@@ -107,6 +111,7 @@ Identical in every host, feature-detected member by member:
 | `schedule(job)` / `unschedule(id)` / `jobs()` | reminders (a notification at a time) and agent jobs (a prompt run by the scheduler, once or recurring) | `scheduler.py`, jobs per app under `/root/.retinue/apps/<chamber>/<app>/schedule.json`, ids `app:<chamber>:<app>:<id>`, listed with their app |
 | `speak(text, lang)` | speech output | host-local (extension TTS, native TTS) |
 | `notify(title, body)` | a notification | host-local |
+| `storage.get/set/remove(key)` | small per-app key-value store | host-local (the dashboard host keeps it in its own IndexedDB, keyed per app) |
 
 Agent jobs are included: an app that may `ask` an agent can spend model credit
 anyway, so withholding the scheduler protects nothing. They are listed with
@@ -114,14 +119,35 @@ their app on the scheduler's listing and stop when the grant is revoked.
 
 ## Hosts
 
-- **Browser extension (first).** Pairs once with a Retinue instance, lists its
-  apps, runs them from the extension's origin, relays calls with the app
-  token, and shows the consent and revocation UI. Tracked separately.
+- **The dashboard.** An *Apps* tab lists the apps; opening one shows it in an
+  `<iframe sandbox="allow-scripts">` — **no** `allow-same-origin`, so the
+  frame has an opaque origin: no access to the dashboard's cookies, storage
+  or DOM, no top-level navigation, no pop-ups. The app's files are served
+  from `/apps/run/<chamber>/<app>/…` with a response header
+  `Content-Security-Policy: sandbox allow-scripts` plus the dashboard's
+  script policy, so they stay sandboxed even when opened directly as a page.
+  The dashboard page around the frame is the host: it injects nothing into
+  the frame, but answers the app's `postMessage` requests (the `retinue.js`
+  shim the app loads speaks this protocol when it finds itself framed),
+  checks the message source is that frame, and relays to `/apps/api/…` with
+  the app's token, which the frame never sees. A request the frame sends to
+  the gateway by itself arrives cross-site and without a token, and is
+  refused. Opaque origins get no service worker or persistent storage, so
+  inside the dashboard the host offers `Retinue.storage` (a small per-app
+  key-value store kept on the device by the host page); standalone the app
+  uses its own storage and service worker.
+- **Browser extension.** Pairs once with a Retinue instance, lists its apps,
+  runs them from the extension's origin (or injects the client into an
+  allowed origin where an app is hosted elsewhere), relays calls with the app
+  token, shows consent and revocation.
 - **Ara Android app.** Ara has no home screen of its own, so chamber apps
-  appear **inside Ara** as apps alongside the dashboard: a list to open them
-  from, each in its own WebView origin with the same injected client, speech
-  and notifications native. Tracked in the `ara-android` repository.
-- **The dashboard** only lists apps and manages grants; it never runs one.
+  appear inside Ara as apps alongside the dashboard: a list to open them
+  from, each in its own WebView origin with the same client, speech and
+  notifications native. Tracked in the `ara-android` repository.
+
+All three show the same consent sheet on first open and use the same grant
+(`POST /apps/grant`, the dashboard's own authenticated request), revocable
+on the dashboard.
 
 ## Data written by apps
 
