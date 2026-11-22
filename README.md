@@ -7,10 +7,77 @@ of personal agents, coordinated by Ara. The core is a small generic harness
 agents/skills, each of which can be a Claude Code plugin (scoped to its
 `.retinue/` subdirectory).
 
+Retinue is designed [accessibility first](#accessibility-first): it adapts to
+people with ADHD by deciding what deserves attention and when, and it supports
+spoken language on every surface, aspiring to completely hands-free use.
+
 Retinue is content-neutral: which chambers exist is declared by the
 **deployment**, not baked into the framework. Two runnable example chambers ship
 under [`examples/chambers/`](examples/chambers/) (Westworld/Dolores and
 Hitchhiker/Marvin) as the canonical "how to author a chamber" reference.
+
+## Accessibility first
+
+Retinue is built to be usable by people for whom the usual personal-software
+stack — an inbox per channel, a bell per arrival, a keyboard for everything —
+does not work. Two properties run through the whole system rather than sitting
+in a settings page.
+
+### Adaptive to ADHD
+
+The system carries the load that executive function would otherwise have to:
+deciding what matters now, remembering what is parked, and coming back to it
+at the right time.
+
+- **Interruptions are decided, not delivered on arrival.** Every thread, chat
+  and project has an importance, an optional deadline with a lead time, and a
+  sphere. From those and the current focus mode the gateway decides whether an
+  item rings now, waits for the next digest, or is merely listed. Only what is
+  time-sensitive or critical breaks through
+  ([`docs/attention-model.md`](docs/attention-model.md)).
+- **Modes describe how interruptible you are**, not what hour it is: *Chores*,
+  *Focused* (scoped to nothing, one sphere or one project), *Social*, *Rest &
+  relax*. A deployment renames and adds its own.
+- **A digest instead of a firehose or a mute button.** Held items arrive
+  batched at breakpoints — mode changes and a few fixed times a day — and a
+  deadline bounds how long anything may wait, so deferring never becomes
+  forgetting.
+- **One list of what wants attention**, across messengers, e-mail, threads and
+  projects, each row with a reason for its rank and a one-tap correction the
+  system learns from.
+- **Nothing depends on you remembering it.** Projects are parked on whoever
+  they wait for and wake by themselves when their date comes; recurring ones
+  return on their cadence; an inbox is a letterbox that gets emptied and
+  filed, not a shelf to keep tidy.
+- **Decisions come as choices.** Agents look up what is already known before
+  asking, and what they do ask is answered with a tap on a chip rather than by
+  composing a reply.
+
+### Spoken language everywhere — aspiring to completely hands-free use
+
+Voice is a first-class way in and out on every surface, not an add-on to a
+text interface:
+
+- **Dictation in every composer**, transcribed by the stack's own `stt`
+  service and tidied by a cleanup pass; detection is constrained to the
+  languages the user actually speaks, with no language privileged.
+- **Answers read aloud**, per thread or always.
+- **Continuous conversation**: a per-thread loop of listen → answer → read
+  aloud → listen again, with voice-activity detection ending each take, and
+  ended by simply telling Ara to switch it off.
+- **A wake phrase** in the Ara Android app opens that loop without touching
+  the phone; the app can also place a phone call the conversation asked for,
+  on speakerphone.
+- **Messengers speak too**: incoming voice notes are transcribed on all
+  gateways, and a Signal control channel answers in audio.
+
+Completely hands-free operation is the goal, not yet the state: some steps
+still deliberately or incidentally need a tap — approving a queued send,
+confirming keystrokes on a paired device, pairing and settings. Mechanics:
+[`docs/dashboard.md`](docs/dashboard.md), "Speech-to-text (the `stt` service)
+and voice input".
+
+## Services
 
 Defines these core compose services:
 
