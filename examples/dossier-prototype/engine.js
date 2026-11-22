@@ -23,24 +23,27 @@
 
   // A mode is a preset of the two controls (docs/dossiers.md, "Focus and aperture"):
   // the FOCUS — what you are on: nothing (flow), some spheres, or one dossier —
-  // and the APERTURE — how far outside the focus you see: the level a dossier
-  // outside the focus needs to be listed. Inside the focus everything pending is
-  // listed; anything listed rings from time-sensitive, critical always.
+  // and the APERTURE — how far from the focus you see, as rings of distance in
+  // the relations the data has: within (the tree), participants, spheres and the
+  // spheres within spheres. Urgency is a different question: critical rings
+  // always; what is listed rings from time-sensitive; the "below the aperture"
+  // line counts the urgent ones out of sight.
   const APERTURES = [
-    { id: 'only',   name: 'only this', bar: 'critical',       glyph: '◔', blurb: 'outside the focus only critical shows' },
-    { id: 'urgent', name: '+ urgent',  bar: 'time-sensitive', glyph: '◑', blurb: 'outside the focus, what is time-sensitive shows too' },
-    { id: 'active', name: '+ active',  bar: 'active',         glyph: '◕', blurb: 'outside the focus, everything with a deadline in reach shows' },
-    { id: 'all',    name: 'everything', bar: 'passive',       glyph: '●', blurb: 'no aperture: everything pending shows' },
+    { id: 'strict', ring: 0, name: 'strictly',   glyph: '◔', blurb: 'the focus itself: the dossier and what is within it, or the sphere' },
+    { id: 'people', ring: 1, name: '+ people',   glyph: '◑', blurb: 'plus its parent and siblings, and whatever shares a participant' },
+    { id: 'nearby', ring: 2, name: '+ nearby',   glyph: '◕', blurb: 'plus the same sphere and the spheres around it' },
+    { id: 'all',    ring: 3, name: 'everything', glyph: '●', blurb: 'no focus: everything pending shows' },
   ];
+  // Spheres within spheres (focus.json `within`): the one structure that says which spheres are near.
+  const SPHERE_WITHIN = { finance: 'admin' };
   const MODES = {
-    off:    { id: 'off',    name: 'Off',       focus: null,                                                   aperture: 'only',   color: '#3a4250', blurb: 'flow, only critical; the digest waits for the morning' },
-    home:   { id: 'home',   name: 'Home',      focus: { spheres: ['family', 'health'], tags: [] },            aperture: 'only',   color: '#a86f2c', blurb: 'focus on family and health' },
-    deep:   { id: 'deep',   name: 'Deep work', focus: null,                                                   aperture: 'only',   color: '#0f4f57', blurb: 'flow: only critical breaks through' },
+    off:    { id: 'off',    name: 'Off',       focus: null,                                                   aperture: 'strict', color: '#3a4250', blurb: 'flow, only critical; the digest waits for the morning' },
+    home:   { id: 'home',   name: 'Home',      focus: { spheres: ['family', 'health'], tags: [] },            aperture: 'strict', color: '#a86f2c', blurb: 'focus on family and health' },
+    deep:   { id: 'deep',   name: 'Deep work', focus: null,                                                   aperture: 'strict', color: '#0f4f57', blurb: 'flow: only critical breaks through' },
     open:   { id: 'open',   name: 'Open',      focus: null,                                                   aperture: 'all',    color: '#8a94a0', blurb: 'no focus, everything shows; time-sensitive rings' },
-    work:   { id: 'work',   name: 'Work',      focus: { spheres: ['customers', 'admin', 'health'], tags: ['health'] }, aperture: 'only', color: '#2f8a90', blurb: 'focus on customers, admin and health' },
-    social: { id: 'social', name: 'Social',    focus: { spheres: ['friends', 'family'], tags: ['health'] },   aperture: 'only',   color: '#7a4f96', blurb: 'focus on friends and family' },
+    work:   { id: 'work',   name: 'Work',      focus: { spheres: ['customers', 'admin', 'health'], tags: ['health'] }, aperture: 'strict', color: '#2f8a90', blurb: 'focus on customers, admin and health' },
+    social: { id: 'social', name: 'Social',    focus: { spheres: ['friends', 'family'], tags: ['health'] },   aperture: 'strict', color: '#7a4f96', blurb: 'focus on friends and family' },
   };
-  const WIDEN_MINUTES = 8; // a hand-widened aperture snaps back after this (a setting in a deployment)
   const SCHEDULE = [[0, 'off'], [7 * H, 'home'], [8 * H, 'deep'], [12 * H, 'open'], [13 * H, 'work'], [17 * H, 'open'], [18 * H, 'social'], [22 * H, 'off']];
   const DIGEST_TIMES = [8 * H, 12 * H, 17 * H, 21 * H];
   const SWEEP_EVERY = 30;
@@ -60,7 +63,7 @@
       this.manualMode = null; this.doneToday = 0; this.corrections = 0; this.modeHistory = []; this.version = 0; this.seq = 0;
       this.modes = clone(MODES);
       // The hand controls over the preset: a focus set for this stint, an aperture widened for a few minutes or narrowed for the stint.
-      this.override = { focus: undefined, aperture: null, apertureUntil: null };
+      this.override = { focus: undefined, aperture: null };
       this.profile = { priors: { ...B.PRIORS }, leads: { ...B.LEAD_DEFAULTS }, permits: { off: [], home: [], deep: [], open: [], work: [], social: [] }, learned: [] };
       this.eventsByMinute = new Map();
       for (const be of B.all) for (const ev of be.events(0, DAY)) { const m = Math.round(ev.at); if (!this.eventsByMinute.has(m)) this.eventsByMinute.set(m, []); this.eventsByMinute.get(m).push(ev); }
@@ -205,28 +208,41 @@
     children(id) { return this.items.filter((i) => i.within === id); }
     pendingDescendants(item) { const kids = this.children(item.id); return kids.filter((k) => k.state === 'open').length + kids.reduce((n, k) => n + this.pendingDescendants(k), 0); }
     participantsOf(item) { if (item.kind === 'relationship' || item.kind === 'group') return [item.title]; return item.participants || []; }
-    // In the focus: the dossier itself, its descendants, and — with "related" — its parent, its siblings and every dossier sharing a participant.
-    inFocus(item, f = this.focus()) {
-      if (!f) return false;
-      if (f.spheres) return f.spheres.includes(item.sphere) || item.tags.some((t) => (f.tags || []).includes(t));
-      const root = this.byId.get(f.dossier); if (!root) return false;
-      if (item.id === root.id || this.ancestors(item).includes(root)) return true;
-      if (!f.related) return false;
-      if (root.within && (item.id === root.within || item.within === root.within)) return true;
-      const ps = this.participantsOf(root); if (!ps.length) return false;
-      const ownPs = this.participantsOf(item); if (ownPs.some((p) => ps.includes(p))) return true;
-      return this.children(root.id).some((k) => this.participantsOf(k).some((p) => ownPs.includes(p)));
+    // The distance of a dossier from the focus, as a ring: 0 strictly in it, 1 by
+    // people (parent, siblings, a shared participant), 2 nearby (the same sphere,
+    // or a sphere within it or around it), 3 everything else. No focus: 0 for all.
+    sphereNear(a, b) { if (a === b) return true; return SPHERE_WITHIN[a] === b || SPHERE_WITHIN[b] === a || (SPHERE_WITHIN[a] && SPHERE_WITHIN[a] === SPHERE_WITHIN[b]); }
+    distance(item, f = this.focus()) {
+      if (!f) return 3;
+      if (f.spheres) {
+        const inSphere = (i) => f.spheres.includes(i.sphere) || i.tags.some((t) => (f.tags || []).includes(t));
+        if (inSphere(item)) return 0;
+        const ps = this.participantsOf(item);
+        if (ps.length && this.items.some((i) => i !== item && i.state === 'open' && inSphere(i) && this.participantsOf(i).some((p) => ps.includes(p)))) return 1;
+        if (f.spheres.some((s) => this.sphereNear(s, item.sphere)) || item.tags.some((t) => f.spheres.some((s) => this.sphereNear(s, t)))) return 2;
+        return 3;
+      }
+      const root = this.byId.get(f.dossier); if (!root) return 3;
+      if (item.id === root.id || this.ancestors(item).includes(root)) return 0;
+      if (root.within && (item.id === root.within || item.within === root.within)) return 1;
+      const ps = this.participantsOf(root).concat(...this.children(root.id).map((k) => this.participantsOf(k)));
+      if (ps.length && this.participantsOf(item).some((p) => ps.includes(p))) return 1;
+      if (this.sphereNear(root.sphere, item.sphere) || item.tags.some((t) => this.sphereNear(root.sphere, t)) || root.tags.some((t) => this.sphereNear(t, item.sphere))) return 2;
+      return 3;
     }
+    inFocus(item, f = this.focus()) { return !!f && this.distance(item, f) === 0; }
+    ringName(d) { return APERTURES[Math.min(d, 3)].name; }
     hasPermit(item) { return !!item.sender && this.profile.permits[this.mode().id].includes(item.sender); }
-    // Admitted = listed: in the focus, or at or above the aperture's bar, or by a permit.
-    admitted(item) { return this.inFocus(item) || rank(this.level(item)) >= rank(this.aperture().bar) || this.hasPermit(item); }
+    // Admitted = listed: within the aperture's ring, or by a permit.
+    admitted(item) { return this.distance(item) <= this.aperture().ring || this.hasPermit(item); }
     admissionReason(item) {
-      const mode = this.mode(); const f = this.focus(); const a = this.aperture();
+      const mode = this.mode(); const f = this.focus(); const a = this.aperture(); const d = this.distance(item);
       if (this.level(item) === 'critical') return 'critical rings in every mode';
-      if (f && this.inFocus(item)) return f.spheres ? `in focus — ${mode.name} covers ${f.spheres.includes(item.sphere) ? item.sphere : 'the tag ' + item.tags.find((t) => (f.tags || []).includes(t))}` : `in focus — ${item.id === f.dossier ? 'the focused dossier' : this.ancestors(item).some((p) => p.id === f.dossier) ? 'within ' + this.byId.get(f.dossier).title : 'related to ' + this.byId.get(f.dossier).title}`;
+      if (!f) return a.ring >= 3 ? 'no focus — everything shows' : `flow — nothing is in focus, and the aperture is ${a.name}`;
+      if (d === 0) return f.spheres ? `in focus — ${mode.name} covers ${f.spheres.includes(item.sphere) ? item.sphere : 'the tag ' + item.tags.find((t) => (f.tags || []).includes(t))}` : `in focus — ${item.id === f.dossier ? 'the focused dossier' : 'within ' + this.byId.get(f.dossier).title}`;
       if (this.hasPermit(item)) return `${item.sender} holds a ${mode.name} permit`;
-      if (rank(this.level(item)) >= rank(a.bar)) return `outside the focus, above the aperture (${a.name})`;
-      return `below the aperture (${a.name})`;
+      const how = d === 1 ? 'shares a participant with the focus' : d === 2 ? `${item.sphere} is near the focus` : 'unrelated to the focus';
+      return d <= a.ring ? `${this.ringName(d)} — ${how}` : `below the aperture (${a.name}): ${how}`;
     }
     // Rings: critical always; otherwise listed and time-sensitive.
     breaksThrough(item) { const lvl = this.level(item); return lvl === 'critical' || (rank(lvl) >= rank('time-sensitive') && this.admitted(item)); }
@@ -238,18 +254,16 @@
       return true;
     }
     releaseFocus() { if (this.override.focus === undefined) return false; this.override.focus = undefined; this.emit({ kind: 'mode', text: `Focus released to the mode's preset: ${this.focusText()}.` }); return true; }
-    // Set the aperture by hand. Widening is temporary and snaps back after WIDEN_MINUTES; narrowing sticks for the stint.
+    // Set the aperture by hand. It holds until the mode changes — by schedule or by hand — and the new preset applies; nothing snaps back on its own.
     setAperture(id) {
       const before = this.aperture(); const after = APERTURES.find((a) => a.id === id); if (!after || after.id === before.id) return false;
       const widening = this.apertureIndex(after.id) > this.apertureIndex(before.id);
-      this.override.aperture = after.id; this.override.apertureUntil = widening ? this.now + WIDEN_MINUTES : null;
-      const preset = APERTURES.find((a) => a.id === this.mode().aperture);
-      this.emit({ kind: 'mode', text: widening ? `Aperture widened to ${after.name} for ${WIDEN_MINUTES} minutes — it snaps back to ${preset.name} at ${hhmm(this.now + WIDEN_MINUTES)}. Looking is delivery: what shows now will not come back in a digest.` : `Aperture narrowed to ${after.name}; it stays until the schedule changes the mode.` });
+      this.override.aperture = after.id;
+      this.emit({ kind: 'mode', text: widening ? `Aperture widened to ${after.name}; it holds until the mode changes. Looking is delivery: what shows now will not come back in a digest.` : `Aperture narrowed to ${after.name}; it holds until the mode changes.` });
       if (widening) { const shown = this.items.filter((i) => i.state === 'open' && i.actor === 'you' && !i.released && this.admitted(i) && (i.snoozedUntil == null || i.snoozedUntil <= this.now)); for (const i of shown) this._release(i, 'aperture'); if (shown.length) this.emit({ kind: 'system', text: `Shown by the wider aperture: ${shown.map((i) => i.title).join(', ')}.` }); }
       return true;
     }
-    _snapBack() { if (this.override.apertureUntil == null || this.now < this.override.apertureUntil) return; const was = this.aperture(); this.override.aperture = null; this.override.apertureUntil = null; this.emit({ kind: 'mode', text: `Aperture snaps back from ${was.name} to ${this.aperture().name}.` }); }
-    _clearOverrides(why) { if (this.override.focus === undefined && !this.override.aperture) return; this.override = { focus: undefined, aperture: null, apertureUntil: null }; this.emit({ kind: 'mode', text: `${why}: focus and aperture follow the mode's preset again.` }); }
+    _clearOverrides(why) { if (this.override.focus === undefined && !this.override.aperture) return; this.override = { focus: undefined, aperture: null }; this.emit({ kind: 'mode', text: `${why}: focus and aperture follow the mode's preset again.` }); }
     stateText(item) {
       if (item.kind === 'standing') return item.state === 'open' ? 'ongoing · something waiting' : 'ongoing';
       if (item.kind === 'relationship' || item.kind === 'group') return item.state === 'open' ? 'pending' : 'nothing pending';
@@ -274,7 +288,7 @@
       if (!item.released) return item.snoozedUntil != null && item.snoozedUntil > this.now ? `snoozed until ${whenText(item.snoozedUntil, this.now)}` : `held until ${this.nextBreakpointText()}`;
       if (this.breaksThrough(item, mode)) return item.pushed.length ? `pushed ${hhmm(item.pushed[item.pushed.length - 1])}` : 'may interrupt';
       if (!this.admitted(item)) return `below the aperture`;
-      return this.level(item) === 'passive' ? 'listed' : (this.inFocus(item) ? 'in focus' : 'outside the focus');
+      return this.level(item) === 'passive' ? 'listed' : (this.inFocus(item) ? 'in focus' : this.ringName(this.distance(item)));
     }
     explain(item) { return { importance: `${item.importance}/5 · ${item.importanceFrom}`, urgency: this.urgencyText(item), delivery: this.deliveryText(item) }; }
 
@@ -292,7 +306,6 @@
       const flips = scheduledId(m) !== scheduledId(m - 1);
       const schedChanged = flips && !this.manualMode;
       const digestTime = DIGEST_TIMES.includes(m);
-      this._snapBack();
       if (schedChanged) { this._clearOverrides('The schedule changes the mode'); const mode = this.mode(); this.emit({ kind: 'mode', text: `${mode.name}: ${mode.blurb}.` }); }
       else if (flips) this.emit({ kind: 'mode', text: `The schedule would switch to ${this.scheduledMode().name} now; the mode stays ${this.mode().name}, set by hand.` });
       const leavingOff = schedChanged && scheduledId(m - 1) === 'off';
@@ -508,12 +521,13 @@
       const mode = this.mode(); const f = this.focus(); const open = this.items.filter((i) => i.state === 'open');
       const now = [], focus = [], outside = [], below = [], waiting = [];
       for (const i of open) { if (i.actor !== 'you') waiting.push(i); else if (i.released && this.breaksThrough(i)) now.push(i); else if (f && this.inFocus(i)) focus.push(i); else if (this.admitted(i)) outside.push(i); else below.push(i); }
-      const key = (i) => [-rank(this.level(i)), -i.importance, i.due == null ? Infinity : i.due - this.now];
-      const cmp = (a, b) => { const ka = key(a), kb = key(b); for (let k = 0; k < 3; k++) if (ka[k] !== kb[k]) return ka[k] - kb[k]; return a.title.localeCompare(b.title); };
+      const key = (i) => [this.distance(i), -rank(this.level(i)), -i.importance, i.due == null ? Infinity : i.due - this.now];
+      const cmp = (a, b) => { const ka = key(a), kb = key(b); for (let k = 0; k < 4; k++) if (ka[k] !== kb[k]) return ka[k] - kb[k]; return a.title.localeCompare(b.title); };
       now.sort(cmp); focus.sort(cmp); outside.sort(cmp); below.sort(cmp); waiting.sort((a, b) => (a.waiting_since || 0) - (b.waiting_since || 0));
       for (const l of [now, focus, outside, below, waiting]) l.sort((a, b) => (b.starred ? 1 : 0) - (a.starred ? 1 : 0));
+      const belowUrgent = below.filter((i) => rank(this.level(i)) >= rank('time-sensitive')).length;
       // The old names, for the deck and the replay: active = listed, other = below the aperture.
-      return { now, focus, outside, below, active: focus.concat(outside), other: below, waiting, mode, focusText: this.focusText(f), aperture: this.aperture(), apertureUntil: this.override.apertureUntil };
+      return { now, focus, outside, below, belowUrgent, active: focus.concat(outside), other: below, waiting, mode, focusText: this.focusText(f), aperture: this.aperture() };
     }
     _starredFirst(list) { return list.sort((a, b) => ((b.starred ? 1 : 0) - (a.starred ? 1 : 0)) || (b.lastActivity - a.lastActivity)); }
     sections() { const h = this.home(); return { now: h.now, next: h.active.concat(h.other).filter((i) => i.released), held: h.active.concat(h.other).filter((i) => !i.released), waiting: h.waiting, mode: h.mode }; }
@@ -542,5 +556,5 @@
 
   root.DossierEngine = DossierEngine;
   root.AttentionEngine = DossierEngine;
-  root.AttentionUtil = { hhmm, whenText, dateText, dur, dayIndex, rank, LEVELS, MODES, APERTURES, WIDEN_MINUTES, SCHEDULE, DIGEST_TIMES, scheduledId, DAY, H };
+  root.AttentionUtil = { hhmm, whenText, dateText, dur, dayIndex, rank, LEVELS, MODES, APERTURES, SCHEDULE, DIGEST_TIMES, scheduledId, DAY, H };
 })(globalThis);

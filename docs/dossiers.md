@@ -287,38 +287,48 @@ traffic has no inbox and is not in Inbox Zero.
 The attention model has two controls folded into one knob, the mode chip with
 its presets. Pulled apart they answer the "eight minutes while the update
 reboots" case — a glance at what else is going on, without switching pages or
-modes, and without having to remember to switch back:
+modes:
 
 - **Focus — what you are on.** Nothing (flow), one or more spheres, or **one
-  dossier** with its descendants. That is today's *Focused* scope (sphere ⊃
+  dossier** with what is within it. That is today's *Focused* scope (sphere ⊃
   dossier), promoted to a chip in the home's header: `⌖ CRR data platform ▾`.
-  A dossier focus has a **related** variant: plus its parent, its siblings and
-  every dossier sharing a participant with it — Guido's Signal message shows
-  during CRR work because he is in CRR, whatever it is about.
-- **Aperture — how far outside the focus you see.** Inside the focus
-  everything pending is listed. Outside, the aperture sets the bar, and the
-  bar is the level the arithmetic already computes, so the notches are the
-  levels: **only this** (critical), **+ urgent** (time-sensitive), **+
-  active**, **everything**. A segmented chip on the phone, a slider on a wide
-  screen.
+- **Aperture — how far from the focus you see.** Not a level of urgency but a
+  **distance**, in rings, measured in the relations the data already has: the
+  tree (`within`), the participants, the spheres and the spheres within spheres
+  (`focus.json` `within`). A segmented chip on the phone, a slider on a wide
+  screen:
+
+| Ring | From a focused **dossier** | From a focused **sphere** |
+|---|---|---|
+| 0 **strictly** | the dossier and what is within it | dossiers in the sphere (and in spheres within it) |
+| 1 **+ people** | its parent and siblings; anything sharing a participant with it or its children | anything sharing a participant with a dossier in the sphere (a customer who is also a friend) |
+| 2 **+ nearby** | the same sphere — other customers — and the spheres within it or around it | the enclosing sphere and the spheres within it |
+| 3 **everything** | no focus | no focus |
+
+"Other customers before spare-time things" is ring 2. Beyond that — is *admin*
+closer to *customers* than *friends*? — the data has nothing to say, and no
+metric is invented: the spheres are a small named set with one nesting, and the
+rings are an ordering of relations, not a number. A learnable refinement later
+(tag co-occurrence) stays out of the first iteration. With **no focus** nothing
+is near, so only the widest aperture shows anything — which is what *Open* is.
 
 The **mode is a preset** of (focus, aperture, permits), set by the schedule as
-today: *Deep work* = flow, only this; *Open* = flow, everything; *Social* =
-friends + family, only this. The hand controls deviate from the preset for the
-stint; a mode change — by schedule or by hand — clears them.
+today: *Deep work* = flow, strictly; *Open* = flow, everything; *Social* =
+friends + family, strictly. The hand controls deviate from the preset for the
+stint; **nothing snaps back on its own** — a hand-set focus or aperture holds
+until the mode changes, by schedule or by hand, and the new mode's preset
+applies. The eight-minute glance ends when Deep work ends, or when the user
+narrows it back.
 
-**Widening is temporary, narrowing sticks.** A hand-widened aperture snaps back
-to the preset a few minutes after the last touch (a setting, 8 min by default)
-and the chip counts down; a narrowing holds until the mode changes. So the
-reboot case never needs a second gesture.
-
-**One rule for delivery and the list.** A dossier is *listed* when it is in
-the focus, or at or above the aperture's bar, or its sender holds a permit for
-the mode. What is listed *rings* from time-sensitive; critical rings always.
-The aperture governs the ring as the list — they are one thing, the mode; a
-list-only aperture would make two things with one name behave differently.
-**Looking is delivery:** what the wider aperture shows is released, as *pull*
-is today, and does not return in the next digest; new arrivals outside do.
+**Listing and ringing.** A dossier is *listed* when its distance is within the
+aperture's ring, or its sender holds a permit for the mode. Urgency is the other
+axis and keeps its own rules: what is listed *rings* from time-sensitive;
+critical rings always, whatever the aperture; and the home's *below the
+aperture* line **counts the urgent ones out of sight** — *+ 7 below the
+aperture, 2 urgent — widen to "+ people"* — so that something urgent is out
+there is visible without showing what, and one tap shows it. **Looking is
+delivery:** what a wider aperture shows is released, as *pull* is today, and
+does not return in the next digest; new arrivals outside do.
 
 **Home** = dossiers that want something, using the attention arithmetic
 unchanged (`docs/attention-model.md`):
@@ -327,9 +337,9 @@ unchanged (`docs/attention-model.md`):
 2. **In focus** — the rest of what the focus covers. Importance, deadline and
    who holds the ball as decoration on the row; the subtitle is the newest
    message or event.
-3. **Outside** — above the aperture; then one line, *+ n below the aperture —
-   widen to "+ urgent"*: one tap widens a notch, so what widening would buy is
-   always known.
+3. **One section per ring within the aperture** — *+ people*, *+ nearby* —
+   then one line, *+ n below the aperture, m urgent — widen to "…"*: one tap
+   widens a ring, so what widening would buy is always known.
 4. **Waiting** — collapsed, with ages.
 
 A **relationship appears on the home only while something is pending** in it
@@ -416,7 +426,8 @@ news rail.
    items retire; existing threads migrate as Ara-only topics (read-only
    history); the chats' companion threads fold into the relationships.
 7. **Focus and aperture.** The two chips over the mode presets in
-   `focus.json`, the snap-back, the *below the aperture* line; the modes'
+   `focus.json`, the distance rings over `within`, participants and sphere
+   nesting, the *below the aperture* line with its urgent count; the modes'
    `admits` and `threshold` become `focus` and `aperture`.
 8. **Mappings** with a brief, filed by the VIP turn or the batch.
 9. **One sender axis** (if open question 3 says yes).
@@ -436,8 +447,6 @@ news rail.
    after the user's answer to Ara's question?
 6. **Several pending things with one person.** Separate topics by design;
    confirm that a relationship never needs more than one pending state.
-7. **Snap-back.** Eight minutes after the last widening, or at the next
-   breakpoint, whichever is sooner? And should a widening the user acted on
-   (opened a dossier, replied) hold longer?
-8. **Related.** Participants are the one relation used; should a reference
-   (a dossier quoting one of the focused dossier's messages) count too?
+7. **Sphere distance.** Ring 2 uses only the spheres' `within` nesting; is
+   that enough, or does a deployment want to name neighbours by hand
+   (`near: [admin]` on a sphere) before any learning?

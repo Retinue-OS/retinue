@@ -28,8 +28,8 @@ Deep links: `index.html?at=16:20` opens the day at that time, `&play=1` starts
 playing, `&list=contacts|dossiers` opens a list, `&open=<dossier id>` opens a
 dossier (`&to=ara` addresses the composer to Ara on a relationship),
 `&details=1` opens its details sheet, `&chip=<label>` taps a chip on load,
-`&other=1` expands *Other spheres*. Try `?at=10:21` for the widened aperture
-with its countdown, `?at=21:16&list=dossiers` for the tree.
+`&other=1` expands *Other spheres*. Try `?at=10:23` for the widened aperture
+with its rings, `?at=21:16&list=dossiers` for the tree.
 
 The chrome is the dashboard's as it is today, so the layout can be judged
 with every feature in place: the navigation row and the shelf frame every
@@ -50,16 +50,17 @@ her dot, as on the dashboard.
 | Ara | a pane beside the chat; the thread itself | the composer's default addressee on every dossier; on a relationship a *to* switch picks the person's channel or Ara |
 | Archive | archive + mute | **none** — a settled relationship sinks in Contacts; a topic is done or rests |
 | Forwarding | — | **the gesture**: ⋯ on a message → select → *Add to dossier…* with a comment → one event, a backlink under the message |
-| Mode | four presets, each an allow-list of spheres and a threshold | still the four presets — now of **focus** (flow · spheres · one dossier, with or without its relations) and **aperture** (only this · + urgent · + active · everything); two chips under the mode chip override the preset for the stint, a widening snaps back after eight minutes |
+| Mode | four presets, each an allow-list of spheres and a threshold | still the four presets — now of **focus** (flow · spheres · one dossier) and **aperture** as **rings of distance** (strictly · + people · + nearby · everything), set under the mode chip; a hand-set value holds until the mode changes, nothing snaps back; the *below the aperture* line counts the urgent ones out of sight |
 | References | a digest line names the mail; the content is a question to Ara | a referenced object is **embedded live as its own block** — a message as the bubble its dossier shows, a dossier as the row its list shows, with its current state; Inbox Zero's proposals, the gesture's events and Ara's turns carry them; a tap opens the object where it lives |
 | Hierarchy | projects flat (`goal:` unused by the UI) | **topics nest**: `within` one parent; the Dossiers page is a tree, a dossier's page links its parent and children, the focus on a dossier covers what is within it |
 
 The story's morning is focused work: at 08:30 the focus goes onto the CRR
 dossier (an engagement with two pieces of work within it); at 10:20 a reboot
-gives eight idle minutes and the aperture is widened a notch — Beat's clause
-appears, Anna's dinner does not — then once more, and at 10:30 it has snapped
-back by itself. The 12:00 digest is one item shorter for it: looking is
-delivery. At 21:15 the gesture opens a third sub-dossier within CRR.
+gives eight idle minutes and the aperture is widened a ring, to *+ people* —
+Beat appears, he is in CRR; Anna does not — then to *+ nearby*: the other
+customers. Nothing snaps back; Open's preset takes over at 12:00, and the
+digest is shorter for what was already seen: looking is delivery. At 21:15 the
+gesture opens a third sub-dossier within CRR.
 
 Two of the old threads were letters the Secretary had triaged — the parking
 card and the tax office. Here they are what they were, mails, and the story

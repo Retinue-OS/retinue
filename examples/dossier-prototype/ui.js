@@ -221,11 +221,11 @@
       }
       const h = e.home(); const total = h.now.length + h.active.length + h.other.length + h.waiting.length;
       const f = e.focus(); const a = h.aperture; const ai = e.apertureIndex();
-      const widen = ai < U.APERTURES.length - 1 ? `<button class="below-row" data-act="aperture" data-aperture="${U.APERTURES[ai + 1].id}">+ ${h.below.length} below the aperture — widen to “${esc(U.APERTURES[ai + 1].name)}”</button>` : '';
+      const widen = ai < U.APERTURES.length - 1 ? `<button class="below-row" data-act="aperture" data-aperture="${U.APERTURES[ai + 1].id}">+ ${h.below.length} below the aperture${h.belowUrgent ? `, <b class="urg">${h.belowUrgent} urgent</b>` : ''} — widen to “${esc(U.APERTURES[ai + 1].name)}”</button>` : '';
       return `${this.focusBar()}<div class="ph-body">
           ${section('NOW', h.now, 'now')}
           ${f ? section(`IN FOCUS · ${esc(h.focusText.toUpperCase())}`, h.focus, 'active') : ''}
-          ${section(f ? `OUTSIDE · ${esc(a.name.toUpperCase())}` : 'PENDING', h.outside, 'active')}
+          ${f ? [1, 2, 3].map((r) => section(esc(e.ringName(r).toUpperCase()), h.outside.filter((i) => e.distance(i) === r), 'active')).join('') : section('PENDING', h.outside, 'active')}
           ${h.below.length ? widen : ''}
           ${collapsible('WAITING ON OTHERS', h.waiting, 'waiting', this.waitingOpen)}
           ${total ? '' : '<div class="empty">Nothing wants your attention.</div>'}
@@ -233,17 +233,17 @@
     }
     // The two controls under the mode chip: the focus (what you are on) and the aperture (how far out you see).
     focusBar() {
-      const e = this.engine; const f = e.focus(); const a = e.aperture(); const until = e.override.apertureUntil;
+      const e = this.engine; const f = e.focus(); const a = e.aperture();
       const notches = U.APERTURES.map((n) => `<button class="notch${n.id === a.id ? ' on' : ''}" data-act="aperture" data-aperture="${n.id}" title="${esc(n.blurb)}" aria-label="${esc(n.name)}">${n.glyph}</button>`).join('');
-      const left = until != null ? ` <small class="snap">· ${Math.max(0, until - e.now)} min</small>` : '';
-      return `<div class="focus-bar"><button class="focus-chip${e.override.focus !== undefined ? ' hand' : ''}" data-act="focus-menu" title="What you are on">⌖ ${esc(e.focusText(f))} ▾</button><div class="aperture" title="How far outside the focus you see">${notches}<span class="ap-name">${esc(a.name)}${left}</span></div></div>`;
+      const hand = e.override.aperture ? ' <small class="snap">· by hand</small>' : '';
+      return `<div class="focus-bar"><button class="focus-chip${e.override.focus !== undefined ? ' hand' : ''}" data-act="focus-menu" title="What you are on">⌖ ${esc(e.focusText(f))} ▾</button><div class="aperture" title="How far from the focus you see">${notches}<span class="ap-name">${esc(a.name)}${hand}</span></div></div>`;
     }
     // The focus picker: flow, the spheres, the dossiers with something pending (with or without their relations).
     focusMenu() {
       const e = this.engine; const f = e.focus(); const cur = (x) => (JSON.stringify(x || null) === JSON.stringify(f || null) ? ' on' : '');
       const spheres = root.Backends.SPHERES.map((s) => `<button class="menu-row${cur({ spheres: [s], tags: [] })}" data-act="set-focus" data-focus='${JSON.stringify({ spheres: [s], tags: [] })}'><span class="dot" style="background:${SPHERE_COLORS[s]}"></span><span><b>${esc(s)}</b><small>the sphere</small></span></button>`).join('');
       const ds = e.items.filter((i) => (i.kind === 'topic' || i.kind === 'ara') && i.state === 'open' && !i.within).sort((x, y) => y.lastActivity - x.lastActivity).slice(0, 6);
-      const dossiers = ds.map((d) => `<div class="menu-pair"><button class="menu-row${cur({ dossier: d.id, related: false })}" data-act="set-focus" data-focus='${JSON.stringify({ dossier: d.id, related: false })}'><span class="kind">${KIND_GLYPH[d.kind]}</span><span><b>${esc(d.title)}</b><small>${e.children(d.id).length ? `with what is within it` : 'this dossier'}</small></span></button><button class="menu-row rel${cur({ dossier: d.id, related: true })}" data-act="set-focus" data-focus='${JSON.stringify({ dossier: d.id, related: true })}' title="Plus its parent, siblings and every dossier sharing a participant">+ related</button></div>`).join('');
+      const dossiers = ds.map((d) => `<button class="menu-row${cur({ dossier: d.id })}" data-act="set-focus" data-focus='${JSON.stringify({ dossier: d.id })}'><span class="kind">${KIND_GLYPH[d.kind]}</span><span><b>${esc(d.title)}</b><small>${e.children(d.id).length ? `with what is within it` : 'this dossier'} — the aperture widens from here</small></span></button>`).join('');
       return `<div class="overlay" data-act="close-menu"><div class="menu" data-stop="1"><div class="menu-head">Focus — what you are on</div><button class="menu-row${cur(null)}" data-act="set-focus" data-focus="null"><span class="dot" style="background:#3a4250"></span><span><b>Flow</b><small>no focus: only the aperture decides</small></span></button>${spheres}<div class="menu-head">Dossiers</div>${dossiers}${e.override.focus !== undefined ? `<button class="menu-row follow" data-act="release-focus"><span class="dot" style="background:${e.mode().color}"></span><span><b>Back to ${esc(e.mode().name)}'s preset</b><small>${esc(e.focusText(e.mode().focus))}</small></span></button>` : ''}</div></div>`;
     }
     // ---- the dashboard's chrome: navigation row, page bar, shelf -----------------------
@@ -443,7 +443,7 @@
         <div class="fields">
           <div class="field"><div class="f-label">Importance</div><div class="f-value">${esc(x.importance)}</div><div class="f-ctl"><button class="btn tiny" data-act="imp" data-delta="-1" data-id="${esc(item.id)}">−</button><button class="btn tiny" data-act="imp" data-delta="1" data-id="${esc(item.id)}">+</button><span class="f-note">corrects the prior for ${esc(item.sender || item.kindLabel)}</span></div></div>
           <div class="field"><div class="f-label">Urgency</div><div class="f-value">${esc(x.urgency)}</div><div class="f-ctl">${item.critical ? '<span class="f-note">critical is declared, not derived</span>' : `<span class="f-k">deadline</span> ${dueSel}${item.due != null ? `<button class="btn tiny" data-act="due" data-delta="-1440" data-id="${esc(item.id)}">−1 day</button><button class="btn tiny" data-act="due" data-delta="1440" data-id="${esc(item.id)}">+1 day</button>` : ''}<span class="f-break"></span><span class="f-k">lead</span> ${leadSel}<span class="f-note">the lead corrects every “${esc(item.kindLabel)}”</span>`}</div></div>
-          <div class="field"><div class="f-label">Delivery</div><div class="f-value">level <b style="color:${LEVEL_COLORS[lvl]}">${esc(lvl)}</b> · ${esc(x.delivery)}</div><div class="f-ctl">${item.sender ? `<button class="btn tiny${hasPermit ? ' on' : ''}" data-act="permit" data-id="${esc(item.id)}">${hasPermit ? `Revoke ${esc(item.sender)}’s ${esc(mode.name)} permit` : `Let ${esc(item.sender)} interrupt in ${esc(mode.name)}`}</button>` : ''}<button class="btn tiny${admitsSphere ? ' on' : ''}" data-act="admit" data-id="${esc(item.id)}">${admitsSphere ? `Take ${esc(item.sphere)} out of ${esc(mode.name)}'s focus` : `Put ${esc(item.sphere)} into ${esc(mode.name)}'s focus`}</button>${item.kind === 'topic' || item.kind === 'ara' ? `<button class="btn tiny" data-act="set-focus" data-focus='${JSON.stringify({ dossier: item.within || item.id, related: false })}'>Focus on ${item.within ? 'its parent' : 'this'}</button>` : ''}<span class="f-note">a Focus rule, importance untouched</span></div></div>
+          <div class="field"><div class="f-label">Delivery</div><div class="f-value">level <b style="color:${LEVEL_COLORS[lvl]}">${esc(lvl)}</b> · ${esc(x.delivery)}</div><div class="f-ctl">${item.sender ? `<button class="btn tiny${hasPermit ? ' on' : ''}" data-act="permit" data-id="${esc(item.id)}">${hasPermit ? `Revoke ${esc(item.sender)}’s ${esc(mode.name)} permit` : `Let ${esc(item.sender)} interrupt in ${esc(mode.name)}`}</button>` : ''}<button class="btn tiny${admitsSphere ? ' on' : ''}" data-act="admit" data-id="${esc(item.id)}">${admitsSphere ? `Take ${esc(item.sphere)} out of ${esc(mode.name)}'s focus` : `Put ${esc(item.sphere)} into ${esc(mode.name)}'s focus`}</button>${item.kind === 'topic' || item.kind === 'ara' ? `<button class="btn tiny" data-act="set-focus" data-focus='${JSON.stringify({ dossier: item.within || item.id })}'>Focus on ${item.within ? 'its parent' : 'this'}</button>` : ''}<span class="f-note">a Focus rule, importance untouched</span></div></div>
         </div>
         ${actions}
       </div></div>`;
@@ -546,7 +546,7 @@
         <h3>System state</h3>
         <div class="mode-card" style="border-left-color:${mode.color}"><div class="mode-name">${esc(mode.name)} <small>${e.manualMode ? 'set by hand' : `scheduled until ${hhmm(e.scheduledUntil())}`}</small></div>
           <div class="kv"><span>focus</span><div>${(() => { const f = e.focus(); return f && f.spheres ? chips(f.spheres, (s) => SPHERE_COLORS[s]) + (f.tags.length ? ` <span class="muted">+ tag</span> ${chips(f.tags, (s) => SPHERE_COLORS[s])}` : '') : `<span class="pill">${esc(e.focusText(f))}</span>`; })()}${e.override.focus !== undefined ? ' <span class="muted">set by hand</span>' : ''}</div></div>
-          <div class="kv"><span>aperture</span><div><span class="pill">${esc(e.aperture().glyph)} ${esc(e.aperture().name)}</span> <span class="muted">${esc(e.aperture().blurb)}</span>${e.override.apertureUntil != null ? ` <span class="muted">· snaps back ${hhmm(e.override.apertureUntil)}</span>` : ''}</div></div>
+          <div class="kv"><span>aperture</span><div><span class="pill">${esc(e.aperture().glyph)} ${esc(e.aperture().name)}</span> <span class="muted">${esc(e.aperture().blurb)}</span>${e.override.aperture ? ' <span class="muted">· set by hand, holds until the mode changes</span>' : ''}</div></div>
           <div class="kv"><span>permits</span><div>${chips(p.permits[mode.id])}</div></div>
           <div class="kv"><span>rings</span><div>critical always; otherwise what is listed and time-sensitive</div></div>
           <div class="kv"><span>next breakpoint</span><div>${esc(e.nextBreakpointText())} — digest and Inbox Zero batch</div></div></div>

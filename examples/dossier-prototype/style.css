@@ -292,7 +292,9 @@ code{font-family:"Source Code Pro","DejaVu Sans Mono",Menlo,monospace;font-size:
 .notch.on{color:#6ea8fe}
 .notch:hover{color:#e7ebf2}
 .ap-name{font-size:10.5px;color:#8b93a3;margin-left:4px;white-space:nowrap}
-.snap{color:#e08a2e}
+.snap{color:#c9a0ff}
+.below-row .urg{color:#e08a2e;font-weight:600}
+.aperture.off{opacity:.45}
 .below-row{display:block;width:100%;font:inherit;font-size:11.5px;color:#8b93a3;background:#10141b;border:1px dashed #1f2630;border-radius:10px;padding:8px 12px;margin:2px 0 10px;cursor:pointer;text-align:left}
 .below-row:hover{color:#e7ebf2;border-color:#6ea8fe}
 .menu-pair{display:flex;gap:4px;margin:0 0 6px}
