@@ -13,24 +13,44 @@ chamber-specific, which the framework must not be (`docs/contributing.md`,
 "No owner specifics in the framework").
 
 A **chamber app** is a Progressive Web App that a chamber ships in its own
-repository. The framework serves it, and offers it a small set of Retinue
-services. An app is an **actual PWA**: it installs, starts and works offline
-without Retinue. Opened outside Retinue (from a file, from static hosting, in
-a browser without the extension below), the Retinue objects are simply
-absent, and the app degrades: it works from data it carries and keeps what it
-records on the device.
+repository. It is an **actual PWA**: it starts and works offline without
+Retinue. Run by a Retinue **host** (the browser extension, the Ara Android
+app), it additionally gets `window.Retinue`, a small client for Retinue
+services. Without a host that object is absent, and the app works from the
+data it carries and keeps what it records on the device.
+
+## Principle: security does not depend on where the app is loaded from
+
+An app never runs on the dashboard's origin. A page there shares the
+dashboard's sign-in and can act in any of its pages (approving a pending send
+included); no header tells such a page's requests from the dashboard's own.
+A permission list that is only a promise is not a permission.
+
+So every app call reaches Retinue **through a host, with a capability token
+bound to that app**, and the gateway enforces the app's granted capabilities
+on every call, whatever origin, device or path the app was loaded from:
+
+- the app runs on an origin of its own (the extension's, the Android app's
+  per-app WebView origin, or wherever it is hosted);
+- the host holds the token; the app's own script never sees it;
+- the gateway's app API accepts **only** such tokens, never the dashboard's
+  sign-in, and refuses anything beyond the token's capabilities;
+- the endpoints that act with the user's authority (send approval, sign-in,
+  settings) accept no app token at all.
+
+The **browser extension is built first**, because it admits no shortcut: it
+cannot borrow the dashboard's sign-in, so the token path has to be complete
+before anything works. The Android app then reuses the same path.
 
 ## What a chamber ships
 
 ```
 <chamber>/.retinue/apps/<app>/
 ├── manifest.webmanifest   standard Web App Manifest, plus a "retinue" member
-├── sw.js                  the app's own service worker (offline)
+├── sw.js                  the app's own service worker (offline, standalone use)
 ├── index.html             entry page
 └── …                      scripts, styles, images, data files (JSON, …)
 ```
-
-The `retinue` member of the manifest declares what the app uses:
 
 ```json
 {
@@ -41,97 +61,84 @@ The `retinue` member of the manifest declares what the app uses:
     "sparql": ["life"],
     "submit": [{"dir": "observations/inbox/", "types": ["application/json"]}],
     "agents": ["<subagent>", "ara"],
-    "schedule": true,
+    "schedule": ["reminder", "agent"],
     "speech": true,
     "notify": true
   }
 }
 ```
 
-The app directory is Tier 3 in its chamber (it is code that runs with the
-user's authority, see "Trust"): it reaches `main` through a reviewed PR.
+The app directory is Tier 3 in its chamber: it reaches `main` through a
+reviewed PR. Review is the first gate; the token is the second.
 
-## Where apps run
+## How a host gets and runs an app
 
-- **On the dashboard's origin**, under `/apps/<chamber>/<app>/`. The gateway
-  serves the directory as static files (never a script type from anywhere
-  else, `docs/dashboard.md`, "No route serves bytes from outside as a
-  script"), with the app's own service-worker scope. No wildcard subdomain is
-  needed. Each app installs as its own home-screen icon.
-- **From the dashboard**: an *Apps* tab lists the apps of every mounted
-  chamber (from their manifests) and opens them. The Android shell opens them
-  in its WebView, where speech and notifications come through
-  `window.RetinueShell`.
-- **On a desktop, elsewhere**: an optional browser extension injects the same
-  client object into an app loaded from another origin (a static copy, a
-  local file) and forwards its calls to a configured Retinue instance. Without
-  the extension the app runs standalone.
+1. **Catalogue.** `GET /apps/index.json` (dashboard sign-in or a host token)
+   lists the apps of every mounted chamber: chamber, id, name, icons, version
+   (content hash), declared capabilities.
+2. **Bundle.** `GET /apps/bundle/<chamber>/<app>` returns the app's files,
+   served as data (a download), never as a page on the dashboard's origin.
+3. **Grant.** The first time the user opens an app, the host shows the
+   declared capabilities (which store it reads, which chamber folder it
+   writes, which agents it may address, whether it may schedule agent jobs)
+   and asks once. On consent the host obtains an **app token** from the
+   gateway (`POST /apps/grant`, an authenticated host request). The token
+   names the app, its manifest hash and the granted capabilities. A changed
+   manifest (new hash) needs a new grant; the user can revoke a grant on the
+   dashboard.
+4. **Run.** The host serves the bundle from its own origin
+   (`chrome-extension://…/apps/<chamber>/<app>/`, the Android app's per-app
+   WebView origin) and injects `window.Retinue`, whose calls go through the
+   host to `/apps/api/…` with the token.
+
+An app hosted elsewhere (a static copy, a developer's local server) gets the
+same object from the extension, for an origin the user has allowed for that
+app.
 
 ## The client object
 
-One framework script, `/apps/retinue.js`, defines `window.Retinue` when the
-app runs under Retinue (the extension defines the same object). An app
-feature-detects it, member by member, as the dashboard detects
-`window.RetinueShell`:
+Identical in every host, feature-detected member by member:
 
-| Member | Does | Backed by |
+| Member | Does | Gateway side |
 |---|---|---|
-| `sparql(endpoint, query)` | read-only query, JSON results | the existing SPARQL proxy |
-| `submit(dir, name, blob)` | write a file into a declared directory of the app's own chamber; converters and the Archivist pick it up as from any inbox | the letterbox mechanism (`docs/scheduling.md`) |
-| `ask(agent, text, opts)` | open or continue a dashboard thread addressed to an agent, with attention fields (`importance`, `due`, …); returns the thread id | `conversation-push` semantics |
-| `schedule(job)` / `unschedule(id)` | create a reminder (a notification at a time) or an agent job (a prompt run by the scheduler, once or recurring) | `scheduler.py`, jobs kept per app under `/root/.retinue/apps/<chamber>/<app>/schedule.json` |
-| `speak(text, lang)` | speech output | `speechSynthesis` / the shell's TTS |
-| `notify(title, body)` | a local notification | the shell / Web Notifications |
+| `sparql(endpoint, query)` | read-only query, JSON results | the existing SPARQL proxy, endpoints limited to the grant |
+| `submit(name, blob, dir?)` | write a file into a granted directory of the app's own chamber; converters or the Archivist pick it up | the letterbox mechanism (`docs/scheduling.md`), type and size checked |
+| `ask(agent, text, opts)` | open or continue a dashboard thread addressed to a granted agent, with attention fields; returns the thread id | `conversation-push` semantics, thread marked as from the app |
+| `schedule(job)` / `unschedule(id)` / `jobs()` | reminders (a notification at a time) and agent jobs (a prompt run by the scheduler, once or recurring) | `scheduler.py`, jobs per app under `/root/.retinue/apps/<chamber>/<app>/schedule.json`, ids `app:<chamber>:<app>:<id>`, listed with their app |
+| `speak(text, lang)` | speech output | host-local (extension TTS, native TTS) |
+| `notify(title, body)` | a notification | host-local |
 
-Agent jobs are included on purpose: an app that can `ask` an agent can spend
-model credit anyway, so withholding the scheduler would protect nothing.
-Scheduled jobs show on the scheduler's own listing, labelled with their app,
-so the user can see and stop them.
+Agent jobs are included: an app that may `ask` an agent can spend model credit
+anyway, so withholding the scheduler protects nothing. They are listed with
+their app on the scheduler's listing and stop when the grant is revoked.
 
-## Trust — what the manifest does and does not enforce
+## Hosts
 
-An app served on the dashboard's origin **is** the dashboard as far as the
-browser is concerned: it shares the sign-in, and a script on that origin can
-open any other page of the origin in a window and act in it, including
-approving a pending send. Neither `Sec-Fetch-Site` (it only says
-"same-origin") nor `Referer` (a same-origin page may set it to any
-same-origin URL) can tell an app's request from the dashboard's. So on the
-dashboard's origin:
-
-- the `retinue` member of the manifest is a **declaration that review checks**,
-  not a sandbox; it is enforced only where the extension or the shell relays
-  the calls;
-- what keeps foreign content from becoming script inside an app is the same
-  **Content-Security-Policy** as the dashboard's (`script-src 'self'`, no
-  inline script, no `eval`), applied to every `/apps/` response, plus the rule
-  that an app renders data from the store as text, never as markup.
-
-This is the same trust level chamber code already has: a chamber's scripts and
-plugin run in the container with more power than any page. The PR review of
-the app directory is the gate.
-
-**If isolation is wanted later**, the one change that buys it is a **single
-second origin for all apps** (one extra host name or port, not a wildcard),
-with `retinue.js` talking to the gateway through a token scoped to the app's
-declared manifest. That makes the manifest enforceable on every device, at the
-cost of one more proxy entry. The client object stays the same, so apps need
-no change when that switch is made.
+- **Browser extension (first).** Pairs once with a Retinue instance, lists its
+  apps, runs them from the extension's origin, relays calls with the app
+  token, and shows the consent and revocation UI. Tracked separately.
+- **Ara Android app.** Ara has no home screen of its own, so chamber apps
+  appear **inside Ara** as apps alongside the dashboard: a list to open them
+  from, each in its own WebView origin with the same injected client, speech
+  and notifications native. Tracked in the `ara-android` repository.
+- **The dashboard** only lists apps and manages grants; it never runs one.
 
 ## Data written by apps
 
-`submit` writes into the app's own chamber only, into directories the manifest
-declares, and only file types that chamber's `.inbox.json` accepts there. A
-record is one file (e.g. `2026-…-<app>-session.json`); the chamber's converter
-turns it into triples, as for Health Connect uploads. Apps get no general file
-read or write: what they read comes from the store.
+`submit` writes into the app's own chamber only, into directories granted from
+the manifest, and only file types that chamber accepts there. A record is one
+file; the chamber's converter turns it into triples, as for Health Connect
+uploads. Apps get no general file read or write: what they read comes from the
+store.
 
 ## Open points
 
-- Whether a thread opened by `ask` is always visible to the user, or whether
-  an app may also dispatch a subagent job whose answer alone reaches them.
-- How the *Apps* tab orders and badges apps (attention items for an app's
-  pending reminders?).
-- The extension: which browsers, and how it is paired with an instance
-  (client certificate vs token).
-- Tests: CSP on `/apps/`, no script type from outside, manifest validation,
-  scheduler jobs owned by an app.
+- Whether a thread opened by `ask` is always visible to the user, or an app may
+  also dispatch a subagent job whose answer alone reaches them.
+- Token form (opaque with a server-side record, or signed), lifetime, refresh.
+- Bundle format (archive or file list) and update check (content hash).
+- How the extension pairs: client certificate, or a one-time pairing code
+  shown on the dashboard.
+- Tests: grants and capability enforcement per call, app token refused on the
+  authority endpoints, dashboard sign-in refused on the app API, bundle served
+  as data only, app-owned scheduler jobs removed on revocation.
