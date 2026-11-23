@@ -461,7 +461,9 @@
     // Send to the dossier's human participants (a relationship's channel); the pending state is settled.
     // The ways to reach a person: the channels the composer can write on — every messaging handle on the card
     // (Phone is for calling, not writing). The default is the one the last message came on.
-    writeChannels(item) { return [...new Set(item.handles.filter((h) => h[0] !== 'Phone').map((h) => h[0]))]; }
+    // A phone number is two ways: a call, and an SMS — the opt-in SMS channel writes to it like any messenger.
+    writeChannels(item) { const ws = item.handles.filter((h) => h[0] !== 'Phone').map((h) => h[0]); if (item.handles.some((h) => h[0] === 'Phone')) ws.push('SMS'); return [...new Set(ws)]; }
+    handleFor(item, channel) { const h = item.handles.find((x) => x[0] === channel) || (channel === 'SMS' ? item.handles.find((x) => x[0] === 'Phone') : null); return h ? h[1] : ''; }
     defaultChannel(item) { const last = this.lastIn(item); const ws = this.writeChannels(item); if (last && last.channel && ws.includes(last.channel)) return last.channel; return ws[0] || item.channel; }
     // The threads of a relationship. A messenger channel is one thread — the person is the subject; mail is a set of
     // threads, each with a subject, newest last.

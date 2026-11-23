@@ -184,10 +184,10 @@ the composer's channel switch, with its participants).
 everything exchanged with the person — a Signal message, a mail, a WhatsApp
 — each bubble marked with its channel. The composer writes **via** one of the
 channels the contact card says reaches them (every messaging handle on the
-card; a phone number is for calling): a *via* row above the field, defaulting
+card; a phone number is two: a call, and an SMS): a *via* row above the field, defaulting
 to the channel the last message came on. On the card itself each handle is a
 button — tap the Signal number and the composer opens on Signal, tap the
-address and it opens on mail with a new thread, tap the phone and it calls.
+address and it opens on mail with a new thread; a phone number offers both a call and an SMS.
 
 **Messenger and mail differ in one thing: threads.** On a messenger channel
 the relationship is one thread — the person is the subject, as in any chat
@@ -390,7 +390,7 @@ messages, in the same row, sortable by latest message (default),
 alphabetically, or by hand (drag; per device; starred pins). Tapping a row
 opens the stream, as on the home; the **contact card** (👤 on the row, in the
 page bar and the ⋮ menu of a relationship) is the person behind it — the
-handles on every channel (each a button: write on that channel, or call), the
+handles on every channel (each a button: write on that channel; a number calls or sends an SMS), the
 sphere, the importance prior and permits, the VIP switch, the instruction,
 the dossiers they take part in — exactly what `docs/contacts.md` describes,
 in one sheet. A screened sender's card says so

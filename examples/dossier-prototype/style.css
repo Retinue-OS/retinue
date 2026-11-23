@@ -396,3 +396,4 @@ code{font-family:"Source Code Pro","DejaVu Sans Mono",Menlo,monospace;font-size:
 .seg.ch small{color:#8b93a3;font-size:10.5px}
 .seg.ch.static{cursor:default}
 .ch-dot{width:7px;height:7px;border-radius:50%;display:inline-block}
+.btn.tiny.sms{color:#cbd3dd;white-space:nowrap}
