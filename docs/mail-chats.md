@@ -24,7 +24,8 @@ what differs is stated here.
 Phase 1's deployment is in place: the `mail-gateway` compose service and
 image, its `messenger-email` ledger and `mail-data` state volumes, the
 registry entry (`email`, enrolled by `MAIL_GATEWAY_BASE_URL`), the monitor's
-wording for a mailbox, and the e-mail policy file on the ledger volume. How to
+wording for a mailbox, and the e-mail policy file on the ledger volume. The
+mirror is opt-in: it runs once the operator sets `MAIL_GATEWAY_TOKEN`. How to
 run it: *Operator notes* at the end.
 
 ## Decisions
@@ -146,7 +147,11 @@ surviving chat, so nothing said in it is lost).
 - **Name**: the *first* subject of the thread with `Re:`/`Fwd:`/`AW:`/`WG:` and
   their kin stripped (`base_subject`); "(no subject)" when empty.
 - **Participants**: every address on `From`/`To`/`Cc` across the thread other
-  than the account's own, resolved through the address book
+  than the user's own — the account's and every other address of the user's
+  that may appear on its mail (the aliases on the mailbox *and* the user's
+  other mirrored accounts, `MAIL_OWN_ADDRESSES`); else a thread that reaches
+  two of the user's accounts would list the user as a correspondent in each,
+  turn into a group and make the user its peer. Resolved through the address book
   (`ContactBook.find("email", address)`); the display name the mail carried
   otherwise, else the address.
 - **Mark**: an `@` channel mark.
@@ -156,8 +161,8 @@ surviving chat, so nothing said in it is lost).
 
 A mail chat's *name* is its subject, but the attention model and the contact
 card are about a **person**. So the chat state keeps both: `name` (the subject)
-and `peer` (`{address, name}` of the latest inbound sender, or the first
-recipient for a thread the user started). For a chat that is not a group the
+and `peer` (`{address, name}` of the latest inbound sender who is not the
+user, or the first recipient for a thread the user started). For a chat that is not a group the
 contact card and the autolink work on `("email", peer.address)`; the attention
 item is about the person and never the subject — its sender is the contact who
 owns the address, else the address itself. Not the display name the mail
@@ -168,7 +173,9 @@ a known person's priors, permits and spheres.
 
 - A mail from a **`news`** sender or carrying a `news` **`List-Id`**
   (`triage_policy.email_gate_decision`) starts no chat. The news rail takes it
-  as before. (It joins a chat only under the rule in *Decisions*.)
+  as before — until the gate phase that is e-mail triage's filing, which runs
+  beside the mirror unchanged; from then on the gateway's. (It joins a chat
+  only under the rule in *Decisions*.)
 - Pending-send drafts, and anything outside the mirrored folders.
 
 `ignored` and `quieted` keep their meaning: the chat shows the mail silently,
@@ -194,7 +201,7 @@ are.
 | Channel | `email` |
 | Ledger volume | `messenger-email` → `/inbound` (gateway, RW), `chambers/_generated/messenger/email` (retinue, RW), qlever-life (RO) |
 | State volume | `mail-data` → `/root/.local/share/mail` (thread index, mailbox index, pending sends) |
-| Token | `MAIL_GATEWAY_TOKEN`; erase capability `CHAT_ERASE_TOKEN` |
+| Token | `MAIL_GATEWAY_TOKEN` — required: without it the gateway mirrors and serves nothing; erase capability `CHAT_ERASE_TOKEN` from the phase that builds the delete |
 | Registry | a built-in channel: `MAIL_GATEWAY_BASE_URL` enrols it |
 
 The registry (`messenger_gateways.py`) learns that a channel's name and its
@@ -203,7 +210,11 @@ gateway reads that before it falls back to reading a slug.
 
 `/health` answers `{configured, connected, mode: "inbox", account, error,
 needs_repair: false, build, backfill: {done, pending}}`. An unconfigured
-gateway (`configured: false`) idles and is not an outage.
+gateway (`configured: false`) idles and is not an outage; so does one not
+opted in — no `MAIL_GATEWAY_TOKEN`, or the default account where
+`MESSENGER_BUILTIN_CHANNELS` is set without `email` — and `error` says which.
+The mirror starts only once the e-mail policy file is in place, since its
+first backfill decides at ingest which mail is news.
 
 ### The mirror
 
@@ -351,7 +362,10 @@ Every mail bubble offers **Original**. A tap shows the full mail in place:
   none;
 - every attachment.
 
-`GET /chats/<id>/messages/<message id>/original` answers the headers, the full
+`GET <original>` — the message's `original` field,
+`/chats/<id>/messages/<token>/original`, where `<token>` is a segment the
+gateway mints and the client never builds (never the raw `Message-ID`) —
+answers the headers, the full
 text and the attachment list; `…/original.html` serves the HTML part as a
 document of its own under a policy stricter than the dashboard's
 (`sandbox allow-popups allow-popups-to-escape-sandbox; default-src 'none';
@@ -502,22 +516,40 @@ The running side of this document is `docs/messaging.md`, "E-mail (the mail
 gateway)": configuration, the backfill, what `/gateways` shows, named
 accounts. The points an operator meets first:
 
-- **Nothing to set for the default account.** The gateway reads the mailbox
-  variables `.env` already holds for `email_client.py`; the base compose runs
-  it in every deployment, idle where no mailbox is configured. Set
-  `MAIL_GATEWAY_TOKEN` (both services read it). `MAIL_BACKFILL_DAYS=0` starts
-  the mirror with no history.
+- **One thing to set for the default account: `MAIL_GATEWAY_TOKEN`.** The
+  gateway reads the mailbox variables `.env` already holds for
+  `email_client.py`, and the base compose runs it in every deployment — but it
+  mirrors and serves nothing until the token is set (both services read it).
+  So an upgrade that changes nothing in `.env` mirrors nothing; setting the
+  token is the decision to mirror. `MAIL_BACKFILL_DAYS=0` starts the mirror
+  with no history.
+- **A pinned channel set must name `email`.** A deployment that sets
+  `MESSENGER_BUILTIN_CHANNELS` adds `email` to it, in `.env` (a value set only
+  on the `retinue` service does not reach the gateway); without it the
+  default account's gateway idles as not configured.
+- **`MAIL_OWN_ADDRESSES` lists every address of the user's** that may appear
+  on the mailbox's mail — aliases and the user's other mirrored accounts —
+  one value for every mail gateway.
 - **The credentials are in two containers until phase 2**: the mail
   gateway's and, as before, the `retinue` container's (`SECURITY.md`).
 - **The e-mail policy file moves** to
   `chambers/_generated/messenger/email/policy/email-policy.nt`, on the
   gateway's ledger volume; the retinue side moves the old
-  `_generated/triage/email-whitelist.nt` there on start. An old file that
-  differs from the new one is left in place and reported, never deleted.
+  `_generated/triage/email-whitelist.nt` there first thing at start. The
+  mirror waits for the file before its first backfill — with no limit unless
+  `MAIL_POLICY_WAIT_SECONDS` is a positive number. An old file that differs
+  from the new one is left in place and reported, never deleted.
 - **A named account** is a second gateway service with `MAIL_ACCOUNT_NAME`,
   enrolled in `MESSENGER_GATEWAYS` with `"channel": "email"`
   (`docker-compose.override.example.yml`).
 - **Not running it at all**: give the service a profile nobody enables in the
   override (`profiles: ["off"]`) and leave `email` out of
   `MESSENGER_BUILTIN_CHANNELS`, as for any built-in channel never run, so the
-  monitor does not report the absent container as an outage.
+  monitor does not report the absent container as an outage. Only then does
+  the mailbox password stay out of a second container: compose hands it to
+  the gateway whether or not it mirrors.
+- **Not in this phase**: sending and the mailbox following the chat (phase 2,
+  which also gives the gateway `EMAIL_SEND_POLICY` and `CHAT_ERASE_TOKEN`),
+  the gate, the gateway's own news filing and the retirement of e-mail triage
+  (phase 3), the model trim (phase 4). Until phase 3 no mail pushes or starts
+  a turn, whatever a contact's prior or VIP flag says.

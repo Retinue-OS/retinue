@@ -174,7 +174,7 @@ gateways when their `*_GATEWAY_BASE_URL` is set and their name is included in
 `telegram`, `sms`, `email`; SMS additionally needs `SMS_GATEWAY_BASE_URL`, which the base
 compose leaves unset — see "Gateway connection monitoring" below — and
 `email` is enrolled by `MAIL_GATEWAY_BASE_URL`, its gateway being the mail
-gateway), but a deployment often runs
+gateway, which reads the variable too — see "E-mail (the mail gateway)"), but a deployment often runs
 *more than one* gateway on a channel — most commonly a second Signal identity,
 the user's **personal** account (`signal-gateway-personal`) alongside the
 system one. Those extra gateways are enrolled by the deployment via
@@ -350,6 +350,25 @@ channel's gateway: a built-in of the registry, enrolled by
 `MAIL_GATEWAY_BASE_URL`, which the base compose sets, and **not** behind a
 profile — a deployment with no mailbox configured runs it idle.
 
+**Opt-in: `MAIL_GATEWAY_TOKEN`.** The container runs everywhere, but it
+mirrors nothing and serves nothing until `MAIL_GATEWAY_TOKEN` is set: one
+random value in `.env` (`openssl rand -hex 32`), which compose passes to both
+the gateway and the `retinue` service. Without it only `/health` answers, with
+`configured: false` and an `error` that names the token, so `/gateways` shows
+the channel as not set up and the monitor raises no outage. An upgrade that
+changes nothing in `.env` therefore mirrors nothing, although the mailbox
+credentials are already there; setting the token is the decision to mirror
+the mailbox (90 days back, by default) into the chat ledger and the life
+store.
+
+**Upgrading a deployment that pinned `MESSENGER_BUILTIN_CHANNELS`.** The
+default account's gateway reads that variable too and idles as not
+configured when it is set and does not list `email` — so a deployment that
+named its channels before e-mail was one gets no mail chats until it adds
+`email`. Set it in `.env`: a value set only on the `retinue` service in the
+override does not reach `mail-gateway` (or set it on both services). To run no
+mail gateway container at all, see "Never run the container at all" below.
+
 It reads the mailbox credentials `scripts/email_client.py` reads, in its own
 container, and uses `email_client.py` as its IMAP and MIME library. The same
 credentials stay on the `retinue` service as well: `email_client.py`, its
@@ -373,7 +392,9 @@ part is kept as a blob in the ledger's media store — plain text, HTML, the
 header block, attachments and inline images — and served only through the
 gateway's token-gated `GET /media/<id>`, which the web gateway proxies. A
 remote image is never fetched; a tracking pixel is dropped. A mail of a `news`
-group or list (`triage_policy.py email-news-add`) starts no chat.
+sender or list (`triage_policy.py email-news-add`) starts no chat: the gateway
+skips it, and e-mail triage files it to the news feed as before — the gateway
+files news itself only from the gate phase on (`docs/mail-chats.md`).
 
 **Configuration** — on the `mail-gateway` service, all named in
 `docker-compose.yml` (it loads no `env_file`):
@@ -382,20 +403,28 @@ group or list (`triage_policy.py email-news-add`) starts no chat.
 |---|---|---|
 | `EMAIL_USER`, `EMAIL_PASS`, `IMAP_HOST`, `IMAP_PORT`, `SMTP_HOST`, `SMTP_PORT`, `SENT_FOLDER`, `EMAIL_FROM_NAME`, `SMTP_SAVE_SENT`, `DRAFTS_FOLDER` | as `email_client.py` | the default account — the same values `.env` already holds for it |
 | `MAIL_ACCOUNT_NAME` | *(empty)* | serve a named account: read the `_<NAME>`-suffixed set instead (below) |
-| `MAIL_OWN_ADDRESSES` | *(empty)* | the user's further addresses on this mailbox (aliases), comma-separated; never listed as participants |
+| `MESSENGER_BUILTIN_CHANNELS` | *(unset: all)* | as on `retinue`; set without `email`, the default account's gateway idles as not configured |
+| `MAIL_OWN_ADDRESSES` | *(empty)* | every address of the user's that may appear on this mailbox's mail, comma-separated: its aliases **and** the addresses of the user's other mirrored accounts. Never a participant, never a chat's peer; one value listing all of them serves every mail gateway |
 | `MAIL_ARCHIVE_FOLDER` | `Archive` | the archive folder the mirror follows |
 | `MAIL_TRASH_FOLDER` | `Trash` | for the writing phase |
 | `MAIL_POLL_SECONDS` | `60` | poll interval |
 | `MAIL_BACKFILL_DAYS` | `90` | how far back INBOX and Sent are mirrored on first run; `0` mirrors only new mail |
+| `MAIL_BACKFILL_BATCH` | `50` | mails per backfill batch |
+| `MAIL_BACKFILL_PAUSE_SECONDS` | `2` | pause between backfill batches |
+| `MAIL_IMAP_TIMEOUT` | `60` | IMAP socket timeout, seconds |
 | `MAIL_MAX_PART_BYTES` | 25 MiB | an attachment larger than this is not stored |
 | `MAIL_MAX_MAIL_BYTES` | 50 MiB | a larger mail keeps its text parts and no attachments |
 | `MAIL_TRIM_WANTING_CHARS` | `2500` | the trim's "still long" threshold (`scripts/mail_trim.py`) |
-| `MAIL_POLICY_WAIT_SECONDS` | `300` | how long the first backfill waits for the e-mail policy file |
-| `MAIL_GATEWAY_TOKEN` | | bearer token of its HTTP API; set the same value for `retinue` |
-| `EMAIL_SEND_POLICY` | | read for the gateway's own address; used once it sends |
+| `MAIL_POLICY_WAIT_SECONDS` | *(unset: no limit)* | a positive number: how long the mirror waits for the e-mail policy file before it starts as with no flags |
+| `MAIL_RECENT_CHATS_MAX` | `200` | how many chats `/recent-chats` answers at most |
+| `MAIL_RAIL_TIMEOUT` | `10` | timeout of the chats rail's POSTs, seconds |
+| `MAIL_GATEWAY_TOKEN` | | **required** — the opt-in (above) and the bearer token of its HTTP API; compose passes the one `.env` value to `retinue` too |
 
-`CHATS_INGEST_*`, `NEWS_INGEST_*`, `CHAT_ERASE_TOKEN` and `INBOUND_STORE_DIR`
-are wired by compose as on the other gateways. Volumes: `messenger-email` is
+`CHATS_INGEST_*` and `INBOUND_STORE_DIR` are wired by compose as on the other
+gateways. What this phase does not read is not given: no `EMAIL_SEND_POLICY`
+(it sends nothing), no `CHAT_ERASE_TOKEN` (it erases nothing; its
+`/chats/delete` answers `501`) and no `NEWS_INGEST_*` (it files no news) — the
+phases that add sending, erasure and the news rail add them. Volumes: `messenger-email` is
 the ledger (the gateway's `/inbound`, the retinue side's
 `chambers/_generated/messenger/email`, qlever-life read-only), `mail-data` its
 own state (the thread index, the index of where each mail lives, outbound
@@ -414,14 +443,20 @@ client's `\Seen` is ignored. `/health.backfill` says how far it got
 the gateway must read at ingest — so it lives on the gateway's ledger volume
 now: `chambers/_generated/messenger/email/policy/email-policy.nt` on the
 retinue side, `/inbound/policy/email-policy.nt` in the gateway. It used to be
-`chambers/_generated/triage/email-whitelist.nt`; the retinue side moves it
-(content and all) on start, and any retinue-side write of the policy moves it
-first. A deployment that pinned `TRIAGE_EMAIL_WHITELIST_PATH` keeps its path
-and is not moved, and must give the gateway the same file under its own mount.
-The gateway waits for the file before its first backfill (`/health.error` says
-so meanwhile), at most `MAIL_POLICY_WAIT_SECONDS`, then goes on as with no
-flags. `python3 scripts/triage_policy.py show-email` places the file too, and
-says on stderr if it left an old file that differs from the new one.
+`chambers/_generated/triage/email-whitelist.nt`; the retinue entrypoint moves
+it (content and all) first thing at start, before the chamber clones and
+installs (`triage_policy.py place-email-policy`), the web gateway does again
+when it starts, and any retinue-side write of the policy moves it first. A
+deployment that pinned `TRIAGE_EMAIL_WHITELIST_PATH` keeps its path and is not
+moved, and must give the gateway the same file under its own mount. The mirror
+does not start until the file is there (`/health.error` says so meanwhile):
+its first backfill decides once, at ingest, which mail is news, so a backfill
+without the flags would make every newsletter of the window a chat for good.
+By default it waits as long as it takes; a positive
+`MAIL_POLICY_WAIT_SECONDS` makes it give up after that long and go on as with
+no flags. `python3 scripts/triage_policy.py place-email-policy` (or any other
+command of it) places the file too, and says if it left an old file that
+differs from the new one.
 
 **`/gateways`** shows the mail gateway as a card like a messenger's: whether
 it is connected and, if not, the reason its `/health` gives (whose `account`
@@ -440,7 +475,10 @@ suffixed variables listed, the default account's password blanked, and its
 records carry their account. Enrol it in `MESSENGER_GATEWAYS` with
 `"channel": "email"`, since its service name does not say which channel it
 serves. One thread reaching two of the user's accounts is two chats, one per
-account. The full example is in `docker-compose.override.example.yml`.
+account — and in each, the user's other account is the user, not a
+correspondent, only if `MAIL_OWN_ADDRESSES` lists it: let that one value
+(which `extends` hands every mail gateway) name every address of the user's.
+The full example is in `docker-compose.override.example.yml`.
 
 ## What an agent session can see
 
@@ -523,6 +561,11 @@ to avoid that, and they mean different things:
   channel out drops it from all three at once, same as a chamber that was
   never mounted. One variable states the deployment's whole channel set, so it
   reads as a deliberate choice rather than a row of easy-to-forget blanks.
+  The mail gateway reads the variable too (from `.env`; a value set only on
+  the `retinue` service does not reach it) and idles where it leaves `email`
+  out; to keep its container from starting at all, also give `mail-gateway`
+  a profile nobody enables in the override (`profiles: ["off"]`). It then
+  holds no mailbox password either.
 
 `GATEWAY_MONITOR_IGNORE` (comma-separated slugs) is the narrower tool: it
 silences the monitor alone while leaving the channel enrolled everywhere else

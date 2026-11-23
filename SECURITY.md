@@ -87,15 +87,23 @@ nothing new.
   container (for `email_client.py`'s backend, the e-mail triage and the
   approval of e-mail drafts, as before) and the `mail-gateway` container,
   which mirrors the mailbox into the chat ledger and is given only the
-  variables it reads, no `.env` wholesale. The mail gateway is the sidecar
+  variables it reads in this phase, no `.env` wholesale — not the send
+  policy, not the chat-erase token, not the news rail's token. Compose hands
+  it the credentials whether or not it mirrors; a deployment that wants them
+  in one container only gives the service a profile nobody enables
+  (`docs/messaging.md`). The mail gateway is the sidecar
   that will close this gap for e-mail, but only once sending moves into it
   and the credentials can leave the `retinue` service; until then it adds a
   second place that holds them rather than taking one away. A named account
   mirrored as chats is held by its own mail gateway service as well. The mail
-  gateway reaches no session and has no public route; what it serves —
-  stored mail and its parts — is behind `MAIL_GATEWAY_TOKEN`, which a session
-  does inherit, like every gateway token, so a session can read the mirrored
-  mail as it can already read the mailbox through the backend. Closing
+  gateway reaches no session and has no public route. It mirrors nothing and
+  serves nothing but its `/health` until `MAIL_GATEWAY_TOKEN` is set — the
+  operator's opt-in, so an upgrade that sets nothing mirrors nothing and no
+  sidecar on the internal network can read stored mail without the token.
+  Once set, what it serves — stored mail and its parts — is behind that
+  token, which a session does inherit, like every gateway token, so a session
+  can read the mirrored mail as it can already read the mailbox through the
+  backend. Closing
   that means holding each secret in its own sidecar or under a separate uid,
   which is a separate roadmap item. An outbound send still has to clear the
   sending identity's policy, but a pending `verify` approval is not bound to

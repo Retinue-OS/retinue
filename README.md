@@ -104,7 +104,9 @@ Defines these core compose services:
   the full mail a tap away (`scripts/mail-gateway.py`;
   [`docs/mail-chats.md`](docs/mail-chats.md)). Read-only for now — it changes
   nothing in the mailbox and sends nothing, and e-mail triage runs beside it.
-  With no mailbox configured it idles. See
+  Opt-in: it mirrors nothing until `MAIL_GATEWAY_TOKEN` is set, so an upgrade
+  that changes nothing in `.env` mirrors nothing; with no mailbox configured
+  it idles. See
   [`docs/messaging.md`](docs/messaging.md), "E-mail (the mail gateway)".
 - **`stt`** — a small speech-to-text microservice that owns the single Whisper
   model in the stack and exposes `POST /transcribe`. Shared by the
@@ -602,7 +604,8 @@ that gap:
   periodic session probe (which catches a session revoked from another device).
   The mail gateway reports whether its last IMAP login and poll succeeded.
   An unconfigured channel reports `configured: false` and idles instead of
-  crash-looping.
+  crash-looping — the mail gateway too while `MAIL_GATEWAY_TOKEN` is unset or
+  `MESSENGER_BUILTIN_CHANNELS` leaves out `email`, its `/health` saying which.
 - **The monitor.** `scripts/gateway-monitor.py` (forked by the entrypoint in
   the `retinue` container) polls every configured gateway's `/health` once a
   minute. After two consecutive failures it notifies the user through the
@@ -617,7 +620,8 @@ that gap:
   registry `/sends` uses — the built-in channels named in
   `MESSENGER_BUILTIN_CHANNELS` (default: all five — SMS only where
   `SMS_GATEWAY_BASE_URL` is set, e-mail's mail gateway where
-  `MAIL_GATEWAY_BASE_URL` is, which the base compose sets) plus any
+  `MAIL_GATEWAY_BASE_URL` is, which the base compose sets; a deployment that
+  pins the set must add `email` to it, in `.env`, to get mail chats) plus any
   `MESSENGER_GATEWAYS` extras. A mail gateway's notices say the mail server
   refused the login or cannot be reached, never to re-pair a phone.
 - **Re-pairing from the phone.** The dashboard page **`/gateways`** (behind the

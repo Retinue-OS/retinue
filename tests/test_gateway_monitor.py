@@ -294,6 +294,25 @@ def test_mail_enrols_only_with_its_base_url():
             os.environ.pop(key, None)
 
 
+def test_a_mail_gateway_not_opted_in_is_never_an_outage():
+    """The mail gateway's opt-ins — MAIL_GATEWAY_TOKEN set, `email` in a
+    pinned MESSENGER_BUILTIN_CHANNELS — leave a running container that
+    mirrors nothing and says why on /health with configured: false. An
+    upgrade that sets neither must not open a "disconnected" thread that
+    blames the mail server, however long it idles."""
+    n = FakeNotifier()
+    e = gm.MonitorEngine(n, fail_threshold=1, remind_seconds=1)
+    for error in ("MAIL_GATEWAY_TOKEN is not set",
+                  "the email channel is not in MESSENGER_BUILTIN_CHANNELS"):
+        body = {"status": "ok", "configured": False, "connected": False,
+                "mode": "inbox", "error": error}
+        verdict, reason = gm.classify_health(200, body)
+        assert (verdict, reason) == ("unconfigured", None), (verdict, reason)
+        for now in (1000, 2000, 90000):
+            e.step("mail-gateway", "E-mail", verdict, reason, now=now, channel="email")
+    assert n.opened == [] and n.appended == [] and "mail-gateway" not in e.state
+
+
 # ── Wording follows the channel ───────────────────────────────────────────────
 
 _PAIRING_WORDS = ("re-pair", "QR", "phone", "messenger")

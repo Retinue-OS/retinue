@@ -159,8 +159,10 @@ services:
       # its base URL enrols the e-mail channel on /gateways, the chat surface
       # and the connection monitor. Wired by default like the messengers — an
       # unconfigured mail gateway reports configured: false and idles. The
-      # send URL is for the send path of a later phase; the mirror is
-      # read-only and answers 501 there.
+      # token is the operator's opt-in: until MAIL_GATEWAY_TOKEN is set in
+      # .env (compose passes the one value to both sides) the gateway
+      # mirrors and serves nothing. The send URL is for the send path of a
+      # later phase; the mirror is read-only and answers 501 there.
       - MAIL_GATEWAY_SEND_URL=http://mail-gateway:8096/send
       - MAIL_GATEWAY_BASE_URL=http://mail-gateway:8096
       - MAIL_GATEWAY_TOKEN
@@ -1121,11 +1123,15 @@ services:
   # part kept as a blob, and serves /health, /recent-chats, /threads and the
   # token-gated /media/<id>. In this phase it is read-only: it changes nothing
   # in the mailbox, sends nothing (its /send answers 501), pushes nothing and
-  # starts no model turn — e-mail triage runs beside it unchanged.
+  # starts no model turn — e-mail triage runs beside it unchanged, and still
+  # files news mail to the feed.
   #
-  # Not behind a profile: with no mailbox configured it reports
-  # configured: false and idles, as an unlinked messenger does. It needs no
-  # public route — IMAP is outbound only.
+  # Not behind a profile, but opt-in: it mirrors nothing and serves nothing
+  # until MAIL_GATEWAY_TOKEN is set (in .env; compose passes it to both
+  # sides), and the default account's gateway idles where
+  # MESSENGER_BUILTIN_CHANNELS is set without `email`. Until then — and with
+  # no mailbox configured — its /health answers alone and says why, as an
+  # unlinked messenger does. It needs no public route — IMAP is outbound only.
   mail-gateway:
     build:
       context: .
@@ -1154,39 +1160,55 @@ services:
       - SENT_FOLDER
       - DRAFTS_FOLDER
       - SMTP_SAVE_SENT
-      # The send policy, keyed by the sending address as for email_client.py;
-      # read for the gateway's own address, used once it sends.
-      - EMAIL_SEND_POLICY
+      # The send policy (EMAIL_SEND_POLICY) and the erase capability
+      # (CHAT_ERASE_TOKEN) are NOT given: this phase sends and erases nothing,
+      # and the container that parses mail from strangers holds no credential
+      # it has no use for. The phases that send and erase add them.
       # Empty: the default account. A name: read the _<NAME>-suffixed set.
       - MAIL_ACCOUNT_NAME
-      # Further addresses that are the user's own on this mailbox (aliases),
-      # comma-separated: never listed as a thread's participants.
+      # The built-in channel set, as on the retinue service: the default
+      # account's gateway idles as not configured when this is set and does
+      # not list `email`. Read from .env — a value set only on the retinue
+      # service in an override does not reach this service.
+      - MESSENGER_BUILTIN_CHANNELS
+      # Every address of the user's that may appear on this mailbox's mail,
+      # comma-separated — the aliases on this mailbox AND the addresses of the
+      # user's other mirrored accounts: never listed as a thread's
+      # participants, never its peer. One value listing all of them serves
+      # every mail gateway (each also knows its own account).
       - MAIL_OWN_ADDRESSES
       # Optional tunables (defaults in scripts/mail-gateway.py and
       # docs/messaging.md): the archive and trash folders, the poll interval,
-      # the backfill window in days (0 mirrors only new mail), the size caps
-      # for one part and one mail, the trim's "wanting" threshold, and how
-      # long the first backfill waits for the e-mail policy file.
+      # the backfill window in days (0 mirrors only new mail), the backfill's
+      # batch size and the pause between batches, the IMAP socket timeout,
+      # the size caps for one part and one mail, the trim's "wanting"
+      # threshold, the limit on waiting for the e-mail policy file before the
+      # mirror starts (unset or 0: no limit), how many chats /recent-chats
+      # answers, and the timeout of the chats rail's POSTs.
       - MAIL_ARCHIVE_FOLDER
       - MAIL_TRASH_FOLDER
       - MAIL_POLL_SECONDS
       - MAIL_BACKFILL_DAYS
+      - MAIL_BACKFILL_BATCH
+      - MAIL_BACKFILL_PAUSE_SECONDS
+      - MAIL_IMAP_TIMEOUT
       - MAIL_MAX_PART_BYTES
       - MAIL_MAX_MAIL_BYTES
       - MAIL_TRIM_WANTING_CHARS
       - MAIL_POLICY_WAIT_SECONDS
       - MAIL_RECENT_CHATS_MAX
+      - MAIL_RAIL_TIMEOUT
       - MAIL_DATA_DIR=/root/.local/share/mail
       - MAIL_GATEWAY_HTTP_PORT=8096
+      # The operator's opt-in: unset, the gateway neither mirrors nor serves.
+      # The same value as on the retinue service (one line in .env).
       - MAIL_GATEWAY_TOKEN
-      # Chats rail and chat erasure — as on telegram-gateway above. The merge
-      # and removal rails are derived from CHATS_INGEST_URL.
+      # Chats rail — as on telegram-gateway above. The merge and removal rails
+      # are derived from CHATS_INGEST_URL. No news rail: in this phase a mail
+      # of a `news` sender or list is only skipped here, and e-mail triage
+      # files it to the feed as before; the gate phase moves that here.
       - CHATS_INGEST_URL=http://retinue:8080/internal/chats/inbound
       - CHATS_INGEST_TOKEN
-      - CHAT_ERASE_TOKEN
-      # The news rail, for a mail of a `news` group.
-      - NEWS_INGEST_URL=http://retinue:8080/internal/news
-      - NEWS_INGEST_TOKEN
       # The ledger, and the e-mail policy file in it: the retinue side writes
       # that file at chambers/_generated/messenger/email/policy/, which is
       # this volume's policy/ here. Named explicitly because the two sides see

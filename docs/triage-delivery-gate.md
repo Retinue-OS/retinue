@@ -274,7 +274,9 @@ channel's own `policy.nt` (`triage_policy.email_whitelist_path()`;
 `TRIAGE_EMAIL_WHITELIST_PATH` overrides it). It used to live at
 `_generated/triage/email-whitelist.nt`, and
 `triage_policy.ensure_email_policy_location()` moves it from there on the
-retinue side (docs/messaging.md, "E-mail (the mail gateway)").
+retinue side — first thing at container start, since the mail gateway's mirror
+waits for the file (docs/messaging.md, "E-mail (the mail gateway)"). News mail
+is still filed to the feed by this gate; the mail gateway only skips it.
 
 **Why the gateway reads a raw file, never SPARQL.** Classification happens on the
 inbound hot path, in-process. If the gateway resolved the policy over

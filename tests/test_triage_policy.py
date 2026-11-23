@@ -779,6 +779,36 @@ def test_the_cli_places_the_file():
         assert env.new.exists() and not env.old.exists()
 
 
+def test_place_email_policy_says_what_it_did_and_fails_loudly():
+    """The entrypoint's first step: the placement alone, its result on stdout,
+    a non-zero exit when the file cannot be put in place (the entrypoint
+    then warns), never a silent success."""
+    import contextlib
+    import io
+    with _PolicyEnv() as env:
+        content = _policy_with(news_wildcards={"*@substack.com"})
+        env.write_old(content)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            assert tp.main(["place-email-policy"]) == 0
+        assert out.getvalue() == f"{env.new}: moved\n", out.getvalue()
+        assert env.new.read_text(encoding="utf-8") == content and not env.old.exists()
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            assert tp.main(["place-email-policy"]) == 0
+        assert out.getvalue() == f"{env.new}: present\n", out.getvalue()
+    with _PolicyEnv() as env:
+        # A file where the policy folder should be: the new path cannot be
+        # written.
+        blocker = env.new.parents[1]
+        blocker.parent.mkdir(parents=True)
+        blocker.write_text("not a directory", encoding="utf-8")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+            assert tp.main(["place-email-policy"]) == 1
+        assert "could not place the e-mail policy file" in err.getvalue(), err.getvalue()
+
+
 def _run() -> int:
     tests = [v for k, v in sorted(globals().items())
              if k.startswith("test_") and callable(v)]

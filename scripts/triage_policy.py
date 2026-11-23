@@ -947,6 +947,9 @@ def main(argv: list[str] | None = None) -> int:
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     sub.add_parser("show-email")
+    # Only the placement every command does first (below), and its result on
+    # stdout; the entrypoint runs it before anything slow at start.
+    sub.add_parser("place-email-policy")
     p = sub.add_parser("email-add-address"); p.add_argument("address", nargs="+")
     p = sub.add_parser("email-add-wildcard"); p.add_argument("wildcard", nargs="+")
     p = sub.add_parser("email-remove"); p.add_argument("entry", nargs="+")
@@ -985,14 +988,20 @@ def main(argv: list[str] | None = None) -> int:
     # policy does not depend on it, and an e-mail edit fails on its own write.
     try:
         placed = ensure_email_policy_location()
-        if placed["action"] != "present" or placed["legacy_left"]:
-            note = (f"left the old file at {placed['legacy_left']} (it differs; the new "
-                    f"one is used)" if placed["legacy_left"] else placed["action"])
-            print(f"triage_policy: e-mail policy {placed['path']}: {note}", file=sys.stderr)
     except OSError as exc:
         print(f"triage_policy: could not place the e-mail policy file: {exc}", file=sys.stderr)
+        placed = None
+    if placed is not None:
+        note = (f"left the old file at {placed['legacy_left']} (it differs; the new "
+                f"one is used)" if placed["legacy_left"] else placed["action"])
+        if args.cmd == "place-email-policy":
+            print(f"{placed['path']}: {note}")
+        elif placed["action"] != "present" or placed["legacy_left"]:
+            print(f"triage_policy: e-mail policy {placed['path']}: {note}", file=sys.stderr)
 
-    if args.cmd == "show-email":
+    if args.cmd == "place-email-policy":
+        return 0 if placed is not None else 1
+    elif args.cmd == "show-email":
         pol = load_email_policy()
         for a in sorted(pol.addresses | pol.contact_addresses | pol.wildcards):
             print(f"whitelist\t{a}")

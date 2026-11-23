@@ -154,6 +154,11 @@ def _extra_channel_gateways(log_prefix: str) -> dict:
 # having to blank that channel's *_GATEWAY_BASE_URL to the same effect. The
 # full tuple is also the set of channel names a registry slug is read against
 # (the web gateway's slug → channel fallback, for an entry with no channel).
+# The mail gateway reads the same variable (compose passes it from .env): its
+# default account idles as not configured when the variable is set and leaves
+# `email` out, so a deployment that pinned its channel set before e-mail was
+# one runs no unenrolled mirror. A named mail account, enrolled through
+# MESSENGER_GATEWAYS, is not affected.
 BUILTIN_CHANNELS = ("signal", "whatsapp", "telegram", "sms", "email")
 
 # Each built-in: its channel, the prefix of its *_GATEWAY_BASE_URL and

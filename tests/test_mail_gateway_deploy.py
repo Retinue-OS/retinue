@@ -8,8 +8,12 @@ qlever-life container cannot mount, a module the image does not carry, a
 policy file the two sides look for under different names. What these pin:
 
 - the service names every variable it reads and loads no env_file (it holds a
-  mailbox password; .env holds every other secret too), runs without a
-  profile, and mounts its ledger and its state volume;
+  mailbox password; .env holds every other secret too), names no setting or
+  credential it does not read in this phase (the send policy, the erase
+  token, the news rail), runs without a profile, and mounts its ledger and
+  its state volume;
+- the retinue entrypoint places the e-mail policy file before anything slow,
+  since the mirror does not start without it;
 - the ledger volume is mounted by the retinue service and read-only by
   qlever-life, and volumes-init creates its mountpoint first;
 - the retinue service enrols the gateway and keeps the mailbox credentials
@@ -57,6 +61,19 @@ def _env_names(block: str) -> set[str]:
     return {e.split("=", 1)[0] for e in _entries(block) if re.match(r"^[A-Z][A-Z0-9_]*(=|$)", e)}
 
 
+_ENV_READ_RE = re.compile(
+    r"(?:os\.environ\.get|os\.getenv|_env_int|_env_float)\(\s*\"([A-Z][A-Z0-9_]*)\"")
+
+
+def _names_read() -> set[str]:
+    """The variables the gateway's own code reads: mail-gateway.py and the
+    trim it runs (the shared modules' rails are checked by name above)."""
+    out = set()
+    for name in ("mail-gateway.py", "mail_trim.py"):
+        out |= set(_ENV_READ_RE.findall((SCRIPTS_DIR / name).read_text(encoding="utf-8")))
+    return out
+
+
 def _load(name: str, path: Path):
     spec = importlib.util.spec_from_file_location(name, path)
     mod = importlib.util.module_from_spec(spec)
@@ -76,11 +93,13 @@ def test_the_service_names_what_it_reads_and_nothing_else():
                "SMTP_HOST", "SMTP_PORT", "SENT_FOLDER", "SMTP_SAVE_SENT"}
     tunables = {"MAIL_ACCOUNT_NAME", "MAIL_OWN_ADDRESSES", "MAIL_ARCHIVE_FOLDER",
                 "MAIL_TRASH_FOLDER", "MAIL_POLL_SECONDS", "MAIL_BACKFILL_DAYS",
+                "MAIL_BACKFILL_BATCH", "MAIL_BACKFILL_PAUSE_SECONDS", "MAIL_IMAP_TIMEOUT",
                 "MAIL_MAX_PART_BYTES", "MAIL_MAX_MAIL_BYTES", "MAIL_TRIM_WANTING_CHARS",
                 "MAIL_DATA_DIR", "MAIL_GATEWAY_HTTP_PORT", "MAIL_GATEWAY_TOKEN",
-                "MAIL_POLICY_WAIT_SECONDS"}
-    rails = {"CHAT_ERASE_TOKEN", "CHATS_INGEST_URL", "CHATS_INGEST_TOKEN",
-             "NEWS_INGEST_URL", "NEWS_INGEST_TOKEN", "EMAIL_SEND_POLICY",
+                "MAIL_POLICY_WAIT_SECONDS", "MAIL_RECENT_CHATS_MAX", "MAIL_RAIL_TIMEOUT",
+                # The default account idles where the channel set leaves out email.
+                "MESSENGER_BUILTIN_CHANNELS"}
+    rails = {"CHATS_INGEST_URL", "CHATS_INGEST_TOKEN",
              "INBOUND_STORE_DIR", "TRIAGE_EMAIL_WHITELIST_PATH"}
     missing = (mailbox | tunables | rails) - names
     assert not missing, f"mail-gateway does not name {sorted(missing)}"
@@ -89,10 +108,26 @@ def test_the_service_names_what_it_reads_and_nothing_else():
                   "CHATS_INGEST_URL=http://retinue:8080/internal/chats/inbound",
                   "mail-data:/root/.local/share/mail", "messenger-email:/inbound"):
         assert fixed in entries, f"mail-gateway: expected `{fixed}`"
-    # Secrets it has no use for stay out.
+    # Secrets it has no use for stay out — and so do the ones a later phase
+    # reads: the read-only mirror sends nothing (EMAIL_SEND_POLICY), erases
+    # nothing (CHAT_ERASE_TOKEN, the messengers' /chats/delete capability) and
+    # files no news (e-mail triage still does). The container that parses
+    # mail from strangers holds no credential it has no use for.
     for foreign in ("LITELLM_MASTER_KEY", "OPENROUTER_API_KEY", "CALDAV_PASSWORD",
-                    "SMS_SERVER_PASSWORD", "TELEGRAM_API_HASH"):
+                    "SMS_SERVER_PASSWORD", "TELEGRAM_API_HASH", "EMAIL_SEND_POLICY",
+                    "CHAT_ERASE_TOKEN", "NEWS_INGEST_URL", "NEWS_INGEST_TOKEN"):
         assert foreign not in names, foreign
+    # Both ways for the gateway's own settings: every MAIL_* it names is one
+    # the gateway's code reads (a value-less name the code ignores would be a
+    # setting that silently does nothing), and every variable the gateway's
+    # own code reads is named (a value in .env would otherwise never arrive).
+    read = _names_read()
+    dead = {n for n in names if n.startswith("MAIL_")} - read
+    assert not dead, f"mail-gateway names {sorted(dead)}, which nothing in it reads"
+    # TRIAGE_MESSENGER_DIR is the alternative to TRIAGE_EMAIL_WHITELIST_PATH,
+    # which compose sets.
+    unwired = read - names - {"TRIAGE_MESSENGER_DIR"}
+    assert not unwired, f"the mail gateway reads {sorted(unwired)}, which compose does not pass"
     try:
         import yaml  # noqa: PLC0415 - optional
     except ImportError:
@@ -210,8 +245,48 @@ def test_the_image_carries_every_module_it_imports():
     print("PASS test_the_image_carries_every_module_it_imports")
 
 
+def test_the_entrypoint_places_the_policy_file_before_anything_slow():
+    """The mirror does not start while the e-mail policy file is absent, and
+    a backfill without the `news` flags would make every newsletter of the
+    window a chat for good. So the retinue side puts the file in place first
+    thing — before the chamber clones, the plugin installs, the pip installs
+    and the web gateway (which places it too, but late)."""
+    lines = [l for l in (SCRIPTS_DIR / "entrypoint.sh").read_text(encoding="utf-8").splitlines()
+             if l.strip() and not l.lstrip().startswith("#")]
+
+    def first(pattern: str) -> int:
+        hit = next((i for i, l in enumerate(lines) if re.search(pattern, l)), None)
+        assert hit is not None, f"entrypoint.sh: no line matches {pattern!r}"
+        return hit
+
+    place = first(r"triage_policy\.py place-email-policy")
+    for slow in (r"git clone", r"sync-plugins\.py", r"pip install", r"web-gateway\.py &"):
+        assert place < first(slow), f"the policy file must be placed before `{slow}`"
+    # Best effort: a failure warns and the boot goes on (set -e is in force).
+    assert re.search(r"\|\|\s*echo", lines[place + 1] + lines[place + 2]), \
+        lines[place:place + 3]
+    tp = _load("triage_policy_cli_under_test", SCRIPTS_DIR / "triage_policy.py")
+    import contextlib  # noqa: PLC0415
+    import io  # noqa: PLC0415
+    import tempfile  # noqa: PLC0415
+    with tempfile.TemporaryDirectory() as tmp:
+        saved = os.environ.get("TRIAGE_EMAIL_WHITELIST_PATH")
+        os.environ["TRIAGE_EMAIL_WHITELIST_PATH"] = str(Path(tmp) / "policy" / "email-policy.nt")
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                assert tp.main(["place-email-policy"]) == 0
+        finally:
+            if saved is None:
+                os.environ.pop("TRIAGE_EMAIL_WHITELIST_PATH", None)
+            else:
+                os.environ["TRIAGE_EMAIL_WHITELIST_PATH"] = saved
+        assert (Path(tmp) / "policy" / "email-policy.nt").read_bytes() == b""
+    print("PASS test_the_entrypoint_places_the_policy_file_before_anything_slow")
+
+
 def main() -> int:
     test_the_service_names_what_it_reads_and_nothing_else()
+    test_the_entrypoint_places_the_policy_file_before_anything_slow()
     test_the_ledger_volume_is_shared_three_ways()
     test_the_retinue_side_enrols_it_and_keeps_its_own_credentials()
     test_both_sides_name_the_same_policy_file()
