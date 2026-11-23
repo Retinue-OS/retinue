@@ -428,6 +428,64 @@ def test_delete_chat_unlinks_part_blobs():
     print("PASS test_delete_chat_unlinks_part_blobs")
 
 
+def test_the_author_of_an_outbound_record_can_be_corrected():
+    """A mail found in the Sent folder is recorded as the own-device echo
+    until the gateway is told who wrote it (POST /outbound-note)."""
+    with tempfile.TemporaryDirectory() as tmp:
+        _u, out, refs = _mail(tmp, outbound=True)
+        before = ist._parse(out.read_text())
+        assert before["author"] == "device"
+        ist.update_message(out, author="agent")
+        after = ist._parse(out.read_text())
+        assert after["author"] == "agent"
+        # Nothing else of the record moved.
+        assert {k: v for k, v in after.items() if k != "author"} == {
+            k: v for k, v in before.items() if k != "author"}
+        _assert_mail_fields(after, refs)
+        # It survives the other rewrites, and a tombstone keeps who sent it.
+        ist.update_message(out, chat="other@x.org")
+        assert ist._parse(out.read_text())["author"] == "agent"
+        assert ist.tombstone_message(out, 2000.0)
+        assert ist._parse(out.read_text())["author"] == "agent"
+        ist.update_message(out, author="user")
+        assert ist._parse(out.read_text())["author"] == "user"
+        # Only the three authors exist; anything else is a programming error.
+        for bad in ("root", "Agent ", "device\nx"):
+            try:
+                ist.update_message(out, author=bad)
+            except ValueError:
+                continue
+            assert bad.strip() in ist.AUTHORS, f"{bad!r} must be refused"
+        # An inbound record has no author, and does not grow one.
+        _u, inbound, _refs = _mail(tmp, timestamp=1001.0)
+        text = inbound.read_text()
+        ist.update_message(inbound, author="agent")
+        assert inbound.read_text() == text and ist.P_AUTHOR not in text
+        # Absent, the argument changes nothing.
+        ist.update_message(out, text="x")
+        assert ist._parse(out.read_text())["author"] == "user"
+    print("PASS test_the_author_of_an_outbound_record_can_be_corrected")
+
+
+def test_discard_media():
+    """Blobs stored for a record that then could not be written are taken
+    back, sidecars and all."""
+    with tempfile.TemporaryDirectory() as tmp:
+        keep = ist.store_media(tmp, b"keep", "text/plain")
+        pic = ist.store_media(tmp, _png(40, 20), "image/png", file_name="chart.png")
+        assert len(list(ist.media_dir(tmp).glob(pic + "*"))) == 4   # blob, type, name, meta
+        assert ist.discard_media(tmp, pic) is True
+        assert not list(ist.media_dir(tmp).glob(pic + "*"))
+        assert ist.load_media(tmp, keep) == (b"keep", "text/plain")
+        # Idempotent, and never a way out of the media directory.
+        assert ist.discard_media(tmp, pic) is True
+        outside = Path(tmp) / "outside"
+        outside.write_text("x")
+        assert ist.discard_media(tmp, "../outside") is True and outside.exists()
+        assert ist.discard_media(tmp, "") is True and ist.load_media(tmp, keep)
+    print("PASS test_discard_media")
+
+
 def test_iter_records():
     with tempfile.TemporaryDirectory() as tmp:
         assert list(ist.iter_records(Path(tmp) / "nope")) == []
@@ -463,5 +521,7 @@ if __name__ == "__main__":
     test_tombstone()
     test_rekey_then_delete_finds_the_new_key()
     test_delete_chat_unlinks_part_blobs()
+    test_the_author_of_an_outbound_record_can_be_corrected()
+    test_discard_media()
     test_iter_records()
     print("all inbound_store mail tests passed")

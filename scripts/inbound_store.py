@@ -1381,7 +1381,7 @@ def mark_delivered(path: str | Path) -> bool:
 
 def update_message(path: str | Path, *, text: str | None = None,
                    clear_media: bool = False, chat: str | None = None,
-                   trim: str | None = None) -> str | None:
+                   trim: str | None = None, author: str | None = None) -> str | None:
     """Rewrite a persisted message's mutable fields in place; never raises
     on file trouble.
 
@@ -1400,6 +1400,12 @@ def update_message(path: str | Path, *, text: str | None = None,
     (:func:`tombstone_message`) ``text=`` and ``trim=`` are ignored — a trim
     finishing after the mail was found gone must not put its words back.
 
+    ``author=`` (one of :data:`AUTHORS`, else ``ValueError``) corrects who an
+    outbound record says sent it. A mail the mail gateway finds in the Sent
+    folder is recorded as the own-device echo until it is told otherwise, and
+    the telling can come after the finding (``POST /outbound-note``). It is
+    ignored on an inbound record, which has no author to correct.
+
     Returns the ``media`` value present *before* the call — so a caller clearing
     it knows which file to unlink — or ``None`` if there was none or the rewrite
     failed. Only the fields named are touched; ``delivered`` and everything else
@@ -1407,6 +1413,9 @@ def update_message(path: str | Path, *, text: str | None = None,
     """
     trim = _check_trim(trim)
     chat = _one(chat)
+    author = _one(author)
+    if author is not None and author not in AUTHORS:
+        raise ValueError(f"author must be one of {'|'.join(AUTHORS)}, got {author!r}")
     p = Path(path)
     try:
         fields = _parse(p.read_text(encoding="utf-8"))
@@ -1422,6 +1431,8 @@ def update_message(path: str | Path, *, text: str | None = None,
         fields["trim"] = trim
     if chat is not None:
         fields["chat"] = chat
+    if author is not None and fields.get("type") == T_OUTBOUND:
+        fields["author"] = author
     if clear_media:
         fields["media"] = None
     try:
@@ -1630,6 +1641,22 @@ def _unlink_blob(store_dir: str | Path, media_id: str) -> tuple[bool, int]:
         except OSError:
             errors += 1
     return removed, errors
+
+
+def discard_media(store_dir: str | Path, media_id: str) -> bool:
+    """Remove one blob :func:`store_media` wrote, with its sidecars.
+
+    For a writer that stored a message's blobs and then could not write the
+    record that would have referenced them, or decided against one of them (a
+    mail's tracking pixel, known for one only once stored): nothing names the
+    blob, so nothing would ever unlink it. Not for a blob a record references — that
+    is :func:`tombstone_message`'s and :func:`delete_chat`'s, which check who
+    else names it. Never raises; True when nothing of the blob is left."""
+    try:
+        _removed, errors = _unlink_blob(store_dir, media_id)
+    except OSError:
+        return False
+    return errors == 0
 
 
 def delete_chat(store_dir: str | Path, chat: str,
