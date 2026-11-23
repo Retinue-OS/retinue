@@ -458,16 +458,31 @@
     // A relationship's pending state is settled; the dossier stays.
     _settle(item, how) { if (item.state !== 'open') return; item.state = item.kind === 'relationship' || item.kind === 'group' ? 'quiet' : 'done'; item.doneAt = this.now; item.doneHow = how; this.doneToday += 1; }
     // Send to the dossier's human participants (a relationship's channel); the pending state is settled.
-    // Send to the dossier's participants. A mail has a subject: empty = a reply in the newest thread; given = a new
-    // thread, which is just a message in the relationship (rule 3) and settles nothing that was pending before.
-    sendChat(id, text, attachments = [], subject = '') {
+    // The threads of a relationship. A messenger relationship is one thread — the person is the subject; a mail
+    // relationship is a set of threads, each with a subject, newest last.
+    threadsOf(item) {
+      const map = new Map();
+      for (const m of [...item.stream].sort((a, b) => a.t - b.t)) { if (m.who !== 'in' && m.who !== 'out') continue; const k = item.mail && m.thread != null ? m.thread : 'chat'; if (!map.has(k)) map.set(k, { key: k, subject: m.subject || null, msgs: [] }); map.get(k).msgs.push(m); }
+      return [...map.values()].sort((a, b) => a.msgs[a.msgs.length - 1].t - b.msgs[b.msgs.length - 1].t);
+    }
+    // Send to the dossier's participants. For mail: `thread` = a reply in that thread (Re: its subject, settling what
+    // it had pending); `subject` = a new thread, just another message in the relationship (rule 3), touching nothing
+    // pending; neither = a reply in the newest thread.
+    sendChat(id, text, attachments = [], opts = {}) {
+      if (typeof opts === 'string') opts = { subject: opts };
       const item = this.byId.get(id); if (!item || !(item.kind === 'relationship' || item.kind === 'group')) return false;
-      const last = this.lastIn(item); const fresh = item.mail && !!subject;
-      item.stream.push({ who: 'out', text, t: this.now, attachments, mail: !!item.mail, subject: item.mail ? (fresh ? subject : last && last.subject ? `Re: ${last.subject}` : null) : null, links: [], uid: ++this.seq, thread: fresh ? ++this.seq : (last ? last.thread : null) }); this._touch(item);
+      let thread = null, subject = null, fresh = false;
+      if (item.mail) {
+        const threads = this.threadsOf(item); const re = (x) => (x ? (/^re:/i.test(x) ? x : `Re: ${x}`) : null);
+        if (opts.thread != null && opts.thread !== 'new') { const th = threads.find((t) => String(t.key) === String(opts.thread)); thread = th ? th.key : ++this.seq; subject = th ? re(th.subject) : (opts.subject || null); }
+        else if (opts.subject) { fresh = true; thread = ++this.seq; subject = opts.subject; }
+        else { const th = threads[threads.length - 1]; thread = th ? th.key : ++this.seq; subject = th ? re(th.subject) : null; }
+      }
+      item.stream.push({ who: 'out', text, t: this.now, attachments, mail: !!item.mail, subject, thread, links: [], uid: ++this.seq }); this._touch(item);
       if (fresh) { this.emit({ kind: 'action', item, text: `New mail to ${item.sender}, “${subject}”: a new thread in the relationship; what was pending before stays pending.` }); return true; }
-      for (const m of item.stream) if (m.mail && m.inbox) this._leaveInbox(m, 'replied');
+      for (const m of item.stream) if (m.mail && m.inbox && (thread == null || m.thread === thread)) this._leaveInbox(m, 'replied');
       this._settle(item, 'replied');
-      this.emit({ kind: 'action', item, text: `Replied to ${item.sender} on ${item.channel}: “${text}”${attachments.length ? ` + ${attachments.length} file${attachments.length === 1 ? '' : 's'}` : ''} — nothing pending.` });
+      this.emit({ kind: 'action', item, text: `Replied to ${item.sender} on ${item.channel}${subject ? ` (“${subject}”)` : ''}: “${text}”${attachments.length ? ` + ${attachments.length} file${attachments.length === 1 ? '' : 's'}` : ''} — nothing pending.` });
       return true;
     }
     // The gesture: messages of one dossier referenced from another, as one event with a comment.

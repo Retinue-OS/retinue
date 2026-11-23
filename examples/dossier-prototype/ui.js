@@ -73,7 +73,7 @@
       this.sim = new root.Simulation(this.engine, { onChange: () => this.renderAll(), ui: this });
       this.sheet = null; this.view = null; this.draft = null; this.toast = null; this.menu = false; this.otherOpen = false; this.waitingOpen = false;
       this.list = 'home'; this.dossierFilter = 'active'; this.to = {}; this.select = null; this.picker = null;
-      this.shelf = []; this.shelfMenu = null; this.pageMenu = false; this.model = 'Ara'; this.treeOpen = {}; this.focusMenuOpen = false; this.newMenu = false; this.card = null; this.newForm = null; // the shelf and the page bar live on the device, as on the dashboard
+      this.shelf = []; this.shelfMenu = null; this.pageMenu = false; this.model = 'Ara'; this.treeOpen = {}; this.focusMenuOpen = false; this.newMenu = false; this.card = null; this.newForm = null; this.threadOpen = {}; this.replyThread = {}; // the shelf and the page bar live on the device, as on the dashboard
       this.files = {}; this.rec = null; this.job = null; this.attachError = ''; this.wave = new Waveform(() => this.phoneEl);
       this.sttUrl = null; this.cloudOk = false; try { this.cloudOk = localStorage.getItem('attention-voice-cloud') === '1'; } catch (_e) { /* no storage */ }
       this.localRecognition = null; // null = unknown, then true/false
@@ -85,11 +85,14 @@
       rootEl.addEventListener('change', (e) => { if (e.target.matches('[data-file]')) { this.addFiles(e.target.dataset.id, e.target.files); return; } this.onInput(e); });
       rootEl.addEventListener('input', (e) => {
         if (e.target.id === 'subject' && this.compose && this.compose.id === e.target.dataset.id) this.compose.subject = e.target.value;
-        if (e.target.id === 'composer') { const src = this.draft && this.draft.id === e.target.dataset.id && this.draft.tab === e.target.dataset.tab ? this.draft.source : 'typed'; this.draft = { id: e.target.dataset.id, tab: e.target.dataset.tab, text: e.target.value, source: src === 'typed' ? 'typed' : src }; }
+        if (e.target.id === 'composer') { this.grow(e.target); const src = this.draft && this.draft.id === e.target.dataset.id && this.draft.tab === e.target.dataset.tab ? this.draft.source : 'typed'; this.draft = { id: e.target.dataset.id, tab: e.target.dataset.tab, text: e.target.value, source: src === 'typed' ? 'typed' : src }; }
         if (e.target.id === 'pick-comment' && this.picker) this.picker.comment = e.target.value;
         if (e.target.id === 'pick-title' && this.picker) this.picker.title = e.target.value;
       });
-      rootEl.addEventListener('keydown', (e) => { if (e.key === 'Enter' && e.target.id === 'composer') { e.preventDefault(); this.send(e.target.dataset.id, e.target.dataset.tab); } });
+      rootEl.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' && e.target.id === 'composer' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); this.send(e.target.dataset.id, e.target.dataset.tab); }
+        if (e.key === 'Enter' && e.target.id === 'subject') { e.preventDefault(); const c = this.phoneEl.querySelector('#composer'); if (c && c.focus) c.focus(); }
+      });
       const params = new URLSearchParams(location.search);
       const at = params.get('at'); if (at) { const [h, m] = at.split(':').map(Number); this.sim.seek(h * 60 + (m || 0)); this.seenPushes = this.engine.pushes.length; }
       const list = params.get('list'); if (list && ['home', 'contacts', 'dossiers'].includes(list)) this.list = list;
@@ -375,14 +378,28 @@
         ${this.picker ? this.pickerHtml() : ''}
       </div></div>`;
       const bub = this.phoneEl.querySelector('#bubbles'); if (bub) bub.scrollTop = bub.scrollHeight;
+      const ta = this.phoneEl.querySelector('#composer'); if (ta && ta.tagName === 'TEXTAREA') this.grow(ta);
       if (this.compose && this.view && this.compose.id === this.view.id && !this._focused) { const f = this.phoneEl.querySelector('#subject') || this.phoneEl.querySelector('#composer'); if (f && typeof f.focus === 'function') { try { f.focus(); } catch (_e) { /* no DOM */ } } this._focused = true; }
       if (!this.compose) this._focused = false;
     }
 
     // ---- the dossier page -------------------------------------------------------------
     openView(id, opts = {}) { const item = this.engine.byId.get(id); if (!item) return; this.engine.ensureOpening(id); this.engine.markSeen(id); this.compose = opts.compose ? { id, subject: '' } : null; this.view = { id }; this.sheet = null; this.menu = false; this.pageMenu = false; this.shelfMenu = null; this.select = null; if (!this.draft || this.draft.id !== id) this.draft = null; }
-    // Whom the composer addresses: 'chat' = the participants over their channel, 'ara' = Ara.
+    // The textarea grows with its text, up to a few lines, then scrolls (the chat page's _grow).
+    grow(ta) { if (!ta || !ta.style) return; ta.style.height = 'auto'; ta.style.height = `${Math.min(ta.scrollHeight || 0, 160)}px`; }
+    // The pane a relationship is open on — the chat page's two panes: 'chat' (the mirror of the messages, the composer
+    // addressed to the person) or 'ara' (the companion: Ara's turns about this relationship). A topic has one stream, with Ara.
     addressee(item) { if (!isPeer(item)) return 'ara'; return this.to[item.id] || 'chat'; }
+    // The chat pane of a mail relationship shows its threads: each a subject with its messages, the newest open.
+    threadsHtml(item, sorted) {
+      const e = this.engine; const threads = e.threadsOf(item); const newest = threads[threads.length - 1];
+      return threads.map((th) => {
+        const k = `${item.id}:${th.key}`; const open = this.threadOpen[k] != null ? this.threadOpen[k] : th === newest;
+        const last = th.msgs[th.msgs.length - 1]; const inbox = th.msgs.some((m) => m.inbox);
+        let lastDay = null; const body = open ? th.msgs.map((m) => { const d = U.dayIndex(m.t); const sep = d !== lastDay ? `<div class="day-sep"><span>${esc(dayText(m.t, e.now))}</span></div>` : ''; lastDay = d; return sep + this.bubble(item, m); }).join('') : '';
+        return `<div class="thread${open ? ' open' : ''}"><button class="thread-head" data-act="thread-toggle" data-key="${esc(k)}"><span class="th-subj">✉ ${esc(th.subject || '(no subject)')}</span><span class="th-meta">${th.msgs.length} · ${esc(ageText(last.t, e.now))}${inbox ? ' · <i>in the inbox</i>' : ''}</span><span class="chev">${open ? '▾' : '▸'}</span></button>${body}</div>`;
+      }).join('');
+    }
     bubble(item, m, idx, embedded) {
       const e = this.engine; const sel = !embedded && this.select && this.select.id === item.id;
       const links = (m.links || []).length ? `<div class="backlinks">${m.links.map((l) => `<button class="backlink" data-act="view" data-id="${esc(l.id)}">▣ ${esc(l.title)}</button>`).join('')}</div>` : '';
@@ -421,10 +438,15 @@
       const treeLine = parent || kids.length ? `<div class="tree-line">${parent ? `<button class="backlink" data-act="view" data-id="${esc(parent.id)}">↑ ${esc(parent.title)}</button>` : ''}${kids.map((k) => `<button class="backlink kid${k.state === 'open' ? ' pend' : ''}" data-act="view" data-id="${esc(k.id)}">↳ ${esc(k.title)} <small>${esc(e.stateText(k))}</small></button>`).join('')}</div>` : '';
       const status = e.stateText(item) + (item.state === 'open' && item.actor === 'you' ? ` · ${lvl} · ${e.urgencyShort(item)}` : '');
       const sorted = [...item.stream].sort((a, b) => a.t - b.t); let lastDay = null;
-      const bubbles = sorted.map((m, i) => { const d = U.dayIndex(m.t); const sep = d !== lastDay ? `<div class="day-sep"><span>${esc(dayText(m.t, e.now))}</span></div>` : ''; lastDay = d; return sep + this.bubble(item, m, i); }).join('');
+      // A relationship has two panes: the chat (the messages, deterministic) and Ara (her turns and events about it). A topic is one stream.
+      const inPane = (m) => !peer ? true : to === 'chat' ? (m.who === 'in' || m.who === 'out') : (m.who !== 'in' && m.who !== 'out');
+      const bubbles = peer && to === 'chat' && item.mail
+        ? this.threadsHtml(item, sorted)
+        : sorted.filter(inPane).map((m, i) => { const d = U.dayIndex(m.t); const sep = d !== lastDay ? `<div class="day-sep"><span>${esc(dayText(m.t, e.now))}</span></div>` : ''; lastDay = d; return sep + this.bubble(item, m, i); }).join('');
+      const panes = peer ? `<div class="segs pane-tabs" role="tablist"><button class="seg${to === 'chat' ? ' on' : ''}" role="tab" data-act="to" data-id="${esc(item.id)}" data-to="chat">Chat</button><button class="seg${to === 'ara' ? ' on' : ''}" role="tab" data-act="to" data-id="${esc(item.id)}" data-to="ara">Ara${item.stream.some((m) => m.who === 'ara' && m.t > (item.seenAt != null ? item.seenAt : -Infinity)) ? ' <i class="dot-new"></i>' : ''}</button></div>` : '';
       const chatDraft = peer && this.draft && this.draft.id === item.id && this.draft.tab === 'chat' && this.draft.text ? this.draft : null;
       const draftCard = to === 'ara' && chatDraft ? `<div class="draft-card"><div class="dc-label">Draft to ${esc(item.title)}</div><div class="dc-text">“${esc(chatDraft.text)}”</div><div class="chips">${['Shorter', 'Warmer', 'More formal'].map((s) => `<button class="chipbtn" data-act="rewrite" data-id="${esc(item.id)}" data-style="${s}">${s}</button>`).join('')}<button class="chipbtn primary" data-act="send-now" data-id="${esc(item.id)}" data-tab="chat">Send now</button><button class="chipbtn" data-act="discard-draft" data-id="${esc(item.id)}" data-tab="chat">Discard</button></div></div>` : '';
-      const chips = item.chips && item.chips.length && (item.state === 'open' || item.kind === 'standing') ? `<div class="chips">${item.chips.map((c) => `<button class="chipbtn" data-act="chip" data-id="${esc(item.id)}" data-label="${esc(c)}">${esc(c)}</button>`).join('')}</div>` : '';
+      const chips = item.chips && item.chips.length && (item.state === 'open' || item.kind === 'standing') && (!peer || to === 'ara') ? `<div class="chips">${item.chips.map((c) => `<button class="chipbtn" data-act="chip" data-id="${esc(item.id)}" data-label="${esc(c)}">${esc(c)}</button>`).join('')}</div>` : '';
       const selBar = this.select && this.select.id === item.id ? `<div class="sel-bar"><span>${this.select.uids.length} selected</span><button class="btn tiny primary" data-act="pick" data-id="${esc(item.id)}"${this.select.uids.length ? '' : ' disabled'}>Add to dossier…</button><button class="btn tiny" data-act="select-off">Cancel</button></div>` : '';
       const composer = this.composerHtml(item, to);
       let foot = '';
@@ -438,7 +460,7 @@
       const pageMenu = this.pageMenu ? `<div class="page-menu" data-stop="1">${peer ? `<button data-act="card" data-id="${esc(item.id)}">👤 Contact card</button>` : ''}<button data-act="open" data-id="${esc(item.id)}">ⓘ Attention details</button>${peer ? `<div class="pm-row"><span>Ara answers as</span>${pickerSel}</div>` : ''}<button data-act="star" data-id="${esc(item.id)}">${item.starred ? '★ Unstar' : '☆ Star'}</button><button data-act="mute" data-id="${esc(item.id)}">${item.muted ? '🔔 Unmute' : '🔕 Mute'}</button>${item.kind === 'topic' && item.state === 'open' ? `<button data-act="rest" data-id="${esc(item.id)}">Rest</button>` : ''}${item.state === 'open' && item.kind !== 'standing' ? `<button data-act="do" data-id="${esc(item.id)}">${peer ? 'Nothing pending' : 'Done'}</button>` : ''}</div>` : '';
       return `<div class="view">
         <div class="v-head"><div class="v-titles"><div class="v-title">${item.starred ? '<span class="star-mark">★</span> ' : ''}${KIND_GLYPH[item.kind]} ${esc(item.title)}${item.muted ? ' <span class="muted-mark" title="Muted">🔕</span>' : ''}</div><div class="v-sub">${esc(sub)} · <span style="color:${item.state === 'open' ? LEVEL_COLORS[lvl] : '#8b93a3'}">${esc(status)}</span></div></div>${peer ? `<button class="bar-btn" data-act="card" data-id="${esc(item.id)}" title="Contact card" aria-label="Contact card">👤</button>` : ''}<button class="bar-btn" data-act="shelve" data-id="${esc(item.id)}" title="Minimize to the shelf" aria-label="Minimize">–</button>${picker}<div class="menu-wrap"><button class="bar-btn${flagged ? ' flagged' : ''}" data-act="page-menu" title="More" aria-label="More">⋮</button>${pageMenu}</div></div>
-        ${treeLine}<div class="bubbles" id="bubbles">${bubbles || '<div class="empty">Nothing yet.</div>'}</div>
+        ${panes}${treeLine}<div class="bubbles" id="bubbles">${bubbles || `<div class="empty">${peer && to === 'ara' ? 'Ask Ara about this relationship — a draft, a summary, what is pending.' : 'Nothing yet.'}</div>`}</div>
         ${selBar}${draftCard}${chips}${composer}${foot}</div>`;
     }
     // Ara rewrites the draft to the participants: rule-based here, a model turn in a deployment.
@@ -458,17 +480,22 @@
       const files = this.files[id] || [];
       const chips = files.length ? `<div class="file-chips">${files.map((f, i) => `<span class="fchip"><span class="c-name">${esc(f.name)}</span><span class="c-size">${esc(fmtSize(f.size))}</span><button type="button" class="c-x" data-act="rmfile" data-id="${esc(id)}" data-index="${i}" aria-label="Remove attachment">×</button></span>`).join('')}</div>` : '';
       const err = this.attachError ? `<div class="attach-err">${esc(this.attachError)}</div>` : '';
-      const last = isPeer(item) ? this.engine.lastIn(item) : null; const composing = this.compose && this.compose.id === id;
-      const subj = isPeer(item) && item.mail && to === 'chat' ? `<div class="subj-row"><span class="to-label">subject</span><input id="subject" class="subj" type="text" placeholder="${composing || !last ? 'New subject — a new thread' : esc('Re: ' + (last.subject || ''))}" value="${esc(composing ? this.compose.subject : '')}" data-id="${esc(id)}"><small class="subj-hint">${composing || !last ? 'a new thread; nothing pending is touched' : 'empty = reply in the newest thread'}</small></div>` : '';
-      const toggle = isPeer(item) ? `${subj}<div class="to-row"><span class="to-label">to</span><button class="seg${to === 'chat' ? ' on' : ''}" data-act="to" data-id="${esc(id)}" data-to="chat">${esc(item.title)} · ${esc(item.channel)}</button><button class="seg${to === 'ara' ? ' on' : ''}" data-act="to" data-id="${esc(id)}" data-to="ara">Ara</button></div>` : '';
+      // Mail: the composer says which thread it writes in — one of the existing ones (a reply), or a new one with its subject.
+      const composing = this.compose && this.compose.id === id; let toggle = '';
+      if (isPeer(item) && item.mail && to === 'chat') {
+        const threads = this.engine.threadsOf(item); const sel = this.replyThread[id] != null ? this.replyThread[id] : (composing || !threads.length ? 'new' : String(threads[threads.length - 1].key));
+        const opts = threads.map((t) => `<option value="${esc(String(t.key))}"${sel === String(t.key) ? ' selected' : ''}>Re: ${esc(t.subject || '(no subject)')}</option>`).join('') + `<option value="new"${sel === 'new' ? ' selected' : ''}>New thread…</option>`;
+        toggle = `<div class="subj-row"><span class="to-label">thread</span><select id="thread-sel" class="select small" data-act="thread-sel" data-id="${esc(id)}">${opts}</select>${sel === 'new' ? `<input id="subject" class="subj" type="text" placeholder="Subject" value="${esc(composing ? this.compose.subject : '')}" data-id="${esc(id)}">` : ''}<small class="subj-hint">${sel === 'new' ? 'a new thread — nothing pending is touched' : 'a reply in this thread'}</small></div>`;
+      }
       let row;
       if (this.rec && this.rec.id === id && this.rec.tab === tab) {
         row = `<div class="composer-row rec-row"><button type="button" class="rec-btn rec-abort" data-act="rec-abort" title="Discard recording" aria-label="Discard recording">✕</button><div class="wave-wrap"><span class="rec-dot" aria-hidden="true"></span><canvas class="wave" data-wave aria-hidden="true"></canvas><span class="rec-time" data-rectime>0:00</span></div><button type="button" class="rec-btn rec-ok" data-act="rec-check" title="Stop and transcribe for review" aria-label="Stop and transcribe for review">✓</button><button type="button" class="rec-btn rec-send" data-act="rec-send" title="Stop, transcribe and send" aria-label="Stop, transcribe and send">➤</button></div>`;
       } else if (this.job && this.job.id === id && this.job.tab === tab) {
         row = `<div class="composer-row rec-row"><div class="wave-wrap rec-status" role="status"><span>${esc(this.job.label)}</span></div></div>`;
       } else {
-        const placeholder = tab === 'chat' ? `${item.mail ? 'Reply by mail to' : 'Reply to'} ${item.title}…` : item.kind === 'standing' || item.kind === 'topic' || item.kind === 'ara' ? 'Ask Ara, or add a note…' : 'Ask Ara…';
-        row = `<div class="composer-row"><button type="button" class="mic" data-act="mic" data-id="${esc(id)}" data-tab="${tab}" title="Record a voice message" aria-label="Record a voice message">🎤</button><div class="field"><input id="composer" type="text" autocomplete="off" placeholder="${esc(placeholder)}" aria-label="${esc(placeholder)}" value="${esc(draft ? draft.text : '')}" data-tab="${tab}" data-id="${esc(id)}"><label class="clip" title="Attach a file" aria-label="Attach a file"><input type="file" multiple hidden data-file data-id="${esc(id)}"><span aria-hidden="true">📎</span></label></div><button type="button" class="send" data-act="send" data-id="${esc(id)}" data-tab="${tab}" title="${tab === 'chat' ? 'Send' : 'Ask Ara'}" aria-label="${tab === 'chat' ? 'Send' : 'Ask Ara'}">➤</button></div>`;
+        const placeholder = tab === 'chat' ? `${item.mail ? 'Write to' : 'Message'} ${item.title}…` : item.kind === 'standing' || item.kind === 'topic' || item.kind === 'ara' ? 'Ask Ara, or add a note…' : `Ask Ara about ${item.title}…`;
+        // The dashboard's composer: a textarea that grows with the text (one line to start), Enter for a line break, Ctrl/⌘-Enter to send.
+        row = `<div class="composer-row"><button type="button" class="mic" data-act="mic" data-id="${esc(id)}" data-tab="${tab}" title="Record a voice message" aria-label="Record a voice message">🎤</button><div class="field"><textarea id="composer" rows="1" autocomplete="off" placeholder="${esc(placeholder)}" aria-label="${esc(placeholder)}" data-tab="${tab}" data-id="${esc(id)}">${esc(draft ? draft.text : '')}</textarea><label class="clip" title="Attach a file" aria-label="Attach a file"><input type="file" multiple hidden data-file data-id="${esc(id)}"><span aria-hidden="true">📎</span></label></div><button type="button" class="send" data-act="send" data-id="${esc(id)}" data-tab="${tab}" title="${tab === 'chat' ? 'Send (Ctrl/⌘-Enter)' : 'Ask Ara (Ctrl/⌘-Enter)'}" aria-label="${tab === 'chat' ? 'Send' : 'Ask Ara'}">➤</button></div>`;
       }
       const bar = draft && draft.text && draft.source !== 'typed' && !this.rec && !this.job ? `<div class="draft-bar"><span class="draft-label">${draft.source === 'ara' ? 'Ara’s draft' : 'Transcribed'} — edit it here</span><button type="button" class="btn tiny primary" data-act="send-now" data-id="${esc(id)}" data-tab="${tab}">${tab === 'chat' ? 'Send now' : 'Ask now'}</button><button type="button" class="btn tiny" data-act="discard-draft" data-id="${esc(id)}" data-tab="${tab}">Discard</button></div>` : '';
       return `<div class="composer">${toggle}${bar}${chips}${err}${row}</div>`;
@@ -650,7 +677,8 @@
       const files = (this.files[id] || []).slice(); if (!text && !files.length) return;
       this.sim.viewerActed(); this.draft = null; this.files[id] = []; this.attachError = '';
       const subjEl = this.phoneEl.querySelector('#subject'); const subject = subjEl && subjEl.dataset.id === id ? subjEl.value.trim() : (this.compose && this.compose.id === id ? this.compose.subject : '');
-      if (tab === 'chat') { this.engine.sendChat(id, text, files, subject); this.compose = null; }
+      const thEl = this.phoneEl.querySelector('#thread-sel'); const thread = thEl && thEl.dataset.id === id ? thEl.value : (this.replyThread[id] != null ? this.replyThread[id] : null);
+      if (tab === 'chat') { const item = this.engine.byId.get(id); if (item && item.mail && (thread === 'new' || (thread == null && this.compose && this.compose.id === id)) && !subject) { this.showToast('A subject for the new thread, please.'); return; } this.engine.sendChat(id, text, files, { thread: thread === 'new' ? null : thread, subject: thread === 'new' || thread == null ? subject : '' }); this.compose = null; delete this.replyThread[id]; }
       else this.converse(id, text, files);
       this.renderAll();
     }
@@ -661,7 +689,7 @@
       if (intent && !files.length && this.draft && this.draft.id === id && this.draft.tab === 'chat' && this.draft.text && !(dlg && dlg.replies && dlg.replies[text])) { this.rewriteDraft(id, intent, text); return; }
       const r = this.engine.say(id, text, files); if (!r) return;
       this._justAsked = id;
-      if (r.draft) { this.draft = { id, tab: 'chat', text: r.draft, source: 'ara' }; this.to[id] = 'chat'; }
+      if (r.draft) { this.draft = { id, tab: 'chat', text: r.draft, source: 'ara' }; this.to[id] = 'chat'; this.showToast(`Ara’s draft is in the chat composer.`); }
       const d = this.engine._dialogue(item); const rec = d && d.replies && d.replies[text]; if (rec && rec.note) this.showToast(rec.note);
     }
     onClick(ev) {
@@ -706,6 +734,7 @@
         case 'shelf-close-quiet': { const keep = this.shelf.filter((s) => { const it = e.byId.get(s.id); return it && (s.working || it.stream.some((m) => (m.who === 'ara' || m.who === 'in') && m.t > s.at)); }); this.shelf = keep; this.shelfMenu = null; break; }
         case 'dossier-filter': this.sim.viewerActed(); this.dossierFilter = el.dataset.filter; break;
         case 'tree-toggle': this.sim.viewerActed(); this.treeOpen[id] = !this.treeOpen[id]; break;
+        case 'thread-toggle': { this.sim.viewerActed(); const k = el.dataset.key; const item = e.byId.get(k.split(':')[0]); const th = e.threadsOf(item); const key = k.slice(k.indexOf(':') + 1); const cur = this.threadOpen[k] != null ? this.threadOpen[k] : (th.length && String(th[th.length - 1].key) === key); this.threadOpen[k] = !cur; if (!cur) this.replyThread[item.id] = key; break; }
         // focus and aperture
         case 'focus-menu': this.sim.viewerActed(); this.focusMenuOpen = !this.focusMenuOpen; this.menu = false; break;
         case 'set-focus': this.sim.viewerActed(); e.setFocus(el.dataset.focus === 'null' ? null : JSON.parse(el.dataset.focus)); this.focusMenuOpen = false; this.sheet = null; break;
@@ -758,6 +787,7 @@
       if (el.dataset.act === 'cloud-ok') { this.cloudOk = !!el.checked; try { localStorage.setItem('attention-voice-cloud', this.cloudOk ? '1' : '0'); } catch (_e) { /* no storage */ } this.renderVoiceLine(); return; }
       if (el.dataset.act === 'sel') { this.onClick({ target: el }); return; }
       if (el.dataset.act === 'pick-within') { if (this.picker) this.picker.within = el.value || null; return; }
+      if (el.dataset.act === 'thread-sel') { this.sim.viewerActed(); this.replyThread[el.dataset.id] = el.value; if (el.value !== 'new') this.compose = null; this.renderAll(); return; }
       if (el.dataset.act === 'new-within') { if (this.newForm) this.newForm.within = el.value || null; return; }
       if (el.dataset.act === 'new-channel') { if (this.newForm) this.newForm.channel = el.value; return; }
       if (el.dataset.act === 'new-sphere') { if (this.newForm) this.newForm.sphere = el.value; return; }

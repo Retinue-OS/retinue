@@ -137,8 +137,7 @@ composer. The stream interleaves two things:
 - **Messages** that belong to this dossier (by the one-dossier rule below),
   rendered as the chat page renders them: bubbles with channel glyph; a mail
   as a card (subject, sender, first lines, attachments as chips; tap opens the
-  full mail under the existing CSP rules), replies stacked under the first
-  card.
+  full mail under the existing CSP rules), grouped by **thread** (below).
 - **Events**, one shape:
 
 ```
@@ -170,26 +169,34 @@ that mentioned it. Ara's turns carry `kb:references` to the same end; the
 Secretary's reply proposals embed the message they answer. A reference whose
 object is gone renders as a short tombstone.
 
-**The composer** on a topic writes to Ara (today's thread turn); on a
-relationship it writes **to the person**, over the channel the last message
-came on, with a *to Ara* switch beside it. An outbound message is a message in
-the stream and goes through the send policies as today. **A mail has a subject
-line** in the composer: left empty, the message is a reply in the newest
-thread (`Re: …`, settling what that thread had pending); given, it is a **new
-thread** — just another message in the relationship (rule 3), touching nothing
-that was pending before. So writing to the tax office about a new matter is:
-＋ → Message → the tax office → subject, text, send; the open letter about
-2025 stays as it was.
+**A relationship's page keeps the chat page's two panes.** *Chat* is the
+deterministic mirror of the messages — what the person and the user wrote, on
+whatever channel — with the composer addressed to the person; *Ara* is the
+companion: her turns about this relationship, her chips (a draft, a summary,
+*nothing pending*), the events. The two never mix in one stream: the mirror
+stays a faithful record, and Ara speaks only in her pane, only when addressed
+— she does not open with a summary of what the user can see; her reading of
+the pending state is the row's second line and the attention sheet. A topic
+has one stream, because a topic *is* a conversation with Ara (and, through
+the composer's channel switch, with its participants).
 
-**Ara in a relationship's stream speaks only when addressed.** Her reading of
-the pending state is the row's second line and the attention sheet, and her
-chips (a draft, a reminder, *nothing pending*) sit under the stream; she does
-not open the stream with a summary of what the user can see. In a topic she
-does — the topic is a conversation with her.
+**Messenger and mail differ in one thing: threads.** A messenger relationship
+is one thread — the person is the subject, as in any chat app. A mail
+relationship is a set of threads, each with its subject, and the Chat pane
+shows them as such: one block per thread, subject and count, the newest open
+and the others folded, their messages inside. The composer says **which
+thread** it writes in: one of the existing ones (a reply, `Re: …`, settling
+what that thread had pending) or *New thread…* with a subject — just another
+message in the relationship (rule 3), touching nothing that was pending
+before. So writing to the tax office about a new matter is: ＋ → Message →
+the tax office → *New thread…*, subject, text, send; the open letter about
+2025 stays as it was in its own thread. The composer is the dashboard's: a
+field that grows with the text, Enter for a line break, Ctrl/⌘-Enter to send,
+the microphone and the paper clip beside it.
 
 **The model picker** (which tier answers Ara's turns, `docs/model-routing.md`)
 is in the page bar of a topic, where Ara is a participant; on a relationship it
-is in the ⋮ menu, since Ara answers there only when addressed.
+is in the ⋮ menu, since Ara answers there only in her pane.
 
 ## Where a message belongs — one rule
 
@@ -428,8 +435,8 @@ mirror.
 ## What this replaces, what it keeps
 
 **Replaced:** the Chats page (by Contacts); dashboard threads as a separate
-kind (by Ara-only topics); companion threads (by the dossier page: Ara is the
-composer's default addressee everywhere); attention items as objects; the
+kind (by Ara-only topics); companion threads as separate conversations (the
+Ara pane stays, as the relationship's own); attention items as objects; the
 omnibus digest and per-mail triage threads (by Inbox Zero); archive.
 
 **Kept:** the delivery ledger and gate; the messenger mirror and its composer
