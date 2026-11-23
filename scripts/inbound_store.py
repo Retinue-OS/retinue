@@ -1,9 +1,10 @@
 """Per-message store for the messaging gateways (message ledger).
 
 Every inbound message that reaches an *inbox*-mode gateway (Signal, WhatsApp,
-Telegram) is persisted here as **one N-Triples file per message**, on the
-gateway's own data volume, before any routing decision is made. Two things fall
-out of that single act:
+Telegram, SMS — and every mail the mail gateway mirrors from a mailbox) is
+persisted here as **one N-Triples file per message**, on the gateway's own data
+volume, before any routing decision is made. Two things fall out of that single
+act:
 
 1. **A browsable history.** The life store indexes the volume read-only, so the
    whole message stream is queryable over SPARQL (``kb:InboundMessage``) — "what
@@ -19,8 +20,10 @@ out of that single act:
    operations, both here: :func:`undelivered`, which returns the held messages
    **and marks them delivered as a side effect**, and :func:`mark_delivered`,
    which flips one already-written message the gateway persisted up front (the
-   persist-before-forward path — see below). Nothing else — no SPARQL query, no
-   ad-hoc read — ever touches it, so browsing history never silently "consumes" a
+   persist-before-forward path — see below). (:func:`tombstone_message` also
+   sets it, for a mail found gone from its mailbox: nothing is owed for a
+   message that no longer exists.) Nothing else — no SPARQL query, no ad-hoc
+   read — ever touches it, so browsing history never silently "consumes" a
    message.
 
    Since the chat surface shows every arrival the moment it lands, an
@@ -163,6 +166,60 @@ XSD_INTEGER = "http://www.w3.org/2001/XMLSchema#integer"
 # retry and disappears the moment the transcript lands.
 P_MEDIA = KB + "media"
 
+# -- what a mail record adds ---------------------------------------------------
+# The mail gateway mirrors a mailbox into this same ledger (docs/mail-chats.md,
+# "The record"). Every one of these is optional, means nothing on another
+# channel, and survives every rewrite below; an absent field writes no triple.
+#
+# The mail's own Subject, decoded. Its field key is "subject_line": "subject"
+# has always been the record's own URN, and every caller reads it as that.
+P_SUBJECT = KB + "subject"
+# The display name on From — on either direction, since a mail the user sent
+# from a client is recorded with its From as well (kb:sender then is the
+# account's own address).
+P_SENDER_NAME = KB + "senderName"
+# To and Cc addresses, one triple each. A set: the record is sorted, so header
+# order is not kept — which is why kb:references, whose order is its meaning,
+# is one literal instead.
+P_RECIPIENT = KB + "recipient"
+P_CC = KB + "cc"
+# Threading, as the headers carried it: the parent's id, and the References
+# ids space-separated in header order. Kept on a tombstone too — a thread index
+# rebuilt from the ledger needs every id a mail ever cited.
+P_IN_REPLY_TO = KB + "inReplyTo"
+P_REFERENCES = KB + "references"
+# The normalised List-Id, what the news gate decides a list mail by.
+P_LIST_ID = KB + "listId"
+# The mail's own parts, each a blob in this store referenced like an
+# attachment (an IRI naming it, the same blob facts stated on that IRI) but
+# never one: a chat shows attachments as files, and a mail's plain body, its
+# HTML and its header block are the original, not files the sender attached.
+# Stored once, never rewritten: kb:text is derived from them (the trim), they
+# are what "Original" shows.
+P_BODY_PART = KB + "bodyPart"
+P_HTML_PART = KB + "htmlPart"
+P_HEADER_PART = KB + "headerPart"
+# An inline part's Content-ID, stated on its attachment IRI like the content
+# type, so an HTML part's cid: references resolve to the right blob.
+P_CONTENT_ID = KB + "contentId"
+# How kb:text was derived from the parts: one of TRIMS.
+P_TRIM = KB + "trim"
+# When the mail was found gone from the mailbox (see tombstone_message).
+P_REMOVED_AT = KB + "removedAt"
+# Valid kb:trim values: the deterministic trim settled the text; it did not and
+# a model trim is due on first view; a model trim replaced the text.
+TRIMS = ("deterministic", "wanting", "model")
+
+# Field key ↔ predicate for the mail fields, by shape. One table each, read by
+# the renderer, the parser and the writers alike, so a field cannot be written
+# by one of them and forgotten by another.
+_MAIL_LITERALS = (("subject_line", P_SUBJECT), ("sender_name", P_SENDER_NAME),
+                  ("in_reply_to", P_IN_REPLY_TO), ("references", P_REFERENCES),
+                  ("list_id", P_LIST_ID), ("trim", P_TRIM))
+_MAIL_LISTS = (("recipients", P_RECIPIENT), ("cc", P_CC))
+_PARTS = (("body_part", P_BODY_PART), ("html_part", P_HTML_PART),
+          ("header_part", P_HEADER_PART))
+
 # Subdirectory (under the gateway's store dir) that holds the per-message files.
 # The gateway owns this folder read-write; the life store mounts it read-only.
 MESSAGES_SUBDIR = "messages"
@@ -198,7 +255,7 @@ def subject_for(path) -> str | None:
         return None
     try:
         fields = _parse(Path(path).read_text(encoding="utf-8"))
-    except OSError:
+    except (OSError, UnicodeDecodeError):
         return None
     return (fields or {}).get("subject")
 
@@ -250,17 +307,31 @@ def media_dir(store_dir: str | Path) -> Path:
 # -- N-Triples serialization --------------------------------------------------
 # A tiny, self-contained N-Triples reader/writer. It supports exactly the three
 # object shapes this store uses: an IRI object (rdf:type), a plain string
-# literal, and an xsd:dateTime typed literal. Nothing here is a general RDF
-# parser — it round-trips only what write_message emits.
+# literal, and a typed literal. Nothing here is a general RDF parser — it reads
+# back what write_message emits, and keeps verbatim any other well-formed
+# triple of that shape it finds on the record (see _parse).
+
+# Characters a literal must not carry raw: every other C0 control and DEL, and
+# the ones Python's str.splitlines() — and many a reader's line splitter —
+# takes for a line end (\x85, U+2028, U+2029). A mail body has form feeds and
+# pasted line separators; written raw, one would cut its triple in two and
+# make the whole record unreadable. They are written as N-Triples \uXXXX.
+_RAW_UNSAFE_RE = re.compile("[\x00-\x08\x0b\x0c\x0e-\x1f\x7f\x85  ]")
+# A lone surrogate (what a decoder's surrogateescape leaves of an undecodable
+# header byte) cannot be written as UTF-8 at all: it becomes U+FFFD.
+_SURROGATE_RE = re.compile("[\ud800-\udfff]")
+
 
 def _esc(value: str) -> str:
-    return (
+    value = _SURROGATE_RE.sub("�", value)
+    value = (
         value.replace("\\", "\\\\")
         .replace("\n", "\\n")
         .replace("\r", "\\r")
         .replace("\t", "\\t")
         .replace('"', '\\"')
     )
+    return _RAW_UNSAFE_RE.sub(lambda m: f"\\u{ord(m.group(0)):04X}", value)
 
 
 def _unesc(value: str) -> str:
@@ -269,6 +340,19 @@ def _unesc(value: str) -> str:
         ch = value[i]
         if ch == "\\" and i + 1 < len(value):
             nxt = value[i + 1]
+            # UCHAR: \uXXXX and \UXXXXXXXX, which _esc writes for the
+            # characters it must not write raw.
+            width = {"u": 4, "U": 8}.get(nxt)
+            if width:
+                digits = value[i + 2:i + 2 + width]
+                try:
+                    if len(digits) != width:
+                        raise ValueError(digits)
+                    out.append(chr(int(digits, 16)))
+                    i += 2 + width
+                    continue
+                except ValueError:
+                    pass  # not a well-formed escape: read as before
             out.append(
                 {"n": "\n", "r": "\r", "t": "\t", '"': '"', "\\": "\\"}.get(nxt, nxt)
             )
@@ -295,26 +379,66 @@ _TRIPLE_RE = re.compile(
 )
 
 
+def _media_refs(fields: dict) -> list[str]:
+    """Every IRI the record's own subject points at, other than its type.
+
+    The attachments and the mail parts, and the IRI object of any triple the
+    parser kept without knowing its predicate — a reference a later version
+    of this module may add. What the record states about these IRIs is the
+    record's own, and is kept through a rewrite; a blob any of them names is
+    this record's to unlink (delete_chat, tombstone_message)."""
+    subj = fields.get("subject")
+    refs = list(fields.get("attachments") or [])
+    refs += [fields[key] for key, _pred in _PARTS if fields.get(key)]
+    for line in fields.get("extra") or []:
+        m = _TRIPLE_RE.match(line)
+        if m and m.group(1) == subj and m.group(3):
+            refs.append(m.group(3))
+    return list(dict.fromkeys(r for r in refs if r))
+
+
 def _render(fields: dict) -> str:
     """Deterministic sorted N-Triples for one message, either direction.
 
     ``fields`` carries the resolved values; the record's ``type`` selects the
-    direction-specific triples (delivered/receivedAt/sender for inbound,
-    author/sentAt for outbound). Optional fields may be absent."""
+    direction-specific triples (delivered/receivedAt for inbound, author/sentAt
+    for outbound). Optional fields may be absent, and an absent field writes
+    no triple. ``extra`` lines — triples the parser read but does not know —
+    are written back verbatim, so a rewrite by this version never loses what a
+    newer one stated."""
     subj = fields["subject"]
     rtype = fields.get("type") or T_INBOUND
     lines = [
         _iri(subj, RDF_TYPE, rtype),
         _lit(subj, P_CHANNEL, fields["channel"]),
-        _lit(subj, P_TEXT, fields["text"]),
+        # Always present, if only empty: the parser and the web gateway's chat
+        # query both require the triple.
+        _lit(subj, P_TEXT, fields.get("text") or ""),
     ]
     if rtype == T_OUTBOUND:
         lines.append(_lit(subj, P_AUTHOR, fields["author"]))
-        lines.append(_lit(subj, P_SENT_AT, fields["sent_at"], XSD_DATETIME))
+        if fields.get("sent_at"):
+            lines.append(_lit(subj, P_SENT_AT, fields["sent_at"], XSD_DATETIME))
     else:
         lines.append(_lit(subj, P_DELIVERED, "true" if fields["delivered"] else "false"))
-        lines.append(_lit(subj, P_RECEIVED_AT, fields["received_at"], XSD_DATETIME))
+        if fields.get("received_at"):
+            lines.append(_lit(subj, P_RECEIVED_AT, fields["received_at"], XSD_DATETIME))
+    # Required on inbound (the writer fills in "unknown"); on outbound only a
+    # mail states it — its From, the account's own address.
+    if fields.get("sender") is not None:
         lines.append(_lit(subj, P_SENDER, fields["sender"]))
+    for key, pred in _MAIL_LITERALS:
+        if fields.get(key):
+            lines.append(_lit(subj, pred, fields[key]))
+    for key, pred in _MAIL_LISTS:
+        for value in dict.fromkeys(fields.get(key) or []):
+            if value:
+                lines.append(_lit(subj, pred, value))
+    for key, pred in _PARTS:
+        if fields.get(key):
+            lines.append(_iri(subj, pred, fields[key]))
+    if fields.get("removed_at"):
+        lines.append(_lit(subj, P_REMOVED_AT, fields["removed_at"], XSD_DATETIME))
     if fields.get("chat"):
         lines.append(_lit(subj, P_CHAT, fields["chat"]))
     # Both directions: the chat key alone does not identify a conversation
@@ -333,9 +457,11 @@ def _render(fields: dict) -> str:
     if fields.get("media"):
         lines.append(_lit(subj, P_MEDIA, fields["media"]))
     # What this gateway knows about each blob, on the blob's own IRI (see
-    # P_CONTENT_TYPE). Only for references the record actually carries.
+    # P_CONTENT_TYPE). Only for references the record actually carries —
+    # attachments and mail parts alike.
+    refs = _media_refs(fields)
     for url, meta in sorted((fields.get("attachment_meta") or {}).items()):
-        if url not in (fields.get("attachments") or []) or not meta:
+        if url not in refs or not meta:
             continue
         if meta.get("content_type"):
             lines.append(_lit(url, P_CONTENT_TYPE, str(meta["content_type"])))
@@ -344,7 +470,17 @@ def _render(fields: dict) -> str:
                 lines.append(_lit(url, pred, str(meta[key]), XSD_INTEGER))
         if meta.get("file_name"):
             lines.append(_lit(url, P_FILE_NAME, str(meta["file_name"])))
-    return "".join(l + "\n" for l in sorted(lines))
+        if meta.get("content_id"):
+            lines.append(_lit(url, P_CONTENT_ID, str(meta["content_id"])))
+    # Triples the parser kept without knowing them, verbatim: those on the
+    # record itself, and those on an IRI it still references (a statement
+    # about a blob the record let go of goes with it). A line that no longer
+    # reads as a triple is never written — one would make the file unreadable.
+    for line in fields.get("extra") or []:
+        m = _TRIPLE_RE.match(line)
+        if m and (m.group(1) == subj or m.group(1) in refs):
+            lines.append(line)
+    return "".join(l + "\n" for l in sorted(dict.fromkeys(lines)))
 
 
 def _parse(text: str) -> dict | None:
@@ -354,42 +490,69 @@ def _parse(text: str) -> dict | None:
     ``kb:OutboundMessage`` existed carries an explicit inbound type, so an
     absent type triple can only be a legacy hand-crafted record — it keeps the
     pre-outbound contract (drainable) rather than being mistaken for a send.
+
+    Strict about what it accepts as a record — one line that is no triple of
+    the shapes above makes the whole file unreadable (None), exactly as
+    before — and lenient about what a record may say: a well-formed triple on
+    the record's subject, or on an IRI it references, whose predicate this
+    version does not know is kept verbatim in ``extra`` and written back by
+    :func:`_render`, so no rewrite here ever drops a newer writer's facts.
+
+    The mail fields (see :data:`P_SUBJECT`) read as ``subject_line``,
+    ``sender_name``, ``recipients`` and ``cc`` (lists), ``in_reply_to``,
+    ``references`` (the space-separated literal as stored), ``list_id``,
+    ``body_part``/``html_part``/``header_part`` (media IRIs), ``trim`` and
+    ``removed_at`` (ISO-8601); an inline part's Content-ID is
+    ``attachment_meta[<reference>]["content_id"]``. ``attachment_meta`` is
+    keyed by every media IRI the record references, the parts included.
     """
     fields: dict = {"type": T_INBOUND, "delivered": False, "group": None,
                     "message_id": None, "chat": None, "account": None,
                     "author": None, "sent_at": None, "attachments": [],
-                    "media": None, "attachment_meta": {}}
+                    "media": None, "attachment_meta": {}, "sender": None,
+                    "removed_at": None, "extra": []}
+    for key, _pred in _MAIL_LITERALS + _PARTS:
+        fields[key] = None
+    for key, _pred in _MAIL_LISTS:
+        fields[key] = []
+    literals = {pred: key for key, pred in _MAIL_LITERALS}
+    lists = {pred: key for key, pred in _MAIL_LISTS}
+    parts = {pred: key for key, pred in _PARTS}
     triples = []
-    for line in text.splitlines():
+    # Lines are what the writer ends with "\n", and nothing else: a character
+    # str.splitlines() would also break on (a form feed, U+2028 in a literal
+    # some other writer left raw) is part of its triple, not a line end.
+    for line in text.split("\n"):
         line = line.strip()
         if not line:
             continue
         m = _TRIPLE_RE.match(line)
         if not m:
             return None
-        triples.append(m.groups())
+        triples.append((line, m.groups()))
     # The record's own subject is the one that carries kb:channel; a file
     # holds one message, so every other subject is a blob the message
     # references, and its triples are what the gateway stated about it.
-    subject = next((t[0] for t in triples if t[1] == P_CHANNEL), None)
+    subject = next((g[0] for _line, g in triples if g[1] == P_CHANNEL), None)
     if subject is None:
         return None
-    for subj, pred, obj_iri, lit, _dtype in triples:
+    fields["subject"] = subject
+    others = []
+    for line, (subj, pred, obj_iri, lit, _dtype) in triples:
         value = obj_iri if obj_iri is not None else _unesc(lit)
         if subj != subject:
-            meta = fields["attachment_meta"].setdefault(subj, {})
-            if pred == P_CONTENT_TYPE:
-                meta["content_type"] = value
-            elif pred == P_FILE_NAME:
-                meta["file_name"] = value
-            elif pred in (P_BYTE_SIZE, P_WIDTH, P_HEIGHT):
-                try:
-                    meta[{P_BYTE_SIZE: "size", P_WIDTH: "width",
-                          P_HEIGHT: "height"}[pred]] = int(value)
-                except ValueError:
-                    pass
+            others.append((line, subj, pred, value))
             continue
-        if pred == RDF_TYPE:
+        if pred in literals:
+            fields[literals[pred]] = value
+        elif pred in lists:
+            if value:
+                fields[lists[pred]].append(value)
+        elif pred in parts:
+            fields[parts[pred]] = value or None
+        elif pred == P_REMOVED_AT:
+            fields["removed_at"] = value
+        elif pred == RDF_TYPE:
             fields["type"] = value
         elif pred == P_CHANNEL:
             fields["channel"] = value
@@ -419,13 +582,34 @@ def _parse(text: str) -> dict | None:
             fields["media"] = value
         elif pred == P_DELIVERED:
             fields["delivered"] = value.strip().lower() == "true"
+        else:
+            fields["extra"].append(line)
     # Statements about a blob the record does not reference are noise, never
     # re-emitted; statements about one it does are kept whether or not the
     # blob still exists here — they are the record's, not the filesystem's.
+    refs = set(_media_refs(fields))
+    for line, subj, pred, value in others:
+        if subj not in refs:
+            continue
+        meta = fields["attachment_meta"].setdefault(subj, {})
+        if pred == P_CONTENT_TYPE:
+            meta["content_type"] = value
+        elif pred == P_FILE_NAME:
+            meta["file_name"] = value
+        elif pred == P_CONTENT_ID:
+            meta["content_id"] = value
+        elif pred in (P_BYTE_SIZE, P_WIDTH, P_HEIGHT):
+            try:
+                meta[{P_BYTE_SIZE: "size", P_WIDTH: "width",
+                      P_HEIGHT: "height"}[pred]] = int(value)
+            except ValueError:
+                fields["extra"].append(line)  # kept as it was, not guessed at
+        elif pred != P_CHANNEL:
+            # Not kb:channel: a second subject carrying it would make the
+            # record's own subject ambiguous on the next read.
+            fields["extra"].append(line)
     fields["attachment_meta"] = {
-        url: meta for url, meta in fields["attachment_meta"].items()
-        if url in fields["attachments"] and meta}
-    fields["subject"] = subject
+        url: meta for url, meta in fields["attachment_meta"].items() if meta}
     return fields
 
 
@@ -478,6 +662,68 @@ def _received_epoch(fields: dict) -> float:
         return 0.0
 
 
+def _one(value) -> str | None:
+    """A single-valued optional field: its text trimmed, None when empty."""
+    if value is None:
+        return None
+    return str(value).strip() or None
+
+
+def _many(values) -> list[str]:
+    """A multi-valued optional field: one string or several, trimmed, empties
+    dropped, duplicates dropped with the first position kept."""
+    if values is None:
+        return []
+    if isinstance(values, str):
+        values = [values]
+    return list(dict.fromkeys(v for v in (_one(x) for x in values) if v))
+
+
+def _check_trim(trim) -> str | None:
+    trim = _one(trim)
+    if trim is not None and trim not in TRIMS:
+        raise ValueError(f"trim must be one of {'|'.join(TRIMS)}, got {trim!r}")
+    return trim
+
+
+def _mail_fields(*, subject=None, sender_name=None, recipients=None, cc=None,
+                 in_reply_to=None, references=None, list_id=None, body_part=None,
+                 html_part=None, header_part=None, trim=None) -> dict:
+    """The mail fields of a new record, normalised (see :data:`P_SUBJECT`).
+
+    ``references`` is the References header's ids in header order, as one
+    string or as a sequence; either way it is stored as one literal, the ids
+    separated by single spaces. Ids, addresses and names are stored as given
+    (trimmed): normalising them — angle brackets, case — is the gateway's."""
+    if references is not None and not isinstance(references, str):
+        references = " ".join(str(r) for r in references if r)
+    return {
+        "subject_line": _one(subject),
+        "sender_name": _one(sender_name),
+        "recipients": _many(recipients),
+        "cc": _many(cc),
+        "in_reply_to": _one(in_reply_to),
+        "references": " ".join(str(references or "").split()) or None,
+        "list_id": _one(list_id),
+        "body_part": _one(body_part),
+        "html_part": _one(html_part),
+        "header_part": _one(header_part),
+        "trim": _check_trim(trim),
+    }
+
+
+def _record_blob_meta(store_dir, fields: dict, content_ids) -> dict:
+    """``attachment_meta`` for a new record: what this store knows about every
+    blob it references (attachments and parts), plus each inline
+    attachment's Content-ID as the caller gave it."""
+    meta = _own_attachment_meta(store_dir, _media_refs(fields))
+    for ref, cid in (content_ids or {}).items():
+        cid = _one(cid)
+        if cid and ref in fields["attachments"]:
+            meta.setdefault(ref, {})["content_id"] = cid
+    return meta
+
+
 # -- public API ---------------------------------------------------------------
 
 def write_message(
@@ -494,6 +740,18 @@ def write_message(
     delivered: bool = False,
     attachment_urls: list[str] | None = None,
     media: str | None = None,
+    subject: str | None = None,
+    sender_name: str | None = None,
+    recipients: list[str] | None = None,
+    cc: list[str] | None = None,
+    in_reply_to: str | None = None,
+    references: str | list[str] | None = None,
+    list_id: str | None = None,
+    body_part: str | None = None,
+    html_part: str | None = None,
+    header_part: str | None = None,
+    trim: str | None = None,
+    content_ids: dict | None = None,
 ) -> tuple[str, Path]:
     """Persist one inbound message as a deterministic N-Triples file.
 
@@ -522,13 +780,28 @@ def write_message(
     so a voice note survives a failed or crashed STT run. Unlike
     ``attachment_urls`` it is transient bookkeeping, cleared by
     :func:`update_message` once the transcript is in.
+
+    The remaining arguments are a mail's (see :data:`P_SUBJECT` and
+    docs/mail-chats.md, "The record"): ``subject`` its Subject, ``sender_name``
+    the display name on From, ``recipients``/``cc`` the To/Cc addresses,
+    ``in_reply_to``/``references`` its threading headers, ``list_id``,
+    ``body_part``/``html_part``/``header_part`` the media references of its
+    parts (stored with :func:`store_media` first, like attachments, so their
+    blob facts are stated), ``trim`` one of :data:`TRIMS` (anything else is a
+    programming error and raises ``ValueError``), and ``content_ids``
+    ``{attachment reference: Content-ID}`` for its inline parts. Every one
+    defaults to absent, and an absent one writes no triple.
     """
     ts = time.time() if timestamp is None else float(timestamp)
     token = secrets.token_hex(8)
-    subject = f"urn:retinue:inbound:{_slug(channel)}:{token}"
+    urn = f"urn:retinue:inbound:{_slug(channel)}:{token}"
     fields = {
+        **_mail_fields(subject=subject, sender_name=sender_name, recipients=recipients,
+                       cc=cc, in_reply_to=in_reply_to, references=references,
+                       list_id=list_id, body_part=body_part, html_part=html_part,
+                       header_part=header_part, trim=trim),
         "type": T_INBOUND,
-        "subject": subject,
+        "subject": urn,
         "channel": channel,
         "sender": sender or "unknown",
         "text": text or "",
@@ -541,12 +814,12 @@ def write_message(
         "attachments": [u for u in (attachment_urls or []) if u],
         "media": media or None,
     }
-    fields["attachment_meta"] = _own_attachment_meta(store_dir, fields["attachments"])
+    fields["attachment_meta"] = _record_blob_meta(store_dir, fields, content_ids)
     # Filename: zero-padded epoch millis (sortable) + token (unique, IRI-safe).
     fname = f"{int(ts * 1000):016d}-{token}.nt"
     path = messages_dir(store_dir) / fname
     _atomic_write(_render(fields), path)
-    return subject, path
+    return urn, path
 
 
 def write_outbound(
@@ -560,6 +833,19 @@ def write_outbound(
     message_id: str | None = None,
     timestamp: float | None = None,
     attachment_urls: list[str] | None = None,
+    sender: str | None = None,
+    sender_name: str | None = None,
+    subject: str | None = None,
+    recipients: list[str] | None = None,
+    cc: list[str] | None = None,
+    in_reply_to: str | None = None,
+    references: str | list[str] | None = None,
+    list_id: str | None = None,
+    body_part: str | None = None,
+    html_part: str | None = None,
+    header_part: str | None = None,
+    trim: str | None = None,
+    content_ids: dict | None = None,
 ) -> tuple[str, Path]:
     """Persist one successfully sent outbound message as its own N-Triples file.
 
@@ -583,29 +869,39 @@ def write_outbound(
     is owed to *triage*, and an outbound message never is — :func:`undelivered`
     and :func:`mark_delivered` filter by record type, so these files can never
     surface in the drain.
+
+    A mail also states its From — ``sender`` (the account's own address, or
+    the alias it went out as) and ``sender_name`` — and takes the same mail
+    arguments as :func:`write_message`; a messenger send passes none of them
+    and its record is what it always was.
     """
     if author not in AUTHORS:
         raise ValueError(f"author must be one of {'|'.join(AUTHORS)}, got {author!r}")
     ts = time.time() if timestamp is None else float(timestamp)
     token = secrets.token_hex(8)
-    subject = f"urn:retinue:outbound:{_slug(channel)}:{token}"
+    urn = f"urn:retinue:outbound:{_slug(channel)}:{token}"
     fields = {
+        **_mail_fields(subject=subject, sender_name=sender_name, recipients=recipients,
+                       cc=cc, in_reply_to=in_reply_to, references=references,
+                       list_id=list_id, body_part=body_part, html_part=html_part,
+                       header_part=header_part, trim=trim),
         "type": T_OUTBOUND,
-        "subject": subject,
+        "subject": urn,
         "channel": channel,
         "chat": chat or "unknown",
         "account": account or None,
         "text": text or "",
         "author": author,
+        "sender": _one(sender),
         "message_id": message_id or None,
         "sent_at": _iso(ts),
         "attachments": [u for u in (attachment_urls or []) if u],
     }
-    fields["attachment_meta"] = _own_attachment_meta(store_dir, fields["attachments"])
+    fields["attachment_meta"] = _record_blob_meta(store_dir, fields, content_ids)
     fname = f"{int(ts * 1000):016d}-{token}.nt"
     path = messages_dir(store_dir) / fname
     _atomic_write(_render(fields), path)
-    return subject, path
+    return urn, path
 
 
 def _image_dimensions(data: bytes) -> tuple[int, int] | None:
@@ -943,13 +1239,14 @@ def backfill_media_meta(store_dir: str | Path) -> int:
     """State the blob metadata on records written before it was recorded.
 
     Walks this store's messages once, and rewrites every record that
-    references a blob this store holds but says less about it than
+    references a blob this store holds (an attachment or a mail part) but
+    says less about it than
     :func:`media_meta` knows. Idempotent — a second run rewrites nothing —
     and never raises: a record that cannot be read or written is skipped.
     A gateway calls this at startup, on its own store only, so the reader
     never has to fall back to anyone's files. Returns the rewrite count.
     """
-    marker = f"<{P_ATTACHMENT}>"
+    markers = [f"<{p}>" for p in (P_ATTACHMENT, *(pred for _k, pred in _PARTS))]
     count = 0
     try:
         paths = sorted(messages_dir(store_dir).glob("*.nt"))
@@ -958,18 +1255,24 @@ def backfill_media_meta(store_dir: str | Path) -> int:
     for path in paths:
         try:
             text = path.read_text(encoding="utf-8")
-        except OSError:
+        except (OSError, UnicodeDecodeError):
             continue
-        if marker not in text:
+        if not any(marker in text for marker in markers):
             continue
         fields = _parse(text)
         if not fields:
             continue
-        known = _own_attachment_meta(store_dir, fields["attachments"])
+        known = _own_attachment_meta(store_dir, _media_refs(fields))
         stated = fields.get("attachment_meta") or {}
-        if all(stated.get(ref) == meta for ref, meta in known.items()):
+        # Compared key by key: a record also states what no sidecar holds (a
+        # Content-ID), and that must neither force a rewrite on every start
+        # nor be lost when one happens.
+        if all(stated.get(ref, {}).get(key) == value
+               for ref, meta in known.items() for key, value in meta.items()):
             continue
-        fields["attachment_meta"] = {**stated, **known}
+        fields["attachment_meta"] = {
+            ref: {**stated.get(ref, {}), **known.get(ref, {})}
+            for ref in {**stated, **known}}
         try:
             _atomic_write(_render(fields), path)
         except OSError:
@@ -1004,7 +1307,7 @@ def undelivered(
     for path in sorted(mdir.glob("*.nt")):
         try:
             fields = _parse(path.read_text(encoding="utf-8"))
-        except OSError:
+        except (OSError, UnicodeDecodeError):
             continue
         # Inbound records only: outbound messages share this directory and carry
         # no delivered flag (which parses as the False default) — without the
@@ -1058,7 +1361,7 @@ def mark_delivered(path: str | Path) -> bool:
     p = Path(path)
     try:
         fields = _parse(p.read_text(encoding="utf-8"))
-    except OSError:
+    except (OSError, UnicodeDecodeError):
         return False
     if not fields:
         return False
@@ -1077,29 +1380,48 @@ def mark_delivered(path: str | Path) -> bool:
 
 
 def update_message(path: str | Path, *, text: str | None = None,
-                   clear_media: bool = False) -> str | None:
-    """Rewrite a persisted message's mutable fields in place; never raises.
+                   clear_media: bool = False, chat: str | None = None,
+                   trim: str | None = None) -> str | None:
+    """Rewrite a persisted message's mutable fields in place; never raises
+    on file trouble.
 
     Used by the **persist-before-transcribe** path: a voice note is written up
     front with empty text and a ``media`` reference to its retained audio, then
     once STT succeeds this fills in the transcript (``text=…``) and drops the
     now-superfluous audio reference (``clear_media=True``).
 
+    A mail's record changes in two more ways. ``chat=`` re-keys it when two
+    threads turn out to be one and merge (:func:`rekey_chat` does a whole
+    chat); ``trim=`` (one of :data:`TRIMS` — anything else raises
+    ``ValueError``, a programming error) says how ``text`` now derives from
+    the parts, when a better trim replaces it. Nothing here can change a
+    record's identity, its timestamps or its parts: what the mail *was* is
+    immutable, only the reading of it is not. On a tombstone
+    (:func:`tombstone_message`) ``text=`` and ``trim=`` are ignored — a trim
+    finishing after the mail was found gone must not put its words back.
+
     Returns the ``media`` value present *before* the call — so a caller clearing
     it knows which file to unlink — or ``None`` if there was none or the rewrite
     failed. Only the fields named are touched; ``delivered`` and everything else
     are preserved.
     """
+    trim = _check_trim(trim)
+    chat = _one(chat)
     p = Path(path)
     try:
         fields = _parse(p.read_text(encoding="utf-8"))
-    except OSError:
+    except (OSError, UnicodeDecodeError):
         return None
     if not fields:
         return None
     prev_media = fields.get("media")
-    if text is not None:
+    removed = bool(fields.get("removed_at"))
+    if text is not None and not removed:
         fields["text"] = text
+    if trim is not None and not removed:
+        fields["trim"] = trim
+    if chat is not None:
+        fields["chat"] = chat
     if clear_media:
         fields["media"] = None
     try:
@@ -1107,6 +1429,186 @@ def update_message(path: str | Path, *, text: str | None = None,
     except OSError:
         return None
     return prev_media
+
+
+def iter_records(store_dir: str | Path):
+    """Every record in this store, as ``(path, fields)``, in timeline order.
+
+    Both directions, oldest first (filenames sort by epoch millis), each
+    parsed as :func:`_parse` reads it — the mail fields included. For a
+    gateway that must rebuild what it derives from the ledger (a thread index,
+    a mailbox index) after losing its own state: the ledger is the record of
+    what exists. Tolerant by design: a file that vanishes, cannot be read or
+    does not parse is skipped, and a missing store yields nothing. Read-only;
+    it never touches the delivered flag.
+    """
+    try:
+        paths = sorted(messages_dir(store_dir).glob("*.nt"))
+    except OSError:
+        return
+    for path in paths:
+        try:
+            fields = _parse(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError):
+            continue
+        if fields:
+            yield path, fields
+
+
+def rekey_chat(store_dir: str | Path, chat: str, account: str | None,
+               into: str) -> dict:
+    """Move every record of one chat to another chat key (a thread merge).
+
+    The chat is the exact (``kb:chat``, ``kb:account``) pair, as for
+    :func:`delete_chat`; each of its records, both directions, is rewritten
+    with ``kb:chat`` = ``into`` through :func:`update_message`, so nothing
+    else of it changes. Fails closed in the same way: a record that cannot be
+    read, or does not parse but names this chat, or cannot be rewritten, is
+    counted in ``errors`` — the caller must not tell anyone the merge is done
+    until a repeat comes back clean. Idempotent: a repeat finds nothing left
+    under the old key. Returns ``{"messages", "errors"}``.
+    """
+    wanted_chat = (chat or "").strip()
+    wanted_account = (account or "").strip()
+    into = (into or "").strip()
+    result = {"messages": 0, "errors": 0}
+    if not wanted_chat or not into or into == wanted_chat:
+        return result
+    chat_marker = f'<{P_CHAT}> "{_esc(wanted_chat)}"'
+    try:
+        paths = sorted(messages_dir(store_dir).glob("*.nt"))
+    except OSError:
+        return result
+    for path in paths:
+        try:
+            text = path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            continue
+        except (OSError, UnicodeDecodeError):
+            result["errors"] += 1
+            continue
+        fields = _parse(text)
+        if not fields:
+            if chat_marker in text:
+                result["errors"] += 1
+            continue
+        if (fields.get("chat") != wanted_chat
+                or (fields.get("account") or "") != wanted_account):
+            continue
+        update_message(path, chat=into)
+        try:
+            moved = _parse(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError):
+            moved = None
+        if moved and moved.get("chat") == into:
+            result["messages"] += 1
+        else:
+            result["errors"] += 1
+    return result
+
+
+def _blob_ids_referenced_elsewhere(store_dir: Path, ids: set[str],
+                                   skip: set[Path]) -> set[str]:
+    """Which of ``ids`` a record other than those in ``skip`` still names.
+
+    Read off each record's raw text, not its parse: a record that no longer
+    parses still references what it names. A record that cannot be read at
+    all might name any of them, so then all of them count as named — a blob
+    is never unlinked on a guess."""
+    named: set[str] = set()
+    if not ids:
+        return named
+    try:
+        paths = sorted(messages_dir(store_dir).glob("*.nt"))
+    except OSError:
+        return set(ids)
+    for path in paths:
+        if path.resolve() in skip:
+            continue
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except FileNotFoundError:
+            continue
+        except OSError:
+            return set(ids)
+        named.update(mid for mid in ids if mid in text)
+        if named == ids:
+            break
+    return named
+
+
+def tombstone_message(path: str | Path, removed_at: str | float | None = None) -> bool:
+    """Strip one record to its identity: the mail is gone from the mailbox.
+
+    For a mail deleted, or moved out of the mirrored folders, in a client
+    (docs/mail-chats.md, "The mirror"). The record stays — a chat whose mails
+    are all gone is archived, not erased — and keeps who, where and when:
+    type, channel, chat, account, group, sender and sender name, author,
+    message id, subject, the threading ids and the list id (a thread index
+    rebuilt from the ledger needs every id a mail cited), its timestamps,
+    and on an inbound record ``delivered`` — set true, since nothing is owed
+    for a mail that no longer exists. It loses what the mail said and to
+    whom: ``kb:text`` becomes the empty string (the triple stays: the parser
+    and the web gateway's chat query require it), and the recipients, the Cc,
+    the trim, the parts, the attachments with what was stated about them, a
+    retained voice-note spool, and any triple this version does not know (it
+    cannot tell identity from content there, and a tombstone keeps only what
+    it knows to be identity). ``kb:removedAt`` is set — ``removed_at`` as
+    epoch seconds or ISO-8601, else now.
+
+    The blobs the record referenced are unlinked first, unless another record
+    of the store still names one (:func:`_blob_ids_referenced_elsewhere`), and
+    the record is rewritten after: if the rewrite fails the call returns
+    False and a repeat finishes the job. Idempotent: a tombstone is left as it
+    is, its first ``removedAt`` kept. Never raises; False only when the record
+    cannot be read, parsed or rewritten.
+    """
+    try:
+        p = Path(path)
+        fields = _parse(p.read_text(encoding="utf-8"))
+        if not fields:
+            return False
+        stripped = {key for key in ("recipients", "cc", "attachments", "extra")
+                    if fields.get(key)}
+        stripped |= {key for key, _pred in _PARTS if fields.get(key)}
+        stripped |= {key for key in ("text", "trim", "media", "attachment_meta")
+                     if fields.get(key)}
+        owed = fields.get("type") == T_INBOUND and not fields.get("delivered")
+        if fields.get("removed_at") and not stripped and not owed:
+            return True
+        # The blobs go first, so a failed rewrite leaves a record a repeat
+        # can still finish — never a record pointing at nothing it can name.
+        if p.parent.name == MESSAGES_SUBDIR:
+            store = p.parent.parent
+            ids = set(filter(None, map(media_id_of, _media_refs(fields))))
+            keep = _blob_ids_referenced_elsewhere(store, ids, {p.resolve()})
+            for mid in sorted(ids - keep):
+                _unlink_blob(store, mid)
+            spool = fields.get("media")
+            if spool:
+                try:
+                    spool_path = Path(spool).resolve()
+                    if spool_path.parent == media_dir(store).resolve():
+                        spool_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+        if not fields.get("removed_at"):
+            when = _parse_since(removed_at)
+            fields["removed_at"] = _iso(time.time() if when is None else when)
+        fields["text"] = ""
+        for key in ("recipients", "cc", "attachments", "extra"):
+            fields[key] = []
+        for key, _pred in _PARTS:
+            fields[key] = None
+        fields["trim"] = None
+        fields["media"] = None
+        fields["attachment_meta"] = {}
+        if fields.get("type") == T_INBOUND:
+            fields["delivered"] = True
+        _atomic_write(_render(fields), p)
+        return True
+    except Exception:  # noqa: BLE001 - a tombstone is bookkeeping; never raise
+        return False
 
 
 def _unlink_blob(store_dir: str | Path, media_id: str) -> tuple[bool, int]:
@@ -1147,7 +1649,8 @@ def delete_chat(store_dir: str | Path, chat: str,
     chat still references it (never the case for blobs this store minted, but
     a reference is only a string and costs nothing to honour). The retained
     raw audio of a voice note still awaiting its transcript (``kb:media``, a
-    path inside the media directory) goes too.
+    path inside the media directory) goes too, and so do a mail's parts (its
+    plain body, HTML and header blobs), with the same care for a shared blob.
 
     Never raises on a single unreadable or undeletable file — it is skipped
     and counted in ``errors``, so the caller can tell the erasure was partial
@@ -1155,13 +1658,15 @@ def delete_chat(store_dir: str | Path, chat: str,
     read at all (it may be one of this chat's), and one that cannot be parsed
     but names this chat key: failing closed there is the point.
 
-    Returns ``{"messages", "media", "errors", "subjects", "message_ids"}`` —
-    the last two identify what was erased, so a reader still serving an older
-    index can hide exactly those records and nothing that arrives afterwards.
+    Returns ``{"messages", "media", "parts", "errors", "subjects",
+    "message_ids"}``: ``media`` counts every blob unlinked, ``parts`` how many
+    of those were mail parts; the last two identify what was erased, so a
+    reader still serving an older index can hide exactly those records and
+    nothing that arrives afterwards.
     """
     wanted_chat = (chat or "").strip()
     wanted_account = (account or "").strip()
-    result: dict = {"messages": 0, "media": 0, "errors": 0,
+    result: dict = {"messages": 0, "media": 0, "parts": 0, "errors": 0,
                     "subjects": [], "message_ids": []}
     if not wanted_chat:
         return result
@@ -1190,7 +1695,7 @@ def delete_chat(store_dir: str | Path, chat: str,
         if mine:
             doomed.append((path, fields))
         else:
-            kept_refs.update(filter(None, map(media_id_of, fields["attachments"])))
+            kept_refs.update(filter(None, map(media_id_of, _media_refs(fields))))
     media_root = media_dir(store_dir).resolve()
     for path, fields in doomed:
         try:
@@ -1204,11 +1709,13 @@ def delete_chat(store_dir: str | Path, chat: str,
         except OSError:
             result["errors"] += 1
             continue
-        for ref in fields["attachments"]:
+        parts = {fields[key] for key, _pred in _PARTS if fields.get(key)}
+        for ref in _media_refs(fields):
             mid = media_id_of(ref)
             if mid and mid not in kept_refs:
                 removed, errors = _unlink_blob(store_dir, mid)
                 result["media"] += int(removed)
+                result["parts"] += int(removed and ref in parts)
                 result["errors"] += errors
         spool = fields.get("media")
         if spool:
