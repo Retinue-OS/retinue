@@ -159,8 +159,10 @@ card are about a **person**. So the chat state keeps both: `name` (the subject)
 and `peer` (`{address, name}` of the latest inbound sender, or the first
 recipient for a thread the user started). For a chat that is not a group the
 contact card and the autolink work on `("email", peer.address)`; the attention
-item's sender is the person's name, so priors, permits and spheres follow the
-person and never the subject.
+item is about the person and never the subject — its sender is the contact who
+owns the address, else the address itself. Not the display name the mail
+carried: anyone can type a name, and keying on it would let a stranger inherit
+a known person's priors, permits and spheres.
 
 ### What never becomes a chat
 
@@ -244,6 +246,17 @@ token-gated `GET /media/<id>`, proxied by the web gateway — exactly as a
 messenger gateway keeps a photo. Tracking pixels are not attachments: a remote
 image is never fetched, and an inline image of two pixels or fewer a side is
 dropped.
+
+Two limits keep one mail from filling the volume. An attachment larger than
+`MAIL_MAX_PART_BYTES` is not stored; a small text attachment named
+`<name>.not-mirrored.txt` stands in for it and says what it was. A mail larger
+than `MAIL_MAX_MAIL_BYTES` keeps its text parts and one such note for all its
+attachments. The text of a mail is always kept.
+
+A record's time is the earlier of the mail's `Date` and the server's arrival
+time, never the future, so a forged date cannot pin a mail to the head of its
+chat. A mail with no usable `Message-ID` gets a stable one derived from its
+headers.
 
 ### The record
 

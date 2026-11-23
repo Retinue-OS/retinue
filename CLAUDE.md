@@ -204,8 +204,9 @@ subject, and before writing to someone — autonomous chats included — run
 python3 /workspace/scripts/recent.py "<name or subject>" [--days 14]
 ```
 
-(the last days of chats, dashboard threads, memory and project logs, matched
-by name and the contact's handles; e-mail: `email_client.py search --text`).
+(the last days of chats — mail threads the mail gateway mirrors included —
+dashboard threads, memory and project logs, matched by name and the contact's
+handles; mail older than the mirror: `email_client.py search --text`).
 Ask only what it leaves open, and never contradict what another thread said.
 
 ## Data refresh and scheduled tasks

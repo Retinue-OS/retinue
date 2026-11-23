@@ -1276,6 +1276,12 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("derive-whitelist", help="refresh the whitelist from Sent only")
     sub.add_parser("news", help="file declared news groups to the feed only")
     args = parser.parse_args(argv)
+    # The policy file moved to the mail gateway's ledger volume; every mode
+    # below reads or locks it, so it is put in place first (idempotent).
+    try:
+        tp.ensure_email_policy_location()
+    except OSError as exc:
+        print(f"[triage-gate] e-mail policy file not placed: {exc}", file=sys.stderr, flush=True)
     if args.mode == "frequent":
         return run_frequent()
     if args.mode == "daily":

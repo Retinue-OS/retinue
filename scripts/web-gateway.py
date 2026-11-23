@@ -5799,6 +5799,12 @@ def _render_gateways_html(statuses: list[dict]) -> str:
                 f"<p>{html.escape(_pairing_hint(slug))}</p>"
                 "</div>"
             )
+        elif configured and not connected and _slug_channel(slug) == chat_state_mod.MAIL_CHANNEL:
+            # No device and nothing to pair: a mail gateway is down because the
+            # mail server refused the login or cannot be reached.
+            rows.append('<p class="meta">The mailbox is not reachable — the gateway keeps '
+                        'trying on its own. If the error above stays, check the '
+                        'mailbox settings and the app password.</p>')
         elif configured and not connected:
             rows.append('<p class="meta">The device is still paired — no QR scan needed; '
                         'the gateway recovers on its own or reports the error above.</p>')
@@ -16245,6 +16251,19 @@ if __name__ == "__main__":
             print(f"[web-gateway] repaired {repaired} chat gateway stamp(s)", flush=True)
     except Exception as exc:  # noqa: BLE001
         print(f"[web-gateway] chat gateway repair skipped: {exc}", flush=True)
+    # The e-mail policy file lives on the mail gateway's ledger volume now
+    # (docs/mail-chats.md): move it there from its old place, or create it
+    # empty — the mail gateway waits for the file before its first backfill,
+    # to tell "no flags" from "not set up yet". Idempotent and best-effort.
+    try:
+        placed = triage_policy.ensure_email_policy_location()
+        if placed.get("action") != "present" or placed.get("legacy_left"):
+            print(f"[web-gateway] e-mail policy file: {placed.get('action')} at "
+                  f"{placed.get('path')}"
+                  + (f" (an older, different file was left at {placed['legacy_left']})"
+                     if placed.get("legacy_left") else ""), flush=True)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[web-gateway] e-mail policy file not placed: {exc}", flush=True)
     # Pin threads that predate the model tiers to the gateway default, so the
     # introduction of RETINUE_ROUTER_MODEL does not retroactively move them to
     # the router tier. Idempotent (marker-guarded) and best-effort.
