@@ -19,8 +19,8 @@
   const fmtSize = (n) => (n < 1024 ? `${n} B` : n < 1024 * 1024 ? `${Math.round(n / 1024)} KB` : `${(n / 1024 / 1024).toFixed(1)} MB`);
   const attachmentsHtml = (atts) => (atts && atts.length ? `<div class="attachments">${atts.map((a) => `<span class="att">📎 ${esc(a.name)}<small>${esc(fmtSize(a.size))}</small></span>`).join('')}</div>` : '');
   const isPeer = (item) => item.kind === 'relationship' || item.kind === 'group';
-  const CHANNEL_MARK = { WhatsApp: 'W', Signal: 'S', Telegram: 'T', 'E-mail': '@', SMS: 'M' };
-  const CHANNEL_COLORS = { WhatsApp: '#25d366', Signal: '#3a76f0', Telegram: '#2aabee', 'E-mail': '#c9a0ff', SMS: '#8b93a3' };
+  const CHANNEL_MARK = { WhatsApp: 'W', Signal: 'S', Telegram: 'T', 'E-mail': '@', SMS: 'M', Phone: '☏' };
+  const CHANNEL_COLORS = { WhatsApp: '#25d366', Signal: '#3a76f0', Telegram: '#2aabee', 'E-mail': '#c9a0ff', SMS: '#8b93a3', Phone: '#57c785' };
   // The chat list's age column, as the dashboard's fmtAge: minutes, hours, days.
   function ageText(t, now) { const m = Math.round(now - t); if (m < 1) return 'now'; if (m < 60) return `${m} min`; if (m < 1440) return `${Math.round(m / 60)} h`; return `${Math.round(m / 1440)} d`; }
   // Day separators in a stream, as the chat page's: Today, Yesterday, then the date.
@@ -73,7 +73,7 @@
       this.sim = new root.Simulation(this.engine, { onChange: () => this.renderAll(), ui: this });
       this.sheet = null; this.view = null; this.draft = null; this.toast = null; this.menu = false; this.otherOpen = false; this.waitingOpen = false;
       this.list = 'home'; this.dossierFilter = 'active'; this.to = {}; this.select = null; this.picker = null;
-      this.shelf = []; this.shelfMenu = null; this.pageMenu = false; this.model = 'Ara'; this.treeOpen = {}; this.focusMenuOpen = false; this.newMenu = false; this.card = null; this.newForm = null; this.threadOpen = {}; this.replyThread = {}; // the shelf and the page bar live on the device, as on the dashboard
+      this.shelf = []; this.shelfMenu = null; this.pageMenu = false; this.model = 'Ara'; this.treeOpen = {}; this.focusMenuOpen = false; this.newMenu = false; this.card = null; this.newForm = null; this.threadOpen = {}; this.replyThread = {}; this.writeOn = {}; // the shelf and the page bar live on the device, as on the dashboard
       this.files = {}; this.rec = null; this.job = null; this.attachError = ''; this.wave = new Waveform(() => this.phoneEl);
       this.sttUrl = null; this.cloudOk = false; try { this.cloudOk = localStorage.getItem('attention-voice-cloud') === '1'; } catch (_e) { /* no storage */ }
       this.localRecognition = null; // null = unknown, then true/false
@@ -294,13 +294,13 @@
     cardHtml() {
       const e = this.engine; const item = e.byId.get(this.card); if (!item) return '';
       const initials = item.title.split(/\s+/).map((w) => w[0]).join('').slice(0, 2).toUpperCase();
-      const handles = item.handles.map((h, i) => `<div class="handle"><span class="h-ch" style="background:${CHANNEL_COLORS[h[0]] || '#8b93a3'}">${esc(CHANNEL_MARK[h[0]] || h[0][0])}</span><span class="h-val"><b>${esc(h[0])}</b> ${esc(h[1])}</span>${item.kind === 'relationship' ? `<button class="btn tiny" data-act="card-rm-handle" data-id="${esc(item.id)}" data-index="${i}" title="Remove">×</button>` : ''}</div>`).join('');
+      const handles = item.handles.map((h, i) => `<div class="handle"><button class="h-reach" data-act="reach" data-id="${esc(item.id)}" data-channel="${esc(h[0])}" data-handle="${esc(h[1])}" title="${h[0] === 'Phone' ? 'Call' : `Write on ${esc(h[0])}`}"><span class="h-ch" style="background:${CHANNEL_COLORS[h[0]] || '#8b93a3'}">${esc(CHANNEL_MARK[h[0]] || h[0][0])}</span><span class="h-val"><b>${esc(h[0])}</b> ${esc(h[1])}</span><span class="h-act">${h[0] === 'Phone' ? '📞 call' : '✎ write'}</span></button>${item.kind === 'relationship' ? `<button class="btn tiny" data-act="card-rm-handle" data-id="${esc(item.id)}" data-index="${i}" title="Remove this handle">×</button>` : ''}</div>`).join('');
       const add = this.cardAdd ? `<div class="form-row"><select class="select small" id="ca-ch">${['WhatsApp', 'Signal', 'Telegram', 'E-mail', 'Phone', 'SMS'].map((c) => `<option>${c}</option>`).join('')}</select><input id="ca-val" class="pick-input" type="text" placeholder="Address or number"><button class="btn tiny primary" data-act="card-add-handle" data-id="${esc(item.id)}">Add</button></div>` : `<button class="btn tiny" data-act="card-add-start">+ handle</button>`;
       const spheres = root.Backends.SPHERES.map((sp) => `<button class="chipbtn${item.sphere === sp ? ' primary' : ''}" data-act="card-sphere" data-id="${esc(item.id)}" data-sphere="${sp}">${sp}</button>`).join('');
       const topics = e.items.filter((i) => (i.kind === 'topic' || i.kind === 'ara') && i.state !== 'done' && e.participantsOf(i).includes(item.title));
       return `<div class="overlay" data-act="close-card"><div class="sheet card" data-stop="1">
         <div class="sheet-head"><div class="card-head"><span class="cl-av" style="background:${SPHERE_COLORS[item.sphere] || '#9aa5b1'}">${esc(initials)}</span><div><div class="sheet-title">${esc(item.title)}</div><div class="sheet-src">${esc(e.kindLabel(item))}${item.org ? ` · ${esc(item.org)}` : ''}${item.screened ? ' · <b class="screened">screened — nobody has filed this sender</b>' : ''}</div></div></div><button class="x" data-act="close-card" aria-label="Close">✕</button></div>
-        <div class="f-label">Reaches them</div><div class="handles">${handles || '<div class="muted">no handle on file</div>'}${add}</div>
+        <div class="f-label">Reaches them — tap one to write</div><div class="handles">${handles || '<div class="muted">no handle on file</div>'}${add}</div>
         <div class="f-label">Sphere</div><div class="chips card-chips">${spheres}</div>
         <div class="f-label">Attention</div><div class="card-attn"><label class="switch"><input type="checkbox" data-act="card-vip" data-id="${esc(item.id)}"${item.gate === 'vip' ? ' checked' : ''}> <span><b>VIP</b> — a model turn on every message, on every channel; rings in every mode</span></label><div class="card-line">importance prior <b>${esc(String(e.profile.priors[item.sender] != null ? e.profile.priors[item.sender] : item.importance))}</b> · permits: ${Object.entries(e.profile.permits).filter(([, v]) => v.includes(item.sender)).map(([m]) => esc(e.modes[m].name)).join(', ') || 'none'}</div></div>
         ${topics.length ? `<div class="f-label">In dossiers</div><div class="embeds">${topics.map((t) => `<div class="embed row-embed cl">${this.chatRow(t)}</div>`).join('')}</div>` : ''}
@@ -387,17 +387,20 @@
     openView(id, opts = {}) { const item = this.engine.byId.get(id); if (!item) return; this.engine.ensureOpening(id); this.engine.markSeen(id); this.compose = opts.compose ? { id, subject: '' } : null; this.view = { id }; this.sheet = null; this.menu = false; this.pageMenu = false; this.shelfMenu = null; this.select = null; if (!this.draft || this.draft.id !== id) this.draft = null; }
     // The textarea grows with its text, up to a few lines, then scrolls (the chat page's _grow).
     grow(ta) { if (!ta || !ta.style) return; ta.style.height = 'auto'; ta.style.height = `${Math.min(ta.scrollHeight || 0, 160)}px`; }
+    channelFor(item) { return this.writeOn[item.id] || this.engine.defaultChannel(item); }
     // The pane a relationship is open on — the chat page's two panes: 'chat' (the mirror of the messages, the composer
     // addressed to the person) or 'ara' (the companion: Ara's turns about this relationship). A topic has one stream, with Ara.
     addressee(item) { if (!isPeer(item)) return 'ara'; return this.to[item.id] || 'chat'; }
     // The chat pane of a mail relationship shows its threads: each a subject with its messages, the newest open.
     threadsHtml(item, sorted) {
-      const e = this.engine; const threads = e.threadsOf(item); const newest = threads[threads.length - 1];
+      // One timeline: messenger messages as bubbles, each mail thread as a block (subject, count, the newest open), ordered by latest activity.
+      const e = this.engine; const threads = e.threadsOf(item); const newestMail = e.mailThreadsOf(item).slice(-1)[0];
       return threads.map((th) => {
-        const k = `${item.id}:${th.key}`; const open = this.threadOpen[k] != null ? this.threadOpen[k] : th === newest;
+        let lastDay = null; const bubs = (msgs) => msgs.map((m) => { const d = U.dayIndex(m.t); const sep = d !== lastDay ? `<div class="day-sep"><span>${esc(dayText(m.t, e.now))}</span></div>` : ''; lastDay = d; return sep + this.bubble(item, m); }).join('');
+        if (!th.mail) return bubs(th.msgs);
+        const k = `${item.id}:${th.key}`; const open = this.threadOpen[k] != null ? this.threadOpen[k] : th === newestMail;
         const last = th.msgs[th.msgs.length - 1]; const inbox = th.msgs.some((m) => m.inbox);
-        let lastDay = null; const body = open ? th.msgs.map((m) => { const d = U.dayIndex(m.t); const sep = d !== lastDay ? `<div class="day-sep"><span>${esc(dayText(m.t, e.now))}</span></div>` : ''; lastDay = d; return sep + this.bubble(item, m); }).join('') : '';
-        return `<div class="thread${open ? ' open' : ''}"><button class="thread-head" data-act="thread-toggle" data-key="${esc(k)}"><span class="th-subj">✉ ${esc(th.subject || '(no subject)')}</span><span class="th-meta">${th.msgs.length} · ${esc(ageText(last.t, e.now))}${inbox ? ' · <i>in the inbox</i>' : ''}</span><span class="chev">${open ? '▾' : '▸'}</span></button>${body}</div>`;
+        return `<div class="thread${open ? ' open' : ''}"><button class="thread-head" data-act="thread-toggle" data-key="${esc(k)}"><span class="th-subj">✉ ${esc(th.subject || '(no subject)')}</span><span class="th-meta">${th.msgs.length} · ${esc(ageText(last.t, e.now))}${inbox ? ' · <i>in the inbox</i>' : ''}</span><span class="chev">${open ? '▾' : '▸'}</span></button>${open ? bubs(th.msgs) : ''}</div>`;
       }).join('');
     }
     bubble(item, m, idx, embedded) {
@@ -407,7 +410,7 @@
       const hold = !sel && !embedded && (m.who === 'in' || m.who === 'out') ? `<button class="hold" data-act="select" data-id="${esc(item.id)}" data-uid="${m.uid}" title="Add to a dossier…">⋯</button>` : '';
       if (m.who === 'in' || m.who === 'out') {
         const mail = m.mail ? `<div class="mail-card"><div class="mail-subj">✉ ${esc(m.subject || '(no subject)')}</div><div class="mail-from">${m.who === 'in' ? esc(m.from || item.title) : 'you'}${m.archived ? ` · <i>left the inbox: ${esc(m.archived)}</i>` : m.inbox ? ' · <i>in the inbox</i>' : ''}</div></div>` : '';
-        return `<div class="bub-wrap ${m.who}">${selBox}<div class="bub ${m.who}${m.mail ? ' mail' : ''}">${m.who === 'in' && m.from && !m.mail ? `<div class="bub-from">${esc(m.from)}</div>` : ''}${mail}${m.text ? `<div class="bub-text">${esc(m.text)}</div>` : ''}${attachmentsHtml(m.attachments)}<div class="bub-t">${m.who === 'in' ? esc(m.from || item.title) : 'you'} · ${esc(item.channel || '')} · ${esc(U.hhmm(m.t))}</div>${links}</div>${hold}</div>`;
+        return `<div class="bub-wrap ${m.who}">${selBox}<div class="bub ${m.who}${m.mail ? ' mail' : ''}">${m.who === 'in' && m.from && !m.mail ? `<div class="bub-from">${esc(m.from)}</div>` : ''}${mail}${m.text ? `<div class="bub-text">${esc(m.text)}</div>` : ''}${attachmentsHtml(m.attachments)}<div class="bub-t">${m.who === 'in' ? esc(m.from || item.title) : 'you'} · ${esc(m.channel || item.channel || '')} · ${esc(U.hhmm(m.t))}</div>${links}</div>${hold}</div>`;
       }
       if (m.who === 'ara' || m.who === 'you') return `<div class="bub ${m.who === 'ara' ? 'in ara' : 'out toara'}${(m.refs || []).length ? ' wide' : ''}">${m.text ? `<div class="bub-text">${esc(m.text)}</div>` : ''}${attachmentsHtml(m.attachments)}${this.embedsHtml(m.refs)}<div class="bub-t">${m.who === 'ara' ? (m.agent ? esc(m.agent) : 'Ara') : 'you → Ara'} · ${esc(U.hhmm(m.t))}</div></div>`;
       if (m.who === 'event') {
@@ -433,14 +436,14 @@
       const e = this.engine; const item = e.byId.get(this.view.id); if (!item) { this.view = null; return ''; }
       e.ensureOpening(item.id);
       const peer = isPeer(item); const to = this.addressee(item); const lvl = e.level(item);
-      const sub = peer ? `${e.kindLabel(item)} · ${item.channel}${item.org ? ` · ${item.org}` : ''}` : item.kind === 'ara' ? `topic with Ara${item.agent && item.agent !== 'Ara' ? ` (opened by ${item.agent})` : ''}` : item.kind === 'standing' ? 'standing dossier · Ara' : `topic${item.within ? ` within ${e.byId.get(item.within).title}` : ''}${item.participants ? ` · with ${item.participants.join(', ')}` : ''}`;
+      const sub = peer ? `${e.kindLabel(item)} · ${e.writeChannels(item).join(', ') || item.channel}${item.org ? ` · ${item.org}` : ''}` : item.kind === 'ara' ? `topic with Ara${item.agent && item.agent !== 'Ara' ? ` (opened by ${item.agent})` : ''}` : item.kind === 'standing' ? 'standing dossier · Ara' : `topic${item.within ? ` within ${e.byId.get(item.within).title}` : ''}${item.participants ? ` · with ${item.participants.join(', ')}` : ''}`;
       const kids = e.children(item.id); const parent = e.parentOf(item);
       const treeLine = parent || kids.length ? `<div class="tree-line">${parent ? `<button class="backlink" data-act="view" data-id="${esc(parent.id)}">↑ ${esc(parent.title)}</button>` : ''}${kids.map((k) => `<button class="backlink kid${k.state === 'open' ? ' pend' : ''}" data-act="view" data-id="${esc(k.id)}">↳ ${esc(k.title)} <small>${esc(e.stateText(k))}</small></button>`).join('')}</div>` : '';
       const status = e.stateText(item) + (item.state === 'open' && item.actor === 'you' ? ` · ${lvl} · ${e.urgencyShort(item)}` : '');
       const sorted = [...item.stream].sort((a, b) => a.t - b.t); let lastDay = null;
       // A relationship has two panes: the chat (the messages, deterministic) and Ara (her turns and events about it). A topic is one stream.
       const inPane = (m) => !peer ? true : to === 'chat' ? (m.who === 'in' || m.who === 'out') : (m.who !== 'in' && m.who !== 'out');
-      const bubbles = peer && to === 'chat' && item.mail
+      const bubbles = peer && to === 'chat' && e.mailThreadsOf(item).length
         ? this.threadsHtml(item, sorted)
         : sorted.filter(inPane).map((m, i) => { const d = U.dayIndex(m.t); const sep = d !== lastDay ? `<div class="day-sep"><span>${esc(dayText(m.t, e.now))}</span></div>` : ''; lastDay = d; return sep + this.bubble(item, m, i); }).join('');
       const panes = peer ? `<div class="segs pane-tabs" role="tablist"><button class="seg${to === 'chat' ? ' on' : ''}" role="tab" data-act="to" data-id="${esc(item.id)}" data-to="chat">Chat</button><button class="seg${to === 'ara' ? ' on' : ''}" role="tab" data-act="to" data-id="${esc(item.id)}" data-to="ara">Ara${item.stream.some((m) => m.who === 'ara' && m.t > (item.seenAt != null ? item.seenAt : -Infinity)) ? ' <i class="dot-new"></i>' : ''}</button></div>` : '';
@@ -480,12 +483,19 @@
       const files = this.files[id] || [];
       const chips = files.length ? `<div class="file-chips">${files.map((f, i) => `<span class="fchip"><span class="c-name">${esc(f.name)}</span><span class="c-size">${esc(fmtSize(f.size))}</span><button type="button" class="c-x" data-act="rmfile" data-id="${esc(id)}" data-index="${i}" aria-label="Remove attachment">×</button></span>`).join('')}</div>` : '';
       const err = this.attachError ? `<div class="attach-err">${esc(this.attachError)}</div>` : '';
-      // Mail: the composer says which thread it writes in — one of the existing ones (a reply), or a new one with its subject.
+      // The channel the composer writes on: every way the card says reaches the person; the default is the last message's.
+      // Then, for mail, which thread — one of the existing ones (a reply), or a new one with its subject.
       const composing = this.compose && this.compose.id === id; let toggle = '';
-      if (isPeer(item) && item.mail && to === 'chat') {
-        const threads = this.engine.threadsOf(item); const sel = this.replyThread[id] != null ? this.replyThread[id] : (composing || !threads.length ? 'new' : String(threads[threads.length - 1].key));
+      const channel = isPeer(item) ? this.channelFor(item) : null;
+      if (isPeer(item) && to === 'chat') {
+        const ws = this.engine.writeChannels(item);
+        if (ws.length > 1) toggle += `<div class="to-row"><span class="to-label">via</span>${ws.map((c) => `<button class="seg ch${channel === c ? ' on' : ''}" data-act="write-on" data-id="${esc(id)}" data-channel="${esc(c)}"><i class="ch-dot" style="background:${CHANNEL_COLORS[c] || '#8b93a3'}"></i>${esc(c)} <small>${esc((item.handles.find((h) => h[0] === c) || [])[1] || '')}</small></button>`).join('')}</div>`;
+        else if (ws.length === 1) toggle += `<div class="to-row"><span class="to-label">via</span><span class="seg on ch static"><i class="ch-dot" style="background:${CHANNEL_COLORS[ws[0]] || '#8b93a3'}"></i>${esc(ws[0])} <small>${esc((item.handles.find((h) => h[0] === ws[0]) || [])[1] || '')}</small></span></div>`;
+      }
+      if (isPeer(item) && channel === 'E-mail' && to === 'chat') {
+        const threads = this.engine.mailThreadsOf(item); const sel = this.replyThread[id] != null ? this.replyThread[id] : (composing || !threads.length ? 'new' : String(threads[threads.length - 1].key));
         const opts = threads.map((t) => `<option value="${esc(String(t.key))}"${sel === String(t.key) ? ' selected' : ''}>Re: ${esc(t.subject || '(no subject)')}</option>`).join('') + `<option value="new"${sel === 'new' ? ' selected' : ''}>New thread…</option>`;
-        toggle = `<div class="subj-row"><span class="to-label">thread</span><select id="thread-sel" class="select small" data-act="thread-sel" data-id="${esc(id)}">${opts}</select>${sel === 'new' ? `<input id="subject" class="subj" type="text" placeholder="Subject" value="${esc(composing ? this.compose.subject : '')}" data-id="${esc(id)}">` : ''}<small class="subj-hint">${sel === 'new' ? 'a new thread — nothing pending is touched' : 'a reply in this thread'}</small></div>`;
+        toggle += `<div class="subj-row"><span class="to-label">thread</span><select id="thread-sel" class="select small" data-act="thread-sel" data-id="${esc(id)}">${opts}</select>${sel === 'new' ? `<input id="subject" class="subj" type="text" placeholder="Subject" value="${esc(composing ? this.compose.subject : '')}" data-id="${esc(id)}">` : ''}<small class="subj-hint">${sel === 'new' ? 'a new thread — nothing pending is touched' : 'a reply in this thread'}</small></div>`;
       }
       let row;
       if (this.rec && this.rec.id === id && this.rec.tab === tab) {
@@ -493,7 +503,7 @@
       } else if (this.job && this.job.id === id && this.job.tab === tab) {
         row = `<div class="composer-row rec-row"><div class="wave-wrap rec-status" role="status"><span>${esc(this.job.label)}</span></div></div>`;
       } else {
-        const placeholder = tab === 'chat' ? `${item.mail ? 'Write to' : 'Message'} ${item.title}…` : item.kind === 'standing' || item.kind === 'topic' || item.kind === 'ara' ? 'Ask Ara, or add a note…' : `Ask Ara about ${item.title}…`;
+        const placeholder = tab === 'chat' ? `${channel === 'E-mail' ? 'Write to' : 'Message'} ${item.title}${channel ? ` on ${channel}` : ''}…` : item.kind === 'standing' || item.kind === 'topic' || item.kind === 'ara' ? 'Ask Ara, or add a note…' : `Ask Ara about ${item.title}…`;
         // The dashboard's composer: a textarea that grows with the text (one line to start), Enter for a line break, Ctrl/⌘-Enter to send.
         row = `<div class="composer-row"><button type="button" class="mic" data-act="mic" data-id="${esc(id)}" data-tab="${tab}" title="Record a voice message" aria-label="Record a voice message">🎤</button><div class="field"><textarea id="composer" rows="1" autocomplete="off" placeholder="${esc(placeholder)}" aria-label="${esc(placeholder)}" data-tab="${tab}" data-id="${esc(id)}">${esc(draft ? draft.text : '')}</textarea><label class="clip" title="Attach a file" aria-label="Attach a file"><input type="file" multiple hidden data-file data-id="${esc(id)}"><span aria-hidden="true">📎</span></label></div><button type="button" class="send" data-act="send" data-id="${esc(id)}" data-tab="${tab}" title="${tab === 'chat' ? 'Send (Ctrl/⌘-Enter)' : 'Ask Ara (Ctrl/⌘-Enter)'}" aria-label="${tab === 'chat' ? 'Send' : 'Ask Ara'}">➤</button></div>`;
       }
@@ -678,7 +688,7 @@
       this.sim.viewerActed(); this.draft = null; this.files[id] = []; this.attachError = '';
       const subjEl = this.phoneEl.querySelector('#subject'); const subject = subjEl && subjEl.dataset.id === id ? subjEl.value.trim() : (this.compose && this.compose.id === id ? this.compose.subject : '');
       const thEl = this.phoneEl.querySelector('#thread-sel'); const thread = thEl && thEl.dataset.id === id ? thEl.value : (this.replyThread[id] != null ? this.replyThread[id] : null);
-      if (tab === 'chat') { const item = this.engine.byId.get(id); if (item && item.mail && (thread === 'new' || (thread == null && this.compose && this.compose.id === id)) && !subject) { this.showToast('A subject for the new thread, please.'); return; } this.engine.sendChat(id, text, files, { thread: thread === 'new' ? null : thread, subject: thread === 'new' || thread == null ? subject : '' }); this.compose = null; delete this.replyThread[id]; }
+      if (tab === 'chat') { const item = this.engine.byId.get(id); const channel = this.channelFor(item); const isMail = channel === 'E-mail'; if (isMail && (thread === 'new' || (thread == null && this.compose && this.compose.id === id)) && !subject) { this.showToast('A subject for the new thread, please.'); return; } this.engine.sendChat(id, text, files, { channel, thread: isMail && thread !== 'new' ? thread : null, subject: isMail && (thread === 'new' || thread == null) ? subject : '' }); this.compose = null; delete this.replyThread[id]; }
       else this.converse(id, text, files);
       this.renderAll();
     }
@@ -734,7 +744,10 @@
         case 'shelf-close-quiet': { const keep = this.shelf.filter((s) => { const it = e.byId.get(s.id); return it && (s.working || it.stream.some((m) => (m.who === 'ara' || m.who === 'in') && m.t > s.at)); }); this.shelf = keep; this.shelfMenu = null; break; }
         case 'dossier-filter': this.sim.viewerActed(); this.dossierFilter = el.dataset.filter; break;
         case 'tree-toggle': this.sim.viewerActed(); this.treeOpen[id] = !this.treeOpen[id]; break;
-        case 'thread-toggle': { this.sim.viewerActed(); const k = el.dataset.key; const item = e.byId.get(k.split(':')[0]); const th = e.threadsOf(item); const key = k.slice(k.indexOf(':') + 1); const cur = this.threadOpen[k] != null ? this.threadOpen[k] : (th.length && String(th[th.length - 1].key) === key); this.threadOpen[k] = !cur; if (!cur) this.replyThread[item.id] = key; break; }
+        case 'thread-toggle': { this.sim.viewerActed(); const k = el.dataset.key; const item = e.byId.get(k.split(':')[0]); const th = e.mailThreadsOf(item); const key = k.slice(k.indexOf(':') + 1); const cur = this.threadOpen[k] != null ? this.threadOpen[k] : (th.length && String(th[th.length - 1].key) === key); this.threadOpen[k] = !cur; if (!cur) { this.replyThread[item.id] = key; this.writeOn[item.id] = 'E-mail'; } break; }
+        case 'write-on': this.sim.viewerActed(); this.writeOn[id] = el.dataset.channel; this.compose = el.dataset.channel === 'E-mail' && !e.mailThreadsOf(e.byId.get(id)).length ? { id, subject: '' } : this.compose; break;
+        // from the card: a handle is a way to reach them — tap it to write on that channel (Phone: call)
+        case 'reach': { this.sim.viewerActed(); const ch = el.dataset.channel; if (ch === 'Phone') { this.showToast(`Calling ${e.byId.get(id).title} ${el.dataset.handle} — on the phone this dials.`); break; } this.card = null; this.writeOn[id] = ch; this.to[id] = 'chat'; this.openView(id, { compose: ch === 'E-mail' }); if (ch === 'E-mail') this.replyThread[id] = 'new'; break; }
         // focus and aperture
         case 'focus-menu': this.sim.viewerActed(); this.focusMenuOpen = !this.focusMenuOpen; this.menu = false; break;
         case 'set-focus': this.sim.viewerActed(); e.setFocus(el.dataset.focus === 'null' ? null : JSON.parse(el.dataset.focus)); this.focusMenuOpen = false; this.sheet = null; break;

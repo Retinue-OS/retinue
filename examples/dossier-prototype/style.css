@@ -387,3 +387,12 @@ code{font-family:"Source Code Pro","DejaVu Sans Mono",Menlo,monospace;font-size:
 .thread.open .bub-wrap,.thread.open .day-sep{margin-left:8px;margin-right:8px}
 .thread.open>.bub-wrap:last-child{margin-bottom:8px}
 .thread .bub.mail .mail-card{display:none}
+
+/* ways to reach a person */
+.h-reach{flex:1;min-width:0;display:flex;align-items:center;gap:8px;font:inherit;color:#e7ebf2;background:none;border:0;padding:0;cursor:pointer;text-align:left}
+.h-reach:hover .h-act{color:#e7ebf2}
+.h-act{flex:none;font-size:11px;color:#6ea8fe}
+.seg.ch{display:inline-flex;align-items:center;gap:5px}
+.seg.ch small{color:#8b93a3;font-size:10.5px}
+.seg.ch.static{cursor:default}
+.ch-dot{width:7px;height:7px;border-radius:50%;display:inline-block}

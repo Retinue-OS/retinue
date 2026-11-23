@@ -180,17 +180,26 @@ the pending state is the row's second line and the attention sheet. A topic
 has one stream, because a topic *is* a conversation with Ara (and, through
 the composer's channel switch, with its participants).
 
-**Messenger and mail differ in one thing: threads.** A messenger relationship
-is one thread — the person is the subject, as in any chat app. A mail
-relationship is a set of threads, each with its subject, and the Chat pane
-shows them as such: one block per thread, subject and count, the newest open
-and the others folded, their messages inside. The composer says **which
-thread** it writes in: one of the existing ones (a reply, `Re: …`, settling
-what that thread had pending) or *New thread…* with a subject — just another
-message in the relationship (rule 3), touching nothing that was pending
-before. So writing to the tax office about a new matter is: ＋ → Message →
-the tax office → *New thread…*, subject, text, send; the open letter about
-2025 stays as it was in its own thread. The composer is the dashboard's: a
+**One relationship, every channel.** The Chat pane is one timeline of
+everything exchanged with the person — a Signal message, a mail, a WhatsApp
+— each bubble marked with its channel. The composer writes **via** one of the
+channels the contact card says reaches them (every messaging handle on the
+card; a phone number is for calling): a *via* row above the field, defaulting
+to the channel the last message came on. On the card itself each handle is a
+button — tap the Signal number and the composer opens on Signal, tap the
+address and it opens on mail with a new thread, tap the phone and it calls.
+
+**Messenger and mail differ in one thing: threads.** On a messenger channel
+the relationship is one thread — the person is the subject, as in any chat
+app. Mail is a set of threads, each with its subject, and the Chat pane shows
+them as such among the messenger bubbles: one block per thread, subject and
+count, the newest open and the others folded, their messages inside. With
+mail chosen, the composer says **which thread** it writes in: one of the
+existing ones (a reply, `Re: …`, settling what that thread had pending) or
+*New thread…* with a subject — just another message in the relationship (rule
+3), touching nothing that was pending before. So writing to the tax office
+about a new matter is: ＋ → Message → the tax office → *New thread…*, subject,
+text, send; the open letter about 2025 stays as it was in its own thread. The composer is the dashboard's: a
 field that grows with the text, Enter for a line break, Ctrl/⌘-Enter to send,
 the microphone and the paper clip beside it.
 
@@ -381,9 +390,10 @@ messages, in the same row, sortable by latest message (default),
 alphabetically, or by hand (drag; per device; starred pins). Tapping a row
 opens the stream, as on the home; the **contact card** (👤 on the row, in the
 page bar and the ⋮ menu of a relationship) is the person behind it — the
-handles on every channel, the sphere, the importance prior and permits, the
-VIP switch, the instruction, the dossiers they take part in — exactly what
-`docs/contacts.md` describes, in one sheet. A screened sender's card says so
+handles on every channel (each a button: write on that channel, or call), the
+sphere, the importance prior and permits, the VIP switch, the instruction,
+the dossiers they take part in — exactly what `docs/contacts.md` describes,
+in one sheet. A screened sender's card says so
 and is where they get filed. Search and *+ New contact* stay.
 
 **Starting something** is one *＋* in the navigation row, on every page, with

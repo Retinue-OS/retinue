@@ -117,7 +117,7 @@
       const item = this._newItem({ id: `rel:${msg.chat}`, kind: c.group ? 'group' : 'relationship', channel: c.channel || 'messenger', mail: c.channel === 'E-mail', org: c.org || null, gate: c.gate || 'batch', title: msg.chat, body: msg.text, sender: msg.sender, sphere: c.sphere || 'friends', tags: c.tags ? c.tags.slice() : [], importance: prior != null ? prior : 2.5, importanceFrom: 'prior', due: null, kindLabel: 'message', state: 'quiet', handles: c.handles ? c.handles.map((h) => h.slice()) : [], lastActivity: -30 * DAY });
       return item;
     }
-    _entry(msg) { return { who: 'in', text: msg.text, t: msg.at, from: msg.from || null, mail: !!msg.mail, subject: msg.subject || null, attachments: msg.attachments || [], inbox: !!msg.mail, judged: !msg.mail, links: [], uid: ++this.seq, thread: msg.mail ? ++this.seq : null }; }
+    _entry(msg) { const c = B.CONTACTS[msg.sender] || {}; return { who: 'in', text: msg.text, t: msg.at, from: msg.from || null, channel: msg.channel || c.channel || 'messenger', mail: !!msg.mail, subject: msg.subject || null, attachments: msg.attachments || [], inbox: !!msg.mail, judged: !msg.mail, links: [], uid: ++this.seq, thread: msg.mail ? ++this.seq : null }; }
     // Put a classification on a relationship's pending state and let it arrive.
     _classify(item, tr, at, by) {
       const fresh = item.state !== 'open';
@@ -459,31 +459,38 @@
     // A relationship's pending state is settled; the dossier stays.
     _settle(item, how) { if (item.state !== 'open') return; item.state = item.kind === 'relationship' || item.kind === 'group' ? 'quiet' : 'done'; item.doneAt = this.now; item.doneHow = how; this.doneToday += 1; }
     // Send to the dossier's human participants (a relationship's channel); the pending state is settled.
-    // The threads of a relationship. A messenger relationship is one thread — the person is the subject; a mail
-    // relationship is a set of threads, each with a subject, newest last.
+    // The ways to reach a person: the channels the composer can write on — every messaging handle on the card
+    // (Phone is for calling, not writing). The default is the one the last message came on.
+    writeChannels(item) { return [...new Set(item.handles.filter((h) => h[0] !== 'Phone').map((h) => h[0]))]; }
+    defaultChannel(item) { const last = this.lastIn(item); const ws = this.writeChannels(item); if (last && last.channel && ws.includes(last.channel)) return last.channel; return ws[0] || item.channel; }
+    // The threads of a relationship. A messenger channel is one thread — the person is the subject; mail is a set of
+    // threads, each with a subject, newest last.
     threadsOf(item) {
       const map = new Map();
-      for (const m of [...item.stream].sort((a, b) => a.t - b.t)) { if (m.who !== 'in' && m.who !== 'out') continue; const k = item.mail && m.thread != null ? m.thread : 'chat'; if (!map.has(k)) map.set(k, { key: k, subject: m.subject || null, msgs: [] }); map.get(k).msgs.push(m); }
+      for (const m of [...item.stream].sort((a, b) => a.t - b.t)) { if (m.who !== 'in' && m.who !== 'out') continue; const k = m.mail && m.thread != null ? m.thread : `chat:${m.channel || item.channel}`; if (!map.has(k)) map.set(k, { key: k, subject: m.subject || null, channel: m.channel || item.channel, mail: !!m.mail, msgs: [] }); map.get(k).msgs.push(m); }
       return [...map.values()].sort((a, b) => a.msgs[a.msgs.length - 1].t - b.msgs[b.msgs.length - 1].t);
     }
-    // Send to the dossier's participants. For mail: `thread` = a reply in that thread (Re: its subject, settling what
-    // it had pending); `subject` = a new thread, just another message in the relationship (rule 3), touching nothing
-    // pending; neither = a reply in the newest thread.
+    mailThreadsOf(item) { return this.threadsOf(item).filter((t) => t.mail); }
+    // Send to the person on a channel. For mail: `thread` = a reply in that thread (Re: its subject, settling what it had
+    // pending); `subject` = a new thread, just another message in the relationship (rule 3), touching nothing pending;
+    // neither = a reply in the newest thread. A messenger message settles what was pending.
     sendChat(id, text, attachments = [], opts = {}) {
       if (typeof opts === 'string') opts = { subject: opts };
       const item = this.byId.get(id); if (!item || !(item.kind === 'relationship' || item.kind === 'group')) return false;
+      const channel = opts.channel || this.defaultChannel(item); const mail = channel === 'E-mail';
       let thread = null, subject = null, fresh = false;
-      if (item.mail) {
-        const threads = this.threadsOf(item); const re = (x) => (x ? (/^re:/i.test(x) ? x : `Re: ${x}`) : null);
+      if (mail) {
+        const threads = this.mailThreadsOf(item); const re = (x) => (x ? (/^re:/i.test(x) ? x : `Re: ${x}`) : null);
         if (opts.thread != null && opts.thread !== 'new') { const th = threads.find((t) => String(t.key) === String(opts.thread)); thread = th ? th.key : ++this.seq; subject = th ? re(th.subject) : (opts.subject || null); }
         else if (opts.subject) { fresh = true; thread = ++this.seq; subject = opts.subject; }
         else { const th = threads[threads.length - 1]; thread = th ? th.key : ++this.seq; subject = th ? re(th.subject) : null; }
+        if (!subject) { fresh = true; subject = opts.subject || '(no subject)'; }
       }
-      item.stream.push({ who: 'out', text, t: this.now, attachments, mail: !!item.mail, subject, thread, links: [], uid: ++this.seq }); this._touch(item);
+      item.stream.push({ who: 'out', text, t: this.now, attachments, channel, mail, subject, thread, links: [], uid: ++this.seq }); this._touch(item);
       if (fresh) { this.emit({ kind: 'action', item, text: `New mail to ${item.sender}, “${subject}”: a new thread in the relationship; what was pending before stays pending.` }); return true; }
       for (const m of item.stream) if (m.mail && m.inbox && (thread == null || m.thread === thread)) this._leaveInbox(m, 'replied');
       this._settle(item, 'replied');
-      this.emit({ kind: 'action', item, text: `Replied to ${item.sender} on ${item.channel}${subject ? ` (“${subject}”)` : ''}: “${text}”${attachments.length ? ` + ${attachments.length} file${attachments.length === 1 ? '' : 's'}` : ''} — nothing pending.` });
+      this.emit({ kind: 'action', item, text: `${mail ? 'Replied' : 'Sent'} to ${item.sender} on ${channel}${subject ? ` (“${subject}”)` : ''}: “${text}”${attachments.length ? ` + ${attachments.length} file${attachments.length === 1 ? '' : 's'}` : ''} — nothing pending.` });
       return true;
     }
     // The gesture: messages of one dossier referenced from another, as one event with a comment.
