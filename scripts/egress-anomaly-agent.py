@@ -126,14 +126,28 @@ def _reason(flow: dict, severity: str, anomaly_type: str, reason: str) -> dict:
     }
 
 
+def _large_body(body: dict, label: str) -> str | None:
+    """The anomaly detail for an unusually large body, or None.
+
+    A body the proxy streamed instead of buffering may have no size: the
+    sender declared no Content-Length (chunked). Streaming starts above the
+    proxy's threshold, so such a body counts as large with its size unknown."""
+    size = body.get("size")
+    if size is None:
+        return f"{label} body streamed, size undeclared" if body.get("streamed") else None
+    if size > LARGE_BODY_BYTES:
+        return f"{label} body {size} bytes"
+    return None
+
+
 def _scan(flow: dict, state: State) -> list[dict]:
     anomalies: list[dict] = []
     host = flow.get("host", "")
     method = flow.get("method", "")
     path = flow.get("path", "")
     status = flow.get("response_status", 0)
-    req_size = flow.get("request_body", {}).get("size", 0)
-    resp_size = flow.get("response_body", {}).get("size", 0)
+    req_body = flow.get("request_body") or {}
+    resp_body = flow.get("response_body") or {}
 
     # New host never seen before (and not in the known-hosts allowlist).
     if host and host not in state.seen_hosts and host not in KNOWN_HOSTS:
@@ -152,10 +166,11 @@ def _scan(flow: dict, state: State) -> list[dict]:
         anomalies.append(_reason(flow, "info", "nonstandard_port", f"Port {flow.get('port')}"))
 
     # Unusually large bodies.
-    if req_size > LARGE_BODY_BYTES:
-        anomalies.append(_reason(flow, "warning", "large_request", f"Request body {req_size} bytes"))
-    if resp_size > LARGE_BODY_BYTES:
-        anomalies.append(_reason(flow, "warning", "large_response", f"Response body {resp_size} bytes"))
+    for body, kind, label in ((req_body, "large_request", "Request"),
+                              (resp_body, "large_response", "Response")):
+        detail = _large_body(body, label)
+        if detail:
+            anomalies.append(_reason(flow, "warning", kind, detail))
 
     # Suspicious path patterns.
     if SUSPICIOUS_PATH_RE.search(path):
