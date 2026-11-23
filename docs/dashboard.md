@@ -991,7 +991,9 @@ for the tabs. (`group` on a chat is the boolean "a group chat", as before.)
 - A new inbound message moves a read chat back to *Unread* and brings an
   archived one back unless it is muted — by the order it landed in, so also
   when it is stamped before the mark (a delayed delivery, a sender's slow
-  clock). An agent's own outbound message changes nothing: it is no reply.
+  clock). A message is one arrival however often its channel delivers it,
+  and one a fast clock stamped a little ahead of the mark that read it stays
+  read. An agent's own outbound message changes nothing: it is no reply.
 - On the page's rows a **swipe right marks as read** (on *Unread*) and a
   **swipe left archives**; the tray — Star, on *Unread* Mark read, Archive
   and Mute; on *Archived* Star, Restore, Mute or Unmute and Delete — opens by

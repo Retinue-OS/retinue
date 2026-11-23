@@ -8,8 +8,10 @@ display metadata — plus the in-memory overlay that bridges the life store's
 indexing lag. This exercises the draft guard (stale version rejected; agent
 staging never clobbers user text), read-mark and unread-classification
 semantics, the restore's two guards, the arrival count that decides what
-landed after a read (a mark guarded by what was seen, a reply, the undo),
-path-safe state filenames, and the overlay's merge/dedup/expiry contract.
+landed after a read (a mark guarded by what was seen, a reply, the undo; one
+count per message, however often its event is delivered), the reach of a
+read to a message stamped by a fast clock, path-safe state filenames, and
+the overlay's merge/dedup/expiry contract.
 
 Standalone, no third-party deps:
 
@@ -382,7 +384,7 @@ def test_the_undo_restores_the_arrival_count_too():
         doc, previous = store.mark_read(cid, 3000.0)
         t3 = doc["last_read"]
         assert previous == t2 and since() == 0
-        assert doc["read_undo"] == {"read_inbound": 1}
+        assert doc["read_undo"] == {"read_inbound": 1, "read_ahead": None}
         store.mark_unread(cid, 2500.0)           # another, after this mark
         restored, doc = store.restore_last_read(cid, restore=previous, marked=t3)
         assert restored and doc["last_read"] == t2
@@ -417,6 +419,166 @@ def test_the_undo_restores_the_arrival_count_too():
                                                 marked=cs.iso_z(3000.0))
         assert restored and cs.arrived_since_read(doc) == 1
         print("PASS test_the_undo_restores_the_arrival_count_too")
+
+
+def test_a_repeated_event_is_one_arrival():
+    """The rail delivers at least once; the count is per message. An event
+    repeated for a message id the chat has counted is no second arrival —
+    across a restart too, the record being in the document."""
+    with tempfile.TemporaryDirectory() as tmp:
+        store = cs.ChatStateStore(tmp)
+        cid = "sms:+41790000085"
+        since = lambda: cs.arrived_since_read(store.get(cid))  # noqa: E731
+        doc, had = store.mark_unread(cid, 1000.0, message_id="m1")
+        assert not had and doc["inbound_seq"] == 1 and cs.arrival_seq(doc, "m1") == 1
+        store.mark_read(cid)
+        doc, had = store.mark_unread(cid, 1010.0, message_id="m2")
+        assert not had and doc["inbound_seq"] == 2 and since() == 1
+        before = store.get(cid)
+        # The retry of that event: counted once, nothing written, and the
+        # chat is said to stand as it does.
+        doc, had = store.mark_unread(cid, 1010.0, message_id="m2")
+        assert had and doc == before and store.get(cid) == before
+        assert since() == 1 and cs.arrival_seq(doc, "m2") == 2
+        # A new store over the same directory — the web gateway restarted
+        # inside the retry window — answers the same.
+        again = cs.ChatStateStore(tmp)
+        doc, _ = again.mark_unread(cid, 1010.0, message_id="m2")
+        assert doc["inbound_seq"] == 2 and since() == 1
+
+        # A repeat of an older message keeps the place that message was
+        # counted at, not the count as it stands: an arrival still on its
+        # way into the attention model is not claimed by it.
+        store.mark_unread(cid, 1020.0, message_id="m3")
+        doc, _ = store.mark_unread(cid, 1010.0, message_id="m2")
+        assert doc["inbound_seq"] == 3
+        assert (cs.arrival_seq(doc, "m2"), cs.arrival_seq(doc, "m3")) == (2, 3)
+        # Read, and redelivered afterwards: it stays read, and "new" is
+        # still what the next message is.
+        doc, _ = store.mark_read(cid)
+        doc, had = store.mark_unread(cid, 1020.0, message_id="m3")
+        assert not had and since() == 0 and doc["unread_since"] is None
+        _, had = store.mark_unread(cid, 1030.0, message_id="m4")
+        assert not had and since() == 1
+
+        # An event that carries no id cannot be told from a new message:
+        # counted, as before, and its place is the count.
+        doc, _ = store.mark_unread(cid, 1040.0)
+        doc, _ = store.mark_unread(cid, 1040.0)
+        assert doc["inbound_seq"] == 6 and since() == 3
+        assert cs.arrival_seq(doc, None) == 6 and cs.arrival_seq(doc, "never-seen") == 6
+        assert cs.arrival_seq(None, "m1") == 0 and cs.arrival_seq({"inbound_seq": 4}, "m1") == 4
+
+        # The record is bounded: only the newest ids are kept, and one that
+        # has aged out counts again.
+        for n in range(cs.INBOUND_RECENT_MAX):
+            doc, _ = store.mark_unread(cid, 2000.0 + n, message_id=f"n{n}")
+        assert len(doc["inbound_recent"]) == cs.INBOUND_RECENT_MAX
+        assert doc["inbound_recent"][-1] == [f"n{cs.INBOUND_RECENT_MAX - 1}", doc["inbound_seq"]]
+        seq = doc["inbound_seq"]
+        assert store.mark_unread(cid, 2000.0, message_id="n0")[0]["inbound_seq"] == seq
+        assert store.mark_unread(cid, 1030.0, message_id="m4")[0]["inbound_seq"] == seq + 1
+        print("PASS test_a_repeated_event_is_one_arrival")
+
+
+def test_a_read_reaches_a_stamp_from_a_fast_clock():
+    """A message stamped a little ahead of this clock lies later than a mark
+    made after it landed. A read of the chat as it stands covers it beside
+    the mark (`read_ahead`); the mark itself stays this clock's, and the
+    undo puts back exactly what the mark changed."""
+    with tempfile.TemporaryDirectory() as tmp:
+        store = cs.ChatStateStore(tmp)
+        cid = "sms:+41790000086"
+        now = time.time()
+        fast = cs.iso_z(now + 30)
+        # The rail hands the arrival on as now, and its own stamp beside it.
+        doc, _ = store.mark_unread(cid, now, message_id="f1", stamp=now + 30)
+        assert doc["inbound_ahead"] == fast and doc["unread_since"] == cs.iso_z(now)
+        assert cs.read_cut(doc) == "" and cs.read_cut(None) == ""
+        doc, previous = store.mark_read(cid)
+        assert previous is None and doc["last_read"] <= cs.iso_z()
+        assert doc["read_ahead"] == fast and cs.read_cut(doc) == fast
+        assert doc["read_undo"] == {"read_inbound": None, "read_ahead": None}
+        mark = doc["last_read"]
+        # What lands next is unread by its place in the count, though the
+        # reach of the read lies past its stamp.
+        doc, _ = store.mark_unread(cid, time.time(), message_id="f2")
+        assert cs.arrived_since_read(doc) == 1 and doc["read_ahead"] == fast
+        # A read up to a named instant, or an echoed reply, reaches no
+        # further than its instant — and takes nothing back either.
+        doc, _ = store.mark_read(cid, mark)
+        assert doc["read_ahead"] == fast and cs.arrived_since_read(doc) == 0
+        assert doc["read_undo"] == {"read_inbound": 1, "read_ahead": fast}
+        doc = store.advance_last_read(cid, mark)
+        assert doc["read_ahead"] == fast and doc["last_read"] == mark
+        # Naming the stamp itself — the message the caller showed — reaches
+        # it; the mark is still not lifted there. An instant short of it
+        # reaches nothing.
+        named = "sms:+41790000084"
+        store.mark_unread(named, now, message_id="n1", stamp=now + 30)
+        doc, _ = store.mark_read(named, now + 10)
+        assert doc["read_ahead"] is None and doc["last_read"] <= cs.iso_z()
+        doc, _ = store.mark_read(named, now + 30)
+        assert doc["read_ahead"] == fast and doc["last_read"] <= cs.iso_z()
+        assert doc["read_undo"] == {"read_inbound": 1, "read_ahead": None}
+
+        # The undo: the mark, the count and the reach go back together.
+        undo = "sms:+41790000087"
+        store.mark_unread(undo, 1000.0, message_id="u1")
+        doc, _ = store.mark_read(undo, 2000.0)
+        t2 = doc["last_read"]
+        store.mark_unread(undo, time.time(), message_id="u2", stamp=time.time() + 45)
+        doc, previous = store.mark_read(undo)
+        ahead = doc["read_ahead"]
+        assert previous == t2 and ahead == doc["inbound_ahead"] > doc["last_read"]
+        restored, doc = store.restore_last_read(undo, restore=previous, marked=doc["last_read"])
+        assert restored and (doc["last_read"], doc["read_inbound"], doc["read_ahead"]) == \
+            (t2, 1, None) and doc["read_undo"] is None
+        assert cs.read_cut(doc) == t2 and cs.arrived_since_read(doc) == 1
+        # Marked again, and marked once more: the second mark's undo goes
+        # back to the first one's reach, not to none.
+        doc, _ = store.mark_read(undo)
+        first = doc["last_read"]
+        doc, previous = store.mark_read(undo)
+        assert doc["read_undo"] == {"read_inbound": 2, "read_ahead": ahead}
+        restored, doc = store.restore_last_read(undo, restore=previous, marked=doc["last_read"])
+        assert restored and (doc["last_read"], doc["read_ahead"]) == (first, ahead)
+        # A record of an undo written before the field existed names none,
+        # and changes none.
+        doc = store._read(undo)
+        doc["read_undo"] = {"read_inbound": 1}
+        store._write(doc)
+        restored, doc = store.restore_last_read(undo, restore=t2, marked=first)
+        assert restored and (doc["read_inbound"], doc["read_ahead"]) == (1, ahead)
+
+        # The dashboard's own send answers everything that has landed, so it
+        # reaches as far; a mark that has passed the stamp needs no reach.
+        sent = "sms:+41790000088"
+        store.mark_unread(sent, time.time(), message_id="s1", stamp=time.time() + 20)
+        doc = store.advance_last_read(sent, time.time(), everything=True)
+        assert doc["read_ahead"] == doc["inbound_ahead"] and doc["read_undo"] is None
+        doc = store._read(sent)
+        doc["inbound_ahead"] = doc["read_ahead"] = cs.iso_z(time.time() - 5)
+        store._write(doc)
+        doc, _ = store.mark_read(sent)
+        assert doc["read_ahead"] is None and cs.read_cut(doc) == doc["last_read"]
+
+        # Only a clock's error is taken for one. A stamp further ahead than
+        # READ_SKEW_SECONDS is kept nowhere, and no read reaches it; nor is
+        # one that is not ahead at all.
+        far = "sms:+41790000089"
+        doc, _ = store.mark_unread(far, time.time(), message_id="x1",
+                                   stamp=time.time() + cs.READ_SKEW_SECONDS + 60)
+        assert doc["inbound_ahead"] is None
+        doc, _ = store.mark_unread(far, time.time() - 50, message_id="x2")
+        assert doc["inbound_ahead"] is None
+        doc, _ = store.mark_read(far)
+        assert doc["read_ahead"] is None and cs.read_cut(doc) == doc["last_read"]
+        # The later of two fast stamps is the one kept.
+        store.mark_unread(far, time.time(), message_id="x3", stamp=time.time() + 60)
+        doc, _ = store.mark_unread(far, time.time(), message_id="x4", stamp=time.time() + 20)
+        assert doc["inbound_ahead"] >= cs.iso_z(time.time() + 55)
+        print("PASS test_a_read_reaches_a_stamp_from_a_fast_clock")
 
 
 def test_archive_unless_arrived():
@@ -557,6 +719,8 @@ if __name__ == "__main__":
     test_mark_read_and_its_guarded_restore()
     test_arrival_order_decides_what_came_after_a_read()
     test_the_undo_restores_the_arrival_count_too()
+    test_a_repeated_event_is_one_arrival()
+    test_a_read_reaches_a_stamp_from_a_fast_clock()
     test_archive_unless_arrived()
     test_flags_and_note_message()
     test_companion_link()

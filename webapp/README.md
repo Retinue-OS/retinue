@@ -422,7 +422,8 @@ The API, as the components consume it:
   reached the ledger without the dashboard still reads the chat — or, where
   that is more, those that have landed since the newest read, whatever they
   are stamped (a delayed delivery is stamped before a mark it arrived
-  after). `inbound_seq` is how many arrivals this summary includes; a client
+  after). `inbound_seq` is how many arrivals this summary includes — one per
+  message, however often the channel delivered it; a client
   hands it back as `seen` with Mark as read (below) and does nothing else
   with it. `list_group` is the tab the chat belongs
   in: `archived` when archived, else `unread` while `unread > 0`, else
@@ -623,7 +624,9 @@ The API, as the components consume it:
   right after the mark, as `GET /chats` would state it — normally 0 and
   `read`, but a client takes both from the answer rather than assuming them.
   The mark is the server's clock, never a message's timestamp and never in
-  the future. `{}` is the same without the check (for a caller that vouches
+  the future; a message it covers that a fast clock stamped up to two
+  minutes ahead is read with it, and stays read. `{}` is the same without
+  the check (for a caller that vouches
   for itself), and `{ts}` reads only up to that instant; a `ts` that is no
   real instant, or lies more than two minutes ahead of the server's clock,
   is a 400 (one a little ahead is taken as now).

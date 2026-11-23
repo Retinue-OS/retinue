@@ -252,7 +252,12 @@ persistent volume — high-churn disposable data, the news-store precedent):
   the rail, and how many of them the newest read covered. The mark says
   *when*; these say in which order things happened here, which is what
   decides whether a message came after the user last dealt with the chat
-  (same section);
+  (same section). `inbound_recent` holds the message ids of the newest
+  arrivals with their place in the count, so that a message is counted once
+  however often its event is delivered;
+- `inbound_ahead`, `read_ahead` — the latest stamp an arrival carried from a
+  little ahead of the gateway's clock, and how far past `last_read` the
+  newest read reaches because of it (same section);
 - `archived`, `muted` — the conversation model's pair, adopted verbatim so
   both rails share one mental model. A chat never *ends*, but the semantics
   transfer exactly: `archived` drops the chat from the card and the default
@@ -329,6 +334,10 @@ of the two.
 max( last_read,  the chat's latest outbound message authored `user` or `device` )
 ```
 
+(`last_read` as far as it reaches: where the newest read covered a message
+stamped ahead of the gateway's clock, up to that stamp — `read_ahead`, see
+*Mark as read* below.)
+
 Both halves are needed. `last_read` is advanced by the paths that see a reply
 as it happens — the dashboard send, and an own-device echo on the rail — and
 by *Mark as read*. But an outbound record can reach the store without passing
@@ -338,7 +347,13 @@ lean query beside the heads and the unread count), and the live overlay
 contributes replies the store has not indexed yet. That query is a
 refinement: when it fails or runs out of its share of the rebuild's time, the
 list is built without it, from the read marks and whatever the last skeleton
-knew of the replies. **An agent-authored outbound message is not a reply**:
+knew of the replies — nothing, on the first build after a restart, which the
+log line then says. Its share is half of what the rebuild's budget
+(`CHAT_LIST_REBUILD_TIMEOUT`) has left when it is asked, so the unread count
+after it keeps the other half, and never more than one query's timeout
+(`QLEVER_TIMEOUT`) — some ten seconds with both at their default of 20; a
+ledger that makes this query slower than that wants a larger budget.
+**An agent-authored outbound message is not a reply**:
 an agent answering on its own must not hide a message the user never saw, so
 `kb:author "agent"` moves nothing, on the rail and in the ledger alike.
 Timestamps are whole seconds and the comparison is strict, so in this view an
@@ -353,11 +368,22 @@ stamped at or before it: a late delivery, a slow clock, the read's own
 second. No comparison of stamps finds such a message. The chat state
 therefore counts every arrival on the rail (`inbound_seq`) and records at
 each read how many it covered (`read_inbound`); what has been counted since
-is unread, wherever its stamp puts it (`chat_state.arrived_since_read`). A
-read covers what has landed when it is *Mark as read* with `{}` or `{seen}`,
-or the dashboard's own send; an own-device echo and a `{ts}` mark cover it
-when their instant is not behind the mark they find — a stale client, or a
-late echo of an old reply, says nothing about what landed after a newer read.
+is unread, wherever its stamp puts it (`chat_state.arrived_since_read`).
+Every arrival, not every event: the rail delivers at least once — a gateway
+retries a POST that timed out and redelivers what it was never told was
+taken — and an event whose message id is among the chat's newest counted
+arrivals (`inbound_recent`, the last 64, kept in the state document and so
+across a restart) is a repeat. It is answered as before, with the same
+acceptance and the same job handle, and counted no second time; the
+attention model and a ring held for the message are given the place the
+message was counted at. An event that carries no message id cannot be told
+from a new message and is counted.
+
+A read covers what has landed when it is *Mark as read* with `{}` or
+`{seen}`, or the dashboard's own send; an own-device echo and a `{ts}` mark
+cover it when their instant is not behind the mark they find — a stale
+client, or a late echo of an old reply, says nothing about what landed after
+a newer read.
 
 The two views count the same messages, hence the larger and not the sum. The
 arrival view is used only while the read mark is the newest word about the
@@ -365,10 +391,12 @@ chat: where the ledger or the overlay holds a reply of the user's later than
 `last_read`, no read was recorded for that reply (it never passed the rail),
 so nothing says which arrivals it followed, and the timestamps alone decide.
 
-No stamp from ahead of the gateway's clock enters either view from the rail:
+No stamp from ahead of the gateway's clock enters the overlay from the rail:
 an arrival stamped later than now is taken as now (a message cannot have been
 written after it landed), so a peer whose clock runs fast neither heads the
-chat until that instant nor sits beyond a mark the user sets today.
+chat until that instant nor sits beyond a mark the user sets today. Its
+ledger record keeps the stamp it was given, though, and the store answers
+with that — which is what `read_ahead` is for (*Mark as read*, below).
 
 `GET /chats` states the result so that no client derives it: every chat
 carries `unread`, `list_group` (`"unread"` | `"read"` | `"archived"`),
@@ -407,11 +435,25 @@ be built at all, it is what the read endpoint answers with.
   the gateway's clock catches up. A `ts` that names no real instant (30
   February, an epoch no calendar holds) or one more than two minutes ahead
   (`CHAT_READ_SKEW_SECONDS`) is answered 400; within that reach it is a fast
-  clock's "now", and now is where the mark goes. One case is left to the
-  stamps: a *ledger record* stamped ahead of the gateway's clock (a phone
-  whose clock runs fast, on SMS) is not read by a mark made before the
-  clock has passed that stamp. It stays unread, the answer's `unread` says
-  so, and a mark made later reads it.
+  clock's "now", and now is where the mark goes.
+- A message the mark covers can still be stamped later than the mark: a
+  phone whose clock runs fast, on SMS, stamps the ledger record with its own
+  time, and by timestamp that record would be unread again once the store
+  has indexed it. So the rail notes an arrival's stamp where it lies ahead
+  of the gateway's clock by no more than `CHAT_READ_SKEW_SECONDS`
+  (`inbound_ahead`), and a read of the chat as it stands — `{seen}`, `{}`,
+  or the dashboard's own send — reaches up to that stamp: it is kept beside
+  the mark as `read_ahead`, and the read cut-off is the later of the two
+  (`chat_state.read_cut`). The mark itself stays the gateway's now, which is
+  what a later reply or mark is compared with, and a message that lands
+  afterwards is unread by its place in the count wherever its stamp lies. A
+  `{ts}` mark and an own-device echo reach no further than their instant.
+  The case left over is a stamp *further* ahead than that reach, which is
+  not taken for a clock's error: the mark reads such a message while only
+  the overlay holds it, stamped as now, and it is unread again once the
+  store answers with its record, until a mark made after the gateway's
+  clock has passed the stamp. A record from ahead of the clock that never
+  passed the rail is likewise read only by a mark made after that.
 - The answer is `{id, last_read, previous, unread, list_group}`; `previous`
   is the mark before the call (null for none). `unread` and `list_group` are
   the chat's state right after the mark, as `GET /chats` would state it —
@@ -423,9 +465,10 @@ be built at all, it is what the read endpoint answers with.
   and the undo then answers 409 with the state as it stands and changes
   nothing. This is the one way `last_read` moves backwards
   (`ChatStateStore.restore_last_read`), and it can never move it past
-  `marked`. `read_inbound` goes back with it, to what the mark being undone
-  found, so the messages that had landed unread before the mark are unread
-  again, with any that came since. It cannot make an answered chat unread:
+  `marked`. `read_inbound` and `read_ahead` go back with it, to what the
+  mark being undone found, so the messages that had landed unread before the
+  mark are unread again — one stamped by a fast clock included — with any
+  that came since. It cannot make an answered chat unread:
   the reply stands in the ledger whatever the mark says, and where a reply
   fell into the mark's own second its cover of what had landed stands too.
   Both timestamps are parsed as strictly as `ts`.
