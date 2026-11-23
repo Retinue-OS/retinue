@@ -7638,6 +7638,25 @@ SELECT ?chat ?account (MAX(?ts) AS ?replied) WHERE {
 # by both: counting a key across accounts would badge one account's chat with
 # another's arrivals. ?account arrives bound from VALUES, so the account test is
 # a FILTER — a BIND on an in-scope variable is a SPARQL error.
+#
+# A tombstone is not unread. A mail deleted or moved away in a client keeps
+# its record's type, chat and receivedAt on purpose (it keeps its place in the
+# thread) and gains kb:removedAt — and nothing in it can be read or answered,
+# so it must not hold its chat in Unread or count in the badge. It is left
+# out here, where the count is made, by a FILTER NOT EXISTS over that one
+# predicate. Chosen with the planner in mind (the comment above
+# _CHATS_HEADS_SPARQL): the pattern inside it is a group of its own, one
+# triple, tested against the rows of the join — it is not a fifth pattern in
+# the group whose join order is enumerated, which is where planning time
+# went; and it is no second query, which would send the VALUES table (a row
+# per chat) twice and leave two answers to keep consistent. The same shape —
+# one FILTER NOT EXISTS per excluded predicate — is what every memory recall
+# runs against this store (scripts/memory.py). NOT measured: what it adds
+# to `time_query_planning` for this query on the live store — the tests'
+# store plans nothing, so they can only show that the list still asks the
+# same number of queries. If a rebuild ever shows the cost there, the
+# remedy is the subtracting query (tombstones above the cut, counted from
+# kb:removedAt), never dropping the exclusion.
 _CHATS_UNREAD_SPARQL = """
 PREFIX k: <%s>
 PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
@@ -7647,6 +7666,7 @@ SELECT ?chat ?account (COUNT(?m) AS ?n) WHERE {
   OPTIONAL { ?m k:account ?acc0 }
   FILTER(COALESCE(?acc0, "") = ?account)
   FILTER(?ts > ?cut)
+  FILTER NOT EXISTS { ?m k:removedAt ?gone }
 } GROUP BY ?chat ?account
 """ % _KB
 
@@ -8037,15 +8057,36 @@ def _shape_chat_message(chat_id: str, channel: str, *, direction: str,
     return msg
 
 
+# How much of a chat's newest message its summary carries (`last.text`): the
+# list shows one line of it and the attention list a shorter one. A messenger
+# message is rarely longer; a mail is, by kilobytes — its trimmed body, or the
+# whole of it where the trim fell back — and the list is every chat in one
+# answer, built again for every poll. The message itself is served whole where
+# it is read: GET /chats/<id>/messages.
+CHAT_PREVIEW_CHARS = 300
+
+
+def _preview_text(text) -> str:
+    """The start of a message, at most CHAT_PREVIEW_CHARS of it; cut text
+    ends in an ellipsis. A text that is not empty stays not empty, so what a
+    summary derives from "has it any text" does not change."""
+    text = str(text or "")
+    if len(text) <= CHAT_PREVIEW_CHARS:
+        return text
+    return text[:CHAT_PREVIEW_CHARS].rstrip() + "…"
+
+
 def _chat_last_preview(*, direction: str, text: str, ts: str,
                        sender: str | None, sender_name: str | None,
                        author: str | None, has_attachments: bool,
                        roster: dict | None = None) -> dict:
+    """A ChatSummary's ``last``: the newest message as a list row shows it —
+    a preview of its text (_preview_text), never the message."""
     last: dict = {
         "ts": ts,
         "direction": direction,
         "kind": "image" if has_attachments and not text else "text",
-        "text": text or "",
+        "text": _preview_text(text),
     }
     if direction == "out":
         last["author"] = author if author in chat_state_mod.AUTHORS else "agent"
@@ -8377,7 +8418,8 @@ def _unread_after_reads(skeleton: dict, unread: dict) -> dict:
     store could know of, whatever it counted before the read. And the other
     way round, for a *Mark as read* undone while the store is away: a chat
     whose head is an inbound message later than its cut-off holds at least
-    that one, whatever was counted while the mark stood. The other counts
+    that one, whatever was counted while the mark stood — unless that head is
+    a tombstone, which is unread to nobody. The other counts
     stand — the store's answer is the best there is without the store. (What
     has landed since the newest read needs no store at all: _chats_payload
     adds it from the chat's state, as it does over a fresh answer.)"""
@@ -8387,7 +8429,8 @@ def _unread_after_reads(skeleton: dict, unread: dict) -> dict:
         if _chat_read_cut(docs.get(cid), row) >= row["ts"]:
             if cid in corrected:
                 corrected[cid] = 0
-        elif row["direction"] == "in" and not corrected.get(cid):
+        elif (row["direction"] == "in" and not row.get("removed_at")
+              and not corrected.get(cid)):
             corrected[cid] = 1
     return corrected
 
@@ -8497,7 +8540,10 @@ def _fetch_chats_skeleton(deadline: float | None = None) -> dict[str, dict]:
             "ts": ts,
             "direction": ("out" if _T_CHAT_OUTBOUND in record.get(_P_RDF_TYPE, [])
                           else "in"),
-            "text": _record_value(record, _P_TEXT) or "",
+            # As much of it as a list row shows (_preview_text): the
+            # skeleton is kept between polls, and a mailbox's worth of
+            # whole mail bodies is not what it is for.
+            "text": _preview_text(_record_value(record, _P_TEXT)),
             "sender": _record_value(record, _P_SENDER),
             "author": _record_value(record, _P_AUTHOR),
             "mid": _record_value(record, _P_MESSAGE_ID),
@@ -8673,7 +8719,17 @@ def _chats_payload() -> dict:
     # The address book, read at most once for this list and only if a mail
     # chat is in it (_AddressBook).
     book = _AddressBook()
+    # Chats a merge folded into another (_merge_chats). The gateway re-keyed
+    # their records before it said so, but the store answers from its last
+    # index for some seconds more — with rows under the old key, which have
+    # no state any more and would list the absorbed chat again: un-archived,
+    # un-muted, every mail it ever held unread. They are the survivor's
+    # messages now and show there once the store has caught up. (An id that
+    # is a chat again — it has a document — is not in this map.)
+    merged_away = _CHAT_STATE.merged_away()
     for chat_id in set(skeleton) | set(overlay_by_chat):
+        if chat_id in merged_away:
+            continue
         parts = chat_state_mod.split_chat_id(chat_id)
         if parts is None:
             continue
@@ -8766,6 +8822,13 @@ def _chats_payload() -> dict:
         if _chat_is_nameless(doc, channel, key):
             nameless.append(chat_id)
         group = _chat_group(doc, channel, key)
+        # A mail thread's people — who it is with, since its name does not
+        # say — and that it cannot be written to yet; nothing for any other
+        # chat.
+        people = _mail_summary_fields(doc, channel, book)
+        # What the card and the stranger test are asked about: the chat as
+        # this row describes it (attention_store.chat_card).
+        described = {"channel": channel, "group": bool(group), "peer": people.get("peer")}
         chats.append({
             "id": chat_id,
             "channel": channel,
@@ -8811,8 +8874,13 @@ def _chats_payload() -> dict:
             # half — nothing on the rail vouched for the last sender (no VIP)
             # and no card names them. Whether that screens them is the
             # attention row's to say: a sphere the profile knows still wins.
-            "contact": doc.get("contact") or None,
-            "unknown_sender": attention_store.chat_is_unknown(doc),
+            # The card that speaks for the chat, that is: a mail thread that
+            # is a group, or whose peer is no longer the card's person, shows
+            # none — the card was filed for one address, the endpoint that
+            # would remove it refuses a group, and a newcomer to the thread
+            # must not be shown as the person on it.
+            "contact": attention_store.chat_card(described, doc) or None,
+            "unknown_sender": attention_store.chat_is_unknown(doc, described),
             "last": last,
             "draft": doc.get("draft"),
             # This chat's companion conversation, or null until one is asked
@@ -8822,9 +8890,7 @@ def _chats_payload() -> dict:
             # being, or was, worked — see _instructed_note — or null.
             "instructed": doc.get("instructed") or None,
             "messages": _chat_messages_url(chat_id),
-            # A mail thread's people — who it is with, since its name does
-            # not say — and that it cannot be written to yet.
-            **_mail_summary_fields(doc, channel, book),
+            **people,
         })
     chats.sort(key=lambda c: c["last"]["ts"], reverse=True)
     _schedule_chat_name_backfill(nameless)
@@ -10029,11 +10095,27 @@ def _merge_chats(channel: str, account: str | None, absorbed_keys,
       kind, into the conversation list — that still points at the surviving
       chat, so nothing said in it is lost and nothing has two companions.
 
+    And the absorbed chat's **id** is remembered (ChatStateStore.note_merged),
+    for every key named — also one with no state to fold, whose records were
+    in the ledger all the same. Two things hang on it. The store answers from
+    its last index for some seconds after the gateway re-keyed the files, so
+    the list would show the absorbed chat again, stateless: its rows are
+    left out (_chats_payload). And whoever still holds the old id — a chat
+    page open on it, a link — is told where the chat went: every
+    /chats/<id>/… endpoint answers 410 with ``merged_into``
+    (Handler._answered_merged), and writes nothing under the dead id.
+
     Idempotent: a key with no state folds nothing, so a repeat is a no-op.
+    And in whatever order the gateway's calls arrive — it retries a merge on
+    its own, apart from the mails around it and from other merges: a
+    survivor that has itself been folded away since the call was queued
+    stands for the chat it is part of now, so nothing is folded into an id
+    that is no chat any more.
     No companion turn is moved: none runs for a mail yet, and the turn
     registries (_CHAT_TURNS and the rest) are keyed by chat id — the phase
     that starts turns for mail re-keys them here."""
     survivor = chat_state_mod.make_chat_id(channel, survivor_key, account)
+    survivor = _CHAT_STATE.merged_into(survivor) or survivor
     merged: list[str] = []
     for key in absorbed_keys:
         absorbed = chat_state_mod.make_chat_id(channel, key, account)
@@ -10050,6 +10132,7 @@ def _merge_chats(channel: str, account: str | None, absorbed_keys,
                 # absorbed chat's out for.
                 _CHAT_STATE.set_companion(survivor, None)
             doc, gone = _CHAT_STATE.merge(absorbed, survivor)
+            _CHAT_STATE.note_merged(absorbed, survivor)
             if gone is None:
                 continue
             merged.append(absorbed)
@@ -10077,14 +10160,35 @@ def _chat_messages_removed(channel: str, account: str | None, key: str,
 
     The records are the gateway's; here the live overlay lets go of those
     messages — it would go on showing what they said — and the list is
-    rebuilt. A chat with no mail left in the mailbox (``live`` 0) is
+    rebuilt. **A tombstone is not unread**: the store's count leaves it out
+    (_CHATS_UNREAD_SPARQL), and the chat's own count of arrivals forgets it
+    here (ChatStateStore.forget_arrivals) — at once, where the store's
+    answer follows when it has indexed the tombstone, within a list cache
+    window. So a chat whose unread mail was deleted in a client leaves
+    Unread, loses that mail from its badge, and stops being an attention
+    item, which a mail chat is only while it holds unread mail
+    (attention_store.chat_wants_attention). A mail that comes back — out of
+    the Trash — is announced again and counts again
+    (ChatStateStore.count_arrival).
+
+    A chat with no mail left in the mailbox (``live`` 0) is
     **archived, not erased** (docs/mail-chats.md, Decisions 2): nothing in
     it can be read or answered any more, so it leaves Unread and Read and
     its open attention item is settled as an archived chat's is, while its
     tombstones, its state and its companion thread stay. Not muted: the
-    next mail in the thread brings it back like any archived chat."""
+    next mail in the thread brings it back like any archived chat.
+
+    A call that names a chat which has been folded into another since it
+    was queued (the gateway retries a removal apart from a merge) is about
+    the surviving chat's messages — and its ``live``, a count of the
+    absorbed chat's mails alone, says nothing of the survivor and archives
+    nothing."""
     chat_id = chat_state_mod.make_chat_id(channel, key, account)
+    into = _CHAT_STATE.merged_into(chat_id)
+    if into is not None:
+        chat_id, live = into, None
     _CHAT_OVERLAY.forget_messages(chat_id, message_ids)
+    _CHAT_STATE.forget_arrivals(chat_id, message_ids)
     if live == 0 and not isinstance(live, bool):
         doc = _CHAT_STATE.set_flags(chat_id, archived=True)
         block = doc.get("attention") or {}
@@ -10584,7 +10688,7 @@ def _chat_messages_payload(chat_id: str, before: str | None = None) -> dict:
                 "direction": newest["direction"],
                 "kind": ("image" if newest.get("attachments")
                          and not newest["text"] else "text"),
-                "text": newest["text"],
+                "text": _preview_text(newest["text"]),
             },
             "draft": doc.get("draft"),
             "companion": doc.get("companion"),
@@ -11746,6 +11850,47 @@ def _attention_arrive_chat(chat_id: str, doc: dict, entry: dict, spec=None,
             decision = attention_policy.on_arrival(item, focus, profile, now)
         _attention_persist(item, attended=attended)
         return decision, item
+
+
+def _attention_relist_chat(chat_id: str, attended: int) -> bool:
+    """A mail landed in this chat that nothing judges — held by the gate, or
+    unread history the mirror is catching up on: where the chat's attention
+    item was settled, it is open again. True when this call reopened it.
+
+    The one write the rule for mail chats needs
+    (attention_store.chat_wants_attention): a mail thread is an item while it
+    holds unread mail the user has not settled, and "settled" — a reply,
+    *Mark as read*, an archive, *Mark handled* — is the block's ``done``,
+    which was about the mail that had come until then. Without this a thread
+    the user dealt with once would never be on the home list again, however
+    much arrived in it, while one they never touched (no block) would.
+
+    Quietly: listed (``released``), so no digest carries it, and nothing is
+    pushed — the model is not asked (attention.on_arrival), since nothing
+    said what this mail is worth. It starts fresh as a handled chat's next
+    message does (_attention_arrive_chat): the defaults and the sender's
+    spheres, only the push history kept. A chat with no block needs nothing
+    — its unread mail lists it — and an open one is left as the user or the
+    model has it. Built from the state document alone, like an arrival: no
+    store query on the rail.
+
+    ``attended`` is the arrival's place in the chat's count. The caller
+    passes a counted arrival only, never a repeated event — a repeat would
+    reopen what the user settled after the first."""
+    with _attention_lock:
+        state = _CHAT_STATE.get(chat_id)
+        block = state.get("attention") or {}
+        if not block or block.get("state", "open") == "open":
+            return False
+        now = _attention_now()
+        fresh = {k: v for k, v in block.items() if k in ("pushed", "boost")}
+        fresh.update(state="open", released=True)
+        item = attention_store.chat_item(
+            dict(_attention_chat_row_from_state(chat_id, state), unread=1, archived=False),
+            dict(state, attention=fresh), _ATTENTION.profile())
+        item["last_level"] = attention_policy.level(item, now)
+        _attention_persist(item, attended=attended)
+        return True
 
 
 def _attention_rename_sender(profile: dict, was: str, now_name: str) -> list[str]:
@@ -13237,7 +13382,36 @@ class Handler(BaseHTTPRequestHandler):
         chat_id = _chat_id_from_path(raw)
         if chat_id is None:
             self._send_json(404, {"error": "not a chat id"})
+            return None
+        if self._answered_merged(chat_id):
+            return None
         return chat_id
+
+    def _answered_merged(self, chat_id: str) -> bool:
+        """Answer 410 for the id of a chat that was folded into another (two
+        mail threads a later mail linked — _merge_chats): ``{error, id,
+        merged_into, messages}``, the surviving chat's id and where its
+        messages are read. True when that answer was sent; the caller
+        returns.
+
+        Gone, with where it went — not a redirect. A redirect would be
+        followed by the page's fetch without the page learning that its chat
+        has another id, and its next write would go to the dead one. The
+        open chat page follows ``merged_into`` instead; every other caller
+        learns that what it holds is stale. On every /chats/<id>/… endpoint,
+        the writing ones included: a tap on a row that was a moment ago a
+        chat must not write a state document for an id nothing will ever
+        use again. Only a mail chat merges, so no other id is looked up."""
+        parts = chat_state_mod.split_chat_id(chat_id)
+        if parts is None or not _is_mail(parts[0]):
+            return False
+        into = _CHAT_STATE.merged_into(chat_id)
+        if into is None:
+            return False
+        self._send_json(410, {"error": "this chat is part of another one now",
+                              "id": chat_id, "merged_into": into,
+                              "messages": _chat_messages_url(into)})
+        return True
 
     def _refused_read_only(self, chat_id: str) -> bool:
         """Answer 409 for a write to a chat that takes none — a mail chat,
@@ -13848,7 +14022,8 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(404, {"error": "not a chat id"})
             return
         payload = self._agent_conversation_payload()
-        if payload is None or self._refused_read_only(chat_id):
+        if (payload is None or self._answered_merged(chat_id)
+                or self._refused_read_only(chat_id)):
             return
         text = payload.get("text")
         if not isinstance(text, str):
@@ -14151,7 +14326,11 @@ class Handler(BaseHTTPRequestHandler):
         nothing (see below). A mail that is no backfill is an arrival like
         any other, and in the mirror's read-only phase every one arrives
         held (`gate.forward` false) with no handover offered: no push, no
-        turn."""
+        turn. Nothing judges such a mail, so it runs through no attention
+        arrival either; what it does is bring a mail chat the user had
+        settled back onto the home list, quietly (_attention_relist_chat).
+        Every event of the mirror is delivered at least once — a backfilled
+        one like a live one — and each is taken once, by its message id."""
         token = self.headers.get("X-Conversation-Backend-Token", "")
         if not _chats_ingest_authorized(token):
             self._send_json(403, {"error": "forbidden"})
@@ -14291,8 +14470,20 @@ class Handler(BaseHTTPRequestHandler):
             # count, so a *Mark as read* made from a list that did not show
             # it yet is refused. And a mail the user sent reads what came
             # before it, as their reply does on every channel.
+            #
+            # Counted once per mail, by its id, exactly as below: the
+            # mirror's outbox re-posts an event whose answer it never saw (a
+            # timeout, a restart of this gateway mid-backfill), and a second
+            # count would turn a chat the user has since marked read back to
+            # Unread with nothing new in it. And a mail that is counted —
+            # unread history — brings a chat the user had already settled on
+            # the home list back there, as the next live mail would.
             if direction == "in" and not seen:
-                _CHAT_STATE.mark_unread(chat_id, ts)
+                counted_doc, _had, counted = _CHAT_STATE.count_arrival(
+                    chat_id, ts, message_id=entry["message_id"], stamp=stamp)
+                if counted:
+                    _attention_relist_chat(
+                        chat_id, chat_state_mod.arrival_seq(counted_doc, entry["message_id"]))
             elif direction == "in" or author in ("user", "device"):
                 _CHAT_STATE.advance_last_read(chat_id, ts)
             self._send_json(200, {"ok": True, "id": chat_id, "pushed": False})
@@ -14305,10 +14496,9 @@ class Handler(BaseHTTPRequestHandler):
             # retried POST, a redelivery) is answered as ever below, but is
             # no second arrival — it keeps the place its message has, which
             # a newer message may have moved the count past.
-            inbound_seq = chat_state_mod.arrival_seq(
-                _CHAT_STATE.mark_unread(chat_id, ts, message_id=entry["message_id"],
-                                        stamp=stamp)[0],
-                entry["message_id"])
+            counted_doc, _had, counted = _CHAT_STATE.count_arrival(
+                chat_id, ts, message_id=entry["message_id"], stamp=stamp)
+            inbound_seq = chat_state_mod.arrival_seq(counted_doc, entry["message_id"])
             # A new message in an archived chat would otherwise land invisible;
             # muted is the explicit "keep it archived" opt-out. Decided inside
             # the state lock (see ChatState.unarchive_unless_muted): the
@@ -14363,6 +14553,14 @@ class Handler(BaseHTTPRequestHandler):
                 else:
                     print(f"[web-gateway] attention: {chat_id} {decision['deliver']} — "
                           f"{decision.get('reason', '')}", flush=True)
+            elif mail and held and counted:
+                # A mail nothing judges — in the mirror's first phase, every
+                # mail. It is no arrival for the model, and it is new mail
+                # in the chat all the same: an item the user settled is the
+                # chat's again, listed and not pushed. Once per mail: a
+                # repeated event must not reopen what the user settled after
+                # the first.
+                _attention_relist_chat(chat_id, inbound_seq)
             # Acceptance: a caller that offers the handover is told the chat
             # has this message, and stops forwarding it anywhere else. That is
             # the whole delivery — the user has it, in the conversation it
@@ -14445,7 +14643,15 @@ class Handler(BaseHTTPRequestHandler):
         endpoints below: authorized exactly like POST /internal/chats/inbound
         (_chats_ingest_authorized), a JSON object, and naming the channel.
         Returns ``(channel, account, payload)``, or None with the refusal
-        already sent."""
+        already sent.
+
+        The channel must be one whose chats can merge or lose messages: a
+        mailbox's (docs/mail-chats.md, "Threading" and "The mirror"). A
+        messenger chat is one peer or group for good and its messages stay,
+        so for any other channel both calls are refused. The rail is open
+        unless CHATS_INGEST_TOKEN is set, and what it may do without one is
+        announce a message — not fold one correspondent's chat, its read
+        mark and its staged draft, into another's, nor archive a chat."""
         token = self.headers.get("X-Conversation-Backend-Token", "")
         if not _chats_ingest_authorized(token):
             self._send_json(403, {"error": "forbidden"})
@@ -14461,17 +14667,23 @@ class Handler(BaseHTTPRequestHandler):
         if not channel:
             self._send_json(400, {"error": "channel is required"})
             return None
+        if not _is_mail(channel):
+            self._send_json(400, {"error": "merge and removed are for mail chats only: "
+                                           "no other channel's chats merge or lose messages"})
+            return None
         return channel, account, payload
 
     def _handle_chats_merge(self) -> None:
         """POST /internal/chats/merge — body {channel, account, from: [chat
         key, …], into: chat key}: the chats ``from`` are the chat ``into``.
 
-        Sent by a gateway once it has re-keyed the absorbed chats' records
-        (the mail gateway, for threads a later mail linked). The state, the
-        live overlay and the companion threads follow (_merge_chats). Safe to
-        repeat, and a key nothing is known of is not an error: the answer
-        names the chats that were folded by this call."""
+        Sent by the mail gateway once it has re-keyed the absorbed chats'
+        records (threads a later mail linked); ``channel`` must be the mail
+        channel (_rail_event). The state, the live overlay and the companion
+        threads follow, and each absorbed id answers 410 with ``merged_into``
+        from then on (_merge_chats). Safe to repeat, and a key nothing is
+        known of is not an error: the answer names the chats that were
+        folded by this call."""
         event = self._rail_event()
         if event is None:
             return
@@ -14492,9 +14704,11 @@ class Handler(BaseHTTPRequestHandler):
         where they came from, and ``live`` of the chat's are still there.
 
         Sent by the mail gateway once it has tombstoned the records of mails
-        deleted or moved away in a client. The overlay drops them, the list
-        is rebuilt, and a chat with nothing left (``live`` 0) is archived —
-        never erased, never muted (_chat_messages_removed). Safe to repeat."""
+        deleted or moved away in a client; ``channel`` must be the mail
+        channel (_rail_event). The overlay drops them, they stop counting
+        as unread, the list is rebuilt, and a chat with nothing left
+        (``live`` 0) is archived — never erased, never muted
+        (_chat_messages_removed). Safe to repeat."""
         event = self._rail_event()
         if event is None:
             return

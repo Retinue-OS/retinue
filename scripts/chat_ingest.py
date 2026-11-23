@@ -142,7 +142,9 @@ def notify_chat_event(
     mirror is catching up on rather than one that just arrived: the chat
     takes it without pushing, starting a turn or bringing an archived chat
     back. ``seen``, with it, says the mailbox had the mail marked read
-    already, which is where the chat's read mark starts from.
+    already, which is where the chat's read mark starts from. Like every
+    event it may be delivered more than once and is taken once, by its
+    ``message_id`` — which a backfilled mail therefore always carries.
     Never raises.
     """
     if not CHATS_INGEST_URL:

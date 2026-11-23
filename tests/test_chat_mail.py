@@ -34,7 +34,14 @@ and its recent threads. Covers:
   answering 409;
 - the companion note for a mail thread: the subject and the names as data,
   the trimmed texts, no draft and no send, and no messenger push script;
-- a messenger chat beside all this, unchanged.
+- a messenger chat beside all this, unchanged;
+- what the review of the phase found: a tombstone is not unread and no
+  attention item; the home list follows a mail chat's unread mail whether or
+  not it has an attention block; a backfill event is taken once; a group
+  thread keeps no contact card; merge and removed are refused for every
+  other channel; a merged chat leaves no ghost and its id answers 410 with
+  where it went; one Message-ID on two accounts is two overlay entries; and
+  the list carries previews, not mail bodies.
 
 Standalone (stdlib + the gateway module's own deps):
 
@@ -53,6 +60,7 @@ import types
 import urllib.error
 import urllib.parse
 import urllib.request
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -236,12 +244,16 @@ class _MockSparql(BaseHTTPRequestHandler):
 
         if "VALUES (?chat ?account ?cut)" in query:
             rows = re.findall(r'\(' + _LIT + r'\s+' + _LIT + r'\s+"([^"]+)"\^\^', query)
+            # As the query is written: tombstones are left out exactly when
+            # it says so.
+            live_only = "FILTER NOT EXISTS { ?m k:removedAt ?gone }" in query
             bindings = []
             for key, account, cut in rows:
                 key, account = _unquote(key), _unquote(account)
                 n = sum(1 for r in msgs.values()
                         if T_IN in r[RDF_TYPE] and of_chat(r, key, account)
-                        and (_one(r, "receivedAt") or "") > cut)
+                        and (_one(r, "receivedAt") or "") > cut
+                        and not (live_only and _one(r, "removedAt")))
                 if n:
                     bindings.append(_row(chat=key, account=account, n=str(n)))
         elif "VALUES ?author" in query:
@@ -296,6 +308,8 @@ class _MockSparql(BaseHTTPRequestHandler):
                                  mid=_one(r, "messageId"),
                                  atts=" ".join(r.get(KB + "attachment", [])))
                             for t, s, r in page]
+        elif "rdf:type k:Project" in query:
+            bindings = []       # the home list's projects: this store holds none
         else:
             raise AssertionError(f"a query this mock does not know: {query}")
         payload = json.dumps({"results": {"bindings": bindings}}).encode("utf-8")
@@ -824,8 +838,13 @@ def test_attention_is_about_the_person(base, wg):
     # The linked contact comes first — in a 1:1 thread; a group's item is its
     # latest sender's.
     card = {"contact": {"name": "Ann Meier", "sphere": "customers", "person": "ann-1"}}
-    assert ast.chat_sender(row, card) == "Ann Meier"
-    assert ast.chat_sender(dict(row, group=True), card) == ANN
+    hers = dict(row, peer={"address": ANN, "name": "Ann Example", "contact": "ann-1"})
+    assert ast.chat_sender(hers, card) == "Ann Meier"
+    assert ast.chat_sender(dict(hers, group=True), card) == "Ann Example", \
+        "the address book's owner of the latest sender's address, not the card"
+    # …and only while the thread's peer is that person: an address the book
+    # gives to nobody is nobody's, whatever card the thread carries.
+    assert ast.chat_sender(row, card) == ANN
     # No peer on record: the channel, never the subject or the key.
     bare = ast.chat_sender({"id": CHAT_C, "channel": "email", "key": ROOT_C,
                             "name": "Some subject"}, {})
@@ -1459,6 +1478,602 @@ def test_removed(base, wg):
     print("PASS test_removed")
 
 
+# ── What the review of the read-only mirror found ─────────────────────────────
+# Each test below writes its own threads into the ledger and names them by a
+# prefix of its own, so none reads another's state.
+
+# Somebody the address book of this run never hears of.
+ZOE = {"address": "zoe@nowhere.example", "name": "Zoe"}
+
+
+def _mail(key, mid, ts, *, sender=ZOE["address"], text="hi", out=False, account=ACCOUNT,
+          **more):
+    """One mail record in the ledger, as the mail gateway writes it; its path."""
+    if out:
+        return ist.write_outbound(
+            STATE["ledger"], channel="email", chat=key, account=account, text=text,
+            author="device", message_id=mid, timestamp=ts, sender=account,
+            subject="Re: Subj", **more)[1]
+    return ist.write_message(
+        STATE["ledger"], channel="email", sender=sender, chat=key, account=account,
+        text=text, message_id=mid, timestamp=ts, subject="Subj", **more)[1]
+
+
+def _thread(key, party=None, **more):
+    """The fields every event of one thread carries."""
+    party = party or ZOE
+    event = dict(chat=key, chat_name="Subj", group=False, participants=[party], peer=party,
+                 sender=party["address"], sender_name=party["name"])
+    event.update(more)
+    return event
+
+
+def _home(base):
+    """The ids of the chats on the home list, whichever section holds them."""
+    status, body = _http(base, "GET", "/attention")
+    assert status == 200, body
+    return {row["id"][len("chat:"):] for rows in body["sections"].values()
+            for row in rows if str(row.get("id", "")).startswith("chat:")}
+
+
+def _unread(base, chat_id):
+    chat = _chats(base)[chat_id]
+    return chat["unread"], chat["list_group"]
+
+
+def _removed(base, key, ids, live, **more):
+    payload = {"channel": "email", "account": ACCOUNT, "chat": key,
+               "message_ids": ids, "live": live}
+    payload.update(more)
+    return _http(base, "POST", "/internal/chats/removed", payload)
+
+
+def _sweep(wg):
+    """One half-hourly sweep of the attention tick — which writes a block for
+    every chat on the list — at a minute that is due for nothing else."""
+    at = datetime(2026, 9, 7, 10, 30, tzinfo=timezone.utc)
+    wg._attention_tick_state.update(minute=None)
+    report = wg._attention_tick(at)
+    assert "sweep" in report.get("events", []), report
+    return report
+
+
+def test_tombstones_are_not_unread(base, wg):
+    """A mail removed in a client while unread: its chat leaves Unread, the
+    badge loses it, and the chat is no attention item — by the store's count
+    and by the chat's own count of arrivals alike."""
+    key = "t1-root@x.org"
+    chat_id = cs.make_chat_id("email", key, ACCOUNT)
+    now = float(int(time.time()))
+    _mail(key, "t1-a1@x.org", now - 5000)
+    _mail(key, "t1-a2@example.org", now - 4000, out=True)
+    gone_path = _mail(key, "t1-a3@x.org", now - 100, text="the unread one")
+    ev = _thread(key)
+    _rail(base, message_id="t1-a1@x.org", ts=now - 5000, text="hi", backfill=True, seen=True, **ev)
+    _rail(base, message_id="t1-a2@example.org", ts=now - 4000, text="re", direction="out",
+          author="device", backfill=True, **ev)
+    _rail(base, message_id="t1-a3@x.org", ts=now - 100, text="the unread one", **ev)
+    assert _unread(base, chat_id) == (1, "unread") and chat_id in _home(base)
+    # The sweep writes the listed chat a block; what follows must not hang
+    # on whether it did.
+    _sweep(wg)
+    assert (wg._CHAT_STATE.get(chat_id)["attention"] or {}).get("state") == "open"
+
+    # The list's discipline, measured where it can be: the exclusion rides in
+    # the one unread query — no further query, no second VALUES table.
+    STATE["queries"].clear()
+    _chats(base)
+    counting = [q for q in STATE["queries"] if "VALUES (?chat ?account ?cut)" in q]
+    assert len(counting) == 1 and counting[0].count("FILTER NOT EXISTS") == 1, counting
+    assert "FILTER NOT EXISTS { ?m k:removedAt ?gone }" in counting[0]
+    assert len([q for q in STATE["queries"] if "VALUES ?m {" not in q]) == 3, \
+        "heads, reply marks, unread — as before"
+
+    # The user deletes the unread mail in their client: a tombstone, two
+    # mails of the thread still there.
+    assert ist.tombstone_message(gone_path, now - 50)
+    status, out = _removed(base, key, ["t1-a3@x.org"], 2)
+    assert status == 200 and out == {"ok": True, "id": chat_id, "archived": False}, out
+    chat = _chats(base)[chat_id]
+    assert chat["unread"] == 0 and chat["list_group"] == "read", chat
+    assert chat["last"]["removed"] is True and chat["last"]["text"] == ""
+    assert chat_id not in _home(base), "nothing in it asks for attention any more"
+    # By arrival order too, which no store answer is behind: the arrival is
+    # counted still (a client's `seen` stays true), and is no unread one.
+    doc = wg._CHAT_STATE.get(chat_id)
+    assert doc["inbound_seq"] == 1 and cs.arrived_since_read(doc) == 0, doc
+    assert doc["unread_since"] is None
+    # Safe to repeat.
+    snapshot = wg._CHAT_STATE.get(chat_id)
+    assert _removed(base, key, ["t1-a3@x.org"], 2)[0] == 200
+    assert wg._CHAT_STATE.get(chat_id) == snapshot
+
+    # Back out of the Trash: the gateway writes the mail anew and announces
+    # it again. A repeat by its id — and an arrival all the same.
+    Path(gone_path).unlink()
+    _mail(key, "t1-a3@x.org", now - 100, text="the unread one")
+    _rail(base, message_id="t1-a3@x.org", ts=now - 100, text="the unread one", **ev)
+    doc = wg._CHAT_STATE.get(chat_id)
+    assert doc["inbound_seq"] == 2 and cs.arrived_since_read(doc) == 1, doc
+    assert _unread(base, chat_id) == (1, "unread") and chat_id in _home(base)
+    # …and that one's own repeat is a repeat.
+    _rail(base, message_id="t1-a3@x.org", ts=now - 100, text="the unread one", **ev)
+    assert wg._CHAT_STATE.get(chat_id)["inbound_seq"] == 2
+
+    # The other form: every unread mail of a thread deleted, so the chat is
+    # archived — and the next mail brings it back with a badge of one.
+    key2 = "t2-root@x.org"
+    chat2 = cs.make_chat_id("email", key2, ACCOUNT)
+    ev2 = _thread(key2)
+    paths = []
+    for n in range(4):
+        paths.append(_mail(key2, f"t2-m{n}@x.org", now - 900 + n))
+        _rail(base, message_id=f"t2-m{n}@x.org", ts=now - 900 + n, text="hi", **ev2)
+    assert _unread(base, chat2) == (4, "unread")
+    for path in paths:
+        assert ist.tombstone_message(path, now - 400)
+    status, out = _removed(base, key2, [f"t2-m{n}@x.org" for n in range(4)], 0)
+    assert status == 200 and out["archived"] is True
+    assert _unread(base, chat2) == (0, "archived") and chat2 not in _home(base)
+    _mail(key2, "t2-new@x.org", now - 30, text="new")
+    _rail(base, message_id="t2-new@x.org", ts=now - 30, text="new", **ev2)
+    assert _unread(base, chat2) == (1, "unread"), "four of five would be tombstones"
+    assert chat2 in _home(base)
+
+    # With the store away the list is served from its last skeleton: a head
+    # that is a tombstone is unread to nobody there either.
+    row = {"ts": cs.iso_z(now - 100), "direction": "in", "replied": None,
+           "removed_at": cs.iso_z(now - 50)}
+    assert wg._unread_after_reads({"email:~x@y.org:none@x.org": row}, {}) == {}
+    assert wg._unread_after_reads({"email:~x@y.org:none@x.org": dict(row, removed_at=None)},
+                                  {}) == {"email:~x@y.org:none@x.org": 1}
+    assert not PUSHES and not TURNS
+    for cid in (chat_id, chat2):
+        wg._CHAT_STATE.delete(cid)
+        wg._CHAT_OVERLAY.forget(cid)
+    print("PASS test_tombstones_are_not_unread")
+
+
+def test_home_list_follows_unread_mail(base, wg):
+    """ONE rule for a mail chat's attention item, block or no block: it is on
+    the home list while it holds unread mail the user has not settled, and
+    the next mail brings a settled chat back."""
+    now = float(int(time.time()))
+    keys = {name: f"h-{name}@x.org" for name in ("a", "b", "c")}
+    ids = {name: cs.make_chat_id("email", key, ACCOUNT) for name, key in keys.items()}
+    seq = {"n": 0}
+    PUSHES.clear()
+
+    def arrive(name, **more):
+        """A new held mail in a thread: its record, then its event."""
+        seq["n"] += 1
+        mid = f"h-{name}-{seq['n']}@x.org"
+        ts = now - 3000 + seq["n"]
+        _mail(keys[name], mid, ts)
+        status, out = _rail(base, message_id=mid, ts=ts, text="hi", **_thread(keys[name]),
+                            **more)
+        assert status == 200 and out["pushed"] is False, out
+        return mid, ts
+
+    def block(name):
+        return wg._CHAT_STATE.get(ids[name])["attention"] or {}
+
+    def act(action, name, **more):
+        status, out = _http(base, "POST", f"/attention/{action}",
+                            dict(id="chat:" + ids[name], **more))
+        assert status == 200, out
+
+    for name in keys:
+        arrive(name)
+    assert set(ids.values()) <= _home(base) and not any(block(n) for n in keys), \
+        "unread mail lists a chat that has no block"
+
+    # A reply from a mail client (the Sent echo) settles A — and writes a
+    # block on a chat that had none. The next mail must bring it back.
+    echo = now - 2000
+    _mail(keys["a"], "h-a-out1@example.org", echo, out=True)
+    _rail(base, direction="out", author="device", message_id="h-a-out1@example.org",
+          ts=echo, text="re", **_thread(keys["a"]))
+    assert block("a").get("state") == "done" and block("a")["done_how"] == "replied"
+    assert ids["a"] not in _home(base) and ids["b"] in _home(base)
+    seq["n"] = 1200          # stamps after the reply from here on
+    mid, ts = arrive("a")
+    arrive("b")
+    assert {ids["a"], ids["b"]} <= _home(base), "a chat dealt with once is not lost"
+    reopened = block("a")
+    assert reopened["state"] == "open" and reopened["released"] is True, reopened
+    assert reopened["pulled"] is False and reopened["done_at"] is None
+    assert reopened["importance"] == 1.0 and not reopened["pushed"], "listed, never pushed"
+    assert wg._CHAT_STATE.get(ids["a"])["attended_seq"] == 2
+
+    # *Mark handled* on the home list settles it while its mail is unread —
+    # and the same event delivered again (the rail is at-least-once) is no
+    # new mail: it reopens nothing.
+    act("done", "a")
+    assert ids["a"] not in _home(base) and _unread(base, ids["a"]) == (1, "unread")
+    status, out = _rail(base, message_id=mid, ts=ts, text="hi", **_thread(keys["a"]))
+    assert status == 200 and block("a")["state"] == "done" and ids["a"] not in _home(base)
+    arrive("a")
+    assert ids["a"] in _home(base) and block("a")["state"] == "open"
+
+    # The sweep writes every listed chat a block. *Mark as read* then
+    # settles it, and the next mail brings it back all the same.
+    _sweep(wg)
+    assert all(block(n).get("state") == "open" for n in keys), [block(n) for n in keys]
+    chat = _chats(base)[ids["b"]]
+    status, out = _http(base, "POST", "/chats/" + _quote(ids["b"]) + "/read",
+                        {"seen": chat["inbound_seq"]})
+    assert status == 200 and out["unread"] == 0, out
+    assert block("b")["state"] == "done" and ids["b"] not in _home(base)
+    arrive("b")
+    assert ids["b"] in _home(base) and block("b")["state"] == "open"
+    # Its undo: unread again, and listed again.
+    chat = _chats(base)[ids["b"]]
+    status, out = _http(base, "POST", "/chats/" + _quote(ids["b"]) + "/read",
+                        {"seen": chat["inbound_seq"]})
+    assert status == 200 and ids["b"] not in _home(base)
+    status, undone = _http(base, "POST", "/chats/" + _quote(ids["b"]) + "/read",
+                           {"restore": out["previous"], "marked": out["last_read"]})
+    assert status == 200 and undone["unread"] >= 1 and ids["b"] in _home(base), undone
+
+    # An archive puts it away; the mail that un-archives it lists it again.
+    status, _o = _http(base, "POST", "/chats/" + _quote(ids["c"]) + "/flags", {"archived": True})
+    assert status == 200 and ids["c"] not in _home(base)
+    assert block("c")["done_how"] == "archived"
+    arrive("c")
+    assert wg._CHAT_STATE.get(ids["c"])["archived"] is False and ids["c"] in _home(base)
+
+    # An open block is not what lists a mail chat — its unread mail is. Read
+    # where no read settles the block (a backfilled reply of the user's),
+    # the chat is off the list with its block still open…
+    assert block("c")["state"] == "open"
+    later = now - 20
+    _mail(keys["c"], "h-c-out@example.org", later, out=True)
+    _rail(base, direction="out", author="device", message_id="h-c-out@example.org", ts=later,
+          text="re", backfill=True, **_thread(keys["c"]))
+    assert block("c")["state"] == "open" and _unread(base, ids["c"]) == (0, "read")
+    assert ids["c"] not in _home(base)
+    # …and one the user puts back by hand stays until they settle it.
+    act("done", "c")
+    act("reopen", "c")
+    assert block("c")["pulled"] is True and ids["c"] in _home(base)
+    act("done", "c")
+    assert ids["c"] not in _home(base)
+    # Unread history the mirror catches up on brings a settled chat back too
+    # (it is counted, so it is unread) — still nothing pushed.
+    hist = now - 10
+    _mail(keys["c"], "h-c-hist@x.org", hist)
+    _rail(base, message_id="h-c-hist@x.org", ts=hist, text="old, unread", backfill=True,
+          seen=False, **_thread(keys["c"]))
+    assert block("c")["state"] == "open" and ids["c"] in _home(base)
+    act("done", "c")
+    _rail(base, message_id="h-c-hist@x.org", ts=hist, text="old, unread", backfill=True,
+          seen=False, **_thread(keys["c"]))
+    assert block("c")["state"] == "done", "a repeated backfill event reopens nothing"
+
+    # The rule itself, as the adapter states it.
+    wants = wg.attention_store.chat_wants_attention
+    mail_row = {"channel": "email", "unread": 1}
+    assert wants(mail_row, {}) and wants(mail_row, {"attention": {"state": "open"}})
+    assert not wants(mail_row, {"attention": {"state": "done"}})
+    assert not wants(dict(mail_row, unread=0), {"attention": {"state": "open"}})
+    assert wants(dict(mail_row, unread=0), {"attention": {"state": "open", "pulled": True}})
+    assert not wants(dict(mail_row, archived=True), {"attention": {"state": "open"}})
+    # A messenger chat's is unchanged: its block decides once it has one.
+    assert wants({"channel": "signal", "unread": 0}, {"attention": {"state": "open"}})
+    assert not wants({"channel": "signal", "unread": 3}, {"attention": {"state": "done"}})
+    assert wants({"channel": "signal", "unread": 3}, {})
+    assert not PUSHES and not TURNS, (PUSHES, TURNS)
+    for cid in ids.values():
+        wg._CHAT_STATE.delete(cid)
+        wg._CHAT_OVERLAY.forget(cid)
+    print("PASS test_home_list_follows_unread_mail")
+
+
+def test_backfill_events_are_idempotent(base, wg):
+    """A backfilled unseen mail is counted once, however often its event is
+    delivered — the mirror's outbox re-posts what it saw no answer to."""
+    now = float(int(time.time()))
+    for name in ("marked", "plain"):
+        key = f"bf-{name}@x.org"
+        chat_id = cs.make_chat_id("email", key, ACCOUNT)
+        ev = _thread(key)
+        _mail(key, f"bf-{name}-1@x.org", now - 9000)
+        _mail(key, f"bf-{name}-2@x.org", now - 8000)
+        unseen = dict(message_id=f"bf-{name}-2@x.org", ts=now - 8000, text="hi",
+                      backfill=True, seen=False, **ev)
+        _rail(base, message_id=f"bf-{name}-1@x.org", ts=now - 9000, text="hi", backfill=True,
+              seen=True, **ev)
+        status, first = _rail(base, **unseen)
+        assert status == 200 and _unread(base, chat_id) == (1, "unread")
+        if name == "marked":
+            # The user marks the chat read between the two deliveries.
+            seen = _chats(base)[chat_id]["inbound_seq"]
+            status, out = _http(base, "POST", "/chats/" + _quote(chat_id) + "/read",
+                                {"seen": seen})
+            assert status == 200 and out["unread"] == 0, out
+        snapshot = wg._CHAT_STATE.get(chat_id)
+        status, again = _rail(base, **unseen)
+        assert status == 200 and again == first, "answered as the first delivery was"
+        assert wg._CHAT_STATE.get(chat_id) == snapshot, "and nothing counted or written"
+        doc = wg._CHAT_STATE.get(chat_id)
+        assert doc["inbound_seq"] == 1 and doc["inbound_recent"] == [[f"bf-{name}-2@x.org", 1]]
+        assert _unread(base, chat_id) == ((0, "read") if name == "marked" else (1, "unread"))
+        # A seen mail's event may repeat as well: it moves nothing twice.
+        _rail(base, message_id=f"bf-{name}-1@x.org", ts=now - 9000, text="hi", backfill=True,
+              seen=True, **ev)
+        assert _unread(base, chat_id) == ((0, "read") if name == "marked" else (1, "unread"))
+        wg._CHAT_STATE.delete(chat_id)
+        wg._CHAT_OVERLAY.forget(chat_id)
+    assert not PUSHES and not TURNS
+    print("PASS test_backfill_events_are_idempotent")
+
+
+def test_group_thread_keeps_no_card(base, wg):
+    """A contact card is about one address. A thread somebody else has joined
+    — or whose peer is not the card's person any more — shows no card and
+    lends the newcomer nothing of that person's."""
+    ast = wg.attention_store
+    now = float(int(time.time()))
+    key = "card-root@q.org"
+    chat_id = cs.make_chat_id("email", key, ACCOUNT)
+    ivy = {"address": "ivy@q.org", "name": "Ivy"}
+    mallory = {"address": "mallory@evil.example", "name": "Ivy Example"}
+    person = wg._CONTACTS.create("private", "Ivy Example", [("email", "ivy@q.org")],
+                                 sphere="customers", tags=["admin"])
+    _mail(key, "card-1@q.org", now - 500, sender="ivy@q.org")
+    _rail(base, message_id="card-1@q.org", ts=now - 500, text="hi", **_thread(key, ivy))
+    doc = wg._CHAT_STATE.get(chat_id)
+    assert doc["contact"]["person"] == person["key"], "auto-linked while one-to-one"
+    row = _chats(base)[chat_id]
+    assert row["contact"]["name"] == "Ivy Example" and row["peer"]["contact"] == person["key"]
+    item = wg._attention_item("chat:" + chat_id, wg._ATTENTION.profile(), wg._attention_now())
+    assert item["sender"] == "Ivy Example" and item["sphere"] == "customers", item
+    assert item["tags"] == ["admin"] and item["contact"]["person"] == person["key"]
+
+    # A stranger who signs as her writes into the thread: a group now.
+    _mail(key, "card-2@evil.example", now - 50, sender="mallory@evil.example")
+    _rail(base, message_id="card-2@evil.example", ts=now - 50, text="pay me",
+          **_thread(key, mallory, group=True, participants=[mallory, ivy]))
+    assert wg._CHAT_STATE.get(chat_id)["contact"]["person"] == person["key"], \
+        "the record is not rewritten"
+    row = _chats(base)[chat_id]
+    assert row["group"] is True and row["contact"] is None, row["contact"]
+    item = wg._attention_item("chat:" + chat_id, wg._ATTENTION.profile(), wg._attention_now())
+    assert item["sender"] == "mallory@evil.example" and item["title"] == "Ivy Example", item
+    assert item["sphere"] != "customers" and item["tags"] == [] and item["contact"] is None
+    assert item["importance"] == 1.0
+    # As the home list serves it.
+    status, body = _http(base, "GET", "/attention")
+    listed = next(r for rows in body["sections"].values() for r in rows
+                  if r.get("id") == "chat:" + chat_id)
+    assert listed["sphere"] != "customers" and not listed.get("contact"), listed
+
+    # One-to-one with the stranger alone (her own mails gone from the
+    # thread's people): still not the card's person.
+    _rail(base, message_id="card-3@evil.example", ts=now - 40, text="again",
+          **_thread(key, mallory))
+    row = _chats(base)[chat_id]
+    assert row["group"] is False and row["peer"]["contact"] is None and row["contact"] is None
+    item = wg._attention_item("chat:" + chat_id, wg._ATTENTION.profile(), wg._attention_now())
+    assert item["sender"] == "mallory@evil.example" and item["sphere"] != "customers", item
+    # With its person again, the card speaks again.
+    _rail(base, message_id="card-4@q.org", ts=now - 30, text="me again", **_thread(key, ivy))
+    assert _chats(base)[chat_id]["contact"]["name"] == "Ivy Example"
+
+    # The rule on its own.
+    card = {"contact": {"name": "Ivy Example", "sphere": "customers", "person": "p1"}}
+    one = {"channel": "email", "group": False, "peer": {"address": "ivy@q.org", "contact": "p1"}}
+    assert ast.chat_card(one, card) == card["contact"]
+    assert ast.chat_card(dict(one, group=True), card) == {}
+    assert ast.chat_card(dict(one, peer={"address": "m@e.example", "contact": None}), card) == {}
+    assert ast.chat_card(dict(one, peer={"address": "o@q.org", "contact": "p2"}), card) == {}
+    # A row that does not say who holds the peer's address decides nothing.
+    assert ast.chat_card({"channel": "email", "group": False}, card) == card["contact"]
+    # A messenger chat is with one peer for good: its card always applies.
+    assert ast.chat_card({"channel": "signal", "group": True}, card) == card["contact"]
+    assert ast.chat_is_unknown({"unknown_sender": True, **card}) is False
+    assert ast.chat_is_unknown({"unknown_sender": True, **card}, dict(one, group=True)) is True
+    wg._CHAT_STATE.delete(chat_id)
+    wg._CHAT_OVERLAY.forget(chat_id)
+    print("PASS test_group_thread_keeps_no_card")
+
+
+def test_merge_and_removed_are_mail_only(base, wg):
+    """No messenger chat merges or loses messages: both calls are refused for
+    any channel but mail, and change nothing."""
+    alice, bob = "signal:+41790000011", "signal:+41790000012"
+    wg._CHAT_STATE.note_message(alice, name="Alice")
+    wg._CHAT_STATE.note_message(bob, name="Bob")
+    wg._CHAT_STATE.advance_last_read(alice, T0)
+    wg._CHAT_STATE.set_draft(alice, "for Alice only", author="user")
+    before = {cid: wg._CHAT_STATE.get(cid) for cid in (alice, bob)}
+    for channel in ("signal", "whatsapp", "telegram", "sms", "Email"):
+        status, out = _http(base, "POST", "/internal/chats/merge",
+                            {"channel": channel, "from": ["+41790000011"],
+                             "into": "+41790000012"})
+        assert status == 400 and "mail" in out["error"], (channel, status, out)
+        status, out = _http(base, "POST", "/internal/chats/removed",
+                            {"channel": channel, "chat": "+41790000011",
+                             "message_ids": [], "live": 0})
+        assert status == 400 and "mail" in out["error"], (channel, status, out)
+    assert {cid: wg._CHAT_STATE.get(cid) for cid in (alice, bob)} == before
+    assert wg._CHAT_STATE.exists(alice) and not wg._CHAT_STATE.get(bob)["draft"]
+    assert wg._CHAT_STATE.get(alice)["archived"] is False
+    assert wg._CHAT_STATE.merged_into(alice) is None
+    for cid in (alice, bob):
+        wg._CHAT_STATE.delete(cid)
+    print("PASS test_merge_and_removed_are_mail_only")
+
+
+def test_merged_chat_leaves_no_ghost(base, wg):
+    """After a merge the store goes on listing the absorbed chat under its
+    old key until it has reindexed. The list shows no such chat, and its id
+    says where it went."""
+    now = float(int(time.time()))
+    old, new, bare = "g-old@x.org", "g-new@x.org", "g-bare@x.org"
+    old_id, new_id, bare_id = (cs.make_chat_id("email", k, ACCOUNT) for k in (old, new, bare))
+    # The records are in the ledger under their own keys and stay there: the
+    # mock reads the files, so "not re-keyed yet" is what the store's lag
+    # looks like from here.
+    _mail(old, "g-o1@x.org", now - 5000)
+    for n in range(3):
+        _mail(new, f"g-n{n}@x.org", now - 4000 + n)
+        _rail(base, message_id=f"g-n{n}@x.org", ts=now - 4000 + n, text="hi", **_thread(new))
+    _mail(bare, "g-b1@x.org", now - 3000)       # a chat the rail never announced
+    _rail(base, message_id="g-o1@x.org", ts=now - 5000, text="hi", **_thread(old))
+    _http(base, "POST", "/chats/" + _quote(new_id) + "/flags", {"muted": True})
+    wg._CHAT_OVERLAY.forget(new_id)
+    assert {old_id, new_id, bare_id} <= set(_chats(base))
+
+    status, out = _merge(base, [new, bare], old)
+    assert status == 200 and out == {"ok": True, "id": old_id, "merged": [new_id]}, out
+    chats = _chats(base)
+    assert old_id in chats and new_id not in chats and bare_id not in chats, \
+        "no stateless, un-muted, all-unread ghost of either"
+    assert not wg._CHAT_STATE.exists(new_id) and not wg._CHAT_STATE.exists(bare_id)
+
+    # The old ids say where the chats went — 410 with the survivor, on the
+    # page's read and on everything that would write.
+    for gone in (new_id, bare_id):
+        status, out = _http(base, "GET", "/chats/" + _quote(gone) + "/messages")
+        assert status == 410 and out["merged_into"] == old_id and out["id"] == gone, out
+        assert out["messages"] == "/chats/" + _quote(old_id) + "/messages"
+    for method, path, body in (
+            ("POST", "/read", {}), ("POST", "/flags", {"archived": True}),
+            ("POST", "/companion", None), ("POST", "/contact", {"name": "X"}),
+            ("POST", "/draft", {"text": "x"}), ("POST", "/send", {"text": "x"})):
+        status, out = _http(base, method, "/chats/" + _quote(new_id) + path, body)
+        assert status == 410 and out["merged_into"] == old_id, (path, status, out)
+    status, out = _http(base, "POST", "/internal/chats/" + _quote(new_id) + "/draft",
+                        {"text": "x"}, {"X-Conversation-Backend-Token": "agent-token"})
+    assert status == 410 and out["merged_into"] == old_id, out
+    assert not wg._CHAT_STATE.exists(new_id), "a tap on the ghost wrote nothing"
+    # The survivor answers as ever, and no other chat is affected.
+    assert _http(base, "GET", "/chats/" + _quote(old_id) + "/messages")[0] == 200
+    assert _http(base, "GET", "/chats/" + _quote(CHAT_A) + "/messages")[0] == 200
+
+    # Safe to repeat; and a survivor that is absorbed in turn takes those
+    # folded into it along.
+    assert _merge(base, [new, bare], old)[1]["merged"] == []
+    top = "g-top@x.org"
+    top_id = cs.make_chat_id("email", top, ACCOUNT)
+    _mail(top, "g-t1@x.org", now - 6000)
+    _rail(base, message_id="g-t1@x.org", ts=now - 6000, text="hi", **_thread(top))
+    assert _merge(base, [old], top)[1]["merged"] == [old_id]
+    for gone in (new_id, bare_id, old_id):
+        status, out = _http(base, "GET", "/chats/" + _quote(gone) + "/messages")
+        assert status == 410 and out["merged_into"] == top_id, out
+    assert set(_chats(base)) & {old_id, new_id, bare_id} == set()
+
+    # The gateway retries a merge and a removal each on its own, so either
+    # can arrive after the chat it names was folded away. A merge "into" an
+    # absorbed chat folds into the chat that one is part of now — never
+    # into a state document under the dead id…
+    late = "g-late@x.org"
+    late_id = cs.make_chat_id("email", late, ACCOUNT)
+    _mail(late, "g-l1@x.org", now - 2000)
+    _rail(base, message_id="g-l1@x.org", ts=now - 2000, text="hi", **_thread(late))
+    status, out = _merge(base, [late], old)
+    assert status == 200 and out == {"ok": True, "id": top_id, "merged": [late_id]}, out
+    assert not wg._CHAT_STATE.exists(old_id) and wg._CHAT_STATE.merged_into(late_id) == top_id
+    # …and a removal that names one is about the survivor's messages: the
+    # arrival stops counting there, and its `live` — the absorbed chat's
+    # mails alone — archives nothing.
+    wg._CHAT_STATE.set_flags(top_id, muted=False, archived=False)
+    assert "g-n0@x.org" in dict(wg._CHAT_STATE.get(top_id)["inbound_recent"])
+    status, out = _removed(base, new, ["g-n0@x.org"], 0)
+    assert status == 200 and out == {"ok": True, "id": top_id, "archived": False}, out
+    assert not wg._CHAT_STATE.exists(new_id)
+    assert len(cs.gone_arrivals(wg._CHAT_STATE.get(top_id))) == 1
+
+    # The store catches up: the records are the survivor's, all of them.
+    for k in (old, new, bare, late):
+        assert ist.rekey_chat(STATE["ledger"], k, ACCOUNT, top)["errors"] == 0
+    wg._CHAT_OVERLAY.forget(top_id)
+    assert len(_messages(base, top_id)["messages"]) == 7
+    # An id that is a chat again — a mail arrived under it — is one again.
+    _mail(bare, "g-b2@x.org", now - 10)
+    _rail(base, message_id="g-b2@x.org", ts=now - 10, text="anew", **_thread(bare))
+    assert bare_id in _chats(base)
+    assert _http(base, "GET", "/chats/" + _quote(bare_id) + "/messages")[0] == 200
+    # And a deleted chat is remembered by nothing, on either side of a merge.
+    wg._CHAT_STATE.delete(top_id)
+    assert wg._CHAT_STATE.merged_into(new_id) is None and wg._CHAT_STATE.merged_away() == {}
+    for cid in (top_id, bare_id):
+        wg._CHAT_STATE.delete(cid)
+        wg._CHAT_OVERLAY.forget(cid)
+    print("PASS test_merged_chat_leaves_no_ghost")
+
+
+def test_same_mail_on_two_accounts(base, wg):
+    """One mail to two of the user's addresses is one Message-ID in two
+    chats: each account's event keeps its own overlay entry."""
+    other = "other@example.org"
+    key = "dup-root@x.org"
+    mine, theirs = (cs.make_chat_id("email", key, acc) for acc in (ACCOUNT, other))
+    event = dict(message_id="dup@x.org", ts=T0 + 900, text="to both", **_thread(key))
+    assert _rail(base, **event)[0] == 200
+    assert _rail(base, account=other, **event)[0] == 200
+    held = sorted(e["chat_id"] for e in wg._CHAT_OVERLAY.entries()
+                  if e.get("message_id") == "dup@x.org")
+    assert held == sorted([mine, theirs]), held
+    chats = _chats(base)
+    assert mine in chats and theirs in chats, "neither thread waits for the store"
+    assert chats[mine]["unread"] == 1 and chats[theirs]["unread"] == 1
+    # A redelivery on one account still replaces only its own entry.
+    _rail(base, **event)
+    assert len([e for e in wg._CHAT_OVERLAY.entries() if e.get("message_id") == "dup@x.org"]) == 2
+    for cid in (mine, theirs):
+        wg._CHAT_STATE.delete(cid)
+        wg._CHAT_OVERLAY.forget(cid)
+    print("PASS test_same_mail_on_two_accounts")
+
+
+def test_list_carries_previews_not_bodies(base, wg):
+    """`last.text` is a preview. The list is every chat in one answer; a
+    mail's text is as long as its sender made it."""
+    cap = wg.CHAT_PREVIEW_CHARS
+    now = float(int(time.time()))
+    body = "A long paragraph of a mail. " * 2000              # some 56 KB
+    stored, live = "big-stored@x.org", "big-live@x.org"
+    stored_id, live_id = (cs.make_chat_id("email", k, ACCOUNT) for k in (stored, live))
+    _mail(stored, "big-1@x.org", now - 700, text=body)          # the store's head
+    _rail(base, message_id="big-2@x.org", ts=now - 600, text=body, **_thread(live))  # the overlay's
+    before = len(json.dumps(_chats(base)))
+    chats = _chats(base)
+    for cid in (stored_id, live_id):
+        last = chats[cid]["last"]
+        assert len(last["text"]) <= cap + 1 and last["text"].endswith("…"), len(last["text"])
+        assert last["text"].startswith("A long paragraph") and last["kind"] == "text"
+    assert before < 2 * len(body), "two such heads, and the list is not two bodies long"
+    # What is kept between polls is the preview, too.
+    assert len(wg._chats_cache["skeleton"][stored_id]["text"]) <= cap + 1
+    # The mail is whole where it is read.
+    assert _messages(base, stored_id)["messages"][-1]["text"] == body
+    assert _messages(base, live_id)["messages"][-1]["text"] == body
+    # A summary built without the list (a chat paged far into the past) is
+    # held to the same.
+    summary, wg._chat_summary = wg._chat_summary, lambda _cid: None
+    try:
+        last = wg._chat_messages_payload(stored_id)["chat"]["last"]
+    finally:
+        wg._chat_summary = summary
+    assert len(last["text"]) <= cap + 1 and last["kind"] == "text", last
+    # Short texts are untouched, an empty one stays empty, and a text that
+    # is all blanks up to the cut still reads as text.
+    assert wg._preview_text("hoi") == "hoi" and wg._preview_text(None) == ""
+    assert wg._preview_text("x" * cap) == "x" * cap
+    assert wg._preview_text(" " * (cap + 5) + "x") == "…"
+    assert wg._chat_last_preview(direction="in", text=body, ts="t", sender=None,
+                                 sender_name=None, author=None,
+                                 has_attachments=True)["kind"] == "text"
+    for cid in (stored_id, live_id):
+        wg._CHAT_STATE.delete(cid)
+        wg._CHAT_OVERLAY.forget(cid)
+    print("PASS test_list_carries_previews_not_bodies")
+
+
 def main():
     sparql = _serve(_MockSparql)
     mail_gw = _serve(_MockMailGateway)
@@ -1498,6 +2113,14 @@ def main():
         test_companion_note(base, wg)
         test_merge(base, wg)
         test_removed(base, wg)
+        test_tombstones_are_not_unread(base, wg)
+        test_home_list_follows_unread_mail(base, wg)
+        test_backfill_events_are_idempotent(base, wg)
+        test_group_thread_keeps_no_card(base, wg)
+        test_merge_and_removed_are_mail_only(base, wg)
+        test_merged_chat_leaves_no_ghost(base, wg)
+        test_same_mail_on_two_accounts(base, wg)
+        test_list_carries_previews_not_bodies(base, wg)
         assert not TURNS, "no model turn runs for a mail in this phase"
         server.shutdown()
     sparql.shutdown()

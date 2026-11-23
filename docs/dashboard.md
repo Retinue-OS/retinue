@@ -1091,10 +1091,35 @@ spheres and permits are filed under — is the linked contact, else the person
 the address book gives the peer's address to, else the address. Never the
 subject, and never the display name a mail carried: anyone can type the name
 of someone the user gave a permit, so that name is only the item's title.
+
+**A card is about one address.** A thread's people change with every mail,
+and its card was filed for the peer it had while it was one-to-one. So the
+card speaks for the thread only while that is still who it is with
+(`attention_store.chat_card`): not for a **group** — a thread a third address
+has joined, which takes nothing but a `Message-ID` to cite — and not where
+the address book gives the thread's peer to someone else or to nobody. Such
+a thread's entry in `GET /chats` has `contact: null`, and its attention item
+takes no sender, sphere or tags from the card: the newcomer is judged as
+whoever their own address makes them. The card stays in the state document
+(nothing is rewritten on a mail's say-so), and applies again once the thread
+is one-to-one with its person.
+
 **A mail pushes nothing by default**: an unjudged mail is passive — listed,
 never pushed, in no digest — whether the thread is one-to-one or not
 (`attention_store.CHANNEL_DEFAULT_IMPORTANCE`); a person's prior says
 otherwise.
+
+**The home list.** A mail chat is an attention item **while it holds unread
+mail the user has not settled** — one rule, whether or not the chat has an
+attention block (`attention_store.chat_wants_attention`). In this phase
+nothing judges a mail on arrival (every one comes held), so it is the unread
+mail that lists the thread, not a block: unread mail lists it; a reply or
+*Mark as read* (nothing unread any more), an archive, or *Mark handled*
+settles it; a mail that is gone from the mailbox is not unread, so the
+thread leaves by itself; and the next mail brings a settled thread back —
+the rail reopens its block for every mail it counts, listed and never pushed
+(`_attention_relist_chat`), once per mail however often the event is
+delivered. A thread the user puts back by hand stays until they settle it.
 
 **The list.** A mail chat's entry in `GET /chats` carries, beyond every
 chat's, `participants` (`[{address, name, contact}]`, resolved through the
@@ -1104,7 +1129,18 @@ address; at most six, `participants_more` counting the rest), `peer`, and in
 is gone from the mailbox previews as removed, not as an empty line. The
 subject, the sender's name and the removal come with the head message's
 record, which the list reads whole anyway — no pattern is added to its
-queries.
+queries. `last.text` is a **preview** on every channel: the first
+`CHAT_PREVIEW_CHARS` (300) characters, ending in an ellipsis where it was
+cut. The list is every chat in one answer and a mail's text can be its whole
+body; the message itself is served by `GET /chats/<id>/messages`.
+
+**A tombstone is not unread.** A mail that is gone from the mailbox keeps
+its record and its place in the thread, and counts for nothing: the unread
+query leaves out a record that carries `kb:removedAt` (one
+`FILTER NOT EXISTS` in `_CHATS_UNREAD_SPARQL`, no further query), and the
+chat state's own count of arrivals forgets it (`inbound_gone`). So a chat
+whose unread mail was deleted in a client leaves *Unread* and its badge
+counts live mail only.
 
 **The messages.** A mail's Message is its **trimmed** text (`kb:text`) and,
 beyond every message's: `sender` and `sender_name` on either direction,
@@ -1149,8 +1185,15 @@ turn, no attention arrival, no overlay entry, and an archived chat stays
 archived. `seen` on it says the mailbox had it marked read, and moves the
 chat's read mark up to that mail (forward only) — the one place the
 mailbox's `\Seen` is ever honoured; a backfilled mail that was not read
-counts as an arrival like any other. Two further calls, authorized like the
-rail, keep the chats in step with the mailbox:
+counts as an arrival like any other — once, by its message id, like a live
+one: the mirror delivers every event at least once. Two further calls,
+authorized like the rail, keep the chats in step with the mailbox. They are
+a mailbox's operations and are **refused for any other channel** (`400`): no
+messenger chat merges or loses messages, and the rail — open unless
+`CHATS_INGEST_TOKEN` is set — must not be a way to fold one correspondent's
+chat into another's or to archive one. The gateway retries each on its own,
+so either may name a chat that has been folded away since it was queued; it
+is then about the chat that one is part of now.
 
 - `POST /internal/chats/merge` `{channel, account, from: [key…], into}` —
   threads a later mail linked are one chat. The absorbed chat's state is
@@ -1160,13 +1203,23 @@ rail, keep the chats in step with the mailbox:
   companion only where the survivor has none — a second companion becomes an
   ordinary conversation that still points at the surviving chat — and its
   attention block where that is the open one. Overlay entries move with it.
-  Idempotent; answers `{ok, id, merged}`.
+  Idempotent; answers `{ok, id, merged}`. The absorbed chat's **id** is
+  remembered (`ChatStateStore.note_merged`, until either chat is deleted):
+  the store goes on answering with rows under the old key until it has
+  reindexed, and the list leaves those out rather than show a stateless
+  ghost; and every `/chats/<absorbed id>/…` endpoint — `messages` first of
+  all — answers **`410`** with
+  `{"error", "id", "merged_into": "<surviving id>", "messages": "<its messages address>"}`
+  and writes nothing. Not a redirect: the page has to learn that its chat
+  has another id, or its next write goes to the dead one. An id that has a
+  state document again (a new mail arrived under it) is a chat again.
 - `POST /internal/chats/removed` `{channel, account, chat, message_ids, live}`
-  — mails are gone from the mailbox. The overlay lets go of them and the
-  list is rebuilt; `live: 0` — no mail of the thread left — **archives** the
-  chat, without muting it, and settles its open attention item as archiving
-  does. Its tombstones, state and companion stay; the next mail brings it
-  back. Answers `{ok, id, archived}`.
+  — mails are gone from the mailbox. The overlay lets go of them, they stop
+  counting as unread (above; a mail that comes back is announced again and
+  counts again), and the list is rebuilt; `live: 0` — no mail of the thread
+  left — **archives** the chat, without muting it, and settles its open
+  attention item as archiving does. Its tombstones, state and companion
+  stay; the next mail brings it back. Answers `{ok, id, archived}`.
 
 **The companion.** A mail thread's note names the thread by its id where it
 gives instructions and carries the subject and the participants as data, in
