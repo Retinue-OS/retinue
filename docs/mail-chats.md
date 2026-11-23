@@ -21,6 +21,12 @@ what differs is stated here.
 | **3 — the gate** | VIP / instructed turns for mail; triage and the whitelist retire; the migration |
 | **4 — the model trim** | one router-tier turn per mail the deterministic trim could not settle |
 
+Phase 1's deployment is in place: the `mail-gateway` compose service and
+image, its `messenger-email` ledger and `mail-data` state volumes, the
+registry entry (`email`, enrolled by `MAIL_GATEWAY_BASE_URL`), the monitor's
+wording for a mailbox, and the e-mail policy file on the ledger volume. How to
+run it: *Operator notes* at the end.
+
 ## Decisions
 
 The brief left four things open. What was decided, and why:
@@ -476,3 +482,29 @@ they call answer with a notice instead of running.
 
 Threads with Ara as chats; a people view across channels; clustering; a daily
 sweep; changes to the attention model beyond the mail default above.
+
+## Operator notes
+
+The running side of this document is `docs/messaging.md`, "E-mail (the mail
+gateway)": configuration, the backfill, what `/gateways` shows, named
+accounts. The points an operator meets first:
+
+- **Nothing to set for the default account.** The gateway reads the mailbox
+  variables `.env` already holds for `email_client.py`; the base compose runs
+  it in every deployment, idle where no mailbox is configured. Set
+  `MAIL_GATEWAY_TOKEN` (both services read it). `MAIL_BACKFILL_DAYS=0` starts
+  the mirror with no history.
+- **The credentials are in two containers until phase 2**: the mail
+  gateway's and, as before, the `retinue` container's (`SECURITY.md`).
+- **The e-mail policy file moves** to
+  `chambers/_generated/messenger/email/policy/email-policy.nt`, on the
+  gateway's ledger volume; the retinue side moves the old
+  `_generated/triage/email-whitelist.nt` there on start. An old file that
+  differs from the new one is left in place and reported, never deleted.
+- **A named account** is a second gateway service with `MAIL_ACCOUNT_NAME`,
+  enrolled in `MESSENGER_GATEWAYS` with `"channel": "email"`
+  (`docker-compose.override.example.yml`).
+- **Not running it at all**: give the service a profile nobody enables in the
+  override (`profiles: ["off"]`) and leave `email` out of
+  `MESSENGER_BUILTIN_CHANNELS`, as for any built-in channel never run, so the
+  monitor does not report the absent container as an outage.

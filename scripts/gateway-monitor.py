@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Messenger gateway connection monitor.
+"""Channel gateway connection monitor.
 
 The Signal / WhatsApp / Telegram gateways occasionally lose their link to the
-messaging service (the phone unlinks the device, the session gets revoked, …).
-Without monitoring, nobody notices until a correspondent complains that their
-messages go unanswered. This daemon closes that gap:
+messaging service (the phone unlinks the device, the session gets revoked, …),
+and the mail gateway its IMAP login (the server refuses the password, or is
+unreachable). Without monitoring, nobody notices until a correspondent
+complains that their messages go unanswered. This daemon closes that gap:
 
   * Every GATEWAY_MONITOR_INTERVAL seconds (default 60) it polls the /health
     endpoint of every configured channel gateway — the same registry the
@@ -15,7 +16,9 @@ messages go unanswered. This daemon closes that gap:
     token-gated /internal/conversations endpoint, which fans out a Web Push
     notification to the user's devices — exactly like a new incoming message.
     The notice links to the /gateways page, where the user sees the gateway's
-    status and the pairing QR code to scan.
+    status and, for a messenger, the pairing QR code to scan. What the notice
+    says follows the gateway's channel (see WORDING): a mailbox has no phone
+    to re-pair.
   * While a gateway stays down it re-reminds in the same thread every
     GATEWAY_MONITOR_REMIND_SECONDS (default 6 h); when the link comes back it
     records the recovery in that thread quietly — no push, no unread badge,
@@ -114,42 +117,83 @@ def repair_link(label: str = "the gateways page") -> str:
     return f"[{label}]({repair_url()})"
 
 
-def outage_message(label: str, reason: str | None, since: float | None = None) -> str:
-    lines = [
-        f"The {label} messenger gateway has lost its connection — incoming messages on "
-        f"this channel are NOT being received and outgoing ones cannot be sent.",
-    ]
+# What the user is told, per kind of gateway. A messenger gateway is a linked
+# device: it goes down because the phone unlinked it or the session was
+# revoked, and the fix is a QR scan on /gateways. The mail gateway logs in to
+# an IMAP server: it goes down because the server refused the login or cannot
+# be reached, and no phone or QR code has anything to do with it — telling the
+# user to re-pair would send them looking for a fix that does not exist. Every
+# notice below takes its channel-specific words from here, so they live in one
+# place. Keyed by the registry's "channel"; anything else reads as a messenger.
+_MESSENGER_WORDING = {
+    "noun": "messenger gateway",
+    "lost": ("incoming messages on this channel are NOT being received and "
+             "outgoing ones cannot be sent."),
+    "cause": ("It most likely needs to be re-paired with the phone. Open {link} "
+              "to see the gateway status and scan the pairing QR code."),
+    "still": "Messages on this channel are not flowing.",
+    "remedy": "Re-pair it on {link}.",
+}
+WORDING = {
+    "email": {
+        # The label is "E-mail", so the bare noun reads right: "The E-mail
+        # gateway …".
+        "noun": "gateway",
+        "lost": ("new mail on this account is NOT reaching the chats. Nothing is "
+                 "lost: it stays in the mailbox and is mirrored once the gateway "
+                 "is back."),
+        "cause": ("The mail server most likely refused the gateway's login (a "
+                  "changed or revoked app password) or cannot be reached. Check "
+                  "the account's mailbox settings and the provider's status; "
+                  "{link} shows what the gateway reports."),
+        "still": "New mail is not reaching the chats.",
+        "remedy": ("Check the mailbox login and the mail server; {link} shows "
+                   "what the gateway reports."),
+    },
+}
+
+
+def wording(channel: str | None) -> dict:
+    """The words for a gateway serving this registry channel (a messenger's
+    when the channel is unknown or not stated)."""
+    return WORDING.get((channel or "").strip().lower(), _MESSENGER_WORDING)
+
+
+def outage_message(label: str, reason: str | None, since: float | None = None,
+                   channel: str | None = None) -> str:
+    words = wording(channel)
+    lines = [f"The {label} {words['noun']} has lost its connection — {words['lost']}"]
     if reason:
         lines.append(f"Reported problem: {reason}")
-    lines.append(
-        f"It most likely needs to be re-paired with the phone. Open "
-        f"{repair_link()} to see the gateway status and scan the pairing QR code."
-    )
+    lines.append(words["cause"].format(link=repair_link()))
     if since:
         mins = max(1, int((time.time() - since) // 60))
         lines.insert(1, f"The connection has been down for about {mins} minute(s).")
     return "\n\n".join(lines)
 
 
-def reminder_message(label: str, since: float) -> str:
+def reminder_message(label: str, since: float, channel: str | None = None) -> str:
+    words = wording(channel)
     hours = max(1, int((time.time() - since) // 3600))
     return (
-        f"Reminder: the {label} messenger gateway is still disconnected "
-        f"(for about {hours} hour(s)). Messages on this channel are not flowing. "
-        f"Re-pair it on {repair_link()}."
+        f"Reminder: the {label} {words['noun']} is still disconnected "
+        f"(for about {hours} hour(s)). {words['still']} "
+        f"{words['remedy'].format(link=repair_link())}"
     )
 
 
-def recovery_message(label: str) -> str:
-    return f"The {label} messenger gateway is connected again. No further action needed."
+def recovery_message(label: str, channel: str | None = None) -> str:
+    return (f"The {label} {wording(channel)['noun']} is connected again. "
+            f"No further action needed.")
 
 
 class MonitorEngine:
     """Per-gateway outage state machine, separated from I/O for testability.
 
-    ``step(slug, label, verdict, reason, now)`` folds one health verdict into
-    the persistent state and performs any due notification via the injected
-    notifier. State per slug:
+    ``step(slug, label, verdict, reason, now, channel)`` folds one health
+    verdict into the persistent state and performs any due notification via
+    the injected notifier; ``channel`` (the registry's) picks the wording.
+    State per slug:
       status      "up" | "down"
       fails       consecutive bad checks while still officially up
       since       when the outage began (first failed check of the streak)
@@ -166,7 +210,7 @@ class MonitorEngine:
         self.remind_seconds = remind_seconds
 
     def step(self, slug: str, label: str, verdict: str, reason: str | None,
-             now: float | None = None) -> None:
+             now: float | None = None, channel: str | None = None) -> None:
         if verdict == "unconfigured":
             self.state.pop(slug, None)
             return
@@ -176,7 +220,8 @@ class MonitorEngine:
         if verdict == "up":
             if entry.get("status") == "down":
                 if entry.get("notified") and entry.get("thread_id"):
-                    self.notifier.append(entry["thread_id"], recovery_message(label), quiet=True)
+                    self.notifier.append(entry["thread_id"], recovery_message(label, channel),
+                                         quiet=True)
                 print(f"{LOG} {slug}: recovered", flush=True)
             self.state[slug] = {"status": "up", "fails": 0}
             return
@@ -195,7 +240,7 @@ class MonitorEngine:
         if not entry.get("notified"):
             thread_id = self.notifier.open_thread(
                 f"{label} gateway disconnected",
-                outage_message(label, reason, entry.get("since")),
+                outage_message(label, reason, entry.get("since"), channel),
                 attention=OUTAGE_ATTENTION,
             )
             if thread_id:
@@ -207,7 +252,8 @@ class MonitorEngine:
 
         if now - float(entry.get("last_notice", 0)) >= self.remind_seconds:
             if entry.get("thread_id") and self.notifier.append(
-                    entry["thread_id"], reminder_message(label, entry.get("since", now))):
+                    entry["thread_id"], reminder_message(label, entry.get("since", now),
+                                                         channel)):
                 entry["last_notice"] = now
 
 
@@ -263,7 +309,8 @@ def main() -> None:
         for slug, gw in watched.items():
             try:
                 verdict, reason = check_gateway(gw)
-                engine.step(slug, gw.get("label") or slug.title(), verdict, reason)
+                engine.step(slug, gw.get("label") or slug.title(), verdict, reason,
+                            channel=gw.get("channel"))
             except Exception as exc:  # noqa: BLE001 - one gateway must not stall the loop
                 print(f"{LOG} error checking {slug}: {exc}\n{traceback.format_exc()}", flush=True)
         _save_state(engine.state)

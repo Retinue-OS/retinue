@@ -105,6 +105,10 @@ NEEDED = {
     "WHATSAPP_GATEWAY_TOKEN": "wa-cap",
     "TELEGRAM_GATEWAY_TOKEN": "tg-cap",
     "CALDAV_GATEWAY_TOKEN": "caldav-cap",
+    # the mail gateway's client side: what reaches it, never the mailbox
+    "MAIL_GATEWAY_TOKEN": "mail-cap",
+    "MAIL_GATEWAY_BASE_URL": "http://mail-gateway:8096",
+    "MAIL_GATEWAY_SEND_URL": "http://mail-gateway:8096/send",
     # non-secret mailbox setting the triage gate lists by name
     "SENT_FOLDER": "Sent",
     "TRIAGE_STATE_DIR": "/root/.retinue/triage",
@@ -123,6 +127,10 @@ DAEMON_ONLY = {
     "EMAIL_SEND_POLICY": "[]",
     "MESSENGER_GATEWAYS": '[{"base_url":"http://x:1","token":"t"}]',
     "SCHEDULER_TICK_SECONDS": "30",
+    # the mail gateway's own settings, should a deployment set them here
+    "MAIL_ACCOUNT_NAME": "ari",
+    "MAIL_BACKFILL_DAYS": "90",
+    "MAIL_OWN_ADDRESSES": "me@alias.example",
     "GATEWAY_BASIC_AUTH_SCOPES": "ara-mcp:ara.example.com",
     "ARA_MCP_ENABLED": "1",
     "VAPID_SUBJECT": "mailto:admin@example.com",

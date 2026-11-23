@@ -1,4 +1,4 @@
-# Outbound messaging — Signal, WhatsApp, Telegram, SMS
+# Messaging — Signal, WhatsApp, Telegram, SMS, e-mail
 
 *Reference depth for the "Messaging" digest in `CLAUDE.md`. Read this before
 sending on an unfamiliar channel or account, changing send policies, enrolling
@@ -170,15 +170,21 @@ with no thread is simply not reported. Retractions are the agent's own act and a
 
 The `/sends` page enrols the built-in
 gateways when their `*_GATEWAY_BASE_URL` is set and their name is included in
-`MESSENGER_BUILTIN_CHANNELS` (default: all four — `signal`, `whatsapp`,
-`telegram`, `sms`; SMS additionally needs `SMS_GATEWAY_BASE_URL`, which the base
-compose leaves unset — see "Gateway connection monitoring" below), but a deployment often runs
+`MESSENGER_BUILTIN_CHANNELS` (default: all five — `signal`, `whatsapp`,
+`telegram`, `sms`, `email`; SMS additionally needs `SMS_GATEWAY_BASE_URL`, which the base
+compose leaves unset — see "Gateway connection monitoring" below — and
+`email` is enrolled by `MAIL_GATEWAY_BASE_URL`, its gateway being the mail
+gateway), but a deployment often runs
 *more than one* gateway on a channel — most commonly a second Signal identity,
 the user's **personal** account (`signal-gateway-personal`) alongside the
 system one. Those extra gateways are enrolled by the deployment via
 **`MESSENGER_GATEWAYS`** (read by `web-gateway.py`), a JSON array of
-`{base_url, token?, label?}` objects; each becomes its own `/sends/<slug>/<id>`
-account on the approval page. The slug is the gateway's Docker **service name**
+`{base_url, token?, label?, channel?}` objects; each becomes its own `/sends/<slug>/<id>`
+account on the approval page. `channel` names the chat channel the gateway
+serves (`signal`, `email`, …) where its service name does not say it — every
+registry entry carries one (`scripts/messenger_gateways.py`), and one left
+unstated is read from the slug and the label as before; a mail account added
+this way must state `"channel": "email"`. The slug is the gateway's Docker **service name**
 and needs no configuration on either side: the web-gateway takes the hostname
 of each registered `base_url` verbatim, and the gateway derives the same name
 from the Host header of the `/send` request that queued the message — so
@@ -332,11 +338,116 @@ sends the event over the phone's own server-sent-events connection to
 registering (or re-register after switching). There is no QR re-pairing: a "not seen recently" on `/gateways` is fixed
 on the phone (is the app running, allowed in the background, online?).
 
+## E-mail (the mail gateway)
+
+The `mail-gateway` service (`scripts/mail-gateway.py`, image
+`mail-gateway/Dockerfile`, port 8096) mirrors **one mailbox** into the same
+per-message ledger the messenger gateways write, so each mail thread is a chat
+on the Chats page — trimmed to its own new text, with the full mail one tap
+away (**Original**). The design and its rules (threading, the record, the trim)
+are `docs/mail-chats.md`; this section is how to run it. It is the `email`
+channel's gateway: a built-in of the registry, enrolled by
+`MAIL_GATEWAY_BASE_URL`, which the base compose sets, and **not** behind a
+profile — a deployment with no mailbox configured runs it idle.
+
+It reads the mailbox credentials `scripts/email_client.py` reads, in its own
+container, and uses `email_client.py` as its IMAP and MIME library. The same
+credentials stay on the `retinue` service as well: `email_client.py`, its
+backend and e-mail triage go on running there (see `SECURITY.md`).
+
+**Read-only, in this phase.** The mirror follows the mailbox and changes
+nothing in it — no flag, no move, no delete. It sends nothing: `/send`,
+`/pending-sends…` and the chat hooks (`/chats/read`, `/chats/archive`,
+`/chats/delete`) answer `501`, and the chat page says a mail chat cannot be
+answered from there yet. It pushes nothing and starts no model turn. E-mail
+triage, the whitelist, `email_client.py` and the e-mail approvals on `/sends`
+work exactly as before, beside it; a mail sent with `email_client.py` shows up
+in its chat once it is in the Sent folder.
+
+What it mirrors: **INBOX** (inbound records) and the **Sent** folder (outbound
+ones), polled every `MAIL_POLL_SECONDS`, and the **archive folder**, which it
+only follows — a mail moved there from INBOX is still that mail. A mail that
+is in none of them any more (deleted or moved away in a client) leaves a
+tombstone in its chat; a chat whose last mail went is archived. Every MIME
+part is kept as a blob in the ledger's media store — plain text, HTML, the
+header block, attachments and inline images — and served only through the
+gateway's token-gated `GET /media/<id>`, which the web gateway proxies. A
+remote image is never fetched; a tracking pixel is dropped. A mail of a `news`
+group or list (`triage_policy.py email-news-add`) starts no chat.
+
+**Configuration** — on the `mail-gateway` service, all named in
+`docker-compose.yml` (it loads no `env_file`):
+
+| Variable | Default | |
+|---|---|---|
+| `EMAIL_USER`, `EMAIL_PASS`, `IMAP_HOST`, `IMAP_PORT`, `SMTP_HOST`, `SMTP_PORT`, `SENT_FOLDER`, `EMAIL_FROM_NAME`, `SMTP_SAVE_SENT`, `DRAFTS_FOLDER` | as `email_client.py` | the default account — the same values `.env` already holds for it |
+| `MAIL_ACCOUNT_NAME` | *(empty)* | serve a named account: read the `_<NAME>`-suffixed set instead (below) |
+| `MAIL_OWN_ADDRESSES` | *(empty)* | the user's further addresses on this mailbox (aliases), comma-separated; never listed as participants |
+| `MAIL_ARCHIVE_FOLDER` | `Archive` | the archive folder the mirror follows |
+| `MAIL_TRASH_FOLDER` | `Trash` | for the writing phase |
+| `MAIL_POLL_SECONDS` | `60` | poll interval |
+| `MAIL_BACKFILL_DAYS` | `90` | how far back INBOX and Sent are mirrored on first run; `0` mirrors only new mail |
+| `MAIL_MAX_PART_BYTES` | 25 MiB | an attachment larger than this is not stored |
+| `MAIL_MAX_MAIL_BYTES` | 50 MiB | a larger mail keeps its text parts and no attachments |
+| `MAIL_TRIM_WANTING_CHARS` | `2500` | the trim's "still long" threshold (`scripts/mail_trim.py`) |
+| `MAIL_POLICY_WAIT_SECONDS` | `300` | how long the first backfill waits for the e-mail policy file |
+| `MAIL_GATEWAY_TOKEN` | | bearer token of its HTTP API; set the same value for `retinue` |
+| `EMAIL_SEND_POLICY` | | read for the gateway's own address; used once it sends |
+
+`CHATS_INGEST_*`, `NEWS_INGEST_*`, `CHAT_ERASE_TOKEN` and `INBOUND_STORE_DIR`
+are wired by compose as on the other gateways. Volumes: `messenger-email` is
+the ledger (the gateway's `/inbound`, the retinue side's
+`chambers/_generated/messenger/email`, qlever-life read-only), `mail-data` its
+own state (the thread index, the index of where each mail lives, outbound
+notes) — losing it costs a full rescan, not data.
+
+**Backfill.** On first run the gateway mirrors INBOX and Sent for
+`MAIL_BACKFILL_DAYS`, merged and ingested oldest first so a reply finds its
+parent. Backfilled mail pushes nothing, starts nothing and does not wake an
+archived chat; a mail already read in a client (`\Seen`) starts read, so ninety
+days of mail do not arrive as ninety days of unread chats. From then on a
+client's `\Seen` is ignored. `/health.backfill` says how far it got
+(`{done, pending, days}`).
+
+**The e-mail policy file moved.** The group flags (`news` / `quieted` /
+`ignored`) and, until the gate phase, the whitelist live in one `.nt`, which
+the gateway must read at ingest — so it lives on the gateway's ledger volume
+now: `chambers/_generated/messenger/email/policy/email-policy.nt` on the
+retinue side, `/inbound/policy/email-policy.nt` in the gateway. It used to be
+`chambers/_generated/triage/email-whitelist.nt`; the retinue side moves it
+(content and all) on start, and any retinue-side write of the policy moves it
+first. A deployment that pinned `TRIAGE_EMAIL_WHITELIST_PATH` keeps its path
+and is not moved, and must give the gateway the same file under its own mount.
+The gateway waits for the file before its first backfill (`/health.error` says
+so meanwhile), at most `MAIL_POLICY_WAIT_SECONDS`, then goes on as with no
+flags. `python3 scripts/triage_policy.py show-email` places the file too, and
+says on stderr if it left an old file that differs from the new one.
+
+**`/gateways`** shows the mail gateway as a card like a messenger's: whether
+it is connected and, if not, the reason its `/health` gives (whose `account`
+is the mailbox address) — the IMAP server refused the login, or cannot be
+reached. There is no
+QR code to scan: a mail gateway is fixed in the mailbox settings (host, port,
+user, an app password that was changed or revoked) or by waiting out the
+provider. The connection monitor words its notices for this case
+(`scripts/gateway-monitor.py`, `WORDING`). Unconfigured (`configured: false`)
+is intentional, never an outage.
+
+**A named account** (`EMAIL_USER_ARI`, …) is one more gateway: a service that
+`extends` `mail-gateway` with `MAIL_ACCOUNT_NAME=ARI`, that account's
+suffixed variables listed, the default account's password blanked, and its
+**own** `mail-data` volume — it shares the `messenger-email` ledger, whose
+records carry their account. Enrol it in `MESSENGER_GATEWAYS` with
+`"channel": "email"`, since its service name does not say which channel it
+serves. One thread reaching two of the user's accounts is two chats, one per
+account. The full example is in `docker-compose.override.example.yml`.
+
 ## What an agent session can see
 
 The gateways are sidecars for credential isolation: the Signal keys, the
 WhatsApp session, the Telegram login and the CalDAV password live in their own
-containers, and an agent reaches each through a thin script that authenticates
+containers (the mailbox password, for now, in two: the mail gateway's and the
+`retinue` container's, see "E-mail (the mail gateway)"), and an agent reaches each through a thin script that authenticates
 with a **capability token** (`SIGNAL_GATEWAY_TOKEN`, `CALDAV_GATEWAY_TOKEN`, …)
 — a token buys one request behind the send policy, where a password would buy
 the account. Those tokens are also the *only* secrets a session inherits: every
@@ -351,14 +462,18 @@ the `RETINUE_SESSION_ENV_EXTRA` escape hatch and the remaining gaps:
 ## Gateway connection monitoring
 
 Linked-device sessions (Signal, WhatsApp, Telegram) die silently — the phone
-unlinks the device, a session gets revoked. The framework watches for this
-itself: every gateway's `GET /health` reports its real link state, and
+unlinks the device, a session gets revoked — and so does a mailbox login (the
+mail gateway's IMAP server refuses a changed password, or is unreachable). The
+framework watches for this itself: every gateway's `GET /health` reports its real link state, and
 `scripts/gateway-monitor.py` (forked by the entrypoint) polls them once a
 minute. On a sustained failure it opens a dashboard conversation (which
 Web-Pushes the user like any incoming message) pointing at the dashboard's
 **`/gateways`** page, where the user sees each gateway's status and — for a
 disconnected one — the pairing QR code to scan (proxied from the gateway's
-token-gated `GET /qr`). Recovery is reported in the same thread. So: do **not**
+token-gated `GET /qr`). For the mail gateway the notice says what is wrong
+instead — the server refused the login or cannot be reached — and asks for
+no QR scan: there is no phone to re-pair (`gateway-monitor.py` words each
+notice by the registry entry's channel). Recovery is reported in the same thread. So: do **not**
 build ad-hoc liveness checks for these channels; if a user reports a channel
 seems dead, check `/gateways` (or the gateways' `/health`) first, and treat a
 `SIGNAL_SEND_POLICY`-style unconfigured channel (`configured: false`) as
@@ -383,9 +498,9 @@ in `docs/contributing.md`.
 **A deployment that doesn't use a given channel at all** — never runs its
 container, not even unpaired — must say so explicitly, or the monitor has no
 way to tell that apart from a real outage. The base `docker-compose.yml`
-always points the `retinue` service at the three always-on built-in gateways via
+always points the `retinue` service at the four always-on built-in gateways via
 `SIGNAL_GATEWAY_BASE_URL` / `WHATSAPP_GATEWAY_BASE_URL` /
-`TELEGRAM_GATEWAY_BASE_URL`; if the matching container is never started, the
+`TELEGRAM_GATEWAY_BASE_URL` / `MAIL_GATEWAY_BASE_URL`; if the matching container is never started, the
 monitor's health check fails DNS resolution — indistinguishable, from inside
 this container, from that same container having crashed — and it would open a
 "gateway disconnected" thread on every restart. There are two supported ways
@@ -399,7 +514,7 @@ to avoid that, and they mean different things:
 - **Never run the container at all.** Then set `MESSENGER_BUILTIN_CHANNELS` on
   the `retinue` service in the deployment's `docker-compose.override.yml` (see
   `scripts/messenger_gateways.py` and the example there) to the comma-separated
-  subset of `signal`, `whatsapp`, `telegram`, `sms` this deployment actually
+  subset of `signal`, `whatsapp`, `telegram`, `sms`, `email` this deployment actually
   runs — e.g. `MESSENGER_BUILTIN_CHANNELS=signal` for a Signal-only deployment,
   or set it explicitly **empty** for none — *unset* means all of them (SMS
   still enrolling only where `SMS_GATEWAY_BASE_URL` is set). Naming a channel there is what enrols it into the

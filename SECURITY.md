@@ -82,7 +82,20 @@ nothing new.
   What the allowlist does *not* do: every process in the container runs as
   the same user, so a session can still read a daemon's `/proc/<pid>/environ`
   (the web gateway's, for one, holds the mailbox credentials for its e-mail
-  backend), and the repository token sits in `~/.git-credentials`. Closing
+  backend), and the repository token sits in `~/.git-credentials`.
+  **The mailbox credentials are now held by two containers**: the `retinue`
+  container (for `email_client.py`'s backend, the e-mail triage and the
+  approval of e-mail drafts, as before) and the `mail-gateway` container,
+  which mirrors the mailbox into the chat ledger and is given only the
+  variables it reads, no `.env` wholesale. The mail gateway is the sidecar
+  that will close this gap for e-mail, but only once sending moves into it
+  and the credentials can leave the `retinue` service; until then it adds a
+  second place that holds them rather than taking one away. A named account
+  mirrored as chats is held by its own mail gateway service as well. The mail
+  gateway reaches no session and has no public route; what it serves —
+  stored mail and its parts — is behind `MAIL_GATEWAY_TOKEN`, which a session
+  does inherit, like every gateway token, so a session can read the mirrored
+  mail as it can already read the mailbox through the backend. Closing
   that means holding each secret in its own sidecar or under a separate uid,
   which is a separate roadmap item. An outbound send still has to clear the
   sending identity's policy, but a pending `verify` approval is not bound to

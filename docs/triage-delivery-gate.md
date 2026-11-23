@@ -267,8 +267,14 @@ gateway's projection of the address book's VIPs; every read-modify-write holds
 the file's `policy_lock`, so neither drops the other's change. The messenger policy rides on the **same
 per-gateway volume as that channel's messages** (see the volume topology below),
 because the gateway must read it at classify time — see the next point. The
-e-mail whitelist has no gateway, so it lives on the retinue side under
-`_generated` purely so it is queryable over SPARQL.
+e-mail policy (whitelist and group flags, one file) rides on the mail
+gateway's volume the same way, since that gateway reads the group flags at
+ingest: `_generated/messenger/email/policy/email-policy.nt`, beside the
+channel's own `policy.nt` (`triage_policy.email_whitelist_path()`;
+`TRIAGE_EMAIL_WHITELIST_PATH` overrides it). It used to live at
+`_generated/triage/email-whitelist.nt`, and
+`triage_policy.ensure_email_policy_location()` moves it from there on the
+retinue side (docs/messaging.md, "E-mail (the mail gateway)").
 
 **Why the gateway reads a raw file, never SPARQL.** Classification happens on the
 inbound hot path, in-process. If the gateway resolved the policy over

@@ -160,20 +160,32 @@ def test_unconfigured_is_skipped():
 def test_channel_gateway_discovery():
     import messenger_gateways
     for key in ("SIGNAL_GATEWAY_BASE_URL", "WHATSAPP_GATEWAY_BASE_URL",
-                "TELEGRAM_GATEWAY_BASE_URL", "MESSENGER_GATEWAYS",
+                "TELEGRAM_GATEWAY_BASE_URL", "MAIL_GATEWAY_BASE_URL", "MESSENGER_GATEWAYS",
                 "SIGNAL_GATEWAY_TOKEN"):
         os.environ.pop(key, None)
     os.environ["SIGNAL_GATEWAY_BASE_URL"] = "http://signal-gateway:8090"
     os.environ["SIGNAL_GATEWAY_TOKEN"] = "s3cret"
     os.environ["MESSENGER_GATEWAYS"] = json.dumps([
         {"base_url": "http://signal-gateway-personal:8090", "label": "Signal (personal)"},
+        {"base_url": "http://mail-gateway-ari:8096", "label": "E-mail (Ari)",
+         "channel": " Email "},
+        {"base_url": "http://odd-gateway:1", "channel": 7},  # kept; its channel is not
         {"base_url": ""},           # skipped: no base_url
         "not-an-object",            # skipped: malformed
     ])
     registry = messenger_gateways.channel_gateways("[test]")
-    assert set(registry) == {"signal-gateway", "signal-gateway-personal"}
+    assert set(registry) == {"signal-gateway", "signal-gateway-personal",
+                             "mail-gateway-ari", "odd-gateway"}
     assert registry["signal-gateway"]["token"] == "s3cret"
     assert registry["signal-gateway-personal"]["label"] == "Signal (personal)"
+    # Every entry carries its channel: a built-in its own, an extra what it
+    # declares (normalized), and None when it declares nothing usable — the
+    # registry does not guess one from the name.
+    assert all("channel" in gw for gw in registry.values()), registry
+    assert registry["signal-gateway"]["channel"] == "signal"
+    assert registry["signal-gateway-personal"]["channel"] is None
+    assert registry["mail-gateway-ari"]["channel"] == "email"
+    assert registry["odd-gateway"]["channel"] is None
     # The slug is the service hostname, verbatim — the same name a gateway sees
     # in the Host header of a /send request, so approval links match registry
     # keys with no slug configuration.
@@ -193,7 +205,7 @@ def test_channel_gateway_discovery():
 def test_builtin_channels_filter():
     import messenger_gateways
     keys = ("SIGNAL_GATEWAY_BASE_URL", "WHATSAPP_GATEWAY_BASE_URL",
-            "TELEGRAM_GATEWAY_BASE_URL", "MESSENGER_GATEWAYS",
+            "TELEGRAM_GATEWAY_BASE_URL", "MAIL_GATEWAY_BASE_URL", "MESSENGER_GATEWAYS",
             "MESSENGER_BUILTIN_CHANNELS")
     for key in keys:
         os.environ.pop(key, None)
@@ -225,7 +237,7 @@ def test_sms_enrols_only_with_its_base_url():
     monitor (which would report it as an outage on every boot)."""
     import messenger_gateways
     keys = ("SIGNAL_GATEWAY_BASE_URL", "WHATSAPP_GATEWAY_BASE_URL",
-            "TELEGRAM_GATEWAY_BASE_URL", "SMS_GATEWAY_BASE_URL",
+            "TELEGRAM_GATEWAY_BASE_URL", "SMS_GATEWAY_BASE_URL", "MAIL_GATEWAY_BASE_URL",
             "SMS_GATEWAY_TOKEN", "MESSENGER_GATEWAYS", "MESSENGER_BUILTIN_CHANNELS")
     for key in keys:
         os.environ.pop(key, None)
@@ -237,7 +249,8 @@ def test_sms_enrols_only_with_its_base_url():
         registry = messenger_gateways.channel_gateways("[test]")
         assert set(registry) == {"signal-gateway", "sms-gateway"}
         assert registry["sms-gateway"] == {
-            "base_url": "http://sms-gateway:8095", "token": "t", "label": "SMS"}
+            "base_url": "http://sms-gateway:8095", "token": "t", "label": "SMS",
+            "channel": "sms"}
         # An explicit channel list still has the final say.
         os.environ["MESSENGER_BUILTIN_CHANNELS"] = "signal"
         assert set(messenger_gateways.channel_gateways("[test]")) == {"signal-gateway"}
@@ -247,6 +260,126 @@ def test_sms_enrols_only_with_its_base_url():
     finally:
         for key in keys:
             os.environ.pop(key, None)
+
+
+def test_mail_enrols_only_with_its_base_url():
+    """E-mail is a built-in channel whose gateway is the mail gateway: its
+    variables are MAIL_*, its slug is the service name, and its entry says
+    "email" because neither the slug nor the label does."""
+    import messenger_gateways
+    keys = ("SIGNAL_GATEWAY_BASE_URL", "WHATSAPP_GATEWAY_BASE_URL",
+            "TELEGRAM_GATEWAY_BASE_URL", "SMS_GATEWAY_BASE_URL", "MAIL_GATEWAY_BASE_URL",
+            "MAIL_GATEWAY_TOKEN", "EMAIL_GATEWAY_BASE_URL", "MESSENGER_GATEWAYS",
+            "MESSENGER_BUILTIN_CHANNELS")
+    for key in keys:
+        os.environ.pop(key, None)
+    try:
+        assert "email" in messenger_gateways.BUILTIN_CHANNELS
+        # Named after the channel is not how this one enrols.
+        os.environ["EMAIL_GATEWAY_BASE_URL"] = "http://email-gateway:8096"
+        assert messenger_gateways.channel_gateways("[test]") == {}
+        os.environ["MAIL_GATEWAY_BASE_URL"] = "http://mail-gateway:8096/"
+        os.environ["MAIL_GATEWAY_TOKEN"] = " m "
+        registry = messenger_gateways.channel_gateways("[test]")
+        assert registry == {"mail-gateway": {
+            "base_url": "http://mail-gateway:8096", "token": "m", "label": "E-mail",
+            "channel": "email"}}, registry
+        # The channel list has the final say, by the channel's name.
+        os.environ["MESSENGER_BUILTIN_CHANNELS"] = "signal"
+        assert messenger_gateways.channel_gateways("[test]") == {}
+        os.environ["MESSENGER_BUILTIN_CHANNELS"] = "signal,email"
+        assert set(messenger_gateways.channel_gateways("[test]")) == {"mail-gateway"}
+    finally:
+        for key in keys:
+            os.environ.pop(key, None)
+
+
+# ── Wording follows the channel ───────────────────────────────────────────────
+
+_PAIRING_WORDS = ("re-pair", "QR", "phone", "messenger")
+
+
+def test_mail_notices_never_talk_about_pairing():
+    """A mail gateway is down because the IMAP server refused or is out of
+    reach. Every notice for it must say that, and none may send the user to
+    re-pair a phone or scan a code that does not exist."""
+    notices = [
+        gm.outage_message("E-mail", "IMAP login failed", since=1000, channel="email"),
+        gm.reminder_message("E-mail", 1000, channel="email"),
+        gm.recovery_message("E-mail", channel="email"),
+    ]
+    for text in notices:
+        for word in _PAIRING_WORDS:
+            assert word.lower() not in text.lower(), (word, text)
+    assert "mail server" in notices[0] and "login" in notices[0], notices[0]
+    assert "IMAP login failed" in notices[0]
+    assert "/gateways)" in notices[0] and "/gateways)" in notices[1]
+    # The channel is matched as the registry states it, case and all.
+    assert gm.outage_message("E-mail", None, channel=" Email ") == \
+        gm.outage_message("E-mail", None, channel="email")
+
+
+def test_messenger_notices_keep_their_wording():
+    for channel in (None, "signal", "telegram", "unknown"):
+        outage = gm.outage_message("Signal", "unlinked", channel=channel)
+        assert "messenger gateway" in outage and "pairing QR code" in outage, outage
+        assert "Re-pair it on" in gm.reminder_message("Signal", 0, channel=channel)
+        assert "messenger gateway is connected again" in gm.recovery_message("Signal", channel)
+
+
+def test_engine_words_each_notice_by_channel():
+    """The state machine hands the gateway's channel to every notice it posts."""
+    n = FakeNotifier()
+    e = gm.MonitorEngine(n, fail_threshold=1, remind_seconds=3600)
+    e.step("mail-gateway", "E-mail", "down", "server unreachable", now=1000, channel="email")
+    e.step("mail-gateway", "E-mail", "down", "server unreachable", now=1000 + 3700,
+           channel="email")
+    e.step("mail-gateway", "E-mail", "up", None, now=1000 + 3800, channel="email")
+    title, outage = n.opened[0]
+    assert title == "E-mail gateway disconnected", title
+    texts = [outage] + [m for _t, m in n.appended]
+    assert len(texts) == 3, texts
+    for text in texts:
+        for word in _PAIRING_WORDS:
+            assert word.lower() not in text.lower(), (word, text)
+    assert "still disconnected" in texts[1] and "connected again" in texts[2]
+
+
+def test_the_loop_passes_the_registry_channel():
+    """main() is where the registry entry meets the engine: the channel the
+    registry states must reach the notice, or the mail gateway would be
+    worded as a messenger after all."""
+    n = FakeNotifier()
+    ticks = []
+
+    class Stop(Exception):
+        pass
+
+    def sleep(_seconds):
+        ticks.append(1)
+        if len(ticks) >= gm.FAIL_THRESHOLD:
+            raise Stop
+
+    saved = (gm.messenger_gateways.channel_gateways, gm.check_gateway, gm.time.sleep,
+             gm.ConversationNotifier, gm._load_state, gm._save_state)
+    gm.messenger_gateways.channel_gateways = lambda _prefix: {
+        "mail-gateway": {"base_url": "http://mail-gateway:8096", "token": "",
+                         "label": "E-mail", "channel": "email"}}
+    gm.check_gateway = lambda gw: ("down", "IMAP login refused")
+    gm.time.sleep = sleep
+    gm.ConversationNotifier = lambda **_kw: n
+    gm._load_state = dict
+    gm._save_state = lambda state: None
+    try:
+        try:
+            gm.main()
+        except Stop:
+            pass
+    finally:
+        (gm.messenger_gateways.channel_gateways, gm.check_gateway, gm.time.sleep,
+         gm.ConversationNotifier, gm._load_state, gm._save_state) = saved
+    assert len(n.opened) == 1, n.opened
+    assert "mail server" in n.opened[0][1] and "QR" not in n.opened[0][1], n.opened[0][1]
 
 
 def main() -> int:

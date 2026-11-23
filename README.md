@@ -99,6 +99,13 @@ Defines these core compose services:
   exposes an outbound `/send` HTTP endpoint so `retinue` can *initiate*
   Signal messages (alerts, escalations, daily briefings) via
   `scripts/signal-push.py`, each with a spoken rendering and optional images.
+- **`mail-gateway`** — mirrors one mailbox over IMAP into the chat ledger, so
+  each mail thread is a chat on the dashboard, trimmed to its new text with
+  the full mail a tap away (`scripts/mail-gateway.py`;
+  [`docs/mail-chats.md`](docs/mail-chats.md)). Read-only for now — it changes
+  nothing in the mailbox and sends nothing, and e-mail triage runs beside it.
+  With no mailbox configured it idles. See
+  [`docs/messaging.md`](docs/messaging.md), "E-mail (the mail gateway)".
 - **`stt`** — a small speech-to-text microservice that owns the single Whisper
   model in the stack and exposes `POST /transcribe`. Shared by the
   `signal-gateway` (inbound voice notes) and the web gateway (dashboard voice
@@ -593,6 +600,7 @@ that gap:
   force a reconnect, at most once per `WHATSAPP_IQ_RECONNECT_BACKOFF` seconds,
   default 600) — and Telegram from the MTProto connection plus a
   periodic session probe (which catches a session revoked from another device).
+  The mail gateway reports whether its last IMAP login and poll succeeded.
   An unconfigured channel reports `configured: false` and idles instead of
   crash-looping.
 - **The monitor.** `scripts/gateway-monitor.py` (forked by the entrypoint in
@@ -607,9 +615,11 @@ that gap:
   `GATEWAY_MONITOR_REMIND_SECONDS`, `GATEWAY_MONITOR_IGNORE` (comma-separated
   slugs to skip, e.g. a deliberately unlinked channel). It watches the same
   registry `/sends` uses — the built-in channels named in
-  `MESSENGER_BUILTIN_CHANNELS` (default: all four — SMS only where
-  `SMS_GATEWAY_BASE_URL` is set) plus any
-  `MESSENGER_GATEWAYS` extras.
+  `MESSENGER_BUILTIN_CHANNELS` (default: all five — SMS only where
+  `SMS_GATEWAY_BASE_URL` is set, e-mail's mail gateway where
+  `MAIL_GATEWAY_BASE_URL` is, which the base compose sets) plus any
+  `MESSENGER_GATEWAYS` extras. A mail gateway's notices say the mail server
+  refused the login or cannot be reached, never to re-pair a phone.
 - **Re-pairing from the phone.** The dashboard page **`/gateways`** (behind the
   same edge auth as the rest) shows each gateway's live state and, for a
   disconnected one, the pairing QR code — proxied from the gateway's
@@ -977,6 +987,8 @@ retinue/
   scripts/             ← operational scripts (ingestion, hooks, refresh)
   Dockerfile           ← image for the `retinue` service
   signal-gateway/      ← image definition for the `signal-gateway` service
+  whatsapp-gateway/, telegram-gateway/, sms-gateway/, mail-gateway/,
+  caldav-gateway/      ← image definitions for the other channel gateways
   docker-compose.yml   ← deployment-neutral base composition
   docker-compose.override.example.yml ← deployment-specific wiring template
   qlever-static/       ← single-file SPARQL service (optional, deployment override)
