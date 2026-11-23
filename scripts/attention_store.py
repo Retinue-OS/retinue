@@ -58,6 +58,17 @@ UNKNOWN_SPHERE = "unknown"
 # fourteen messages about the street party are listed, never rung.
 DEFAULT_DIRECT_IMPORTANCE = 4.0
 DEFAULT_GROUP_IMPORTANCE = 1.0
+# …and a channel can have a default of its own, whatever the chat's shape.
+# E-mail is the one that does: **a mail pushes nothing by default; a contact
+# can say otherwise** (docs/mail-chats.md, "The gate"). A mailbox is mostly
+# mail nobody asked for, written by senders who lose nothing by writing, so
+# "someone took the trouble" — the reason a direct message is active — does
+# not hold for it. An unjudged mail is therefore worth what group chatter is:
+# passive, listed, never pushed and in no digest, one-to-one or not. What
+# raises it is what raises anything: the person's importance prior, a VIP
+# flag, a judgement of the message.
+MAIL_CHANNEL = "email"
+CHANNEL_DEFAULT_IMPORTANCE = {MAIL_CHANNEL: DEFAULT_GROUP_IMPORTANCE}
 
 # The sphere vocabulary the sheet offers. A deployment can extend it in
 # focus.json (``spheres``); the modes' ``admits`` lists use the same words.
@@ -323,16 +334,56 @@ def chat_screened(item: dict) -> bool:
     return bool(item.get("stranger")) and item.get("sphere") == UNKNOWN_SPHERE
 
 
-def chat_item(chat: dict, state: dict, profile: dict) -> dict:
-    """A messenger chat (a /chats row plus its state document) as an item.
+def chat_sender(chat: dict, state: dict | None) -> str:
+    """Who a chat's item is about: the name the profile's priors, spheres and
+    permits are keyed on.
 
-    The sender is the chat's name — a person or a group — which is also the
-    key the profile's priors and permits use, since that is how the user
-    thinks of them."""
+    For a messenger chat that is the chat's name — a person or a group —
+    since that is how the user thinks of them. A mail thread's name is its
+    subject, and a subject is nobody: every thread would be a sender of its
+    own and nothing the user taught about a person would ever match. So a
+    mail chat's sender is the **person** it is with: the contact the chat is
+    linked to (a one-to-one thread only — a card says who a chat is with,
+    which a thread that grew a third participant no longer has one answer
+    to), else the person the address book gives its peer's address to (the
+    row's ``peer``, which the gateway resolves and marks with ``contact``),
+    else that address.
+
+    Never the display name a mail carried for an address nobody holds. That
+    name is whatever its sender typed, and anyone can type the name of
+    someone the user gave a high prior or a permit; the address they cannot
+    choose. The display name is the item's *title* (:func:`chat_item`), where
+    it only has to read well."""
+    if chat.get("channel") != MAIL_CHANNEL:
+        return chat.get("name") or chat.get("key") or chat.get("id") or "Chat"
+    state = state or {}
+    card = state.get("contact") or {}
+    if card.get("name") and not chat.get("group"):
+        return card["name"]
+    for peer in (chat.get("peer"), state.get("peer")):
+        if isinstance(peer, dict) and peer.get("address"):
+            return peer["name"] if peer.get("contact") and peer.get("name") else peer["address"]
+    # No peer on record yet (a chat the rail has not passed by, its state
+    # lost): the channel stands in. Never the subject, which would file the
+    # thread's judgements under a name no later mail carries, and never the
+    # key, which is a Message-ID.
+    return "E-mail"
+
+
+def chat_item(chat: dict, state: dict, profile: dict) -> dict:
+    """A chat (a /chats row plus its state document) as an item.
+
+    The sender (:func:`chat_sender`) is also the key the profile's priors and
+    permits use, and the item's title — but for a mail from an address
+    nobody in the address book holds, whose key is the address and whose
+    title is the name the mail carried, when it carried one."""
     block = dict((state or {}).get("attention") or {})
     # Read before the defaults below fill the block in.
     predates_model = not block
-    name = chat.get("name") or chat.get("key") or chat.get("id") or "Chat"
+    name = chat_sender(chat, state)
+    mail = chat.get("channel") == MAIL_CHANNEL
+    peer = (chat.get("peer") or (state or {}).get("peer") or {}) if mail else {}
+    title = peer.get("name") if mail and name == peer.get("address") else None
     stranger = chat_is_unknown(state)
     priors = profile.get("priors") or {}
     if "importance" not in block:
@@ -340,7 +391,9 @@ def chat_item(chat: dict, state: dict, profile: dict) -> dict:
             block["importance"] = priors[name]
             block["importance_from"] = "prior"
         else:
-            block["importance"] = DEFAULT_GROUP_IMPORTANCE if chat.get("group") else DEFAULT_DIRECT_IMPORTANCE
+            block["importance"] = CHANNEL_DEFAULT_IMPORTANCE.get(
+                chat.get("channel"),
+                DEFAULT_GROUP_IMPORTANCE if chat.get("group") else DEFAULT_DIRECT_IMPORTANCE)
             block["importance_from"] = "default"
     # The spheres: a triage judgement of the latest message where there is
     # one (a customer who is also a friend, asking about Saturday's
@@ -362,7 +415,7 @@ def chat_item(chat: dict, state: dict, profile: dict) -> dict:
             sphere = block["sphere"]
         tags = list(block.get("tags") or [])
     judged = dict(block, sphere=sphere, tags=[t for t in dict.fromkeys(tags) if t != sphere])
-    doc = {"id": f"chat:{chat['id']}", "title": name, "attention": judged, "sphere": sphere,
+    doc = {"id": f"chat:{chat['id']}", "title": title or name, "attention": judged, "sphere": sphere,
            "sender": name, "archived": bool(chat.get("archived"))}
     item = policy.item_from_doc(doc, "chat", profile)
     last = chat.get("last") or {}
@@ -378,7 +431,10 @@ def chat_item(chat: dict, state: dict, profile: dict) -> dict:
         # naming a number renames its peer, and the profile's priors, permits
         # and sphere are keyed on the name the user sees.
         "sender": name,
-        "handle": chat.get("key") or "",
+        # What the contact card would file: the peer's handle. A mail
+        # thread's key is a Message-ID, which reaches nobody — there it is
+        # the peer's address.
+        "handle": (peer.get("address") or "") if mail else chat.get("key") or "",
         # Screened is where that lands (see chat_screened): a sender the
         # profile or an earlier judgement on this chat already placed is not a
         # stranger, whatever the rail said.
@@ -588,8 +644,8 @@ def default_emit_path(chambers_dir: Path) -> Path:
 
 __all__ = [
     "AttentionStore", "DEFAULT_CHAT_SPHERE", "DEFAULT_SPHERES", "DEFAULT_DIRECT_IMPORTANCE",
-    "DEFAULT_GROUP_IMPORTANCE", "zone",
+    "DEFAULT_GROUP_IMPORTANCE", "CHANNEL_DEFAULT_IMPORTANCE", "MAIL_CHANNEL", "zone",
     "thread_wants_attention", "thread_item", "chat_wants_attention", "chat_is_unknown",
-    "chat_screened", "chat_item",
+    "chat_screened", "chat_sender", "chat_item",
     "project_item", "fold_projects", "block_for", "subject_iri", "emit", "default_emit_path",
 ]

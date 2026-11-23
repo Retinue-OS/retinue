@@ -54,6 +54,9 @@ one JSON document per chat under ``CHAT_STATE_DIR``:
   was established, and a per-chat ``roster`` of sender handle → display name
   (the ledger stores handles only; names arrive on the notify rail and are
   remembered here).
+- for a mail thread (docs/mail-chats.md) — a chat whose ``name`` is its
+  subject — the people in it: ``participants`` and ``peer``. See
+  :data:`MAIL_CHANNEL`.
 
 ``gateway_source`` exists because a slug alone says nothing about how much it
 can be trusted. Stamps written before the gateways reported their account were
@@ -121,6 +124,70 @@ READ_SKEW_SECONDS = 120.0
 # a few messages later; this is far more than either needs, and small enough
 # to ride in every state write.
 INBOUND_RECENT_MAX = 64
+
+# The channel whose chats are mail threads (docs/mail-chats.md). Two things
+# about them are this module's business. A mail chat is **named by its
+# subject**, not by its peer, so nothing that names a *person* — a contact
+# card, a profile name passing by — may write its ``name`` (set_contact, and
+# the callers of note_message). And since the name no longer says who the chat
+# is with, the people are kept beside it: ``participants`` and ``peer``.
+MAIL_CHANNEL = "email"
+
+# How many participants a chat document keeps, and how long an address and a
+# display name may be. A thread's participants come from its mails'
+# From/To/Cc — text from outside — so they are bounded here, where they are
+# stored.
+PARTICIPANTS_MAX = 100
+_PARTY_NAME_MAX = 200
+_PARTY_ADDRESS_MAX = 320
+_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f  ]")
+
+
+def named_by_subject(channel: str | None) -> bool:
+    """Whether a channel's chats carry a subject as their name (see
+    :data:`MAIL_CHANNEL`) rather than the name of whoever they are with."""
+    return channel == MAIL_CHANNEL
+
+
+def clean_party(value) -> dict | None:
+    """One participant as a chat document keeps it: ``{"address", "name"}``.
+
+    The address is lower-cased and must read as one — a local part, an ``@``,
+    a domain, no blank and no control character; anything else is no
+    participant. The name is the display name a mail carried, or None: one
+    line, control characters dropped, bounded. Both are text from outside and
+    are only ever shown or compared, never interpreted."""
+    if not isinstance(value, dict):
+        return None
+    address = value.get("address")
+    if not isinstance(address, str):
+        return None
+    address = address.strip().lower()
+    local, at, domain = address.rpartition("@")
+    if (not at or not local or not domain or len(address) > _PARTY_ADDRESS_MAX
+            or _CONTROL_RE.search(address) or any(ch.isspace() for ch in address)):
+        return None
+    name = value.get("name")
+    name = " ".join(_CONTROL_RE.sub(" ", name).split()) if isinstance(name, str) else ""
+    return {"address": address, "name": name[:_PARTY_NAME_MAX] or None}
+
+
+def clean_parties(values) -> list[dict]:
+    """A participants list as stored: cleaned, one entry per address (the
+    first wins, so the order the gateway gave — most recent sender first — is
+    kept), at most :data:`PARTICIPANTS_MAX`."""
+    out: list[dict] = []
+    seen: set[str] = set()
+    for value in values if isinstance(values, list) else []:
+        party = clean_party(value)
+        if party is None or party["address"] in seen:
+            continue
+        seen.add(party["address"])
+        out.append(party)
+        if len(out) >= PARTICIPANTS_MAX:
+            break
+    return out
+
 
 _ISO_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$")
 
@@ -371,6 +438,14 @@ class ChatStateStore:
             "gateway_source": None,
             "roster": {},
             "roster_refreshed": None,
+            # A mail thread's people (see MAIL_CHANNEL): everyone on its
+            # mails' From/To/Cc but the account itself, as ``[{"address",
+            # "name"}]``, and ``peer`` — the one the thread is with: its
+            # latest inbound sender, or the first recipient of a thread the
+            # user started. Both None until the rail (or the name backfill)
+            # has said; an empty list is an answer, None is not knowing.
+            "participants": None,
+            "peer": None,
             # First-unread watermark: set when an inbound lands on a fully-read
             # chat, cleared when the user catches up. Its presence is what
             # classifies the next notification as "reply" rather than "new".
@@ -509,14 +584,24 @@ class ChatStateStore:
                      gateway_source: str | None = None,
                      sender: str | None = None,
                      sender_name: str | None = None,
-                     unknown_sender: bool | None = None) -> dict:
+                     unknown_sender: bool | None = None,
+                     participants=None, peer=None) -> dict:
         """Cache display metadata learned from a message event (the rail).
 
         The ledger persists handles, never names — names are remembered here as
         they pass by, so group bubbles can label their senders and a send can
-        route back through the exact gateway account the chat lives on."""
+        route back through the exact gateway account the chat lives on.
+
+        ``participants`` (a list) and ``peer`` are a mail thread's people as
+        its gateway states them (see MAIL_CHANNEL); each replaces what was
+        kept, cleaned (:func:`clean_parties`). None leaves them as they are,
+        and a ``peer`` that does not read as one is not stored."""
         with self._lock:
             doc = self._read(chat_id)
+            if participants is not None:
+                doc["participants"] = clean_parties(participants)
+            if peer is not None:
+                doc["peer"] = clean_party(peer) or doc.get("peer")
             if name:
                 doc["name"] = name
             if group is not None:
@@ -570,6 +655,11 @@ class ChatStateStore:
         profile, the life-store record — is the web-gateway's business; this
         is only what a chat document knows about it.
 
+        A mail thread is the exception to the first half (see MAIL_CHANNEL):
+        its name is its subject and stays that, card or no card — the card
+        says who the thread is *with*, which the document keeps as ``contact``
+        beside the name.
+
         ``unknown_sender`` is deliberately left alone: it is what the rail
         last said about the sender, and the card is the *user's* word about
         the person. A named chat is not screened because a card exists (see
@@ -582,14 +672,17 @@ class ChatStateStore:
         with self._lock:
             doc = self._read(chat_id)
             clean = " ".join(str(name or "").split())
+            titled = named_by_subject(doc["channel"])
             if not clean:
                 # Back to a handle: the name went with the card, and whatever
                 # the channel itself passes by next will name the chat again.
                 doc["contact"] = None
-                doc["name"] = None
+                if not titled:
+                    doc["name"] = None
                 self._write(doc)
                 return doc
-            doc["name"] = clean
+            if not titled:
+                doc["name"] = clean
             doc["contact"] = {
                 "name": clean,
                 "sphere": (str(sphere).strip().lower() or None) if sphere else None,
@@ -600,6 +693,123 @@ class ChatStateStore:
                 doc["contact"].update(person=str(person), chamber=chamber or None, path=path or None)
             self._write(doc)
             return doc
+
+    def merge(self, absorbed_id: str, survivor_id: str) -> tuple[dict, dict | None]:
+        """Fold one chat's state into another's and forget the first; returns
+        ``(survivor, absorbed)`` — the surviving document as it now stands and
+        the absorbed one as it was, or None where there was none to fold.
+
+        For two chats that turned out to be one conversation: mail threads a
+        later mail linked (docs/mail-chats.md, "Threading"). The messages are
+        the gateway's to re-key; this is everything else, and nothing the
+        user did to either chat may be lost in it:
+
+        - the **read mark** is the later of the two, and the arrival counts
+          add up — what had landed unread in either is still unread, by its
+          place in the count (:func:`arrived_since_read`), wherever the other
+          chat's mark falls. That holds for a chat never read as well: the
+          user said "read" about the other one, having seen only that, so
+          every arrival of the unread one stays unread behind the mark it
+          inherits. (Two chats never read have no mark between them, and
+          their timestamps go on deciding.) Where the mark moved, the undo of
+          the survivor's last *Mark as read* is dropped — it names a mark
+          that no longer stands;
+        - the **flags**: starred if either was; muted if either was (the user
+          silenced this conversation, whichever half they did it on), and
+          muting archives, as everywhere; otherwise archived only if both
+          were — the half that was in view keeps the whole in view;
+        - the **draft** stays the survivor's; an absorbed draft moves over
+          only where the survivor has none, under a version later than any
+          either chat has handed out, so a writer holding an old one is
+          refused;
+        - the **companion** stays the survivor's; an absorbed one moves over
+          only where the survivor has none. What becomes of a second
+          companion thread is the caller's business (it holds the
+          conversations) — the absorbed document it gets back names it;
+        - the **attention block** in force is the open one, the survivor's
+          first; the ``instructed`` block is the survivor's, else the
+          absorbed chat's;
+        - the survivor keeps its own name, people and contact card, and takes
+          the absorbed chat's only where it has none; the participants and
+          the roster are the union.
+
+        One step under the lock, the survivor written before the absorbed
+        file goes: a crash in between leaves both, and a repeat folds again —
+        read mark, flags and people come out the same, the arrival counts
+        higher than the truth by the absorbed chat's, which shows at worst a
+        read chat as unread, never the reverse. Idempotent otherwise: with no
+        absorbed document (a repeat, a chat nothing was ever noted for)
+        nothing is written."""
+        with self._lock:
+            if absorbed_id == survivor_id or not self._path(absorbed_id).exists():
+                return self._read(survivor_id), None
+            gone = self._read(absorbed_id)
+            doc = self._read(survivor_id)
+
+            def covered(d: dict) -> int:
+                # The arrivals a chat's newest read covered: none, for a chat
+                # never read.
+                return int(d.get("read_inbound") or 0)
+
+            mark = max(doc.get("last_read") or "", gone.get("last_read") or "") or None
+            if mark != doc.get("last_read"):
+                doc["read_undo"] = None
+                doc["read_settled"] = None
+            read_before = (doc.get("read_inbound") is not None
+                           or gone.get("read_inbound") is not None)
+            doc["read_inbound"] = covered(doc) + covered(gone) if read_before else None
+            doc["last_read"] = mark
+            for key in ("read_seq", "inbound_seq", "attended_seq"):
+                doc[key] = int(doc.get(key) or 0) + int(gone.get(key) or 0)
+            marks = [m for m in (doc.get("unread_since"), gone.get("unread_since")) if m]
+            doc["unread_since"] = min(marks) if marks else None
+            if doc["unread_since"] and mark and mark >= doc["unread_since"]:
+                doc["unread_since"] = None
+
+            doc["starred"] = bool(doc.get("starred") or gone.get("starred"))
+            doc["muted"] = bool(doc.get("muted") or gone.get("muted"))
+            doc["archived"] = doc["muted"] or bool(doc.get("archived") and gone.get("archived"))
+
+            version = max(int(doc.get("draft_version") or 0),
+                          int(gone.get("draft_version") or 0))
+            if (gone.get("draft") or {}).get("text") and not (doc.get("draft") or {}).get("text"):
+                version += 1
+                doc["draft"] = dict(gone["draft"], version=version)
+                doc["cleared"] = None
+            # Never behind a version the absorbed chat handed out: its clients
+            # are about to be looking at this document.
+            doc["draft_version"] = version
+
+            doc["companion"] = doc.get("companion") or gone.get("companion")
+            mine, theirs = doc.get("attention") or None, gone.get("attention") or None
+            if theirs and (not mine or (mine.get("state", "open") != "open"
+                                        and theirs.get("state", "open") == "open")):
+                # The open one is the one still asking for something.
+                doc["attention"] = theirs
+            for key in ("instructed", "name", "peer", "contact"):
+                if not doc.get(key) and gone.get(key):
+                    doc[key] = gone[key]
+            if not doc.get("gateway") and gone.get("gateway"):
+                # Slug and provenance travel as one, as everywhere.
+                doc["gateway"] = gone["gateway"]
+                doc["gateway_source"] = gone.get("gateway_source")
+            if doc.get("unknown_sender") is None:
+                doc["unknown_sender"] = gone.get("unknown_sender")
+            if doc.get("participants") is not None or gone.get("participants") is not None:
+                doc["participants"] = clean_parties(
+                    list(doc.get("participants") or []) + list(gone.get("participants") or []))
+            if doc.get("group") is not None or gone.get("group") is not None:
+                doc["group"] = bool(doc.get("group") or gone.get("group")
+                                    or len(doc.get("participants") or []) > 1)
+            roster = dict(gone.get("roster") or {})
+            roster.update(doc.get("roster") or {})
+            if roster != (doc.get("roster") or {}):
+                doc["roster"] = roster
+                doc["roster_refreshed"] = time.time()
+
+            self._write(doc)
+            self._path(absorbed_id).unlink(missing_ok=True)
+            return doc, gone
 
     def set_attention(self, chat_id: str, block: dict | None, *,
                       attended: int | None = None) -> dict:
@@ -1111,6 +1321,34 @@ class ChatOverlay:
         """Drop every live entry of one chat (a deleted chat); returns the count."""
         with self._lock:
             doomed = [k for k, e in self._entries.items() if e.get("chat_id") == chat_id]
+            for k in doomed:
+                self._entries.pop(k, None)
+        return len(doomed)
+
+    def rekey(self, old_chat_id: str, new_chat_id: str) -> int:
+        """Move every live entry of one chat to another (two chats that
+        turned out to be one — ChatStateStore.merge); returns the count.
+
+        The dedup key of an entry without a message id names its chat, so
+        the entries are filed anew; one that already stands under the new
+        chat's key keeps its place."""
+        with self._lock:
+            moving = [(k, e) for k, e in self._entries.items()
+                      if e.get("chat_id") == old_chat_id]
+            for key, entry in moving:
+                self._entries.pop(key, None)
+                entry["chat_id"] = new_chat_id
+                self._entries.setdefault(self.entry_key(entry), entry)
+        return len(moving)
+
+    def forget_messages(self, chat_id: str, message_ids) -> int:
+        """Drop the live entries of one chat that carry one of these message
+        ids (messages gone from where they came from); returns the count."""
+        wanted = {str(m) for m in message_ids or [] if m}
+        with self._lock:
+            doomed = [k for k, e in self._entries.items()
+                      if e.get("chat_id") == chat_id
+                      and str(e.get("message_id") or "") in wanted]
             for k in doomed:
                 self._entries.pop(k, None)
         return len(doomed)

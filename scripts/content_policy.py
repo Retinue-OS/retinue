@@ -95,10 +95,11 @@ DIRECTIVES = (
     # fetch() and the like go to this origin's API only; the dashboard makes
     # no third-party requests.
     ("connect-src", ("'self'",)),
-    # Frames: none. Only the file viewer frames anything, and gets this origin
-    # for itself (PAGE_SOURCES). Were this 'self' on every page, markup that
-    # slipped into one could frame another page of this origin, an approval
-    # card say, under a click the user meant for something else.
+    # Frames: none. Only the file viewer and the chat page frame anything, and
+    # get this origin for themselves (PAGE_SOURCES). Were this 'self' on every
+    # page, markup that slipped into one could frame another page of this
+    # origin, an approval card say, under a click the user meant for
+    # something else.
     ("frame-src", ("'none'",)),
     ("object-src", ("'none'",)),
     ("base-uri", ("'self'",)),
@@ -126,7 +127,17 @@ PAGE_SOURCES = {
     # unsent message across a reload) are object URLs the page makes itself
     # of those files (URL.createObjectURL). No other page makes one. And it
     # plays messenger media through the media proxy, in <audio> and <video>.
-    "chat.html": {"img-src": ("blob:",), "media-src": ("'self'",)},
+    # And it frames one thing: a mail's HTML part (docs/mail-chats.md, "The
+    # original"), served by this origin at
+    # /chats/<id>/messages/<mid>/original.html. That answer is sanitised,
+    # carries a sandboxing policy of its own (web-gateway.py,
+    # MAIL_ORIGINAL_CSP) and is framed with the `sandbox` attribute as well,
+    # so what is in the frame has no origin, runs nothing and loads nothing.
+    # The source list cannot name that one path family — a chat id is part
+    # of it — so it is 'self', and what the frame may hold is the page's
+    # doing: it sets no other frame source.
+    "chat.html": {"img-src": ("blob:",), "media-src": ("'self'",),
+                  "frame-src": ("'self'",)},
     # The file viewer (webapp/viewer.html, components/viewer-page.js): a
     # thread attachment of this origin, in a frame. Its own <meta> policy
     # says the same, so a link inside a PDF cannot load another site into the

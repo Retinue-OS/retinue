@@ -8,6 +8,15 @@ path now lands in the chat, not in triage.** Phases 5 and 6 (summaries, forking,
 the polish list) are still the target picture. This supersedes the "one
 dashboard conversation per inbound message" model for messenger channels.
 
+**E-mail has since joined it.** A mail thread is a chat in every sense this
+document defines — the same ledger, list, page, state and companion — and
+only what differs is stated in [mail-chats.md](mail-chats.md): the identity
+(a thread's root `Message-ID`), a name that is a subject, the trimmed bubble
+with its original, and a mailbox behind the chat. Where this document says
+"messenger", read "channel"; where it leaves e-mail out, that document picks
+it up. What the web gateway serves for a mail chat is in
+[dashboard.md](dashboard.md), "Mail threads as chats".
+
 ## Problem
 
 Messenger support today routes every inbound message through triage into
@@ -787,7 +796,11 @@ ledger and `delivered` semantics; the news rail; the daily drain; reply tokens
 and the push CLIs (still the right tool for headless sends and escalations);
 the conversation concept, dashboard, and push machinery for everything that is
 not a messenger chat; e-mail triage in full (pull channel, own flow — it can
-adopt this pattern later, but nothing here depends on it).
+adopt this pattern later, but nothing here depends on it). *It since has:*
+[mail-chats.md](mail-chats.md) mirrors the mailbox into this same ledger and
+shows a mail thread as a chat. Its first phase is a read-only mirror beside
+which e-mail triage keeps running untouched; a later one retires triage for
+mail.
 
 **Converges with:** issue #130 — the message-id plumbing is shared, and the
 chat page is the missing answer to where reactions and quoted replies surface.

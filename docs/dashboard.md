@@ -105,11 +105,14 @@ the gateway's escaping and its media rules (#402, #404; "Attachments" and
 "Media in a messenger chat" below) see to that. The Content-Security-Policy is
 the second line behind them: should markup from outside reach a page all the
 same, it cannot run script there, because scripts run only from the
-dashboard's own files. Every HTML response of the gateway carries it — the
+dashboard's own files. Every page of the gateway carries it — the
 pages of `webapp/`, the pages the gateway builds itself (`/sends`,
 `/gateways`, `/claude-auth`, the session log) and its error pages. It is
 added where the handler's headers end, for any answer of type `text/html`, so
-no code path can forget it. The policy is built in one place,
+no code path can forget it. (One answer of that type is no page of the
+dashboard and opts out by name: a mail's HTML part, which is served as a
+sandboxed document under a stricter policy of its own — "The frame on the chat
+page" below.) The policy is built in one place,
 `scripts/content_policy.py`, with the page that needs each source:
 
 ```
@@ -128,7 +131,7 @@ shows an attachment that is a web link as a link to open (see
 "Attachments"), and the session log shows an image an answer names (a web
 address or a `data:` URL) as a link to it, or as its alt text, never as an
 image, as the dashboard's Markdown renderer does. Every page but one plays
-no audio or video, and every page but one frames nothing, so `media-src`
+no audio or video, and every page but two frames nothing, so `media-src`
 and `frame-src` are `'none'`: markup that slipped into a page can then not
 frame another page of this origin either (an approval card, under a click
 meant for something else). No page loads a font.
@@ -136,12 +139,14 @@ Three pages get more, each for itself alone (`PAGE_SOURCES` in the module;
 a source added to a directive that is `'none'` takes its place):
 the chat page (`/chat.html`) adds `blob:` to `img-src`, for its previews of
 the images about to be sent, which it makes itself as object URLs (no other
-page makes one), and gets `media-src 'self'`, for the messenger media it
-plays; it is the only page that plays any. (The briefing card would play
-audio on the start page, but `index.html` leaves it out for now; bringing it
-back means giving `index.html` `media-src 'self'` there.) The file viewer
-(`/viewer.html`) gets `frame-src 'self'`, for the attachment it shows in a
-frame; it is the only page that frames anything. `/sparql` (also served as
+page makes one), gets `media-src 'self'`, for the messenger media it
+plays — it is the only page that plays any — and gets `frame-src 'self'`,
+for the one thing it frames: a mail's HTML part (below). (The briefing card
+would play audio on the start page, but `index.html` leaves it out for now;
+bringing it back means giving `index.html` `media-src 'self'` there.) The
+file viewer (`/viewer.html`) gets `frame-src 'self'`, for the attachment it
+shows in a frame; it and the chat page are the only pages that frame
+anything. `/sparql` (also served as
 `/sparql.html`) adds `data:` to `img-src`, for the icons in YASGUI's
 stylesheet. It needs nothing else: the vendored YASGUI compiles no strings.
 Two other policies stay as they were, separate and always enforced:
@@ -149,6 +154,46 @@ Two other policies stay as they were, separate and always enforced:
 settings page") and the file viewer's own `frame-src 'self'`. Inside the
 Android shell, the bridge the app injects (`window.RetinueShell`) and the
 scripts it evaluates are the app's, not governed by a page's policy.
+
+**The frame on the chat page.** The chat page frames one thing: the HTML part
+of a mail, when the user opens a mail's *Original* ("Mail threads as chats"
+below; `GET /chats/<id>/messages/<mid>/original.html`). That is markup from
+outside shown on purpose, so it is given nothing of the origin, by three
+lines that each hold without the others:
+
+- it is **sanitised** before it is served (`mail_trim.sanitize_html`): an
+  allow-list of tags and attributes re-serialised from the token stream — no
+  script, no handler attribute, no form control, no frame, no `meta`, nothing
+  that loads. Its own inline (`cid:`) images are embedded as `data:` URLs,
+  from that message's own attachments only, raster types only, up to
+  `MAIL_ORIGINAL_INLINE_MAX_BYTES` (8 MiB) a mail; every other image source
+  is dropped, so a tracking pixel never loads;
+- it is **its own document under its own policy**, always enforced, whatever
+  `RETINUE_CSP` says:
+  `sandbox allow-popups allow-popups-to-escape-sandbox; default-src 'none'; img-src data:; style-src 'unsafe-inline'`.
+  `sandbox` gives it an opaque origin — no script, no form submission, no
+  access to the dashboard's cookies, storage or API, no navigating the page
+  around it — and the two `allow-popups` tokens let exactly one thing
+  through: a link the user clicks opens as an ordinary tab. It also goes out
+  with `X-Content-Type-Options: nosniff`, `Cache-Control: no-store`,
+  `X-Frame-Options: SAMEORIGIN` (only a page of this origin frames it) and
+  `Referrer-Policy: no-referrer` (the site a link leads to learns no address
+  of the dashboard). The dashboard's own policy is left off this one answer:
+  that policy describes the dashboard's pages, which this document is not —
+  its `img-src 'self'` would stop the embedded pictures, and report each of
+  them in `report` mode;
+- the page frames it with the `sandbox` attribute as well
+  (`allow-popups allow-popups-to-escape-sandbox`), so the same holds where a
+  client ignores the header.
+
+A source list cannot name that one path family — a chat id is part of it —
+so the directive is `'self'`, and what the frame holds is the page's doing:
+it sets the frame's address from the `html_url` the gateway answered, never
+from anything a message said. What `'self'` gives up is stated plainly: on
+the chat page alone, markup that slipped into the page could frame another
+page of this origin. The page renders what a message says as text, and
+`tests/test_chat_mail.py` pins the answer's headers and what the sanitiser
+leaves of a hostile mail.
 
 The policy decides what a page loads and runs, not where a link takes the
 user: following a link is a navigation, which none of its directives
@@ -227,8 +272,11 @@ render: listeners are added in script. No `javascript:` URLs, no `eval`,
 `new Function` or string timers, nothing from another origin. A page that
 cannot work without more gets it for that page alone, stated in
 `PAGE_SOURCES` of `scripts/content_policy.py` (as the chat page's `blob:`
-images, `/sparql`'s `data:` images and the file viewer's frame are), rather
-than a weaker policy for every page.
+images and its frame, `/sparql`'s `data:` images and the file viewer's frame
+are), rather than a weaker policy for every page. And markup from outside
+that is to be *shown* — a mail's HTML — is never put into a page: it is
+sanitised and served as a sandboxed document of its own, which a page frames
+("The frame on the chat page" above).
 `tests/test_webapp_no_inline_script.py` checks the pages, the components'
 markup and every page the gateway builds (its builders rendered, and its
 source for the error pages it writes in place), and that every script a page
@@ -1012,6 +1060,125 @@ for the tabs. (`group` on a chat is the boolean "a group chat", as before.)
 The derivation, the endpoint's request and answer shapes, and what the store
 being away does to the counts are in
 [messenger-chats.md](messenger-chats.md), "Unread · Read · Archived".
+
+## Mail threads as chats
+
+A mail thread is a chat like any other — the same list, page, state document
+and companion ([mail-chats.md](mail-chats.md) is the design; this is what the
+web gateway serves of it). The channel is `email`, the chat key the thread
+root's `Message-ID`, the account the mailbox address:
+`email:~<account>:<message-id>`. In its first phase the mirror is
+**read-only**: nothing is written to the mailbox and nothing is sent.
+
+**Routing.** The mail gateway's service is `mail-gateway` and its channel
+`email`, which no reading of the slug says, so a registry entry may state its
+`channel` and the web gateway reads that before it reads a slug or a label
+(`_gateway_in_channel`, `_slug_channel`); an entry without the field is read
+as before. The blobs are `urn:retinue:media:email:<id>` and go through the
+media proxy like a messenger's (`/chats/media/mail-gateway/<id>`).
+
+**A name that is a subject.** A mail chat's `name` is its thread's subject
+(`(no subject)` when there is none; never the key), so who it is with is kept
+beside it: the state document's `participants` and `peer`, which the rail
+writes. Nothing that names a *person* writes the name — not a sender's name
+on the rail, not the contact card, the autolink or a renamed person, not the
+name backfill (which asks the mail gateway's `GET /recent-chats` for what a
+state lacks). Everything about a person works on the peer's address instead:
+the contact card and the autolink (`_chat_handle` answers
+`("email", <peer address>)` for a one-to-one thread and nothing for a
+group), and the attention item, whose sender — the key the profile's priors,
+spheres and permits are filed under — is the linked contact, else the person
+the address book gives the peer's address to, else the address. Never the
+subject, and never the display name a mail carried: anyone can type the name
+of someone the user gave a permit, so that name is only the item's title.
+**A mail pushes nothing by default**: an unjudged mail is passive — listed,
+never pushed, in no digest — whether the thread is one-to-one or not
+(`attention_store.CHANNEL_DEFAULT_IMPORTANCE`); a person's prior says
+otherwise.
+
+**The list.** A mail chat's entry in `GET /chats` carries, beyond every
+chat's, `participants` (`[{address, name, contact}]`, resolved through the
+address book — the person's name, else the name the mail carried, else the
+address; at most six, `participants_more` counting the rest), `peer`, and in
+`last` the sender's name on either direction and `removed`: a head mail that
+is gone from the mailbox previews as removed, not as an empty line. The
+subject, the sender's name and the removal come with the head message's
+record, which the list reads whole anyway — no pattern is added to its
+queries.
+
+**The messages.** A mail's Message is its **trimmed** text (`kb:text`) and,
+beyond every message's: `sender` and `sender_name` on either direction,
+`subject`, `recipients`, `cc`, `trim` (`deterministic` · `wanting` · `model`),
+`removed` / `removed_at`, and `original` — the address of the full mail,
+present exactly when there is one to show. The attachments are the mail's
+files, an inline (`cid:`) picture among them; the mail's own parts — its
+plain body, its HTML, its header block — are blobs of the same store and are
+never listed as attachments. A tombstone (a mail deleted or moved away in a
+client) keeps its place — who, when, which mail — and shows no text, no
+attachment and no original. A mail thread's page is read like the list: one
+lean query for the page's message IRIs, then their records as
+`(message, predicate, object)` rows, rather than one more `OPTIONAL` per
+field in the messenger query.
+
+**The original.** `GET <original>` answers
+`{id, headers: {from, to, cc, date, subject}, header_block, text, html_url, attachments}`:
+the headline headers from the record, the whole header block and the whole
+plain text read from the gateway that keeps the parts, and `html_url`
+(`<original>.html`) when the mail has an HTML part. Both answer only for a
+mail of the chat the path names — 404 for any other, and for a tombstone —
+and sit behind the dashboard's sign-in like the media proxy. The message
+segment of the path is a token the gateway mints; the client follows the
+address it was given and never builds one. The HTML is served as a sandboxed
+document of its own: see "The frame on the chat page" under "The
+Content-Security-Policy". Each text part is read up to
+`MAIL_ORIGINAL_MAX_BYTES` (4 MiB).
+
+**Read-only.** The chat summary of a mail chat says `can_send: false` with
+`cannot_send_reason`, and `POST /chats/<id>/send`, `/draft`, `/draft/undo`,
+`/delete` and the agents' `/internal/chats/<id>/draft` answer `409` with that
+sentence and `read_only: true`. One constant in the gateway
+(`MAIL_READ_ONLY_REASON`) is all of it; the writing phase removes it. What is
+state alone works: *Mark as read*, the flags, the contact card, the
+companion.
+
+**The rail.** `POST /internal/chats/inbound` takes five more fields for a
+mail (`scripts/chat_ingest.py`): `subject` (this mail's own), `participants`
+and `peer` (the thread's), `backfill` and `seen`. A **backfilled** mail —
+history the mirror is catching up on — is filed and nothing more: no push, no
+turn, no attention arrival, no overlay entry, and an archived chat stays
+archived. `seen` on it says the mailbox had it marked read, and moves the
+chat's read mark up to that mail (forward only) — the one place the
+mailbox's `\Seen` is ever honoured; a backfilled mail that was not read
+counts as an arrival like any other. Two further calls, authorized like the
+rail, keep the chats in step with the mailbox:
+
+- `POST /internal/chats/merge` `{channel, account, from: [key…], into}` —
+  threads a later mail linked are one chat. The absorbed chat's state is
+  folded into the survivor's (`ChatStateStore.merge`): the later read mark,
+  with what had landed unread in either still unread; starred or muted if
+  either was, archived only if both were (or muted); its draft and its
+  companion only where the survivor has none — a second companion becomes an
+  ordinary conversation that still points at the surviving chat — and its
+  attention block where that is the open one. Overlay entries move with it.
+  Idempotent; answers `{ok, id, merged}`.
+- `POST /internal/chats/removed` `{channel, account, chat, message_ids, live}`
+  — mails are gone from the mailbox. The overlay lets go of them and the
+  list is rebuilt; `live: 0` — no mail of the thread left — **archives** the
+  chat, without muting it, and settles its open attention item as archiving
+  does. Its tombstones, state and companion stay; the next mail brings it
+  back. Answers `{ok, id, archived}`.
+
+**The companion.** A mail thread's note names the thread by its id where it
+gives instructions and carries the subject and the participants as data, in
+a block beside the mails — a subject is the first thing a stranger writes.
+It says the texts are the trimmed ones, lists attachments by type under the
+rule in "Attachments", and while the mirror is read-only ends in what the
+companion can do — read, discuss, open an ordinary conversation for a matter
+of its own — in place of the draft and send paragraphs. It names no send
+tool.
+
+`tests/test_chat_mail.py` covers all of the above against real ledger
+records.
 
 ## Archived, muted, starred, deleted
 
