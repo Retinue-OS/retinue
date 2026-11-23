@@ -264,10 +264,15 @@ archived; referenced into a dossier → archived (it is held there now); marked
 done in its stream → archived; filed by the Archivist → deleted or archived per
 the existing receipt rules. The gateway does this on its next pass.
 
-**What remains gets a proposal.** Ara's pass (the existing cadence: VIP
-senders soon, the rest in the daily run) adds one event to Inbox Zero per
-batch: each mail **embedded** as its own bubble, with its proposed resolution
-under it and its chips, one bulk chip to apply them all. Reading the mail costs
+**A mail nobody has judged yet is Ara's, not the user's.** On arrival the mail
+is embedded in Inbox Zero's stream (dated, as the mail's own bubble) and is a
+row on the home under its sender — but Inbox Zero itself asks nothing: no
+pending state, no badge, no "n mails waiting". It becomes pending the moment a
+batch has a **proposal**. Ara's pass (the existing cadence: VIP senders soon,
+the rest in the daily run) adds one event per batch: each mail **embedded** as
+its own bubble, with its proposed resolution under it and its chips, one bulk
+chip to apply them all. That event is what the user is asked to look at — the
+triage proposal, with the mail in it. Reading the mail costs
 no turn; "what does this offer
 actually mean for me" is a turn right there and its answer an event; if it
 becomes a decision, the
@@ -330,26 +335,23 @@ there is visible without showing what, and one tap shows it. **Looking is
 delivery:** what a wider aperture shows is released, as *pull* is today, and
 does not return in the next digest; new arrivals outside do.
 
-**Home** = dossiers that want something, using the attention arithmetic
-unchanged (`docs/attention-model.md`):
-
-1. **Now** — rings in the mode in force.
-2. **In focus** — the rest of what the focus covers. Importance, deadline and
-   who holds the ball as decoration on the row; the subtitle is the newest
-   message or event.
-3. **One section per ring within the aperture** — *+ people*, *+ nearby* —
-   then one line, *+ n below the aperture, m urgent — widen to "…"*: one tap
-   widens a ring, so what widening would buy is always known.
-4. **Waiting** — collapsed, with ages.
-
-A **relationship appears on the home only while something is pending** in it
-(a message classified with a deadline or an actor), and leaves it when that is
-done — the row then looks like any quiet chat in Contacts. **Resting** dossiers
-appear only when they wake; **Done** never. A row is the dossier; tapping opens
-it; back returns to the same list. Nothing vanishes except what the user
-closes, mutes or deletes. The digest is unchanged in timing and content: a
-push about what is in *Now* and what climbed since the last breakpoint,
-linking to rows.
+**Home** = the chat list, for everything. The row is the Chats page's row
+today — avatar with the channel mark, name, age, the newest entry as preview
+(*who: text*), the unread badge — and every dossier is in it: people, groups,
+mail senders, topics, conversations with Ara, Inbox Zero, newest first,
+starred first. The focus and aperture decide **which rows** are in the list,
+not what a row looks like: within the aperture's ring a dossier is listed;
+outside, one line counts them and the urgent ones among them — *+ 7 below the
+aperture, 2 urgent — widen to "+ people"* — and widens on a tap. What rings
+in the mode in force sits on top under *Rings now*; everything else follows by
+recency. A **pending** dossier carries one quiet line under its preview —
+Ara's reading of what is pending, the deadline, the ring — as decoration; a
+dossier with nothing pending looks like any chat row. **Resting** dossiers
+join the list when they wake; **Done** never. A row is the dossier; tapping
+opens it; back returns to the same list. Nothing vanishes except what the
+user closes, mutes or deletes. The digest is unchanged in timing and content:
+a push about what is in *Rings now* and what climbed since the last
+breakpoint, linking to rows.
 
 **Contacts** = relationships, sortable by latest message (default),
 alphabetically, or by hand (drag; per device; starred pins). Each row: name,
@@ -357,8 +359,13 @@ newest message's preview and channel, unread badge, and the chip of any topic
 with something pending that references their messages. Search, edit and *+ New
 contact* stay.
 
-**Dossiers** (today's Projects page) = everything, as a tree (children
-collapsed), behind *Active · Resting · Done* and search.
+**Dossiers** (today's Projects page) = the topics, standing dossiers and
+conversations with Ara, in the same row, as a tree (children collapsed),
+behind *Active · Resting · Done* and search.
+
+**The dossier page** is the chat page: the stream newest at the bottom, day
+separators (*Today*, *Yesterday*, the date), every entry with its time, the
+composer at the foot.
 
 **No archive.** Topics close or rest; relationships are only ever sorted.
 **Mute** stays (silences pushes). Swipe right on any row = done (closes a

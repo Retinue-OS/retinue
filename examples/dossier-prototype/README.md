@@ -43,8 +43,8 @@ her dot, as on the dashboard.
 | | Attention prototype | Dossier prototype |
 |---|---|---|
 | Rows | attention items over chats, threads, projects | **dossiers**: relationships (one per person or group), topics (project files; threads with Ara), one standing *Inbox Zero* |
-| Home | Now · Next · Held · Waiting | Now · Active (this mode's spheres) · Other spheres · Waiting — only dossiers with something pending |
-| Chat list | the Chats card | **Contacts**, by latest message; a new sender is a row the moment they write |
+| Home | Now · Next · Held · Waiting | **the chat list** — the Chats page's row for every dossier (people, mail senders, groups, topics, Ara), newest first; *Rings now* on top; focus and aperture decide which rows are in it, a pending dossier carries one quiet line of attention fields |
+| Chat list | the Chats card | the home itself; **Contacts** is the same list filtered to people and groups; a new sender is a row the moment they write |
 | E-mail | arrives as a Secretary-triaged thread | **in the open on arrival** in the sender's relationship; judged by Inbox Zero at the next batch (no VIP, no turn) |
 | The digest | a push listing held items | unchanged — plus **Inbox Zero's batch** at the same breakpoints, one event with the proposals and their chips |
 | Ara | a pane beside the chat; the thread itself | the composer's default addressee on every dossier; on a relationship a *to* switch picks the person's channel or Ara |

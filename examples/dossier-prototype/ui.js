@@ -19,6 +19,12 @@
   const fmtSize = (n) => (n < 1024 ? `${n} B` : n < 1024 * 1024 ? `${Math.round(n / 1024)} KB` : `${(n / 1024 / 1024).toFixed(1)} MB`);
   const attachmentsHtml = (atts) => (atts && atts.length ? `<div class="attachments">${atts.map((a) => `<span class="att">📎 ${esc(a.name)}<small>${esc(fmtSize(a.size))}</small></span>`).join('')}</div>` : '');
   const isPeer = (item) => item.kind === 'relationship' || item.kind === 'group';
+  const CHANNEL_MARK = { WhatsApp: 'W', Signal: 'S', Telegram: 'T', 'E-mail': '@', SMS: 'M' };
+  const CHANNEL_COLORS = { WhatsApp: '#25d366', Signal: '#3a76f0', Telegram: '#2aabee', 'E-mail': '#c9a0ff', SMS: '#8b93a3' };
+  // The chat list's age column, as the dashboard's fmtAge: minutes, hours, days.
+  function ageText(t, now) { const m = Math.round(now - t); if (m < 1) return 'now'; if (m < 60) return `${m} min`; if (m < 1440) return `${Math.round(m / 60)} h`; return `${Math.round(m / 1440)} d`; }
+  // Day separators in a stream, as the chat page's: Today, Yesterday, then the date.
+  function dayText(t, now) { const d = U.dayIndex(t), dn = U.dayIndex(now); if (d === dn) return 'Today'; if (d === dn - 1) return 'Yesterday'; return U.dateText(t); }
 
   // Draft rewrites, rule-based: what a model turn does in a deployment.
   const CONTRACTIONS = [[/\bI’ll\b|\bI'll\b/g, 'I will'], [/\bI’m\b|\bI'm\b/g, 'I am'], [/\bdon’t\b|\bdon't\b/gi, 'do not'], [/\bcan’t\b|\bcan't\b/gi, 'cannot'], [/\bwon’t\b|\bwon't\b/gi, 'will not'], [/\bit’s\b|\bit's\b/gi, 'it is'], [/\bwe’re\b|\bwe're\b/gi, 'we are'], [/\bthat’s\b|\bthat's\b/gi, 'that is'], [/\bdoesn’t\b|\bdoesn't\b/gi, 'does not']];
@@ -175,6 +181,23 @@
     showToast(text) { this.toast = text; clearTimeout(this.toastTimer); this.toastTimer = setTimeout(() => { this.toast = null; this.renderPhone(); }, 4500); }
 
     // ---- the three lists ---------------------------------------------------------------
+    // The chat-list row, as the dashboard's Chats page draws it (webapp/components/chats.js): avatar with the
+    // channel mark · name · age · preview · unread badge. The attention fields are a quiet line under the
+    // preview, only while something is pending — decoration, never a different kind of row.
+    chatRow(item, opts = {}) {
+      const e = this.engine; const pending = item.state === 'open'; const lvl = e.level(item); const pv = e.preview(item); const n = e.unread(item);
+      const last = e.lastEntry(item); const age = last ? ageText(last.t, e.now) : '';
+      const initials = item.title.split(/\s+/).map((w) => w[0]).join('').slice(0, 2).toUpperCase();
+      const av = isPeer(item) ? `<span class="cl-av" style="background:${SPHERE_COLORS[item.sphere] || '#9aa5b1'}">${esc(initials)}<span class="cl-ch" style="background:${CHANNEL_COLORS[item.channel] || '#8b93a3'}">${esc((CHANNEL_MARK[item.channel] || '?'))}</span></span>` : `<span class="cl-av ${item.kind}">${KIND_GLYPH[item.kind]}</span>`;
+      const prev = pv ? `${pv.who ? `<span class="pv-who">${esc(pv.who)}:</span> ` : ''}${pv.mail ? '✉ ' : ''}${esc(pv.text || '')}` : '';
+      const d = e.distance(item); const f = e.focus();
+      const whyBits = [];
+      if (pending && item.actor === 'you') { whyBits.push(e.urgencyShort(item)); if (f) whyBits.push(d === 0 ? 'in focus' : e.ringName(d)); if (opts.now) whyBits.push('rings'); }
+      else if (pending) whyBits.push(`waiting on ${item.actor}`);
+      const sum = e.summary(item); const why = pending ? `<span class="cl-why" style="--lvl:${LEVEL_COLORS[lvl]}">${sum ? `<span class="cl-sum">${esc(sum)}</span> · ` : ''}${esc(whyBits.join(' · '))}</span>` : '';
+      const badge = n ? `<span class="cl-unread${item.muted ? ' muted-chat' : ''}">${n}</span>` : item.muted ? '<span class="cl-mute" title="Muted">🔕</span>' : '';
+      return `<button class="cl-row${n ? ' has-unread' : ''}${pending ? ' pending' : ''}" data-act="view" data-id="${esc(item.id)}" style="--stripe:${pending ? LEVEL_COLORS[lvl] : 'transparent'}">${av}<span class="cl-name">${item.starred ? '<span class="star-mark">★</span> ' : ''}${esc(item.title)}${item.within ? `<span class="cl-in">in ${esc(e.byId.get(item.within).title)}</span>` : ''}</span><span class="cl-when">${esc(age)}</span><span class="cl-prev">${prev}</span>${badge}${why}</button>`;
+    }
     // A home row: a dossier with something pending, decorated with the three fields.
     row(item, section) {
       const e = this.engine; const lvl = e.level(item);
@@ -211,24 +234,30 @@
       const collapsible = (label, items, key, open) => items.length ? `<section class="sec ${key}"><button class="sec-toggle" data-act="toggle-${key}"><span>${label} · ${items.length}</span><span class="chev">${open ? '▾' : '▸'}</span></button>${open ? items.map((i) => this.row(i, key)).join('') : ''}</section>` : '';
       if (this.list === 'contacts') {
         const rows = e.contacts();
-        return `<div class="ph-body">${rows.map((i) => this.contactRow(i)).join('') || '<div class="empty">Nobody yet.</div>'}<p class="list-hint">Every person and group, by latest message. A new sender appears here the moment they write — nothing to triage first.</p></div>`;
+        return `<div class="ph-body cl">${rows.map((i) => this.chatRow(i)).join('') || '<div class="empty">Nobody yet.</div>'}<p class="list-hint">Every person and group, by latest message. A new sender appears here the moment they write — nothing to triage first.</p></div>`;
       }
       if (this.list === 'dossiers') {
         const tree = e.dossierTree(this.dossierFilter);
         const f = (k, l) => `<button class="seg${this.dossierFilter === k ? ' on' : ''}" data-act="dossier-filter" data-filter="${k}">${l}</button>`;
-        const walk = (n) => { const open = this.treeOpen[n.item.id]; const kids = n.children.length ? `<button class="tree-toggle" data-act="tree-toggle" data-id="${esc(n.item.id)}">${open ? '▾' : '▸'} ${n.children.length} within${open ? '' : ' · ' + e.pendingDescendants(n.item) + ' pending'}</button>${open ? n.children.map((k) => `<div class="tree-child">${walk(k)}</div>`).join('') : ''}` : ''; return this.dossierRow(n.item) + kids; };
-        return `<div class="segs">${f('active', 'Active')}${f('resting', 'Resting')}${f('done', 'Done')}</div><div class="ph-body">${tree.map(walk).join('') || '<div class="empty">Nothing here.</div>'}<p class="list-hint">A topic may sit within one parent topic; the focus on a dossier covers what is within it.</p></div>`;
+        const walk = (n) => { const open = this.treeOpen[n.item.id]; const kids = n.children.length ? `<button class="tree-toggle" data-act="tree-toggle" data-id="${esc(n.item.id)}">${open ? '▾' : '▸'} ${n.children.length} within${open ? '' : ' · ' + e.pendingDescendants(n.item) + ' pending'}</button>${open ? n.children.map((k) => `<div class="tree-child">${walk(k)}</div>`).join('') : ''}` : ''; return this.chatRow(n.item) + kids; };
+        return `<div class="segs">${f('active', 'Active')}${f('resting', 'Resting')}${f('done', 'Done')}</div><div class="ph-body cl">${tree.map(walk).join('') || '<div class="empty">Nothing here.</div>'}<p class="list-hint">A topic may sit within one parent topic; the focus on a dossier covers what is within it.</p></div>`;
       }
-      const h = e.home(); const total = h.now.length + h.active.length + h.other.length + h.waiting.length;
-      const f = e.focus(); const a = h.aperture; const ai = e.apertureIndex();
-      const widen = ai < U.APERTURES.length - 1 ? `<button class="below-row" data-act="aperture" data-aperture="${U.APERTURES[ai + 1].id}">+ ${h.below.length} below the aperture${h.belowUrgent ? `, <b class="urg">${h.belowUrgent} urgent</b>` : ''} — widen to “${esc(U.APERTURES[ai + 1].name)}”</button>` : '';
-      return `${this.focusBar()}<div class="ph-body">
-          ${section('NOW', h.now, 'now')}
-          ${f ? section(`IN FOCUS · ${esc(h.focusText.toUpperCase())}`, h.focus, 'active') : ''}
-          ${f ? [1, 2, 3].map((r) => section(esc(e.ringName(r).toUpperCase()), h.outside.filter((i) => e.distance(i) === r), 'active')).join('') : section('PENDING', h.outside, 'active')}
-          ${h.below.length ? widen : ''}
-          ${collapsible('WAITING ON OTHERS', h.waiting, 'waiting', this.waitingOpen)}
-          ${total ? '' : '<div class="empty">Nothing wants your attention.</div>'}
+      // The home is the chat list: every dossier with activity — people, groups, mail senders, topics, Ara —
+      // newest first, in the Chats page's row. The focus and aperture decide which rows are in it: within the
+      // aperture's ring they are listed; outside, one line counts them (and the urgent ones) and widens on a tap.
+      // What rings sits on top; what is pending carries its fields as a second line; the rest looks like a chat.
+      const h = e.home(); const f = e.focus(); const a = h.aperture; const ai = e.apertureIndex();
+      const all = e.chatList(); const nowIds = new Set(h.now.map((i) => i.id));
+      const listed = all.filter((i) => nowIds.has(i.id) || e.distance(i) <= a.ring || e.hasPermit(i));
+      const hidden = all.filter((i) => !listed.includes(i)); const hiddenUrgent = hidden.filter((i) => i.state === 'open' && U.rank(e.level(i)) >= U.rank('time-sensitive')).length;
+      const top = listed.filter((i) => nowIds.has(i.id)); const rest = listed.filter((i) => !nowIds.has(i.id));
+      const widen = hidden.length && ai < U.APERTURES.length - 1 ? `<button class="below-row" data-act="aperture" data-aperture="${U.APERTURES[ai + 1].id}">+ ${hidden.length} below the aperture${hiddenUrgent ? `, <b class="urg">${hiddenUrgent} urgent</b>` : ''} — widen to “${esc(U.APERTURES[ai + 1].name)}”</button>` : hidden.length ? `<div class="below-row quiet">+ ${hidden.length} below the aperture${hiddenUrgent ? `, <b class="urg">${hiddenUrgent} urgent</b>` : ''}</div>` : '';
+      return `${this.focusBar()}<div class="ph-body cl">
+          ${top.length ? `<div class="cl-sec">Rings now</div>${top.map((i) => this.chatRow(i, { now: true })).join('')}` : ''}
+          ${top.length && rest.length ? `<div class="cl-sec">${f ? esc(h.focusText) + ' · ' + esc(a.name) : 'Everything'}</div>` : ''}
+          ${rest.map((i) => this.chatRow(i)).join('')}
+          ${widen}
+          ${listed.length ? '' : '<div class="empty">Nothing in this focus yet.</div>'}
         </div>`;
     }
     // The two controls under the mode chip: the focus (what you are on) and the aperture (how far out you see).
@@ -309,7 +338,7 @@
     }
 
     // ---- the dossier page -------------------------------------------------------------
-    openView(id) { const item = this.engine.byId.get(id); if (!item) return; this.engine.ensureOpening(id); this.view = { id }; this.sheet = null; this.menu = false; this.pageMenu = false; this.shelfMenu = null; this.select = null; if (!this.draft || this.draft.id !== id) this.draft = null; }
+    openView(id) { const item = this.engine.byId.get(id); if (!item) return; this.engine.ensureOpening(id); this.engine.markSeen(id); this.view = { id }; this.sheet = null; this.menu = false; this.pageMenu = false; this.shelfMenu = null; this.select = null; if (!this.draft || this.draft.id !== id) this.draft = null; }
     // Whom the composer addresses: 'chat' = the participants over their channel, 'ara' = Ara.
     addressee(item) { if (!isPeer(item)) return 'ara'; return this.to[item.id] || 'chat'; }
     bubble(item, m, idx, embedded) {
@@ -319,14 +348,14 @@
       const hold = !sel && !embedded && (m.who === 'in' || m.who === 'out') ? `<button class="hold" data-act="select" data-id="${esc(item.id)}" data-uid="${m.uid}" title="Add to a dossier…">⋯</button>` : '';
       if (m.who === 'in' || m.who === 'out') {
         const mail = m.mail ? `<div class="mail-card"><div class="mail-subj">✉ ${esc(m.subject || '(no subject)')}</div><div class="mail-from">${m.who === 'in' ? esc(m.from || item.title) : 'you'}${m.archived ? ` · <i>left the inbox: ${esc(m.archived)}</i>` : m.inbox ? ' · <i>in the inbox</i>' : ''}</div></div>` : '';
-        return `<div class="bub-wrap ${m.who}">${selBox}<div class="bub ${m.who}${m.mail ? ' mail' : ''}">${m.who === 'in' && m.from && !m.mail ? `<div class="bub-from">${esc(m.from)}</div>` : ''}${mail}${m.text ? `<div class="bub-text">${esc(m.text)}</div>` : ''}${attachmentsHtml(m.attachments)}<div class="bub-t">${m.who === 'in' ? esc(m.from || item.title) : 'you'} · ${esc(item.channel || '')} · ${esc(whenText(m.t, e.now))}</div>${links}</div>${hold}</div>`;
+        return `<div class="bub-wrap ${m.who}">${selBox}<div class="bub ${m.who}${m.mail ? ' mail' : ''}">${m.who === 'in' && m.from && !m.mail ? `<div class="bub-from">${esc(m.from)}</div>` : ''}${mail}${m.text ? `<div class="bub-text">${esc(m.text)}</div>` : ''}${attachmentsHtml(m.attachments)}<div class="bub-t">${m.who === 'in' ? esc(m.from || item.title) : 'you'} · ${esc(item.channel || '')} · ${esc(U.hhmm(m.t))}</div>${links}</div>${hold}</div>`;
       }
-      if (m.who === 'ara' || m.who === 'you') return `<div class="bub ${m.who === 'ara' ? 'in ara' : 'out toara'}${(m.refs || []).length ? ' wide' : ''}">${m.text ? `<div class="bub-text">${esc(m.text)}</div>` : ''}${attachmentsHtml(m.attachments)}${this.embedsHtml(m.refs)}<div class="bub-t">${m.who === 'ara' ? (m.agent ? esc(m.agent) : 'Ara') : 'you → Ara'} · ${esc(whenText(m.t, e.now))}</div></div>`;
+      if (m.who === 'ara' || m.who === 'you') return `<div class="bub ${m.who === 'ara' ? 'in ara' : 'out toara'}${(m.refs || []).length ? ' wide' : ''}">${m.text ? `<div class="bub-text">${esc(m.text)}</div>` : ''}${attachmentsHtml(m.attachments)}${this.embedsHtml(m.refs)}<div class="bub-t">${m.who === 'ara' ? (m.agent ? esc(m.agent) : 'Ara') : 'you → Ara'} · ${esc(U.hhmm(m.t))}</div></div>`;
       if (m.who === 'event') {
         const quotes = this.embedsHtml(m.messages) + this.embedsHtml(m.refs);
         const props = (m.proposals || []).map((p) => `<div class="prop">${this.embedsHtml([p.quote])}<span class="p-what">→ ${esc(p.proposal)} · importance ${p.importance}${p.due != null ? ` · due ${esc(whenText(p.due, e.now))}` : ''}</span></div>`).join('');
         const who = m.author === 'you' ? 'you' : m.author.replace(/^(agent|job):/, (x, k) => (k === 'job' ? 'job ' : ''));
-        return `<div class="event"><div class="ev-head"><span class="ev-kind">${esc(m.kind || 'event')}</span><span class="ev-who">${esc(who)}</span><span class="ev-t">${esc(whenText(m.t, e.now))}</span></div>${m.comment ? `<div class="ev-comment">${esc(m.comment)}</div>` : ''}${m.text ? `<div class="ev-text">${esc(m.text)}</div>` : ''}${quotes}${props}${(m.links || []).length ? `<div class="backlinks">${m.links.map((l) => `<button class="backlink" data-act="view" data-id="${esc(l.id)}">▣ ${esc(l.title)}</button>`).join('')}</div>` : ''}</div>`;
+        return `<div class="event"><div class="ev-head"><span class="ev-kind">${esc(m.kind || 'event')}</span><span class="ev-who">${esc(who)}</span><span class="ev-t">${esc(U.hhmm(m.t))}</span></div>${m.comment ? `<div class="ev-comment">${esc(m.comment)}</div>` : ''}${m.text ? `<div class="ev-text">${esc(m.text)}</div>` : ''}${quotes}${props}${(m.links || []).length ? `<div class="backlinks">${m.links.map((l) => `<button class="backlink" data-act="view" data-id="${esc(l.id)}">▣ ${esc(l.title)}</button>`).join('')}</div>` : ''}</div>`;
       }
       return '';
     }
@@ -338,7 +367,7 @@
       return `<div class="embeds">${refs.map((r) => {
         const x = e.resolve(r); if (!x) return '<div class="embed gone">— no longer there —</div>';
         if (x.message) return `<div class="embed msg"><button class="embed-from" data-act="view" data-id="${esc(x.dossier.id)}">${KIND_GLYPH[x.dossier.kind]} ${esc(x.dossier.title)} · ${esc(e.kindLabel(x.dossier))} ↗</button>${this.bubble(x.dossier, x.message, 0, true)}</div>`;
-        const d = x.dossier; return `<div class="embed row-embed">${isPeer(d) ? this.contactRow(d) : d.state === 'open' && d.actor === 'you' ? this.row(d, 'active') : this.dossierRow(d)}</div>`;
+        const d = x.dossier; return `<div class="embed row-embed cl">${this.chatRow(d)}</div>`;
       }).join('')}</div>`;
     }
     viewHtml() {
@@ -349,7 +378,8 @@
       const kids = e.children(item.id); const parent = e.parentOf(item);
       const treeLine = parent || kids.length ? `<div class="tree-line">${parent ? `<button class="backlink" data-act="view" data-id="${esc(parent.id)}">↑ ${esc(parent.title)}</button>` : ''}${kids.map((k) => `<button class="backlink kid${k.state === 'open' ? ' pend' : ''}" data-act="view" data-id="${esc(k.id)}">↳ ${esc(k.title)} <small>${esc(e.stateText(k))}</small></button>`).join('')}</div>` : '';
       const status = e.stateText(item) + (item.state === 'open' && item.actor === 'you' ? ` · ${lvl} · ${e.urgencyShort(item)}` : '');
-      const bubbles = [...item.stream].sort((a, b) => a.t - b.t).map((m, i) => this.bubble(item, m, i)).join('');
+      const sorted = [...item.stream].sort((a, b) => a.t - b.t); let lastDay = null;
+      const bubbles = sorted.map((m, i) => { const d = U.dayIndex(m.t); const sep = d !== lastDay ? `<div class="day-sep"><span>${esc(dayText(m.t, e.now))}</span></div>` : ''; lastDay = d; return sep + this.bubble(item, m, i); }).join('');
       const chatDraft = peer && this.draft && this.draft.id === item.id && this.draft.tab === 'chat' && this.draft.text ? this.draft : null;
       const draftCard = to === 'ara' && chatDraft ? `<div class="draft-card"><div class="dc-label">Draft to ${esc(item.title)}</div><div class="dc-text">“${esc(chatDraft.text)}”</div><div class="chips">${['Shorter', 'Warmer', 'More formal'].map((s) => `<button class="chipbtn" data-act="rewrite" data-id="${esc(item.id)}" data-style="${s}">${s}</button>`).join('')}<button class="chipbtn primary" data-act="send-now" data-id="${esc(item.id)}" data-tab="chat">Send now</button><button class="chipbtn" data-act="discard-draft" data-id="${esc(item.id)}" data-tab="chat">Discard</button></div></div>` : '';
       const chips = item.chips && item.chips.length && (item.state === 'open' || item.kind === 'standing') ? `<div class="chips">${item.chips.map((c) => `<button class="chipbtn" data-act="chip" data-id="${esc(item.id)}" data-label="${esc(c)}">${esc(c)}</button>`).join('')}</div>` : '';

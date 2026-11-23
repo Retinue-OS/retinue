@@ -106,7 +106,7 @@
         p.lastActivity = ev.waiting_since != null ? ev.waiting_since : (ev.doneAt != null ? ev.doneAt : -3 * DAY);
         if (ev.resolved) { p.state = 'done'; p.doneAt = ev.doneAt != null ? ev.doneAt : -DAY; return; }
         if (ev.paused) { p.state = 'resting'; p.resting = true; return; }
-        if (ev.standing) { p.state = 'quiet'; p.actor = 'Ara'; p.inbox = []; return; }
+        if (ev.standing) { p.state = 'quiet'; p.actor = 'Ara'; p.inbox = []; p.stream.push({ who: 'event', author: 'agent:Ara', kind: 'note', t: -3 * DAY, text: '', comment: ev.body, links: [] }); return; }
         return this._arrive(p, ev.at);
       }
     }
@@ -130,7 +130,8 @@
       const entry = this._entry(msg); item.stream.push(entry); item.body = msg.text; this._touch(item, msg.at);
       // A mail from a sender who is no VIP: visible at once under Contacts, judged at the next batch. Inbox Zero holds it meanwhile.
       if (msg.mail && item.gate !== 'vip') {
-        const iz = this.byId.get('inbox-zero'); if (iz) { iz.inbox.push({ item, entry, triage: tr }); iz.state = 'open'; iz.actor = 'Ara'; iz.body = `${iz.inbox.length} mail${iz.inbox.length === 1 ? '' : 's'} in the inbox, judged at the next batch`; this._touch(iz, msg.at); }
+        // Inbox Zero holds the mail — embedded in its stream as the mail's own bubble — but asks nothing of the user until a batch has a proposal: a mail nobody has judged yet is Ara's to deal with, not the user's.
+        const iz = this.byId.get('inbox-zero'); if (iz) { iz.inbox.push({ item, entry, triage: tr }); iz.stream.push({ who: 'event', author: 'job:gateway', kind: 'status', t: msg.at, text: 'In the inbox:', refs: [this._quote(item, entry)], links: [] }); iz.body = this._inboxBody(iz); this._touch(iz, msg.at); }
         return this.emit({ kind: 'arrive', item, text: `Mail from ${msg.sender} (“${msg.subject}”): in the inbox and in the relationship at once — no model turn; ${msg.sender} is no VIP, so Inbox Zero judges it at the next batch (${this.nextBreakpointText()}).` });
       }
       if (item.state !== 'open') return this._classify(item, tr, msg.at, 'triage');
@@ -162,7 +163,7 @@
       iz.chips = [].concat(...lines.map((l) => l.chips)); iz.body = this._inboxBody(iz);
       this.emit({ kind: 'system', item: iz, text: `Inbox Zero (${reason}): ${lines.map((l) => `${l.item.title} → ${l.proposal}`).join('; ')}. The proposals are in its stream; what you deal with elsewhere leaves the inbox by itself.` });
     }
-    _inboxBody(iz) { const open = iz.inbox.filter((x) => x.entry.inbox); if (!open.length) return 'The inbox is empty.'; const oldest = Math.min(...open.map((x) => x.entry.t)); return `${open.length} mail${open.length === 1 ? '' : 's'} waiting, oldest ${dur(this.now - oldest)}`; }
+    _inboxBody(iz) { const open = iz.inbox.filter((x) => x.entry.inbox); if (!open.length) return 'The inbox is empty.'; const judged = open.filter((x) => x.entry.judged).length; return `${open.length} mail${open.length === 1 ? '' : 's'} in the inbox${judged ? `, ${judged} with a proposal for you` : ', none judged yet'}`; }
     // A mail leaves the inbox: replied to, referenced into a dossier, or marked done.
     _leaveInbox(entry, how) {
       if (!entry || !entry.mail || !entry.inbox) return;
@@ -382,21 +383,27 @@
     lastIn(item) { return [...item.stream].reverse().find((m) => m.who === 'in'); }
     _fill(text, item) { const last = this.lastIn(item); return text.replace('{time}', hhmm(this.now)).replace('{arrived}', hhmm(item.arrived != null ? item.arrived : this.now)).replace('{last}', last ? last.text : ''); }
     // The one-line description a dossier row shows; Ara's opening restates it.
+    // The newest entry of the stream, the way a chat list previews it: who, then the text. Ara's reading of the pending state is the row's second line, not its preview.
     preview(item) {
-      const d = this._dialogue(item);
-      if (item.kind === 'standing') return item.body || '';
-      if (item.state === 'open' && d && d.summary) return this._fill(d.summary, item);
-      const last = [...item.stream].reverse().find((m) => m.who === 'in' || m.who === 'out' || m.who === 'event' || m.who === 'ara');
-      if (!last) return item.body || '';
-      if (last.who === 'in') return `${last.from ? last.from + ': ' : ''}${last.mail ? last.subject : last.text}`;
-      if (last.who === 'out') return `you: ${last.mail && last.subject ? last.subject : last.text}`;
-      return last.text || item.body || '';
+      const last = this.lastEntry(item); if (!last) return item.body || '';
+      if (last.who === 'in') return { who: last.from || (item.kind === 'relationship' || item.kind === 'group' ? '' : item.title), text: last.mail ? last.subject : last.text, mail: !!last.mail };
+      if (last.who === 'out') return { who: 'You', text: last.mail && last.subject ? last.subject : last.text, mail: !!last.mail };
+      if (last.who === 'ara') return { who: last.agent || 'Ara', text: last.text };
+      if (last.who === 'you') return { who: 'You', text: last.text };
+      return { who: last.author === 'you' ? 'You' : String(last.author || '').replace(/^(agent|job):/, ''), text: last.comment || last.text || (last.refs && last.refs.length ? `${last.refs.length} reference${last.refs.length === 1 ? '' : 's'}` : '') };
     }
+    lastEntry(item) { return [...item.stream].sort((a, b) => a.t - b.t).reverse()[0] || null; }
+    summary(item) { const d = this._dialogue(item); return item.state === 'open' && d && d.summary ? this._fill(d.summary, item) : ''; }
+    // Unread: inbound entries since the user last opened the dossier.
+    unread(item) { return item.stream.filter((m) => (m.who === 'in' || m.who === 'ara' || (m.who === 'event' && m.author !== 'you')) && m.t > (item.seenAt != null ? item.seenAt : -Infinity)).length; }
+    markSeen(id) { const item = this.byId.get(id); if (item) item.seenAt = this.now; }
+    // The list the home shows: every dossier with any activity, newest first, starred first; the focus and aperture decide which rows and their decoration.
+    chatList() { return this._starredFirst(this.items.filter((i) => i.state !== 'done' && i.state !== 'resting')); }
     ensureOpening(id) {
       const item = this.byId.get(id); if (!item || item.opened) return item;
       item.opened = true; const d = this._dialogue(item);
       if (item.kind === 'ara' && item.stream.length && !item.chips) { item.chips = d && d.chips ? d.chips.slice() : []; return item; }
-      if (item.kind === 'standing') { if (!item.stream.length) item.stream.push({ who: 'ara', text: item.body, t: this.now }); if (!item.chips) item.chips = []; return item; }
+      if (item.kind === 'standing') { if (!item.chips) item.chips = []; return item; }
       if (item.kind === 'topic' && item.state !== 'open') { item.chips = []; return item; }
       const opening = d && d.opening ? d.opening : (item.kind === 'relationship' || item.kind === 'group' ? null : item.body);
       if (opening) item.stream.push({ who: 'ara', text: this._fill(opening, item), t: item.kind === 'topic' && item.arrived != null && item.arrived > 0 ? item.arrived : this.now, refs: d && d.embed ? d.embed.map((id) => this.ref(id)).filter((x) => this.byId.has(x.id)) : [] });
