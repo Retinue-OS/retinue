@@ -26,9 +26,22 @@ and pin:
     a second tap collapses it, a third shows it from the cache; it survives a
     poll and a full render; loading and error states, with a retry;
   * a tombstone: quiet, who and when, no Original and no attachments;
-  * the poll reconciles: a message on screen whose removal, text, trim or
-    attachments changed is re-rendered in place, the other bubbles and the
-    scroll position untouched, an open Original kept where it still applies;
+  * the poll reconciles: a message on screen whose removal, text, trim,
+    attachments or author changed is re-rendered in place, the other bubbles
+    untouched, an open Original kept where it still applies;
+  * the reader's place is kept by what is on screen, never by a number: a
+    bubble changing height above the view, a long Original closed from its
+    foot (its top comes into view), a long mail turned tombstone under the
+    reader (it stays on screen);
+  * a mail older than the newest (a merge, a late parent) goes in at its
+    place by time, with its day separator, the waterline and the Mark as
+    read row right, the bubbles around it untouched;
+  * focus never falls to the document when the control pressed is replaced:
+    Try again, a tombstone, the header disclosure;
+  * the frame of an HTML mail with little or no plain text opens at its cap;
+  * a chat a merge absorbed: the page follows `merged_into` (410) quietly,
+    from a poll, a load, a reload of the old id and an Original; a 404 is a
+    chat gone, and a `merged_into` that names nowhere usable is too;
   * `can_send: false` replaces the composer, the chips and the draft with the
     server's reason, drops the grip, adopts and saves no draft; a flip
     re-renders;
@@ -62,7 +75,19 @@ import { readFileSync } from 'node:fs';
 // The thread is an ordered list of top-level nodes, each the HTML of one
 // <div> the page put there. A node answers the few queries the page makes of
 // a bubble: its frame slot (which records what is appended to it) and its
-// Original control (which records focus).
+// controls (which record focus). Each node has a height by kind, so the
+// thread has geometry: a node's box is where the heights before it put it,
+// less the scroll offset, which is clamped as a browser clamps it.
+const HEIGHT = { sep: 30, row: 40, msg: 100, tomb: 40, open: 800, wait: 200, other: 50 };
+function heightOf(html) {
+  const open = html.slice(0, html.indexOf('>') + 1);
+  if (open.includes('day-sep') || open.includes('unread-sep')) return HEIGHT.sep;
+  if (open.includes('data-mark-read-row')) return HEIGHT.row;
+  if (!open.includes('data-mid')) return HEIGHT.other;
+  if (open.includes(' tomb')) return HEIGHT.tomb;
+  if (open.includes('orig-open')) return html.includes('class="orig"') ? HEIGHT.open : HEIGHT.wait;
+  return HEIGHT.msg;
+}
 function chunks(html) {
   const out = [];
   let depth = 0;
@@ -74,9 +99,17 @@ function chunks(html) {
   return out;
 }
 class Ctl {
-  constructor(attr) { this.attr = attr; }
-  focus() { globalThis.focused = this; document.activeElement = this; }
-  hasAttribute(n) { return n === this.attr; }
+  constructor(attr, sel = `[${attr}]`, native = true) {
+    this.attr = attr; this.sel = sel; this.native = native; this.attrs = new Map();
+  }
+  focus(opts) { globalThis.focused = this; globalThis.focusOpts = opts; document.activeElement = this; }
+  hasAttribute(n) { return n === this.attr || this.attrs.has(n); }
+  setAttribute(n, v) { this.attrs.set(n, String(v)); }
+  getAttribute(n) { return this.attrs.has(n) ? this.attrs.get(n) : null; }
+  matches(s) {
+    if (s === 'button, summary, a[href], [tabindex]') return this.native || this.attrs.has('tabindex');
+    return s === this.sel;
+  }
 }
 class Slot {
   constructor() { this.children = []; }
@@ -97,14 +130,23 @@ class Node {
     if (this.mid) this.mid = this.mid.replace(/&amp;/g, '&').replace(/&quot;/g, '"').replace(/&#39;/g, "'")
       .replace(/&lt;/g, '<').replace(/&gt;/g, '>');
     this.isRow = open.includes('data-mark-read-row');
+    this.isDay = open.includes('class="day-sep"');
+    this.isNew = open.includes('class="unread-sep"');
+    this.isEmpty = open.includes('class="center');
+    this.height = heightOf(html);
     this.button = this.isRow ? new Ctl('data-mark-read') : null;
     this._slot = null;
     this._toggle = null;
+    this._retry = null;
+    this._summary = null;
+    this._bubble = null;
   }
-  getAttribute(n) { return n === 'data-mid' ? this.mid : null; }
-  hasAttribute() { return false; }
-  setAttribute() {}
-  focus() {}
+  getAttribute(n) { return n === 'data-mid' ? this.mid : (this.attrs && this.attrs.get(n)) || null; }
+  hasAttribute(n) { return !!this.attrs && this.attrs.has(n); }
+  setAttribute(n, v) { (this.attrs = this.attrs || new Map()).set(n, String(v)); }
+  matches() { return false; }
+  focus(opts) { globalThis.focused = this; globalThis.focusOpts = opts; document.activeElement = this; }
+  getBoundingClientRect() { return this.thread.rectOf(this); }
   querySelector(sel) {
     if (sel === '[data-orig-frame]') {
       return this.html.includes('data-orig-frame') ? (this._slot = this._slot || new Slot()) : null;
@@ -112,40 +154,72 @@ class Node {
     if (sel === '[data-orig-toggle]') {
       return this.html.includes('data-orig-toggle') ? (this._toggle = this._toggle || new Ctl('data-orig-toggle')) : null;
     }
+    if (sel === '[data-orig-retry]') {
+      return this.html.includes('data-orig-retry') ? (this._retry = this._retry || new Ctl('data-orig-retry')) : null;
+    }
+    if (sel === '[data-orig-raw] > summary') {
+      return this.html.includes('data-orig-raw') ? (this._summary = this._summary || new Ctl('', sel)) : null;
+    }
+    if (sel === '.bubble') {
+      return this.html.includes('class="bubble"') ? (this._bubble = this._bubble || new Ctl('', sel, false)) : null;
+    }
     return null;
   }
-  contains(x) { return !!x && (x === this._toggle || x === this.button); }
+  contains(x) {
+    return !!x && [this._toggle, this._retry, this._summary, this._bubble, this.button].includes(x);
+  }
   remove() { this.thread.nodes = this.thread.nodes.filter((x) => x !== this); }
   replaceWith(n) { const i = this.thread.nodes.indexOf(this); this.thread.nodes[i] = n; n.thread = this.thread; }
   insertAdjacentHTML(where, html) {
-    assert.equal(where, 'afterend');
-    const i = this.thread.nodes.indexOf(this);
-    this.thread.nodes.splice(i + 1, 0, ...chunks(html).map((h) => new Node(this.thread, h)));
+    assert.ok(where === 'afterend' || where === 'beforebegin', where);
+    const i = this.thread.nodes.indexOf(this) + (where === 'afterend' ? 1 : 0);
+    this.thread.nodes.splice(i, 0, ...chunks(html).map((h) => new Node(this.thread, h)));
   }
 }
 class Thread {
   constructor(html) {
     this.nodes = chunks(html).map((h) => new Node(this, h));
-    this.scrollTop = 0;
-    this.clientHeight = 500;
+    this._top = 0;
+    this.clientHeight = 300;
     this.attrs = new Map();
   }
   hasAttribute(n) { return this.attrs.has(n); }
   setAttribute(n, v) { this.attrs.set(n, String(v)); }
   focus() {}
-  get scrollHeight() { return 1000; }
+  get scrollHeight() { return Math.max(this.clientHeight, this.nodes.reduce((a, n) => a + n.height, 0)); }
+  get scrollTop() { return this._top; }
+  set scrollTop(v) { this._top = Math.max(0, Math.min(Number(v) || 0, this.scrollHeight - this.clientHeight)); }
+  getBoundingClientRect() { return { top: 0, bottom: this.clientHeight }; }
+  rectOf(node) {
+    let y = 0;
+    for (const n of this.nodes) { if (n === node) break; y += n.height; }
+    const top = y - this._top;
+    return { top, bottom: top + node.height };
+  }
+  // Scroll so the node's box starts `at` px below the view's top.
+  scrollToNode(mid, at = 0) { this.scrollTop += this.rectOf(this.node(mid)).top - at; }
   querySelector(sel) {
     if (sel === '[data-mark-read-row]') return this.nodes.find((n) => n.isRow) || null;
     if (sel === '[data-mark-read-row] button') { const r = this.nodes.find((n) => n.isRow); return r ? r.button : null; }
+    if (sel === ':scope > .center') return this.nodes.find((n) => n.isEmpty) || null;
     return null;
   }
-  querySelectorAll(sel) { return sel === '[data-mid]' ? this.nodes.filter((n) => n.mid) : []; }
+  querySelectorAll(sel) {
+    if (sel === '[data-mid]') return this.nodes.filter((n) => n.mid);
+    if (sel === '.day-sep, .unread-sep') return this.nodes.filter((n) => n.isDay || n.isNew);
+    return [];
+  }
   insertAdjacentHTML(where, html) {
     assert.equal(where, 'beforeend');
     this.nodes.push(...chunks(html).map((h) => new Node(this, h)));
   }
   node(mid) { return this.nodes.find((n) => n.mid === mid); }
   layout() { return this.nodes.map((n) => (n.mid ? n.mid : n.isRow ? 'ROW' : null)).filter(Boolean); }
+  // Everything, separators included: 'DAY <label>', 'NEW', 'EMPTY'.
+  layoutFull() {
+    return this.nodes.map((n) => (n.mid ? n.mid : n.isRow ? 'ROW' : n.isNew ? 'NEW'
+      : n.isDay ? `DAY ${/<span>([^<]*)<\/span>/.exec(n.html)[1]}` : n.isEmpty ? 'EMPTY' : '?'));
+  }
 }
 const registry = new Map();
 class FakeElement {
@@ -185,7 +259,9 @@ globalThis.document = {
 };
 globalThis.window = globalThis;
 globalThis.innerHeight = 800;
-globalThis.location = { hash: '', pathname: '/chat.html', search: '', href: 'http://dash/chat.html' };
+const replaced = [];
+globalThis.location = { hash: '', pathname: '/chat.html', search: '', href: 'http://dash/chat.html',
+                        replace: (u) => replaced.push(String(u)) };
 globalThis.addEventListener = () => {};
 globalThis.removeEventListener = () => {};
 globalThis.dispatchEvent = () => true;
@@ -371,6 +447,7 @@ const mail = (id, direction, ts, extra = {}) => ({
   subject: 'Re: Quarterly numbers', recipients: [ACCT], cc: [], trim: 'deterministic',
   removed: false, removed_at: null, original: orig(`t${id}`), attachments: [], ...extra,
 });
+const MORE = ['m5', 'm6', 'm7', 'm8'].map((id, i) => mail(id, 'in', `2026-11-20T1${i}:00:00Z`));
 const BASE = [
   mail('m1', 'in', '2026-11-20T08:00:00Z', { subject: 'Quarterly numbers' }),
   mail('m2', 'out', '2026-11-20T08:05:00Z', { author: 'device', sender: ACCT, sender_name: 'Me' }),
@@ -384,6 +461,9 @@ async function open(chat = {}, messages = BASE, id = ID) {
   log.length = 0;
   frames.length = 0;
   renders = 0;
+  replaced.length = 0;
+  document.activeElement = null;
+  globalThis.focused = null;
   const el = new Page();
   el.attachShadow({ mode: 'open' });
   el._id = id;
@@ -413,6 +493,11 @@ async function poll(el, chat, messages) {
     .answer({ chat: pageSummary(chat), messages: messages.map((m) => JSON.parse(JSON.stringify(m))) });
   await p;
 }
+// Whether focus is on the control `sel` of the bubble `mid` as it now is.
+const focusedOn = (el, mid, sel, what = sel) => {
+  const c = el._thread.node(mid).querySelector(sel);
+  assert.ok(c && globalThis.focused === c, `focus on ${what} of ${mid}`);
+};
 const bubble = (el, mid) => { const n = el._thread.node(mid); assert.ok(n, `bubble ${mid}`); return n.html; };
 const DOC = (tok, extra = {}) => ({
   id: 'x',
@@ -545,14 +630,24 @@ await ok('a tap expands the whole mail in place; a second collapses it; a third 
   assert.equal(el._thread.node('m3')._slot.children[0].getAttribute('src'), `${orig('tm3')}.html`);
 });
 
-await ok('focus stays on the Original control; the scroll offset is kept', async () => {
-  const el = await open();
-  el._thread.scrollTop = 120;
-  document.activeElement = el._thread.node('m1').querySelector('[data-orig-toggle]');
+await ok('focus stays on the Original control; the mail opens where it is', async () => {
+  const el = await open({}, [...BASE, ...MORE]);
+  el._thread.scrollToNode('m2', 40);
+  document.activeElement = el._thread.node('m2').querySelector('[data-orig-toggle]');
   globalThis.focused = null;
-  await expand(el, 'm1', DOC('tm1'));
-  assert.equal(el._thread.scrollTop, 120);
-  assert.ok(globalThis.focused && globalThis.focused === el._thread.node('m1')._toggle, 'focus on the new control');
+  await expand(el, 'm2', DOC('tm2'));
+  assert.equal(el._thread.rectOf(el._thread.node('m2')).top, 40, 'the bubble\'s top stays put');
+  focusedOn(el, 'm2', '[data-orig-toggle]', 'the new control');
+  assert.deepEqual(globalThis.focusOpts, { preventScroll: true });
+  // Opened from a bubble whose top had scrolled above the view: the top of
+  // the original comes into view.
+  el._toggleOriginal('m2');
+  el._thread.scrollToNode('m3', -60);
+  el._toggleOriginal('m3');
+  take((w) => w.url === orig('tm3'), 'the original').answer(DOC('tm3'));
+  await settle();
+  await settle();
+  assert.equal(el._thread.rectOf(el._thread.node('m3')).top, 0);
   document.activeElement = null;
 });
 
@@ -647,7 +742,10 @@ await ok('the poll re-renders a changed message in place and nothing else', asyn
   const el = await open({ unread: 1, list_group: 'unread' });
   assert.deepEqual(el._thread.layout(), ['m1', 'm2', 'm3', 'm4', 'ROW']);
   await expand(el, 'm3', DOC('tm3'));
-  el._thread.scrollTop = 200;
+  // A short view, so the thread can still be scrolled there once the long
+  // Original has gone.
+  el._thread.clientHeight = 100;
+  el._thread.scrollToNode('m2', -20);
   const kept = Object.fromEntries(['m1', 'm2', 'm4'].map((id) => [id, el._thread.node(id)]));
   // m3 is removed in a mail client; m1's attachments gain their size.
   const next = BASE.map((m) => (m.id === 'm3'
@@ -662,11 +760,11 @@ await ok('the poll re-renders a changed message in place and nothing else', asyn
   assert.notEqual(el._thread.node('m1'), kept.m1);
   assert.equal(el._thread.node('m2'), kept.m2, 'untouched bubbles are the same nodes');
   assert.equal(el._thread.node('m4'), kept.m4);
-  assert.equal(el._thread.scrollTop, 200, 'the scroll position is kept');
+  assert.equal(el._thread.rectOf(el._thread.node('m2')).top, -20, 'the reader\'s message keeps its place');
   // A reader at the bottom stays at the bottom.
-  el._thread.scrollTop = 500;
+  el._thread.scrollTop = 1e6;
   await poll(el, { unread: 1, list_group: 'unread' }, next.map((m) => (m.id === 'm4' ? { ...m, text: 'edited' } : m)));
-  assert.equal(el._thread.scrollTop, 1000);
+  assert.equal(el._thread.scrollTop, el._thread.scrollHeight - el._thread.clientHeight);
   assert.ok(bubble(el, 'm4').includes('edited'));
 });
 
@@ -736,6 +834,246 @@ await ok('messenger chats are unchanged', async () => {
   assert.ok(el._chatMsgHtml(msgs[0]).includes('>Mara</small>'));
   assert.ok(!el._chatMsgHtml({ ...msgs[0], sender_name: null }).includes('class="who sender"'), 'no address fallback off mail');
   assert.ok(!el._chatMsgHtml({ ...msgs[0], subject: 'X' }).includes('msg-subj'), 'subjects are mail only');
+});
+
+await ok('a mail older than the newest goes in at its place by time', async () => {
+  // Mon and Fri on screen, Fri's mails unread; a merge brings Wed, and Sat
+  // arrives.
+  const mon = mail('mon', 'in', '2026-11-16T10:00:00Z');
+  const fri = ['fri', 'fb', 'fc', 'fd'].map((id, i) => mail(id, 'in', `2026-11-20T1${i}:00:00Z`));
+  const el = await open({ unread: 4, list_group: 'unread' }, [mon, ...fri]);
+  const full = () => el._thread.layoutFull().map((x) => (x.startsWith('DAY') ? 'DAY' : x));
+  assert.deepEqual(full(), ['DAY', 'mon', 'DAY', 'NEW', 'fri', 'fb', 'fc', 'fd', 'ROW']);
+  await expand(el, 'mon', DOC('tmon'));
+  const keep = { mon: el._thread.node('mon'), fri: el._thread.node('fri') };
+  // The reader looks at Fri, 20px below the view's top.
+  el._thread.scrollToNode('fri', 20);
+  const wed = mail('wed', 'in', '2026-11-18T14:00:00Z');
+  const sat = mail('sat', 'out', '2026-11-21T08:00:00Z', { author: 'device', sender: ACCT });
+  await poll(el, { unread: 4, list_group: 'unread' }, [mon, wed, ...fri, sat]);
+  assert.deepEqual(el._messages.map((m) => m.id), ['mon', 'wed', 'fri', 'fb', 'fc', 'fd', 'sat'], 'in time order');
+  assert.deepEqual(full(), ['DAY', 'mon', 'DAY', 'wed', 'DAY', 'NEW', 'fri', 'fb', 'fc', 'fd', 'ROW', 'DAY', 'sat']);
+  const labels = el._thread.layoutFull().filter((x) => x.startsWith('DAY'));
+  assert.equal(new Set(labels).size, 4, `one separator a day: ${labels}`);
+  assert.equal(el._thread.node('mon'), keep.mon, 'the bubbles around it are the same nodes');
+  assert.equal(el._thread.node('fri'), keep.fri);
+  assert.equal(keep.mon._slot.children.length, 1, 'the open Original\'s frame is untouched');
+  assert.equal(el._thread.rectOf(keep.fri).top, 20, 'the reader keeps their message');
+  assert.equal(el._markReadAnchor().id, 'fd', 'the row is under the newest inbound mail');
+  // A late parent older than everything; an inbound newer than Fri's but
+  // older than Sat: the row follows the newest inbound one.
+  const parent = mail('parent', 'in', '2026-11-15T08:00:00Z');
+  const fri2 = mail('fri2', 'in', '2026-11-20T18:00:00Z');
+  await poll(el, { unread: 5, list_group: 'unread' }, [parent, mon, wed, ...fri, fri2, sat]);
+  assert.deepEqual(full(), ['DAY', 'parent', 'DAY', 'mon', 'DAY', 'wed', 'DAY', 'NEW', 'fri', 'fb', 'fc', 'fd',
+                            'fri2', 'ROW', 'DAY', 'sat']);
+  // Without a usable time: at the end, as before.
+  await poll(el, { unread: 5, list_group: 'unread' },
+             [parent, mon, wed, ...fri, fri2, sat, mail('x', 'in', 'not a date'), mail('y', 'in', undefined)]);
+  assert.deepEqual(el._messages.slice(-2).map((m) => m.id), ['x', 'y']);
+  assert.deepEqual(el._thread.layout().slice(-3), ['x', 'y', 'ROW']);
+});
+
+await ok('a late mail with the reader at the bottom keeps them there; an empty thread fills', async () => {
+  const el = await open({}, [...BASE, ...MORE]);
+  el._thread.scrollTop = 1e6;
+  await poll(el, {}, [mail('early', 'in', '2026-11-20T07:00:00Z'), ...BASE, ...MORE]);
+  assert.equal(el._thread.layout()[0], 'early');
+  assert.equal(el._thread.scrollTop, el._thread.scrollHeight - el._thread.clientHeight);
+  const empty = await open({}, []);
+  assert.deepEqual(empty._thread.layoutFull(), ['EMPTY']);
+  await poll(empty, {}, [mail('first', 'in', '2026-11-20T07:00:00Z')]);
+  assert.deepEqual(empty._thread.layoutFull().map((x) => x.split(' ')[0]), ['DAY', 'first']);
+});
+
+await ok('the reader keeps their place when a bubble changes height above the view', async () => {
+  // A long Original closed from its foot: the mail comes back into view.
+  const el = await open({}, [...BASE, ...MORE]);
+  await expand(el, 'm3', DOC('tm3'));
+  const t = el._thread;
+  t.scrollTop += t.rectOf(t.node('m3')).bottom - 130;
+  assert.ok(t.rectOf(t.node('m3')).top < -600, 'the bubble\'s top is far above the view');
+  document.activeElement = t.node('m3').querySelector('[data-orig-toggle]');
+  el._toggleOriginal('m3');
+  assert.equal(t.rectOf(t.node('m3')).top, 0, 'the closed mail at the top of the view');
+  focusedOn(el, 'm3', '[data-orig-toggle]', 'its control');
+  document.activeElement = null;
+  // A poll: a long mail entirely above the view turns tombstone; the reader's
+  // message stays where it is.
+  el._toggleOriginal('m3');
+  assert.equal(wire.length, 0, 'from the cache');
+  t.scrollToNode('m5', 10);
+  assert.ok(t.rectOf(t.node('m3')).bottom < 0);
+  const gone = (m) => (m.id === 'm3' ? { ...m, removed: true, removed_at: '2026-11-21T07:00:00Z', text: '' } : m);
+  await poll(el, {}, [...BASE, ...MORE].map(gone));
+  assert.ok(bubble(el, 'm3').includes('tomb'));
+  assert.equal(t.rectOf(t.node('m5')).top, 10, 'the reader\'s message did not move');
+  // A long mail under the reader (its top above, its foot in view) turns
+  // tombstone: it stays on screen, at the top of the view.
+  const el2 = await open({}, [...BASE, ...MORE]);
+  await expand(el2, 'm3', DOC('tm3'));
+  el2._thread.scrollToNode('m3', -600);
+  await poll(el2, {}, [...BASE, ...MORE].map(gone));
+  assert.equal(el2._thread.rectOf(el2._thread.node('m3')).top, 0);
+  // A message changing below the view moves nothing.
+  const el3 = await open({}, [...BASE, ...MORE]);
+  el3._thread.scrollToNode('m2', -10);
+  await poll(el3, {}, [...BASE, ...MORE].map((m) => (m.id === 'm8' ? { ...m, removed: true } : m)));
+  assert.equal(el3._thread.rectOf(el3._thread.node('m2')).top, -10);
+});
+
+await ok('focus never falls to the document when the control pressed is replaced', async () => {
+  const el = await open();
+  const req = await expand(el, 'm1');
+  req.answer({ error: 'x' }, 502);
+  await settle();
+  await settle();
+  // Try again: while it loads, focus rests on the Original control …
+  document.activeElement = el._thread.node('m1').querySelector('[data-orig-retry]');
+  el._loadOriginal(el._messages.find((m) => m.id === 'm1'), orig('tm1'));
+  focusedOn(el, 'm1', '[data-orig-toggle]', 'the Original control while loading');
+  // … and goes back to Try again when the retry fails too.
+  take((w) => w.url === orig('tm1'), 'the retry').answer({ error: 'x' }, 502);
+  await settle();
+  await settle();
+  assert.ok(bubble(el, 'm1').includes('data-orig-retry'));
+  focusedOn(el, 'm1', '[data-orig-retry]', 'the new Try again');
+  // A retry that works: the Original control.
+  el._loadOriginal(el._messages.find((m) => m.id === 'm1'), orig('tm1'));
+  take((w) => w.url === orig('tm1'), 'the retry').answer(DOC('tm1'));
+  await settle();
+  await settle();
+  focusedOn(el, 'm1', '[data-orig-toggle]');
+  // The full header block's disclosure, through a poll's re-render.
+  document.activeElement = el._thread.node('m1').querySelector('[data-orig-raw] > summary');
+  await poll(el, {}, BASE.map((m) => (m.id === 'm1' ? { ...m, text: 'better', trim: 'model' } : m)));
+  focusedOn(el, 'm1', '[data-orig-raw] > summary', 'the new disclosure');
+  // The mail is removed in a client while its control has focus: the
+  // tombstone takes it, made focusable for that.
+  document.activeElement = el._thread.node('m1').querySelector('[data-orig-toggle]');
+  await poll(el, {}, BASE.map((m) => (m.id === 'm1' ? { ...m, removed: true, text: '' } : m)));
+  assert.ok(bubble(el, 'm1').includes('tomb'));
+  focusedOn(el, 'm1', '.bubble', 'the tombstone');
+  const b = el._thread.node('m1')._bubble;
+  assert.equal(b.getAttribute('tabindex'), '-1');
+  assert.deepEqual(globalThis.focusOpts, { preventScroll: true });
+  // Focus elsewhere is not taken.
+  globalThis.focused = null;
+  document.activeElement = null;
+  await poll(el, {}, BASE.map((m) => (m.id === 'm3' ? { ...m, text: 'edited' } : m)));
+  assert.equal(globalThis.focused, null);
+  // The message itself focused (where a lapsed Mark as read row leaves it).
+  const before = el._thread.node('m3');
+  document.activeElement = before;
+  await poll(el, {}, BASE.map((m) => (m.id === 'm3' ? { ...m, text: 'edited again' } : m)));
+  assert.notEqual(el._thread.node('m3'), before);
+  assert.equal(globalThis.focused, el._thread.node('m3'), 'on the new message');
+  assert.equal(el._thread.node('m3').getAttribute('tabindex'), '-1');
+  document.activeElement = null;
+});
+
+await ok('an HTML mail with little or no plain text opens its frame at the cap', async () => {
+  const el = await open();
+  assert.equal(el._frameHeight({ text: '' }), 560, 'HTML only');
+  assert.equal(el._frameHeight({}), 560);
+  assert.equal(el._frameHeight({ text: '  View this mail in your browser: https://x.example/v  ' }), 560, 'a stub');
+  const long = Array.from({ length: 12 }, () => 'word '.repeat(14)).join('\n');
+  assert.equal(el._frameHeight({ text: long }), 12 * 20 + 48, 'a real plain part: estimated');
+  assert.equal(el._frameHeight({ text: 'x'.repeat(72 * 40) }), 560, 'never past the cap');
+  await expand(el, 'm1', DOC('tm1', { text: '' }));
+  assert.ok(bubble(el, 'm1').includes('data-orig-frame style="height:560px"'), bubble(el, 'm1'));
+});
+
+await ok('a changed author re-renders the bubble', async () => {
+  const el = await open();
+  assert.ok(bubble(el, 'm2').includes('by-device'));
+  await poll(el, {}, BASE.map((m) => (m.id === 'm2' ? { ...m, author: 'agent', agent: 'Ara' } : m)));
+  assert.ok(bubble(el, 'm2').includes('class="msg out by-agent"'), bubble(el, 'm2'));
+  assert.ok(bubble(el, 'm2').includes('<small class="who">Ara</small>'));
+  await poll(el, {}, BASE.map((m) => (m.id === 'm2' ? { ...m, author: 'agent', agent: 'Coach' } : m)));
+  assert.ok(bubble(el, 'm2').includes('<small class="who">Coach</small>'), 'the agent too');
+});
+
+await ok('a chat a merge absorbed: the page follows it, quietly', async () => {
+  const SURV = 'email:~me@example.org:older@mail.example.com';
+  const to = `/chat.html?id=${encodeURIComponent(SURV)}`;
+  // From a poll.
+  let el = await open();
+  const notes = [];
+  el._showNote = (h) => notes.push(h);
+  let p = el._poll();
+  take((w) => w.url === MSG_URL, 'the poll').answer({ error: 'merged', merged_into: SURV }, 410);
+  await p;
+  assert.deepEqual(replaced, [to]);
+  assert.deepEqual(notes, [], 'no note');
+  await el._poll();
+  assert.equal(wire.length, 0, 'the poll stopped');
+  // Gone without a word (a plain 404): what is shown stays, the poll stops.
+  el = await open();
+  el._showNote = (h) => notes.push(h);
+  p = el._poll();
+  take((w) => w.url === MSG_URL, 'the poll').answer({ error: 'not found' }, 404);
+  await p;
+  assert.deepEqual(replaced, []);
+  assert.equal(notes.length, 1);
+  assert.equal(el._state, 'ok');
+  assert.deepEqual(el._thread.layout(), ['m1', 'm2', 'm3', 'm4']);
+  await el._poll();
+  assert.equal(wire.length, 0);
+  // A 410 that names nowhere usable is a chat gone, too.
+  for (const bad of [ID, 42, null, '', 'x'.repeat(4000)]) {
+    el = await open();
+    el._showNote = () => {};
+    p = el._poll();
+    take((w) => w.url === MSG_URL, 'the poll').answer({ merged_into: bad }, 410);
+    await p;
+    assert.deepEqual(replaced, [], String(bad).slice(0, 20));
+  }
+  // Whatever it names stays a chat id on this page.
+  el = await open();
+  p = el._poll();
+  take((w) => w.url === MSG_URL, 'the poll').answer({ merged_into: 'javascript:alert(1)//?id=x#y' }, 410);
+  await p;
+  assert.deepEqual(replaced, [`/chat.html?id=${encodeURIComponent('javascript:alert(1)//?id=x#y')}`]);
+  // From an Original's fetch.
+  el = await open();
+  const req = await expand(el, 'm1');
+  req.answer({ merged_into: SURV }, 410);
+  await settle();
+  await settle();
+  assert.deepEqual(replaced, [to]);
+  // A reload of the old id: not in the list; its messages say where it went.
+  for (const [status, body, follows] of [[410, { merged_into: SURV }, true], [404, {}, false]]) {
+    wire.length = 0;
+    replaced.length = 0;
+    const page = new Page();
+    page.attachShadow({ mode: 'open' });
+    page._id = ID;
+    page.render = () => {};
+    const loading = page._load();
+    take((w) => w.url === '/chats', 'the list').answer({ chats: [] });
+    await settle();
+    take((w) => w.url === MSG_URL, 'the probe').answer(body, status);
+    await loading;
+    assert.deepEqual(replaced, follows ? [to] : []);
+    if (follows) assert.notEqual(page._state, 'error');
+    else assert.equal(page._error, 'This chat is not in the chat list.');
+    assert.ok(!page._pollTimer, 'no poll');
+  }
+  // Listed still (a list a step behind), its messages already merged.
+  wire.length = 0;
+  replaced.length = 0;
+  const page = new Page();
+  page.attachShadow({ mode: 'open' });
+  page._id = ID;
+  page.render = () => {};
+  const loading = page._load();
+  take((w) => w.url === '/chats', 'the list').answer({ chats: [pageSummary()] });
+  await settle();
+  take((w) => w.url === MSG_URL, 'the messages').answer({ merged_into: SURV }, 410);
+  await loading;
+  assert.deepEqual(replaced, [to]);
+  assert.ok(!page._pollTimer);
 });
 
 await ok('the reference documents carry a mail thread that renders', async () => {

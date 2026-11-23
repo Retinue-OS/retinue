@@ -198,9 +198,20 @@ const FRAME_SANDBOX = 'allow-popups allow-popups-to-escape-sandbox';
 // The frame cannot be measured from here (a sandboxed document of its own
 // origin), so its height is estimated from the mail's plain text — between
 // these bounds, the CSS cap on small screens, and the user's own drag (the
-// box resizes vertically); the frame scrolls inside for the rest.
+// box resizes vertically where the browser offers a handle); the frame
+// scrolls inside for the rest. A plain part shorter than FRAME_STUB_CHARS
+// says nothing about the HTML beside it — an HTML-only mail has none, a
+// "view this mail in your browser" stub next to nothing — and the box opens
+// at FRAME_MAX_PX: too short is the costly guess (a phone gives the box no
+// handle, and the mail reads through a slot), too tall costs a scroll, and
+// the CSS cap keeps it on the screen.
 const FRAME_MIN_PX = 160;
 const FRAME_MAX_PX = 560;
+const FRAME_STUB_CHARS = 200;
+// The controls of a bubble that a re-render gives the focus back to, by kind
+// (_replaceBubble): the retry of a failed Original, the full header block's
+// disclosure, the Original control itself.
+const FOCUS_KINDS = ['[data-orig-retry]', '[data-orig-raw] > summary', '[data-orig-toggle]'];
 
 function ownOriginal(url, chatId) {
   if (typeof url !== 'string' || !chatId) return '';
@@ -246,11 +257,18 @@ function subjectDiffers(subject, name) {
 // What of a message, when it changes on the server, changes its bubble — the
 // poll re-renders a bubble on screen in place when this differs
 // (_reconcileChanged): a mail removed in a client, a better trim, an
-// attachment's facts filled in.
+// attachment's facts filled in, the author of a mail first seen in the Sent
+// folder named by the note that follows it (`device` → Ara or the user).
 function msgSig(m) {
   return JSON.stringify([!!m.removed, m.removed_at || null, m.text || '', m.trim || null,
     Array.isArray(m.attachments) ? m.attachments : [], m.subject || null, m.original || null,
-    m.sender_name || null]);
+    m.sender_name || null, m.author || null, m.agent || null]);
+}
+
+// Epoch milliseconds of a message's timestamp, or NaN — which compares as
+// neither older nor newer, so a message without a usable time goes at the end.
+function tsMs(m) {
+  return m && typeof m.ts === 'string' ? Date.parse(m.ts) : NaN;
 }
 
 // Splitter persistence, per device — same pattern as layout.js (STORE_KEY).
@@ -463,6 +481,7 @@ class RetinueChatPage extends HTMLElement {
     this._draftTimer = null;
     this._draftInflight = null;
     this._pollTimer = null;
+    this._pollDone = false;    // the chat moved or went: no more polls (_stopPolling)
     this._onVis = null;
     // Mark as read (_markRead): a read or its undo on the wire, the Undo still
     // offered ({restore, marked, unread, listGroup, armedAt, timer} — what
@@ -678,6 +697,16 @@ class RetinueChatPage extends HTMLElement {
       const list = await listRes.json();
       const summary = (list.chats || []).find((c) => c.id === this._id);
       if (!summary || !summary.messages) {
+        // Not listed: perhaps a thread a merge folded into another chat (a
+        // reload, a push or a bookmark of the old id). Its messages' address
+        // is the one place the server says where it went; asked only here,
+        // on the way to the error, never to load a chat.
+        let moved = false;
+        try {
+          const probe = await fetch(`/chats/${encodeURIComponent(this._id)}/messages`, { cache: 'no-store' });
+          moved = (await this._whereGone(probe)) === 'moved';
+        } catch (_e) { moved = false; }
+        if (moved) return;
         this._state = 'error';
         this._error = 'This chat is not in the chat list.';
         this.render();
@@ -686,6 +715,14 @@ class RetinueChatPage extends HTMLElement {
       this._msgUrl = summary.messages;
       const msgRes = await fetch(this._msgUrl, { cache: 'no-store' });
       if (msgRes.status === 502) throw new Error('store');
+      const gone = msgRes.ok ? '' : await this._whereGone(msgRes);
+      if (gone === 'moved') return;
+      if (gone) {
+        this._state = 'error';
+        this._error = 'This chat is not in the chat list.';
+        this.render();
+        return;
+      }
       if (!msgRes.ok) throw new Error(String(msgRes.status));
       const doc = await msgRes.json();
       this._chat = doc.chat || summary;
@@ -792,9 +829,28 @@ class RetinueChatPage extends HTMLElement {
     return !!t && t.scrollHeight - t.scrollTop - t.clientHeight < NEAR_BOTTOM_PX;
   }
 
+  // A chat a merge absorbed (docs/mail-chats.md, "Threading", case 4): the
+  // server answers its documents 410 with `merged_into`, the surviving chat,
+  // and the page follows — quietly, replacing this history entry, so Back
+  // does not lead to the dead id. A 404, or a 410 that names nowhere usable,
+  // is a chat gone. One answer `res` (not ok) → 'moved' (the page is on its
+  // way to the survivor), 'gone', or '' for an answer of any other kind.
+  async _whereGone(res) {
+    if (!res || (res.status !== 410 && res.status !== 404)) return '';
+    let to = '';
+    try {
+      const doc = await res.json();
+      to = doc && typeof doc.merged_into === 'string' ? doc.merged_into : '';
+    } catch (_e) { to = ''; }
+    if (!to || to === this._id || to.length > 2048) return 'gone';
+    this._stopPolling();
+    location.replace(`/chat.html?id=${encodeURIComponent(to)}`);
+    return 'moved';
+  }
+
   // ── Live mirror: poll ──────────────────────────────────────────────────────
   _startPolling() {
-    if (this._pollTimer) return;
+    if (this._pollTimer || this._pollDone) return;
     this._pollTimer = setInterval(() => this._poll(), POLL_MS);
     this._onVis = () => {
       // Coming back to a visible page: catch up at once. Looking is not
@@ -804,35 +860,52 @@ class RetinueChatPage extends HTMLElement {
     document.addEventListener('visibilitychange', this._onVis);
   }
 
+  // For good: the chat moved (_whereGone) or went.
+  _stopPolling() {
+    this._pollDone = true;
+    if (this._pollTimer) clearInterval(this._pollTimer);
+    this._pollTimer = null;
+  }
+
   async _poll() {
-    if (this._state !== 'ok' || !this._msgUrl || document.hidden) return;
+    if (this._state !== 'ok' || this._pollDone || !this._msgUrl || document.hidden) return;
     // A read posted from here after this poll left makes its answer's unread
     // state stale, and a flag set from here its flags (_adoptSummary).
     const readEpoch = this._readEpoch;
     const flagEpoch = this._flagEpoch;
     try {
       const res = await fetch(this._msgUrl, { cache: 'no-store' });
-      if (!res.ok) throw new Error(String(res.status));
+      if (!res.ok) {
+        // Merged into another chat: the page follows. Gone without a word:
+        // what is on screen stays, and the poll stops asking.
+        const gone = await this._whereGone(res);
+        if (gone === 'gone' && !this._pollDone) {
+          this._stopPolling();
+          this._showNote('This chat is no longer in the chat list.');
+        }
+        if (gone) return;
+        throw new Error(String(res.status));
+      }
       const doc = await res.json();
       const msgs = Array.isArray(doc.messages) ? doc.messages : [];
       const stick = this._atBottom();
-      let added = false;
-      // Append unseen messages — never a full re-render, which would fight
-      // the composer (focus, IME, dictation) and the scroll position. Chat
-      // streams are monotonic enough that appending in payload order is
-      // right; anything older is history this page already shows. A message
-      // already on screen that changed since (a mail removed in a client, a
-      // better trim) is re-rendered where it is, and nothing else with it.
+      // Never a full re-render, which would fight the composer (focus, IME,
+      // dictation) and the reader's place. First the messages on screen that
+      // changed since (a mail removed in a client, a better trim, its author
+      // named): each re-rendered where it is, and nothing else with it.
       for (const m of msgs) {
-        if (!m) continue;
-        if (this._seen.has(m.id)) {
-          this._reconcileChanged(m, stick);
-          continue;
-        }
+        if (m && this._seen.has(m.id)) this._reconcileChanged(m, stick);
+      }
+      // Then the ones not seen yet, each at its place by time. Most are the
+      // newest and are appended; a mail thread is not monotonic, though — a
+      // merge brings another chat's mails, a parent arrives after its reply —
+      // and those go in between (_insertChatMessage).
+      let added = false;
+      for (const m of msgs) {
+        if (!m || this._seen.has(m.id)) continue;
         this._seen.add(m.id);
         if (this._reconcileUnconfirmed(m)) continue;
-        this._messages.push(m);
-        this._appendChatMessage(m, stick);
+        this._insertChatMessage(m, stick);
         added = true;
       }
       // The chat as the server now sees it — read by a reply from the
@@ -921,9 +994,7 @@ class RetinueChatPage extends HTMLElement {
     const node = thread && [...thread.querySelectorAll('[data-mid]')]
       .find((n) => n.getAttribute('data-mid') === pending.id);
     if (node) {
-      const tpl = document.createElement('template');
-      tpl.innerHTML = this._chatMsgHtml(m);
-      node.replaceWith(tpl.content.firstElementChild);
+      this._replaceBubble(node, m);
     } else if (idx < 0) {
       // The bubble is gone (a re-render dropped it) and nothing holds the
       // message: let the caller append it normally rather than losing it.
@@ -935,8 +1006,9 @@ class RetinueChatPage extends HTMLElement {
   // One polled message the page already shows, against the version on
   // screen. Unchanged (msgSig), nothing happens. Changed, the message is
   // replaced in `_messages` and its bubble re-rendered in place — the rest of
-  // the thread, the scroll position (unless the reader sits at the bottom,
-  // `stick`) and the Mark as read row beside it stay as they are. An open
+  // the thread, the reader's place (the bottom when they sat there, `stick`,
+  // else the message they were looking at) and the Mark as read row beside
+  // it stay as they are. An open
   // Original stays open while it still applies: the mail is still there and
   // still names the same original (which never changes — the record's parts
   // are immutable), so a better trim leaves it, and a removal shuts it.
@@ -956,12 +1028,73 @@ class RetinueChatPage extends HTMLElement {
       const cached = this._origCache.get(m.id);
       if (cached && cached.url !== original) this._origCache.delete(m.id);
       if (this._origOpen.has(m.id) && !this._origCache.has(m.id)) {
-        this._loadOriginal(m, original, stick);
+        this._loadOriginal(m, original, stick ? 'bottom' : 'reader');
         return true;
       }
     }
-    this._rerenderMessage(m, stick);
+    this._rerenderMessage(m, stick ? 'bottom' : 'reader');
     return true;
+  }
+
+  // One message not on screen yet, into the thread at its place by time:
+  // after the last message not newer than it. That is the end for nearly
+  // every arrival (appended, _appendChatMessage); a mail a merge brought from
+  // another chat, or a parent arriving after its reply, goes in before the
+  // first newer bubble instead — the bubbles around it stay the nodes they
+  // are (an open Original's frame, a focused control), the day separators
+  // and the waterline are drawn again around them (_reflowSeparators), and
+  // the reader keeps the message they were looking at, or the bottom.
+  // `_messages` stays in time order, so its last inbound message is the
+  // newest one, the one the Mark as read row belongs under.
+  _insertChatMessage(m, stick) {
+    const t = tsMs(m);
+    let i = this._messages.length;
+    while (i > 0 && tsMs(this._messages[i - 1]) > t) i -= 1;
+    const thread = this.shadowRoot.querySelector('[data-chat-thread]');
+    const next = thread && i < this._messages.length ? this._bubbleNode(this._messages[i].id) : null;
+    if (!next) {
+      this._messages.push(m);
+      this._appendChatMessage(m, stick);
+      return;
+    }
+    const loc = stick ? null : this._mirrorLocation();
+    this._messages.splice(i, 0, m);
+    // The waterline marks what was new when the chat was opened; a message
+    // that turns up older than its first is above it.
+    if (this._firstUnread >= i) this._firstUnread += 1;
+    next.insertAdjacentHTML('beforebegin', this._chatMsgHtml(m));
+    this._reflowSeparators(thread);
+    if (stick) thread.scrollTop = thread.scrollHeight;
+    else this._scrollMirrorTo(loc);
+  }
+
+  // The separators before the message at index `i` of `_messages`, the one
+  // before it being of day `prevDay`: a day's, where the day changes, and
+  // the waterline, where it stands.
+  _sepHtml(m, i, prevDay) {
+    let html = '';
+    if (dayKey(m.ts) !== prevDay) html += `<div class="day-sep"><span>${esc(fmtDay(m.ts))}</span></div>`;
+    if (i === this._firstUnread) {
+      html += `<div class="unread-sep"><span>${this._newCount ? `${this._newCount} new` : 'New'}</span></div>`;
+    }
+    return html;
+  }
+
+  // Every day separator and the waterline taken out and put back before the
+  // bubbles they belong to, by `_messages` as it now is. The bubbles are not
+  // touched; the Mark as read row is _placeMarkRead's.
+  _reflowSeparators(thread) {
+    thread.querySelectorAll('.day-sep, .unread-sep').forEach((n) => n.remove());
+    const nodes = new Map();
+    for (const n of thread.querySelectorAll('[data-mid]')) nodes.set(n.getAttribute('data-mid'), n);
+    let prevDay = '';
+    this._messages.forEach((m, i) => {
+      const node = nodes.get(m.id);
+      if (!node) return;
+      const html = this._sepHtml(m, i, prevDay);
+      if (html) node.insertAdjacentHTML('beforebegin', html);
+      prevDay = dayKey(m.ts);
+    });
   }
 
   // The bubble of a message on screen, found by walking rather than by
@@ -972,28 +1105,68 @@ class RetinueChatPage extends HTMLElement {
       .find((n) => n.getAttribute('data-mid') === id)) || null;
   }
 
-  // Re-render one bubble where it is. `stick` keeps the reader at the bottom
-  // when they were there (a poll); false or null keeps the scroll offset as
-  // it was (a tap on Original reads on from where the reader is). Focus on
-  // the Original control stays on it.
-  _rerenderMessage(m, stick = false) {
+  // Re-render one bubble where it is, the reader kept in place by what is on
+  // screen — never by writing back a scroll offset, which a bubble changing
+  // height above the view turns into a jump. `place`:
+  //  - 'bottom': the reader was at the newest message and stays there;
+  //  - 'reader' (a poll): the first message on screen keeps its offset, and
+  //    a bubble that was on screen does not leave it upwards (a long mail
+  //    turned tombstone under the reader shows at the top of the view);
+  //  - 'own' (the reader acted on this bubble — Original, Hide original, Try
+  //    again): its top stays where it was, or comes to the top of the view
+  //    where it had scrolled above it, so a long Original closed from its
+  //    foot leaves the mail and its control in view. A bubble off screen by
+  //    then (a load that settled after the reader scrolled on) is 'reader'.
+  // Focus inside the bubble stays inside it (_replaceBubble; `prefer`).
+  _rerenderMessage(m, place = 'reader', prefer = '') {
     const thread = this.shadowRoot && this.shadowRoot.querySelector('[data-chat-thread]');
     const node = this._bubbleNode(m.id);
     if (!thread || !node) return;
-    const keep = thread.scrollTop;
+    const view = thread.getBoundingClientRect();
+    const r0 = node.getBoundingClientRect();
+    const inView = r0.bottom > view.top && r0.top < view.bottom;
+    const loc = place === 'bottom' ? null : this._mirrorLocation();
+    const next = this._replaceBubble(node, m, prefer);
+    if (place === 'bottom') {
+      thread.scrollTop = thread.scrollHeight;
+    } else if (place === 'own' && inView) {
+      const top = thread.getBoundingClientRect().top;
+      thread.scrollTop += next.getBoundingClientRect().top - top - Math.max(r0.top - view.top, 0);
+    } else {
+      this._scrollMirrorTo(loc);
+      const top = thread.getBoundingClientRect().top;
+      const r1 = next.getBoundingClientRect();
+      if (inView && r1.bottom <= top) thread.scrollTop += r1.top - top;
+    }
+  }
+
+  // The bubble `node` replaced by one rendered from `m` (and the frame of an
+  // open Original mounted); returns the new node. Focus inside the old bubble
+  // must not fall to the document with it: it goes to the same control in
+  // the new one — `prefer` first, where that names one present — else to the
+  // Original control, else to the bubble itself (a tombstone has no
+  // control). A control with no counterpart of its kind (a link) falls back;
+  // the message itself focused (where _placeMarkRead leaves it) stays so.
+  _replaceBubble(node, m, prefer = '') {
     const active = deepActiveElement();
-    const hadToggle = !!active && node.contains(active) && !!active.hasAttribute
-      && active.hasAttribute('data-orig-toggle');
+    let kind = '';
+    if (active && active === node) kind = 'self';
+    else if (active && node.contains(active)) {
+      kind = FOCUS_KINDS.find((k) => active.matches && active.matches(k)) || '*';
+    }
     const tpl = document.createElement('template');
     tpl.innerHTML = this._chatMsgHtml(m);
     const next = tpl.content.firstElementChild;
     node.replaceWith(next);
     this._mountFrame(next, m);
-    thread.scrollTop = stick ? thread.scrollHeight : keep;
-    if (hadToggle) {
-      const btn = next.querySelector('[data-orig-toggle]');
-      if (btn) btn.focus({ preventScroll: true });
-    }
+    if (!kind) return next;
+    const pick = (sel) => (FOCUS_KINDS.includes(sel) ? next.querySelector(sel) : null);
+    const target = (kind === 'self' && next) || pick(prefer) || pick(kind)
+      || next.querySelector('[data-orig-toggle]') || next.querySelector('.bubble') || next;
+    const focusable = !!target.matches && target.matches('button, summary, a[href], [tabindex]');
+    if (!focusable) target.setAttribute('tabindex', '-1');
+    target.focus({ preventScroll: true });
+    return next;
   }
 
   // ── The Original of a mail, in place ───────────────────────────────────────
@@ -1007,21 +1180,32 @@ class RetinueChatPage extends HTMLElement {
     if (!original) return;
     if (this._origOpen.has(id)) {
       this._origOpen.delete(id);
-      this._rerenderMessage(m);
+      this._rerenderMessage(m, 'own');
       return;
     }
     this._origOpen.add(id);
     const cached = this._origCache.get(id);
     if (!cached || cached.url !== original || cached.state === 'error') this._loadOriginal(m, original);
-    else this._rerenderMessage(m);
+    else this._rerenderMessage(m, 'own');
   }
 
-  async _loadOriginal(m, url, stick = false) {
+  // Fetch a mail's original into the cache, the bubble showing the loading
+  // line meanwhile and the result once it settles (`place` as for
+  // _rerenderMessage; a press on the bubble is 'own'). A 'Try again' pressed
+  // has the focus back if the retry fails too — while loading it rests on
+  // the Original control, the one control the bubble then has.
+  async _loadOriginal(m, url, place = 'own') {
+    const node = this._bubbleNode(m.id);
+    const active = deepActiveElement();
+    const retry = !!node && !!active && node.contains(active) && !!active.matches
+      && active.matches('[data-orig-retry]');
     const entry = { url, state: 'loading', doc: null };
     this._origCache.set(m.id, entry);
-    this._rerenderMessage(m, stick);
+    this._rerenderMessage(m, place);
     try {
       const res = await fetch(url, { cache: 'no-store' });
+      // The chat merged into another meanwhile: the page follows it there.
+      if (!res.ok && (await this._whereGone(res)) === 'moved') return;
       if (!res.ok) throw new Error(String(res.status));
       const doc = await res.json();
       if (!doc || typeof doc !== 'object' || Array.isArray(doc)) throw new Error('shape');
@@ -1034,7 +1218,9 @@ class RetinueChatPage extends HTMLElement {
     // newer entry renders itself.
     if (this._origCache.get(m.id) !== entry) return;
     const cur = this._messages.find((x) => x && x.id === m.id);
-    if (cur && this._origOpen.has(m.id)) this._rerenderMessage(cur);
+    if (cur && this._origOpen.has(m.id)) {
+      this._rerenderMessage(cur, place === 'bottom' ? 'reader' : place, retry ? '[data-orig-retry]' : '');
+    }
   }
 
   // The frame for a bubble whose Original is open on an HTML mail: built
@@ -2058,14 +2244,8 @@ class RetinueChatPage extends HTMLElement {
     let html = '';
     let lastDay = '';
     msgs.forEach((m, i) => {
-      const day = dayKey(m.ts);
-      if (day !== lastDay) {
-        html += `<div class="day-sep"><span>${esc(fmtDay(m.ts))}</span></div>`;
-        lastDay = day;
-      }
-      if (i === this._firstUnread) {
-        html += `<div class="unread-sep"><span>${this._newCount ? `${this._newCount} new` : 'New'}</span></div>`;
-      }
+      html += this._sepHtml(m, i, lastDay);
+      lastDay = dayKey(m.ts);
       html += this._chatMsgHtml(m);
       if (m === anchor) html += this._markReadHtml();
     });
@@ -2197,9 +2377,11 @@ class RetinueChatPage extends HTMLElement {
   }
 
   // The frame's height in px, estimated from the mail's plain text (see
-  // FRAME_MIN_PX): a line per 72 characters of each line, 20px a line.
+  // FRAME_MIN_PX): a line per 72 characters of each line, 20px a line; no
+  // plain text worth the name opens it at its cap.
   _frameHeight(doc) {
     const text = typeof doc.text === 'string' ? doc.text : '';
+    if (text.trim().length < FRAME_STUB_CHARS) return FRAME_MAX_PX;
     let lines = 0;
     for (const l of text.split('\n')) lines += Math.max(1, Math.ceil(l.length / 72));
     return Math.max(FRAME_MIN_PX, Math.min(FRAME_MAX_PX, lines * 20 + 48));
@@ -2359,7 +2541,9 @@ class RetinueChatPage extends HTMLElement {
   // the reader to another message), or the newest.
   _scrollMirrorTo(m) {
     const t = this.shadowRoot.querySelector('[data-chat-thread]');
-    if (!t || !m) return;
+    // Not displayed (the draft has the pane): there is no place to keep, and
+    // the one it had is restored when it shows again.
+    if (!t || !m || this.hasAttribute('draft-expanded')) return;
     if (m.bottom) { t.scrollTop = t.scrollHeight; return; }
     const el = m.anchor && [...t.querySelectorAll('[data-mid]')].find((n) => n.getAttribute('data-mid') === m.anchor);
     if (el) t.scrollTop += el.getBoundingClientRect().top - t.getBoundingClientRect().top - (m.offset || 0);
@@ -3572,11 +3756,7 @@ class RetinueChatPage extends HTMLElement {
         this._seen.add(msg.id);
       }
       const cur = findLocal();
-      if (cur) {
-        const tpl = document.createElement('template');
-        tpl.innerHTML = this._chatMsgHtml(msg);
-        cur.replaceWith(tpl.content.firstElementChild);
-      }
+      if (cur) this._replaceBubble(cur, msg);
       images.forEach((im) => { try { URL.revokeObjectURL(im.url); } catch (_e) { /* ignore */ } });
       // The server cleared the shared draft and read the chat with this send
       // — a reply reads it, the server's rule, so nothing is posted for it
@@ -3643,6 +3823,10 @@ class RetinueChatPage extends HTMLElement {
     // A message arriving while the user reads old history must not yank the
     // view to the bottom; only stick when they were already there.
     const keep = thread.scrollTop;
+    // The first message of an empty thread takes the place of its "No
+    // messages." line.
+    const empty = thread.querySelector(':scope > .center');
+    if (empty) empty.remove();
     thread.insertAdjacentHTML('beforeend', html);
     thread.scrollTop = stick ? thread.scrollHeight : keep;
   }
@@ -3896,8 +4080,8 @@ const CSS = `
                   overflow: auto; margin: 6px 0 0; padding: 8px; border-radius: 8px;
                   background: rgba(0, 0, 0, .2); }
   /* The HTML part's box: the estimated height (_frameHeight), never more
-     than most of the screen, and the user's to drag taller or shorter; the
-     mail scrolls inside it. White, as nearly every HTML mail assumes. */
+     than most of the screen, and the user's to drag taller or shorter where
+     the browser gives the box a handle; the mail scrolls inside it. White, as nearly every HTML mail assumes. */
   .orig-frame { resize: vertical; overflow: hidden; min-height: 120px; max-height: 70vh;
                 border-radius: 8px; background: #fff; }
   .orig-html { display: block; width: 100%; height: 100%; border: 0; background: #fff; }
