@@ -22,8 +22,11 @@ The message history itself lives in the gateways' ledgers and is served over
 SPARQL; everything about a chat that is *not* a channel message lives here, in
 one JSON document per chat under ``CHAT_STATE_DIR``:
 
-- ``last_read`` — the user's read watermark (ISO-8601), from which unread
-  badges derive; only ever advances.
+- ``last_read`` — the user's read mark (ISO-8601): everything up to it has
+  been dealt with. It is set by a reply and by the explicit *Mark as read*,
+  never by opening the chat, and unread counts derive from it. It only ever
+  advances — with one guarded exception, the undo of a *Mark as read*
+  (:meth:`ChatStateStore.restore_last_read`).
 - ``draft`` — the shared text area both the user and an agent compose into:
   ``{text, author, agent?, ts, version}``. Writes are version-guarded (the
   project-file sha-guard precedent): a writer names the version it based its
@@ -245,12 +248,19 @@ class ChatStateStore:
             # state document is readable on its own; the id stays the truth.
             "account": parts[1],
             "key": parts[2],
+            # The read mark: the user replied, or said "read", up to here.
+            # Looking at a chat moves nothing — see advance_last_read.
             "last_read": None,
             # How many reads advance_last_read has taken, whether or not the
-            # watermark moved: a read is an event even when its whole-second
+            # mark moved: a read is an event even when its whole-second
             # mark equals the one held (see the web gateway's
             # _instructed_read_since).
             "read_seq": 0,
+            # What the newest *Mark as read* settled: the ``done_at`` of the
+            # attention item it marked done, or None when it settled nothing.
+            # Kept so that undoing that mark reopens exactly the item it
+            # closed and no other (see set_read_settled).
+            "read_settled": None,
             "draft": None,
             # What the newest clear removed, kept so it can be put back exactly
             # — see set_draft and undo_clear. None when nothing is recoverable.
@@ -538,16 +548,74 @@ class ChatStateStore:
             return doc
 
     def advance_last_read(self, chat_id: str, ts: str | float | None) -> dict:
-        """Advance the read watermark — forward only, so a stale client (or an
-        out-of-order echo) can never resurrect already-read messages."""
+        """Advance the read mark — forward only, so a stale client (or an
+        out-of-order echo) can never resurrect already-read messages.
+
+        Called for the two things that make a chat read: the user's own reply
+        (from the dashboard, or echoed from their device) and the explicit
+        *Mark as read* (:meth:`mark_read`). Opening a chat calls nothing."""
+        return self.mark_read(chat_id, ts)[0]
+
+    def mark_read(self, chat_id: str, ts: str | float | None) -> tuple[dict, str | None]:
+        """:meth:`advance_last_read`, also saying what the mark was before:
+        ``(doc, previous)``, ``previous`` None for a chat never read. The
+        pair is what an undo hands back to :meth:`restore_last_read`, so it
+        is taken under the same lock as the write it describes."""
         mark = iso_z(ts)
         with self._lock:
             doc = self._read(chat_id)
-            if doc["last_read"] is None or mark > doc["last_read"]:
+            previous = doc["last_read"]
+            if previous is None or mark > previous:
                 doc["last_read"] = mark
             doc["read_seq"] = int(doc.get("read_seq") or 0) + 1
             if doc.get("unread_since") and doc["last_read"] >= doc["unread_since"]:
                 doc["unread_since"] = None
+            self._write(doc)
+            return doc, previous
+
+    def restore_last_read(self, chat_id: str, *, restore: str | None,
+                          marked: str) -> tuple[bool, dict]:
+        """Undo a *Mark as read*: put the mark back to ``restore`` (None for
+        a chat that had none) — the one way ``last_read`` ever moves
+        backwards. Returns ``(restored, doc)``.
+
+        Guarded twice, because moving this mark back resurrects messages as
+        unread. It happens only while the mark is still exactly ``marked``,
+        the value the call being undone answered: a reply or a later mark in
+        between has said something newer about the chat, and an undo that
+        arrives after it must not take that back (refused, nothing changes).
+        And ``restore`` may not lie past ``marked``, which would be an
+        advance wearing the undo's name — that raises ValueError.
+
+        ``read_seq`` stays: it counts reads, and the read that is being
+        undone happened. ``unread_since`` is not put back either; the next
+        arrival sets it afresh."""
+        marked = iso_z(marked)
+        if restore is not None:
+            restore = iso_z(restore)
+            if restore > marked:
+                raise ValueError("restore must not be later than the mark it undoes")
+        with self._lock:
+            doc = self._read(chat_id)
+            if doc["last_read"] != marked:
+                return False, doc
+            doc["last_read"] = restore
+            self._write(doc)
+            return True, doc
+
+    def set_read_settled(self, chat_id: str, done_at: str | None) -> dict:
+        """Record — or clear, with None — which attention item the newest
+        *Mark as read* settled, by that item's ``done_at``.
+
+        The mark and the item are settled in two steps (the web-gateway first
+        has to see whether the mark left anything unread), and an undo comes
+        as a separate request, so the link between them has to be stored. An
+        identity rather than a flag: an item that was reopened by a new
+        message and settled again by something else carries another
+        ``done_at``, and undoing the old mark then leaves it alone."""
+        with self._lock:
+            doc = self._read(chat_id)
+            doc["read_settled"] = done_at or None
             self._write(doc)
             return doc
 

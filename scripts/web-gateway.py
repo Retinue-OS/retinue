@@ -153,11 +153,19 @@ Push notifications (dashboard PWA; see scripts/push_notify.py):
   POST /push/unsubscribe              -> drop one (body {endpoint}); idempotent.
 
 Messenger chats (the deterministic chat mirror; see scripts/chat_state.py):
-  GET  /chats                         -> {"generated", "chats": [ChatSummary]}
+  GET  /chats                         -> {"generated", "chats": [ChatSummary],
+                                         "counts": {unread, read, archived}}
                                          — every chat in the message ledgers,
                                          SPARQL over the life store merged with
                                          the live overlay and the chat state,
-                                         ordered by last activity.
+                                         ordered by last activity. Each chat
+                                         states its `list_group` ("unread" |
+                                         "read" | "archived"; `group` is the
+                                         boolean "a group chat") and `unread`,
+                                         the inbound messages later than both
+                                         its read mark and the user's own
+                                         latest message; `counts` are chats
+                                         per group.
   GET  /chats/<id>/messages           -> {"generated", "chat": ChatSummary,
                                          "messages": [Message]} ascending, the
                                          last CHAT_PAGE_MESSAGES by default.
@@ -167,7 +175,16 @@ Messenger chats (the deterministic chat mirror; see scripts/chat_state.py):
                                          <id> is <channel>:<chat-key>,
                                          percent-encoded; the key is split off
                                          at the FIRST colon.
-  POST /chats/<id>/read               -> advance the read watermark (body {ts}).
+  POST /chats/<id>/read               -> Mark as read: body {} or {ts} moves
+                                         the read mark forward (ts defaults to
+                                         now) and settles the chat's attention
+                                         item; answers {id, last_read,
+                                         previous, unread, list_group}. Body
+                                         {restore, marked} undoes it — the
+                                         mark goes back to `restore` only
+                                         while it is still `marked` (409
+                                         otherwise). Opening a chat reads
+                                         nothing.
   POST /chats/<id>/flags              -> set {archived, muted, starred} (any of
                                          them, booleans). `starred` sorts the
                                          chat first in its list, nothing else.
@@ -7387,11 +7404,34 @@ def _record_value(record: dict, predicate: str) -> str | None:
     values = record.get(predicate)
     return values[0] if values else None
 
-# Unread = COUNT of inbound above each chat's own read watermark. The per-chat
+# The user's own latest message per chat: what makes a chat read without any
+# read mark being set. The rail already advances the mark for a reply it sees
+# (the dashboard send, an own-device echo), but an outbound record can reach
+# the store without passing the rail — a backfilled one — so the list reads
+# the ledger's answer too and takes the later of the two (_chat_read_cut).
+#
+# Only `user` and `device` authorship counts: an agent answering on its own
+# must not hide a message the user never saw. The two values are a VALUES
+# table joined on kb:author rather than a FILTER over every outbound record,
+# and kb:sentAt is what an outbound record carries, so no rdf:type pattern is
+# needed: three patterns and the one OPTIONAL the account fold costs — the
+# shape of the heads subquery above, kept that lean for the same planner.
+_CHATS_REPLIED_SPARQL = """
+PREFIX k: <%s>
+SELECT ?chat ?account (MAX(?ts) AS ?replied) WHERE {
+  VALUES ?author { "user" "device" }
+  ?m k:author ?author ; k:chat ?chat ; k:sentAt ?ts .
+  OPTIONAL { ?m k:account ?acc0 }
+  BIND(COALESCE(?acc0, "") AS ?account)
+} GROUP BY ?chat ?account
+""" % _KB
+
+# Unread = COUNT of inbound above each chat's own cut-off — the later of its
+# read mark and the user's own latest message (_chat_read_cut). The per-chat
 # cutoffs are injected as a VALUES table, so one bounded query returns one
 # count per chat and no message rows ever cross the wire — chosen over
 # fetching (chat, ts) pairs and counting here, whose payload grows with every
-# never-opened noisy group (a chat with no watermark counts from the epoch).
+# never-answered noisy group (a chat with no cut-off counts from the epoch).
 # The row key is (chat key, account) for the same reason the list query groups
 # by both: counting a key across accounts would badge one account's chat with
 # another's arrivals. ?account arrives bound from VALUES, so the account test is
@@ -7815,17 +7855,40 @@ def _chats_cached(now: float) -> tuple[dict | None, dict | None]:
     return None, None
 
 
+def _chat_read_cut(doc: dict | None, row: dict | None) -> str:
+    """The instant up to which a chat counts as read, "" for never: the later
+    of its read mark (a reply the rail saw, or *Mark as read*) and the user's
+    own latest message in the ledger (``replied`` on the skeleton row — see
+    _CHATS_REPLIED_SPARQL for why both are asked). Inbound messages later
+    than this are the chat's unread ones."""
+    return max((doc or {}).get("last_read") or "", (row or {}).get("replied") or "")
+
+
+def _chat_list_group(archived: bool, unread: int) -> str:
+    """Which of the Chats page's three groups a chat is in. Archived wins: a
+    chat the user put out of the way stays there whatever it holds — which,
+    arrivals un-archiving every chat but a muted one, means a muted chat."""
+    if archived:
+        return "archived"
+    return "unread" if unread > 0 else "read"
+
+
 def _unread_after_reads(skeleton: dict, unread: dict) -> dict:
-    """The store's last unread counts, corrected by the read watermarks written
+    """The store's last unread counts, corrected by the read marks written
     since: a chat read up to (or past) its head message has nothing unread the
-    store could know of, whatever it counted before the read. The other counts
+    store could know of, whatever it counted before the read. And the other
+    way round, for a *Mark as read* undone while the store is away: a chat
+    whose head is an inbound message later than its cut-off holds at least
+    that one, whatever was counted while the mark stood. The other counts
     stand — the store's answer is the best there is without the store."""
     docs = _CHAT_STATE.all()
-    corrected = {}
-    for cid, n in unread.items():
-        row = skeleton.get(cid)
-        last_read = (docs.get(cid) or {}).get("last_read") or ""
-        corrected[cid] = 0 if row is not None and last_read >= row["ts"] else n
+    corrected = dict(unread)
+    for cid, row in skeleton.items():
+        if _chat_read_cut(docs.get(cid), row) >= row["ts"]:
+            if cid in corrected:
+                corrected[cid] = 0
+        elif row["direction"] == "in" and not corrected.get(cid):
+            corrected[cid] = 1
     return corrected
 
 
@@ -7861,8 +7924,8 @@ def _chats_skeleton_and_unread() -> tuple[dict, dict]:
             skeleton = _fetch_chats_skeleton(deadline)
             docs_for_cutoffs = _CHAT_STATE.all()
             unread = _fetch_unread_counts({
-                cid: (docs_for_cutoffs.get(cid) or {}).get("last_read")
-                for cid in skeleton
+                cid: _chat_read_cut(docs_for_cutoffs.get(cid), row) or None
+                for cid, row in skeleton.items()
             }, deadline)
         except Exception as exc:  # noqa: BLE001 - a stale list beats no list
             now = time.time()
@@ -7901,7 +7964,9 @@ def _chats_skeleton_and_unread() -> tuple[dict, dict]:
 
 
 def _fetch_chats_skeleton(deadline: float | None = None) -> dict[str, dict]:
-    """One entry per chat from the ledgers: channel + its latest message row.
+    """One entry per chat from the ledgers: channel + its latest message row,
+    and ``replied`` — when the user last wrote in it themselves, None if the
+    ledger holds no such message (see _fetch_reply_marks).
 
     Keyed by the composed chat id, so two accounts talking to the same peer are
     two entries. A row whose ``?account`` is the empty string carries no
@@ -7937,8 +8002,30 @@ def _fetch_chats_skeleton(deadline: float | None = None) -> dict[str, dict]:
             "author": _record_value(record, _P_AUTHOR),
             "mid": _record_value(record, _P_MESSAGE_ID),
             "attachments": list(record.get(_P_ATTACHMENT, [])),
+            "replied": None,
         }
+    for chat_id, replied in _fetch_reply_marks(skeleton, deadline).items():
+        skeleton[chat_id]["replied"] = replied
     return skeleton
+
+
+def _fetch_reply_marks(skeleton: dict[str, dict],
+                       deadline: float | None = None) -> dict[str, str]:
+    """``{chat id: when the user last wrote in it}`` from the ledgers, for the
+    chats of ``skeleton`` (see _CHATS_REPLIED_SPARQL): one query, one row per
+    chat that holds a message of the user's own. Mapped back on (chat key,
+    account) like the unread counts, so one account's reply never reads
+    another account's chat with the same peer. No chats, no query."""
+    by_pair = {(row["key"], row["account"] or ""): cid for cid, row in skeleton.items()}
+    if not by_pair:
+        return {}
+    marks: dict[str, str] = {}
+    for b in _sparql_bindings(_CHATS_REPLIED_SPARQL, timeout=_budget_left(deadline)):
+        pair = (_bval(b, "chat"), _bval(b, "account") or "")
+        replied = _bval(b, "replied")
+        if pair in by_pair and replied:
+            marks[by_pair[pair]] = replied
+    return marks
 
 
 def _fetch_unread_counts(cutoffs: dict[str, str | None],
@@ -8063,7 +8150,8 @@ def _chats_payload() -> dict:
                 author=row.get("author"),
                 has_attachments=bool(row.get("attachments")), roster=roster)
         count = unread.get(chat_id, 0) if row is not None else 0
-        last_read = doc.get("last_read") or ""
+        # Up to where the chat is read; the store counted from here.
+        cut = _chat_read_cut(doc, row)
         store_ts = row["ts"] if row is not None else ""
         store_mid = row.get("mid") if row is not None else None
         for entry in overlay_by_chat.get(chat_id, []):  # ascending by (ts, id)
@@ -8077,9 +8165,17 @@ def _chats_payload() -> dict:
             same_as_store = ts == store_ts and (
                 not entry.get("message_id")
                 or entry.get("message_id") == store_mid)
-            if (entry.get("direction") == "in" and not same_as_store
-                    and ts > last_read):
-                count += 1
+            if entry.get("direction") == "in":
+                if not same_as_store and ts > cut:
+                    count += 1
+            elif entry.get("author") in ("user", "device") and ts > cut:
+                # The user's own message, not yet in the store's answer: it
+                # reads everything before it, exactly as the ledger's reply
+                # mark will once the record is indexed. (At or after the
+                # store's head, so nothing the store counted is later.) An
+                # agent's message is no reply and leaves the count alone.
+                cut = ts
+                count = 0
             if ts >= last_ts:
                 last_ts = ts
                 last = _chat_last_preview(
@@ -8110,8 +8206,19 @@ def _chats_payload() -> dict:
             # one person one avatar colour however many chats they appear in.
             "key": key,
             "name": _chat_display_name(doc, channel, key),
+            # Whether this is a group chat — not to be confused with
+            # `list_group` below.
             "group": bool(group),
+            # Inbound messages the user has neither answered nor marked read:
+            # later than their read mark and than their own latest message.
+            # Opening the chat changes nothing here.
             "unread": count,
+            # Which of the page's three groups the chat is in — "unread",
+            # "read" or "archived" — stated here so no client derives it.
+            "list_group": _chat_list_group(bool(doc.get("archived")), count),
+            # The read mark itself, as POST /chats/<id>/read answers it and
+            # as an undo must name it; null for a chat never marked.
+            "last_read": doc.get("last_read") or None,
             "archived": bool(doc.get("archived")),
             "muted": bool(doc.get("muted")),
             "starred": bool(doc.get("starred")),
@@ -8134,9 +8241,14 @@ def _chats_payload() -> dict:
         })
     chats.sort(key=lambda c: c["last"]["ts"], reverse=True)
     _schedule_chat_name_backfill(nameless)
+    counts = {"unread": 0, "read": 0, "archived": 0}
+    for chat in chats:
+        counts[chat["list_group"]] += 1
     return {
         "generated": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "chats": chats,
+        # Chats per group, for the page's tabs.
+        "counts": counts,
     }
 
 
@@ -8146,6 +8258,21 @@ def _chat_summary(chat_id: str) -> dict | None:
         if chat["id"] == chat_id:
             return chat
     return None
+
+
+def _chat_read_state(chat_id: str, doc: dict) -> tuple[int, str]:
+    """A chat's ``(unread, list_group)`` as GET /chats states them right now —
+    what the read endpoint answers with. Where the list cannot be built (the
+    store away with nothing recent to serve) or does not hold the chat, what
+    the state document alone can say: nothing known to be unread."""
+    try:
+        summary = _chat_summary(chat_id)
+    except Exception as exc:  # noqa: BLE001 - the mark is written; answer anyway
+        print(f"[web-gateway] read state of {chat_id} unavailable ({exc})", flush=True)
+        summary = None
+    if summary is not None:
+        return summary["unread"], summary["list_group"]
+    return 0, _chat_list_group(bool(doc.get("archived")), 0)
 
 
 # Serializes create-or-get for companion threads. The web-gateway is the only
@@ -8478,8 +8605,8 @@ def _start_chat_arrival_turn(chat_id: str, entry: dict, *,
     ``vip`` whether the sender is also a VIP. ``ring`` is set for a message
     whose ring waits on this turn — an instructed sender who is not a VIP —
     and carries what delivering it needs later (the chat's ``read_seq`` at
-    arrival, which tells whether the user has read the message by then:
-    _instructed_read_since); the ring is
+    arrival, which tells whether the user has marked the chat read or
+    answered it by then: _instructed_read_since); the ring is
     registered here, with its timeout, under the same lock that mints the
     job, so a repeated delivery of one message never registers a second."""
     if not CHAT_ARRIVAL_TURNS:
@@ -8689,7 +8816,8 @@ def _instructed_deliver(ring: dict, verdict: dict | None, why: str, *,
     the verdict's importance and deadline, decided by the mode in force like
     any message; without one, as a VIP's — it rings, whatever the mode. A
     chat muted meanwhile stays quiet, as it would have on arrival; so does a
-    message the user has already read or answered while the turn worked."""
+    message the user has already marked read or answered while the turn
+    worked."""
     chat_id, entry = ring["chat_id"], ring["entry"]
     doc = _CHAT_STATE.get(chat_id)
     if doc.get("muted"):
@@ -8697,8 +8825,10 @@ def _instructed_deliver(ring: dict, verdict: dict | None, why: str, *,
     elif _instructed_read_since(doc, ring):
         # A ring would tell the user nothing new, and putting the message
         # through the attention model now would reopen the item their reply
-        # just settled. The verdict still records on an item left open.
-        out = {"delivery": "seen", "reason": "you read the chat while the turn was working"}
+        # or their mark just settled. The verdict still records on an item
+        # left open. (A mark taken back later is _instructed_unsee's.)
+        out = {"delivery": "seen",
+               "reason": "you marked the chat read or answered it while the turn was working"}
         if verdict is not None:
             _attention_note_verdict(chat_id, verdict)
     else:
@@ -8730,18 +8860,47 @@ def _instructed_deliver(ring: dict, verdict: dict | None, why: str, *,
 
 
 def _instructed_read_since(doc: dict, ring: dict) -> bool:
-    """Whether the user caught up on the chat past a held arrival while its
-    turn worked: opened it, or answered from the composer or their phone —
-    each a read since the arrival (``read_seq`` moved) that leaves the
-    watermark at or past the message. Counted by reads rather than by the
-    watermark moving, which keeps whole seconds: a message delivered late,
-    stamped behind a read the watermark already holds, is seen by the next
-    read even when that read falls in the same second."""
+    """Whether the user dealt with the chat past a held arrival while its
+    turn worked: marked it read, or answered from the composer or their
+    phone — each a read since the arrival (``read_seq`` moved) that leaves
+    the read mark at or past the message. Opening the chat is not one: it
+    moves nothing, so a message merely looked at still rings. Nor is a mark
+    the user took back before the ring was due — the undo leaves the mark
+    behind the message again. Counted by reads rather than by the mark
+    moving, which keeps whole seconds: a message delivered late, stamped
+    behind a read the mark already holds, is seen by the next read even when
+    that read falls in the same second."""
     last = doc.get("last_read")
     if not last or "read_seq" not in ring:
         return False
     return (last >= (ring["entry"].get("ts") or "")
             and int(doc.get("read_seq") or 0) > ring["read_seq"])
+
+
+def _instructed_unsee(chat_id: str, doc: dict) -> None:
+    """What an undone *Mark as read* owes an instructed message. A held
+    arrival the user marked read while its turn worked was delivered as
+    "seen": not rung, and never put through the attention model
+    (_instructed_deliver). With the mark taken back the message is unread
+    again and nothing has listed it, so it is put on the list now — listed,
+    not rung, as the user is looking at the chat while they undo — with the
+    verdict's judgement where the turn has left one.
+
+    Recognized by the mark alone: after the restore it lies behind the
+    message again. A reply that made the message "seen" moves the mark too,
+    and no undo reaches behind a reply, so this never reopens an answered
+    one. ``doc`` is the chat's state as the restore wrote it."""
+    ins = doc.get("instructed") or {}
+    if ins.get("delivery") != "seen" or doc.get("muted"):
+        return
+    if (ins.get("since") or "") <= (doc.get("last_read") or ""):
+        return
+    _attention_mark(f"chat:{chat_id}", "open")
+    verdict = ins.get("verdict")
+    if isinstance(verdict, dict) and verdict.get("importance") is not None:
+        _attention_note_verdict(chat_id, verdict)
+    _instructed_note(chat_id, jobs={ins.get("job")}, delivery="list",
+                     reason="the read mark was undone")
 
 
 def _attention_note_verdict(chat_id: str, verdict: dict) -> None:
@@ -9416,7 +9575,11 @@ def _chat_messages_payload(chat_id: str, before: str | None = None) -> dict:
             "group": bool(doc.get("group")
                           if doc.get("group") is not None
                           else _chat_is_group(channel, key)),
+            # Not in the list, so nothing counted it: the same three fields
+            # the list states, as far as the state document knows them.
             "unread": 0,
+            "list_group": _chat_list_group(bool(doc.get("archived")), 0),
+            "last_read": doc.get("last_read") or None,
             "archived": bool(doc.get("archived")),
             "muted": bool(doc.get("muted")),
             "starred": bool(doc.get("starred")),
@@ -10538,6 +10701,57 @@ def _attention_mark(item_id: str, state: str, how: str | None = None) -> bool:
             attention_policy.reopen(item)
         _attention_persist(item)
         return True
+
+
+def _attention_settle_read(chat_id: str, inbound_seq) -> str | None:
+    """*Mark as read* is the user saying "dealt with": settle the chat's open
+    item the way *Mark handled* does (``done_how`` "marked"). Returns the
+    item's ``done_at`` when this call is what settled it — the identity its
+    undo reopens it by (ChatStateStore.set_read_settled) — and None when
+    nothing was open: a chat nothing was pending in gains no item by being
+    marked, and one a reply or an archive settled keeps its own marker.
+
+    ``inbound_seq`` is the chat's arrival count as the mark found it. A
+    message that has landed since is one the mark was not about, and the item
+    is by now, or is about to be, that message's: it is left open. An
+    arrival counts itself before the attention model takes it in, under this
+    same lock, so either it is seen here or it reopens what this settles.
+
+    A chat from before the model has no block, and needs none here: it is an
+    item only while it holds unread messages (attention_store.
+    chat_wants_attention), which the mark itself has just ended."""
+    with _attention_lock:
+        state = _CHAT_STATE.get(chat_id)
+        block = state.get("attention") or {}
+        if not block or block.get("state", "open") != "open":
+            return None
+        if state.get("inbound_seq") != inbound_seq:
+            return None
+        if not _attention_mark(f"chat:{chat_id}", "done", "marked"):
+            return None
+        return (_CHAT_STATE.get(chat_id).get("attention") or {}).get("done_at")
+
+
+def _attention_reopen_read(chat_id: str, doc: dict) -> bool:
+    """The undo of a *Mark as read* reopens the item that mark settled, and
+    only that — the mirror of un-archiving, which reopens only what archiving
+    settled. ``done_how`` cannot tell this mark from *Mark handled* on the
+    home screen (both are "marked"), so the item is recognized by the
+    ``done_at`` the mark left on the chat's state (``read_settled`` in
+    ``doc``, the state as the restore wrote it): an item that a new message
+    reopened and something else settled since carries another, and stays as
+    it is. On the list again, never pushed for it."""
+    settled = doc.get("read_settled")
+    if not settled:
+        return False
+    with _attention_lock:
+        block = _CHAT_STATE.get(chat_id).get("attention") or {}
+        mine = (block.get("state") == "done" and block.get("done_how") == "marked"
+                and block.get("done_at") == settled)
+        if mine:
+            _attention_mark(f"chat:{chat_id}", "open")
+    _CHAT_STATE.set_read_settled(chat_id, None)
+    return mine
 
 
 def _attention_push_item(item: dict, reason: str = "") -> int:
@@ -11948,7 +12162,27 @@ class Handler(BaseHTTPRequestHandler):
                                   "detail": str(exc)})
 
     def _handle_chat_read(self, raw_id: str) -> None:
-        """Advance one chat's read watermark (body {ts}) — forward only."""
+        """*Mark as read* (body {} or {ts}), and its undo (body {restore,
+        marked}).
+
+        A chat is read when its latest inbound message was replied to or
+        marked read — never by being opened, so nothing calls this on the
+        user's behalf: it is their explicit word. The mark moves forward to
+        ``ts``; without one, to now — or to the chat's newest message where
+        that is stamped later than this clock reads, since the channels stamp
+        messages with clocks of their own and "everything" must include the
+        message the user is looking at. A client that names the ``ts`` of the
+        newest message it shows marks exactly what the user saw: a message
+        that slipped in behind it stays unread, and the answer says so.
+
+        Marking read is "dealt with", so it settles the chat's attention item
+        as *Mark handled* does — when the mark leaves nothing unread. A mark
+        that a newer message outran settles nothing: that message's item is
+        not the user's to have dismissed unseen.
+
+        Answers {id, last_read, previous, unread, list_group}; ``previous``
+        is the mark before this call (null for none), which together with
+        ``last_read`` is what the undo sends back."""
         chat_id = self._chat_id_or_404(raw_id)
         if chat_id is None:
             return
@@ -11956,14 +12190,76 @@ class Handler(BaseHTTPRequestHandler):
         if payload is None:
             self._send_json(400, {"error": "invalid JSON"})
             return
+        if "restore" in payload or "marked" in payload:
+            self._chat_read_restore(chat_id, payload)
+            return
         ts = payload.get("ts")
-        if not isinstance(ts, (str, int, float)) or (
+        if ts is None:
+            ts = time.time()
+            try:
+                head = ((_chat_summary(chat_id) or {}).get("last") or {}).get("ts")
+            except Exception:  # noqa: BLE001 - the store away: this clock will do
+                head = None
+            if head and head > chat_state_mod.iso_z(ts):
+                ts = head
+        elif isinstance(ts, bool) or not isinstance(ts, (str, int, float)) or (
                 isinstance(ts, str) and not _CHAT_TS_RE.match(ts)):
             self._send_json(400, {"error": "ts must be an ISO-8601 timestamp or epoch seconds"})
             return
-        doc = _CHAT_STATE.advance_last_read(chat_id, ts)
+        doc, previous = _CHAT_STATE.mark_read(chat_id, ts)
         _chats_cache_invalidate()
-        self._send_json(200, {"id": chat_id, "last_read": doc["last_read"]})
+        unread, list_group = _chat_read_state(chat_id, doc)
+        settled = (_attention_settle_read(chat_id, doc.get("inbound_seq"))
+                   if unread == 0 else None)
+        if settled or doc.get("read_settled"):
+            # What this mark settled replaces what the one before it did: an
+            # undo is always of the newest mark.
+            _CHAT_STATE.set_read_settled(chat_id, settled)
+        self._send_json(200, {"id": chat_id, "last_read": doc["last_read"],
+                              "previous": previous, "unread": unread,
+                              "list_group": list_group})
+
+    def _chat_read_restore(self, chat_id: str, payload: dict) -> None:
+        """Undo a *Mark as read*: body {restore: <the mark's `previous`, or
+        null>, marked: <the `last_read` it answered>}.
+
+        The read mark's one way back (ChatStateStore.restore_last_read): only
+        while it is still exactly ``marked`` — a reply or a later mark in
+        between is newer word about the chat, and the undo then answers 409
+        with the state as it stands and changes nothing. The attention item
+        comes back only if that mark is what settled it, and an instructed
+        message the mark kept from ringing is listed (_instructed_unsee).
+        Answers like the mark does, with ``previous`` the mark just undone.
+        What the undo cannot do is make a chat unread that the user has
+        answered: the reply stands in the ledger whatever the mark says."""
+        marked, restore = payload.get("marked"), payload.get("restore")
+        if "restore" not in payload or not isinstance(marked, str) \
+                or not _CHAT_TS_RE.match(marked):
+            self._send_json(400, {"error": "restore (the previous mark, or null) and marked "
+                                           "(the last_read the mark answered) are required"})
+            return
+        if restore is not None and not (isinstance(restore, str) and _CHAT_TS_RE.match(restore)):
+            self._send_json(400, {"error": "restore must be an ISO-8601 timestamp or null"})
+            return
+        try:
+            restored, doc = _CHAT_STATE.restore_last_read(chat_id, restore=restore,
+                                                          marked=marked)
+        except ValueError as exc:
+            self._send_json(400, {"error": str(exc)})
+            return
+        if not restored:
+            unread, list_group = _chat_read_state(chat_id, doc)
+            self._send_json(409, {"error": "the read mark has moved since; nothing was restored",
+                                  "id": chat_id, "last_read": doc["last_read"],
+                                  "unread": unread, "list_group": list_group})
+            return
+        _chats_cache_invalidate()
+        _attention_reopen_read(chat_id, doc)
+        _instructed_unsee(chat_id, doc)
+        unread, list_group = _chat_read_state(chat_id, doc)
+        self._send_json(200, {"id": chat_id, "last_read": doc["last_read"],
+                              "previous": chat_state_mod.iso_z(marked),
+                              "unread": unread, "list_group": list_group})
 
     def _handle_chat_flags(self, raw_id: str) -> None:
         """Set one chat's `archived` / `muted` / `starred` flags (body
@@ -12630,9 +12926,12 @@ class Handler(BaseHTTPRequestHandler):
         _start_chat_arrival_turn). Held/no-action gate classes and muted
         chats stay silent; an arrival un-archives an archived chat unless it
         is muted (the conversation rule, verbatim). Outbound echoes with
-        author user/device advance the read watermark — the user was visibly
-        in that chat on their phone; an agent-authored outbound advances
-        nothing. Open unless CHATS_INGEST_TOKEN is set — see
+        author user/device advance the read mark — the user answered from
+        their own device, and a reply is what reads a chat; an
+        agent-authored outbound advances nothing, so an agent answering on
+        its own never hides a message the user has not seen. An arrival
+        needs no un-reading: it is later than the mark, which is what unread
+        means. Open unless CHATS_INGEST_TOKEN is set — see
         _chats_ingest_authorized for why fail-open is the fail-safe here."""
         token = self.headers.get("X-Conversation-Backend-Token", "")
         if not _chats_ingest_authorized(token):

@@ -30,7 +30,9 @@ direct user-send contract and serving token-gated media). Covers:
   arrivals during a turn fold into one follow-up without losing a job, a reply
   that could not be stored fails its job rather than reporting delivery, and
   the turn pushes nothing the arrival has already pushed;
-- the read watermark, the version-guarded draft (409), agent staging;
+- the read mark as POST /chats/<id>/read answers it (the three groups, the
+  derivation and the undo have their own file, tests/test_chat_read.py), the
+  version-guarded draft (409), agent staging;
 - POST /chats/<id>/flags: archiving takes a chat out of the list and an
   arrival brings it back, muting archives it in the same breath and keeps it
   out however busy it gets, un-muting leaves it archived, restoring clears
@@ -122,6 +124,9 @@ STATE: dict = {"fail": False, "queries": [], "gw_requests": [], "sent": [],
                "list_rows": None,
                # When set, replaces the canned per-chat message rows.
                "msg_rows": None,
+               # The user's own latest message per chat, as the reply-marks
+               # query finds it in the ledgers: (chat key, account, ts) rows.
+               "replied_rows": [],
                # What each queued send will produce once it completes.
                "outcomes": {}}
 
@@ -156,6 +161,8 @@ class _MockSparql(BaseHTTPRequestHandler):
             return
         if "VALUES (?chat ?account ?cut)" in query:
             bindings = self._unread(query)
+        elif "VALUES ?author" in query:
+            bindings = self._replied(query)
         elif "MAX(?ts0)" in query:
             bindings = self._chat_heads()
         elif "VALUES ?m {" in query:
@@ -242,6 +249,12 @@ class _MockSparql(BaseHTTPRequestHandler):
                   dict(ct="image/jpeg", size="717", w="320", h="420", name="IMG_0042.jpg"),
                   f"urn:retinue:media:signal:{MID_ATT2}": dict(ct="image/png", size="2048")}
         return [_lit_row(att=iri, **stated[iri]) for iri in asked if iri in stated]
+
+    def _replied(self, query):
+        # The user's own latest message per chat. Nothing by default: these
+        # canned chats hold none, so their counts follow the read mark alone.
+        return [_lit_row(chat=key, account=acct, replied=ts)
+                for key, acct, ts in STATE.get("replied_rows") or []]
 
     def _unread(self, query):
         # Canned semantics: a chat whose injected cutoff is still the epoch has
@@ -570,9 +583,13 @@ def test_chat_list_contract(base, wg):
     # ChatSummary contract fields, exactly the fixture's shape.
     for c in (c1, c2):
         assert {"id", "channel", "account", "key", "name", "group", "unread",
-                "archived", "muted", "last", "draft", "companion",
-                "messages"} <= set(c)
+                "list_group", "last_read", "archived", "muted", "last", "draft",
+                "companion", "messages"} <= set(c)
         assert c["companion"] is None, "no companion thread until one is asked for"
+        # Never answered, never marked: unread, and no mark to show.
+        assert c["list_group"] == "unread" and c["last_read"] is None, c
+    # Chats per group, stated beside the list.
+    assert body["counts"] == {"unread": 2, "read": 0, "archived": 0}, body["counts"]
     # The two halves of a chat's identity, both surfaced: the peer (stable
     # across accounts, so the client can colour one person one way) and the
     # account, null while the records carry none.
@@ -590,9 +607,20 @@ def test_chat_list_contract(base, wg):
     assert c1["messages"] == "/chats/" + _quote(CHAT1) + "/messages"
     status, doc = _http(base, "GET", c1["messages"])
     assert status == 200
+    # Opening the chat read nothing: the page's own summary says the same as
+    # the list, and the list says it again afterwards.
+    assert doc["chat"]["unread"] == 2 and doc["chat"]["list_group"] == "unread", doc["chat"]
+    assert doc["chat"]["last_read"] is None
+    status, again = _http(base, "GET", "/chats")
+    assert next(c for c in again["chats"] if c["id"] == CHAT1)["unread"] == 2
     # The unread query injected the epoch cutoff for never-read chats.
     unread_qs = [q for q in STATE["queries"] if "VALUES (?chat ?account ?cut)" in q]
     assert unread_qs and MARA in unread_qs[-1] and "1970-01-01" in unread_qs[-1]
+    # The reply marks are asked of the ledgers in a query of their own, for
+    # the user's own authorship only: an agent's message is no reply.
+    replied_qs = [q for q in STATE["queries"] if "VALUES ?author" in q]
+    assert replied_qs and 'VALUES ?author { "user" "device" }' in replied_qs[-1], replied_qs[-1:]
+    assert '"agent"' not in replied_qs[-1]
     print("PASS test_chat_list_contract")
 
 
@@ -666,17 +694,26 @@ def test_messages_before_paging(base, wg):
 
 
 def test_read_watermark(base, wg):
+    """Mark as read, named by the newest message's own timestamp."""
     status, body = _http(base, "POST", "/chats/" + _quote(CHAT1) + "/read",
                          {"ts": TS3})
     assert status == 200 and body["last_read"] == TS3
+    # The answer is the chat's new state, and what an undo needs.
+    assert body == {"id": CHAT1, "last_read": TS3, "previous": None,
+                    "unread": 0, "list_group": "read"}, body
     status, body = _http(base, "GET", "/chats")
     assert status == 200
     c1 = next(c for c in body["chats"] if c["id"] == CHAT1)
     # The mock store answers 0 once a real cutoff is injected — and the query
-    # carried exactly the new watermark.
-    assert c1["unread"] == 0
+    # carried exactly the new mark.
+    assert c1["unread"] == 0 and c1["list_group"] == "read" and c1["last_read"] == TS3
+    assert body["counts"]["read"] == 1 and body["counts"]["unread"] >= 1, body["counts"]
     unread_q = [q for q in STATE["queries"] if "VALUES (?chat ?account ?cut)" in q][-1]
     assert TS3 in unread_q
+    # A malformed timestamp is refused, not read as "now".
+    for bad in ("yesterday", True, ["2026-08-27T07:12:00Z"]):
+        status, _ = _http(base, "POST", "/chats/" + _quote(CHAT1) + "/read", {"ts": bad})
+        assert status == 400, bad
     print("PASS test_read_watermark")
 
 
@@ -1674,10 +1711,10 @@ def test_instructed_arrival(base, wg):
         assert wg._CHAT_STATE.get(chat)["attention"]["state"] == "done", \
             f"the {late} reopened an item the reply settled"
 
-    # A message delivered late — stamped behind a read the watermark already
-    # holds — and read while the turn works, by a read whose whole-second
-    # mark equals the one held: the watermark cannot move, the read still
-    # counts.
+    # A message delivered late — stamped behind a read the mark already
+    # holds — and marked read while the turn works, by a read whose
+    # whole-second mark equals the one held: the mark cannot move, the read
+    # still counts.
     mark = int(time.time()) + 20
     status, _ = _http(base, "POST", rail,
                       {"direction": "out", "channel": "telegram", "chat": "888001",

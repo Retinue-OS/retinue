@@ -2,12 +2,13 @@
 """Focused checks for the chat state store and the live overlay.
 
 `scripts/chat_state.py` holds everything about a messenger chat that is not a
-channel message: the read watermark (forward-only), the version-guarded shared
-draft, archive/mute, cached display metadata — plus the in-memory overlay that
-bridges the life store's indexing lag. This exercises the draft guard (stale
-version rejected; agent staging never clobbers user text), watermark and
-unread-classification semantics, path-safe state filenames, and the overlay's
-merge/dedup/expiry contract.
+channel message: the read mark (forward-only, but for the guarded undo of a
+*Mark as read*), the version-guarded shared draft, archive/mute, cached
+display metadata — plus the in-memory overlay that bridges the life store's
+indexing lag. This exercises the draft guard (stale version rejected; agent
+staging never clobbers user text), read-mark and unread-classification
+semantics, the restore's two guards, path-safe state filenames, and the
+overlay's merge/dedup/expiry contract.
 
 Standalone, no third-party deps:
 
@@ -242,6 +243,59 @@ def test_last_read_forward_only_and_unread_modes():
         print("PASS test_last_read_forward_only_and_unread_modes")
 
 
+def test_mark_read_and_its_guarded_restore():
+    """The read mark only advances — except for the undo of a *Mark as read*,
+    which is guarded: only while the mark is still the one being undone, and
+    never to a later instant."""
+    with tempfile.TemporaryDirectory() as tmp:
+        store = cs.ChatStateStore(tmp)
+        cid = "signal:+41790000090"
+        t1, t2, t3 = cs.iso_z(1000.0), cs.iso_z(2000.0), cs.iso_z(3000.0)
+        # mark_read is advance_last_read that also says what the mark was.
+        doc, previous = store.mark_read(cid, 1000.0)
+        assert previous is None and doc["last_read"] == t1 and doc["read_seq"] == 1
+        doc, previous = store.mark_read(cid, 2000.0)
+        assert previous == t1 and doc["last_read"] == t2
+        # Forward only, still: an older mark moves nothing, and is a read.
+        doc, previous = store.mark_read(cid, 500.0)
+        assert previous == t2 and doc["last_read"] == t2 and doc["read_seq"] == 3
+
+        # The undo: back to the previous mark, the read count untouched.
+        restored, doc = store.restore_last_read(cid, restore=t1, marked=t2)
+        assert restored and doc["last_read"] == t1 and doc["read_seq"] == 3
+        assert store.get(cid)["last_read"] == t1
+        # Spent — the mark is no longer the one named — so nothing changes.
+        restored, doc = store.restore_last_read(cid, restore=None, marked=t2)
+        assert not restored and doc["last_read"] == t1
+        # Back to "never read" is a restore like any other.
+        restored, doc = store.restore_last_read(cid, restore=None, marked=t1)
+        assert restored and doc["last_read"] is None
+
+        # A reply (or a later mark) in between wins over the undo.
+        doc, previous = store.mark_read(cid, 2000.0)
+        store.advance_last_read(cid, 3000.0)
+        restored, doc = store.restore_last_read(cid, restore=previous, marked=t2)
+        assert not restored and doc["last_read"] == t3
+        # An "undo" to a later instant would be an advance by another name.
+        try:
+            store.restore_last_read(cid, restore=cs.iso_z(4000.0), marked=t3)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("a restore later than the mark it undoes must raise")
+        assert store.get(cid)["last_read"] == t3
+        # Nothing is stored for a chat an undo merely named.
+        restored, _ = store.restore_last_read("signal:+41790000091", restore=None, marked=t1)
+        assert not restored and not store.exists("signal:+41790000091")
+
+        # What the newest mark settled is remembered beside it, and cleared.
+        assert store.get(cid)["read_settled"] is None
+        assert store.set_read_settled(cid, "2026-01-01T00:00:00+00:00")["read_settled"] \
+            == "2026-01-01T00:00:00+00:00"
+        assert store.set_read_settled(cid, None)["read_settled"] is None
+        print("PASS test_mark_read_and_its_guarded_restore")
+
+
 def test_archive_unless_arrived():
     with tempfile.TemporaryDirectory() as tmp:
         store = cs.ChatStateStore(tmp)
@@ -377,6 +431,7 @@ if __name__ == "__main__":
     test_undo_clear_is_refused_once_it_is_stale_or_moot()
     test_agent_staging_never_clobbers_user_text()
     test_last_read_forward_only_and_unread_modes()
+    test_mark_read_and_its_guarded_restore()
     test_archive_unless_arrived()
     test_flags_and_note_message()
     test_companion_link()
