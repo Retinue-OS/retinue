@@ -1,11 +1,43 @@
 {
  "generated": "2026-08-27T09:45:00+02:00",
  "counts": {
-  "unread": 4,
+  "unread": 5,
   "read": 2,
   "archived": 1
  },
  "chats": [
+  {
+   "id": "email:~me@example.org:CAJx8kQ2v7Lr3n@mail.example.com",
+   "channel": "email",
+   "account": "me@example.org",
+   "key": "CAJx8kQ2v7Lr3n@mail.example.com",
+   "name": "Quarterly numbers",
+   "group": true,
+   "participants": [
+    {"address": "ann@example.com", "name": "Ann Example", "contact": "urn:retinue:person:ann-example"},
+    {"address": "bob@builder.example", "name": "Bob Builder", "contact": null},
+    {"address": "carla@example.net", "name": null, "contact": null}
+   ],
+   "participants_more": 0,
+   "peer": {"address": "ann@example.com", "name": "Ann Example"},
+   "unread": 1,
+   "list_group": "unread",
+   "last_read": "2026-08-26T17:30:00+02:00",
+   "inbound_seq": 4,
+   "archived": false,
+   "muted": false,
+   "companion": null,
+   "last": {
+    "ts": "2026-08-27T08:58:00+02:00",
+    "direction": "in",
+    "kind": "text",
+    "text": "Thanks Bob, the revised table works for me. Let's freeze it on Friday.",
+    "sender_name": "Ann Example",
+    "removed": false
+   },
+   "draft": null,
+   "messages": "/data/chats/email-quarterly.json"
+  },
   {
    "id": "signal:~+41765761976:+41794456312",
    "channel": "signal",

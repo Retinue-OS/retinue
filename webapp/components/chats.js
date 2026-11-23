@@ -1,6 +1,9 @@
 // Chats card: the messenger mirror's home screen — every channel conversation
-// (one peer or group each) as one row, ordered by last activity, with unread
-// badge, channel mark and last-message preview. Rows link to the chat's own
+// (one peer or group each, and on e-mail one mail thread each) as one row,
+// ordered by last activity, with unread badge, channel mark and last-message
+// preview. A mail thread's row is named by its subject and carries a line of
+// its participants between the name and the preview (docs/mail-chats.md,
+// "What a chat shows"). Rows link to the chat's own
 // page (chat.html), which renders the full mirror beside its companion thread.
 // With the `full` attribute (chats.html) the list drops the dashboard cap and
 // splits into three tabs — Unread · Read · Archived — by the server's
@@ -77,7 +80,15 @@ export const CHANNELS = {
   whatsapp: { label: 'WhatsApp', mark: 'W', color: '#25d366' },
   telegram: { label: 'Telegram', mark: 'T', color: '#2aabee' },
   sms: { label: 'SMS', mark: 'M', color: '#8e7cc3' },
+  email: { label: 'E-mail', mark: '@', color: '#d0603f' },
 };
+
+// Whether a chat is a mail thread: its name is a subject, its peer a person
+// who is not the chat, and an outbound message "from the device" was sent
+// from a mail client rather than from the user's phone.
+export function isMail(chat) {
+  return !!chat && chat.channel === 'email';
+}
 
 export function channelMarkHtml(channel) {
   const c = CHANNELS[channel] || { label: channel, mark: '?', color: 'var(--muted, #8b93a3)' };
@@ -118,28 +129,70 @@ export function initials(name) {
 // in as many colours as there are chats with them, in exactly the list where
 // telling those chats apart is already the difficulty. The key rather than the
 // name, because a roster update renames a contact and must not repaint them.
+//
+// A mail chat's key is its thread's root Message-ID, which names the thread
+// and not the person: there the summary's `peer` (the latest inbound sender,
+// or whom the user wrote to) is the key, by address, so one correspondent
+// keeps one colour across every thread with them — and the initials are that
+// person's too: the disc says who, the row's name what about.
+export function avatarKey(chat) {
+  const c = chat || {};
+  const addr = c.peer && typeof c.peer.address === 'string' ? c.peer.address.trim().toLowerCase() : '';
+  return `${c.channel || ''}\u0000${addr || c.key || c.id || ''}`;
+}
+
+export function avatarInitials(chat) {
+  const c = chat || {};
+  const p = c.peer && typeof c.peer === 'object' ? c.peer : null;
+  const who = p && (String(p.name || '').trim() || String(p.address || '').trim());
+  return initials(who || c.name);
+}
+
 export function avatarHtml(chat) {
-  const peer = `${chat.channel || ''}\u0000${chat.key || chat.id || ''}`;
-  return `<span class="av" style="background:${colorFor(peer)}" aria-hidden="true">` +
-    `${esc(initials(chat.name))}${channelMarkHtml(chat.channel)}</span>`;
+  return `<span class="av" style="background:${colorFor(avatarKey(chat))}" aria-hidden="true">` +
+    `${esc(avatarInitials(chat))}${channelMarkHtml(chat.channel)}</span>`;
+}
+
+// A mail chat's participants as one line of plain text (the caller escapes
+// it): each by the name the address book or the mail gave, else the address,
+// and "+n" for those the server's cap left out. '' for a chat that names
+// none — every messenger chat.
+export function participantsText(chat) {
+  const c = chat || {};
+  const list = Array.isArray(c.participants) ? c.participants : [];
+  const names = list
+    .map((p) => (p && typeof p === 'object'
+      ? (String(p.name || '').trim() || String(p.address || '').trim()) : ''))
+    .filter(Boolean);
+  const n = Number(c.participants_more);
+  const more = Number.isFinite(n) && n > 0 ? Math.floor(n) : 0;
+  if (!names.length) return more ? `+${more}` : '';
+  return names.join(', ') + (more ? ` +${more}` : '');
 }
 
 // The one-line preview under the chat name, messenger-home style: who said the
 // last thing, then what. Outbound gets its author ("You", the agent's name,
-// "You (phone)" for an own-device echo); group inbound gets the sender's first
-// name. An image message shows a camera mark before any caption.
+// "You (phone)" for an own-device echo — "You (mail client)" on e-mail, where
+// the device is whichever client sent it); group inbound gets the sender's
+// first name, and so does every inbound mail, whose row is named by its
+// subject and says nothing else about who wrote. An image message shows a
+// camera mark before any caption; a mail removed in a mail client says so in
+// place of the text it no longer has.
 export function previewHtml(chat) {
   const last = chat.last || {};
+  const mail = isMail(chat);
   let who = '';
   if (last.direction === 'out') {
     who = last.author === 'agent' ? 'Ara'
-      : last.author === 'device' ? 'You (phone)' : 'You';
-  } else if (chat.group && last.sender_name) {
-    who = String(last.sender_name).split(/\s+/)[0];
+      : last.author === 'device' ? (mail ? 'You (mail client)' : 'You (phone)') : 'You';
+  } else if ((chat.group || mail) && last.sender_name) {
+    who = String(last.sender_name).trim().split(/\s+/)[0];
   }
+  const lead = who ? `<span class="pv-who">${esc(who)}:</span> ` : '';
+  if (last.removed) return `${lead}<span class="pv-removed">Removed in a mail client</span>`;
   const img = last.kind === 'image' ? '<span class="pv-img" aria-label="Image">&#128247;</span> ' : '';
   const text = last.text || (last.kind === 'image' ? 'Photo' : '');
-  return (who ? `<span class="pv-who">${esc(who)}:</span> ` : '') + img + esc(text);
+  return lead + img + esc(text);
 }
 
 // The three lists of the full page, in tab order.
@@ -518,6 +571,14 @@ class RetinueChats extends RetinueCard {
               min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
       .prev .pv-who { color: var(--fg, #e7ebf2); opacity: .75; }
       .prev .pv-draft { color: var(--accent, #6ea8fe); font-style: italic; }
+      .prev .pv-removed { font-style: italic; }
+      /* A mail thread's participants, between its subject and the preview:
+         the row grows a third line, and the avatar spans all three. */
+      .row.has-people { grid-template-rows: auto auto auto; }
+      .row.has-people .av { grid-row: 1 / 4; }
+      .ppl { grid-column: 2; grid-row: 2; color: var(--fg, #e7ebf2); opacity: .8; font-size: .76rem;
+             min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .row.has-people .prev, .row.has-people .unread, .row.has-people .mute-mark { grid-row: 3; }
       .unread { grid-column: 3; justify-self: end; min-width: 18px; height: 18px; padding: 0 5px;
                 border-radius: 9px; background: var(--accent, #6ea8fe); color: #0b0d12;
                 font-size: .68rem; font-weight: 700; display: inline-flex;
@@ -614,14 +675,19 @@ class RetinueChats extends RetinueCard {
     const shown = (this._full || isWideFrame()) ? chats : chats.slice(0, MAX_CARD_CHATS);
     // Two accounts of one channel talking to the same peer are two chats with
     // the same name (and so is a peer's unattributed history beside its
-    // account-named chat). The name alone cannot tell them apart, so where —
-    // and only where — a name repeats within a channel, each row also says
-    // which account it is. Computed over the rows actually shown, so an
-    // unambiguous list carries no such label at all.
-    const nameCount = {};
+    // account-named chat; and so is one mail thread that reached two of the
+    // user's mailboxes). The name alone cannot tell them apart, so where — and
+    // only where — a name repeats within a channel ACROSS accounts, each row
+    // also says which account it is. Rows that share a name on one account
+    // (two mail threads both called "Invoice", two contacts both called
+    // "Mara") get no label: it would be the same on each and tell them apart
+    // no better — the participants line and the preview do that. Computed
+    // over the rows actually shown, so an unambiguous list carries none.
+    const accountsOf = {};
+    const nameKey = (c) => `${c.channel}\u0000${c.name}`;
     for (const c of shown) {
-      const k = `${c.channel}\u0000${c.name}`;
-      nameCount[k] = (nameCount[k] || 0) + 1;
+      const k = nameKey(c);
+      (accountsOf[k] = accountsOf[k] || new Set()).add(c.account || '');
     }
     const rows = shown.map((c) => {
       // The count says what it counts in words too, for whoever does not see
@@ -671,17 +737,18 @@ class RetinueChats extends RetinueCard {
         : (quick ? `<div class="quick ${quick}" aria-hidden="true">${QUICK_LABEL[quick]}</div>` : '') +
           (quickLeft ? `<div class="quick-left ${quickLeft}" aria-hidden="true">Archive</div>` : '') +
           `<div class="tray">${tray}</div>`;
+      const people = participantsText(c);
       return (this._full
         ? `<li class="swipe" data-id="${esc(c.id)}"` +
           (quick ? ` data-quick="${quick}"` : '') +
           (quickLeft ? ` data-quick-left="${quickLeft}"` : '') + '>'
         : '<li>') + under +
-        `<a class="row${unread ? ' has-unread' : ''}"` +
+        `<a class="row${unread ? ' has-unread' : ''}${people ? ' has-people' : ''}"` +
         (this._full ? ' draggable="false" ' : ' ') +
         `href="/chat.html?id=${encodeURIComponent(c.id)}">` +
         `${avatarHtml(c)}` +
         `<span class="name">${c.starred ? STAR_MARK : ''}${esc(c.name)}` +
-        (nameCount[`${c.channel}\u0000${c.name}`] > 1
+        (accountsOf[nameKey(c)].size > 1
           ? `<span class="acct" title="${c.account
               ? `On the account ${esc(c.account)}`
               : 'Older messages, from before the account was recorded'}">${
@@ -689,6 +756,7 @@ class RetinueChats extends RetinueCard {
           : '') +
         `</span>` +
         `<span class="when">${esc(fmtAge((c.last || {}).ts))}</span>` +
+        (people ? `<span class="ppl" title="${esc(people)}">${esc(people)}</span>` : '') +
         `<span class="prev">${prev}</span>` +
         badge +
         '</a></li>';

@@ -238,7 +238,8 @@ the entrypoint) so only in-container agents can post on the user's behalf.
 ## Messenger chats
 
 The chat surface of the messenger-chats redesign: each messenger conversation
-(Signal / WhatsApp / Telegram, one peer or group) is a **chat** — a
+(Signal / WhatsApp / Telegram / SMS, one peer or group — and on e-mail one
+mail thread, see *Mail threads* below) is a **chat** — a
 deterministic mirror rendered like the messenger client — with its
 **companion pane** (the conversation-with-Ara rail) beside it. It runs against
 the gateway's chat API (SPARQL over the message ledgers plus a live overlay;
@@ -394,6 +395,56 @@ docstring). Pieces:
   — into an empty box, or over the text she was asked to rework, whenever
   nothing unsaved is in it (unsaved keystrokes meet the newer draft at
   their own save, as a conflict) — and the send press stays the user's.
+- **Mail threads** (channel `email`, `docs/mail-chats.md` for the whole
+  design) are chats in every sense above; what differs is this. The **row**
+  carries the thread's subject as its name, an `@` channel mark, and a third
+  line between name and preview: the participants by name (the address where
+  neither the address book nor the mail gave one), with "+n" past the
+  server's cap. Its avatar is keyed on the summary's `peer` address rather
+  than the chat key — the key is the thread's root Message-ID, so keying on
+  it would give one person a colour per thread — and shows the peer's
+  initials. The preview reads "Name: text" for every inbound mail (the row's
+  name is a subject, so nothing else says who wrote), "You (mail client)" for
+  a mail sent from another client, and "Removed in a mail client" where the
+  latest mail is gone. The account label follows the rule every channel now
+  has: a name repeated **across accounts** carries the account; two threads
+  on one account that share a subject carry none (the label would be the
+  same on both). The **header** shows the subject, the participants and
+  `via <account>` on two lines — never the Message-ID key. **Bubbles**: an
+  inbound mail in a group carries its sender's name (the address without a
+  display name), in a 1:1 none, as on every channel; a mail whose own subject
+  is not the thread's shows it as a small line above the text, reply and
+  forward markers aside (told by their shape — a short token and a colon, a
+  bracketed list tag — so no language's "Re:" is privileged); a mail sent
+  from another client is "You · mail client". The text is the server's
+  trimmed text, rendered like any message (escaped, http(s) links, line
+  breaks kept), attachments under the rules below. **Original**: a bubble
+  whose message names an `original` offers a control that expands the whole
+  mail in the bubble — From, To, Cc, Date and Subject, the full header block
+  behind an *All headers* disclosure, then the HTML part in a sandboxed frame
+  (`<iframe sandbox="allow-popups allow-popups-to-escape-sandbox">`, built by
+  DOM calls, sized by an estimate from the text within a cap, resizable, with
+  its own scroll) or the full plain text when there is no HTML part, then
+  every attachment; a second tap gives the trimmed text back. It is fetched
+  on the first tap and cached per message, with a loading line and an error
+  line with *Try again*; the open state, and the disclosure's, live on the
+  element, so neither a poll nor a re-render collapses it. The page takes the
+  `original` URL only when it is exactly this chat's own
+  `/chats/<id>/messages/<token>/original` (the id segment, decoded, is the
+  open chat's id; the token one URL-safe segment that is no dot segment), and
+  frames only `html_url` equal to that URL plus `.html`; anything else gets no
+  control and no frame. A **tombstone** — a mail deleted or moved away in a
+  mail client (`removed`) — is a quiet outlined bubble saying so, with who it
+  was from and when (the removal time on hover), and no text, Original or
+  attachment. The poll **reconciles**: a message already on screen whose
+  removal, text, trim, attachments, subject or original changed is
+  re-rendered in its place, the rest of the thread, the scroll position and
+  an Original that still applies left as they are. And a chat whose summary
+  says `can_send: false` (the read-only mirror) shows `cannot_send_reason` in
+  one line where the composer, its chips, the draft and the grip would be;
+  nothing is loaded into, adopted by or saved from a draft there. That is one
+  switch (`_canSend`), followed on every poll, which the writing phase flips
+  by answering `true`.
 
 The API, as the components consume it:
 
@@ -411,8 +462,9 @@ The API, as the components consume it:
   `account` the gateway account, or null for that older history. Both are
   surfaced because the name identifies neither: two accounts talking to the
   same person are two chats called the same thing, so the client labels a
-  repeated name with its account, and keys the avatar colour on the *peer* so
-  one person keeps one colour across all of them. Clients must treat the id as
+  name repeated across accounts with its account (not one repeated on a single
+  account, where the label would be the same on each), and keys the avatar
+  colour on the *peer* so one person keeps one colour across all of them. Clients must treat the id as
   opaque and read `key`/`account` rather than splitting it.
 
   `unread` is the number of inbound messages the user has neither answered
@@ -643,6 +695,22 @@ The API, as the components consume it:
   the pane is a plain conversation client: `GET /conversations/<id>` for the
   thread (`pending` is Ara writing), the reply POST for a turn, the read POST
   when the pane shows it.
+- **Mail additions** (`docs/mail-chats.md`). An e-mail `ChatSummary` also
+  carries `participants` (`[{address, name, contact}]`, at most 6),
+  `participants_more` (how many the cap left out), `peer` (`{address, name}`:
+  the latest inbound sender, or whom a thread the user started went to),
+  `last.removed`, and — on the messages document's `chat` — `can_send` and
+  `cannot_send_reason` (absent or true on every other chat). An e-mail
+  `Message` also carries `subject` (its own), `recipients` and `cc`, `trim`
+  (`deterministic` | `wanting` | `model`), `removed` and `removed_at`, and
+  `original` — the URL of its full form, present exactly when there is one to
+  show (never on a tombstone, which has empty `text` and no attachments).
+  `GET <original>` answers `{id, headers: {from, to, cc, date, subject},
+  header_block, text, html_url, attachments}`: the full, untrimmed plain
+  text, and `html_url` either null or the original URL plus `.html`, which
+  serves the sanitised HTML part as a document of its own under a policy
+  that lets nothing load or run (the chat page's own policy gains
+  `frame-src 'self'` for it).
 
 **Reference documents:** `data/chats.json` and `data/chats/<slug>.json` are
 static documents in the API's response shapes — the contract drafts the API
@@ -657,7 +725,11 @@ link's url is the proxy's or an http(s) URL); the origin's
 Content-Security-Policy allows no `data:` media on the chat page, since no
 record the gateway serves carries one, so the corpus shows its media only
 where it is served without that policy. It covers both companion states: one chat names an
-existing thread, the rest carry `companion: null`. Companion messages
+existing thread, the rest carry `companion: null`. It holds a mail thread
+too (`data/chats/email-quarterly.json`): a read-only group thread with an
+inline image and an attached sheet, a mail sent from another client, an HTML
+mail whose subject is not the thread's, and a tombstone, with the Original of
+its HTML mail beside it (`email-quarterly.original.json`). Companion messages
 themselves are conversation documents, not chat ones, so the corpus holds
 none — the suite mocks `/conversations/<id>` for those.
 
