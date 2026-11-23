@@ -9874,6 +9874,66 @@ def _contact_file_card(handle: tuple[str, str], card: dict, *, name: str, sphere
                             instruction=instruction), "update"
 
 
+# A chat whose handle the address book already gives to someone is that
+# person's chat: the card is filled in without the user tapping "This is …".
+# Only an exact owner counts — the same number on another channel stays a
+# suggestion — and only a chat with no card at all is touched, so a card the
+# user filled in, changed or removed stays as they left it (removing a card
+# also takes the handle off the person, so nothing links it back).
+CHAT_AUTOLINK_SECONDS = float(os.environ.get("CHAT_AUTOLINK_SECONDS", "300"))
+_chat_autolink_state = {"at": 0.0}
+
+
+def _chat_autolink(chat_id: str, doc: dict | None = None, *, profile: dict | None = None) -> dict | None:
+    """Link a card-less 1:1 chat to the person who owns its handle. Returns
+    the chat document as it now stands, or None when nothing changed."""
+    doc = doc if doc is not None else _CHAT_STATE.get(chat_id)
+    if not doc or doc.get("contact"):
+        return None
+    handle = _chat_handle(chat_id)
+    if handle is None:
+        return None
+    try:
+        record = _CONTACTS.find(*handle)
+    except Exception:  # noqa: BLE001 - an unreadable address book leaves the chat a handle
+        return None
+    if record is None:
+        return None
+    channel, key = chat_state_mod.split_chat_id(chat_id) or ("", chat_id)
+    was = _chat_display_name(doc, channel, key)
+    with _attention_lock:
+        own = profile is None
+        if own:
+            profile = _ATTENTION.profile()
+        new = _CHAT_STATE.set_contact(chat_id, at=_attention_now().isoformat(), **_contact_card_fields(record))
+        # What the user taught the bare number follows it to the person, as
+        # when the card is filled in by hand.
+        moved = _attention_rename_sender(profile, was, record["name"]) if was != record["name"] else []
+        if own and moved:
+            _ATTENTION.save_profile(profile)
+    _chats_cache_invalidate()
+    print(f"[web-gateway] contacts: linked {chat_id} to {record['name']} (the owner of its handle)", flush=True)
+    return new
+
+
+def _chats_autolink(*, force: bool = True) -> int:
+    """Sweep every chat for _chat_autolink: at startup, after a person is
+    written, and (throttled) on the tick, for persons filed outside the
+    gateway. Returns the chats linked."""
+    now = time.monotonic()
+    if not force and now - _chat_autolink_state["at"] < CHAT_AUTOLINK_SECONDS:
+        return 0
+    _chat_autolink_state["at"] = now
+    linked = 0
+    for chat_id, doc in _CHAT_STATE.all().items():
+        try:
+            if _chat_autolink(chat_id, doc) is not None:
+                linked += 1
+        except Exception as exc:  # noqa: BLE001 - one bad chat must not stop the sweep
+            print(f"[web-gateway] contacts: could not link {chat_id!r} ({exc})", flush=True)
+    return linked
+
+
 def _contact_brief(record: dict) -> dict:
     """A person as the contact card offers them: to link, or to show."""
     out = contacts_mod.public(record)
@@ -10059,8 +10119,13 @@ def _contacts_sync_policy() -> None:
 
 
 def _contact_changed(record: dict, verb: str) -> None:
-    """After any write to a person: the VIP projection, and the commit."""
+    """After any write to a person: the VIP projection, the chats their
+    handles now link, and the commit."""
     _contacts_sync_policy()
+    try:
+        _chats_autolink()
+    except Exception as exc:  # noqa: BLE001 - best effort; the tick sweeps again
+        print(f"[web-gateway] contacts: autolink failed ({exc})", flush=True)
     _contact_commit(record, verb)
 
 
@@ -10703,6 +10768,10 @@ def _attention_tick_loop() -> None:
         except Exception as exc:  # noqa: BLE001 - the loop must survive a bad minute
             print(f"[web-gateway] attention tick failed: {exc!r}", flush=True)
         _contacts_sync_policy()
+        try:
+            _chats_autolink(force=False)
+        except Exception as exc:  # noqa: BLE001 - the loop must survive
+            print(f"[web-gateway] contacts: autolink failed ({exc})", flush=True)
         time.sleep(ATTENTION_TICK_SECONDS)
 
 
@@ -12633,6 +12702,12 @@ class Handler(BaseHTTPRequestHandler):
             gateway_source=chat_state_mod.GATEWAY_SOURCE_ACCOUNT if rail_slug else None,
             sender=entry["sender"], sender_name=entry["sender_name"],
             unknown_sender=_rail_unknown_sender(payload) if direction == "in" else None)
+        # A handle the address book already knows names the chat before the
+        # attention model judges the arrival, so it is judged as the person.
+        try:
+            doc = _chat_autolink(chat_id, doc) or doc
+        except Exception as exc:  # noqa: BLE001 - the arrival must land regardless
+            print(f"[web-gateway] contacts: autolink of {chat_id!r} failed ({exc})", flush=True)
         _chats_cache_invalidate()
         pushed = False
         job_url = None
@@ -14529,6 +14604,9 @@ if __name__ == "__main__":
         if imported:
             print(f"[web-gateway] gave {imported} contact(s) what the attention profile knew", flush=True)
         _contacts_sync_policy()
+        linked = _chats_autolink()
+        if linked:
+            print(f"[web-gateway] linked {linked} chat(s) to the contacts owning their handles", flush=True)
     except Exception as exc:  # noqa: BLE001
         print(f"[web-gateway] contact migration skipped: {exc}", flush=True)
     # The attention model's clock: breakpoints (digest times, scheduled mode
