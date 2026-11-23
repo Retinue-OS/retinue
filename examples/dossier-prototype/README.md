@@ -44,7 +44,8 @@ her dot, as on the dashboard.
 |---|---|---|
 | Rows | attention items over chats, threads, projects | **dossiers**: relationships (one per person or group), topics (project files; threads with Ara), one standing *Inbox Zero* |
 | Home | Now · Next · Held · Waiting | **the chat list** — the Chats page's row for every dossier (people, mail senders, groups, topics, Ara), newest first; *Rings now* on top; focus and aperture decide which rows are in it, a pending dossier carries one quiet line of attention fields |
-| Chat list | the Chats card | the home itself; **Contacts** is the same list filtered to people and groups; a new sender is a row the moment they write |
+| Chat list | the Chats card | the home itself; **Contacts** is the address book in the same row — every person and group, 👤 opens the **contact card** (handles on every channel, sphere, VIP, prior and permits, the dossiers they are in); a new sender is a row the moment they write, screened until filed |
+| Starting things | per page: a composer here, a button there | one **＋** in the navigation row: a message to someone, ask Ara, a dossier with people, a contact |
 | E-mail | arrives as a Secretary-triaged thread | **in the open on arrival** in the sender's relationship; judged by Inbox Zero at the next batch (no VIP, no turn) |
 | The digest | a push listing held items | unchanged — plus **Inbox Zero's batch** at the same breakpoints, one event with the proposals and their chips |
 | Ara | a pane beside the chat; the thread itself | the composer's default addressee on every dossier; on a relationship a *to* switch picks the person's channel or Ara |

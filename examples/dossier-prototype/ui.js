@@ -73,7 +73,7 @@
       this.sim = new root.Simulation(this.engine, { onChange: () => this.renderAll(), ui: this });
       this.sheet = null; this.view = null; this.draft = null; this.toast = null; this.menu = false; this.otherOpen = false; this.waitingOpen = false;
       this.list = 'home'; this.dossierFilter = 'active'; this.to = {}; this.select = null; this.picker = null;
-      this.shelf = []; this.shelfMenu = null; this.pageMenu = false; this.model = 'Ara'; this.treeOpen = {}; this.focusMenuOpen = false; // the shelf and the page bar live on the device, as on the dashboard
+      this.shelf = []; this.shelfMenu = null; this.pageMenu = false; this.model = 'Ara'; this.treeOpen = {}; this.focusMenuOpen = false; this.newMenu = false; this.card = null; this.newForm = null; // the shelf and the page bar live on the device, as on the dashboard
       this.files = {}; this.rec = null; this.job = null; this.attachError = ''; this.wave = new Waveform(() => this.phoneEl);
       this.sttUrl = null; this.cloudOk = false; try { this.cloudOk = localStorage.getItem('attention-voice-cloud') === '1'; } catch (_e) { /* no storage */ }
       this.localRecognition = null; // null = unknown, then true/false
@@ -234,7 +234,7 @@
       const collapsible = (label, items, key, open) => items.length ? `<section class="sec ${key}"><button class="sec-toggle" data-act="toggle-${key}"><span>${label} · ${items.length}</span><span class="chev">${open ? '▾' : '▸'}</span></button>${open ? items.map((i) => this.row(i, key)).join('') : ''}</section>` : '';
       if (this.list === 'contacts') {
         const rows = e.contacts();
-        return `<div class="ph-body cl">${rows.map((i) => this.chatRow(i)).join('') || '<div class="empty">Nobody yet.</div>'}<p class="list-hint">Every person and group, by latest message. A new sender appears here the moment they write — nothing to triage first.</p></div>`;
+        return `<div class="ph-body cl">${rows.map((i) => `<div class="cl-wrap">${this.chatRow(i)}<button class="cl-card" data-act="card" data-id="${esc(i.id)}" title="Contact card" aria-label="Contact card">👤</button></div>`).join('') || '<div class="empty">Nobody yet.</div>'}<button class="below-row" data-act="new-form" data-form="contact">＋ New contact</button><p class="list-hint">The address book, by latest message: every person and group, with or without messages. 👤 opens the card — handles, sphere, VIP. A new sender appears here the moment they write, screened until you file them.</p></div>`;
       }
       if (this.list === 'dossiers') {
         const tree = e.dossierTree(this.dossierFilter);
@@ -267,6 +267,42 @@
       const hand = e.override.aperture ? ' <small class="snap">· by hand</small>' : '';
       return `<div class="focus-bar"><button class="focus-chip${e.override.focus !== undefined ? ' hand' : ''}" data-act="focus-menu" title="What you are on">⌖ ${esc(e.focusText(f))} ▾</button><div class="aperture" title="How far from the focus you see">${notches}<span class="ap-name">${esc(a.name)}${hand}</span></div></div>`;
     }
+    // "New": the three things the user starts — a message to someone, a dossier (with Ara, or with people), a contact.
+    newMenuHtml() {
+      return `<div class="overlay" data-act="close-menu"><div class="menu" data-stop="1"><div class="menu-head">New</div>
+        <button class="menu-row" data-act="new-form" data-form="message"><span class="kind">👤</span><span><b>Message</b><small>write to someone — opens their dossier</small></span></button>
+        <button class="menu-row" data-act="new-form" data-form="ara"><span class="kind">✦</span><span><b>Ask Ara</b><small>a new topic with Ara alone</small></span></button>
+        <button class="menu-row" data-act="new-form" data-form="topic"><span class="kind">▣</span><span><b>Dossier</b><small>a topic with people — the first message goes out from it</small></span></button>
+        <button class="menu-row" data-act="new-form" data-form="contact"><span class="kind">＋</span><span><b>Contact</b><small>a person or group in the address book</small></span></button>
+      </div></div>`;
+    }
+    newFormHtml() {
+      const e = this.engine; const f = this.newForm; const people = e.contacts().filter((c) => c.kind === 'relationship');
+      const pick = (multi) => `<div class="pick-list people">${people.map((c) => `<label class="pick-person"><input type="${multi ? 'checkbox' : 'radio'}" name="who" data-act="new-who" value="${esc(c.title)}"${(f.who || []).includes(c.title) ? ' checked' : ''}><span class="cl-av small" style="background:${SPHERE_COLORS[c.sphere] || '#9aa5b1'}">${esc(c.title.split(/\s+/).map((w) => w[0]).join('').slice(0, 2).toUpperCase())}</span>${esc(c.title)} <small>${esc(c.channel)}</small></label>`).join('')}</div>`;
+      let body = '', title = '', ok = '';
+      if (f.kind === 'message') { title = 'Message'; body = `<div class="form-hint">Whom? The composer opens in their dossier, addressed to them.</div>${pick(false)}`; ok = 'Open'; }
+      if (f.kind === 'ara') { title = 'Ask Ara'; body = `<input id="nf-title" class="pick-input" type="text" placeholder="What is it about? (the dossier's title)" value="${esc(f.title || '')}"><select class="select small" data-act="new-within"><option value="">at the top</option>${e.items.filter((i) => i.kind === 'topic' && i.state !== 'done').map((t) => `<option value="${esc(t.id)}"${f.within === t.id ? ' selected' : ''}>within ${esc(t.title)}</option>`).join('')}</select>`; ok = 'Open'; }
+      if (f.kind === 'topic') { title = 'Dossier'; body = `<input id="nf-title" class="pick-input" type="text" placeholder="Title" value="${esc(f.title || '')}"><div class="form-hint">Participants — the first message goes to them from the dossier, and their replies file themselves into it.</div>${pick(true)}<select class="select small" data-act="new-within"><option value="">at the top</option>${e.items.filter((i) => i.kind === 'topic' && i.state !== 'done').map((t) => `<option value="${esc(t.id)}"${f.within === t.id ? ' selected' : ''}>within ${esc(t.title)}</option>`).join('')}</select>`; ok = 'Open'; }
+      if (f.kind === 'contact') { title = 'Contact'; body = `<input id="nf-title" class="pick-input" type="text" placeholder="Name" value="${esc(f.title || '')}"><div class="form-row"><select class="select small" data-act="new-channel">${['WhatsApp', 'Signal', 'Telegram', 'E-mail', 'Phone', 'SMS'].map((c) => `<option${(f.channel || 'E-mail') === c ? ' selected' : ''}>${c}</option>`).join('')}</select><input id="nf-handle" class="pick-input" type="text" placeholder="Address or number" value="${esc(f.handle || '')}"></div><div class="form-row"><span class="f-k">sphere</span><select class="select small" data-act="new-sphere">${root.Backends.SPHERES.map((sp) => `<option${(f.sphere || 'friends') === sp ? ' selected' : ''}>${sp}</option>`).join('')}</select></div>`; ok = 'Create'; }
+      return `<div class="overlay" data-act="close-form"><div class="sheet" data-stop="1"><div class="sheet-head"><div><div class="sheet-title">New ${esc(title.toLowerCase())}</div></div><button class="x" data-act="close-form" aria-label="Close">✕</button></div>${body}<div class="actions"><button class="btn primary" data-act="new-ok">${ok}</button><button class="btn" data-act="close-form">Cancel</button></div></div></div>`;
+    }
+    // The contact card: the person behind the relationship — handles on every channel, sphere, VIP (docs/contacts.md).
+    cardHtml() {
+      const e = this.engine; const item = e.byId.get(this.card); if (!item) return '';
+      const initials = item.title.split(/\s+/).map((w) => w[0]).join('').slice(0, 2).toUpperCase();
+      const handles = item.handles.map((h, i) => `<div class="handle"><span class="h-ch" style="background:${CHANNEL_COLORS[h[0]] || '#8b93a3'}">${esc(CHANNEL_MARK[h[0]] || h[0][0])}</span><span class="h-val"><b>${esc(h[0])}</b> ${esc(h[1])}</span>${item.kind === 'relationship' ? `<button class="btn tiny" data-act="card-rm-handle" data-id="${esc(item.id)}" data-index="${i}" title="Remove">×</button>` : ''}</div>`).join('');
+      const add = this.cardAdd ? `<div class="form-row"><select class="select small" id="ca-ch">${['WhatsApp', 'Signal', 'Telegram', 'E-mail', 'Phone', 'SMS'].map((c) => `<option>${c}</option>`).join('')}</select><input id="ca-val" class="pick-input" type="text" placeholder="Address or number"><button class="btn tiny primary" data-act="card-add-handle" data-id="${esc(item.id)}">Add</button></div>` : `<button class="btn tiny" data-act="card-add-start">+ handle</button>`;
+      const spheres = root.Backends.SPHERES.map((sp) => `<button class="chipbtn${item.sphere === sp ? ' primary' : ''}" data-act="card-sphere" data-id="${esc(item.id)}" data-sphere="${sp}">${sp}</button>`).join('');
+      const topics = e.items.filter((i) => (i.kind === 'topic' || i.kind === 'ara') && i.state !== 'done' && e.participantsOf(i).includes(item.title));
+      return `<div class="overlay" data-act="close-card"><div class="sheet card" data-stop="1">
+        <div class="sheet-head"><div class="card-head"><span class="cl-av" style="background:${SPHERE_COLORS[item.sphere] || '#9aa5b1'}">${esc(initials)}</span><div><div class="sheet-title">${esc(item.title)}</div><div class="sheet-src">${esc(e.kindLabel(item))}${item.org ? ` · ${esc(item.org)}` : ''}${item.screened ? ' · <b class="screened">screened — nobody has filed this sender</b>' : ''}</div></div></div><button class="x" data-act="close-card" aria-label="Close">✕</button></div>
+        <div class="f-label">Reaches them</div><div class="handles">${handles || '<div class="muted">no handle on file</div>'}${add}</div>
+        <div class="f-label">Sphere</div><div class="chips card-chips">${spheres}</div>
+        <div class="f-label">Attention</div><div class="card-attn"><label class="switch"><input type="checkbox" data-act="card-vip" data-id="${esc(item.id)}"${item.gate === 'vip' ? ' checked' : ''}> <span><b>VIP</b> — a model turn on every message, on every channel; rings in every mode</span></label><div class="card-line">importance prior <b>${esc(String(e.profile.priors[item.sender] != null ? e.profile.priors[item.sender] : item.importance))}</b> · permits: ${Object.entries(e.profile.permits).filter(([, v]) => v.includes(item.sender)).map(([m]) => esc(e.modes[m].name)).join(', ') || 'none'}</div></div>
+        ${topics.length ? `<div class="f-label">In dossiers</div><div class="embeds">${topics.map((t) => `<div class="embed row-embed cl">${this.chatRow(t)}</div>`).join('')}</div>` : ''}
+        <div class="actions"><button class="btn primary" data-act="view" data-id="${esc(item.id)}">Open the stream</button><button class="btn" data-act="open" data-id="${esc(item.id)}">Attention details</button></div>
+      </div></div>`;
+    }
     // The focus picker: flow, the spheres, the dossiers with something pending (with or without their relations).
     focusMenu() {
       const e = this.engine; const f = e.focus(); const cur = (x) => (JSON.stringify(x || null) === JSON.stringify(f || null) ? ' on' : '');
@@ -284,7 +320,7 @@
       const cur = this.view ? null : this.list;
       const back = this.view ? `<button class="nav-back" data-act="back" aria-label="Back">‹</button>` : '';
       const tabs = places.map(([k, l]) => `<button class="nav-tab${cur === k ? ' on' : ''}${k === 'news' ? ' stub' : ''}" data-act="list" data-list="${k}" ${k === 'news' ? 'title="Not part of this prototype"' : ''}>${l}${k === 'contacts' && e.inboxCount() ? `<span class="nav-badge">${e.inboxCount()}</span>` : ''}</button>`).join('');
-      return `<nav class="nav" aria-label="Dashboard">${back}<div class="nav-tabs">${tabs}</div><button class="nav-icon stub" title="Pending sends (none in this prototype)" aria-label="Pending sends">⇪</button><button class="nav-icon stub" title="Settings (not part of this prototype)" aria-label="Settings">⚙</button></nav>`;
+      return `<nav class="nav" aria-label="Dashboard">${back}<div class="nav-tabs">${tabs}</div><button class="nav-icon plus" data-act="new-menu" title="New — a message, a dossier, a contact" aria-label="New">＋</button><button class="nav-icon stub" title="Pending sends (none in this prototype)" aria-label="Pending sends">⇪</button><button class="nav-icon stub" title="Settings (not part of this prototype)" aria-label="Settings">⚙</button></nav>`;
     }
     // The shelf at the foot of every page (webapp/components/shelf.js): minimized
     // dossiers as a row of icons — top right a relationship's unread count, bottom
@@ -331,6 +367,9 @@
         ${toast}
         ${this.menu ? this.modeMenu() : ''}
         ${this.focusMenuOpen ? this.focusMenu() : ''}
+        ${this.newMenu ? this.newMenuHtml() : ''}
+        ${this.newForm ? this.newFormHtml() : ''}
+        ${this.card ? this.cardHtml() : ''}
         ${this.sheet ? this.sheetHtml() : ''}
         ${this.picker ? this.pickerHtml() : ''}
       </div></div>`;
@@ -392,9 +431,9 @@
       // title and state, then minimize (–), the model picker, and the ⋮ menu with Attention details, Star, Mute.
       const models = ['Ara', 'Ara jr.']; const picker = `<select class="model-pick" data-act="model" aria-label="Model answering Ara's turns" title="Which model answers Ara's turns in this dossier">${models.map((m) => `<option${this.model === m ? ' selected' : ''}>${esc(m)}</option>`).join('')}</select>`;
       const flagged = item.muted || item.starred;
-      const pageMenu = this.pageMenu ? `<div class="page-menu" data-stop="1"><button data-act="open" data-id="${esc(item.id)}">ⓘ Attention details</button><button data-act="star" data-id="${esc(item.id)}">${item.starred ? '★ Unstar' : '☆ Star'}</button><button data-act="mute" data-id="${esc(item.id)}">${item.muted ? '🔔 Unmute' : '🔕 Mute'}</button>${item.kind === 'topic' && item.state === 'open' ? `<button data-act="rest" data-id="${esc(item.id)}">Rest</button>` : ''}${item.state === 'open' && item.kind !== 'standing' ? `<button data-act="do" data-id="${esc(item.id)}">${peer ? 'Nothing pending' : 'Done'}</button>` : ''}</div>` : '';
+      const pageMenu = this.pageMenu ? `<div class="page-menu" data-stop="1">${peer ? `<button data-act="card" data-id="${esc(item.id)}">👤 Contact card</button>` : ''}<button data-act="open" data-id="${esc(item.id)}">ⓘ Attention details</button><button data-act="star" data-id="${esc(item.id)}">${item.starred ? '★ Unstar' : '☆ Star'}</button><button data-act="mute" data-id="${esc(item.id)}">${item.muted ? '🔔 Unmute' : '🔕 Mute'}</button>${item.kind === 'topic' && item.state === 'open' ? `<button data-act="rest" data-id="${esc(item.id)}">Rest</button>` : ''}${item.state === 'open' && item.kind !== 'standing' ? `<button data-act="do" data-id="${esc(item.id)}">${peer ? 'Nothing pending' : 'Done'}</button>` : ''}</div>` : '';
       return `<div class="view">
-        <div class="v-head"><div class="v-titles"><div class="v-title">${item.starred ? '<span class="star-mark">★</span> ' : ''}${KIND_GLYPH[item.kind]} ${esc(item.title)}${item.muted ? ' <span class="muted-mark" title="Muted">🔕</span>' : ''}</div><div class="v-sub">${esc(sub)} · <span style="color:${item.state === 'open' ? LEVEL_COLORS[lvl] : '#8b93a3'}">${esc(status)}</span></div></div><button class="bar-btn" data-act="shelve" data-id="${esc(item.id)}" title="Minimize to the shelf" aria-label="Minimize">–</button>${picker}<div class="menu-wrap"><button class="bar-btn${flagged ? ' flagged' : ''}" data-act="page-menu" title="More" aria-label="More">⋮</button>${pageMenu}</div></div>
+        <div class="v-head"><div class="v-titles"><div class="v-title">${item.starred ? '<span class="star-mark">★</span> ' : ''}${KIND_GLYPH[item.kind]} ${esc(item.title)}${item.muted ? ' <span class="muted-mark" title="Muted">🔕</span>' : ''}</div><div class="v-sub">${esc(sub)} · <span style="color:${item.state === 'open' ? LEVEL_COLORS[lvl] : '#8b93a3'}">${esc(status)}</span></div></div>${peer ? `<button class="bar-btn" data-act="card" data-id="${esc(item.id)}" title="Contact card" aria-label="Contact card">👤</button>` : ''}<button class="bar-btn" data-act="shelve" data-id="${esc(item.id)}" title="Minimize to the shelf" aria-label="Minimize">–</button>${picker}<div class="menu-wrap"><button class="bar-btn${flagged ? ' flagged' : ''}" data-act="page-menu" title="More" aria-label="More">⋮</button>${pageMenu}</div></div>
         ${treeLine}<div class="bubbles" id="bubbles">${bubbles || '<div class="empty">Nothing yet.</div>'}</div>
         ${selBar}${draftCard}${chips}${composer}${foot}</div>`;
     }
@@ -623,7 +662,7 @@
       const act = el.dataset.act; const id = el.dataset.id; const e = this.engine;
       if (act === 'seek') { const pt = el.getBoundingClientRect(); const rel = (ev.clientX - pt.left) / pt.width; const minute = Math.round(((rel * 720 - 20) / 680) * DAY); this.sim.seek(minute); this.sheet = null; this.menu = false; this.view = null; this.draft = null; this.select = null; this.picker = null; this.seenPushes = e.pushes.length; this.banner = null; this.renderAll(); return; }
       const stop = ev.target.closest('[data-stop]');
-      if ((act === 'close-sheet' || act === 'close-menu' || act === 'close-picker') && stop && el !== ev.target.closest('.x')) return; // clicks inside the sheet do not close it
+      if ((act === 'close-sheet' || act === 'close-menu' || act === 'close-picker' || act === 'close-card' || act === 'close-form') && stop && el !== ev.target.closest('.x')) return; // clicks inside the sheet do not close it
       if (act !== 'page-menu' && !ev.target.closest('.page-menu')) this.pageMenu = false; // any press outside the ⋮ menu shuts it
       switch (act) {
         case 'toggle-play': this.sim.toggle(); break;
@@ -632,7 +671,22 @@
         case 'resume': this.sim.resume(); break;
         case 'dismiss-banner': this.banner = null; break;
         case 'mode-menu': this.sim.viewerActed(); this.menu = !this.menu; break;
-        case 'close-menu': this.menu = false; this.focusMenuOpen = false; break;
+        case 'close-menu': this.menu = false; this.focusMenuOpen = false; this.newMenu = false; break;
+        // new things
+        case 'new-menu': this.sim.viewerActed(); this.newMenu = !this.newMenu; this.menu = false; this.focusMenuOpen = false; break;
+        case 'new-form': this.sim.viewerActed(); this.newMenu = false; this.newForm = { kind: el.dataset.form, who: [], title: '', within: null, channel: 'E-mail', handle: '', sphere: 'friends' }; break;
+        case 'close-form': this.newForm = null; break;
+        case 'new-ok': { const f = this.newForm; if (!f) return; const t = (this.phoneEl.querySelector('#nf-title') || {}).value; if (t != null) f.title = t; const hv = (this.phoneEl.querySelector('#nf-handle') || {}).value; if (hv != null) f.handle = hv;
+          if (f.kind === 'message') { if (!f.who.length) { this.showToast('Pick someone.'); break; } this.newForm = null; this.openView(`rel:${f.who[0]}`); this.to[`rel:${f.who[0]}`] = 'chat'; break; }
+          if (f.kind === 'ara' || f.kind === 'topic') { if (!(f.title || '').trim()) { this.showToast('Give it a title.'); break; } if (f.kind === 'topic' && !f.who.length) { this.showToast('Pick at least one participant.'); break; } const d = e.newTopic(f.title.trim(), f.kind === 'topic' ? f.who : [], f.within); this.newForm = null; this.openView(d.id); if (f.kind === 'topic') this.to[d.id] = 'chat'; break; }
+          if (f.kind === 'contact') { if (!(f.title || '').trim()) { this.showToast('Give them a name.'); break; } const c = e.newContact(f.title.trim(), f.channel, (f.handle || '').trim(), f.sphere); this.newForm = null; this.card = c.id; this.list = 'contacts'; this.view = null; break; } break; }
+        // the contact card
+        case 'card': this.sim.viewerActed(); this.card = id; this.cardAdd = false; this.pageMenu = false; break;
+        case 'close-card': this.card = null; this.cardAdd = false; break;
+        case 'card-sphere': this.sim.viewerActed(); e.updateContact(id, { sphere: el.dataset.sphere }); break;
+        case 'card-rm-handle': this.sim.viewerActed(); e.updateContact(id, { removeHandle: Number(el.dataset.index) }); break;
+        case 'card-add-start': this.cardAdd = true; break;
+        case 'card-add-handle': { this.sim.viewerActed(); const ch = (this.phoneEl.querySelector('#ca-ch') || {}).value || 'E-mail'; const v = ((this.phoneEl.querySelector('#ca-val') || {}).value || '').trim(); if (!v) { this.showToast('An address or number, please.'); break; } e.updateContact(id, { addHandle: [ch, v] }); this.cardAdd = false; break; }
         case 'set-mode': this.sim.viewerActed(); e.setManualMode(el.dataset.mode || null); this.menu = false; break;
         case 'list': this.sim.viewerActed(); this.list = el.dataset.list; this.view = null; this.pageMenu = false; this.shelfMenu = null; break;
         // the page bar and the shelf
@@ -650,7 +704,7 @@
         case 'set-focus': this.sim.viewerActed(); e.setFocus(el.dataset.focus === 'null' ? null : JSON.parse(el.dataset.focus)); this.focusMenuOpen = false; this.sheet = null; break;
         case 'release-focus': this.sim.viewerActed(); e.releaseFocus(); this.focusMenuOpen = false; break;
         case 'aperture': this.sim.viewerActed(); e.setAperture(el.dataset.aperture); break;
-        case 'view': this.sim.viewerActed(); this.sheet = null; this.picker = null; this.openView(id); break;
+        case 'view': this.sim.viewerActed(); this.sheet = null; this.picker = null; this.card = null; this.openView(id); break;
         case 'back': { const leaving = this.view && e.byId.get(this.view.id); this.view = null; this.draft = null; this.select = null; this.pageMenu = false; if (this.rec) this.stopRecording('abort');
           // Leaving while Ara is "answering" (a chip just tapped) parks the page on the shelf by itself; here Ara answers at once, so the automatic item simply shows her dot.
           if (leaving && this._justAsked === leaving.id && !this.shelf.some((s) => s.id === leaving.id)) { this.shelf.unshift({ id: leaving.id, at: this.engine.now - 1, working: false, automatic: true }); }
@@ -697,6 +751,11 @@
       if (el.dataset.act === 'cloud-ok') { this.cloudOk = !!el.checked; try { localStorage.setItem('attention-voice-cloud', this.cloudOk ? '1' : '0'); } catch (_e) { /* no storage */ } this.renderVoiceLine(); return; }
       if (el.dataset.act === 'sel') { this.onClick({ target: el }); return; }
       if (el.dataset.act === 'pick-within') { if (this.picker) this.picker.within = el.value || null; return; }
+      if (el.dataset.act === 'new-within') { if (this.newForm) this.newForm.within = el.value || null; return; }
+      if (el.dataset.act === 'new-channel') { if (this.newForm) this.newForm.channel = el.value; return; }
+      if (el.dataset.act === 'new-sphere') { if (this.newForm) this.newForm.sphere = el.value; return; }
+      if (el.dataset.act === 'new-who') { if (!this.newForm) return; const f = this.newForm; if (el.type === 'radio') f.who = [el.value]; else { const i = f.who.indexOf(el.value); if (el.checked && i < 0) f.who.push(el.value); if (!el.checked && i >= 0) f.who.splice(i, 1); } return; }
+      if (el.dataset.act === 'card-vip') { this.sim.viewerActed(); this.engine.updateContact(el.dataset.id, { vip: !!el.checked }); this.renderAll(); return; }
       if (el.dataset.act === 'model') { this.sim.viewerActed(); this.model = el.value; this.showToast(`${el.value} answers the next turn in this dossier.`); this.renderAll(); return; }
       if (el.dataset.act === 'lead') { this.sim.viewerActed(); this.engine.correct(el.dataset.id, { lead: Number(el.value) }); this.renderAll(); }
       if (el.dataset.act === 'due-set') { this.sim.viewerActed(); this.engine.correct(el.dataset.id, { due: el.value === 'none' ? null : Number(el.value) }); this.renderAll(); }

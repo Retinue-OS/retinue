@@ -19,14 +19,19 @@
   // (vip = a model turn on arrival; everyone else is shown at once and judged
   // in the next batch). `firstSeen` marks a sender the contacts had not met
   // before the day — their relationship is created by the arrival itself.
+  // `handles` is the person's address book entry (docs/contacts.md): every channel that reaches them.
+  // `channel` is the one the day's messages come on. A contact is a relationship dossier from the
+  // start, with or without messages — the Contacts page is the address book.
   const CONTACTS = {
-    'Anna Keller':    { sphere: 'friends',   gate: 'vip',   channel: 'WhatsApp' },
-    'Beat Frei':      { sphere: 'customers', gate: 'vip',   channel: 'Signal', org: 'Frei Bau AG' },
-    'Mum':            { sphere: 'family',    gate: 'vip',   channel: 'WhatsApp' },
-    'Luca Meier':     { sphere: 'friends',   gate: 'vip',   channel: 'Telegram' },
-    'Quartier group': { sphere: 'friends',   gate: 'group', channel: 'WhatsApp', group: true },
-    'Parking app':    { sphere: 'admin',     gate: 'batch', channel: 'E-mail', org: 'noreply@parking.example' },
-    'Tax office':     { sphere: 'admin',     gate: 'batch', channel: 'E-mail', org: 'Steuerverwaltung, via ePost' },
+    'Anna Keller':    { sphere: 'friends',   gate: 'vip',   channel: 'WhatsApp', handles: [['WhatsApp', '+41 79 100 00 01'], ['E-mail', 'anna@keller.example']] },
+    'Beat Frei':      { sphere: 'customers', gate: 'vip',   channel: 'Signal', org: 'Frei Bau AG', tags: ['finance'], handles: [['Signal', '+41 79 100 00 02'], ['E-mail', 'beat.frei@freibau.example'], ['Phone', '+41 44 100 00 02']] },
+    'Mum':            { sphere: 'family',    gate: 'vip',   channel: 'WhatsApp', handles: [['WhatsApp', '+41 79 100 00 03'], ['Phone', '+41 31 100 00 03']] },
+    'Luca Meier':     { sphere: 'friends',   gate: 'vip',   channel: 'Telegram', handles: [['Telegram', '@lucameier'], ['Signal', '+41 79 100 00 04']] },
+    'Quartier group': { sphere: 'friends',   gate: 'group', channel: 'WhatsApp', group: true, handles: [['WhatsApp', 'group · 9 members']] },
+    'Parking app':    { sphere: 'admin',     gate: 'batch', channel: 'E-mail', org: 'noreply@parking.example', handles: [['E-mail', 'noreply@parking.example']] },
+    'Tax office':     { sphere: 'admin',     gate: 'batch', channel: 'E-mail', org: 'Steuerverwaltung, via ePost', handles: [['E-mail', 'noreply@epost.example'], ['Phone', '+41 31 633 60 01']] },
+    'Studio Nord':    { sphere: 'customers', gate: 'batch', channel: 'E-mail', org: 'Studio Nord GmbH', handles: [['E-mail', 'hello@studionord.example']] },
+    'Frau Zeller':    { sphere: 'admin',     gate: 'vip',   channel: 'E-mail', org: 'the accountant', tags: ['finance'], handles: [['E-mail', 'zeller@treuhand.example'], ['Phone', '+41 44 200 00 05']] },
   };
 
   // Importance priors per relationship (what the attention profile starts with).

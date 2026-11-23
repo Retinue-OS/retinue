@@ -70,6 +70,8 @@
       // Yesterday's arrivals and the dossiers on file: already seen, already released.
       this.quiet = true;
       for (const p of B.topics.initial()) this._ingestEvent({ type: 'topic', at: -DAY, ...p });
+      // The address book: every contact is a relationship dossier before any message, quiet.
+      for (const name of Object.keys(B.CONTACTS)) this._add(this._relationship({ sender: name, chat: name, text: '' }));
       for (const be of B.all) for (const ev of be.events(-Infinity, 0)) this._ingestEvent(ev);
       for (const i of this.items) { if (i.state === 'open' && !i.released) this._release(i, 'yesterday'); i.lastLevel = this.level(i); }
       this.quiet = false; this._trackMode();
@@ -112,7 +114,7 @@
     }
     _relationship(msg) {
       const c = B.CONTACTS[msg.sender] || {}; const prior = this.profile.priors[msg.sender];
-      const item = this._newItem({ id: `rel:${msg.chat}`, kind: c.group ? 'group' : 'relationship', channel: c.channel || 'messenger', mail: c.channel === 'E-mail', org: c.org || null, gate: c.gate || 'batch', title: msg.chat, body: msg.text, sender: msg.sender, sphere: c.sphere || 'friends', tags: [], importance: prior != null ? prior : 2.5, importanceFrom: 'prior', due: null, kindLabel: 'message', state: 'quiet' });
+      const item = this._newItem({ id: `rel:${msg.chat}`, kind: c.group ? 'group' : 'relationship', channel: c.channel || 'messenger', mail: c.channel === 'E-mail', org: c.org || null, gate: c.gate || 'batch', title: msg.chat, body: msg.text, sender: msg.sender, sphere: c.sphere || 'friends', tags: c.tags ? c.tags.slice() : [], importance: prior != null ? prior : 2.5, importanceFrom: 'prior', due: null, kindLabel: 'message', state: 'quiet', handles: c.handles ? c.handles.map((h) => h.slice()) : [], lastActivity: -30 * DAY });
       return item;
     }
     _entry(msg) { return { who: 'in', text: msg.text, t: msg.at, from: msg.from || null, mail: !!msg.mail, subject: msg.subject || null, attachments: msg.attachments || [], inbox: !!msg.mail, judged: !msg.mail, links: [], uid: ++this.seq }; }
@@ -126,7 +128,7 @@
     }
     _onMessage(msg) {
       const id = `rel:${msg.chat}`; let item = this.byId.get(id); const tr = msg.triage || {};
-      const isNew = !item; if (isNew) item = this._add(this._relationship(msg));
+      const isNew = !item; if (isNew) { item = this._add(this._relationship(msg)); item.screened = true; if (!item.handles.length) item.handles = [[item.channel, msg.chat]]; }
       const entry = this._entry(msg); item.stream.push(entry); item.body = msg.text; this._touch(item, msg.at);
       // A mail from a sender who is no VIP: visible at once under Contacts, judged at the next batch. Inbox Zero holds it meanwhile.
       if (msg.mail && item.gate !== 'vip') {
@@ -481,6 +483,35 @@
       for (const e of entries) { e.links.push({ id: tgt.id, title: tgt.title }); if (e.mail && e.inbox) this._leaveInbox(e, `referenced in “${tgt.title}”`); }
       this.emit({ kind: 'action', item: tgt, text: `${entries.length} message${entries.length === 1 ? '' : 's'} from ${src.title} added to “${tgt.title}”${comment ? ` — “${comment}”` : ''}; the messages show the backlink.` });
       return tgt;
+    }
+    // Starting something: a topic (with Ara, or with participants), a new contact, or the first message to someone.
+    newTopic(title, participants = [], within = null) {
+      const parent = within ? this.byId.get(within) : null;
+      const t = this._add(this._newItem({ id: `top-${++this.seq}`, kind: participants.length ? 'topic' : 'ara', agent: 'Ara', title: title || 'New dossier', body: '', sphere: parent ? parent.sphere : (participants.length ? (this.byId.get(`rel:${participants[0]}`) || {}).sphere || 'admin' : 'admin'), tags: [], importance: parent ? parent.importance : 3, importanceFrom: parent ? 'inherited' : 'default', due: null, kindLabel: 'admin chore', participants: participants.length ? participants : null, within: parent ? parent.id : null }));
+      t.opened = true; t.chips = [];
+      if (parent) { parent.stream.push({ who: 'event', author: 'you', kind: 'status', t: this.now, text: 'Opened a sub-dossier:', refs: [this.ref(t.id)], links: [] }); this._touch(parent); }
+      this._touch(t); this._arrive(t, this.now);
+      this.emit({ kind: 'action', item: t, text: `New dossier “${t.title}”${participants.length ? ` with ${participants.join(', ')}` : ' with Ara'}${parent ? ` within ${parent.title}` : ''}.` });
+      return t;
+    }
+    newContact(name, channel, handle, sphere) {
+      const id = `rel:${name}`; if (this.byId.has(id)) return this.byId.get(id);
+      const item = this._add(this._newItem({ id, kind: 'relationship', channel, mail: channel === 'E-mail', org: null, gate: 'batch', title: name, body: '', sender: name, sphere: sphere || 'friends', tags: [], importance: 2.5, importanceFrom: 'default', due: null, kindLabel: 'message', state: 'quiet', handles: handle ? [[channel, handle]] : [], lastActivity: this.now }));
+      this.emit({ kind: 'action', item, text: `New contact ${name}${handle ? ` (${channel} ${handle})` : ''}, filed under ${item.sphere}.` });
+      return item;
+    }
+    // The contact card: edit the person — name, sphere, handles, VIP.
+    updateContact(id, patch) {
+      const item = this.byId.get(id); if (!item || !(item.kind === 'relationship' || item.kind === 'group')) return false;
+      if (patch.sphere) { item.sphere = patch.sphere; this.profile.priors[item.sender] = this.profile.priors[item.sender] || item.importance; }
+      if (patch.vip != null) item.gate = patch.vip ? 'vip' : 'batch';
+      if (patch.addHandle) item.handles.push(patch.addHandle);
+      if (patch.removeHandle != null) item.handles.splice(patch.removeHandle, 1);
+      if (patch.name) item.title = patch.name;
+      item.screened = false;
+      this.emit({ kind: 'action', item, text: `Contact card: ${item.title} — ${patch.sphere ? `sphere ${patch.sphere}` : patch.vip != null ? (patch.vip ? 'VIP: a turn on every message' : 'no longer VIP') : patch.addHandle ? `added ${patch.addHandle[0]} ${patch.addHandle[1]}` : patch.removeHandle != null ? 'a handle removed' : 'renamed'}.` });
+      for (const i of this.items) if (i.sender === item.sender && i.state === 'open') this._reevaluate(i, 'the contact card', this.level(i));
+      return true;
     }
     note(id, text) { const item = this.byId.get(id); if (!item) return false; item.stream.push({ who: 'event', author: 'you', kind: 'note', t: this.now, text: '', comment: text, messages: [], links: [] }); this._touch(item); this.emit({ kind: 'action', item, text: `Note in ${item.title}: “${text}”` }); return true; }
 

@@ -353,11 +353,22 @@ user closes, mutes or deletes. The digest is unchanged in timing and content:
 a push about what is in *Rings now* and what climbed since the last
 breakpoint, linking to rows.
 
-**Contacts** = relationships, sortable by latest message (default),
-alphabetically, or by hand (drag; per device; starred pins). Each row: name,
-newest message's preview and channel, unread badge, and the chip of any topic
-with something pending that references their messages. Search, edit and *+ New
-contact* stay.
+**Contacts** = the address book: every person and group, with or without
+messages, in the same row, sortable by latest message (default),
+alphabetically, or by hand (drag; per device; starred pins). Tapping a row
+opens the stream, as on the home; the **contact card** (👤 on the row, in the
+page bar and the ⋮ menu of a relationship) is the person behind it — the
+handles on every channel, the sphere, the importance prior and permits, the
+VIP switch, the instruction, the dossiers they take part in — exactly what
+`docs/contacts.md` describes, in one sheet. A screened sender's card says so
+and is where they get filed. Search and *+ New contact* stay.
+
+**Starting something** is one *＋* in the navigation row, on every page, with
+four entries: a **message** to someone (opens their stream with the composer
+addressed to them), **ask Ara** (a new topic with Ara alone, optionally within
+a topic), a **dossier** with people (its first message goes out from it, the
+replies file themselves — rule 4), a **contact**. There is no other "new"; a
+new topic from a message is the gesture.
 
 **Dossiers** (today's Projects page) = the topics, standing dossiers and
 conversations with Ara, in the same row, as a tree (children collapsed),
