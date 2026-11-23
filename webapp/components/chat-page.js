@@ -17,12 +17,20 @@
 // follows that URL verbatim — it never constructs message URLs. The composer
 // is live: sends POST /chats/<id>/send (the user's send press is direct under
 // every policy category), the shared draft is saved through the
-// version-guarded POST /chats/<id>/draft, and the read watermark advances via
-// POST /chats/<id>/read. The open chat is polled on the conversations cadence,
-// appending only unseen messages — the composer and the scroll position are
-// never rebuilt by a poll. The messages endpoint also pages older history
-// (?before=<ts>); this page renders the newest page and leaves a load-older
-// affordance for later.
+// version-guarded POST /chats/<id>/draft. The open chat is polled on the
+// conversations cadence, appending only unseen messages — the composer and the
+// scroll position are never rebuilt by a poll. The messages endpoint also
+// pages older history (?before=<ts>); this page renders the newest page and
+// leaves a load-older affordance for later.
+//
+// Opening a chat does not read it. A chat is read by a reply — the user's
+// send from here, or one from the phone or any other client, which the server
+// sees on its own — or by the **Mark as read** button this page shows under
+// the latest inbound message while the chat is unread (POST /chats/<id>/read,
+// with Undo for a few seconds). Each poll takes the chat's unread count, list
+// group and flags from the server's answer, so the button moves under a newer
+// arrival and goes when the chat was read elsewhere; the "new" waterline is
+// where the chat stood when it was opened.
 //
 // Media: image attachments render inline at their true aspect ratio when the
 // record carries intrinsic dimensions (a fixed placeholder frame otherwise —
@@ -68,6 +76,7 @@ import { pastedFiles, pastedText } from './clipboard.js';
 import { avatarHtml, colorFor, initials, CHANNELS } from './chats.js';
 import { openAttentionSheet, instructedSummary } from './attention-sheet.js';
 import { shelf, goLive, takeRestore, threadFacts } from './shelf-store.js';
+import { UNDO_MS } from './swipe-rows.js';
 // Registers <retinue-conversation>, the companion pane (see _companionHtml).
 // The chat mirror renders no Markdown of its own — what other people sent is
 // shown as sent (linkify below) — so the Markdown renderer and its styles
@@ -341,8 +350,7 @@ class RetinueChatPage extends HTMLElement {
     this._wide = matchMedia(WIDE_FRAME);
     // Live-API state: the chat's own messages URL (followed verbatim from the
     // summary), the ids already rendered (poll de-dup), the version the next
-    // draft write is based on, the draft text the server last accepted, and
-    // the newest ts already posted to the read watermark.
+    // draft write is based on and the draft text the server last accepted.
     this._msgUrl = '';
     this._seen = new Set();
     this._draftVersion = 0;
@@ -350,8 +358,18 @@ class RetinueChatPage extends HTMLElement {
     this._draftTimer = null;
     this._draftInflight = null;
     this._pollTimer = null;
-    this._lastReadPosted = '';
     this._onVis = null;
+    // Mark as read (_markRead): a read or its undo on the wire, the Undo still
+    // offered ({restore, marked, unread, listGroup, timer} — what puts the
+    // chat back as it was), and an epoch a read bumps, so a poll that left
+    // before it cannot hand back the unread state it replaced.
+    this._readBusy = false;
+    this._readUndo = null;
+    this._readEpoch = 0;
+    // The "new" waterline, pinned at load (_waterline): the index of the
+    // first message that was unread then, or -1, and how many there were.
+    this._firstUnread = -1;
+    this._newCount = 0;
     // Voice dictation: this element is a host of voice.js's presentation
     // contract — the third one, after conversations.js and project-page.js.
     // The host owns the MediaRecorder state machine and what ✓/➤ mean;
@@ -519,6 +537,7 @@ class RetinueChatPage extends HTMLElement {
     this._expandKeydown = null;
     if (this._onVis) document.removeEventListener('visibilitychange', this._onVis);
     this._onVis = null;
+    this._clearReadUndo();
     this._toggleMenu(false);
     this._stopRecording();
     this._wave.stop();
@@ -561,12 +580,12 @@ class RetinueChatPage extends HTMLElement {
       // (see _companionHtml).
       this._companionId = this._chat.companion || '';
       this._seen = new Set(this._messages.map((m) => m.id));
-      // Pin the unread waterline to where it was when the chat opened —
-      // messages sent from here are appended below it, and a re-render must
-      // not drift the line (messenger convention: it stays put while the
-      // thread is open).
-      this._firstUnread = this._chat.unread
-        ? this._messages.length - this._chat.unread : -1;
+      // Pin the waterline to where the chat stood when it was opened —
+      // messages sent from here are appended below it, and neither a
+      // re-render nor a Mark as read moves it (messenger convention: it stays
+      // put while the thread is open).
+      this._firstUnread = this._waterline();
+      this._newCount = this._firstUnread >= 0 ? Number(this._chat.unread) || 0 : 0;
       // A staged draft lands in the composer, marked with its author — the
       // agent writes into the draft, the user's send button sends. The draft
       // version anchors all later version-guarded saves.
@@ -602,11 +621,12 @@ class RetinueChatPage extends HTMLElement {
         this._showNote('The page was left while this message was being sent. It is back in the box '
           + '&mdash; if it shows up in the chat, there is no need to send it again.');
       }
-      // Open means read: the shelf item (if any) has nothing unread any more.
-      shelf.observe(this._shelfKey(), { unread: 0, title: this._chat.name || '', avatar: this._avatar() });
-      // Opening the chat reads it: advance the watermark to the newest
-      // message, then keep the mirror fresh on the conversations cadence.
-      this._postRead(this._newestTs());
+      // Opening reads nothing: the shelf item (if any) shows what the server
+      // says is unread, as the shelf's own reconciliation does.
+      shelf.observe(this._shelfKey(), {
+        unread: this._unreadCount(), title: this._chat.name || '', avatar: this._avatar(),
+      });
+      // Keep the mirror fresh on the conversations cadence.
       this._startPolling();
     } catch (err) {
       this._state = 'error';
@@ -617,43 +637,67 @@ class RetinueChatPage extends HTMLElement {
     }
   }
 
-  _newestTs() {
-    const m = this._messages[this._messages.length - 1];
-    return m ? m.ts : '';
+  // Where the "new" waterline goes: before the first of the messages the
+  // server counted as unread when the chat was opened, or -1. The server
+  // counts the inbound messages after the read mark and after the chat's
+  // latest outbound message, so they are the last `unread` inbound messages
+  // of the page — counted from the end, outbound ones skipped. Fewer inbound
+  // on the page than the count (the rest are older history) puts the line
+  // above the first of them.
+  _waterline() {
+    const unread = this._unreadCount();
+    if (!unread) return -1;
+    let at = -1;
+    let n = 0;
+    for (let i = this._messages.length - 1; i >= 0 && n < unread; i -= 1) {
+      const m = this._messages[i];
+      if (m && m.direction !== 'out') { at = i; n += 1; }
+    }
+    return at;
+  }
+
+  // How many messages the server counts as unread. A summary that carries
+  // only the list group (no count) still says the chat is unread.
+  _unreadCount() {
+    const c = this._chat || {};
+    const n = Number(c.unread);
+    if (n > 0) return n;
+    return c.list_group === 'unread' ? 1 : 0;
   }
 
   // Whether the user is looking at the newest message. Never while the draft
   // is expanded: the thread is not displayed then, and its zeroed scroll
-  // measures would read as the bottom — marking arrivals read that nobody saw.
+  // measures would read as the bottom.
   _atBottom() {
     if (this.hasAttribute('draft-expanded')) return false;
     const t = this.shadowRoot.querySelector('[data-chat-thread]');
     return !!t && t.scrollHeight - t.scrollTop - t.clientHeight < NEAR_BOTTOM_PX;
   }
 
-  // ── Live mirror: poll, read watermark ──────────────────────────────────────
+  // ── Live mirror: poll ──────────────────────────────────────────────────────
   _startPolling() {
     if (this._pollTimer) return;
     this._pollTimer = setInterval(() => this._poll(), POLL_MS);
     this._onVis = () => {
-      if (document.hidden) return;
-      // Coming back to a visible page: catch up at once, and mark the newest
-      // message read if the user is looking at the bottom of the thread.
-      this._poll();
-      if (this._atBottom()) this._postRead(this._newestTs());
+      // Coming back to a visible page: catch up at once. Looking is not
+      // reading — nothing is marked read here.
+      if (!document.hidden) this._poll();
     };
     document.addEventListener('visibilitychange', this._onVis);
   }
 
   async _poll() {
     if (this._state !== 'ok' || !this._msgUrl || document.hidden) return;
+    // A read posted from here after this poll left makes its answer's unread
+    // state stale (_adoptSummary).
+    const readEpoch = this._readEpoch;
     try {
       const res = await fetch(this._msgUrl, { cache: 'no-store' });
       if (!res.ok) throw new Error(String(res.status));
       const doc = await res.json();
       const msgs = Array.isArray(doc.messages) ? doc.messages : [];
       const stick = this._atBottom();
-      let newest = '';
+      let added = false;
       // Append only unseen messages — never a full re-render, which would
       // fight the composer (focus, IME, dictation) and the scroll position.
       // Chat streams are monotonic enough that appending in payload order is
@@ -661,15 +705,16 @@ class RetinueChatPage extends HTMLElement {
       for (const m of msgs) {
         if (!m || this._seen.has(m.id)) continue;
         this._seen.add(m.id);
-        if (this._reconcileUnconfirmed(m)) {
-          if (!newest || tsAfter(m.ts, newest)) newest = m.ts;
-          continue;
-        }
+        if (this._reconcileUnconfirmed(m)) continue;
         this._messages.push(m);
         this._appendChatMessage(m, stick);
-        if (!newest || tsAfter(m.ts, newest)) newest = m.ts;
+        added = true;
       }
-      if (newest && stick) this._postRead(newest);
+      // The chat as the server now sees it — read by a reply from the
+      // phone, unread again by an arrival, archived elsewhere — and the
+      // Mark as read button where that puts it.
+      const changed = doc.chat ? this._adoptSummary(doc.chat, readEpoch === this._readEpoch) : false;
+      if (added || changed) this._placeMarkRead(stick);
       // Ara answers a companion turn by staging a reply here — into an empty
       // composer, or over the text she was asked to rework (the server let
       // her: an agent's write is refused while the user's own draft sits
@@ -760,22 +805,168 @@ class RetinueChatPage extends HTMLElement {
     return true;
   }
 
-  // Advance the server-side read watermark, monotonically: the newest ts is
-  // posted once, and a failure returns it to the pool for the next occasion.
-  async _postRead(ts) {
-    if (!ts || (this._lastReadPosted && !tsAfter(ts, this._lastReadPosted))) return;
-    const prev = this._lastReadPosted;
-    this._lastReadPosted = ts;
-    try {
-      const res = await fetch(`/chats/${encodeURIComponent(this._id)}/read`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ ts }),
-      });
-      if (!res.ok) throw new Error(String(res.status));
-    } catch (_err) {
-      this._lastReadPosted = prev;
+  // ── Read state: the server's, followed; Mark as read ───────────────────────
+  // One poll's chat summary onto the page: the unread count, list group and
+  // read mark (unless `fresh` is false — a read from here overtook the poll,
+  // and its answer is the newer word), and the flags, whose switches and
+  // header mark follow. True when the read state changed.
+  _adoptSummary(s, fresh = true) {
+    const c = this._chat;
+    if (!c || !s) return false;
+    let changed = false;
+    if (fresh) {
+      const before = `${this._unreadCount()}\u0000${c.list_group || ''}`;
+      if ('unread' in s) c.unread = Number(s.unread) || 0;
+      if ('list_group' in s) c.list_group = s.list_group;
+      if ('last_read' in s) c.last_read = s.last_read;
+      changed = before !== `${this._unreadCount()}\u0000${c.list_group || ''}`;
+      // A chat unread again (a newer arrival) has nothing left to undo: the
+      // mark the Undo would restore is not the one that stands any more.
+      if (changed && this._isUnread()) this._clearReadUndo();
+      if (changed) shelf.observe(this._shelfKey(), { unread: this._unreadCount() });
     }
+    const flags = ['archived', 'muted', 'starred'];
+    if (flags.some((f) => f in s && !!s[f] !== !!c[f])) {
+      for (const f of flags) if (f in s) c[f] = !!s[f];
+      this._refreshFlagsUi();
+    }
+    return changed;
+  }
+
+  _isUnread() { return this._unreadCount() > 0; }
+
+  // The message the Mark as read row sits under: the latest inbound one.
+  _markReadAnchor() {
+    for (let i = this._messages.length - 1; i >= 0; i -= 1) {
+      const m = this._messages[i];
+      if (m && m.direction !== 'out') return m;
+    }
+    return null;
+  }
+
+  // The row under the latest inbound message: the button while the chat is
+  // unread, the Undo while one is offered, nothing otherwise.
+  _markReadHtml() {
+    if (!this._markReadAnchor()) return '';
+    if (this._isUnread()) {
+      return `<div class="mark-read-row" data-mark-read-row>` +
+        `<button type="button" class="mark-read" data-mark-read ` +
+        `title="Mark this chat as read — it moves to the Read list">` +
+        `<span aria-hidden="true">&#10003;</span> Mark as read</button></div>`;
+    }
+    if (this._readUndo) {
+      return `<div class="mark-read-row done" data-mark-read-row role="status">` +
+        `<span class="mark-read-said">Marked as read</span>` +
+        `<button type="button" class="mark-read-undo" data-mark-read-undo ` +
+        `title="Put the chat back as it was before">Undo</button></div>`;
+    }
+    return '';
+  }
+
+  // Put the row where the state says, in place: the thread itself is never
+  // rebuilt for it. Focus on the row's button moves to its successor (the
+  // Undo after a read, the button again after an undo), so a keyboard user
+  // is not dropped to the top of the page.
+  _placeMarkRead(stick = null) {
+    const thread = this.shadowRoot && this.shadowRoot.querySelector('[data-chat-thread]');
+    if (!thread) return;
+    const atBottom = stick === null ? this._atBottom() : stick;
+    const old = thread.querySelector('[data-mark-read-row]');
+    const hadFocus = !!old && old.contains(deepActiveElement());
+    if (old) old.remove();
+    const html = this._markReadHtml();
+    const anchor = html && this._markReadAnchor();
+    // Found by walking rather than by selector, as _reconcileUnconfirmed
+    // does: a message id is text from outside.
+    const node = anchor && [...thread.querySelectorAll('[data-mid]')]
+      .find((n) => n.getAttribute('data-mid') === anchor.id);
+    if (node) node.insertAdjacentHTML('afterend', html);
+    if (atBottom) thread.scrollTop = thread.scrollHeight;
+    if (hadFocus) {
+      const btn = thread.querySelector('[data-mark-read-row] button');
+      if (btn) btn.focus();
+    }
+  }
+
+  // The read endpoint, the page's only way to post one: `{}` reads the chat
+  // up to its newest message, `{restore, marked}` undoes that. Throws with
+  // the status on a failed answer.
+  async _postReadMark(body) {
+    const res = await fetch(`/chats/${encodeURIComponent(this._id)}/read`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) throw new Error(String(res.status));
+    return res.json();
+  }
+
+  // The answer of a read (or its undo) onto the chat: what the server says,
+  // or — for a field it leaves out — `fallback`.
+  _adoptRead(doc, fallback) {
+    const c = this._chat;
+    const d = doc || {};
+    c.unread = typeof d.unread === 'number' ? d.unread : fallback.unread;
+    c.list_group = typeof d.list_group === 'string' ? d.list_group : fallback.listGroup;
+    if ('last_read' in d) c.last_read = d.last_read;
+    shelf.observe(this._shelfKey(), { unread: this._unreadCount() });
+  }
+
+  async _markRead() {
+    if (this._readBusy || !this._chat || !this._isUnread()) return;
+    this._readBusy = true;
+    this._readEpoch += 1;
+    const before = { unread: this._chat.unread, listGroup: this._chat.list_group };
+    try {
+      const doc = await this._postReadMark({});
+      this._readEpoch += 1;
+      this._adoptRead(doc, { unread: 0, listGroup: this._chat.archived ? 'archived' : 'read' });
+      this._clearReadUndo();
+      // Undo needs the mark this read replaced; an answer without it (a
+      // server older than the field) offers none.
+      if (doc && Object.prototype.hasOwnProperty.call(doc, 'previous')) {
+        this._readUndo = {
+          restore: doc.previous == null ? null : doc.previous,
+          marked: doc.last_read,
+          unread: before.unread,
+          listGroup: before.listGroup,
+          timer: setTimeout(() => { this._readUndo = null; this._placeMarkRead(); }, UNDO_MS),
+        };
+      }
+    } catch (_err) {
+      this._showNote("Couldn't mark the chat as read &mdash; try again.");
+    } finally {
+      this._readBusy = false;
+    }
+    this._placeMarkRead();
+  }
+
+  async _undoMarkRead() {
+    const u = this._readUndo;
+    if (this._readBusy || !u) return;
+    this._readBusy = true;
+    this._readEpoch += 1;
+    this._clearReadUndo();
+    try {
+      const doc = await this._postReadMark({ restore: u.restore, marked: u.marked });
+      this._readEpoch += 1;
+      this._adoptRead(doc, { unread: u.unread, listGroup: u.listGroup });
+    } catch (err) {
+      // 409: the mark moved since (a reply, a read from elsewhere) and that
+      // stands; the poll brings the chat as it now is.
+      this._showNote(err && err.message === '409'
+        ? 'The chat has moved on since &mdash; nothing to undo.'
+        : "Couldn't undo &mdash; check the connection.");
+      this._poll();
+    } finally {
+      this._readBusy = false;
+    }
+    this._placeMarkRead();
+  }
+
+  _clearReadUndo() {
+    if (this._readUndo && this._readUndo.timer) clearTimeout(this._readUndo.timer);
+    this._readUndo = null;
   }
 
   // ── Kept on the device: what leaving must not cost ─────────────────────────
@@ -1416,8 +1607,6 @@ class RetinueChatPage extends HTMLElement {
         this._chat.muted = !!out.muted;
         this._chat.starred = !!out.starred;
       }
-      const name = this.shadowRoot.querySelector('.head-name');
-      if (name && this._chat) name.innerHTML = this._starHtml() + esc(this._chat.name);
       // Muted: off the shelf, whatever put it there. Archived: not waiting.
       if (out.muted) shelf.muted(this._shelfKey());
       else if (flag === 'archived' && out.archived) {
@@ -1426,16 +1615,29 @@ class RetinueChatPage extends HTMLElement {
       }
       window.dispatchEvent(new CustomEvent('retinue-attention-change', { detail: { action: 'flags' } }));
     } catch (_err) { /* the row keeps showing the last known state */ }
-    const row = this.shadowRoot.querySelector('[data-flags]');
+    this._refreshFlagsUi(flag);
+  }
+
+  // What shows the flags — the star before the name, the menu's switches,
+  // the ⋮'s dot — redrawn from the chat as it now is: after a switch here, or
+  // a poll that found them changed elsewhere. Focus on a switch stays on the
+  // same switch (`flag`, the pressed one, or whichever had it).
+  _refreshFlagsUi(flag = '') {
+    const root = this.shadowRoot;
+    if (!root || !this._chat) return;
+    const name = root.querySelector('.head-name');
+    if (name) name.innerHTML = this._starHtml() + esc(this._chat.name);
+    const row = root.querySelector('[data-flags]');
     if (row) {
-      // The pressed switch is replaced by its new state: keep focus on it.
-      const had = row.contains(deepActiveElement());
+      const active = deepActiveElement();
+      const had = row.contains(active);
+      const which = flag || (had && active.getAttribute && active.getAttribute('data-flag')) || '';
       row.outerHTML = this._switchesHtml();
       this._bindSwitches();
-      const again = had && this.shadowRoot.querySelector(`[data-flag="${flag}"]`);
+      const again = had && which && root.querySelector(`[data-flag="${which}"]`);
       if (again) again.focus();
     }
-    const btn = this.shadowRoot.querySelector('[data-menu-btn]');
+    const btn = root.querySelector('[data-menu-btn]');
     if (btn) btn.classList.toggle('flagged', this._flagged());
   }
 
@@ -1518,10 +1720,14 @@ class RetinueChatPage extends HTMLElement {
   // The mirror: day separators, an unread waterline, bubbles left (inbound) /
   // right (outbound) with the author on every outbound bubble — the user, Ara,
   // or the user's own phone — a distinction the real clients cannot show.
+  // The waterline says what was new when the chat was opened, so it does not
+  // claim "unread" after a Mark as read; it stays put while the page is open.
+  // The Mark as read row follows the latest inbound message (_placeMarkRead
+  // moves it from there on).
   _chatThreadHtml() {
     const msgs = this._messages;
     if (!msgs.length) return '<div class="center muted">No messages.</div>';
-    const unread = this._chat.unread || 0;
+    const anchor = this._markReadAnchor();
     let html = '';
     let lastDay = '';
     msgs.forEach((m, i) => {
@@ -1531,9 +1737,10 @@ class RetinueChatPage extends HTMLElement {
         lastDay = day;
       }
       if (i === this._firstUnread) {
-        html += `<div class="unread-sep"><span>${unread} unread</span></div>`;
+        html += `<div class="unread-sep"><span>${this._newCount ? `${this._newCount} new` : 'New'}</span></div>`;
       }
       html += this._chatMsgHtml(m);
+      if (m === anchor) html += this._markReadHtml();
     });
     return html;
   }
@@ -1659,7 +1866,8 @@ class RetinueChatPage extends HTMLElement {
       key: this._shelfKey(), kind: 'chat', id: this._id,
       title: (this._chat && this._chat.name) || 'Chat',
       href: `/chat.html?id=${encodeURIComponent(this._id)}`,
-      avatar: this._avatar(), unread: 0,
+      // What the server counts as unread: opening the chat read nothing.
+      avatar: this._avatar(), unread: this._unreadCount(),
       location: {
         pane: this._pane,
         mirror: this._mirrorLocation(),
@@ -1949,12 +2157,10 @@ class RetinueChatPage extends HTMLElement {
       this._expandKeydown = null;
     }
     if (on) return;
-    // Back to the place the reader left. Back at the newest message, what
-    // arrived meanwhile is in view now, and only now read.
+    // Back to the place the reader left.
     const loc = this._threadLoc || { bottom: true };
     this._threadLoc = null;
     this._scrollMirrorTo(loc);
-    if (loc.bottom) this._postRead(this._newestTs());
     // Pressed from the keyboard on a draft that fits again, the control goes
     // with the overflow; the focus goes to the field rather than nowhere.
     const field = root.querySelector('[data-field]');
@@ -2066,15 +2272,21 @@ class RetinueChatPage extends HTMLElement {
     this._wireChatComposer();
     this._wireGrip();
 
-    // Image lightbox: delegated on the thread container, so bubbles appended
-    // by polls and sends are covered without per-message wiring.
+    // Image lightbox and the Mark as read row: delegated on the thread
+    // container, so bubbles appended by polls and sends, and the row as it
+    // moves, are covered without per-message wiring.
     const chatThread = root.querySelector('[data-chat-thread]');
     if (chatThread) {
       chatThread.addEventListener('click', (e) => {
-        const btn = e.target && e.target.closest && e.target.closest('[data-lightbox]');
+        const at = (sel) => e.target && e.target.closest && e.target.closest(sel);
+        const btn = at('[data-lightbox]');
         if (btn) {
           this._openLightbox(btn.getAttribute('data-lightbox'),
             btn.getAttribute('data-alt') || 'Image');
+        } else if (at('[data-mark-read]')) {
+          this._markRead();
+        } else if (at('[data-mark-read-undo]')) {
+          this._undoMarkRead();
         }
       });
     }
@@ -2871,12 +3083,19 @@ class RetinueChatPage extends HTMLElement {
         cur.replaceWith(tpl.content.firstElementChild);
       }
       images.forEach((im) => { try { URL.revokeObjectURL(im.url); } catch (_e) { /* ignore */ } });
-      // The server cleared the shared draft and advanced the watermark with
-      // this send; mirror both (the next draft save re-anchors its version
-      // through the guard's one-shot retry).
+      // The server cleared the shared draft and read the chat with this send
+      // — a reply reads it, the server's rule, so nothing is posted for it
+      // here; mirror both (the next draft save re-anchors its version
+      // through the guard's one-shot retry). A poll that left before the
+      // send would still say unread: the epoch makes it stand aside.
       this._draftSaved = '';
       this._keepLocal();
-      this._postRead(msg.ts);
+      this._readEpoch += 1;
+      this._clearReadUndo();
+      if (this._chat) {
+        this._adoptRead(null, { unread: 0, listGroup: this._chat.archived ? 'archived' : 'read' });
+      }
+      this._placeMarkRead();
     } catch (_err) {
       // Not sent: take the bubble down, give words and images back to the
       // composer. The preview object URLs were never revoked, so the staged
@@ -3088,6 +3307,22 @@ const CSS = `
   .day-sep span { flex: none; }
   .unread-sep { color: var(--accent, #6ea8fe); }
   .unread-sep::before, .unread-sep::after { border-color: var(--accent, #6ea8fe); opacity: .5; }
+  /* Mark as read, under the latest inbound message while the chat is unread:
+     the one thing that reads a chat short of replying, so it is a real,
+     full-size button rather than a link-sized afterthought. Then, for a few
+     seconds, what it did and its Undo in the same place. */
+  .mark-read-row { display: flex; align-items: center; gap: 10px; align-self: flex-start;
+                   margin: -2px 0 2px; font-size: .82rem; }
+  .mark-read { display: inline-flex; align-items: center; gap: 6px; min-height: 36px;
+               padding: 7px 14px; border-radius: 999px; cursor: pointer; font: inherit;
+               font-weight: 600; background: var(--card-2, #1c2230); color: var(--accent, #6ea8fe);
+               border: 1px solid var(--accent, #6ea8fe); -webkit-tap-highlight-color: transparent; }
+  .mark-read:hover { background: rgba(110, 168, 254, .14); }
+  .mark-read:focus-visible, .mark-read-undo:focus-visible {
+    outline: 2px solid var(--fg, #e7ebf2); outline-offset: 2px; }
+  .mark-read-row.done { color: var(--muted, #8b93a3); }
+  .mark-read-undo { background: none; border: 0; padding: 6px 4px; cursor: pointer; font: inherit;
+                    font-weight: 600; color: var(--accent, #6ea8fe); }
   .msg { display: flex; flex-direction: column; gap: 2px; max-width: 86%; align-self: flex-start; }
   .msg.out { align-self: flex-end; align-items: flex-end; }
   .msg-head { display: flex; align-items: baseline; gap: 6px; padding: 0 4px; }

@@ -8,6 +8,8 @@
   "name": "Mara Meier",
   "group": false,
   "unread": 0,
+  "list_group": "read",
+  "last_read": null,
   "archived": false,
   "muted": false,
   "companion": null,

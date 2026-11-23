@@ -168,8 +168,10 @@ On the home the element is a `viewer` only — threads open from the attention
 list's rows. *Threads* in the navigation row leads to `conversations.html`, a
 dedicated page that lists every thread with an Active/Archived/Edits/Cowork
 filter (the same `retinue-conversations` element with the `full` attribute).
-Its tiles swipe exactly like the chats page's rows — one implementation,
-`components/swipe-rows.js`, so the two lists cannot drift apart:
+Its tiles swipe with the chats page's rows' gesture — one implementation,
+`components/swipe-rows.js`, so the two lists cannot drift apart; the chats
+page's Unread and Read tabs opt into a committing swipe left as well (a
+row's `data-quick-left`), which threads do not:
 
 | Tab | Swipe right | Swipe left (tray) |
 |---|---|---|
@@ -243,29 +245,43 @@ the gateway's chat API (SPARQL over the message ledgers plus a live overlay;
 the endpoints and their rationale live in `scripts/web-gateway.py`'s module
 docstring). Pieces:
 
-- `components/chats.js` — the Chats card on the dashboard and, with `full`,
-  the whole `chats.html` page: avatar, channel mark, last-message preview,
-  unread badge, non-archived chats ordered by last activity; the full page
-  adds an Active/Archived filter like the conversations page, and rows that
-  swipe (`components/swipe-rows.js`, shared with the threads page: pointer
-  events, so touch, pen and mouse drag alike; a long press, right-click or
-  the context-menu key opens the same tray). On *Active*, a swipe right
-  archives at once and a swipe left uncovers **Star**, **Archive** (out of
-  the list until it speaks again) and **Mute** (out of the list, and the next
-  message does not bring it back), all `POST /chats/<id>/flags`. Muting
-  archives — the server's rule — so both land under *Archived*, where a swipe
-  right restores at once and a swipe left uncovers **Star**, **Restore**,
-  **Mute** / **Unmute** (stays archived) and **Delete**
-  (`POST /chats/<id>/delete`, armed by a first tap, done by a second). What
-  takes a row out of view offers Undo for a few seconds; a starred chat leads
-  whichever list it is in. The dashboard card stays a glance and carries
-  none of it. In the wide
-  layout the card has its own fixed-height region above the conversations
-  (`--chats-h`), resizable and snap-closable at a third `layout.js` splitter
-  (`data-splitter="chats"`). The card refreshes on an ambient cadence and
-  keeps its last rendered state over a failed fetch.
+- `components/chats.js` — the list, with `full` the whole `chats.html` page
+  (the dashboard no longer carries a Chats card; the element's card mode, a
+  capped glance at every chat that is not archived, is unused): avatar,
+  channel mark, last-message preview and unread badge, ordered by last
+  activity, in three tabs — **Unread · Read · Archived** — by each chat's
+  `list_group` (below). The *Unread* tab carries the number of unread chats;
+  each row keeps its badge with the number of unread messages, since one new
+  message and twelve read differently. Rows swipe
+  (`components/swipe-rows.js`, shared with the threads page: pointer events,
+  so touch, pen and mouse drag alike):
+
+  | Tab | Swipe right | Swipe left |
+  |---|---|---|
+  | Unread | mark read at once | archive at once |
+  | Read | nothing (the row does not move) | archive at once |
+  | Archived | restore at once | uncover the tray |
+
+  The tray — **Star**, on *Unread* **Mark read**, **Archive** (out of the list
+  until it speaks again) and **Mute** (out of the list, and the next message
+  does not bring it back), all `POST /chats/<id>/flags` but the read — opens
+  on *Unread* and *Read* by a long press, a right-click or the context-menu
+  key; that is also how a keyboard reaches what a swipe does. Muting
+  archives — the server's rule — so both land under *Archived*, whose tray
+  holds **Star**, **Restore**, **Mute** / **Unmute** (stays archived) and
+  **Delete** (`POST /chats/<id>/delete`, armed by a first tap, done by a
+  second). What takes a row out of view offers Undo for a few seconds — Mark
+  read's puts the previous read mark back (`POST /chats/<id>/read`, below);
+  a starred chat leads whichever list it is in. The tabs are a tablist
+  (arrow keys move between them); the choice holds across refreshes and
+  writes, and a fresh page opens on *Unread*. The list refreshes on an
+  ambient cadence and keeps its last rendered state over a failed fetch.
 - `chat.html?id=<chat id>` (`components/chat-page.js`) — one chat: bubbles
-  with day separators and an unread waterline, sender labels in groups, the
+  with day separators and a "new" waterline (before the first message that
+  was unread when the chat was opened — the last `unread` inbound messages of
+  the page — and staying there while the page is open), a **Mark as read**
+  button under the latest inbound message while the chat is unread (below),
+  sender labels in groups, the
   author on every outbound bubble (you / Ara / your phone), inline media
   (images with a lightbox, voice-note and video players — see the Message
   contract below), a live composer (send, shared draft, one-tap clear ✕,
@@ -326,12 +342,23 @@ docstring). Pieces:
   whole pane at its full width (the thread and the chips step aside, the mic
   and send sit under its corners) until the control is pressed again, Escape
   is pressed, a recording starts or the draft is sent. Shrunk again by the
-  control or Escape, the thread is back at the message it was left at; while
-  it is hidden nothing arriving is marked read. A tap on the control leaves
-  the focus where it was, so the phone keyboard stays as it was.
-  The open chat polls on the conversations cadence,
-  appending only unseen messages, and posts the read watermark on open, on
-  arrivals while at the bottom, and when the page becomes visible again.
+  control or Escape, the thread is back at the message it was left at. A tap
+  on the control leaves the focus where it was, so the phone keyboard stays
+  as it was.
+  The open chat polls on the conversations cadence, appending only unseen
+  messages. **Opening a chat, looking at it or scrolling it reads nothing.**
+  A chat is read by a reply — a send from the composer (the server reads the
+  chat with it, so the page posts nothing for it), or one from the phone or
+  any other client, which the next poll shows — or by **Mark as read**: the
+  button under the latest inbound message, there whenever the chat is
+  unread. It posts `POST /chats/<id>/read` `{}`, gives way to *Marked as read*
+  with an **Undo** for a few seconds (the restore call below; "nothing to
+  undo" when the mark has moved on since), and keeps the focus on that row.
+  Every poll takes the chat summary's `unread`, `list_group`, `last_read` and
+  flags from the answer rather than keeping the ones from the first load, so
+  the button moves under a newer inbound message, goes when the chat was read
+  elsewhere, and the ★, the ⋮ switches and its dot follow a flag changed
+  elsewhere. A minimized chat on the shelf carries the server's unread count.
   The companion pane is the chat's own conversation with Ara (see the
   `companion` field below), and it *is* `<retinue-conversation>` — the same
   element the conversations card embeds, so the two surfaces cannot drift
@@ -355,10 +382,11 @@ docstring). Pieces:
 
 The API, as the components consume it:
 
-- `GET /chats` — `{generated, chats: [ChatSummary]}`, ordered by last
-  activity. A `ChatSummary` is `{id, channel, account, key, name, group,
-  members?, unread, archived, muted, starred, companion, instructed, last, draft,
-  messages}`.
+- `GET /chats` — `{generated, counts: {unread, read, archived}, chats:
+  [ChatSummary]}`, ordered by last activity; `counts` is how many chats each
+  tab holds. A `ChatSummary` is `{id, channel, account, key, name, group,
+  members?, unread, list_group, archived, muted, starred, companion,
+  instructed, last, draft, messages}`.
 
   A chat is one peer **on one account**, and `id` names both:
   `<channel>:~<account>:<chat-key>`, or `<channel>:<chat-key>` for history
@@ -371,7 +399,14 @@ The API, as the components consume it:
   one person keeps one colour across all of them. Clients must treat the id as
   opaque and read `key`/`account` rather than splitting it.
 
-  `unread` derives from the user's `last_read` watermark, `last` is
+  `unread` is the number of inbound messages later than both the read mark
+  (`last_read`, set only by Mark as read and by a reply) and the chat's latest
+  outbound message — so a reply that reached the ledger without the
+  dashboard still reads the chat. `list_group` is the tab the chat belongs
+  in: `archived` when archived, else `unread` while `unread > 0`, else
+  `read`; a new inbound message moves a read chat back to `unread`. (It is
+  not `group`, which stays the boolean "this is a group chat".) A client
+  meeting a payload without `list_group` derives it by that same rule. `last` is
   the preview `{ts, direction, author?, sender_name?, text, kind}`, `draft`
   is the shared draft `{text, author, agent?, ts, version}` or null, and
   `companion` is the conversation id of this chat's companion thread (null
@@ -388,8 +423,8 @@ The API, as the components consume it:
 
   `messages` is the URL of the chat's message document — the client follows
   it and never constructs message URLs. `archived` and `muted` carry the
-  dashboard-conversation semantics verbatim: an archived chat leaves the card
-  and the Active list (the full page's Archived filter keeps it reachable),
+  dashboard-conversation semantics verbatim: an archived chat leaves the
+  Unread and Read tabs (the Archived tab keeps it reachable),
   and a new inbound message **un-archives** an archived chat unless it is
   muted — the server's rule, applied on the notify rail. `muted` silences
   that chat's Web Push and keeps an archived chat archived; setting it also
@@ -446,7 +481,9 @@ The API, as the components consume it:
   default), then with an honest 502 (the page shows it; the card keeps its
   last state).
 - `GET /chats/<id>/messages` — `{generated, chat: ChatSummary, messages:
-  [Message]}`, ascending by `ts`, the newest page by default;
+  [Message]}`, ascending by `ts`, the newest page by default. Its `chat`
+  carries `unread`, `list_group` and `last_read` on every poll — what the
+  page's Mark as read button and waterline follow;
   `?before=<ISO ts>` pages older history (the page renders the newest page —
   a load-older affordance is future work). A `Message` is `{id, chat,
   direction, author? (out: user|agent|device, plus agent name),
@@ -548,7 +585,15 @@ The API, as the components consume it:
   words to the user about to send them in their own name — and one guarded
   step, so it cannot race the clear that produced it whichever order the two
   requests arrive in.
-- `POST /chats/<id>/read` `{ts}` — advances the read watermark, forward-only.
+- `POST /chats/<id>/read` `{}` — **Mark as read**: reads the chat up to its
+  newest message and answers `{id, last_read, previous, unread: 0,
+  list_group}`, `previous` being the mark it replaced (null when there was
+  none). `{restore: <previous>, marked: <last_read>}` is its Undo: the mark
+  goes back to `previous` only while it is still the one that read set, and
+  the answer is 409 otherwise (a reply or another read moved it since, and
+  that stands). The list's swipe and tray and the chat page's button are the
+  only callers; nothing posts a read when a chat is opened, looked at or
+  scrolled, and a send reads the chat server-side.
 - `POST /chats/<id>/companion` — `{id}`, the chat's companion conversation.
   Idempotent: it creates the thread on the first call and returns the same id
   afterwards. The page calls it lazily — on the user's first turn or chip, so

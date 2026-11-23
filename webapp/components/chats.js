@@ -1,12 +1,21 @@
 // Chats card: the messenger mirror's home screen — every channel conversation
-// (Signal / WhatsApp / Telegram, one peer or group each) as one row, ordered by
-// last activity, with unread badge, channel mark and last-message preview. Rows
-// link to the chat's own page (chat.html), which renders the full mirror beside
-// its companion thread. With the `full` attribute (chats.html) the list drops
-// the dashboard cap and adds an Active/Archived filter, like the conversations
-// page. Archived chats are excluded everywhere else; `muted` only changes the
-// badge treatment here (its real meaning — no Web Push, and no un-archive on a
-// new inbound message — is the server's).
+// (one peer or group each) as one row, ordered by last activity, with unread
+// badge, channel mark and last-message preview. Rows link to the chat's own
+// page (chat.html), which renders the full mirror beside its companion thread.
+// With the `full` attribute (chats.html) the list drops the dashboard cap and
+// splits into three tabs — Unread · Read · Archived — by the server's
+// `list_group`. Archived chats are excluded everywhere else; `muted` only
+// changes the badge treatment here (its real meaning — no Web Push, and no
+// un-archive on a new inbound message — is the server's).
+//
+// **Unread** is a chat whose latest inbound message has been neither replied
+// to nor marked read; **Read** is one where it has. Opening a chat reads
+// nothing: a chat leaves Unread by a reply (from anywhere) or by Mark as read —
+// a swipe here, or the button under its latest message on the chat page — and
+// a new inbound message brings it back. The server says which group a chat is
+// in (`list_group`); a payload without it is grouped the same way from
+// `archived` and the unread count. The unread badge stays on the row: the tab
+// says whether a chat wants attention, the badge how much has come in.
 //
 // On the full page each row is swiped, messenger-style, rather than carrying
 // buttons that eat a third of a phone's width — the gesture the threads page
@@ -18,18 +27,22 @@
 // blacklist: not wanting to hear from someone is a chat one mutes, on the chat,
 // in front of the user — not a list only Ara can edit.
 //
-//   Active tab    swipe right  archive at once
-//                 swipe left   reveal Star · Archive · Mute
+//   Unread tab    swipe right  mark read at once
+//                 swipe left   archive at once
+//   Read tab      swipe right  nothing (there is nothing to mark)
+//                 swipe left   archive at once
 //   Archived tab  swipe right  restore at once
 //                 swipe left   reveal Star · Restore · Mute (Unmute) · Delete
 //
-// **Star** keeps a chat at the top of whichever list it is in, and does
-// nothing else. A swipe or tray action that takes a row out of view offers
-// Undo for a few seconds. **Delete** erases the chat from the whole system —
-// every message and file in the ledger, its companion thread — and a later
-// message from the peer starts a new chat; it asks for a second tap, and
-// cannot be undone. A long press, a right-click or the context-menu key opens
-// the same tray without swiping.
+// On Unread and Read the tray — Star · (Mark read) · Archive · Mute — opens by
+// a long press, a right-click or the context-menu key; on every tab that is
+// also how the keyboard reaches what a swipe does. **Star** keeps a chat at
+// the top of whichever list it is in, and does nothing else. A swipe or tray
+// action that takes a row out of view offers Undo for a few seconds — Mark
+// read's puts the previous read mark back. **Delete** erases the chat from the
+// whole system — every message and file in the ledger, its companion thread —
+// and a later message from the peer starts a new chat; it asks for a second
+// tap, and cannot be undone.
 //
 // The list comes from the gateway's GET /chats (the default `src`, still
 // overridable by attribute) — SPARQL over the message ledgers merged with the
@@ -125,19 +138,48 @@ export function previewHtml(chat) {
   return (who ? `<span class="pv-who">${esc(who)}:</span> ` : '') + img + esc(text);
 }
 
+// The three lists of the full page, in tab order.
+export const LIST_GROUPS = ['unread', 'read', 'archived'];
+
+// Which list a chat belongs in by its own flags and count: archived first
+// (an archived chat with unread messages is still archived — muted, or not
+// yet spoken to since), then unread or read by the count. The same rule the
+// server states as `list_group`; used where the payload predates that field,
+// and after a write from here changed what it was computed from.
+export function deriveListGroup(chat) {
+  const c = chat || {};
+  if (c.archived) return 'archived';
+  return Number(c.unread) > 0 ? 'unread' : 'read';
+}
+
+// The list a chat is shown in: the server's word where it gave one.
+export function listGroup(chat) {
+  const g = chat && chat.list_group;
+  return LIST_GROUPS.includes(g) ? g : deriveListGroup(chat);
+}
+
 class RetinueChats extends RetinueCard {
   connectedCallback() {
     this._full = this.hasAttribute('full');
-    this._scope = 'active';  // full-mode filter: active | archived
+    // The full page's tab: unread | read | archived. Held on the element, as
+    // the filter it replaced was — a refresh, a write or a breakpoint flip
+    // keeps it; a fresh page starts on Unread, where what wants attention is.
+    this._scope = 'unread';
+    // A write from here changed a chat's group since the last list was
+    // fetched: the payload's own `counts` describe the list before it, so the
+    // tabs count the rows instead until the next fetch.
+    this._dirty = false;
     // Bumped by a flag write. A refresh that began before one is stale by the
     // time it answers — it carries the pre-hide list — and rendering it would
     // put the row back and flip the button to the wrong inverse until the next
     // poll. The epoch is how such an answer is recognised and dropped.
     this._epoch = 0;
-    // The full page's rows swipe (swipe-rows.js): a committed swipe right is
-    // the row's quick action, Archive or Restore.
+    // The full page's rows swipe (swipe-rows.js): a committed swipe is the
+    // row's quick action for that side — Mark read or Restore to the right,
+    // Archive to the left.
     this._swipe = new SwipeRows(this, {
-      onQuick: (id, action, el) => this._setFlags(id, action, el),
+      onQuick: (id, action, el) => (action === 'read'
+        ? this._markRead(id, el) : this._setFlags(id, action, el)),
       isBusy: () => !!this._flagging,
     });
     // Crossing the layout breakpoint changes how many rows fit (cap vs all).
@@ -174,12 +216,13 @@ class RetinueChats extends RetinueCard {
       if (epoch !== this._epoch) return;
       // Re-render only when the list actually changed — a rebuild would reset
       // the region's scroll and the filter wiring for nothing.
-      const sig = JSON.stringify(data.chats || []);
-      if (sig === this._sig) { this._data = data; return; }
+      const sig = JSON.stringify([data.chats || [], data.counts || null]);
+      if (sig === this._sig) { this._data = data; this._dirty = false; return; }
       // A rebuild under a finger mid-swipe would drop the row it is dragging;
       // the next tick picks the change up.
       if (this._swipe.dragging) return;
       this._sig = sig;
+      this._dirty = false;
       this.renderState({ state: 'ok', data });
     } catch (_err) {
       if (!this._data) this.renderState({ state: 'offline' });
@@ -190,14 +233,21 @@ class RetinueChats extends RetinueCard {
   // per-row tray buttons are the interactive parts, wired after each render.
   renderState(s) {
     super.renderState(s);
-    this.shadowRoot.querySelectorAll('[data-scope]').forEach((el) =>
-      el.addEventListener('click', () => {
-        const scope = el.getAttribute('data-scope');
-        if (scope === this._scope) return;
-        this._scope = scope;
-        this._swipe.reset();
-        if (this._data) this.renderState({ state: 'ok', data: this._data });
-      }));
+    this.shadowRoot.querySelectorAll('[data-scope]').forEach((el) => {
+      el.addEventListener('click', () => this._setScope(el.getAttribute('data-scope')));
+      // A tablist moves with the arrow keys (and Home/End), focus following
+      // the selection — the one tab stop the row has (roving tabindex).
+      el.addEventListener('keydown', (e) => {
+        const at = LIST_GROUPS.indexOf(el.getAttribute('data-scope'));
+        const to = { ArrowRight: at + 1, ArrowLeft: at - 1, Home: 0, End: LIST_GROUPS.length - 1 }[e.key];
+        if (to === undefined) return;
+        e.preventDefault();
+        const scope = LIST_GROUPS[(to + LIST_GROUPS.length) % LIST_GROUPS.length];
+        this._setScope(scope);
+        const tab = this.shadowRoot.querySelector(`[data-scope="${scope}"]`);
+        if (tab) tab.focus();
+      });
+    });
     this.shadowRoot.querySelectorAll('[data-flag]').forEach((el) =>
       el.addEventListener('click', (e) => {
         e.preventDefault();
@@ -205,9 +255,18 @@ class RetinueChats extends RetinueCard {
         const id = el.getAttribute('data-flag');
         const action = el.getAttribute('data-set');
         if (action === 'delete') this._confirmDelete(id, el);
+        else if (action === 'read') this._markRead(id);
         else this._setFlags(id, action);
       }));
     if (this._full) this._swipe.wire(this.shadowRoot);
+  }
+
+  // Switch the full page's tab; the list is already here, so no fetch.
+  _setScope(scope) {
+    if (!LIST_GROUPS.includes(scope) || scope === this._scope) return;
+    this._scope = scope;
+    this._swipe.reset();
+    if (this._data) this.renderState({ state: 'ok', data: this._data });
   }
 
   // Delete cannot be undone, so the first tap only arms it (swipe-rows.js);
@@ -294,16 +353,17 @@ class RetinueChats extends RetinueCard {
       // archives server-side, and this way the rule lives in one place.
       const doc = await res.json();
       const chat = (this._data && this._data.chats || []).find((c) => c.id === id);
-      if (chat) { chat.archived = !!doc.archived; chat.muted = !!doc.muted; chat.starred = !!doc.starred; }
+      if (chat) {
+        chat.archived = !!doc.archived; chat.muted = !!doc.muted; chat.starred = !!doc.starred;
+        // Archive and Restore move the row between tabs; the server's group
+        // was computed before them, so the flags just written decide it.
+        chat.list_group = deriveListGroup(chat);
+      }
       // The minimized-pages shelf (issue #282) follows: a muted chat leaves it
       // whatever put it there; archiving drops only what was parked by itself.
       if (doc.muted) shelf.muted(`chat:${id}`);
       else if (doc.archived) shelf.archived(`chat:${id}`, true);
-      this._swipe.reset();
-      this._sig = '';
-      // Any refresh already on the wire answers from before this write.
-      this._epoch += 1;
-      if (this._data) this.renderState({ state: 'ok', data: this._data });
+      this._changed();
       // What took the row out of view (or brought it back) can be taken back.
       const said = { archive: 'Archived', mute: 'Muted', restore: 'Restored' }[action];
       if (said && before) {
@@ -318,6 +378,87 @@ class RetinueChats extends RetinueCard {
     }
   }
 
+  // Mark as read: POST /chats/<id>/read with an empty body — the server reads
+  // the chat up to its newest message and says where the mark now is; the
+  // client names no instant of its own. The answer carries the mark it
+  // replaced (`previous`) and the one it set (`last_read`): Undo hands both
+  // back, and the server puts the old mark back only if the chat's mark is
+  // still the one this set (409 otherwise — a reply or another read moved it
+  // since, and that stands).
+  async _markRead(id, li = null) {
+    if (!id || this._flagging) return;
+    const chat0 = (this._data && this._data.chats || []).find((c) => c.id === id);
+    const before = chat0 ? { unread: chat0.unread, list_group: chat0.list_group } : null;
+    this._flagging = true;
+    try {
+      const doc = await this._postRead(id, {});
+      const chat = (this._data && this._data.chats || []).find((c) => c.id === id);
+      if (chat) this._adoptRead(chat, doc, 0);
+      shelf.observe(`chat:${id}`, { unread: 0 });
+      this._changed();
+      // Undo needs the mark this replaced; a server that does not say it
+      // (one that predates the answer's `previous`) gets no Undo offered.
+      if (before && Object.prototype.hasOwnProperty.call(doc, 'previous')) {
+        const undo = { restore: doc.previous == null ? null : doc.previous, marked: doc.last_read };
+        offerUndo(`Marked read · ${chat ? chat.name : ''}`, () => this._undoRead(id, undo, before));
+      }
+    } catch (_err) {
+      if (li) this._swipe.slide(li, 0);
+    } finally {
+      this._flagging = false;
+    }
+  }
+
+  async _undoRead(id, undo, before) {
+    if (!id || this._flagging) return;
+    this._flagging = true;
+    try {
+      const doc = await this._postRead(id, undo);
+      const chat = (this._data && this._data.chats || []).find((c) => c.id === id);
+      if (chat) this._adoptRead(chat, doc, Number(before.unread) || 0);
+      shelf.observe(`chat:${id}`, { unread: chat ? Number(chat.unread) || 0 : 0 });
+      this._changed();
+    } catch (_err) {
+      // A 409 is the mark having moved on (a reply, a read elsewhere): what
+      // the chat is now is what the next list shows — fetch it now.
+      this.load();
+    } finally {
+      this._flagging = false;
+    }
+  }
+
+  // The one way this list posts a read; throws on a failed answer (with the
+  // status, so a caller can tell a conflict from an outage).
+  async _postRead(id, body) {
+    const res = await fetch(`/chats/${encodeURIComponent(id)}/read`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) throw new Error(String(res.status));
+    return res.json();
+  }
+
+  // A read's answer onto the row: its count and group as the server now
+  // states them, or — where the answer leaves one out — `unread` as given
+  // and the group that follows from it.
+  _adoptRead(chat, doc, unread) {
+    const d = doc || {};
+    chat.unread = typeof d.unread === 'number' ? d.unread : unread;
+    if (typeof d.last_read === 'string' || d.last_read === null) chat.last_read = d.last_read;
+    chat.list_group = LIST_GROUPS.includes(d.list_group) ? d.list_group : deriveListGroup(chat);
+  }
+
+  // A write from here landed: re-render from the list as it now stands, and
+  // drop any refresh already on the wire (it answers from before the write).
+  _changed() {
+    this._dirty = true;
+    this._swipe.reset();
+    this._sig = '';
+    this._epoch += 1;
+    if (this._data) this.renderState({ state: 'ok', data: this._data });
+  }
+
   css() {
     return `
       /* Chrome-less on phones, edge to edge under the navigation like the
@@ -329,11 +470,11 @@ class RetinueChats extends RetinueCard {
       }
       ul.list { gap: 4px; }
       li { margin: 0; }
-      /* A swipeable row (swipe-rows.js): the link slides over two layers
+      /* A swipeable row (swipe-rows.js): the link slides over the layers
          underneath — the quick action on the left (uncovered by a swipe
-         right) and the tray of buttons on the right (uncovered by a swipe
-         left). The row needs an opaque background of its own to hide them
-         while it rests. */
+         right), and on the right either Archive (uncovered by a swipe left
+         on Unread and Read) or the tray of buttons. The row needs an opaque
+         background of its own to hide them while it rests. */
       ${SWIPE_CSS}
       li.swipe { border-radius: 12px; }
       li.swipe .row { background: var(--card, #151922); }
@@ -375,24 +516,64 @@ class RetinueChats extends RetinueCard {
       .all-link { color: var(--accent, #6ea8fe); text-decoration: none; font-size: .85rem;
                   text-align: center; padding: 2px; }
       .all-link:hover { text-decoration: underline; }
-      /* Active/Archived switch — full page only; same look as the
+      /* Words for a screen reader that the eye gets from the shape. */
+      .vh { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0);
+            white-space: nowrap; }
+      /* Unread · Read · Archived — full page only; same look as the
          conversations page's filter. */
       .filter { display: flex; background: var(--card-2, #1c2230); border-radius: 12px;
                 padding: 3px; margin-bottom: 10px; }
       .filter-tab { flex: 1; background: transparent; border: 0; border-radius: 9px; padding: 7px;
-                    color: var(--muted, #8b93a3); cursor: pointer; }
+                    color: var(--muted, #8b93a3); cursor: pointer;
+                    display: inline-flex; align-items: center; justify-content: center; gap: 6px; }
+      .filter-tab:focus-visible { outline: 2px solid var(--accent, #6ea8fe); outline-offset: 1px; }
       .filter-tab.on { background: var(--accent, #6ea8fe); color: #0b0d12; font-weight: 600; }
+      /* The number of unread chats, on the Unread tab. */
+      .tab-count { min-width: 18px; height: 18px; padding: 0 5px; border-radius: 9px;
+                   background: var(--accent, #6ea8fe); color: #0b0d12; font-size: .68rem;
+                   font-weight: 700; display: inline-flex; align-items: center; justify-content: center; }
+      .filter-tab.on .tab-count { background: #0b0d12; color: var(--accent, #6ea8fe); }
     `;
   }
 
-  // The Active/Archived switch shown on the full page. Starred chats lead
-  // whichever list is showing; there is no starred-only or unread-only view.
-  _filterHtml() {
+  // How many chats each tab holds: the payload's own `counts` while the list
+  // is as fetched, the rows themselves once a write from here moved one (or
+  // where the payload carries no counts).
+  _counts(d, all) {
+    const given = d && d.counts;
+    if (!this._dirty && given && LIST_GROUPS.every((g) => typeof given[g] === 'number')) {
+      return { unread: given.unread, read: given.read, archived: given.archived };
+    }
+    const n = { unread: 0, read: 0, archived: 0 };
+    for (const c of all) n[listGroup(c)] += 1;
+    return n;
+  }
+
+  // The full page's three tabs, a tablist over the one list below it. The
+  // Unread tab says how many chats are unread (the rows' badges say how many
+  // messages). Starred chats lead whichever list is showing.
+  _filterHtml(counts) {
     if (!this._full) return '';
-    const tab = (scope, label) =>
-      `<button class="filter-tab${this._scope === scope ? ' on' : ''}" ` +
-      `data-scope="${scope}">${label}</button>`;
-    return `<div class="filter">${tab('active', 'Active')}${tab('archived', 'Archived')}</div>`;
+    const LABELS = { unread: 'Unread', read: 'Read', archived: 'Archived' };
+    const tab = (scope) => {
+      const on = this._scope === scope;
+      const n = scope === 'unread' && counts && counts.unread > 0
+        ? ` <span class="tab-count">${Number(counts.unread)}</span>` : '';
+      return `<button type="button" role="tab" id="chats-tab-${scope}" ` +
+        `class="filter-tab${on ? ' on' : ''}" aria-selected="${on}" aria-controls="chats-panel" ` +
+        `tabindex="${on ? '0' : '-1'}" data-scope="${scope}">${LABELS[scope]}${n}</button>`;
+    };
+    return `<div class="filter" role="tablist" aria-label="Chats">${LIST_GROUPS.map(tab).join('')}</div>`;
+  }
+
+  // What an empty tab says. An empty list says one thing on every tab.
+  _emptyText(any) {
+    if (!any || !this._full) return 'No chats yet.';
+    return {
+      unread: 'Nothing unread.',
+      read: 'No read chats.',
+      archived: 'No archived chats.',
+    }[this._scope];
   }
 
   body(d) {
@@ -401,15 +582,21 @@ class RetinueChats extends RetinueCard {
     // The API contract returns the list ordered by last activity; keep that
     // guarantee client-side too, so a hand-edited fixture cannot scramble it.
     all.sort((a, b) => String((b.last || {}).ts || '').localeCompare(String((a.last || {}).ts || '')));
-    // Archived chats leave the card and the Active list; the full page's
-    // Archived filter is where they remain reachable — and where Restore puts
-    // them back.
-    const archived = this._full && this._scope === 'archived';
+    // The full page shows one tab's chats; the dashboard card shows every chat
+    // that is not archived. The Archived tab is where archived chats remain
+    // reachable — and where Restore puts them back.
+    const scope = this._full ? this._scope : '';
+    const archived = scope === 'archived';
+    const inScope = (c) => (scope ? listGroup(c) === scope : listGroup(c) !== 'archived');
     // Starred chats first, each group still by last activity.
-    const chats = starredFirst(all.filter((c) => !!c.archived === archived));
+    const chats = starredFirst(all.filter(inScope));
+    const tabs = this._filterHtml(this._full ? this._counts(d, all) : null);
+    // The tabs' panel: what the selected tab shows, rows or its empty line.
+    const panel = (inner) => (this._full
+      ? `<div role="tabpanel" id="chats-panel" aria-labelledby="chats-tab-${scope}">${inner}</div>`
+      : inner);
     if (!chats.length) {
-      const msg = archived ? 'No archived chats.' : 'No chats yet.';
-      return `${this._filterHtml()}<p class="muted">${msg}</p>${this._footHtml()}`;
+      return `${tabs}${panel(`<p class="muted">${this._emptyText(all.length > 0)}</p>`)}${this._footHtml()}`;
     }
     const shown = (this._full || isWideFrame()) ? chats : chats.slice(0, MAX_CARD_CHATS);
     // Two accounts of one channel talking to the same peer are two chats with
@@ -424,8 +611,12 @@ class RetinueChats extends RetinueCard {
       nameCount[k] = (nameCount[k] || 0) + 1;
     }
     const rows = shown.map((c) => {
-      const badge = c.unread
-        ? `<span class="unread${c.muted ? ' muted-chat' : ''}">${c.unread}</span>`
+      // The count says what it counts in words too, for whoever does not see
+      // the pill: "3" alone is not a statement.
+      const unread = Number(c.unread) > 0 ? Number(c.unread) : 0;
+      const badge = unread
+        ? `<span class="unread${c.muted ? ' muted-chat' : ''}" title="${unread} unread">` +
+          `${unread}<span class="vh"> unread</span></span>`
         : (c.muted ? '<span class="mute-mark" title="Muted" aria-label="Muted">&#128277;</span>' : '');
       // A staged draft outranks the last message in the preview — it is what
       // this chat is waiting on.
@@ -442,6 +633,9 @@ class RetinueChats extends RetinueCard {
         `title="${title}">${label}</button>`;
       const star = starButtonHtml(!!c.starred,
         (set) => `data-flag="${esc(c.id)}" data-set="${set}"`);
+      // What a swipe does is in the tray too — Mark read and Archive beside
+      // Star and Mute — so a keyboard, which opens the tray with the
+      // context-menu key, reaches everything a finger does.
       const tray = star + (archived
         ? act('Restore', 'restore', 'Put this chat back in the list') +
           (c.muted
@@ -449,17 +643,27 @@ class RetinueChats extends RetinueCard {
             : act('Mute', 'mute', 'Keep it out of the list, even when it speaks')) +
           act('Delete', 'delete',
               'Erase this chat and all its messages from the system')
-        : act('Archive', 'archive', 'Out of the list until the next message') +
+        : (scope === 'unread'
+          ? act('Mark read', 'read', 'Mark everything in this chat as read') : '') +
+          act('Archive', 'archive', 'Out of the list until the next message') +
           act('Mute', 'mute',
               'Out of the list, and the next message does not bring it back'));
-      const quick = archived ? 'restore' : 'archive';
+      // The two sides of a swipe, per tab: right marks read (Unread),
+      // restores (Archived) or does nothing (Read — nothing to mark); left
+      // archives on Unread and Read, and on Archived uncovers the tray.
+      const quick = { unread: 'read', archived: 'restore' }[scope] || '';
+      const quickLeft = archived ? '' : 'archive';
+      const QUICK_LABEL = { read: 'Mark read', restore: 'Restore' };
       const under = !this._full ? ''
-        : `<div class="quick ${quick}" aria-hidden="true">${archived ? 'Restore' : 'Archive'}</div>` +
+        : (quick ? `<div class="quick ${quick}" aria-hidden="true">${QUICK_LABEL[quick]}</div>` : '') +
+          (quickLeft ? `<div class="quick-left ${quickLeft}" aria-hidden="true">Archive</div>` : '') +
           `<div class="tray">${tray}</div>`;
       return (this._full
-        ? `<li class="swipe" data-id="${esc(c.id)}" data-quick="${quick}">`
+        ? `<li class="swipe" data-id="${esc(c.id)}"` +
+          (quick ? ` data-quick="${quick}"` : '') +
+          (quickLeft ? ` data-quick-left="${quickLeft}"` : '') + '>'
         : '<li>') + under +
-        `<a class="row${c.unread ? ' has-unread' : ''}"` +
+        `<a class="row${unread ? ' has-unread' : ''}"` +
         (this._full ? ' draggable="false" ' : ' ') +
         `href="/chat.html?id=${encodeURIComponent(c.id)}">` +
         `${avatarHtml(c)}` +
@@ -476,7 +680,7 @@ class RetinueChats extends RetinueCard {
         badge +
         '</a></li>';
     }).join('');
-    return `${this._filterHtml()}<ul class="list">${rows}</ul>${this._footHtml()}`;
+    return `${tabs}${panel(`<ul class="list">${rows}</ul>`)}${this._footHtml()}`;
   }
 
   // The card leads deeper (the full list). The full page's way back out is
