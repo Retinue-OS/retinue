@@ -7,8 +7,9 @@ channel message: the read mark (forward-only, but for the guarded undo of a
 display metadata — plus the in-memory overlay that bridges the life store's
 indexing lag. This exercises the draft guard (stale version rejected; agent
 staging never clobbers user text), read-mark and unread-classification
-semantics, the restore's two guards, path-safe state filenames, and the
-overlay's merge/dedup/expiry contract.
+semantics, the restore's two guards, the arrival count that decides what
+landed after a read (a mark guarded by what was seen, a reply, the undo),
+path-safe state filenames, and the overlay's merge/dedup/expiry contract.
 
 Standalone, no third-party deps:
 
@@ -296,6 +297,128 @@ def test_mark_read_and_its_guarded_restore():
         print("PASS test_mark_read_and_its_guarded_restore")
 
 
+def test_arrival_order_decides_what_came_after_a_read():
+    """`read_inbound` is the arrival count the newest read covered: what is
+    counted after it landed after the read, whatever it is stamped."""
+    with tempfile.TemporaryDirectory() as tmp:
+        store = cs.ChatStateStore(tmp)
+        cid = "sms:+41790000095"
+        since = lambda: cs.arrived_since_read(store.get(cid))  # noqa: E731
+        # Never read: nothing is recorded, the timestamps alone decide.
+        store.mark_unread(cid, 1000.0)
+        assert store.get(cid)["read_inbound"] is None and since() == 0
+        assert cs.arrived_since_read(None) == 0 and cs.arrived_since_read({}) == 0
+        # A document from before the field existed reads the same way.
+        assert cs.arrived_since_read({"inbound_seq": 57}) == 0
+
+        # Read as it stands: both arrivals so far are covered.
+        store.mark_unread(cid, 1010.0)
+        doc, previous = store.mark_read(cid)
+        assert previous is None and doc["read_inbound"] == 2 and since() == 0
+        assert doc["unread_since"] is None
+        mark = doc["last_read"]
+        # One that lands now is unread though it is stamped long before the
+        # mark, and the mark has not moved.
+        doc, _ = store.mark_unread(cid, 900.0)
+        assert doc["last_read"] == mark and cs.iso_z(900.0) < mark
+        assert since() == 1
+
+        # Guarded by what the caller showed: a message it never saw refuses
+        # the mark, and nothing is written.
+        marked, doc, previous = store.mark_read_unless_arrived(cid, None, 2)
+        assert not marked and previous == mark
+        assert (doc["read_seq"], doc["read_inbound"]) == (1, 2) and since() == 1
+        marked, doc, previous = store.mark_read_unless_arrived(cid, None, 3)
+        assert marked and previous == mark and doc["read_inbound"] == 3 and since() == 0
+        # A caller ahead of the count is not refused; None does not ask.
+        assert store.mark_read_unless_arrived(cid, None, 99)[0]
+        assert store.mark_read_unless_arrived(cid, None, None)[0]
+
+        # A read naming an instant behind the mark covers nothing that landed
+        # since: not a stale mark, not a late echo of an old reply.
+        store.mark_unread(cid, 950.0)
+        store.mark_read(cid, 500.0)
+        assert since() == 1
+        store.advance_last_read(cid, 600.0)
+        assert since() == 1
+        # The dashboard's own send does, whatever instant it is stamped with …
+        store.advance_last_read(cid, 600.0, everything=True)
+        assert since() == 0 and store.get(cid)["unread_since"] is None
+        # … and so does a reply or a mark stamped at or after the mark.
+        store.mark_unread(cid, 960.0)
+        store.advance_last_read(cid, store.get(cid)["last_read"])
+        assert since() == 0
+
+        # A mark is never set past this clock, whatever instant it names: a
+        # read cannot have happened later than now. The instant still says
+        # what the read covers.
+        ahead = "sms:+41790000096"
+        future = time.time() + 3600
+        store.mark_unread(ahead, 1000.0)
+        doc, previous = store.mark_read(ahead, future)
+        assert previous is None and doc["last_read"] <= cs.iso_z()
+        store.mark_unread(ahead, 1010.0)
+        doc, _ = store.mark_read(ahead, future)
+        assert doc["last_read"] <= cs.iso_z() and cs.arrived_since_read(doc) == 0
+        # A reply keeps the instant it was written at.
+        doc = store.advance_last_read(ahead, future)
+        assert doc["last_read"] == cs.iso_z(future)
+        print("PASS test_arrival_order_decides_what_came_after_a_read")
+
+
+def test_the_undo_restores_the_arrival_count_too():
+    """Undoing a mark puts `read_inbound` back with it — the messages that
+    had landed unread before the mark are unread again, with any that came
+    since — and never reaches behind a reply."""
+    with tempfile.TemporaryDirectory() as tmp:
+        store = cs.ChatStateStore(tmp)
+        cid = "sms:+41790000097"
+        since = lambda: cs.arrived_since_read(store.get(cid))  # noqa: E731
+        store.mark_unread(cid, 1000.0)
+        doc, _ = store.mark_read(cid, 2000.0)
+        t2 = doc["last_read"]
+        store.mark_unread(cid, 1500.0)           # lands late, behind the mark
+        assert since() == 1
+        doc, previous = store.mark_read(cid, 3000.0)
+        t3 = doc["last_read"]
+        assert previous == t2 and since() == 0
+        assert doc["read_undo"] == {"read_inbound": 1}
+        store.mark_unread(cid, 2500.0)           # another, after this mark
+        restored, doc = store.restore_last_read(cid, restore=previous, marked=t3)
+        assert restored and doc["last_read"] == t2
+        assert doc["read_inbound"] == 1 and doc["read_undo"] is None and since() == 2
+        # Undone to "never read": nothing is recorded again.
+        store.mark_read(cid, 3000.0)
+        store.restore_last_read(cid, restore=t2, marked=t3)
+        restored, doc = store.restore_last_read(cid, restore=None, marked=t2)
+        assert restored and doc["last_read"] is None
+
+        # A reply in the mark's own second passes the undo's first guard (the
+        # mark still reads the same); its cover of what had landed stands.
+        other = "sms:+41790000098"
+        store.mark_unread(other, 1000.0)
+        doc, previous = store.mark_read(other, 2000.0)
+        store.mark_unread(other, 1900.0)
+        doc = store.advance_last_read(other, 2000.0)
+        assert doc["read_inbound"] == 2 and doc["read_undo"] is None
+        restored, doc = store.restore_last_read(other, restore=previous,
+                                                marked=cs.iso_z(2000.0))
+        assert restored and doc["last_read"] is None and doc["read_inbound"] == 2
+        assert cs.arrived_since_read(doc) == 0
+        # A stale read in between leaves the undo's record alone.
+        third = "sms:+41790000099"
+        store.mark_unread(third, 1000.0)
+        store.mark_read(third, 2000.0)
+        store.mark_unread(third, 1900.0)
+        doc, previous = store.mark_read(third, 3000.0)
+        store.advance_last_read(third, 1000.0)
+        store.mark_read(third, 1000.0)
+        restored, doc = store.restore_last_read(third, restore=previous,
+                                                marked=cs.iso_z(3000.0))
+        assert restored and cs.arrived_since_read(doc) == 1
+        print("PASS test_the_undo_restores_the_arrival_count_too")
+
+
 def test_archive_unless_arrived():
     with tempfile.TemporaryDirectory() as tmp:
         store = cs.ChatStateStore(tmp)
@@ -432,6 +555,8 @@ if __name__ == "__main__":
     test_agent_staging_never_clobbers_user_text()
     test_last_read_forward_only_and_unread_modes()
     test_mark_read_and_its_guarded_restore()
+    test_arrival_order_decides_what_came_after_a_read()
+    test_the_undo_restores_the_arrival_count_too()
     test_archive_unless_arrived()
     test_flags_and_note_message()
     test_companion_link()

@@ -24,13 +24,18 @@
 // leaves a load-older affordance for later.
 //
 // Opening a chat does not read it. A chat is read by a reply — the user's
-// send from here, or one from the phone or any other client, which the server
+// send from here, or, on the channels that echo it (Signal, WhatsApp,
+// Telegram; not SMS), one from the phone or another client, which the server
 // sees on its own — or by the **Mark as read** button this page shows under
 // the latest inbound message while the chat is unread (POST /chats/<id>/read,
-// with Undo for a few seconds). Each poll takes the chat's unread count, list
-// group and flags from the server's answer, so the button moves under a newer
-// arrival and goes when the chat was read elsewhere; the "new" waterline is
-// where the chat stood when it was opened.
+// with Undo for a few seconds). The mark says what the page has shown: it
+// carries the `inbound_seq` of the last summary whose messages are in the
+// thread, and the server refuses it (409) when a message has landed that is
+// not — the poll then brings that message, with the button under it. Each
+// poll takes the chat's unread count, list group and flags from the server's
+// answer, so the button moves under a newer arrival and goes when the chat
+// was read elsewhere; the "new" waterline is where the chat stood when it was
+// opened.
 //
 // Media: image attachments render inline at their true aspect ratio when the
 // record carries intrinsic dimensions (a fixed placeholder frame otherwise —
@@ -89,6 +94,11 @@ import { loadDraft, saveDraft, loadFiles, saveFiles } from './drafts.js';
 import { transcribe, handOff, adopt } from './dictation.js';
 
 const LIST_URL = '/chats';
+// How long the inline Undo ignores a press after it appears. It takes the
+// place of the Mark as read button — under the same finger, and with the
+// keyboard's focus — so the second half of a double tap, or of a double
+// Enter, would otherwise undo the read it just made.
+const UNDO_ARM_MS = 500;
 // Where the back control lands a visitor who has no app history behind them.
 const CHATS_URL = '/chats.html';
 const HOME_URL = '/';
@@ -360,12 +370,15 @@ class RetinueChatPage extends HTMLElement {
     this._pollTimer = null;
     this._onVis = null;
     // Mark as read (_markRead): a read or its undo on the wire, the Undo still
-    // offered ({restore, marked, unread, listGroup, timer} — what puts the
-    // chat back as it was), and an epoch a read bumps, so a poll that left
-    // before it cannot hand back the unread state it replaced.
+    // offered ({restore, marked, unread, listGroup, armedAt, timer} — what
+    // puts the chat back as it was, and from when a press counts), and an
+    // epoch a read bumps, so a poll that left before it cannot hand back the
+    // unread state it replaced. The flags have an epoch of their own, for
+    // the same reason (_setFlag).
     this._readBusy = false;
     this._readUndo = null;
     this._readEpoch = 0;
+    this._flagEpoch = 0;
     // The "new" waterline, pinned at load (_waterline): the index of the
     // first message that was unread then, or -1, and how many there were.
     this._firstUnread = -1;
@@ -689,8 +702,9 @@ class RetinueChatPage extends HTMLElement {
   async _poll() {
     if (this._state !== 'ok' || !this._msgUrl || document.hidden) return;
     // A read posted from here after this poll left makes its answer's unread
-    // state stale (_adoptSummary).
+    // state stale, and a flag set from here its flags (_adoptSummary).
     const readEpoch = this._readEpoch;
+    const flagEpoch = this._flagEpoch;
     try {
       const res = await fetch(this._msgUrl, { cache: 'no-store' });
       if (!res.ok) throw new Error(String(res.status));
@@ -713,7 +727,9 @@ class RetinueChatPage extends HTMLElement {
       // The chat as the server now sees it — read by a reply from the
       // phone, unread again by an arrival, archived elsewhere — and the
       // Mark as read button where that puts it.
-      const changed = doc.chat ? this._adoptSummary(doc.chat, readEpoch === this._readEpoch) : false;
+      const changed = doc.chat
+        ? this._adoptSummary(doc.chat, readEpoch === this._readEpoch, flagEpoch === this._flagEpoch)
+        : false;
       if (added || changed) this._placeMarkRead(stick);
       // Ara answers a companion turn by staging a reply here — into an empty
       // composer, or over the text she was asked to rework (the server let
@@ -809,10 +825,16 @@ class RetinueChatPage extends HTMLElement {
   // One poll's chat summary onto the page: the unread count, list group and
   // read mark (unless `fresh` is false — a read from here overtook the poll,
   // and its answer is the newer word), and the flags, whose switches and
-  // header mark follow. True when the read state changed.
-  _adoptSummary(s, fresh = true) {
+  // header mark follow (unless `flagsFresh` is false — a switch pressed here
+  // overtook it the same way). True when the read state changed.
+  _adoptSummary(s, fresh = true, flagsFresh = true) {
     const c = this._chat;
     if (!c || !s) return false;
+    // How many arrivals this answer's messages include. They are in the
+    // thread by now (_poll appends before it calls this), so the count is
+    // taken whatever else of the answer is stale: it is what a Mark as read
+    // from here says the user was shown.
+    if (Number.isInteger(s.inbound_seq)) c.inbound_seq = s.inbound_seq;
     let changed = false;
     if (fresh) {
       const before = `${this._unreadCount()}\u0000${c.list_group || ''}`;
@@ -826,7 +848,7 @@ class RetinueChatPage extends HTMLElement {
       if (changed) shelf.observe(this._shelfKey(), { unread: this._unreadCount() });
     }
     const flags = ['archived', 'muted', 'starred'];
-    if (flags.some((f) => f in s && !!s[f] !== !!c[f])) {
+    if (flagsFresh && flags.some((f) => f in s && !!s[f] !== !!c[f])) {
       for (const f of flags) if (f in s) c[f] = !!s[f];
       this._refreshFlagsUi();
     }
@@ -865,8 +887,10 @@ class RetinueChatPage extends HTMLElement {
 
   // Put the row where the state says, in place: the thread itself is never
   // rebuilt for it. Focus on the row's button moves to its successor (the
-  // Undo after a read, the button again after an undo), so a keyboard user
-  // is not dropped to the top of the page.
+  // Undo after a read, the button again after an undo) — or, where the row
+  // goes and nothing takes its place (the Undo lapsed, or failed and the
+  // chat stays read), to the message it sat under — so a keyboard user is
+  // not dropped to the top of the page.
   _placeMarkRead(stick = null) {
     const thread = this.shadowRoot && this.shadowRoot.querySelector('[data-chat-thread]');
     if (!thread) return;
@@ -875,22 +899,30 @@ class RetinueChatPage extends HTMLElement {
     const hadFocus = !!old && old.contains(deepActiveElement());
     if (old) old.remove();
     const html = this._markReadHtml();
-    const anchor = html && this._markReadAnchor();
+    const anchor = this._markReadAnchor();
     // Found by walking rather than by selector, as _reconcileUnconfirmed
     // does: a message id is text from outside.
     const node = anchor && [...thread.querySelectorAll('[data-mid]')]
       .find((n) => n.getAttribute('data-mid') === anchor.id);
-    if (node) node.insertAdjacentHTML('afterend', html);
+    if (node && html) node.insertAdjacentHTML('afterend', html);
     if (atBottom) thread.scrollTop = thread.scrollHeight;
     if (hadFocus) {
       const btn = thread.querySelector('[data-mark-read-row] button');
-      if (btn) btn.focus();
+      if (btn) {
+        btn.focus();
+      } else {
+        // Not the composer: focusing it would raise the on-screen keyboard
+        // and run the draft's focus handling for a press that asked neither.
+        const to = node || thread;
+        if (!to.hasAttribute('tabindex')) to.setAttribute('tabindex', '-1');
+        to.focus({ preventScroll: true });
+      }
     }
   }
 
-  // The read endpoint, the page's only way to post one: `{}` reads the chat
-  // up to its newest message, `{restore, marked}` undoes that. Throws with
-  // the status on a failed answer.
+  // The read endpoint, the page's only way to post one: `{seen}` reads the
+  // chat as this page has shown it, `{restore, marked}` undoes that. Throws
+  // with the status on a failed answer.
   async _postReadMark(body) {
     const res = await fetch(`/chats/${encodeURIComponent(this._id)}/read`, {
       method: 'POST',
@@ -917,8 +949,12 @@ class RetinueChatPage extends HTMLElement {
     this._readBusy = true;
     this._readEpoch += 1;
     const before = { unread: this._chat.unread, listGroup: this._chat.list_group };
+    // What the user was shown: the arrival count of the last summary whose
+    // messages are in the thread. A server that does not state one (older
+    // than the field) is asked to read the chat as it stands.
+    const seen = this._chat.inbound_seq;
     try {
-      const doc = await this._postReadMark({});
+      const doc = await this._postReadMark(Number.isInteger(seen) ? { seen } : {});
       this._readEpoch += 1;
       this._adoptRead(doc, { unread: 0, listGroup: this._chat.archived ? 'archived' : 'read' });
       this._clearReadUndo();
@@ -930,11 +966,19 @@ class RetinueChatPage extends HTMLElement {
           marked: doc.last_read,
           unread: before.unread,
           listGroup: before.listGroup,
+          armedAt: Date.now() + UNDO_ARM_MS,
           timer: setTimeout(() => { this._readUndo = null; this._placeMarkRead(); }, UNDO_MS),
         };
       }
-    } catch (_err) {
-      this._showNote("Couldn't mark the chat as read &mdash; try again.");
+    } catch (err) {
+      if (err && err.message === '409') {
+        // A message landed that this page had not shown yet, and nothing
+        // was marked: the poll brings it, with the button under it.
+        this._showNote('A new message just came in &mdash; nothing was marked read.');
+        this._poll();
+      } else {
+        this._showNote("Couldn't mark the chat as read &mdash; try again.");
+      }
     } finally {
       this._readBusy = false;
     }
@@ -943,7 +987,8 @@ class RetinueChatPage extends HTMLElement {
 
   async _undoMarkRead() {
     const u = this._readUndo;
-    if (this._readBusy || !u) return;
+    // Not yet armed: the press that made the read, arriving twice.
+    if (this._readBusy || !u || Date.now() < u.armedAt) return;
     this._readBusy = true;
     this._readEpoch += 1;
     this._clearReadUndo();
@@ -1595,6 +1640,10 @@ class RetinueChatPage extends HTMLElement {
   }
 
   async _setFlag(flag, on) {
+    // A poll already on the wire answers with the flags from before this
+    // write, and would draw the switch back (_adoptSummary). Bumped again
+    // with the answer, for a poll that left while the write was on its way.
+    this._flagEpoch += 1;
     try {
       const res = await fetch(`/chats/${encodeURIComponent(this._id)}/flags`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -1602,6 +1651,7 @@ class RetinueChatPage extends HTMLElement {
       });
       if (!res.ok) throw new Error(String(res.status));
       const out = await res.json();
+      this._flagEpoch += 1;
       if (this._chat) {
         this._chat.archived = !!out.archived;
         this._chat.muted = !!out.muted;

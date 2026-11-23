@@ -154,7 +154,10 @@ class _MockSparql(BaseHTTPRequestHandler):
         body = self.rfile.read(length).decode("utf-8")
         query = urllib.parse.parse_qs(body).get("query", [""])[0]
         STATE["queries"].append(query)
-        if STATE["fail"]:
+        # True fails every query; a string only those that contain it — one
+        # query of a rebuild failing while the others answer.
+        fail = STATE["fail"]
+        if fail is True or (isinstance(fail, str) and fail in query):
             self.send_response(500)
             self.end_headers()
             self.wfile.write(b"boom")
@@ -710,10 +713,31 @@ def test_read_watermark(base, wg):
     assert body["counts"]["read"] == 1 and body["counts"]["unread"] >= 1, body["counts"]
     unread_q = [q for q in STATE["queries"] if "VALUES (?chat ?account ?cut)" in q][-1]
     assert TS3 in unread_q
-    # A malformed timestamp is refused, not read as "now".
-    for bad in ("yesterday", True, ["2026-08-27T07:12:00Z"]):
-        status, _ = _http(base, "POST", "/chats/" + _quote(CHAT1) + "/read", {"ts": bad})
-        assert status == 400, bad
+    # A malformed timestamp is refused, not read as "now" — one that only
+    # has the shape of a date included, and an epoch no calendar holds — and
+    # so is an instant that has not come yet: a mark from the future would
+    # stand ahead of whatever arrives until then.
+    for bad in ("yesterday", True, ["2026-08-27T07:12:00Z"],
+                "2026-02-30T10:00:00Z", "2026-13-01T00:00:00Z", "2026-08-27T25:00:00Z",
+                1e18, -1e18, float("nan"), float("inf"),
+                "2099-01-01T00:00:00Z", time.time() + 3600):
+        status, body = _http(base, "POST", "/chats/" + _quote(CHAT1) + "/read", {"ts": bad})
+        assert status == 400, (bad, status, body)
+    assert wg._CHAT_STATE.get(CHAT1)["last_read"] == TS3, "a refused timestamp moved the mark"
+    # A clock a little ahead of this one names "now", and now is where the
+    # mark goes: never past this clock.
+    status, body = _http(base, "POST", "/chats/" + _quote(CHAT1) + "/read",
+                         {"ts": time.time() + 30})
+    assert status == 200 and TS3 < body["last_read"] <= wg.chat_state_mod.iso_z(), body
+    # The same strictness for what an undo names.
+    for bad in ({"restore": None, "marked": "2026-02-30T10:00:00Z"},
+                {"restore": "2026-02-30T10:00:00Z", "marked": body["last_read"]},
+                {"restore": None, "marked": 1e18}):
+        status, answer = _http(base, "POST", "/chats/" + _quote(CHAT1) + "/read", bad)
+        assert status == 400, (bad, status, answer)
+    status, body = _http(base, "POST", "/chats/" + _quote(CHAT1) + "/read",
+                         {"restore": TS3, "marked": body["last_read"]})
+    assert status == 200 and body["last_read"] == TS3, body
     print("PASS test_read_watermark")
 
 

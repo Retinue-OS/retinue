@@ -271,7 +271,11 @@ docstring). Pieces:
   holds **Star**, **Restore**, **Mute** / **Unmute** (stays archived) and
   **Delete** (`POST /chats/<id>/delete`, armed by a first tap, done by a
   second). What takes a row out of view offers Undo for a few seconds — Mark
-  read's puts the previous read mark back (`POST /chats/<id>/read`, below);
+  read's puts the previous read mark back (`POST /chats/<id>/read`, below).
+  A Mark read is about the row as shown: it names the row's `inbound_seq`,
+  and where a message has landed that the list has not fetched yet (it
+  refreshes every 15 s) the server marks nothing — the row slides back and
+  the list is fetched again, showing what came in;
   a starred chat leads whichever list it is in. The tabs are a tablist
   (arrow keys move between them); the choice holds across refreshes and
   writes, and a fresh page opens on *Unread*. The list refreshes on an
@@ -348,17 +352,28 @@ docstring). Pieces:
   The open chat polls on the conversations cadence, appending only unseen
   messages. **Opening a chat, looking at it or scrolling it reads nothing.**
   A chat is read by a reply — a send from the composer (the server reads the
-  chat with it, so the page posts nothing for it), or one from the phone or
-  any other client, which the next poll shows — or by **Mark as read**: the
-  button under the latest inbound message, there whenever the chat is
-  unread. It posts `POST /chats/<id>/read` `{}`, gives way to *Marked as read*
-  with an **Undo** for a few seconds (the restore call below; "nothing to
-  undo" when the mark has moved on since), and keeps the focus on that row.
-  Every poll takes the chat summary's `unread`, `list_group`, `last_read` and
-  flags from the answer rather than keeping the ones from the first load, so
-  the button moves under a newer inbound message, goes when the chat was read
-  elsewhere, and the ★, the ⋮ switches and its dot follow a flag changed
-  elsewhere. A minimized chat on the shelf carries the server's unread count.
+  chat with it, so the page posts nothing for it), or, on Signal, WhatsApp
+  and Telegram, one from the phone or any other client, which the next poll
+  shows (an SMS sent outside Retinue is never seen, so such a chat needs
+  Mark as read) — or by **Mark as read**: the button under the latest
+  inbound message, there whenever the chat is unread. It posts
+  `POST /chats/<id>/read` `{seen}` — the `inbound_seq` of the last poll whose
+  messages are in the thread — and gives way to *Marked as read* with an
+  **Undo** for a few seconds (the restore call below; "nothing to undo" when
+  the mark has moved on since). A 409 means a message landed that the page
+  had not shown: nothing was marked, a note says so, and the poll brings the
+  message with the button under it. The Undo ignores a press in its first
+  half second, since it appears where the button was and with its focus — a
+  double tap or a double Enter would otherwise undo the read it made. Focus
+  stays on the row, and moves to the message it sat under when the row goes
+  with nothing in its place (the Undo lapsed, or failed).
+  Every poll takes the chat summary's `unread`, `list_group`, `last_read`,
+  `inbound_seq` and flags from the answer rather than keeping the ones from
+  the first load, so the button moves under a newer inbound message, goes
+  when the chat was read elsewhere, and the ★, the ⋮ switches and its dot
+  follow a flag changed elsewhere. A poll that left before a read or a flag
+  switch made on this page does not draw the older state back over it. A
+  minimized chat on the shelf carries the server's unread count.
   The companion pane is the chat's own conversation with Ara (see the
   `companion` field below), and it *is* `<retinue-conversation>` — the same
   element the conversations card embeds, so the two surfaces cannot drift
@@ -385,8 +400,9 @@ The API, as the components consume it:
 - `GET /chats` — `{generated, counts: {unread, read, archived}, chats:
   [ChatSummary]}`, ordered by last activity; `counts` is how many chats each
   tab holds. A `ChatSummary` is `{id, channel, account, key, name, group,
-  members?, unread, list_group, archived, muted, starred, companion,
-  instructed, last, draft, messages}`.
+  members?, unread, list_group, last_read, inbound_seq, archived, muted,
+  starred, contact, unknown_sender, companion, instructed, last, draft,
+  messages}`.
 
   A chat is one peer **on one account**, and `id` names both:
   `<channel>:~<account>:<chat-key>`, or `<channel>:<chat-key>` for history
@@ -399,14 +415,23 @@ The API, as the components consume it:
   one person keeps one colour across all of them. Clients must treat the id as
   opaque and read `key`/`account` rather than splitting it.
 
-  `unread` is the number of inbound messages later than both the read mark
-  (`last_read`, set only by Mark as read and by a reply) and the chat's latest
-  outbound message — so a reply that reached the ledger without the
-  dashboard still reads the chat. `list_group` is the tab the chat belongs
+  `unread` is the number of inbound messages the user has neither answered
+  nor marked read: those stamped later than both the read mark (`last_read`,
+  set only by Mark as read and by a reply; null for a chat never marked) and
+  the chat's latest outbound message of the user's own — so a reply that
+  reached the ledger without the dashboard still reads the chat — or, where
+  that is more, those that have landed since the newest read, whatever they
+  are stamped (a delayed delivery is stamped before a mark it arrived
+  after). `inbound_seq` is how many arrivals this summary includes; a client
+  hands it back as `seen` with Mark as read (below) and does nothing else
+  with it. `list_group` is the tab the chat belongs
   in: `archived` when archived, else `unread` while `unread > 0`, else
   `read`; a new inbound message moves a read chat back to `unread`. (It is
   not `group`, which stays the boolean "this is a group chat".) A client
-  meeting a payload without `list_group` derives it by that same rule. `last` is
+  meeting a payload without `list_group` derives it by that same rule.
+  `contact` is the address-book card the chat is linked to (or null), and
+  `unknown_sender` whether its peer is a stranger: nothing on the rail
+  vouched for the last sender, and no card names them. `last` is
   the preview `{ts, direction, author?, sender_name?, text, kind}`, `draft`
   is the shared draft `{text, author, agent?, ts, version}` or null, and
   `companion` is the conversation id of this chat's companion thread (null
@@ -482,8 +507,10 @@ The API, as the components consume it:
   last state).
 - `GET /chats/<id>/messages` — `{generated, chat: ChatSummary, messages:
   [Message]}`, ascending by `ts`, the newest page by default. Its `chat`
-  carries `unread`, `list_group` and `last_read` on every poll — what the
-  page's Mark as read button and waterline follow;
+  carries `unread`, `list_group`, `last_read` and `inbound_seq` on every
+  poll — what the page's Mark as read button and waterline follow, and what
+  its mark names: the count is taken before the messages are collected, so
+  every arrival it includes is on the page;
   `?before=<ISO ts>` pages older history (the page renders the newest page —
   a load-older affordance is future work). A `Message` is `{id, chat,
   direction, author? (out: user|agent|device, plus agent name),
@@ -585,10 +612,22 @@ The API, as the components consume it:
   words to the user about to send them in their own name — and one guarded
   step, so it cannot race the clear that produced it whichever order the two
   requests arrive in.
-- `POST /chats/<id>/read` `{}` — **Mark as read**: reads the chat up to its
-  newest message and answers `{id, last_read, previous, unread: 0,
-  list_group}`, `previous` being the mark it replaced (null when there was
-  none). `{restore: <previous>, marked: <last_read>}` is its Undo: the mark
+- `POST /chats/<id>/read` `{seen: <inbound_seq>}` — **Mark as read**, about
+  what the client showed: `seen` is the `inbound_seq` of the summary it
+  rendered. If a message has landed since, nothing is marked and the answer
+  is **409** `{error, id, last_read, unread, list_group}` — the chat as it
+  stands; the client fetches and shows it before the user marks again.
+  Otherwise the chat is read as it stands and the answer is `{id, last_read,
+  previous, unread, list_group}`: `previous` is the mark it replaced (null
+  when there was none), and `unread` / `list_group` are the chat's state
+  right after the mark, as `GET /chats` would state it — normally 0 and
+  `read`, but a client takes both from the answer rather than assuming them.
+  The mark is the server's clock, never a message's timestamp and never in
+  the future. `{}` is the same without the check (for a caller that vouches
+  for itself), and `{ts}` reads only up to that instant; a `ts` that is no
+  real instant, or lies more than two minutes ahead of the server's clock,
+  is a 400 (one a little ahead is taken as now).
+  `{restore: <previous>, marked: <last_read>}` is its Undo: the mark
   goes back to `previous` only while it is still the one that read set, and
   the answer is 409 otherwise (a reply or another read moved it since, and
   that stands). The list's swipe and tray and the chat page's button are the

@@ -18,9 +18,13 @@ and pins:
     archive, on Read nothing to the right and left = archive, on Archived
     right = restore and left = the tray (no committing left swipe), with the
     tray carrying what a swipe does for a keyboard;
-  * a committed mark read posts `{}` to /chats/<id>/read, moves the row to
-    Read and offers Undo, which posts `{restore, marked}` from the answer and
-    puts the row back; a 409 on Undo refetches the list;
+  * a committed mark read posts `{seen}` — the row's `inbound_seq` as the
+    list shows it, `{}` only where the list states none — to
+    /chats/<id>/read, moves the row to Read and offers Undo, which posts
+    `{restore, marked}` from the answer and puts the row back; a 409 on Undo
+    refetches the list;
+  * a mark the server refuses (409: a message landed that the row does not
+    show) leaves the row in Unread, offers no Undo and refetches the list;
   * a committed archive posts the flag and moves the row to Archived;
   * a refresh that left before a write is dropped when it answers.
 
@@ -116,7 +120,7 @@ const { listGroup, deriveListGroup } = await import('./chats.js');
 
 const chat = (id, extra = {}) => ({
   id, channel: 'signal', account: '+41000', key: id, name: 'N' + id, group: false,
-  unread: 0, archived: false, muted: false, starred: false,
+  unread: 0, inbound_seq: 5, archived: false, muted: false, starred: false,
   last: { ts: '2026-11-20T10:00:00Z', direction: 'in', kind: 'text', text: 'hi' },
   draft: null, companion: null, messages: `/chats/${id}/messages`, ...extra,
 });
@@ -224,6 +228,9 @@ await ok('the reference document follows the contract', async () => {
   for (const c of doc.chats) {
     assert.ok(['unread', 'read', 'archived'].includes(c.list_group), c.id);
     assert.equal(c.list_group, deriveListGroup(c), c.id);
+    // What a Mark as read from the list hands back, and the mark itself.
+    assert.ok(Number.isInteger(c.inbound_seq) && c.inbound_seq >= 0, c.id);
+    assert.ok(c.last_read === null || typeof c.last_read === 'string', c.id);
     n[c.list_group] += 1;
   }
   assert.deepEqual(doc.counts, n);
@@ -267,12 +274,12 @@ await ok('swipes per tab: Unread right=read left=archive, Read left=archive only
   assert.deepEqual(trayOf(html(el), 'a1'), ['star', 'restore', 'unmute', 'delete']);
 });
 
-await ok('swipe right on Unread marks read: POST {} , the row moves to Read, Undo restores', async () => {
-  const el = await mount(payload(LIST, COUNTS));
+await ok('swipe right on Unread marks read: POST {seen}, the row moves to Read, Undo restores', async () => {
+  const el = await mount(payload(LIST.map((c) => (c.id === 'u1' ? { ...c, inbound_seq: 12 } : c)), COUNTS));
   el._swipe._onQuick('u1', 'read', null);
   const post = take((w) => w.method === 'POST', 'the read');
   assert.equal(post.url, '/chats/u1/read');
-  assert.deepEqual(post.body, {}, 'the client names no instant');
+  assert.deepEqual(post.body, { seen: 12 }, 'what the row showed; the client names no instant');
   post.answer({ id: 'u1', last_read: '2026-11-20T09:00:00Z', previous: '2026-11-18T00:00:00Z', unread: 0, list_group: 'read' });
   await settle();
   assert.deepEqual(rowIds(html(el)), ['u2', 'u3'], 'gone from Unread at once');
@@ -330,12 +337,53 @@ await ok('a server without `previous` reads, and offers no Undo', async () => {
   assert.equal(toast, null);
 });
 
+await ok('the count a mark names is the newest list\'s; a list that states none posts {}', async () => {
+  const el = await mount(payload(LIST, COUNTS));
+  el.load();
+  takeList().answer(payload(LIST.map((c) => (c.id === 'u3' ? { ...c, inbound_seq: 6 } : c)), COUNTS));
+  await settle();
+  el._markRead('u3');
+  const post = take((w) => w.method === 'POST', 'the read');
+  assert.deepEqual(post.body, { seen: 6 });
+  post.answer({ id: 'u3', last_read: 'L', previous: null, unread: 0, list_group: 'read' });
+  await settle();
+  const bare = await mount(payload(LIST.map(({ inbound_seq, ...c }) => c), COUNTS));
+  bare._markRead('u1');
+  const old = take((w) => w.method === 'POST', 'the read');
+  assert.deepEqual(old.body, {}, 'a server older than the field');
+  old.answer({ id: 'u1', last_read: 'L', previous: null, unread: 0, list_group: 'read' });
+  await settle();
+});
+
+await ok('a mark the server refuses (409) leaves the row unread and refetches the list', async () => {
+  const el = await mount(payload(LIST, COUNTS));
+  toast = null;
+  let slidBack = null;
+  el._swipe.slide = (li, x) => { slidBack = [li, x]; };
+  const row = { id: 'the row element' };
+  el._swipe._onQuick('u1', 'read', row);
+  take((w) => w.method === 'POST', 'the read')
+    .answer({ error: 'a message has arrived since', id: 'u1', last_read: null, unread: 4, list_group: 'unread' }, 409);
+  await settle();
+  assert.deepEqual(slidBack, [row, 0], 'the swiped row slides back');
+  assert.equal(toast, null, 'nothing was marked, so no Undo');
+  assert.deepEqual(rowIds(html(el)), ['u2', 'u3', 'u1'], 'still in Unread');
+  // The list as it now is: the row shows what came in, and names it next time.
+  takeList().answer(payload(LIST.map((c) => (c.id === 'u1'
+    ? { ...c, unread: 4, inbound_seq: 6, last: { ts: '2026-11-22T09:00:00Z', direction: 'in', text: 'newer' } } : c)), COUNTS));
+  await settle();
+  assert.ok(html(el).includes('title="4 unread"'), 'with the message that landed');
+  el._markRead('u1');
+  assert.deepEqual(take((w) => w.method === 'POST', 'the read').body, { seen: 6 });
+});
+
 await ok('a failed read leaves the row in Unread', async () => {
   const el = await mount(payload(LIST, COUNTS));
   el._markRead('u1');
   take((w) => w.method === 'POST', 'the read').answer({}, 502);
   await settle();
   assert.deepEqual(rowIds(html(el)), ['u2', 'u3', 'u1']);
+  assert.deepEqual(wire.filter((w) => w.method === 'GET'), [], 'an outage is not a reason to refetch');
 });
 
 await ok('swipe left archives: the flag is posted and the row moves to Archived', async () => {

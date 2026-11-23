@@ -18,6 +18,15 @@ so the derivation is exercised end to end rather than canned:
   un-archives the chat unless it is muted;
 - POST /chats/<id>/read is the explicit *Mark as read*, and its guarded undo:
   the mark goes back only while it is still the one being undone;
+- a client marks what it showed (`seen`, the summary's `inbound_seq`): a
+  message that has landed since refuses the mark, 409, and nothing is read or
+  settled unseen;
+- arrival order beside the timestamps: a message that lands after a read is
+  unread whatever its stamp — a delayed delivery, the mark's own second — and
+  that survives the store indexing it, the undo, and the store being away;
+- no message's stamp moves the mark: an arrival from ahead of this clock is
+  taken as now, and the mark is this clock's own, never later;
+- the reply-marks query failing alone leaves the list standing;
 - marking read settles the chat's attention item as *Mark handled* does, the
   undo reopens it only if that mark is what settled it, and a mark that a
   newer message outran settles nothing;
@@ -47,7 +56,11 @@ _http, _quote, _wait_for, _await_job = api._http, api._quote, api._wait_for, api
 PUSHES, TURNS, TURN_GATE = api.PUSHES, api.TURNS, api.TURN_GATE
 
 RAIL = "/internal/chats/inbound"
-NOW = int(time.time())
+# The run's zero, two hours back: every offset a test stamps a message with
+# (up to +5000) then lies in the past, as a real message's stamp does. One
+# from ahead of the gateway's clock is not kept — the rail takes it as now,
+# and the read endpoint refuses it — so those cases stamp by _clock instead.
+T0 = int(time.time()) - 7200
 
 # The ledger the mock store answers from: one dict per message record, as the
 # gateways write them. A test appends to it to put a record in the store
@@ -55,17 +68,32 @@ NOW = int(time.time())
 LEDGER: list[dict] = []
 
 
-def _at(offset: float) -> str:
-    """An instant relative to the start of the run, as the ledger stamps it."""
+def _iso(epoch: float) -> str:
     from datetime import datetime, timezone
-    return (datetime.fromtimestamp(NOW + offset, tz=timezone.utc)
+    return (datetime.fromtimestamp(epoch, tz=timezone.utc)
             .isoformat(timespec="seconds").replace("+00:00", "Z"))
+
+
+def _at(offset: float) -> str:
+    """An instant relative to the run's zero, as the ledger stamps it."""
+    return _iso(T0 + offset)
+
+
+def _clock(offset: float = 0.0) -> str:
+    """An instant relative to the clock as it reads right now."""
+    return _iso(time.time() + offset)
+
+
+def _epoch(iso: str) -> float:
+    from datetime import datetime
+    return datetime.fromisoformat(iso.replace("Z", "+00:00")).timestamp()
 
 
 def _store(key: str, offset: float, direction: str, text: str = "…", *,
            channel: str = "signal", account: str = "", author: str | None = None,
-           mid: str | None = None) -> dict:
-    record = {"chat": key, "account": account, "channel": channel, "ts": _at(offset),
+           mid: str | None = None, ts: str | None = None) -> dict:
+    record = {"chat": key, "account": account, "channel": channel,
+              "ts": ts or _at(offset),
               "dir": direction, "text": text, "author": author,
               "mid": mid or f"s{len(LEDGER) + 1}"}
     LEDGER.append(record)
@@ -147,7 +175,7 @@ def _arrive(base, key, offset, text="hoi", *, channel="signal", mid=None, **extr
     event = {"direction": "in", "channel": channel, "chat": key, "sender": key,
              "sender_name": extra.pop("name", None) or f"Peer {key[-2:]}", "group": False,
              "message_id": mid or f"r{key[-3:]}-{offset}", "text": text,
-             "ts": NOW + offset, "gate": {"forward": True, "reason": "open"}}
+             "ts": T0 + offset, "gate": {"forward": True, "reason": "open"}}
     event.update(extra)
     return _http(base, "POST", RAIL, event)
 
@@ -203,11 +231,14 @@ def test_three_groups(base, wg):
     assert page["chat"]["unread"] == 2 and page["chat"]["list_group"] == "unread"
     assert "last_read" in page["chat"] and page["chat"]["last_read"] is None
     assert _chat(base, "signal:" + a)["unread"] == 2
-    # A chat the list does not hold still gets the three fields.
+    # Both carry the arrival count a mark hands back as `seen`: none has
+    # passed the rail for these chats.
+    assert rows["signal:" + a]["inbound_seq"] == 0 and page["chat"]["inbound_seq"] == 0
+    # A chat the list does not hold still gets the same fields.
     status, page = _http(base, "GET", "/chats/" + _quote("signal:+41791999999") + "/messages")
     assert status == 200, page
-    assert (page["chat"]["unread"], page["chat"]["list_group"], page["chat"]["last_read"]) \
-        == (0, "read", None), page["chat"]
+    assert (page["chat"]["unread"], page["chat"]["list_group"], page["chat"]["last_read"],
+            page["chat"]["inbound_seq"]) == (0, "read", None, 0), page["chat"]
     print("PASS test_three_groups")
 
 
@@ -231,7 +262,7 @@ def test_a_reply_reads_the_chat(base, wg):
     # From the user's own device, echoed on the rail.
     status, _ = _http(base, "POST", RAIL, {
         "direction": "out", "channel": "signal", "chat": echo, "author": "device",
-        "message_id": "echo-1", "text": "ok", "ts": NOW + 5})
+        "message_id": "echo-1", "text": "ok", "ts": T0 + 5})
     assert status == 200
     row = _chat(base, "signal:" + echo)
     assert (row["list_group"], row["unread"]) == ("read", 0), row
@@ -240,7 +271,7 @@ def test_a_reply_reads_the_chat(base, wg):
     # and the message the user never saw is still unread.
     status, _ = _http(base, "POST", RAIL, {
         "direction": "out", "channel": "signal", "chat": agent, "author": "agent",
-        "message_id": "agent-1", "text": "Ara here", "ts": NOW + 5})
+        "message_id": "agent-1", "text": "Ara here", "ts": T0 + 5})
     assert status == 200
     row = _chat(base, "signal:" + agent)
     assert row["last"]["direction"] == "out" and row["last"]["author"] == "agent", row
@@ -260,12 +291,21 @@ def test_a_reply_reads_the_chat(base, wg):
 
     # A new inbound message on a read chat: unread again, counting only what
     # came after the reply.
-    status, body = _arrive(base, sent, 600, "noch was", mid="again-1")
+    status, body = _arrive(base, echo, 600, "noch was", mid="again-1")
+    assert status == 200, body
+    row = _chat(base, "signal:" + echo)
+    assert (row["list_group"], row["unread"]) == ("unread", 1), row
+    # … and once the store has indexed it, it is still one message, not two:
+    # the count by timestamp and the count of arrivals are two views of it.
+    _store(echo, 600, "in", "noch was", mid="again-1")
+    assert _chat(base, "signal:" + echo)["unread"] == 1
+    # The same for one stamped before the reply it follows — the reply went
+    # out a moment ago, this message is stamped an hour back.
+    status, body = _arrive(base, sent, 600, "noch was", mid="again-2")
     assert status == 200, body
     row = _chat(base, "signal:" + sent)
     assert (row["list_group"], row["unread"]) == ("unread", 1), row
-    # … and once the store has indexed it, it is still one message, not two.
-    _store(sent, 600, "in", "noch was", mid="again-1")
+    _store(sent, 600, "in", "noch was", mid="again-2")
     assert _chat(base, "signal:" + sent)["unread"] == 1
     print("PASS test_a_reply_reads_the_chat")
 
@@ -307,41 +347,37 @@ def test_mark_as_read_and_undo(base, wg):
     status, body = _read(base, cid, {"restore": None, "marked": t1})
     assert status == 200 and body["last_read"] is None and body["unread"] == 2, body
 
-    # With no ts the mark is "everything there is": now.
-    before = wg.chat_state_mod.iso_z()
+    # With no ts the mark is "everything there is": this clock's now.
+    before = _clock()
     status, body = _read(base, cid)
     assert status == 200 and body["previous"] is None, body
-    assert body["last_read"] >= before and (body["unread"], body["list_group"]) == (0, "read")
+    assert before <= body["last_read"] <= _clock(), body
+    assert (body["unread"], body["list_group"]) == (0, "read")
     marked = body["last_read"]
     # A reply in between is newer word about the chat: the undo is refused
-    # and nothing changes.
+    # and nothing changes. (Stamped by the phone, a moment after the mark.)
+    replied = _iso(_epoch(marked) + 2)
     status, _ = _http(base, "POST", RAIL, {
         "direction": "out", "channel": "signal", "chat": key, "author": "device",
-        "message_id": "mk-echo", "text": "ok", "ts": NOW + 900})
+        "message_id": "mk-echo", "text": "ok", "ts": _epoch(replied)})
     assert status == 200
     status, body = _read(base, cid, {"restore": None, "marked": marked})
-    assert status == 409 and body["last_read"] == _at(900), body
+    assert status == 409 and body["last_read"] == replied, body
     assert (body["unread"], body["list_group"]) == (0, "read"), body
     assert _chat(base, cid)["list_group"] == "read"
 
     # What the undo is not: an advance, or a guess.
-    for bad in ({"restore": _at(990), "marked": _at(900)},   # later than the mark it undoes
-                {"marked": _at(900)},                        # no restore named
+    for bad in ({"restore": _iso(_epoch(replied) + 90), "marked": replied},  # later than its mark
+                {"marked": replied},                         # no restore named
                 {"restore": None},                           # no mark named
                 {"restore": None, "marked": "then"},
-                {"restore": "then", "marked": _at(900)},
-                {"restore": 5, "marked": _at(900)}):
+                {"restore": "then", "marked": replied},
+                {"restore": 5, "marked": replied},
+                {"restore": "2026-02-30T10:00:00Z", "marked": replied},  # no such day
+                {"restore": None, "marked": "2026-02-30T10:00:00Z"}):
         status, body = _read(base, cid, bad)
         assert status == 400, (bad, status, body)
-    assert wg._CHAT_STATE.get(cid)["last_read"] == _at(900)
-
-    # A message stamped ahead of this clock — the channel's clock, not ours —
-    # is still covered by a mark that names no time.
-    ahead = "+41791000022"
-    _store(ahead, 5000, "in", "aus der Zukunft")
-    status, body = _read(base, "signal:" + ahead)
-    assert status == 200 and body["last_read"] == _at(5000), body
-    assert (body["unread"], body["list_group"]) == (0, "read"), body
+    assert wg._CHAT_STATE.get(cid)["last_read"] == replied
 
     # No state is invented for an undo of a chat nobody marked.
     status, _ = _read(base, "signal:+41791000029", {"restore": None, "marked": t1})
@@ -440,7 +476,7 @@ def test_mark_as_read_settles_attention(base, wg):
     _arrive(base, other, 2000, "Frage")
     status, _ = _http(base, "POST", RAIL, {
         "direction": "out", "channel": "signal", "chat": other, "author": "device",
-        "message_id": "att-echo", "text": "Antwort", "ts": NOW + 2010})
+        "message_id": "att-echo", "text": "Antwort", "ts": T0 + 2010})
     assert _attention(wg, oid)["done_how"] == "replied"
     status, body = _read(base, oid, {"ts": _at(2020)})
     assert status == 200 and _attention(wg, oid)["done_how"] == "replied"
@@ -503,7 +539,7 @@ def test_instructed_turn_and_the_read_mark(base, wg):
         TURN_GATE.update(hold=hold, during=verdict(importance))
         try:
             status, body = _http(base, "POST", RAIL, dict(event, message_id=mid, text=mid,
-                                                          ts=NOW + offset))
+                                                          ts=T0 + offset))
             assert status == 202 and body["pushed"] is False, body
             _wait_for(lambda: instructed().get("message_id") == mid
                       and instructed().get("verdict"), "the turn to set its verdict")
@@ -520,6 +556,18 @@ def test_instructed_turn_and_the_read_mark(base, wg):
 
     held_arrival("opened", 3000, 4, open_the_chat)
     assert len(PUSHES) == 1, "a message the user only looked at was not rung"
+    assert instructed()["delivery"] == "rang", instructed()
+
+    # Nor is a mark for what the page showed before the message landed: it
+    # is refused, moves nothing, and the message rings.
+    shown = wg._CHAT_STATE.get(cid)["inbound_seq"]
+
+    def mark_what_was_shown():
+        status, body = _read(base, cid, {"seen": shown})
+        assert status == 409 and body["unread"] == 2, body
+
+    held_arrival("unseen", 3050, 4, mark_what_was_shown)
+    assert len(PUSHES) == 1, "a message marked read unseen was not rung"
     assert instructed()["delivery"] == "rang", instructed()
 
     # Marking it read while the turn works: nothing rings afterwards.
@@ -567,8 +615,291 @@ def test_instructed_turn_and_the_read_mark(base, wg):
     assert PUSHES == [], "the undo rang"
     ins = instructed()
     assert ins["delivery"] == "list" and "undone" in ins["reason"], ins
+
+    # The same for a message delivered late, stamped behind the mark that
+    # stands (3100): there the mark's instant says nothing — it was past the
+    # message before the message landed — and what tells a read that covers
+    # it from one taken back is the order things happened in.
+    def mark_seen_and_undo():
+        seq = wg._CHAT_STATE.get(cid)["inbound_seq"]
+        status, body = _read(base, cid, {"seen": seq})
+        assert status == 200 and body["unread"] == 0, body
+        status, body = _read(base, cid, {"restore": body["previous"], "marked": body["last_read"]})
+        assert status == 200 and body["last_read"] == _at(3100), body
+        # The late message, and the two before it whose marks were undone.
+        assert (body["unread"], body["list_group"]) == (3, "unread"), body
+
+    held_arrival("late-stamped", 3090, 4, mark_seen_and_undo)
+    assert len(PUSHES) == 1, "a late message whose mark was taken back did not ring"
+    assert instructed()["delivery"] == "rang", instructed()
+    # Nor does a read naming an instant behind the mark count for it.
+    held_arrival("late-stale-read", 3095, 4, lambda: _read(base, cid, {"ts": _at(3000)}))
+    assert len(PUSHES) == 1, "a stale read kept a late message from ringing"
+    # One that covers it does.
+    held_arrival("late-read", 3096, 4,
+                 lambda: _read(base, cid, {"seen": wg._CHAT_STATE.get(cid)["inbound_seq"]}))
+    assert PUSHES == [] and instructed()["delivery"] == "seen", instructed()
     wg._CONTACTS.delete(person["key"])
     print("PASS test_instructed_turn_and_the_read_mark")
+
+
+def test_mark_names_what_was_seen(base, wg):
+    """A client marks what it showed: `seen` is the arrival count of the
+    summary it rendered, and a message that has landed since refuses the
+    mark instead of being read — and settled — unseen."""
+    key = "+41791000061"
+    cid = "signal:" + key
+    _arrive(base, key, 4000, "eins")
+    row = _chat(base, cid)
+    assert (row["inbound_seq"], row["unread"]) == (1, 1), row
+    status, page = _http(base, "GET", row["messages"])
+    assert status == 200 and page["chat"]["inbound_seq"] == 1, page["chat"]
+
+    # The page's count is the one read before its messages were collected:
+    # an arrival that lands while the page is being built is not claimed as
+    # shown by a page that may not hold it.
+    real_summary = wg._chat_summary
+
+    def summary_after_an_arrival(chat_id):
+        wg._CHAT_STATE.mark_unread(chat_id, time.time())
+        return real_summary(chat_id)
+
+    wg._chat_summary = summary_after_an_arrival
+    try:
+        status, page = _http(base, "GET", row["messages"])
+    finally:
+        wg._chat_summary = real_summary
+    assert status == 200 and page["chat"]["inbound_seq"] == 1, page["chat"]
+    assert wg._CHAT_STATE.get(cid)["inbound_seq"] == 2
+
+    # The list the user is looking at goes stale: another message lands.
+    _arrive(base, key, 4010, "zwei")
+    before = wg._CHAT_STATE.get(cid)
+    status, body = _read(base, cid, {"seen": row["inbound_seq"]})
+    assert status == 409 and "arrived" in body["error"], body
+    assert {k: body.get(k) for k in ("id", "last_read", "unread", "list_group")} == \
+        {"id": cid, "last_read": None, "unread": 2, "list_group": "unread"}, body
+    assert _chat(base, cid)["inbound_seq"] == 3
+    after = wg._CHAT_STATE.get(cid)
+    assert [after[k] for k in ("last_read", "read_seq", "read_inbound", "read_undo")] == \
+        [before[k] for k in ("last_read", "read_seq", "read_inbound", "read_undo")], \
+        "a refused mark wrote something"
+    assert _attention(wg, cid)["state"] == "open", "a refused mark settled the item"
+    assert _chat(base, cid)["unread"] == 2
+
+    # Shown, and marked again: read, at this clock's now, and the item settled.
+    row = _chat(base, cid)
+    assert row["inbound_seq"] == 3, row
+    status, body = _read(base, cid, {"seen": row["inbound_seq"]})
+    assert status == 200 and (body["unread"], body["list_group"]) == (0, "read"), body
+    assert body["previous"] is None and body["last_read"] <= _clock(), body
+    assert _attention(wg, cid)["done_how"] == "marked"
+    # A count ahead of the server's is no reason to refuse.
+    status, body = _read(base, cid, {"seen": 99})
+    assert status == 200, body
+    # With an instant as well: guarded the same way.
+    _arrive(base, key, 4020, "drei")
+    status, body = _read(base, cid, {"seen": 3, "ts": _at(4020)})
+    assert status == 409 and body["unread"] == 1, body
+    status, body = _read(base, cid, {"seen": 4, "ts": _clock()})
+    assert status == 200 and body["unread"] == 0, body
+
+    # `seen` is a count and nothing else.
+    for bad in (True, "2", -1, 1.5, [2]):
+        status, body = _read(base, cid, {"seen": bad})
+        assert status == 400, (bad, status, body)
+    print("PASS test_mark_names_what_was_seen")
+
+
+def test_an_arrival_after_a_read_is_unread_whatever_its_stamp(base, wg):
+    """Unread is decided by the order things landed in, beside the
+    timestamps: a message that arrives after the mark is unread even when it
+    is stamped at or before it."""
+    # SMS: the stamp is when the phone received the message, and a delayed
+    # webhook delivers it later — here, after the user marked the chat read.
+    key = "+41791000071"
+    cid = "sms:" + key
+    _arrive(base, key, 4100, "eins", channel="sms", mid="sms-1")
+    status, body = _read(base, cid, {"seen": 1})
+    assert status == 200 and body["list_group"] == "read", body
+    mark = body["last_read"]
+    _arrive(base, key, 4050, "verspätet", channel="sms", mid="sms-late")
+    assert _at(4050) < mark
+    row = _chat(base, cid)
+    assert (row["list_group"], row["unread"], row["last_read"]) == ("unread", 1, mark), row
+    assert row["inbound_seq"] == 2
+    assert _attention(wg, cid)["state"] == "open"
+    # Once the store has indexed both records the answer is the same: one
+    # unread message, counted once.
+    _store(key, 4100, "in", "eins", channel="sms", mid="sms-1")
+    _store(key, 4050, "in", "verspätet", channel="sms", mid="sms-late")
+    row = _chat(base, cid)
+    assert (row["list_group"], row["unread"]) == ("unread", 1), row
+
+    # Marked read, it is read; the undo brings back exactly what the mark
+    # found unread — the late message, which no timestamp would.
+    status, body = _read(base, cid, {"seen": 2})
+    assert status == 200 and (body["unread"], body["list_group"]) == (0, "read"), body
+    status, body = _read(base, cid, {"restore": body["previous"], "marked": body["last_read"]})
+    assert status == 200 and (body["unread"], body["list_group"]) == (1, "unread"), body
+    # A late echo of a reply written before the mark says nothing about what
+    # landed after it.
+    status, _ = _http(base, "POST", RAIL, {
+        "direction": "out", "channel": "sms", "chat": key, "author": "device",
+        "message_id": "sms-old-echo", "text": "ok", "ts": T0 + 4060})
+    assert status == 200
+    assert _chat(base, cid)["unread"] == 1, "a stale echo read a message that came after it"
+    # A read naming an older instant: the same.
+    status, body = _read(base, cid, {"ts": _at(4060)})
+    assert status == 200 and (body["unread"], body["list_group"]) == (1, "unread"), body
+    # One naming the mark itself covers what is stamped up to it.
+    status, body = _read(base, cid, {"ts": mark})
+    assert status == 200 and (body["unread"], body["list_group"]) == (0, "read"), body
+
+    # Any channel, in the mark's own second: the whole-second stamps are
+    # equal, and the message came after.
+    other = "+41791000072"
+    oid = "signal:" + other
+    _arrive(base, other, 4100, "eins")
+    status, body = _read(base, oid, {"seen": 1})
+    assert status == 200 and body["list_group"] == "read", body
+    status, _ = _arrive(base, other, 0, "gleich danach", mid="same-second",
+                        ts=_epoch(body["last_read"]))
+    row = _chat(base, oid)
+    assert (row["list_group"], row["unread"]) == ("unread", 1), row
+    # The user's answer from the dashboard reads whatever has landed.
+    status, msg = _http(base, "POST", "/chats/" + _quote(oid) + "/send", {"text": "ok"})
+    assert status == 200, msg
+    row = _chat(base, oid)
+    assert (row["list_group"], row["unread"]) == ("read", 0), row
+    # … and nothing reaches behind it: an arrival after the reply is unread
+    # again, a mark and its undo leave it so.
+    _arrive(base, other, 4110, "noch eins", mid="after-reply")
+    status, body = _read(base, oid, {"seen": 3})
+    assert status == 200 and body["unread"] == 0, body
+    status, body = _read(base, oid, {"restore": body["previous"], "marked": body["last_read"]})
+    assert status == 200 and (body["unread"], body["list_group"]) == (1, "unread"), body
+
+    # The dashboard's answer is written now, to everything that has landed —
+    # also where the mark already stands ahead of the send's own stamp (the
+    # phone the user answered from before has a fast clock).
+    fourth = "+41791000074"
+    fid = "signal:" + fourth
+    _arrive(base, fourth, 4100, "eins")
+    status, _ = _http(base, "POST", RAIL, {
+        "direction": "out", "channel": "signal", "chat": fourth, "author": "device",
+        "message_id": "fast-echo", "text": "ok", "ts": time.time() + 90})
+    assert status == 200 and _chat(base, fid)["list_group"] == "read"
+    _arrive(base, fourth, 0, "und?", mid="after-fast-echo", ts=time.time())
+    row = _chat(base, fid)
+    assert (row["list_group"], row["unread"]) == ("unread", 1), row
+    status, msg = _http(base, "POST", "/chats/" + _quote(fid) + "/send", {"text": "ja"})
+    assert status == 200 and msg["ts"] < wg._CHAT_STATE.get(fid)["last_read"], msg
+    row = _chat(base, fid)
+    assert (row["list_group"], row["unread"]) == ("read", 0), row
+
+    # A reply that reached the ledger without passing the rail, later than
+    # the mark: no read was recorded for it, so its timestamp decides — and
+    # it is later than the message.
+    third = "+41791000073"
+    tid = "signal:" + third
+    _arrive(base, third, 4100, "eins")
+    status, body = _read(base, tid, {"seen": 1})
+    _arrive(base, third, 4050, "verspätet", mid="late-3")
+    assert _chat(base, tid)["unread"] == 1
+    _store(third, 0, "out", "vom Telefon", author="device", ts=_clock(5))
+    row = _chat(base, tid)
+    assert (row["list_group"], row["unread"]) == ("read", 0), row
+    print("PASS test_an_arrival_after_a_read_is_unread_whatever_its_stamp")
+
+
+def test_a_senders_clock_never_moves_the_mark(base, wg):
+    """A message's stamp comes from whoever stamped it. One from ahead of
+    this clock is taken as now when it arrives, and the mark is this clock's
+    own — so a peer with a wrong clock cannot have later messages counted
+    read."""
+    key = "+41791000081"
+    cid = "signal:" + key
+    years = 3 * 365 * 86400
+    status, body = _arrive(base, key, 0, "aus der Zukunft", mid="fut-1",
+                           ts=time.time() + years)
+    assert status == 200, body
+    row = _chat(base, cid)
+    assert row["last"]["ts"] <= _clock(), "an arrival kept a stamp from ahead of this clock"
+    status, page = _http(base, "GET", row["messages"])
+    assert [m["ts"] <= _clock() for m in page["messages"]] == [True], page["messages"]
+    status, body = _read(base, cid, {"seen": row["inbound_seq"]})
+    assert status == 200 and body["last_read"] <= _clock(), body
+    assert (body["unread"], body["list_group"]) == (0, "read"), body
+    # The next message, from a clock that is right, is unread.
+    _arrive(base, key, 0, "und jetzt?", mid="fut-2", ts=time.time())
+    row = _chat(base, cid)
+    assert (row["list_group"], row["unread"]) == ("unread", 1), row
+    assert row["last_read"] <= _clock()
+    # And a later, earlier-stamped one too (the clock was set right again).
+    status, body = _read(base, cid, {"seen": 2})
+    _arrive(base, key, 4300, "nochmal", mid="fut-3")
+    assert _chat(base, cid)["unread"] == 1
+
+    # A ledger record stamped by a clock running ahead (a phone's, on SMS):
+    # no mark is lifted to it. A mark made before this clock has passed the
+    # stamp leaves it unread, and the answer says so.
+    ahead = "+41791000082"
+    _store(ahead, 0, "in", "voraus", channel="sms", ts=_clock(5000))
+    status, body = _read(base, "sms:" + ahead)
+    assert status == 200 and body["last_read"] <= _clock(), body
+    assert (body["unread"], body["list_group"]) == (1, "unread"), body
+    # Nor does a caller's own instant get there: refused from the future,
+    # taken as now within a fast clock's reach.
+    status, body = _read(base, "sms:" + ahead, {"ts": _clock(5000)})
+    assert status == 400, body
+    status, body = _read(base, "sms:" + ahead, {"ts": _clock(60)})
+    assert status == 200 and body["last_read"] <= _clock(), body
+    print("PASS test_a_senders_clock_never_moves_the_mark")
+
+
+def test_reply_marks_are_a_refinement(base, wg):
+    """The query for the user's own latest messages refines the list; its
+    failure alone must not take the list down."""
+    answered, marked = "+41791000091", "+41791000092"
+    _store(answered, -900, "in")
+    _store(answered, -800, "out", author="device")   # read by the ledger's reply only
+    _store(marked, -900, "in")
+    status, body = _read(base, "signal:" + marked, {"ts": _at(-900)})
+    assert status == 200, body
+    assert _chat(base, "signal:" + answered)["list_group"] == "read"
+
+    api.STATE["fail"] = "VALUES ?author"
+    try:
+        # What the last skeleton knew of the replies is kept meanwhile.
+        rows = {c["id"]: c for c in _chats(base)["chats"]}
+        assert rows["signal:" + answered]["list_group"] == "read", rows["signal:" + answered]
+        assert rows["signal:" + marked]["list_group"] == "read"
+        # With no skeleton to take them from: the read marks alone — still a
+        # list, with the unread counts asked as ever.
+        wg._chats_cache_clear()
+        asked = len(api.STATE["queries"])
+        rows = {c["id"]: c for c in _chats(base)["chats"]}
+        row = rows["signal:" + answered]
+        assert (row["list_group"], row["unread"]) == ("unread", 1), row
+        assert rows["signal:" + marked]["list_group"] == "read"
+        assert any("VALUES (?chat ?account ?cut)" in q for q in api.STATE["queries"][asked:])
+    finally:
+        api.STATE["fail"] = False
+        wg._chats_cache_clear()
+    assert _chat(base, "signal:" + answered)["list_group"] == "read"
+
+    # It is given half of what the rebuild's budget has left, so that running
+    # out of time leaves the unread query its share.
+    timeouts = []
+    real = wg._sparql_bindings
+    wg._sparql_bindings = lambda _query, timeout=None: timeouts.append(timeout) or []
+    try:
+        wg._fetch_reply_marks({"signal:x": {"key": "x", "account": None}}, time.time() + 8)
+    finally:
+        wg._sparql_bindings = real
+    assert len(timeouts) == 1 and 0 < timeouts[0] <= 4.0, timeouts
+    print("PASS test_reply_marks_are_a_refinement")
 
 
 def test_store_away(base, wg):
@@ -598,6 +929,42 @@ def test_store_away(base, wg):
         wg.CHAT_LIST_CACHE_SECONDS = 0.0
         wg._chats_cache_clear()
     assert _chat(base, cid)["unread"] == 2
+
+    # The arrival count is in the chat's state and needs no store: a message
+    # that lands behind a mark is unread on the last good skeleton too, the
+    # guard holds, and where no list can be built at all the state answers.
+    late = "+41791000052"
+    lid = "sms:" + late
+    _arrive(base, late, 4400, "eins", channel="sms", mid="away-1")
+    _store(late, 4400, "in", "eins", channel="sms", mid="away-1")
+    assert _chat(base, lid)["unread"] == 1
+    wg.CHAT_LIST_CACHE_SECONDS = 30.0
+    wg._chats_cache_invalidate()
+    api.STATE["fail"] = True
+    try:
+        status, body = _read(base, lid, {"seen": 1})
+        assert status == 200 and (body["unread"], body["list_group"]) == (0, "read"), body
+        _arrive(base, late, 4350, "verspätet", channel="sms", mid="away-late")
+        row = _chat(base, lid)
+        assert (row["list_group"], row["unread"], row["inbound_seq"]) == ("unread", 1, 2), row
+        status, body = _read(base, lid, {"seen": 1})
+        assert status == 409 and (body["unread"], body["list_group"]) == (1, "unread"), body
+        # Nothing to serve: the read endpoint still answers, from the state.
+        wg._chats_cache_clear()
+        status, _ = _http(base, "GET", "/chats")
+        assert status == 502
+        status, body = _read(base, lid, {"seen": 1})
+        assert status == 409 and (body["unread"], body["list_group"]) == (1, "unread"), body
+        status, body = _read(base, lid, {"seen": 2})
+        assert status == 200 and (body["unread"], body["list_group"]) == (0, "read"), body
+        status, body = _read(base, lid, {"restore": body["previous"],
+                                         "marked": body["last_read"]})
+        assert status == 200 and (body["unread"], body["list_group"]) == (1, "unread"), body
+    finally:
+        api.STATE["fail"] = False
+        wg.CHAT_LIST_CACHE_SECONDS = 0.0
+        wg._chats_cache_clear()
+    assert _chat(base, lid)["unread"] == 1
     print("PASS test_store_away")
 
 
@@ -621,6 +988,10 @@ def main():
         test_an_arrival_unreads_and_unarchives(base, wg)
         test_mark_as_read_settles_attention(base, wg)
         test_instructed_turn_and_the_read_mark(base, wg)
+        test_mark_names_what_was_seen(base, wg)
+        test_an_arrival_after_a_read_is_unread_whatever_its_stamp(base, wg)
+        test_a_senders_clock_never_moves_the_mark(base, wg)
+        test_reply_marks_are_a_refinement(base, wg)
         test_store_away(base, wg)
         server.shutdown()
     sparql.shutdown()

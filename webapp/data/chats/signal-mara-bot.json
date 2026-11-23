@@ -10,6 +10,7 @@
   "unread": 0,
   "list_group": "read",
   "last_read": null,
+  "inbound_seq": 0,
   "archived": false,
   "muted": false,
   "companion": null,

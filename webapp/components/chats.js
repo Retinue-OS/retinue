@@ -10,9 +10,13 @@
 //
 // **Unread** is a chat whose latest inbound message has been neither replied
 // to nor marked read; **Read** is one where it has. Opening a chat reads
-// nothing: a chat leaves Unread by a reply (from anywhere) or by Mark as read —
-// a swipe here, or the button under its latest message on the chat page — and
-// a new inbound message brings it back. The server says which group a chat is
+// nothing: a chat leaves Unread by a reply (from the dashboard; from the
+// phone too on the channels that echo it — Signal, WhatsApp, Telegram, not
+// SMS) or by Mark as read — a swipe here, or the button under its latest
+// message on the chat page — and a new inbound message brings it back. A
+// mark from here is about the row as it is shown: it names the row's
+// `inbound_seq`, and the server refuses it when a message has landed that
+// the row does not show yet. The server says which group a chat is
 // in (`list_group`); a payload without it is grouped the same way from
 // `archived` and the unread count. The unread badge stays on the row: the tab
 // says whether a chat wants attention, the badge how much has come in.
@@ -378,20 +382,27 @@ class RetinueChats extends RetinueCard {
     }
   }
 
-  // Mark as read: POST /chats/<id>/read with an empty body — the server reads
-  // the chat up to its newest message and says where the mark now is; the
-  // client names no instant of its own. The answer carries the mark it
-  // replaced (`previous`) and the one it set (`last_read`): Undo hands both
-  // back, and the server puts the old mark back only if the chat's mark is
-  // still the one this set (409 otherwise — a reply or another read moved it
-  // since, and that stands).
+  // Mark as read: POST /chats/<id>/read with `{seen}`, the `inbound_seq` of
+  // the row as this list shows it. The list is up to REFRESH_MS old, and a
+  // message that landed since is one the user has not been shown: the server
+  // then marks nothing and answers 409, the row slides back, and the list is
+  // fetched again so the row shows what came in. The client names no instant
+  // of its own — the mark is the server's clock. Its answer carries the mark
+  // it replaced (`previous`) and the one it set (`last_read`): Undo hands
+  // both back, and the server puts the old mark back only if the chat's mark
+  // is still the one this set (409 otherwise — a reply or another read moved
+  // it since, and that stands).
   async _markRead(id, li = null) {
     if (!id || this._flagging) return;
     const chat0 = (this._data && this._data.chats || []).find((c) => c.id === id);
     const before = chat0 ? { unread: chat0.unread, list_group: chat0.list_group } : null;
+    // A list from a server older than the field carries no count: the chat
+    // is then read as it stands.
+    const seen = chat0 ? chat0.inbound_seq : undefined;
+    let outrun = false;
     this._flagging = true;
     try {
-      const doc = await this._postRead(id, {});
+      const doc = await this._postRead(id, Number.isInteger(seen) ? { seen } : {});
       const chat = (this._data && this._data.chats || []).find((c) => c.id === id);
       if (chat) this._adoptRead(chat, doc, 0);
       shelf.observe(`chat:${id}`, { unread: 0 });
@@ -402,11 +413,13 @@ class RetinueChats extends RetinueCard {
         const undo = { restore: doc.previous == null ? null : doc.previous, marked: doc.last_read };
         offerUndo(`Marked read · ${chat ? chat.name : ''}`, () => this._undoRead(id, undo, before));
       }
-    } catch (_err) {
+    } catch (err) {
       if (li) this._swipe.slide(li, 0);
+      outrun = !!err && err.message === '409';
     } finally {
       this._flagging = false;
     }
+    if (outrun) this.load();
   }
 
   async _undoRead(id, undo, before) {

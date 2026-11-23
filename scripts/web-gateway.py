@@ -161,10 +161,13 @@ Messenger chats (the deterministic chat mirror; see scripts/chat_state.py):
                                          ordered by last activity. Each chat
                                          states its `list_group` ("unread" |
                                          "read" | "archived"; `group` is the
-                                         boolean "a group chat") and `unread`,
-                                         the inbound messages later than both
-                                         its read mark and the user's own
-                                         latest message; `counts` are chats
+                                         boolean "a group chat"), `unread` —
+                                         the inbound messages the user has
+                                         neither answered nor marked read —
+                                         and `inbound_seq`, the count of
+                                         arrivals this view of the chat
+                                         includes (what Mark as read hands
+                                         back as `seen`); `counts` are chats
                                          per group.
   GET  /chats/<id>/messages           -> {"generated", "chat": ChatSummary,
                                          "messages": [Message]} ascending, the
@@ -175,16 +178,22 @@ Messenger chats (the deterministic chat mirror; see scripts/chat_state.py):
                                          <id> is <channel>:<chat-key>,
                                          percent-encoded; the key is split off
                                          at the FIRST colon.
-  POST /chats/<id>/read               -> Mark as read: body {} or {ts} moves
-                                         the read mark forward (ts defaults to
-                                         now) and settles the chat's attention
-                                         item; answers {id, last_read,
-                                         previous, unread, list_group}. Body
-                                         {restore, marked} undoes it — the
-                                         mark goes back to `restore` only
-                                         while it is still `marked` (409
-                                         otherwise). Opening a chat reads
-                                         nothing.
+  POST /chats/<id>/read               -> Mark as read. Body {seen}: the
+                                         `inbound_seq` of the summary the
+                                         client showed; a message that landed
+                                         since refuses the mark — 409 with
+                                         {id, last_read, unread, list_group},
+                                         nothing written. Body {} reads
+                                         whatever has landed, {ts} only up to
+                                         that instant. The mark moves forward,
+                                         never past this clock, and settles
+                                         the chat's attention item; answers
+                                         {id, last_read, previous, unread,
+                                         list_group}. Body {restore, marked}
+                                         undoes it — the mark goes back to
+                                         `restore` only while it is still
+                                         `marked` (409 otherwise). Opening a
+                                         chat reads nothing.
   POST /chats/<id>/flags              -> set {archived, muted, starred} (any of
                                          them, booleans). `starred` sorts the
                                          chat first in its list, nothing else.
@@ -7266,6 +7275,32 @@ _CHAT_MEDIA_PATH_RE = re.compile(r"^/media/([0-9a-f]{32})/?$")
 _CHAT_MEDIA_URN_RE = re.compile(r"^urn:retinue:media:([a-z0-9_]+):([0-9a-f]{32})$")
 _CHAT_TS_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$")
 _T_CHAT_OUTBOUND = _KB + "OutboundMessage"
+# How far ahead of this clock a read may name its instant and still be taken
+# to mean "now": the stamp of a message from a clock running a little fast.
+# Anything later is no instant a read can have happened at (_handle_chat_read).
+CHAT_READ_SKEW_SECONDS = 120.0
+
+
+def _chat_ts_strict(value) -> str | None:
+    """A client's timestamp — an ISO-8601 string or epoch seconds — in the
+    ledger's ISO-Z form, or None when it names no real instant.
+
+    Stricter than chat_state.iso_z, which reads whatever it cannot parse as
+    now. That suits a gateway's own stamps and is wrong for a read mark: 30
+    February has the shape of a date, and would read the chat up to this
+    moment. An epoch no calendar holds (or NaN) is refused the same way
+    rather than raised."""
+    if isinstance(value, bool):
+        return None
+    try:
+        if isinstance(value, (int, float)):
+            return chat_state_mod.iso_z(value)
+        if isinstance(value, str) and _CHAT_TS_RE.match(value):
+            datetime.fromisoformat(value.replace("Z", "+00:00"))
+            return chat_state_mod.iso_z(value)
+    except (OverflowError, OSError, ValueError):
+        pass
+    return None
 
 
 def _chat_id_from_path(raw: str) -> str | None:
@@ -7859,8 +7894,10 @@ def _chat_read_cut(doc: dict | None, row: dict | None) -> str:
     """The instant up to which a chat counts as read, "" for never: the later
     of its read mark (a reply the rail saw, or *Mark as read*) and the user's
     own latest message in the ledger (``replied`` on the skeleton row — see
-    _CHATS_REPLIED_SPARQL for why both are asked). Inbound messages later
-    than this are the chat's unread ones."""
+    _CHATS_REPLIED_SPARQL for why both are asked). Inbound messages stamped
+    later than this are unread — and so are those that landed after the
+    newest read with a stamp that is not, which only the arrival count finds
+    (_chats_payload)."""
     return max((doc or {}).get("last_read") or "", (row or {}).get("replied") or "")
 
 
@@ -7880,7 +7917,9 @@ def _unread_after_reads(skeleton: dict, unread: dict) -> dict:
     way round, for a *Mark as read* undone while the store is away: a chat
     whose head is an inbound message later than its cut-off holds at least
     that one, whatever was counted while the mark stood. The other counts
-    stand — the store's answer is the best there is without the store."""
+    stand — the store's answer is the best there is without the store. (What
+    has landed since the newest read needs no store at all: _chats_payload
+    adds it from the chat's state, as it does over a fresh answer.)"""
     docs = _CHAT_STATE.all()
     corrected = dict(unread)
     for cid, row in skeleton.items():
@@ -8004,7 +8043,23 @@ def _fetch_chats_skeleton(deadline: float | None = None) -> dict[str, dict]:
             "attachments": list(record.get(_P_ATTACHMENT, [])),
             "replied": None,
         }
-    for chat_id, replied in _fetch_reply_marks(skeleton, deadline).items():
+    # The reply marks refine the list and must never cost it: the rail has
+    # already advanced the read mark for every reply it saw, so without this
+    # answer only a reply that reached the ledger some other way goes
+    # unnoticed until a later rebuild. What the last skeleton knew is kept
+    # meanwhile — an older reply than the truth, at worst, which leaves a
+    # message unread rather than hiding one.
+    try:
+        marks = _fetch_reply_marks(skeleton, deadline)
+    except Exception as exc:  # noqa: BLE001 - see above
+        with _chats_cache_lock:
+            previous = _chats_cache["skeleton"] or {}
+        marks = {cid: previous[cid]["replied"] for cid in skeleton
+                 if (previous.get(cid) or {}).get("replied")}
+        print(f"[web-gateway] chat list: the reply-marks query failed ({exc}); "
+              f"read state from the read marks and the last known replies",
+              flush=True)
+    for chat_id, replied in marks.items():
         skeleton[chat_id]["replied"] = replied
     return skeleton
 
@@ -8015,12 +8070,17 @@ def _fetch_reply_marks(skeleton: dict[str, dict],
     chats of ``skeleton`` (see _CHATS_REPLIED_SPARQL): one query, one row per
     chat that holds a message of the user's own. Mapped back on (chat key,
     account) like the unread counts, so one account's reply never reads
-    another account's chat with the same peer. No chats, no query."""
+    another account's chat with the same peer. No chats, no query.
+
+    Given half of what the rebuild's budget has left, no more: the unread
+    counts are still to be asked after this, and a query the list can do
+    without (_fetch_chats_skeleton catches its failure) must not spend the
+    time of one it cannot."""
     by_pair = {(row["key"], row["account"] or ""): cid for cid, row in skeleton.items()}
     if not by_pair:
         return {}
     marks: dict[str, str] = {}
-    for b in _sparql_bindings(_CHATS_REPLIED_SPARQL, timeout=_budget_left(deadline)):
+    for b in _sparql_bindings(_CHATS_REPLIED_SPARQL, timeout=_budget_left(deadline) / 2):
         pair = (_bval(b, "chat"), _bval(b, "account") or "")
         replied = _bval(b, "replied")
         if pair in by_pair and replied:
@@ -8188,6 +8248,17 @@ def _chats_payload() -> dict:
                     roster=roster)
         if last is None:
             continue
+        # By arrival order as well: whatever has landed since the newest read
+        # is unread wherever its stamp puts it — at or behind the mark for a
+        # delayed delivery or one in the mark's own second, which no
+        # comparison above can see (chat_state.arrived_since_read). The
+        # larger of the two views, not their sum: they count the same
+        # messages. Only while the read mark is the newest word, though:
+        # where a reply of the user's later than the mark has reached the
+        # ledger or the overlay, no read was recorded here for it, so nothing
+        # says which arrivals it followed — its timestamp has to, as above.
+        if cut == (doc.get("last_read") or ""):
+            count = max(count, chat_state_mod.arrived_since_read(doc))
         if _chat_is_nameless(doc, channel, key):
             nameless.append(chat_id)
         group = doc.get("group")
@@ -8210,9 +8281,17 @@ def _chats_payload() -> dict:
             # `list_group` below.
             "group": bool(group),
             # Inbound messages the user has neither answered nor marked read:
-            # later than their read mark and than their own latest message.
-            # Opening the chat changes nothing here.
+            # stamped later than their read mark and their own latest
+            # message, or landed after the newest read. Opening the chat
+            # changes nothing here.
             "unread": count,
+            # How many arrivals this view of the chat includes: what a client
+            # hands back as `seen` with *Mark as read*, so that a message
+            # landing after this list was built is not marked unseen. Taken
+            # from the state as it was read before the overlay, never later —
+            # a number too low only refuses a mark, one too high would wave
+            # a message through that this row does not show.
+            "inbound_seq": int((docs.get(chat_id) or {}).get("inbound_seq") or 0),
             # Which of the page's three groups the chat is in — "unread",
             # "read" or "archived" — stated here so no client derives it.
             "list_group": _chat_list_group(bool(doc.get("archived")), count),
@@ -8264,7 +8343,8 @@ def _chat_read_state(chat_id: str, doc: dict) -> tuple[int, str]:
     """A chat's ``(unread, list_group)`` as GET /chats states them right now —
     what the read endpoint answers with. Where the list cannot be built (the
     store away with nothing recent to serve) or does not hold the chat, what
-    the state document alone can say: nothing known to be unread."""
+    the state document alone can say: the messages that have landed since
+    the newest read, and nothing else known to be unread."""
     try:
         summary = _chat_summary(chat_id)
     except Exception as exc:  # noqa: BLE001 - the mark is written; answer anyway
@@ -8272,7 +8352,8 @@ def _chat_read_state(chat_id: str, doc: dict) -> tuple[int, str]:
         summary = None
     if summary is not None:
         return summary["unread"], summary["list_group"]
-    return 0, _chat_list_group(bool(doc.get("archived")), 0)
+    unread = chat_state_mod.arrived_since_read(doc)
+    return unread, _chat_list_group(bool(doc.get("archived")), unread)
 
 
 # Serializes create-or-get for companion threads. The web-gateway is the only
@@ -8869,9 +8950,18 @@ def _instructed_read_since(doc: dict, ring: dict) -> bool:
     behind the message again. Counted by reads rather than by the mark
     moving, which keeps whole seconds: a message delivered late, stamped
     behind a read the mark already holds, is seen by the next read even when
-    that read falls in the same second."""
+    that read falls in the same second.
+
+    And the read has to cover the arrival, by the order they happened in
+    (``read_inbound`` at or past the arrival's own count): for that late
+    message the mark says nothing — it was past the message before the
+    message landed — so a read naming an older instant, or a mark taken
+    back, would otherwise still count."""
     last = doc.get("last_read")
     if not last or "read_seq" not in ring:
+        return False
+    covered, arrival = doc.get("read_inbound"), ring.get("inbound_seq")
+    if covered is not None and arrival is not None and covered < arrival:
         return False
     return (last >= (ring["entry"].get("ts") or "")
             and int(doc.get("read_seq") or 0) > ring["read_seq"])
@@ -9477,6 +9567,12 @@ def _chat_messages_payload(chat_id: str, before: str | None = None) -> dict:
     channel, account, key = chat_state_mod.split_chat_ref(chat_id)
     doc = _CHAT_STATE.get(chat_id)
     roster = doc.get("roster") or {}
+    # The arrival count this page will carry (`inbound_seq`), read before the
+    # messages are collected: an arrival is in the overlay before it is
+    # counted, so every message counted here is on the page, and one that
+    # lands while the page is built is on neither — or on the page only,
+    # which merely refuses a mark that could have passed.
+    shown_seq = int(doc.get("inbound_seq") or 0)
     # Which gateway serves this chat's media is the media resolver's answer,
     # not the send resolver's: a chat may be unsendable (two inbox accounts,
     # owner unknown) and still perfectly readable. The slug is the gateway
@@ -9575,10 +9671,11 @@ def _chat_messages_payload(chat_id: str, before: str | None = None) -> dict:
             "group": bool(doc.get("group")
                           if doc.get("group") is not None
                           else _chat_is_group(channel, key)),
-            # Not in the list, so nothing counted it: the same three fields
-            # the list states, as far as the state document knows them.
-            "unread": 0,
-            "list_group": _chat_list_group(bool(doc.get("archived")), 0),
+            # Not in the list, so nothing counted it: the same fields the
+            # list states, as far as the state document knows them.
+            "unread": chat_state_mod.arrived_since_read(doc),
+            "list_group": _chat_list_group(
+                bool(doc.get("archived")), chat_state_mod.arrived_since_read(doc)),
             "last_read": doc.get("last_read") or None,
             "archived": bool(doc.get("archived")),
             "muted": bool(doc.get("muted")),
@@ -9595,6 +9692,7 @@ def _chat_messages_payload(chat_id: str, before: str | None = None) -> dict:
             "instructed": doc.get("instructed") or None,
             "messages": _chat_messages_url(chat_id),
         }
+    summary["inbound_seq"] = shown_seq
     return {
         "generated": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "chat": summary,
@@ -12162,23 +12260,35 @@ class Handler(BaseHTTPRequestHandler):
                                   "detail": str(exc)})
 
     def _handle_chat_read(self, raw_id: str) -> None:
-        """*Mark as read* (body {} or {ts}), and its undo (body {restore,
-        marked}).
+        """*Mark as read* (body {seen}, {} or {ts}), and its undo (body
+        {restore, marked}).
 
         A chat is read when its latest inbound message was replied to or
         marked read — never by being opened, so nothing calls this on the
-        user's behalf: it is their explicit word. The mark moves forward to
-        ``ts``; without one, to now — or to the chat's newest message where
-        that is stamped later than this clock reads, since the channels stamp
-        messages with clocks of their own and "everything" must include the
-        message the user is looking at. A client that names the ``ts`` of the
-        newest message it shows marks exactly what the user saw: a message
-        that slipped in behind it stays unread, and the answer says so.
+        user's behalf: it is their explicit word, and it is about what they
+        were shown. A client says what that was with ``seen``, the
+        ``inbound_seq`` of the summary it rendered: if a message has landed
+        since, the mark is refused — 409 with the chat as it stands, nothing
+        written — and the client shows that message before it asks again.
+        Without ``seen`` the caller vouches for itself: {} reads whatever
+        has landed by now, {ts} only what is stamped up to that instant.
+
+        The mark is an instant of this clock: now, or ``ts`` where that is
+        earlier. Never later. A message's stamp comes from whoever stamped
+        it, and a mark lifted to one would count as read whatever arrives
+        before this clock catches up with it. Which messages landed before
+        the mark and which after is kept beside it instead, as a count of
+        arrivals (ChatStateStore.mark_read_unless_arrived), so a message
+        that lands later is unread whatever its stamp. What the count cannot
+        help with is a ledger record stamped by a clock running ahead of
+        this one, read before this clock has passed it: it stays unread, and
+        the answer says so.
 
         Marking read is "dealt with", so it settles the chat's attention item
-        as *Mark handled* does — when the mark leaves nothing unread. A mark
-        that a newer message outran settles nothing: that message's item is
-        not the user's to have dismissed unseen.
+        as *Mark handled* does — when the mark leaves nothing unread, and the
+        item holds nothing that landed after it. A mark that a newer message
+        outran settles nothing: that message's item is not the user's to
+        have dismissed unseen.
 
         Answers {id, last_read, previous, unread, list_group}; ``previous``
         is the mark before this call (null for none), which together with
@@ -12193,20 +12303,29 @@ class Handler(BaseHTTPRequestHandler):
         if "restore" in payload or "marked" in payload:
             self._chat_read_restore(chat_id, payload)
             return
-        ts = payload.get("ts")
-        if ts is None:
-            ts = time.time()
-            try:
-                head = ((_chat_summary(chat_id) or {}).get("last") or {}).get("ts")
-            except Exception:  # noqa: BLE001 - the store away: this clock will do
-                head = None
-            if head and head > chat_state_mod.iso_z(ts):
-                ts = head
-        elif isinstance(ts, bool) or not isinstance(ts, (str, int, float)) or (
-                isinstance(ts, str) and not _CHAT_TS_RE.match(ts)):
-            self._send_json(400, {"error": "ts must be an ISO-8601 timestamp or epoch seconds"})
+        ts, seen = payload.get("ts"), payload.get("seen")
+        if seen is not None and (isinstance(seen, bool) or not isinstance(seen, int)
+                                 or seen < 0):
+            self._send_json(400, {"error": "seen must be the inbound_seq of the chat "
+                                           "summary the mark is about"})
             return
-        doc, previous = _CHAT_STATE.mark_read(chat_id, ts)
+        mark = None
+        if ts is not None:
+            mark = _chat_ts_strict(ts)
+            # Within the allowance it is a fast clock's "now" — and now is as
+            # far as the store lets a mark go.
+            if mark is None or mark > chat_state_mod.iso_z(
+                    time.time() + CHAT_READ_SKEW_SECONDS):
+                self._send_json(400, {"error": "ts must be an ISO-8601 timestamp or epoch "
+                                               "seconds, and not in the future"})
+                return
+        marked, doc, previous = _CHAT_STATE.mark_read_unless_arrived(chat_id, mark, seen)
+        if not marked:
+            unread, list_group = _chat_read_state(chat_id, doc)
+            self._send_json(409, {"error": "a message has arrived since; nothing was marked",
+                                  "id": chat_id, "last_read": doc["last_read"],
+                                  "unread": unread, "list_group": list_group})
+            return
         _chats_cache_invalidate()
         unread, list_group = _chat_read_state(chat_id, doc)
         settled = (_attention_settle_read(chat_id, doc.get("inbound_seq"))
@@ -12232,15 +12351,18 @@ class Handler(BaseHTTPRequestHandler):
         Answers like the mark does, with ``previous`` the mark just undone.
         What the undo cannot do is make a chat unread that the user has
         answered: the reply stands in the ledger whatever the mark says."""
-        marked, restore = payload.get("marked"), payload.get("restore")
-        if "restore" not in payload or not isinstance(marked, str) \
-                or not _CHAT_TS_RE.match(marked):
+        marked = payload.get("marked")
+        marked = _chat_ts_strict(marked) if isinstance(marked, str) else None
+        if "restore" not in payload or marked is None:
             self._send_json(400, {"error": "restore (the previous mark, or null) and marked "
                                            "(the last_read the mark answered) are required"})
             return
-        if restore is not None and not (isinstance(restore, str) and _CHAT_TS_RE.match(restore)):
-            self._send_json(400, {"error": "restore must be an ISO-8601 timestamp or null"})
-            return
+        restore = payload["restore"]
+        if restore is not None:
+            restore = _chat_ts_strict(restore) if isinstance(restore, str) else None
+            if restore is None:
+                self._send_json(400, {"error": "restore must be an ISO-8601 timestamp or null"})
+                return
         try:
             restored, doc = _CHAT_STATE.restore_last_read(chat_id, restore=restore,
                                                           marked=marked)
@@ -12258,7 +12380,7 @@ class Handler(BaseHTTPRequestHandler):
         _instructed_unsee(chat_id, doc)
         unread, list_group = _chat_read_state(chat_id, doc)
         self._send_json(200, {"id": chat_id, "last_read": doc["last_read"],
-                              "previous": chat_state_mod.iso_z(marked),
+                              "previous": marked,
                               "unread": unread, "list_group": list_group})
 
     def _handle_chat_flags(self, raw_id: str) -> None:
@@ -12901,7 +13023,9 @@ class Handler(BaseHTTPRequestHandler):
             "attachments": gw_atts,
         })
         _CHAT_STATE.clear_draft(chat_id)
-        _CHAT_STATE.advance_last_read(chat_id, ts)
+        # Written here and now, in answer to everything the chat held —
+        # whatever instant the channel stamps the send with.
+        _CHAT_STATE.advance_last_read(chat_id, ts, everything=True)
         # The reply is what the chat waited for: its attention item is handled.
         _attention_mark(f"chat:{chat_id}", "done", "replied")
         # Deliberately no stamping here. A send either used an already
@@ -12930,8 +13054,10 @@ class Handler(BaseHTTPRequestHandler):
         their own device, and a reply is what reads a chat; an
         agent-authored outbound advances nothing, so an agent answering on
         its own never hides a message the user has not seen. An arrival
-        needs no un-reading: it is later than the mark, which is what unread
-        means. Open unless CHATS_INGEST_TOKEN is set — see
+        needs no un-reading: it is counted, and what is counted after the
+        newest read is unread — by its place in that count, not by its
+        stamp, which a delayed delivery or a sender's clock can put at or
+        before the mark. Open unless CHATS_INGEST_TOKEN is set — see
         _chats_ingest_authorized for why fail-open is the fail-safe here."""
         token = self.headers.get("X-Conversation-Backend-Token", "")
         if not _chats_ingest_authorized(token):
@@ -12957,6 +13083,16 @@ class Handler(BaseHTTPRequestHandler):
         account = (payload.get("account") or "").strip() or None
         chat_id = chat_state_mod.make_chat_id(channel, chat_key, account)
         ts = chat_state_mod.iso_z(payload.get("ts"))
+        if direction == "in":
+            # An arrival's stamp is the sender's clock (Signal) or a phone's
+            # (SMS), and no message was written after it landed: one from
+            # ahead of this clock is taken as now. Kept, it would head the
+            # chat until that instant came, sort above everything that
+            # really follows it, and lie beyond any mark the user sets
+            # today. (Earlier stamps are kept — a delayed delivery belongs
+            # at its place in the conversation, and is unread by the order
+            # it landed in: mark_unread below.)
+            ts = min(ts, chat_state_mod.iso_z())
         author = (payload.get("author") or "").strip() or None
         entry = {
             "chat_id": chat_id,

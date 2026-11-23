@@ -381,9 +381,9 @@ judgement) where it carries one, else from the profile's priors for the
 sender, else the default — a person writing directly is *active* (held for the
 next digest, rung at once where the sender holds a permit), a group is chatter
 (passive). `attention-set.py chat:<id> …` revises it; a reply (from the
-dashboard or the phone), *Mark handled*, *Mark as read* or archiving the chat
-settles it. Undoing a *Mark as read* reopens the item only where that mark
-settled it.
+dashboard, or from the phone on the channels that echo it — not SMS), *Mark
+handled*, *Mark as read* or archiving the chat settles it. Undoing a *Mark as
+read* reopens the item only where that mark settled it.
 The chat page carries **Archive** and **Mute** switches in its header's ⋮ menu
 (`POST /chats/<id>/flags {archived?, muted?}`), with the thread flags'
 meaning: an archived chat leaves the chats list and comes back when a
@@ -969,25 +969,35 @@ devices would need to re-enable.
 
 The Chats page (`chats.html`) sorts every messenger chat into three groups,
 **Unread · Read · Archived**, and the gateway says which: every chat in
-`GET /chats` carries `list_group` and `unread`, and the payload `counts` —
-chats per group, for the tabs. (`group` on a chat is the boolean "a group
-chat", as before.)
+`GET /chats` carries `list_group`, `unread` and `inbound_seq` (the count of
+arrivals the summary includes), and the payload `counts` — chats per group,
+for the tabs. (`group` on a chat is the boolean "a group chat", as before.)
 
 - A chat is **unread** while its latest inbound message has neither been
   replied to nor marked read, and **read** once it has — by a reply from the
-  dashboard or from the user's own phone, or by **Mark as read**: the button
-  under the latest inbound message on the chat page, and a swipe right on the
-  Chats page.
+  dashboard, or from the user's own phone on the channels that echo it
+  (Signal, WhatsApp, Telegram; not SMS, where a chat answered on the phone
+  stays unread until it is marked), or by **Mark as read**: the button under
+  the latest inbound message on the chat page, and a swipe right on the Chats
+  page.
 - **Opening a chat does not mark it read.** The pages post no read on open,
   on scroll or on a poll; `POST /chats/<id>/read` is the user's explicit word
   and nothing calls it for them.
+- **A mark is about what was shown.** Both pages post `{seen}`, the
+  `inbound_seq` of the summary they rendered. A message that has landed
+  since is one the user has not seen: the gateway marks nothing and answers
+  409, and the page shows the message instead (the list is fetched again,
+  the chat page polls and says a new message came in).
 - A new inbound message moves a read chat back to *Unread* and brings an
-  archived one back unless it is muted. An agent's own outbound message
-  changes nothing: it is no reply.
-- On the page's rows a **swipe right marks as read** and a **swipe left
-  archives**; the tray — Star, Mute, and on *Archived* Restore and Delete —
-  opens by long press, right-click or the context-menu key. On the *Archived*
-  tab a swipe right restores and a swipe left opens the tray.
+  archived one back unless it is muted — by the order it landed in, so also
+  when it is stamped before the mark (a delayed delivery, a sender's slow
+  clock). An agent's own outbound message changes nothing: it is no reply.
+- On the page's rows a **swipe right marks as read** (on *Unread*) and a
+  **swipe left archives**; the tray — Star, on *Unread* Mark read, Archive
+  and Mute; on *Archived* Star, Restore, Mute or Unmute and Delete — opens by
+  long press, right-click or the context-menu key, so a keyboard reaches
+  what a swipe does. On the *Archived* tab a swipe right restores and a swipe
+  left opens the tray.
 - The badge on a row is the number of messages that have arrived since the
   user last dealt with the chat; the *Unread* tab carries the number of
   unread chats.

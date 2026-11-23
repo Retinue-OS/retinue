@@ -1209,9 +1209,10 @@ async def _on_outgoing_message(event) -> None:
             _record_outbound(chat_key, text, "device",
                              message_id=msg_id, timestamp=sent_at,
                              attachment_urls=refs)
-            # Chats rail: an own-device send advances the chat's read watermark
-            # on the dashboard (the user was visibly in that chat on their
-            # phone).
+            # Chats rail: an own-device send is the user's reply, and a
+            # reply reads the chat — so it advances the chat's read mark on
+            # the dashboard. (Opening or viewing a chat, here or on the
+            # phone, reads nothing.)
             _chats.notify_chat_event_async(
                 direction="out", channel=INBOUND_CHANNEL, chat=chat_key,
                 account=TELEGRAM_ACCOUNT, author="device",

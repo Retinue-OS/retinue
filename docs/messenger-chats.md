@@ -248,6 +248,11 @@ persistent volume — high-churn disposable data, the news-store precedent):
   Set by a reply and by *Mark as read*, never by opening the chat; forward
   only, but for the guarded undo of a *Mark as read* (see *Unread · Read ·
   Archived* below);
+- `inbound_seq`, `read_inbound` — how many inbound messages have landed on
+  the rail, and how many of them the newest read covered. The mark says
+  *when*; these say in which order things happened here, which is what
+  decides whether a message came after the user last dealt with the chat
+  (same section);
 - `archived`, `muted` — the conversation model's pair, adopted verbatim so
   both rails share one mental model. A chat never *ends*, but the semantics
   transfer exactly: `archived` drops the chat from the card and the default
@@ -298,19 +303,27 @@ Every chat is in exactly one of three groups, on every channel:
 
 - **Unread** — its latest inbound message has neither been replied to nor
   marked read.
-- **Read** — it has: by a reply from anywhere (the dashboard's composer, the
-  user's own phone), or by **Mark as read**.
+- **Read** — it has: by a reply the gateway sees, or by **Mark as read**. A
+  reply from the dashboard's composer is seen on every channel. One from the
+  user's own phone or another client is seen on Signal, WhatsApp and
+  Telegram, which echo the user's own messages. **SMS has no such echo** (the
+  SMS gateway receives only `sms:received` and records only what it sends
+  itself), so an SMS answered in the phone's own SMS app stays *Unread* until
+  it is marked read.
 - **Archived** — the `archived` flag, as before. Archived wins: a muted chat
   stays there however much arrives.
 
 **Opening a chat does not mark it read.** Looking is not dealing with: a chat
 the user glanced at on the way to something else must still be in *Unread*
 when they come back. A new inbound message moves a read chat back to *Unread*
-(and un-archives it unless it is muted) — by construction, since it is later
-than everything that made the chat read.
+(and un-archives it unless it is muted), whatever its timestamp says: it
+landed after everything that made the chat read.
 
-**The derivation.** A chat's `unread` is the number of inbound messages later
-than its *read cut-off*:
+**The derivation.** A chat's `unread` is taken in two ways, and is the larger
+of the two.
+
+*By timestamp:* the number of inbound messages stamped later than the chat's
+*read cut-off*:
 
 ```
 max( last_read,  the chat's latest outbound message authored `user` or `device` )
@@ -322,81 +335,141 @@ by *Mark as read*. But an outbound record can reach the store without passing
 the rail (a backfilled one), so the chat list also asks the ledgers for each
 chat's latest `user`/`device` outbound message (`_CHATS_REPLIED_SPARQL`, one
 lean query beside the heads and the unread count), and the live overlay
-contributes replies the store has not indexed yet. **An agent-authored
-outbound message is not a reply**: an agent answering on its own must not hide
-a message the user never saw, so `kb:author "agent"` moves nothing, on the
-rail and in the ledger alike. Timestamps are whole seconds and the comparison
-is strict, so an inbound message stamped in the very second of a reply counts
-as answered.
+contributes replies the store has not indexed yet. That query is a
+refinement: when it fails or runs out of its share of the rebuild's time, the
+list is built without it, from the read marks and whatever the last skeleton
+knew of the replies. **An agent-authored outbound message is not a reply**:
+an agent answering on its own must not hide a message the user never saw, so
+`kb:author "agent"` moves nothing, on the rail and in the ledger alike.
+Timestamps are whole seconds and the comparison is strict, so in this view an
+inbound message stamped in the very second of a reply or a mark counts as
+covered by it.
+
+*By arrival order:* the number of inbound messages that have landed since the
+newest read. A timestamp says when a message was stamped, and by whose clock
+— the sender's on Signal, the receiving phone's on SMS, where a webhook can
+also be delayed or retried — so a message can land after a read and be
+stamped at or before it: a late delivery, a slow clock, the read's own
+second. No comparison of stamps finds such a message. The chat state
+therefore counts every arrival on the rail (`inbound_seq`) and records at
+each read how many it covered (`read_inbound`); what has been counted since
+is unread, wherever its stamp puts it (`chat_state.arrived_since_read`). A
+read covers what has landed when it is *Mark as read* with `{}` or `{seen}`,
+or the dashboard's own send; an own-device echo and a `{ts}` mark cover it
+when their instant is not behind the mark they find — a stale client, or a
+late echo of an old reply, says nothing about what landed after a newer read.
+
+The two views count the same messages, hence the larger and not the sum. The
+arrival view is used only while the read mark is the newest word about the
+chat: where the ledger or the overlay holds a reply of the user's later than
+`last_read`, no read was recorded for that reply (it never passed the rail),
+so nothing says which arrivals it followed, and the timestamps alone decide.
+
+No stamp from ahead of the gateway's clock enters either view from the rail:
+an arrival stamped later than now is taken as now (a message cannot have been
+written after it landed), so a peer whose clock runs fast neither heads the
+chat until that instant nor sits beyond a mark the user sets today.
 
 `GET /chats` states the result so that no client derives it: every chat
-carries `unread`, `list_group` (`"unread"` | `"read"` | `"archived"`) and
-`last_read`, and the payload carries `counts` — the number of chats per group.
-(`group` on a chat is, as it always was, the boolean "this is a group chat".)
-The chat summary inside `GET /chats/<id>/messages` carries the same three
-fields, so an open chat page shows and clears its own state from its poll.
-With the store away the list is served from its last skeleton, corrected by
-the marks written since: a chat read past its head message counts nothing, and
-one whose head is an inbound message later than its cut-off counts at least
-that one.
+carries `unread`, `list_group` (`"unread"` | `"read"` | `"archived"`),
+`last_read` and `inbound_seq`, and the payload carries `counts` — the number
+of chats per group. (`group` on a chat is, as it always was, the boolean
+"this is a group chat".) The chat summary inside `GET /chats/<id>/messages`
+carries the same four fields, so an open chat page shows and clears its own
+state from its poll; its `inbound_seq` is read before the page's messages are
+collected, so every arrival it counts is among them. With the store away the
+list is served from its last skeleton, corrected by the marks written since:
+a chat read past its head message counts nothing by timestamp, and one whose
+head is an inbound message later than its cut-off counts at least that one.
+The arrival count is in the chat state and needs no store; where no list can
+be built at all, it is what the read endpoint answers with.
 
 **Mark as read** is `POST /chats/<id>/read`:
 
-- Body `{}` or `{"ts": …}` moves the mark forward — to `ts`, else to now, or
-  to the chat's newest message where the channel stamped that later than the
-  gateway's own clock reads. It answers `{id, last_read, previous, unread,
-  list_group}`; `previous` is the mark before the call (null for none). A
-  client that names the `ts` of the newest message it shows marks exactly what
-  the user saw: a message that slipped in behind it stays unread, and the
-  answer says so.
+- Body `{"seen": n}` is what both dashboard clients send: `n` is the
+  `inbound_seq` of the summary they rendered — the list's row, or on the chat
+  page the last poll whose messages are in the thread. If the chat's count
+  has moved past it, a message has landed that the user was never shown:
+  nothing is marked, and the answer is **409** with `{error, id, last_read,
+  unread, list_group}` as they stand. The client then shows the message (the
+  list is fetched again, the chat page polls) and the user marks what they
+  now see. Otherwise the chat is read as it stands. The check and the mark
+  are one decision under the state's lock
+  (`ChatStateStore.mark_read_unless_arrived`), and an arrival counts itself
+  under the same lock: it is either seen by the check or lands after the
+  mark, and is then unread by its place in the count.
+- Body `{}` is the same without the check, for a caller that vouches for
+  itself. `{"ts": …}` reads only up to that instant: what is stamped later
+  stays unread, and the answer says so. `seen` and `ts` may be combined.
+- The mark is an instant of the gateway's own clock: now, or `ts` where that
+  is earlier. It is never later, and never a message's stamp — a mark lifted
+  to a stamp from a fast clock would count as read whatever arrives before
+  the gateway's clock catches up. A `ts` that names no real instant (30
+  February, an epoch no calendar holds) or one more than two minutes ahead
+  (`CHAT_READ_SKEW_SECONDS`) is answered 400; within that reach it is a fast
+  clock's "now", and now is where the mark goes. One case is left to the
+  stamps: a *ledger record* stamped ahead of the gateway's clock (a phone
+  whose clock runs fast, on SMS) is not read by a mark made before the
+  clock has passed that stamp. It stays unread, the answer's `unread` says
+  so, and a mark made later reads it.
+- The answer is `{id, last_read, previous, unread, list_group}`; `previous`
+  is the mark before the call (null for none). `unread` and `list_group` are
+  the chat's state right after the mark, as `GET /chats` would state it —
+  normally 0 and `read`, but a client takes both from the answer rather than
+  assuming them.
 - Body `{"restore": <that previous, or null>, "marked": <that last_read>}` is
   the **undo**: the mark goes back to `restore` only while it is still exactly
   `marked`. A reply or a later mark in between is newer word about the chat,
   and the undo then answers 409 with the state as it stands and changes
   nothing. This is the one way `last_read` moves backwards
   (`ChatStateStore.restore_last_read`), and it can never move it past
-  `marked`. It cannot make an answered chat unread either: the reply stands
-  in the ledger whatever the mark says.
+  `marked`. `read_inbound` goes back with it, to what the mark being undone
+  found, so the messages that had landed unread before the mark are unread
+  again, with any that came since. It cannot make an answered chat unread:
+  the reply stands in the ledger whatever the mark says, and where a reply
+  fell into the mark's own second its cover of what had landed stands too.
+  Both timestamps are parsed as strictly as `ts`.
 
 **Attention.** Marking read is the user saying "dealt with", so it settles the
 chat's attention item exactly as *Mark handled* does (`done_how: "marked"`) —
-when the mark leaves nothing unread; a mark that a newer message outran
-settles nothing. The undo reopens the item only if that mark is what settled
-it, the mirror of un-archiving: the mark records the `done_at` of the item it
-closed (`read_settled` in the chat state), and an item that a new message
-reopened and something else settled since carries another. The reverse does
-not hold: *Mark handled* on the home screen settles the item and leaves the
-chat's read state alone.
+when the mark leaves nothing unread and nothing has landed since it was
+taken; a mark that a newer message outran settles nothing, and a refused one
+(409) touches nothing at all. The undo reopens the item only if that mark is
+what settled it, the mirror of un-archiving: the mark records the `done_at`
+of the item it closed (`read_settled` in the chat state), and an item that a
+new message reopened and something else settled since carries another. The
+reverse does not hold: *Mark handled* on the home screen settles the item and
+leaves the chat's read state alone.
 
 **An instructed sender's held ring** (see *Inbound flow*) is dropped when the
 user has dealt with the chat while the turn worked. With no read-on-open that
 means a reply or an explicit mark: a message merely looked at still rings by
 the verdict, and so does one whose mark the user took back before the ring
-was due. A mark taken back *after* the turn ended — the message was delivered
+was due, or whose mark was refused because the page had not shown the
+message. A mark taken back *after* the turn ended — the message was delivered
 as seen, and never listed — puts the message on the attention list, with the
 verdict's judgement and without a ring.
 
 ## The chat surface (UI)
 
-- A **Chats card** on the dashboard (finally replacing the static
-  `messages.js` mock): the messenger home screen — every **non-archived**
-  chat, ordered by last activity, with unread badge (how many messages have
-  arrived since the user last dealt with the chat), last-message preview
-  (a staged draft outranks it) and channel glyph. Deliberately not filtered
-  to unread: the card is also the launchpad for *writing*, and with archive
-  in place the list self-curates. The phone caps it (five rows plus an
-  "All chats →" link); on the wide frame the card sits in **its own region
-  above the Conversations card, behind a draggable splitter** (the
-  `layout.js` set: drag, double-click reset, snap closed, per-device
-  persistence), scrolling internally. Pin-to-top, as the clients have it, is
-  the `starred` flag the chat state carries (shared with the dashboard
-  threads): a starred chat leads whichever list it is in. A dedicated
-  `chats.html` sorts every chat into **Unread · Read · Archived** (see that
+- The **Chats page** (`chats.html`, a tab of the navigation row) is the
+  messenger home screen: every chat of every channel, ordered by last
+  activity, with avatar, channel glyph, last-message preview (a staged draft
+  outranks it) and an unread badge (how many messages have arrived since the
+  user last dealt with the chat). The dashboard home carries no Chats card:
+  chats that want attention are rows of its attention list, and the
+  component's capped card mode (every non-archived chat, five rows plus
+  "All chats →", the `layout.js` splitter region) is unused. Pin-to-top, as
+  the clients have it, is the `starred` flag the chat state carries (shared
+  with the dashboard threads): a starred chat leads whichever list it is in.
+  The page sorts every chat into **Unread · Read · Archived** (see that
   section above; the *Unread* tab carries the number of unread chats, its
-  rows the count of unread messages). A swipe right marks a chat read, with
-  an Undo; a swipe left archives it; star, mute, and on *Archived* restore
-  and delete are in the row's tray. Each chat has its own page/panel, where
-  **Mark as read** sits under the latest inbound message.
+  rows the count of unread messages). A swipe right marks an unread chat
+  read, with an Undo; a swipe left archives it. The row's tray (long press,
+  right-click or the context-menu key) holds star, mark read (*Unread* only),
+  archive and mute — so a keyboard reaches what a swipe does — and on
+  *Archived* star, restore, mute or unmute, and delete. Each chat has its own
+  page/panel, where **Mark as read** sits under the latest inbound message.
 - The **chat pane** renders like a messenger client: bubbles left/right, day
   separators, sender labels in groups, media inline. Outbound bubbles carry
   their author — the user, *Ara* (agent-sent), or *phone* (own-device echo) — a
