@@ -924,7 +924,12 @@ Then carry out the disposition:
   send `reply` returns `sent_uid` + `message_id`: **record them in the status
   file** so a later run can verify the send instead of trusting the `resolved`
   flag. A queued reply becomes `resolved` only once its pending send is
-  approved — until then it stays non-terminal.
+  approved — until then it stays non-terminal. **Approval closes it, with no
+  model turn:** when the user allows an e-mail reply on `/sends`, the web
+  gateway moves the mail it answers (`In-Reply-To`) from the INBOX to the
+  answered folder and writes `resolved` on its record, and its thread note
+  says so. Never promise in the thread to file the mail "once you approve" —
+  nothing wakes you then; the gateway does it.
 
   For a **messenger** reply, the thread's agent context (replayed in the
   engage prompt: "Reply via: … --reply-to <token>") carries the exact send

@@ -1670,6 +1670,7 @@ def approve_pending_send(cfg, request_id):
         if not recipients:
             die(f"pending send request {request_id} has no recipients")
         thread = _valid_thread(msg.get(REQUEST_THREAD_HEADER))
+        in_reply_to = (msg.get("In-Reply-To") or "").strip()
         for h in _REQUEST_HEADERS:
             del msg[h]
         del msg["Bcc"]  # never expose Bcc in the dispatched / stored copy
@@ -1682,7 +1683,42 @@ def approve_pending_send(cfg, request_id):
         return {"approved": request_id, "sent": True, "from": _decode(msg.get("From")),
                 "to": recipients,
                 "subject": _decode(msg.get("Subject")), "saved_to_sent": cfg.save_sent,
-                "stripped_headers": stripped, "thread": thread}
+                "stripped_headers": stripped, "thread": thread,
+                "in_reply_to": in_reply_to}
+    finally:
+        M.logout()
+
+
+def move_by_message_id(cfg, message_id, src, dest):
+    """Move the message with *message_id* from *src* to *dest*.
+
+    Returns the UID it had in *src*, or None when no such message is there
+    (already filed elsewhere). Raises EmailError when the move itself fails.
+    Used after a reply's approval to take the mail it answers out of the
+    INBOX, so a reply decided in a dashboard thread ends there.
+    """
+    if not (message_id or "").strip():
+        return None
+    M = imap_connect(cfg)
+    try:
+        imap_select(M, src)
+        uids = _search_by_message_id(M, message_id)
+        if not uids:
+            return None
+        uid = uids[-1].decode() if isinstance(uids[-1], (bytes, bytearray)) else uids[-1]
+        try:
+            typ, data = M.uid("move", uid, _quote(dest))
+            if typ != "OK":
+                raise imaplib.IMAP4.error(data)
+        except imaplib.IMAP4.error:
+            typ, data = M.uid("copy", uid, _quote(dest))
+            if typ != "OK":
+                die(f"copy to {dest} failed: {data}")
+            typ, data = M.uid("store", uid, "+FLAGS", "(\\Deleted)")
+            if typ != "OK":
+                die(f"copied to {dest} but marking the source deleted failed: {data}")
+            M.expunge()
+        return uid
     finally:
         M.logout()
 

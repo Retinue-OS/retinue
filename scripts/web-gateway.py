@@ -8925,9 +8925,77 @@ def _send_decision_subject(entry: dict, label: str) -> str:
     return what + (f": “{body}”" if body else "")
 
 
+# A reply approved on /sends ends the mail it answers: the gateway moves that
+# mail out of the INBOX and resolves its triage record in the same request, so
+# the decision taken in the reply's thread is the mail's last word there —
+# nothing is left for a later triage run to propose (and re-explain) again.
+# Same folder and state dir as the triage gate's answered-mail rail.
+TRIAGE_STATE_DIR = Path(os.environ.get("TRIAGE_STATE_DIR", "/root/.retinue/triage"))
+REPLY_ARCHIVE_FOLDER = os.environ.get(
+    "TRIAGE_ANSWERED_FOLDER",
+    os.environ.get("TRIAGE_NEWS_FOLDER", "Archive") or "Archive").strip()
+
+
+def _triage_record_path(message_id: str) -> Path | None:
+    """The triage status file for a Message-ID (triage's own naming rule)."""
+    mid = (message_id or "").strip().strip("<>").strip()
+    if not mid:
+        return None
+    return TRIAGE_STATE_DIR / mid.replace("/", "_")
+
+
+def _archive_answered_source(account: str, request_id: str,
+                             result: dict) -> str | None:
+    """Move the mail an approved reply answers out of the INBOX.
+
+    Returns a one-sentence note for the thread when the mail was moved, else
+    None (not a reply, the mail is no longer in the INBOX, or archiving is
+    switched off with an empty folder). A failed move is logged and left to
+    triage's reconcile pass — the send itself already stands.
+    """
+    source = (result.get("in_reply_to") or "").strip()
+    if not (source and REPLY_ARCHIVE_FOLDER):
+        return None
+    try:
+        uid = ec.move_by_message_id(_ec_config(account), source, "INBOX",
+                                    REPLY_ARCHIVE_FOLDER)
+    except ec.EmailError as exc:
+        print(f"[web-gateway] archiving the mail answered by {account}/"
+              f"{request_id} failed: {exc}", flush=True)
+        return None
+    if uid is None:
+        return None
+    path = _triage_record_path(source)
+    if path is not None and path.exists():
+        stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%MZ")
+        try:
+            record = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(record, dict):
+                record.update({
+                    "status": "resolved",
+                    "note": (f"Reply approved on /sends ({account}/{request_id}) "
+                             f"and sent; moved INBOX->{REPLY_ARCHIVE_FOLDER} by "
+                             "the web gateway."),
+                    "folder": REPLY_ARCHIVE_FOLDER,
+                    "updated": stamp,
+                    "resolved_at": stamp,
+                })
+                tmp = path.with_suffix(path.suffix + ".tmp")
+                tmp.write_text(json.dumps(record, ensure_ascii=False, indent=2)
+                               + "\n", encoding="utf-8")
+                tmp.replace(path)
+        except (OSError, ValueError) as exc:
+            print(f"[web-gateway] resolving triage record {path.name} failed: "
+                  f"{exc}", flush=True)
+    print(f"[web-gateway] {account}/{request_id}: answered mail uid {uid} "
+          f"moved INBOX->{REPLY_ARCHIVE_FOLDER}", flush=True)
+    return f"The mail it answers is filed in {REPLY_ARCHIVE_FOLDER}."
+
+
 def _report_send_decision(channel: str, request_id: str, entry: dict,
                           label: str, outcome: str,
-                          error: str | None = None) -> None:
+                          error: str | None = None,
+                          addendum: str | None = None) -> None:
     """Note the user's decision on a queued send in the thread that queued it.
 
     `outcome` is "sent", "failed", "unconfirmed" (allowed, still sending when
@@ -8961,6 +9029,8 @@ def _report_send_decision(channel: str, request_id: str, entry: dict,
     else:
         text = f"🚫 You denied {subject} — nothing was " + (
             "written." if noun == "event" else "sent.")
+    if addendum:
+        text += " " + addendum
     status = {"sent": "approved", "failed": "error",
               "unconfirmed": "sending"}.get(outcome, "rejected")
     context = (f"Send decision on /sends: {channel}/{request_id} is {status}"
@@ -11556,11 +11626,19 @@ class Handler(BaseHTTPRequestHandler):
                             + html.escape(str(exc)) + '</p><p><a href="/sends">Back</a></p>'
                             + "</body></html>")
             return
+        addendum = None
+        if verb == "approve" and decided:
+            try:
+                addendum = _archive_answered_source(account, request_id, decided)
+            except Exception as exc:  # noqa: BLE001 - the send itself already stands
+                print(f"[web-gateway] archiving after {account}/{request_id} "
+                      f"failed: {exc!r}", flush=True)
         if (decided and send_origin.valid_thread(decided.get("thread"))
                 and _claim_send_decision(account, request_id)):
             try:
                 _report_send_decision(account, request_id, decided, "e-mail",
-                                      "sent" if verb == "approve" else "denied")
+                                      "sent" if verb == "approve" else "denied",
+                                      addendum=addendum)
             except Exception as exc:  # noqa: BLE001 - the decision itself already stands
                 print(f"[web-gateway] reporting send decision {account}/"
                       f"{request_id} failed: {exc!r}", flush=True)

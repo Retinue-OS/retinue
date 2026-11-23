@@ -197,6 +197,41 @@ def test_email_decisions_are_noted(wg):
     assert "Re: Keys" in notes[1] and "denied" in notes[1], notes
 
 
+def test_email_reply_approval_archives_source(wg):
+    """An approved reply files the mail it answers and resolves its record."""
+    _FakeSendHandler._request_from_edge = wg.Handler._request_from_edge
+    _FakeSendHandler._claude_auth_same_origin = wg.Handler._claude_auth_same_origin
+    cid = wg._new_conv("user", "me", "Mail", "user", "reply to the clinic")["id"]
+    state = Path(os.environ["CONVERSATIONS_DIR"]).parent / "triage"
+    state.mkdir(exist_ok=True)
+    record = state / "abc@clinic.example"
+    record.write_text(json.dumps({"status": "engaged", "uid": "6157"}))
+    approved = {"approved": "50", "sent": True, "to": ["info@clinic.example"],
+                "subject": "Re: Appointment", "saved_to_sent": True,
+                "stripped_headers": [], "thread": cid,
+                "in_reply_to": "<abc@clinic.example>"}
+    with patch.object(wg, "TRIAGE_STATE_DIR", state), \
+            patch.object(wg.ec, "approve_pending_send", return_value=approved), \
+            patch.object(wg.ec, "move_by_message_id", return_value="6157") as move:
+        with redirect_stdout(io.StringIO()):
+            wg.Handler._handle_send_action(_FakeSendHandler(), "default", "50", "approve")
+    move.assert_called_once()
+    assert move.call_args.args[1:] == ("<abc@clinic.example>", "INBOX", "Archive")
+    note = _agent_notes(wg, cid)[-1]["text"]
+    assert "was sent" in note and "filed in Archive" in note, note
+    stored = json.loads(record.read_text())
+    assert stored["status"] == "resolved" and stored["folder"] == "Archive", stored
+    # Not a reply, or the mail already gone: no move claimed in the note.
+    for result, moved in (({**approved, "approved": "51", "in_reply_to": ""}, None),
+                          ({**approved, "approved": "52"}, None)):
+        with patch.object(wg.ec, "approve_pending_send", return_value=result), \
+                patch.object(wg.ec, "move_by_message_id", return_value=moved):
+            with redirect_stdout(io.StringIO()):
+                wg.Handler._handle_send_action(_FakeSendHandler(), "default",
+                                               result["approved"], "approve")
+        assert "filed in" not in _agent_notes(wg, cid)[-1]["text"]
+
+
 def test_email_approval_failure_is_noted(wg):
     cid = wg._new_conv("user", "me", "Mail", "user", "reply to the bank")["id"]
     wg._conv_set_flags(cid, unread=False)
@@ -275,6 +310,7 @@ def main():
         test_channel_approve_failure_wakes_thread(wg, gw)
         test_no_thread_no_note(wg, gw)
         test_email_decisions_are_noted(wg)
+        test_email_reply_approval_archives_source(wg)
         test_email_approval_failure_is_noted(wg)
         test_email_page_load_failure_is_a_400(wg)
         test_unconfirmed_link_is_absolute(wg)
