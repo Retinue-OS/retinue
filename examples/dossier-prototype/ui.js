@@ -84,6 +84,7 @@
       rootEl.addEventListener('contextmenu', (e) => { const it = e.target.closest('[data-shelfmenu]'); if (!it) return; e.preventDefault(); this.sim.viewerActed(); this.shelfMenu = this.shelfMenu === it.dataset.shelfmenu ? null : it.dataset.shelfmenu; this.renderAll(); });
       rootEl.addEventListener('change', (e) => { if (e.target.matches('[data-file]')) { this.addFiles(e.target.dataset.id, e.target.files); return; } this.onInput(e); });
       rootEl.addEventListener('input', (e) => {
+        if (e.target.id === 'subject' && this.compose && this.compose.id === e.target.dataset.id) this.compose.subject = e.target.value;
         if (e.target.id === 'composer') { const src = this.draft && this.draft.id === e.target.dataset.id && this.draft.tab === e.target.dataset.tab ? this.draft.source : 'typed'; this.draft = { id: e.target.dataset.id, tab: e.target.dataset.tab, text: e.target.value, source: src === 'typed' ? 'typed' : src }; }
         if (e.target.id === 'pick-comment' && this.picker) this.picker.comment = e.target.value;
         if (e.target.id === 'pick-title' && this.picker) this.picker.title = e.target.value;
@@ -318,7 +319,7 @@
     navHtml() {
       const e = this.engine; const places = [['home', 'Home'], ['contacts', 'Contacts'], ['dossiers', 'Dossiers'], ['news', 'News']];
       const cur = this.view ? null : this.list;
-      const back = this.view ? `<button class="nav-back" data-act="back" aria-label="Back">‹</button>` : '';
+      const back = this.view ? `<button class="nav-back" data-act="back" aria-label="Back" title="Back to ${esc({ home: 'Home', contacts: 'Contacts', dossiers: 'Dossiers', news: 'News' }[this.list])}">‹</button>` : '';
       const tabs = places.map(([k, l]) => `<button class="nav-tab${cur === k ? ' on' : ''}${k === 'news' ? ' stub' : ''}" data-act="list" data-list="${k}" ${k === 'news' ? 'title="Not part of this prototype"' : ''}>${l}${k === 'contacts' && e.inboxCount() ? `<span class="nav-badge">${e.inboxCount()}</span>` : ''}</button>`).join('');
       return `<nav class="nav" aria-label="Dashboard">${back}<div class="nav-tabs">${tabs}</div><button class="nav-icon plus" data-act="new-menu" title="New — a message, a dossier, a contact" aria-label="New">＋</button><button class="nav-icon stub" title="Pending sends (none in this prototype)" aria-label="Pending sends">⇪</button><button class="nav-icon stub" title="Settings (not part of this prototype)" aria-label="Settings">⚙</button></nav>`;
     }
@@ -374,10 +375,12 @@
         ${this.picker ? this.pickerHtml() : ''}
       </div></div>`;
       const bub = this.phoneEl.querySelector('#bubbles'); if (bub) bub.scrollTop = bub.scrollHeight;
+      if (this.compose && this.view && this.compose.id === this.view.id && !this._focused) { const f = this.phoneEl.querySelector('#subject') || this.phoneEl.querySelector('#composer'); if (f && typeof f.focus === 'function') { try { f.focus(); } catch (_e) { /* no DOM */ } } this._focused = true; }
+      if (!this.compose) this._focused = false;
     }
 
     // ---- the dossier page -------------------------------------------------------------
-    openView(id) { const item = this.engine.byId.get(id); if (!item) return; this.engine.ensureOpening(id); this.engine.markSeen(id); this.view = { id }; this.sheet = null; this.menu = false; this.pageMenu = false; this.shelfMenu = null; this.select = null; if (!this.draft || this.draft.id !== id) this.draft = null; }
+    openView(id, opts = {}) { const item = this.engine.byId.get(id); if (!item) return; this.engine.ensureOpening(id); this.engine.markSeen(id); this.compose = opts.compose ? { id, subject: '' } : null; this.view = { id }; this.sheet = null; this.menu = false; this.pageMenu = false; this.shelfMenu = null; this.select = null; if (!this.draft || this.draft.id !== id) this.draft = null; }
     // Whom the composer addresses: 'chat' = the participants over their channel, 'ara' = Ara.
     addressee(item) { if (!isPeer(item)) return 'ara'; return this.to[item.id] || 'chat'; }
     bubble(item, m, idx, embedded) {
@@ -429,9 +432,10 @@
       else if (item.state === 'resting') foot = `<div class="v-foot"><button class="btn" data-act="reopen" data-id="${esc(item.id)}">Wake it up</button></div>`;
       // The page's own bar, the second row under the navigation (webapp/components/chat-page.js's header):
       // title and state, then minimize (–), the model picker, and the ⋮ menu with Attention details, Star, Mute.
-      const models = ['Ara', 'Ara jr.']; const picker = `<select class="model-pick" data-act="model" aria-label="Model answering Ara's turns" title="Which model answers Ara's turns in this dossier">${models.map((m) => `<option${this.model === m ? ' selected' : ''}>${esc(m)}</option>`).join('')}</select>`;
+      // The model picker is the dashboard's per-thread choice: which tier answers Ara's turns here (docs/model-routing.md). Shown where Ara is a participant; on a relationship it is in the ⋮ menu.
+      const models = ['Ara', 'Ara jr.']; const pickerSel = `<select class="model-pick" data-act="model" aria-label="Model answering Ara's turns" title="Which model answers Ara's turns in this dossier">${models.map((m) => `<option${this.model === m ? ' selected' : ''}>${esc(m)}</option>`).join('')}</select>`; const picker = peer ? '' : pickerSel;
       const flagged = item.muted || item.starred;
-      const pageMenu = this.pageMenu ? `<div class="page-menu" data-stop="1">${peer ? `<button data-act="card" data-id="${esc(item.id)}">👤 Contact card</button>` : ''}<button data-act="open" data-id="${esc(item.id)}">ⓘ Attention details</button><button data-act="star" data-id="${esc(item.id)}">${item.starred ? '★ Unstar' : '☆ Star'}</button><button data-act="mute" data-id="${esc(item.id)}">${item.muted ? '🔔 Unmute' : '🔕 Mute'}</button>${item.kind === 'topic' && item.state === 'open' ? `<button data-act="rest" data-id="${esc(item.id)}">Rest</button>` : ''}${item.state === 'open' && item.kind !== 'standing' ? `<button data-act="do" data-id="${esc(item.id)}">${peer ? 'Nothing pending' : 'Done'}</button>` : ''}</div>` : '';
+      const pageMenu = this.pageMenu ? `<div class="page-menu" data-stop="1">${peer ? `<button data-act="card" data-id="${esc(item.id)}">👤 Contact card</button>` : ''}<button data-act="open" data-id="${esc(item.id)}">ⓘ Attention details</button>${peer ? `<div class="pm-row"><span>Ara answers as</span>${pickerSel}</div>` : ''}<button data-act="star" data-id="${esc(item.id)}">${item.starred ? '★ Unstar' : '☆ Star'}</button><button data-act="mute" data-id="${esc(item.id)}">${item.muted ? '🔔 Unmute' : '🔕 Mute'}</button>${item.kind === 'topic' && item.state === 'open' ? `<button data-act="rest" data-id="${esc(item.id)}">Rest</button>` : ''}${item.state === 'open' && item.kind !== 'standing' ? `<button data-act="do" data-id="${esc(item.id)}">${peer ? 'Nothing pending' : 'Done'}</button>` : ''}</div>` : '';
       return `<div class="view">
         <div class="v-head"><div class="v-titles"><div class="v-title">${item.starred ? '<span class="star-mark">★</span> ' : ''}${KIND_GLYPH[item.kind]} ${esc(item.title)}${item.muted ? ' <span class="muted-mark" title="Muted">🔕</span>' : ''}</div><div class="v-sub">${esc(sub)} · <span style="color:${item.state === 'open' ? LEVEL_COLORS[lvl] : '#8b93a3'}">${esc(status)}</span></div></div>${peer ? `<button class="bar-btn" data-act="card" data-id="${esc(item.id)}" title="Contact card" aria-label="Contact card">👤</button>` : ''}<button class="bar-btn" data-act="shelve" data-id="${esc(item.id)}" title="Minimize to the shelf" aria-label="Minimize">–</button>${picker}<div class="menu-wrap"><button class="bar-btn${flagged ? ' flagged' : ''}" data-act="page-menu" title="More" aria-label="More">⋮</button>${pageMenu}</div></div>
         ${treeLine}<div class="bubbles" id="bubbles">${bubbles || '<div class="empty">Nothing yet.</div>'}</div>
@@ -454,7 +458,9 @@
       const files = this.files[id] || [];
       const chips = files.length ? `<div class="file-chips">${files.map((f, i) => `<span class="fchip"><span class="c-name">${esc(f.name)}</span><span class="c-size">${esc(fmtSize(f.size))}</span><button type="button" class="c-x" data-act="rmfile" data-id="${esc(id)}" data-index="${i}" aria-label="Remove attachment">×</button></span>`).join('')}</div>` : '';
       const err = this.attachError ? `<div class="attach-err">${esc(this.attachError)}</div>` : '';
-      const toggle = isPeer(item) ? `<div class="to-row"><span class="to-label">to</span><button class="seg${to === 'chat' ? ' on' : ''}" data-act="to" data-id="${esc(id)}" data-to="chat">${esc(item.title)} · ${esc(item.channel)}</button><button class="seg${to === 'ara' ? ' on' : ''}" data-act="to" data-id="${esc(id)}" data-to="ara">Ara</button></div>` : '';
+      const last = isPeer(item) ? this.engine.lastIn(item) : null; const composing = this.compose && this.compose.id === id;
+      const subj = isPeer(item) && item.mail && to === 'chat' ? `<div class="subj-row"><span class="to-label">subject</span><input id="subject" class="subj" type="text" placeholder="${composing || !last ? 'New subject — a new thread' : esc('Re: ' + (last.subject || ''))}" value="${esc(composing ? this.compose.subject : '')}" data-id="${esc(id)}"><small class="subj-hint">${composing || !last ? 'a new thread; nothing pending is touched' : 'empty = reply in the newest thread'}</small></div>` : '';
+      const toggle = isPeer(item) ? `${subj}<div class="to-row"><span class="to-label">to</span><button class="seg${to === 'chat' ? ' on' : ''}" data-act="to" data-id="${esc(id)}" data-to="chat">${esc(item.title)} · ${esc(item.channel)}</button><button class="seg${to === 'ara' ? ' on' : ''}" data-act="to" data-id="${esc(id)}" data-to="ara">Ara</button></div>` : '';
       let row;
       if (this.rec && this.rec.id === id && this.rec.tab === tab) {
         row = `<div class="composer-row rec-row"><button type="button" class="rec-btn rec-abort" data-act="rec-abort" title="Discard recording" aria-label="Discard recording">✕</button><div class="wave-wrap"><span class="rec-dot" aria-hidden="true"></span><canvas class="wave" data-wave aria-hidden="true"></canvas><span class="rec-time" data-rectime>0:00</span></div><button type="button" class="rec-btn rec-ok" data-act="rec-check" title="Stop and transcribe for review" aria-label="Stop and transcribe for review">✓</button><button type="button" class="rec-btn rec-send" data-act="rec-send" title="Stop, transcribe and send" aria-label="Stop, transcribe and send">➤</button></div>`;
@@ -643,7 +649,8 @@
       const text = (explicit != null ? explicit : fromDom != null ? fromDom : (this.draft && this.draft.id === id && this.draft.tab === tab ? this.draft.text : '')).trim();
       const files = (this.files[id] || []).slice(); if (!text && !files.length) return;
       this.sim.viewerActed(); this.draft = null; this.files[id] = []; this.attachError = '';
-      if (tab === 'chat') this.engine.sendChat(id, text, files);
+      const subjEl = this.phoneEl.querySelector('#subject'); const subject = subjEl && subjEl.dataset.id === id ? subjEl.value.trim() : (this.compose && this.compose.id === id ? this.compose.subject : '');
+      if (tab === 'chat') { this.engine.sendChat(id, text, files, subject); this.compose = null; }
       else this.converse(id, text, files);
       this.renderAll();
     }
@@ -677,7 +684,7 @@
         case 'new-form': this.sim.viewerActed(); this.newMenu = false; this.newForm = { kind: el.dataset.form, who: [], title: '', within: null, channel: 'E-mail', handle: '', sphere: 'friends' }; break;
         case 'close-form': this.newForm = null; break;
         case 'new-ok': { const f = this.newForm; if (!f) return; const t = (this.phoneEl.querySelector('#nf-title') || {}).value; if (t != null) f.title = t; const hv = (this.phoneEl.querySelector('#nf-handle') || {}).value; if (hv != null) f.handle = hv;
-          if (f.kind === 'message') { if (!f.who.length) { this.showToast('Pick someone.'); break; } this.newForm = null; this.openView(`rel:${f.who[0]}`); this.to[`rel:${f.who[0]}`] = 'chat'; break; }
+          if (f.kind === 'message') { if (!f.who.length) { this.showToast('Pick someone.'); break; } this.newForm = null; const rid = `rel:${f.who[0]}`; this.to[rid] = 'chat'; this.openView(rid, { compose: true }); break; }
           if (f.kind === 'ara' || f.kind === 'topic') { if (!(f.title || '').trim()) { this.showToast('Give it a title.'); break; } if (f.kind === 'topic' && !f.who.length) { this.showToast('Pick at least one participant.'); break; } const d = e.newTopic(f.title.trim(), f.kind === 'topic' ? f.who : [], f.within); this.newForm = null; this.openView(d.id); if (f.kind === 'topic') this.to[d.id] = 'chat'; break; }
           if (f.kind === 'contact') { if (!(f.title || '').trim()) { this.showToast('Give them a name.'); break; } const c = e.newContact(f.title.trim(), f.channel, (f.handle || '').trim(), f.sphere); this.newForm = null; this.card = c.id; this.list = 'contacts'; this.view = null; break; } break; }
         // the contact card

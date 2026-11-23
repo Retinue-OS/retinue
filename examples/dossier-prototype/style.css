@@ -364,3 +364,10 @@ code{font-family:"Source Code Pro","DejaVu Sans Mono",Menlo,monospace;font-size:
 .pick-person input{accent-color:#6ea8fe}
 .pick-person small{color:#8b93a3}
 .cl-av.small{width:26px;height:26px;font-size:10.5px}
+
+/* mail subject in the composer; the ⋮ menu's model row */
+.subj-row{display:flex;align-items:center;gap:6px;margin:0 0 6px;flex-wrap:wrap}
+.subj{flex:1;min-width:120px;font:inherit;font-size:13px;color:#e7ebf2;background:#151922;border:1px solid #2a323b;border-radius:10px;padding:6px 10px;outline:none}
+.subj:focus{border-color:#6ea8fe}
+.subj-hint{flex-basis:100%;font-size:10.5px;color:#8b93a3;padding-left:52px}
+.pm-row{display:flex;align-items:center;justify-content:space-between;gap:8px;min-height:38px;padding:0 10px;font-size:12px;color:#8b93a3}

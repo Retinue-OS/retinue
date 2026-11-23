@@ -207,7 +207,6 @@
     },
     'rel:Tax office': {
       summary: '2025 statement due 30 September',
-      opening: 'The tax office wants the 2025 statement by 30 September. Inbox Zero proposes to make this a dossier of its own; the accountant has the documents.',
       chips: ['Make it a dossier', 'Nothing pending'],
       replies: {
         'Make it a dossier': { text: 'Use the proposal in Inbox Zero, or long-press the letter and add it to a new dossier.', chips: ['Nothing pending'] },

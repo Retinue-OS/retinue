@@ -117,7 +117,7 @@
       const item = this._newItem({ id: `rel:${msg.chat}`, kind: c.group ? 'group' : 'relationship', channel: c.channel || 'messenger', mail: c.channel === 'E-mail', org: c.org || null, gate: c.gate || 'batch', title: msg.chat, body: msg.text, sender: msg.sender, sphere: c.sphere || 'friends', tags: c.tags ? c.tags.slice() : [], importance: prior != null ? prior : 2.5, importanceFrom: 'prior', due: null, kindLabel: 'message', state: 'quiet', handles: c.handles ? c.handles.map((h) => h.slice()) : [], lastActivity: -30 * DAY });
       return item;
     }
-    _entry(msg) { return { who: 'in', text: msg.text, t: msg.at, from: msg.from || null, mail: !!msg.mail, subject: msg.subject || null, attachments: msg.attachments || [], inbox: !!msg.mail, judged: !msg.mail, links: [], uid: ++this.seq }; }
+    _entry(msg) { return { who: 'in', text: msg.text, t: msg.at, from: msg.from || null, mail: !!msg.mail, subject: msg.subject || null, attachments: msg.attachments || [], inbox: !!msg.mail, judged: !msg.mail, links: [], uid: ++this.seq, thread: msg.mail ? ++this.seq : null }; }
     // Put a classification on a relationship's pending state and let it arrive.
     _classify(item, tr, at, by) {
       const fresh = item.state !== 'open';
@@ -407,7 +407,8 @@
       if (item.kind === 'ara' && item.stream.length && !item.chips) { item.chips = d && d.chips ? d.chips.slice() : []; return item; }
       if (item.kind === 'standing') { if (!item.chips) item.chips = []; return item; }
       if (item.kind === 'topic' && item.state !== 'open') { item.chips = []; return item; }
-      const opening = d && d.opening ? d.opening : (item.kind === 'relationship' || item.kind === 'group' ? null : item.body);
+      // A relationship's stream is the messages; Ara's reading of the pending state is the row's second line and the sheet, and she speaks in the stream only when addressed. A topic opens with her.
+      const opening = item.kind === 'relationship' || item.kind === 'group' ? null : (d && d.opening ? d.opening : item.body);
       if (opening) item.stream.push({ who: 'ara', text: this._fill(opening, item), t: item.kind === 'topic' && item.arrived != null && item.arrived > 0 ? item.arrived : this.now, refs: d && d.embed ? d.embed.map((id) => this.ref(id)).filter((x) => this.byId.has(x.id)) : [] });
       item.chips = d && d.chips ? d.chips.slice() : [];
       return item;
@@ -457,10 +458,13 @@
     // A relationship's pending state is settled; the dossier stays.
     _settle(item, how) { if (item.state !== 'open') return; item.state = item.kind === 'relationship' || item.kind === 'group' ? 'quiet' : 'done'; item.doneAt = this.now; item.doneHow = how; this.doneToday += 1; }
     // Send to the dossier's human participants (a relationship's channel); the pending state is settled.
-    sendChat(id, text, attachments = []) {
+    // Send to the dossier's participants. A mail has a subject: empty = a reply in the newest thread; given = a new
+    // thread, which is just a message in the relationship (rule 3) and settles nothing that was pending before.
+    sendChat(id, text, attachments = [], subject = '') {
       const item = this.byId.get(id); if (!item || !(item.kind === 'relationship' || item.kind === 'group')) return false;
-      const last = this.lastIn(item);
-      item.stream.push({ who: 'out', text, t: this.now, attachments, mail: !!item.mail, subject: item.mail && last ? `Re: ${last.subject}` : null, links: [] }); this._touch(item);
+      const last = this.lastIn(item); const fresh = item.mail && !!subject;
+      item.stream.push({ who: 'out', text, t: this.now, attachments, mail: !!item.mail, subject: item.mail ? (fresh ? subject : last && last.subject ? `Re: ${last.subject}` : null) : null, links: [], uid: ++this.seq, thread: fresh ? ++this.seq : (last ? last.thread : null) }); this._touch(item);
+      if (fresh) { this.emit({ kind: 'action', item, text: `New mail to ${item.sender}, “${subject}”: a new thread in the relationship; what was pending before stays pending.` }); return true; }
       for (const m of item.stream) if (m.mail && m.inbox) this._leaveInbox(m, 'replied');
       this._settle(item, 'replied');
       this.emit({ kind: 'action', item, text: `Replied to ${item.sender} on ${item.channel}: “${text}”${attachments.length ? ` + ${attachments.length} file${attachments.length === 1 ? '' : 's'}` : ''} — nothing pending.` });

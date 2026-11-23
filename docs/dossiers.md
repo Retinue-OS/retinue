@@ -170,11 +170,26 @@ that mentioned it. Ara's turns carry `kb:references` to the same end; the
 Secretary's reply proposals embed the message they answer. A reference whose
 object is gone renders as a short tombstone.
 
-**The composer** writes to Ara by default (today's thread turn). A dossier with
-human participants has a channel switch — *to Ara* / *to the participants*
-(mail, Signal, …) — and an outbound message sent from a dossier is a message
-in the stream and goes through the send policies as today. On a relationship
-the default is the person's channel, the one the last message came on.
+**The composer** on a topic writes to Ara (today's thread turn); on a
+relationship it writes **to the person**, over the channel the last message
+came on, with a *to Ara* switch beside it. An outbound message is a message in
+the stream and goes through the send policies as today. **A mail has a subject
+line** in the composer: left empty, the message is a reply in the newest
+thread (`Re: …`, settling what that thread had pending); given, it is a **new
+thread** — just another message in the relationship (rule 3), touching nothing
+that was pending before. So writing to the tax office about a new matter is:
+＋ → Message → the tax office → subject, text, send; the open letter about
+2025 stays as it was.
+
+**Ara in a relationship's stream speaks only when addressed.** Her reading of
+the pending state is the row's second line and the attention sheet, and her
+chips (a draft, a reminder, *nothing pending*) sit under the stream; she does
+not open the stream with a summary of what the user can see. In a topic she
+does — the topic is a conversation with her.
+
+**The model picker** (which tier answers Ara's turns, `docs/model-routing.md`)
+is in the page bar of a topic, where Ara is a participant; on a relationship it
+is in the ⋮ menu, since Ara answers there only when addressed.
 
 ## Where a message belongs — one rule
 
@@ -364,8 +379,8 @@ VIP switch, the instruction, the dossiers they take part in — exactly what
 and is where they get filed. Search and *+ New contact* stay.
 
 **Starting something** is one *＋* in the navigation row, on every page, with
-four entries: a **message** to someone (opens their stream with the composer
-addressed to them), **ask Ara** (a new topic with Ara alone, optionally within
+four entries: a **message** to someone (opens their stream at the composer,
+addressed to them, the subject line empty for a new thread), **ask Ara** (a new topic with Ara alone, optionally within
 a topic), a **dossier** with people (its first message goes out from it, the
 replies file themselves — rule 4), a **contact**. There is no other "new"; a
 new topic from a message is the gesture.
