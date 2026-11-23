@@ -240,8 +240,17 @@ changes the chat.
   archive folder (`TRIAGE_NEWS_FOLDER`'s sibling, `MAIL_ARCHIVE_FOLDER`,
   default `Archive`); *unarchive* does not move them back.
 - An instructed turn that files a document archives the mail the same way;
-  one that decides a mail is to be deleted moves it to the trash folder — only
-  an instruction can delete.
+  one that decides a mail is to be deleted moves it to the trash folder.
+- **Deleting the chat deletes the mails.** The chat-page delete — today an
+  erasure of the mirror, reached from the Archived tab's tray, two taps, no
+  undo — moves every message of the thread to the **trash folder**
+  (`MAIL_TRASH_FOLDER`, the account's own Trash) before erasing the mirror.
+  The trash is the safety net: a mail deleted by mistake is in the client's
+  trash for as long as the provider keeps it, which is what a user expects of
+  "delete" in any mail app. Nothing is expunged. The chat's own guards stay —
+  the two taps, the `CHAT_ERASE_TOKEN` capability that agent sessions do not
+  hold, the same-origin check — so no agent and no page from another site can
+  trigger it. An instruction's "delete" is the same move.
 - `\Seen` set or cleared in a client → ignored. A mail **moved or deleted** in
   a client → gone from the mirror on the next poll; its bubble is a tombstone,
   the chat stays (see open question 2).
