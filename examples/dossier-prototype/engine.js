@@ -400,7 +400,8 @@
     unread(item) { return item.stream.filter((m) => (m.who === 'in' || m.who === 'ara' || (m.who === 'event' && m.author !== 'you')) && m.t > (item.seenAt != null ? item.seenAt : -Infinity)).length; }
     markSeen(id) { const item = this.byId.get(id); if (item) item.seenAt = this.now; }
     // The list the home shows: every dossier with any activity, newest first, starred first; the focus and aperture decide which rows and their decoration.
-    chatList() { return this._starredFirst(this.items.filter((i) => i.state !== 'done' && i.state !== 'resting')); }
+    // The home lists what has a stream: a contact nobody has exchanged a message with is in the address book, not in the chat list.
+    chatList() { return this._starredFirst(this.items.filter((i) => i.state !== 'done' && i.state !== 'resting' && (i.stream.length || i.state === 'open'))); }
     ensureOpening(id) {
       const item = this.byId.get(id); if (!item || item.opened) return item;
       item.opened = true; const d = this._dialogue(item);

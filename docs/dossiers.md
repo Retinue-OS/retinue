@@ -359,9 +359,10 @@ does not return in the next digest; new arrivals outside do.
 
 **Home** = the chat list, for everything. The row is the Chats page's row
 today — avatar with the channel mark, name, age, the newest entry as preview
-(*who: text*), the unread badge — and every dossier is in it: people, groups,
-mail senders, topics, conversations with Ara, Inbox Zero, newest first,
-starred first. The focus and aperture decide **which rows** are in the list,
+(*who: text*), the unread badge — and every dossier **with a stream** is in
+it: people, groups, mail senders, topics, conversations with Ara, Inbox Zero,
+newest first, starred first. A contact nobody has exchanged a message with is
+in the address book, not in the chat list — as in any chat app. The focus and aperture decide **which rows** are in the list,
 not what a row looks like: within the aperture's ring a dossier is listed;
 outside, one line counts them and the urgent ones among them — *+ 7 below the
 aperture, 2 urgent — widen to "+ people"* — and widens on a tap. What rings
