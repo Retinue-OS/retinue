@@ -109,6 +109,7 @@ NEEDED = {
     "MAIL_GATEWAY_TOKEN": "mail-cap",
     "MAIL_GATEWAY_BASE_URL": "http://mail-gateway:8096",
     "MAIL_GATEWAY_SEND_URL": "http://mail-gateway:8096/send",
+    "MAIL_GATEWAY_TIMEOUT": "120",
     # non-secret mailbox setting the triage gate lists by name
     "SENT_FOLDER": "Sent",
     "TRIAGE_STATE_DIR": "/root/.retinue/triage",
@@ -131,6 +132,12 @@ DAEMON_ONLY = {
     "MAIL_ACCOUNT_NAME": "ari",
     "MAIL_BACKFILL_DAYS": "90",
     "MAIL_OWN_ADDRESSES": "me@alias.example",
+    # the web gateway's mail-chat tunables: the daemon reads them, no session does
+    "MAIL_SEND_TIMEOUT": "120",
+    "CHAT_PENDING_TIMEOUT": "4",
+    "CHAT_PENDING_RETRY_SECONDS": "15",
+    "CHAT_PENDING_SYNC_SECONDS": "20",
+    "MAILBOX_NONE_SECONDS": "600",
     "GATEWAY_BASIC_AUTH_SCOPES": "ara-mcp:ara.example.com",
     "ARA_MCP_ENABLED": "1",
     "VAPID_SUBJECT": "mailto:admin@example.com",

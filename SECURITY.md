@@ -111,16 +111,20 @@ nothing new.
   `user_approved`, `allow` sends — the request's `author` grants nothing), it
   **sets `\Seen`** on a thread's mails, **moves** a thread's INBOX mails to
   the archive folder and, on the user's delete, a thread's mails in every
-  mirrored folder to the Trash; it never expunges a folder. A session can, through
-  the API, send under the policy and mark a thread read or archive it, and —
+  mirrored folder to the Trash (a Trash folder it never creates); it never
+  expunges a folder. A send may carry an idempotency key, so a repeat of the
+  same press sends nothing twice, and `POST /reply-preview` only reads. A
+  session can, through the API, send under the policy and mark a thread read or archive it, and —
   as on every gateway — approve, reject or retract a pending send, since
   those share the bearer token, which is why send approval is a workflow gate
   rather than a boundary. It **cannot erase**: moving mail to the
   Trash and erasing the mirror need `CHAT_ERASE_TOKEN`
   (`X-Chat-Erase-Token`), which the gateway demands and which no session
   inherits, so only the user's own delete reaches it; unset, the gateway
-  refuses with 503. Mail sent through the gateway does not add its recipient
-  to the e-mail whitelist — the gateway never writes policy. Closing
+  refuses with 503. On the web gateway, marking a mail chat read, archiving it
+  and flagging it write to the mailbox, so those endpoints are the user's own
+  act like send, compose and delete: same-origin only. Mail sent through the
+  gateway does not add its recipient to the e-mail whitelist — the gateway never writes policy. Closing
   that means holding each secret in its own sidecar or under a separate uid,
   which is a separate roadmap item. An outbound send still has to clear the
   sending identity's policy, but a pending `verify` approval is not bound to

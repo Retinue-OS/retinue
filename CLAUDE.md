@@ -273,11 +273,13 @@ human comes from the `secretary` subagent (see **Routing**) — dispatch, then
 send its text verbatim. **Before any send to a
 named person, apply the `messaging-contact-lookup` skill** (recent chats
 first, directory fallback — `signal-contacts.py` and siblings). **E-mail in a
-thread the mail gateway mirrors** — a reply (`--chat <id>` or `--reply-to
-<token>`, `--reply all|sender`) or a new mail (`--to`, `--subject`) — goes
-through `scripts/mail-push.py` like the other push CLIs, under the same send
-policy; `scripts/email_client.py` (the `use-email-client` skill) stays for
-everything else: reading, searching, filing, drafts, and any mailbox the
+thread the mail gateway mirrors**, when you hold its chat id — a reply
+(`--chat <id>`, `--reply all|sender`) or a new mail (`--to`, `--subject`) —
+goes through `scripts/mail-push.py` like the other push CLIs, under the same
+send policy; a mail e-mail triage hands you (a UID, not a chat id) is still
+answered with `email_client.py reply --uid`, as the `triage` skill says, until
+triage retires. `scripts/email_client.py` (the `use-email-client` skill) stays
+for everything else: reading, searching, filing, drafts, and any mailbox the
 gateway does not serve. Sends are
 gated by per-identity send policies (`allow`/`trust`/`verify`; undeclared
 defaults to `verify`, queued for approval on the dashboard's `/sends` page) —
