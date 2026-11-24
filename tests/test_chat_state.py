@@ -23,6 +23,7 @@ Standalone, no third-party deps:
     python3 tests/test_chat_state.py
 """
 import importlib.util
+import json
 import tempfile
 import time
 from pathlib import Path
@@ -1131,6 +1132,37 @@ def test_a_queued_send_is_kept_as_data():
     assert odd["message_id"] == "m1@x.org x" and "\x00" not in odd["text"]
     assert len(odd["text"]) <= 64 * 1024 + 1 and odd["text"].endswith("…")
     assert "message_id" not in cs.clean_pending(_pending(rid, message_id=None))
+    # Where it stands: waiting unless said otherwise, and a word that is no
+    # status is none.
+    assert (clean["status"], clean["error"], clean["outcome_unknown"], clean["refused"]) == (
+        "pending", None, False, [])
+    assert cs.clean_pending(_pending(rid, status="sending"))["status"] == "sending"
+    assert cs.clean_pending(_pending(rid, status="approved"))["status"] == "pending"
+    # Only a failed send has a reason, and may have gone out all the same.
+    # The reason repeats what a mail server said: one bounded line.
+    failed = cs.clean_pending(_pending(
+        rid, status="failed", error="550 5.7.1 no\r\nX-Injected: 1 " + "x" * 900,
+        outcome_unknown=True, refused=["cat@z.org\r\nBcc: evil@x.org", "", 7]))
+    assert failed["status"] == "failed" and failed["outcome_unknown"] is True
+    assert failed["error"].startswith("550 5.7.1 no X-Injected: 1 x") and len(failed["error"]) == 500
+    assert failed["refused"] == ["cat@z.org Bcc: evil@x.org"]
+    waiting = cs.clean_pending(_pending(rid, error="left over", outcome_unknown=True))
+    assert waiting["error"] is None and waiting["outcome_unknown"] is False
+    assert cs.clean_pending(_pending(rid, status="failed", outcome_unknown="yes"))[
+        "outcome_unknown"] is False
+    # The key of the press that made it: a short printable token, or none.
+    assert cs.clean_pending(_pending(rid, request_key="press-1"))["request_key"] == "press-1"
+    for bad in ("", "two words", "k" * 65, "line\nbreak", 7, None):
+        assert "request_key" not in cs.clean_pending(_pending(rid, request_key=bad)), bad
+    # Whom a sent mail did not reach: addresses and nothing else, by the
+    # mail's id, the newest mails.
+    assert cs.clean_refused({"m1@x.org": ["Cat@Z.org", "cat@z.org", "<script>", "a b@c.org", 7],
+                             "m2@x.org": [], "": ["a@b.org"], "m3@x.org": "a@b.org",
+                             "m4@x.org\r\nx": ["dan@w.org"]}) == {
+        "m1@x.org": ["cat@z.org"], "m4@x.org x": ["dan@w.org"]}
+    assert cs.clean_refused(["nonsense"]) == {} and cs.clean_refused(None) == {}
+    many = cs.clean_refused({f"m{n}@x.org": ["a@b.org"] for n in range(cs.REFUSED_MAX + 5)})
+    assert len(many) == cs.REFUSED_MAX and "m4@x.org" not in many and "m5@x.org" in many
     print("PASS test_a_queued_send_is_kept_as_data")
 
 
@@ -1206,6 +1238,134 @@ def test_the_copy_follows_the_gateways_queue():
     print("PASS test_the_copy_follows_the_gateways_queue")
 
 
+def test_a_send_that_was_decided_stays_as_decided():
+    """Allowed, a queued send stays in its chat — as being sent, then as
+    failed or gone; nothing an older answer of the queue says takes that
+    back."""
+    with tempfile.TemporaryDirectory() as tmp:
+        st = cs.ChatStateStore(tmp)
+        cid = cs.make_chat_id("email", "root@x.org", "me@example.org")
+        a, b = "a" * 32, "b" * 32
+        st.set_pending(cid, [_pending(a), _pending(b, ts=1790000200)])
+        path = st._path(cid)
+        # The gateway is asked for its queue ...
+        asked = time.time()
+        time.sleep(0.01)
+        # ... and meanwhile the user allows one of them.
+        doc, changed = st.update_pending(cid, a, status="sending")
+        assert changed and [p["status"] for p in doc["pending"]] == ["sending", "pending"]
+        # The answer, from before the decision, still calls it waiting. It
+        # does not go back to waiting (with an approval link to press again).
+        doc, _ = st.set_pending(cid, [_pending(a), _pending(b, ts=1790000200)], since=asked)
+        assert [p["status"] for p in doc["pending"]] == ["sending", "pending"]
+        # An answer asked after the decision is the truth again.
+        doc, _ = st.set_pending(cid, [_pending(a, status="failed", error="535 auth failed"),
+                                      _pending(b, ts=1790000200)], since=time.time() + 1)
+        assert [(p["status"], p["error"]) for p in doc["pending"]] == [
+            ("failed", "535 auth failed"), ("pending", None)]
+        assert "decided" not in doc["pending"][0]
+        # The same state again writes nothing; an entry the chat does not
+        # hold is no entry; a chat without state gets none.
+        before = path.stat().st_mtime_ns
+        assert st.update_pending(cid, a, status="failed", error="535 auth failed")[1] is False
+        assert st.update_pending(cid, "c" * 32, status="sending")[1] is False
+        assert path.stat().st_mtime_ns == before
+        other = cs.make_chat_id("email", "never@x.org", "me@example.org")
+        assert st.update_pending(other, a, status="sending")[1] is False and not st.exists(other)
+        # What does not read as a state changes nothing either.
+        assert st.update_pending(cid, b, status="exploded")[1] is False
+
+        # Whom a mail did not reach is kept with the chat, by the mail's id.
+        doc = st.note_refused(cid, "m1@x.org", ["cat@z.org", "not an address"])
+        assert doc["refused"] == {"m1@x.org": ["cat@z.org"]}
+        before = path.stat().st_mtime_ns
+        assert st.note_refused(cid, "m1@x.org", ["cat@z.org"])["refused"] == doc["refused"]
+        assert st.note_refused(cid, None, ["a@b.org"])["refused"] == doc["refused"]
+        assert st.note_refused(cid, "m2@x.org", [])["refused"] == doc["refused"]
+        assert path.stat().st_mtime_ns == before, "nothing new, nothing written"
+        assert not st.exists(other) and st.note_refused(other, "", ["a@b.org"])["refused"] == {}
+        # A merge keeps both chats' notes.
+        st.note_refused(other, "m9@x.org", ["dan@w.org"])
+        doc, _gone = st.merge(other, cid)
+        assert doc["refused"] == {"m9@x.org": ["dan@w.org"], "m1@x.org": ["cat@z.org"]}
+
+        # A chat that is so far only a mail that has not gone out says so,
+        # until a mail of it exists; merged into a chat of mails, it is one.
+        new = cs.make_chat_id("email", "queued@example.org", "me@example.org")
+        assert st.get(new)["unsent"] is False
+        assert st.note_message(new, name="Offer", unsent=True)["unsent"] is True
+        assert st.note_message(new, name="Offer")["unsent"] is True, "None leaves it"
+        assert st.note_message(new, unsent=False)["unsent"] is False
+        st.note_message(new, unsent=True)
+        doc, _gone = st.merge(new, cid)
+        assert doc["unsent"] is False
+    print("PASS test_a_send_that_was_decided_stays_as_decided")
+
+
+def test_owed_calls_outlast_the_process():
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "mailbox" / "owed.json"
+        owed = cs.OwedCalls(path)
+        assert len(owed) == 0 and list(owed) == [] and not path.exists()
+        a, b = "email:~me@example.org:a@x.org", "email:~me@example.org:b@x.org"
+        assert owed.add(a, "read") is True and owed.add(b, "archive") is True
+        assert owed.add(a, "read") is False, "owed once, from the first instant"
+        assert owed.add(a, "archive") is True
+        assert list(owed) == [(a, "read"), (b, "archive"), (a, "archive")]
+        assert (a, "read") in owed and (b, "read") not in owed and len(owed) == 3
+        # Another process finds them (a restart of the web gateway).
+        again = cs.OwedCalls(path)
+        assert again.pairs() == [(a, "read"), (b, "archive"), (a, "archive")]
+        # One call is owed no more; then none of a chat's.
+        assert again.discard(a, "read") == 1 and again.discard(a, "read") == 0
+        assert again.discard(a) == 1 and again.pairs() == [(b, "archive")]
+        assert cs.OwedCalls(path).pairs() == [(b, "archive")]
+        again.clear()
+        assert cs.OwedCalls(path).pairs() == [] and json.loads(path.read_text()) == {"owed": []}
+        # A call may carry which messages it is about; the newest action's
+        # list is the one kept, and a restart keeps it.
+        scoped = cs.OwedCalls(Path(tmp) / "scoped.json")
+        assert scoped.add(a, "read", ["m1@x.org", "m2@x.org"]) is True
+        assert scoped.scope(a, "read") == ["m1@x.org", "m2@x.org"] and scoped.scope(b, "read") is None
+        assert scoped.add(a, "read") is False and scoped.scope(a, "read") == ["m1@x.org", "m2@x.org"]
+        assert scoped.add(a, "read", ["m1@x.org", "m2@x.org", "m3@x.org"]) is False
+        assert cs.OwedCalls(Path(tmp) / "scoped.json").scope(a, "read") == [
+            "m1@x.org", "m2@x.org", "m3@x.org"]
+        scoped.add(a, "archive")
+        assert scoped.scope(a, "archive") is None
+        scoped.discard(a, "read")
+        assert scoped.scope(a, "read") is None and cs.OwedCalls(
+            Path(tmp) / "scoped.json").pairs() == [(a, "archive")]
+        # Which arrivals landed after a place in the chat's count.
+        doc = {"inbound_recent": [["m1@x.org", 1], ["m2@x.org", 2], ["m3@x.org", 3], "junk",
+                                  [None, 4], ["m5@x.org", "5"]]}
+        assert cs.arrivals_after(doc, 1) == {"m2@x.org", "m3@x.org"}
+        assert cs.arrivals_after(doc, 3) == set() and cs.arrivals_after(doc, None) == set()
+        assert cs.arrivals_after(None, 0) == set()
+        # Bounded: the newest are kept ...
+        small = cs.OwedCalls(Path(tmp) / "small.json", maxlen=2)
+        for n in range(4):
+            small.add(f"email:~me@example.org:{n}@x.org", "read")
+        assert [chat[-7:] for chat, _a in small] == ["2@x.org", "3@x.org"]
+        # ... and none for longer than it could be of use.
+        brief = cs.OwedCalls(Path(tmp) / "brief.json", keep_seconds=0.02)
+        brief.add(a, "read")
+        assert (a, "read") in brief
+        time.sleep(0.05)
+        assert (a, "read") not in brief and len(brief) == 0
+        # A file that is no queue is an empty one — and no chat document.
+        path.write_text("{not json", encoding="utf-8")
+        assert cs.OwedCalls(path).pairs() == []
+        path.write_text(json.dumps({"owed": [[a, "read", "soon"], [a], "x", [a, "archive", 5.0],
+                                             [b, "read", time.time()]]}), encoding="utf-8")
+        assert cs.OwedCalls(path).pairs() == [(b, "read")], "rows that are none, and one long past"
+        st = cs.ChatStateStore(tmp)
+        owed = cs.OwedCalls(path)
+        owed.add(a, "read")
+        assert st.all() == {}, "beside the chats' state, not among it"
+    print("PASS test_owed_calls_outlast_the_process")
+
+
 if __name__ == "__main__":
     test_split_and_filename_safety()
     test_account_is_half_the_identity()
@@ -1234,4 +1394,6 @@ if __name__ == "__main__":
     test_a_merged_chats_id_says_where_it_went()
     test_a_queued_send_is_kept_as_data()
     test_the_copy_follows_the_gateways_queue()
+    test_a_send_that_was_decided_stays_as_decided()
+    test_owed_calls_outlast_the_process()
     print("all chat-state tests passed")

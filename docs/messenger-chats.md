@@ -286,13 +286,26 @@ persistent volume — high-churn disposable data, the news-store precedent):
 - `summary`, `summary_watermark` — the rolling summary and the timestamp up to
   which it has folded both rails;
 - `companion` — the companion thread's conversation id, once created;
-- `pending` — a copy of the sends of this chat that wait in its gateway's
-  queue for approval (a mail chat's only; see *Trust model*, "E-mail"). The
-  gateway's queue is the truth and the copy follows it; it is what the chat
-  list counts from and what the chat page shows while the gateway is away;
+- `pending` — a copy of the sends of this chat that are not over in its
+  gateway's queue (a mail chat's only; see *Trust model*, "E-mail"): each
+  waiting for approval, being sent, or failed — with the reason, and whether
+  the mail may have gone out all the same — until the user dismisses it.
+  The gateway's queue is the truth and the copy follows it; it is what the
+  chat list counts from and what the chat page shows while the gateway is
+  away;
+- `refused` — whom a mail of the user's did not reach: the recipients the
+  mail server refused while it took the mail for the others, by the mail's
+  `Message-ID` (a mail chat's only);
+- `unsent` — true for a chat that so far is nothing but a mail of the user's
+  own that has not gone out (a queued new mail). Such a chat is forgotten
+  when that send is denied, retracted or dismissed;
 - display metadata (resolved name, group flag) cached from the gateway.
 
-Beside the documents sits one small index, `merged/into.json`: which chat ids
+Beside the documents sit two small files of their own. `mailbox/owed.json`
+is the durable queue of calls a chat's gateway is still owed — a read mark or
+an archive that did not reach the mailbox (`chat_state.OwedCalls`; see "The
+mailbox follows the chat" below) — kept on disk so a restart of the
+web-gateway forgets none. And one small index, `merged/into.json`: which chat ids
 were folded into which chat. Only mail threads merge
 ([mail-chats.md](mail-chats.md), "Threading"); the index is what lets an id
 from before a merge be answered with where the chat went, and it forgets a
@@ -341,9 +354,19 @@ need no capability: a read mark or a reply is passed on to the chat's gateway
 as `POST /chats/read`, an archive as `POST /chats/archive`, each
 `{chat, account}`. Generic by contract — the call goes to the chat's own
 gateway on every channel, and one with no mailbox behind it answers 404 (the
-messenger gateways do) and is owed nothing. Best-effort, after the state
-change and never part of it; the undo of a mark and an un-archive call
-nothing. The mechanics are in [dashboard.md](dashboard.md), "Writing mail".
+messenger gateways do) and is owed nothing. (A *mail* gateway's 404 is its
+word about one thread — "not this gateway's account" — and never read as "no
+mailbox".) Best-effort, after the state change and never part of it; the
+undo of a mark and an un-archive call nothing. A call that could not be made
+is owed: kept on disk, and made again on a timer until it goes through or no
+longer says what the chat says. The mechanics are in
+[dashboard.md](dashboard.md), "Writing mail".
+
+Because they reach a real mailbox now, **the read mark and the flags are the
+user's own act like a send**: `POST /chats/<id>/read` and
+`POST /chats/<id>/flags` answer 403 to a request another site's page made the
+browser send (a `Sec-Fetch-Site` other than `same-origin` or `none`), on
+every channel and for every body — the undo and a star included.
 
 ### Unread · Read · Archived
 
@@ -463,7 +486,8 @@ head is an inbound message later than its cut-off counts at least that one.
 The arrival count is in the chat state and needs no store; where no list can
 be built at all, it is what the read endpoint answers with.
 
-**Mark as read** is `POST /chats/<id>/read`:
+**Mark as read** is `POST /chats/<id>/read` (same-origin only — see "The
+mailbox follows the chat" above):
 
 - Body `{"seen": n}` is what both dashboard clients send: `n` is the
   `inbound_seq` of the summary they rendered — the list's row, or on the chat
@@ -832,14 +856,35 @@ through `EMAIL_SEND_POLICY` like anyone's. The press is passed to the mail
 gateway as `user_approved`, so under `trust` and `allow` it sends; under
 `verify` the mail is queued although the user typed it, and the web-gateway
 does not release it — `_chat_send_via_gateway` approves a queued send for
-the messengers only. The send answers `202` with the pending send, the chat
-shows it as a pending bubble with its approval link, and `/sends` is where
-it is allowed, with recipients, subject and text on one card. So for mail
-the draft area does not replace `/sends`; the two meet in the chat, which
-lists every queued send of its thread whoever queued it. The companion of a
-mail thread stages drafts like any companion and, unlike a messenger chat's,
-has a send path that is the thread's own: `scripts/mail-push.py`, under the
-same policy, when the user asks for it there.
+the messengers only; a mail goes through `_mail_send`. The send answers
+`202` with the pending send, the chat shows it as a pending bubble with its
+approval link, and `/sends` is where it is allowed, with recipients, subject
+and text on one card. So for mail the draft area does not replace `/sends`;
+the two meet in the chat, which lists every send of its thread that is not
+over, whoever made it — waiting, being sent, or failed with its reason. The
+companion of a mail thread stages drafts like any companion and, unlike a
+messenger chat's, has a send path that is the thread's own:
+`scripts/mail-push.py`, under the same policy, when the user asks for it
+there — its note names the thread's gateway where that is not the default
+one, and the mailbox's policy with the rule that goes with it.
+
+Three rules hold for a mail send that a messenger's does not need
+([dashboard.md](dashboard.md), "Writing mail", has the endpoints):
+
+- **The recipients a user sees are the recipients the gateway will use.**
+  The page draws a reply's To and Cc from `GET /chats/<id>/reply-preview`,
+  which is the mail gateway's own addressing, asked without sending; nothing
+  on this side computes an address.
+- **A mail that may have gone out is never reported as not sent.** A hop to
+  the gateway that timed out or lost its connection after the request was
+  written, and the gateway's own "the mail server never confirmed", answer
+  the browser `202 {unconfirmed: true}` — never an error that hands the
+  words back for a second send. Every press carries an idempotency key
+  (`request_key`), so the same press can be retried and sends nothing twice.
+- **Nothing the user queued or sent disappears without a word.** An allowed
+  send that then fails stays in its chat as failed, with the gateway's
+  reason, until the user dismisses it; recipients the mail server refused
+  are named on the sent message.
 
 ## What this replaces, what it keeps
 
@@ -910,8 +955,9 @@ serving logic, `webapp/`, `scripts/`). Phases 1–4 have shipped.
    chat is invisible on the chat page until approved; showing it as a
    pending bubble (approvable in place) would fold `/sends` into the chat for
    those too. Deferred to phase 6. *Built for e-mail:* a mail chat lists its
-   queued sends (`pending` on `GET /chats/<id>/messages`), each with the link
-   to its approval page; the messengers' chats do not yet.
+   sends that are not over (`pending` on `GET /chats/<id>/messages`) — each
+   waiting with the link to its approval page, being sent, or failed with
+   its reason; the messengers' chats do not yet.
 5. **SMS.** Resolved: `sms-gateway` (opt-in, `sms` compose profile) writes
    the same store shape, so SMS chats appear here with no serving-code change —
    as this design predicted. See `docs/messaging.md`, "SMS".
