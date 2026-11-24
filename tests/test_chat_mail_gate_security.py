@@ -739,13 +739,86 @@ def test_a_batch_never_cuts_the_brief(base, wg):
     for turn, hook in zip(TURNS, hooks):
         quoted = [m for m in mids[1:] if html.escape(m) in turn["prompt"]]
         assert sorted(quoted) == sorted(hook["message_ids"]), (quoted, hook)
-    assert wg._CHAT_STATE.get(chat2)["archived"] is False
+    # Each turn asked for the archive, so the last — the oldest mails' —
+    # archives the thread over the newer ones (decision AR).
+    assert all(a["archived"] is False for a in answers[:-1]), answers
+    assert answers[-1]["archived"] is True and "reason" not in answers[-1], answers
+    assert wg._CHAT_STATE.get(chat2)["archived"] is True
     for record in (acme, office):
         wg._CONTACTS.delete(record["key"])
     _forget(wg, chat, chat2)
     TURNS.clear()
     PUSHES.clear()
     print("PASS test_a_batch_never_cuts_the_brief")
+
+
+def test_a_turn_quotes_every_mail_it_takes(base, wg):
+    """Decision AQ: one quote decision per turn. The worker decides which
+    mails a turn quotes and the prompt quotes exactly those: every mail a
+    turn takes — into its jobs, its mail ids and places, and so its rings,
+    "told" and turns_done — stands quoted in that turn's prompt, and every
+    mail the prompt says gets a turn of its own gets one. Swept over batch
+    layouts: an ordinary mail among mails whose escaped headers are long,
+    at every place and length (the layouts where the prompt once worked the
+    quotes out again, for a larger share each, and lost a taken mail)."""
+    def arrival(i, hostile, text_len):
+        return {"mail": True, "handle": f"m{i}@aq.example", "gate_sender": f"m{i}@aq.example",
+                "sender_name": ('"' * 200) if hostile else "Billing",
+                "subject": ('"' * 300) if hostile else "Final notice",
+                "message_id": (("&" * 380) if hostile else "") + f"{i}@aq.example",
+                "text": f"MAIL-{i} " + (("a" * 30000) if hostile else "b" * text_len),
+                "instruction": None, "person": "AQ", "person_key": "aq", "vip": True,
+                "seq": i + 1, "files": [], "attachments": 0}
+
+    seen: list = []
+
+    def turn(_cid, _key, *, arrival=None, arrival_turn=None, **_kw):
+        with wg._chat_turns_lock:
+            record = next(r for rs in wg._RUNNING_TURNS.values() for r in rs
+                          if r["token"] == arrival_turn)
+            seen.append((arrival, list(record["mids"]), list(record["seqs"]),
+                         set(record["jobs"])))
+        return False
+
+    real = wg._conv_worker
+    wg._conv_worker = turn
+    layouts = 0
+    try:
+        for before in range(0, 6):
+            for after in range(1, 8):
+                for text_len in (1000, 3000, 6000, 12000, 30000):
+                    arrivals = ([arrival(i, True, 0) for i in range(before)]
+                                + [arrival(before, False, text_len)]
+                                + [arrival(before + 1 + j, True, 0) for j in range(after)])
+                    chat = _chat_id(f"aq-{before}-{after}-{text_len}@aq.example")
+                    jobs = [f"aq-{before}-{after}-{text_len}-{i}" for i in range(len(arrivals))]
+                    with wg._chat_turns_lock:
+                        wg._CHAT_TURNS[chat] = {"jobs": list(jobs), "worker": None,
+                                                "arrivals": [dict(a) for a in arrivals],
+                                                "cid": "aq-companion"}
+                    seen.clear()
+                    wg._chat_arrival_worker(chat, "aq-companion", None)
+                    where = (before, after, text_len)
+                    taken: list = []
+                    for prompt, mids, seqs, turn_jobs in seen:
+                        quoted = re.findall(r"Text: MAIL-(\d+) ", prompt)
+                        # Each mail the turn took is quoted, and nothing else.
+                        assert sorted(int(q) for q in quoted) == sorted(s - 1 for s in seqs), \
+                            (where, quoted, seqs)
+                        assert prompt.count("</external_message>") == len(mids), where
+                        assert turn_jobs == {jobs[s - 1] for s in seqs}, where
+                        taken += seqs
+                        # The mails it says wait get turns of their own: all
+                        # that are left of the batch, and no more.
+                        note = re.search(r"\[(\d+) older mails? of this thread", prompt)
+                        assert (int(note.group(1)) if note else 0) == len(arrivals) - len(taken), \
+                            (where, note and note.group(0), len(taken))
+                    assert sorted(taken) == list(range(1, len(arrivals) + 1)), (where, taken)
+                    layouts += len(seen) > 1
+    finally:
+        wg._conv_worker = real
+    assert layouts, "no layout deferred a mail: the sweep tests nothing"
+    print(f"PASS test_a_turn_quotes_every_mail_it_takes ({layouts} layouts defer)")
 
 
 def main():
@@ -786,6 +859,7 @@ def main():
         test_a_hostile_mail_cannot_speak_for_the_user(base, wg)
         test_a_long_mail_never_makes_an_unstartable_turn(base, wg)
         test_a_batch_never_cuts_the_brief(base, wg)
+        test_a_turn_quotes_every_mail_it_takes(base, wg)
         server.shutdown()
     sparql.shutdown()
     mail_gw.shutdown()

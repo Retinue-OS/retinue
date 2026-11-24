@@ -687,6 +687,52 @@ def test_what_an_arrival_owes_is_kept_per_arrival():
         print("PASS test_what_an_arrival_owes_is_kept_per_arrival")
 
 
+def test_a_turn_archives_over_mail_whose_turn_asked_too():
+    """Decision AR: a turn's archive reaches past its cut exactly when every
+    arrival after it was worked by a completed turn that asked for the
+    archive (or is gone) — remembered on the mails, through a reload and a
+    merge; a later turn of a mail that did not ask takes the ask off it."""
+    with tempfile.TemporaryDirectory() as tmp:
+        store = cs.ChatStateStore(tmp)
+        a = "email:~me@x.example:chain@x.example"
+        for i, mid in enumerate(("old", "n1", "n2", "n3"), 1):
+            store.count_arrival(a, 1000.0 + i, message_id=mid, owe=True)
+        # The newer mails' turn asked and completed — two of three so far.
+        store.note_turn_done(a, "n1", asked=True)
+        store.note_turn_done(a, "n2", asked=True)
+        doc, done = store.archive_through(a, cut=1)
+        assert not done and not doc["archived"], "n3 was worked by no turn"
+        # n3's turn completed without asking: still no archive.
+        store.note_turn_done(a, "n3")
+        assert not cs.archive_asked(store.get(a), "n3") and cs.turn_done(store.get(a), "n3")
+        assert not store.archive_through(a, cut=1)[1]
+        # Its next turn asked: now everything after the cut asked, and the
+        # record outlasts the process.
+        store.note_turn_done(a, "n3", asked=True)
+        store = cs.ChatStateStore(tmp)
+        assert cs.asked_through(store.get(a), 1) and not cs.asked_through(store.get(a), 0)
+        # A later turn that did not ask takes the ask off again.
+        store.note_turn_done(a, "n2")
+        assert not cs.asked_through(store.get(a), 1)
+        store.note_turn_done(a, "n2", asked=True)
+        # A gone arrival after the cut is no reason to stay; one with no id
+        # (no place by id) is.
+        store.count_arrival(a, 1010.0, message_id="deleted", owe=True)
+        assert not cs.asked_through(store.get(a), 1)
+        store.forget_arrivals(a, ["deleted"])
+        assert cs.asked_through(store.get(a), 1)
+        store.count_arrival(a, 1011.0)
+        assert not store.archive_through(a, cut=1)[1]
+        # A merge keeps what either half asked; the places come with it.
+        b = "email:~me@x.example:chain-b@x.example"
+        store.count_arrival(b, 900.0, message_id="b1", owe=True)
+        store.note_turn_done(b, "b1", asked=True)
+        doc, _gone = store.merge(b, a)
+        assert cs.archive_asked(doc, "b1") and cs.archive_asked(doc, "n1"), doc["archive_asked"]
+        assert not cs.archive_asked(doc, "old")
+        print("PASS test_a_turn_archives_over_mail_whose_turn_asked_too")
+
+
 def test_flags_and_note_message():
     with tempfile.TemporaryDirectory() as tmp:
         store = cs.ChatStateStore(tmp)
@@ -1483,6 +1529,7 @@ if __name__ == "__main__":
     test_a_read_reaches_a_stamp_from_a_fast_clock()
     test_archive_unless_arrived()
     test_what_an_arrival_owes_is_kept_per_arrival()
+    test_a_turn_archives_over_mail_whose_turn_asked_too()
     test_flags_and_note_message()
     test_companion_link()
     test_overlay_merge_dedup_expiry()

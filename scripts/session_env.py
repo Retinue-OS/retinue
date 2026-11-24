@@ -28,7 +28,7 @@ suffixes below. Deployments whose chamber scripts read variables the framework
 does not know about name them in RETINUE_SESSION_ENV_EXTRA (comma-separated;
 a trailing `*` admits a prefix) instead of editing this file.
 
-Six per-session values are never inherited, whatever the source holds:
+Seven per-session values are never inherited, whatever the source holds:
 RETINUE_SESSION_MODEL (the model stamp scripts/memory.py records; a stale one
 would mislabel a session), RETINUE_ESCALATE_FILE (Ara junior's escape hatch,
 docs/model-routing.md), RETINUE_REPLY_ATTACHMENTS_FILE (the manifest a
@@ -36,11 +36,14 @@ dashboard-thread turn lists the files for its own reply in, docs/dashboard.md),
 RETINUE_REPLY_SHELL_ACTIONS_FILE (its sibling for the shell actions — text to
 type on the user's paired device — the reply carries, scripts/shell-type.py)
 RETINUE_THREAD_ID (the thread a dashboard turn answers, which queued sends
-are linked to, docs/messaging.md) and RETINUE_ARRIVAL_TURN (the token that
+are linked to, docs/messaging.md), RETINUE_ARRIVAL_TURN (the token that
 tells the web gateway a chat-flags call comes from the arrival turn it was
-minted for, docs/dashboard.md) — the spawner sets them per spawn through the
-`model`, `escalate_file`, `reply_attachments_file`,
-`reply_shell_actions_file`, `thread_id` and `arrival_turn` arguments.
+minted for, docs/dashboard.md) and RETINUE_USER_TURN (its counterpart for a
+dashboard thread's turn: the proof that a chat-flags call is on the user's
+word) — the spawner sets them per spawn through the `model`,
+`escalate_file`, `reply_attachments_file`, `reply_shell_actions_file`,
+`thread_id`, `arrival_turn` and `user_turn` arguments, so a session another
+session spawns through build() never carries its spawner's.
 
 What this does NOT do: a session runs as the same uid as the daemons, so it can
 still read a daemon's /proc/<pid>/environ. Keeping the secrets out of the
@@ -183,7 +186,7 @@ SESSION_ENV_EXCLUDED: frozenset[str] = frozenset({"RETINUE_LITELLM_KEY"})
 _PER_SPAWN: tuple[str, ...] = ("RETINUE_SESSION_MODEL", "RETINUE_ESCALATE_FILE",
                                "RETINUE_REPLY_ATTACHMENTS_FILE",
                                "RETINUE_REPLY_SHELL_ACTIONS_FILE", "RETINUE_THREAD_ID",
-                               "RETINUE_ARRIVAL_TURN")
+                               "RETINUE_ARRIVAL_TURN", "RETINUE_USER_TURN")
 
 EXTRA_VAR = "RETINUE_SESSION_ENV_EXTRA"
 
@@ -239,6 +242,7 @@ def build(source: Mapping[str, str] | None = None, *, model: str = "",
           reply_shell_actions_file: "str | os.PathLike[str] | None" = None,
           thread_id: str | None = None,
           arrival_turn: str | None = None,
+          user_turn: str | None = None,
           ) -> dict[str, str]:
     """Return the environment for one spawned session.
 
@@ -261,6 +265,10 @@ def build(source: Mapping[str, str] | None = None, *, model: str = "",
     only for it, as RETINUE_ARRIVAL_TURN: the turn's own unguessable id,
     which scripts/chat-flags.py sends along, so the web gateway can tell that
     turn's call from Ara acting on the user's word in another session.
+    `user_turn` is set for the spawn of a dashboard thread's turn, and only
+    for it, as RETINUE_USER_TURN: that turn's proof, which chat-flags.py
+    sends too, so the web gateway can tell a call on the user's word from
+    one an arrival turn made without its token.
 
     E-mail goes through the gateway's backend: whenever the spawner holds the
     EMAIL_BACKEND_TOKEN (the entrypoint always mints one in remote-control
@@ -283,6 +291,8 @@ def build(source: Mapping[str, str] | None = None, *, model: str = "",
         env["RETINUE_THREAD_ID"] = thread_id
     if arrival_turn:
         env["RETINUE_ARRIVAL_TURN"] = arrival_turn
+    if user_turn:
+        env["RETINUE_USER_TURN"] = user_turn
     if env.get("EMAIL_BACKEND_TOKEN"):
         port = env.get("WEB_GATEWAY_PORT", "8080")
         env["EMAIL_BACKEND_URL"] = f"http://localhost:{port}/internal/email"

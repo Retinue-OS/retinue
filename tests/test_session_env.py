@@ -301,6 +301,29 @@ def test_the_arrival_turn_token_is_set_per_spawn_only():
     print("ok: the arrival-turn token is set per spawn, never inherited")
 
 
+def test_the_user_turn_proof_is_set_per_spawn_only():
+    """Decision AK: RETINUE_USER_TURN proves that a chat-flags call comes
+    from a dashboard thread's turn — the user's word. Only that spawn
+    carries it: a session another one spawns through build() never inherits
+    it (an arrival turn's child would hold the user's word), nor does the
+    escape hatch let it through, and an arrival turn's spawn is handed none."""
+    src = _source(RETINUE_USER_TURN="stale-proof", RETINUE_ARRIVAL_TURN="a-turn")
+    assert "RETINUE_USER_TURN" not in se.build(src)
+    for extra in ("RETINUE_USER_TURN", "RETINUE_*"):
+        hatch = {**src, "RETINUE_SESSION_ENV_EXTRA": extra}
+        assert "RETINUE_USER_TURN" not in se.build(hatch), extra
+        assert not se.allowed("RETINUE_USER_TURN", hatch), extra
+    env = se.build(src, user_turn="1e" * 16)
+    assert env["RETINUE_USER_TURN"] == "1e" * 16 and "RETINUE_ARRIVAL_TURN" not in env
+    turn = se.build(src, arrival_turn="0f" * 16)
+    assert "RETINUE_USER_TURN" not in turn, "an arrival turn was handed the user's word"
+    # The arrival turn's own child, built from the turn's environment.
+    assert "RETINUE_USER_TURN" not in se.build(turn)
+    for none in (None, ""):
+        assert "RETINUE_USER_TURN" not in se.build(src, user_turn=none)
+    print("ok: the user-turn proof is set per spawn, never inherited")
+
+
 def test_email_goes_through_the_gateway_backend():
     # The spawner holds the token: the session is pointed at the backend, and
     # a stale inherited URL does not survive.
@@ -394,6 +417,7 @@ def main():
     test_gateway_client_suffixes_cover_deployment_added_gateways()
     test_per_spawn_stamps_are_never_inherited()
     test_the_arrival_turn_token_is_set_per_spawn_only()
+    test_the_user_turn_proof_is_set_per_spawn_only()
     test_email_goes_through_the_gateway_backend()
     test_escape_hatch_admits_what_a_deployment_names()
     test_default_source_is_the_process_environment()

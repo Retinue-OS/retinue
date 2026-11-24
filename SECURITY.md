@@ -165,7 +165,16 @@ nothing new.
   briefed by the sender's instruction — which can file the documents it
   carries, archive the thread (moving its mails out of the inbox) and send a
   reply under the mailbox's send policy, at once under `allow` where the
-  instruction approves that in so many words. One that forges a contact with
+  instruction approves that in so many words. Archiving is all such a turn
+  can do with its own thread's flags while it runs: the web gateway takes a
+  flags call on that thread as the turn's — its mute an archive, its unmute,
+  unarchive and star nothing — whether or not the call carries the turn's
+  token, unless it carries the proof a dashboard thread's turn is handed
+  (the user's word). That holds no further. The turn's session holds the
+  backend token every agent session holds, so it can set **another** chat's
+  flags — mute it — with the user's meaning, and a process it leaves behind
+  can do so on its own thread once the turn has ended; what keeps a turn to
+  its brief there is the brief. One that forges a contact with
   an importance prior or a permit rings as that contact would. The turn
   reads the mail as data: everything the mail says of itself — its sender's
   name, its subject, its id, its text, and the thread's earlier mails in the

@@ -400,12 +400,22 @@ instruction without VIP and has it ask for a high importance.
   turn's own mail (the answer says `a turn cannot mute; archived instead`,
   or why the archive was not made either). Nor can it take a mute off,
   bring an archived thread back or star it: those change nothing, and the
-  answer says so (`a turn cannot unmute or unarchive`) — a mail asking its
-  turn to undo the user's mute gets nowhere. A call is the turn's only when
-  it carries the token its session was handed (`RETINUE_ARRIVAL_TURN`,
-  sent by `chat-flags.py`). Muting stays the user's — their own flags, or
-  Ara acting on their word from any other session, whose call carries no
-  token and mutes even while a turn runs. The archive a mail turn sets
+  answer says so (`a turn cannot unmute or unarchive`). The web gateway
+  decides that, not the turn: a call on the thread while a mail's turn runs
+  on it is the turn's whether it carries the turn's token
+  (`RETINUE_ARRIVAL_TURN`, sent by `chat-flags.py`) or leaves it out — the
+  answer then says `a turn is running on this chat; …` — unless it carries
+  the proof a dashboard thread's turn is handed (`RETINUE_USER_TURN`). So a
+  mail asking its turn to undo the user's mute on its own thread gets
+  nowhere while the turn runs. That is all it holds: the turn's session
+  holds the backend token every agent session holds, so it can set another
+  chat's flags with the user's meaning, and a process it leaves behind can
+  act once the turn has ended — a guard against a turn that was talked into
+  something, not a sandbox. Muting stays the user's — their own flags, or
+  Ara acting on their word from their own dashboard thread, whose call
+  carries that turn's proof and mutes even while a mail's turn runs (on a
+  messenger chat, as before the gate, any call without a turn's token
+  does). The archive a mail turn sets
   is recorded as the turn's own: a turn that ends with a verdict keeps it, and
   the mail rings nothing; a turn that fails, ends without a verdict or times
   out has it undone — the thread un-archived — before the failure ring. That
@@ -414,7 +424,10 @@ instruction without VIP and has it ask for a high importance.
   was started for and shown: if another mail arrived in the thread after the
   turn's own, or waits for a turn of its own, the thread is not archived
   (the answer says `newer mail arrived`), and the mailbox is touched only
-  for the mail the turn worked.
+  for the mail the turn worked — unless every mail after the turn's own was
+  worked by a completed turn that asked for the archive too: the turn for
+  the older mails of a batch too big to quote whole, which runs last,
+  archives the thread then.
 - **No sending on a messenger.** A reply is only ever staged in the chat's
   draft; the user's send press is the only way a chat reply leaves in their
   name. That is how the chat surface works for every agent

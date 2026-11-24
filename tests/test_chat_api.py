@@ -540,9 +540,10 @@ def _stub_send_message(prompt, display_question=None, session_key=None,
                        model=None, restart_message=None, resume=True,
                        reply_attachments=False, reply_shell_actions=None,
                        thread_id=None, prompt_builder=None,
-                       display_message_id=None, arrival_turn=None):
+                       display_message_id=None, arrival_turn=None, user_turn=None):
     TURNS.append({"prompt": prompt, "question": display_question,
-                  "session": session_key, "resume": resume, "token": arrival_turn})
+                  "session": session_key, "resume": resume, "token": arrival_turn,
+                  "user_turn": user_turn})
     # What the session does while it runs — an instructed turn setting its
     # verdict, say.
     during = TURN_GATE.get("during")

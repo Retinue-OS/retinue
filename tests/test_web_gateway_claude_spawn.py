@@ -581,6 +581,40 @@ def _sensitive_run(sid: str, *, rc: int = 0, escalate: bool = False):
     return run
 
 
+def test_only_a_dashboard_turn_holds_the_users_word(wg):
+    """Decision AK: a dashboard thread's turn — the user's own conversation
+    with Ara — is handed a proof of that (RETINUE_USER_TURN), valid while
+    the turn runs and never after; a chat arrival's turn is handed its own
+    token and never the proof, whatever the spawner's environment holds."""
+    seen = []
+
+    def run(cmd, **kwargs):
+        env = kwargs["env"]
+        proof = env.get("RETINUE_USER_TURN")
+        seen.append((env, proof, bool(proof) and wg._user_turn_valid(proof)))
+        return subprocess.CompletedProcess(
+            cmd, 0, stdout=json.dumps({"result": "Done.", "session_id": "s-u"}), stderr="")
+
+    _capture_spawns(wg, "")
+    wg.subprocess.run = run
+    with _daemon_environment():
+        os.environ["RETINUE_USER_TURN"] = "inherited-proof"
+        try:
+            conv = wg._new_conv("user", "reto", "t", "user", "mute that thread", via_edge=True)
+            assert wg._conv_worker(conv["id"], f"conv:{conv['id']}", push=False)
+            arrival = wg._new_conv("user", "reto", "c", "user", "companion")
+            assert wg._conv_worker(arrival["id"], f"conv:{arrival['id']}", push=False,
+                                   arrival="A mail arrived.", arrival_turn="f" * 32)
+        finally:
+            os.environ.pop("RETINUE_USER_TURN", None)
+    (users, proof, valid), (turns, none, _v) = seen
+    assert proof and proof != "inherited-proof" and valid, (proof, valid)
+    assert not wg._user_turn_valid(proof), "the proof outlived its turn"
+    assert "RETINUE_ARRIVAL_TURN" not in users
+    assert none is None and turns["RETINUE_ARRIVAL_TURN"] == "f" * 32, turns
+    print("ok: only a dashboard turn holds the user's word, and only while it runs")
+
+
 def test_sensitive_turn_never_resumable(wg, tmp: Path):
     """A turn that attached a sensitive text never leaves a resumable session:
     send_message drops it under the session lock — so a turn queued behind it
@@ -1253,6 +1287,7 @@ def main():
         test_redact_a_user_message(wg)
         test_only_a_dashboard_turn_can_type(wg)
         test_a_turn_that_waited_types_only_for_the_user(wg)
+        test_only_a_dashboard_turn_holds_the_users_word(wg)
         test_sensitive_turn_never_resumable(wg, tmp)
         test_a_new_session_gets_the_whole_thread(wg)
         test_redaction_reaches_every_copy(wg, tmp)

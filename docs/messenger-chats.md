@@ -743,9 +743,11 @@ section.)
    mute it asks for is taken as an archive, its unmute, unarchive and star
    change nothing, and the answer says so. A flags call is the turn's only
    when it carries the token the turn's session was handed
-   (`RETINUE_ARRIVAL_TURN`, which `chat-flags.py` sends); one without it is
-   Ara on the user's word and mutes, also while a turn runs
-   (docs/dashboard.md, "The gate for mail").
+   (`RETINUE_ARRIVAL_TURN`, which `chat-flags.py` sends); on a messenger
+   chat one without it is Ara on the user's word and mutes, also while a
+   turn runs. (A mail thread is stricter: there a call without the token,
+   while a mail's turn runs, is that turn's unless it carries a dashboard
+   thread turn's proof — docs/dashboard.md, "The gate for mail".)
 
    As built, five things are worth naming:
 

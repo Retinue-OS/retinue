@@ -47,7 +47,10 @@ one JSON document per chat under ``CHAT_STATE_DIR``:
   arrival. And how many turns each mail has had (:meth:`note_turn_attempt`),
   so one whose turn keeps failing is not worked for ever — and
   ``turns_done``, the mails whose turn completed (:meth:`note_turn_done`),
-  so one offered again after a restart is not worked a second time.
+  so one offered again after a restart is not worked a second time; and
+  ``archive_asked``, those of them whose turn asked for the thread's
+  archive, which a later turn's archive may then reach
+  (:meth:`archive_through`).
 - ``inbound_ahead`` / ``read_ahead`` — the latest stamp an arrival carried
   from a little ahead of this clock, and how far past ``last_read`` the
   newest read reaches by it: a message stamped by a clock running fast lies
@@ -470,6 +473,30 @@ def turn_done(doc: dict | None, message_id: str | None) -> bool:
     return bool(message_id) and str(message_id) in ((doc or {}).get("turns_done") or [])
 
 
+def archive_asked(doc: dict | None, message_id: str | None) -> bool:
+    """Whether the turn that completed last for the arrival with this id
+    asked for the thread's archive (:meth:`ChatStateStore.note_turn_done`)."""
+    return (turn_done(doc, message_id)
+            and str(message_id) in ((doc or {}).get("archive_asked") or []))
+
+
+def asked_through(doc: dict | None, cut: int) -> bool:
+    """Whether every arrival the chat counted after place ``cut`` was worked
+    by a completed turn that asked for the thread's archive
+    (:func:`archive_asked`) — or is gone from where it came from. Each place
+    must be accounted for by id (``inbound_recent``): one the chat no longer
+    remembers, or that has no id, cannot be said to have been worked."""
+    seq = int((doc or {}).get("inbound_seq") or 0)
+    places: dict[int, str] = {}
+    for pair in (doc or {}).get("inbound_recent") or []:
+        if (isinstance(pair, (list, tuple)) and len(pair) == 2 and pair[0]
+                and isinstance(pair[1], int) and not isinstance(pair[1], bool)):
+            places[pair[1]] = str(pair[0])
+    gone = set(gone_arrivals(doc))
+    return all(place in gone or archive_asked(doc, places.get(place))
+               for place in range(int(cut) + 1, seq + 1))
+
+
 def gone_arrivals(doc: dict | None) -> list[int]:
     """The places in the chat's arrival count of the counted arrivals that are
     gone from where they came from (``inbound_gone``), ascending — whatever of
@@ -758,6 +785,11 @@ class ChatStateStore:
             # (note_turn_done): one offered again — its answer lost, this
             # process restarted — is accepted without another turn.
             "turns_done": [],
+            # Those of them whose completed turn asked for the thread's
+            # archive (note_turn_done's ``asked``), at most INBOUND_RECENT_MAX:
+            # a turn worked later — an older mail's, left for a turn of its
+            # own — may archive the thread over them (archive_through).
+            "archive_asked": [],
             # The latest stamp a counted arrival carried from ahead of this
             # clock, no further than READ_SKEW_SECONDS: a sender's clock, or
             # a receiving phone's, running a little fast. The rail takes
@@ -1214,6 +1246,10 @@ class ChatStateStore:
                 [str(m) for m in (gone.get("turns_done") or []) if m]
                 + [str(m) for m in (doc.get("turns_done") or []) if m]))
             doc["turns_done"] = done[-INBOUND_RECENT_MAX:]
+            asked = list(dict.fromkeys(
+                [str(m) for m in (gone.get("archive_asked") or []) if m]
+                + [str(m) for m in (doc.get("archive_asked") or []) if m]))
+            doc["archive_asked"] = asked[-INBOUND_RECENT_MAX:]
 
             doc["read_inbound"] = mine_read + their_read if read_before else None
             doc["last_read"] = mark
@@ -1755,16 +1791,22 @@ class ChatStateStore:
             self._write(doc)
             return count
 
-    def note_turn_done(self, chat_id: str, message_id: str | None) -> None:
+    def note_turn_done(self, chat_id: str, message_id: str | None, *,
+                       asked: bool = False) -> None:
         """A turn for the arrival with this id completed: its next offer —
         made because the answer to this one was lost — is no reason for
-        another (:func:`turn_done`)."""
+        another (:func:`turn_done`). ``asked``: the turn asked for the
+        thread's archive (:func:`archive_asked`); a turn that did not takes
+        an earlier turn's ask off the mail."""
         if not message_id:
             return
+        mid = str(message_id)
         with self._lock:
             doc = self._read(chat_id)
-            done = [m for m in doc.get("turns_done") or [] if m != str(message_id)]
-            doc["turns_done"] = (done + [str(message_id)])[-INBOUND_RECENT_MAX:]
+            done = [m for m in doc.get("turns_done") or [] if m != mid]
+            doc["turns_done"] = (done + [mid])[-INBOUND_RECENT_MAX:]
+            ask = [m for m in doc.get("archive_asked") or [] if m != mid]
+            doc["archive_asked"] = (ask + [mid] if asked else ask)[-INBOUND_RECENT_MAX:]
             self._write(doc)
 
     def archive_through(self, chat_id: str, cut: int) -> tuple[dict, bool]:
@@ -1774,13 +1816,19 @@ class ChatStateStore:
         and archiving would put it away unseen. Returns ``(doc, done)``.
         (Never a mute: a turn cannot mute — the web gateway's _turn_flags.)
 
+        An arrival counted since that a completed turn worked and asked to
+        archive too (:func:`asked_through`) is no such mail: a turn for
+        older mail — left for a turn of its own while the newer one's ran,
+        whose archive this very rule refused then — archives the thread
+        over it. Every arrival after ``cut`` must be one, or the chat stays.
+
         One decision under the lock, like :meth:`archive_unless_arrived`:
         an arrival counts itself before it unarchives, so either this sees
         the count and leaves the chat be, or it archives first and the
         arrival's unarchive brings the chat back."""
         with self._lock:
             doc = self._read(chat_id)
-            if int(doc.get("inbound_seq") or 0) > int(cut):
+            if int(doc.get("inbound_seq") or 0) > int(cut) and not asked_through(doc, cut):
                 return doc, False
             doc["archived"] = True
             self._write(doc)

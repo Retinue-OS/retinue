@@ -1410,7 +1410,11 @@ adopts). What the web gateway does with the event, by who sent the mail:
   told how many older ones wait; those stay on the chat's queue, untouched
   by anything that turn's outcome settles (its archive, its verdict, the
   rings, "told", the turns being over), and get a turn of their own next —
-  a turn is for the mails it was shown, and only for those — and none of it in a
+  a turn is for the mails it was shown, and only for those. Which mails those
+  are is decided once, by the worker (`_mail_arrival_quotes` over the whole
+  batch), and the prompt quotes exactly the quotes it decided: every mail a
+  turn takes is quoted in its prompt, and every mail the prompt says gets a
+  turn of its own gets one. None of it stands in a
   sentence that tells the turn
   what to do: those name the person by the address book's name alone, and
   the sender's address stands in the one command that needs it (the memory
@@ -1450,19 +1454,39 @@ adopts). What the web gateway does with the event, by who sent the mail:
   the user's word, as for a thread). There is no delete: erasing a chat is
   the user's own act. A merged thread's id answers `410` here as everywhere
   — unless a running turn answers to it (below).
-- **Who is asking.** A call is an arrival turn's only when it proves it:
-  the web gateway hands each arrival turn's session a token of its own
-  (`RETINUE_ARRIVAL_TURN`, one of the turn's unguessable job ids, set per
-  spawn by `scripts/session_env.py` and never inherited),
-  `scripts/chat-flags.py` sends it as `X-Arrival-Turn`, and the endpoint
-  takes the call for that turn's (`_turn_by_token`) only while the turn
-  runs on the chat named — on it, or on the chat a merge folded it into. A
-  token that names no turn running there (a turn asking about another chat,
-  one whose turn is over) is refused, `403`, and changes nothing. A call
-  without a token is Ara acting on the user's word from another session —
-  the user's own dashboard thread, say — and has the user's meaning, the
-  mute included, whether or not a turn runs on the chat. This holds for a
-  messenger chat's turns as for a mail thread's.
+- **Who is asking** is the web gateway's to decide, not the turn's
+  cooperation. It hands each arrival turn's session a token of its own
+  (`RETINUE_ARRIVAL_TURN`, one of the turn's unguessable job ids), and each
+  session of a dashboard thread's turn — the user's own conversation with
+  Ara, never an arrival's or a scheduled job's — a proof of that
+  (`RETINUE_USER_TURN`, minted per turn and valid while it runs); both are
+  set per spawn by `scripts/session_env.py` and never inherited, so a
+  session another one spawns carries neither. `scripts/chat-flags.py` sends
+  them as `X-Arrival-Turn` and `X-User-Turn`. In this order:
+  1. a call with a turn's token is that turn's (`_turn_by_token`) while it
+     runs on the chat named — on it, or on the chat a merge folded it into;
+     a token that names no turn running there (a turn asking about another
+     chat, one whose turn is over) is refused, `403`, and changes nothing;
+  2. a call with a valid user-turn proof has the user's meaning, the mute
+     included, even while an arrival turn runs on the chat; a stale or
+     invented proof is no proof;
+  3. a call with neither, on a mail thread while a mail's turn runs on it,
+     is taken as that turn's (below), and the answer's `reason` begins `a
+     turn is running on this chat; the call was taken as the turn's` and
+     ends `ask again once it is over` — for a scheduled job or another
+     session, which `chat-flags.py` tells so;
+  4. any other call — no turn running on the chat, a messenger chat — has
+     the user's meaning, as before the gate. A messenger chat's turns are as
+     they were: a call with the turn's token is the turn's, one without it
+     the user's word.
+
+  This holds for the turn's own chat while the turn runs, and no further.
+  It is a guard against a turn that was talked into something, not a
+  sandbox: an arrival turn's session holds the backend token every agent
+  session holds, so without its token it can set another chat's flags with
+  the user's meaning, and a process it leaves behind can act on its own
+  chat once the turn has ended. What keeps a turn to its brief there is the
+  brief, as on the messengers.
 - **A turn can only archive its own mails.** A mute keeps every later
   message of the chat out of view and unrung, a VIP's included — the user's
   to decide, never a turn's that one message started — and so are taking a
@@ -1490,7 +1514,19 @@ adopts). What the web gateway does with the event, by who sent the mail:
   leave the inbox, and the answer says so: `{"archived": false, "reason":
   "newer mail arrived"}` (or `"an earlier mail of the thread waits for a
   turn of its own"`). (That hook, if the gateway is away, is not owed for
-  later: an archive is owed only while the chat is archived.)
+  later: an archive is owed only while the chat is archived.) What a turn
+  asked is remembered on its mails once it completes, made or refused
+  (`archive_asked` beside `turns_done` in the chat's state, durable): newer
+  mail every piece of which a completed turn worked and asked to archive
+  too is no reason to stay (`chat_state.asked_through`). So the chain of
+  turns a batch too big to quote whole leaves — the newest mails' turn
+  first, refused while the older ones wait, then theirs, refused before by
+  "newer mail arrived" — archives the thread with its last turn, and the
+  instruction's "then archive the mail" is carried out. A mail that arrived
+  since and has had no turn, or whose turn did not ask, still keeps the
+  thread on the list; a later turn of a mail that did not ask takes the
+  ask off it, and so does the user bringing the thread back while the turn
+  runs.
 - **A thread its turn archived rings nothing.** What the turn archived is
   noted as its own. If the turn then ends with a verdict, the ring that
   waited on it is not delivered — whatever importance the verdict gives —

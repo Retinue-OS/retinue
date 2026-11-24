@@ -31,8 +31,13 @@ A turn a chat arrival started is told so by its environment:
 RETINUE_ARRIVAL_TURN holds its token, and this sends it along
 (``X-Arrival-Turn``). The gateway takes the call for that turn's only while
 the turn runs on the chat named; a call with a token for any other chat is
-refused. Without a token — Ara on the user's word, in any other session —
-the call has the user's meaning.
+refused. A dashboard thread's turn — the user's own conversation with Ara —
+holds a proof of that instead, RETINUE_USER_TURN, which this sends as well
+(``X-User-Turn``): its call has the user's meaning, also on a mail thread a
+turn is working. A call with neither has the user's meaning too, except on
+a mail thread while a mail's turn runs on it: then it is taken as that
+turn's (``"reason": "a turn is running on this chat; …"``) — ask again once
+the turn is over.
 
 A turn can only archive its own mails (docs/dashboard.md, "The gate for
 mail"). A mute keeps every later message of the chat out of view and
@@ -70,6 +75,8 @@ Configuration (environment):
     CONVERSATION_BACKEND_TOKEN  shared secret gating the endpoint (set by the entrypoint)
     RETINUE_ARRIVAL_TURN        the arrival turn's token (set by the web gateway for
                                 that turn's session only)
+    RETINUE_USER_TURN           a dashboard thread turn's proof (set by the web
+                                gateway for that turn's session only)
 """
 import argparse
 import json
@@ -85,6 +92,7 @@ DEFAULT_URL = os.environ.get(
 )
 TOKEN = os.environ.get("CONVERSATION_BACKEND_TOKEN", "").strip()
 ARRIVAL_TURN = os.environ.get("RETINUE_ARRIVAL_TURN", "").strip()
+USER_TURN = os.environ.get("RETINUE_USER_TURN", "").strip()
 DEFAULT_TIMEOUT = float(os.environ.get("CONVERSATION_BACKEND_TIMEOUT", "30"))
 
 
@@ -145,6 +153,8 @@ def main() -> int:
     }
     if ARRIVAL_TURN:
         headers["X-Arrival-Turn"] = ARRIVAL_TURN
+    if USER_TURN:
+        headers["X-User-Turn"] = USER_TURN
     req = urllib.request.Request(
         url,
         data=json.dumps(payload).encode("utf-8"),
@@ -175,7 +185,12 @@ def main() -> int:
         print(f"chat-flags: not everything asked was done: {body['reason']}.",
               file=sys.stderr)
         asked_away = payload.get("archived") is True or payload.get("muted") is True
-        if asked_away and body.get("archived") is True and body.get("muted") is False:
+        if str(body["reason"]).startswith("a turn is running on this chat"):
+            # Not a turn's call, taken as the running turn's: the caller's
+            # to make again once the turn is over.
+            print("chat-flags: an arrival turn is working this mail thread; ask again "
+                  "once it is over.", file=sys.stderr)
+        elif asked_away and body.get("archived") is True and body.get("muted") is False:
             print("chat-flags: the chat is archived, not muted: its next message brings "
                   "it back.", file=sys.stderr)
         elif asked_away and body.get("archived") is False:

@@ -892,21 +892,49 @@ subject and files, is `docs/dashboard.md`, "The gate for mail".
 nothing if the turn ends with a verdict, whatever importance the verdict
 gives: the chat's status says `quiet`, with the verdict and its actions. The
 archive covers only the mail the turn was started for: where another mail
-arrived in the chat after it, the chat is not archived (the answer says so),
-and the mailbox is told only of the mails the turn worked. A turn cannot
-mute: a mute it asks for is taken as that same archive, and the answer says so
-(`a turn cannot mute; archived instead`) — muting stays the user's. Archiving
-is all a turn can do with a chat's flags: its unmute, unarchive and star
-change nothing, and the answer says so. A flags call counts as the turn's
-only when it carries the token its session was handed
-(`RETINUE_ARRIVAL_TURN`, which `scripts/chat-flags.py` sends) for a turn
-running on that chat; a call without one is an agent acting on the user's
-word and has the user's meaning, a mute included, even while a turn runs. A turn
-that does not finish — it fails, runs past `MAIL_INSTRUCTION_TIMEOUT`, or sets
-no verdict — has the chat brought back (un-archived) and the mail rung by the
-failure rule, since a turn that did not finish is not trusted with having put
-a mail away. The user's own archive during a turn
-changes nothing about the ring.
+arrived in the chat after it, or an earlier one waits for a turn of its own,
+the chat is not archived (the answer says so), and the mailbox is told only of
+the mails the turn worked. What the turn asked is remembered on its mails once
+it completes, so a newer mail is no reason to stay in view when a turn that
+asked for the archive too has worked it: a batch too big to quote whole is
+worked newest first, and the turn for its older mails, the last of the chain,
+archives the thread when every mail after its own was worked by a turn that
+asked. A mail that arrived since and has had no turn, or whose turn did not
+ask, still keeps the thread on the list.
+
+A turn cannot mute: a mute it asks for is taken as that same archive, and the
+answer says so (`a turn cannot mute; archived instead`) — muting stays the
+user's. Archiving is all a turn can do with its chat's flags: its unmute,
+unarchive and star change nothing, and the answer says so. Who is asking is
+decided by the web gateway, not by the turn's cooperation:
+
+- a call carrying the token the turn's session was handed
+  (`RETINUE_ARRIVAL_TURN`, which `scripts/chat-flags.py` sends) is the turn's
+  where that turn runs on the chat named, and is refused (403) anywhere else;
+- a call carrying the proof a dashboard thread's turn is handed — the user's
+  own conversation with Ara (`RETINUE_USER_TURN`, sent too; valid while that
+  turn runs) — has the user's meaning, a mute included, even while a turn
+  runs on the thread;
+- a call carrying neither, on a mail thread while a mail's turn runs on it,
+  is taken as that turn's, and the answer says why (`a turn is running on
+  this chat; …`), so that a scheduled job or another session asks again once
+  the turn is over;
+- any other call — no turn running, a messenger chat — has the user's
+  meaning, as before the gate.
+
+That rule holds for the turn's **own** chat **while the turn runs**, and no
+further. It is a guard against a turn that was talked into something, not a
+sandbox: an arrival turn's session holds the backend token every agent
+session holds, so without its token it can set **another** chat's flags with
+the user's meaning, and a process it leaves behind can do so on its own chat
+once the turn has ended. What keeps a turn to its brief there is the brief,
+as on the messengers.
+
+A turn that does not finish — it fails, runs past `MAIL_INSTRUCTION_TIMEOUT`,
+or sets no verdict — has the chat brought back (un-archived) and the mail rung
+by the failure rule, since a turn that did not finish is not trusted with
+having put a mail away. The user's own archive during a turn changes nothing
+about the ring.
 
 **The re-offer rule.** A mail offered again is taken once, by its
 `Message-ID`: a repeat un-archives nothing, reopens no settled item, and is
