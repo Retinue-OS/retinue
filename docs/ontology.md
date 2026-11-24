@@ -277,3 +277,21 @@ SELECT ?when ?actor ?content ?challengedBy WHERE {
   OPTIONAL { ?memory kb:correctedBy|kb:supersededBy|kb:questionedBy ?challengedBy }
 } ORDER BY DESC(?when) LIMIT 50
 ```
+
+```sparql
+PREFIX kb: <https://w3id.org/retinue/kb#>
+PREFIX dcterms: <http://purl.org/dc/terms/>
+
+# The dashboard's threads with Ara, newest first: their state and the project
+# each is about. Only the list fields are in the store (scripts/thread_index.py),
+# never what a thread says; the dashboard's Archived tab pages through the same
+# summaries.
+SELECT ?thread ?title ?modified ?archived ?messages ?project WHERE {
+  ?thread a kb:Thread ;
+          dcterms:title ?title ;
+          dcterms:modified ?modified ;
+          kb:archived ?archived ;
+          kb:messageCount ?messages .
+  OPTIONAL { ?thread kb:project ?project }
+} ORDER BY DESC(?modified) LIMIT 50
+```
