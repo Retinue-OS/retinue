@@ -535,9 +535,13 @@ were split from, which the gateway holds against the record's `kb:text`.
 
 A line **shows something** when it has a letter, a number, a punctuation mark
 or a symbol that is not a blank look-alike (the braille blank, the Hangul and
-Khmer fillers, the Mongolian vowel separator); format characters (a
-zero-width space, a word joiner, a BOM) and spaces show nothing. Length is no
-test: "OK" is a whole message, and a lone "." is visible text.
+Khmer fillers, the Mongolian vowel separator), or a code point the running
+Python cannot name — unassigned to its Unicode tables (an emoji newer than
+they are) or private use — which cannot be known to be blank; format
+characters (a zero-width space, a word joiner, a BOM) and spaces show
+nothing. Length is no test: "OK" is a whole message, and a lone "." is
+visible text. This judges a model's choice only: trim()'s own rules keep
+every line that is not whitespace, as they always have.
 
 `apply_keep` takes `keep = [[first, last], …]`, 1-based inclusive line
 numbers, and is a choice only if it is a list of at most
@@ -616,7 +620,10 @@ seconds and the chat page's poll re-renders a message whose `text` or `trim`
 changed — and the one caller, the web gateway, has the new text in the
 answer: when a trim settles it forgets that message's live-overlay entry and
 invalidates what the chat list shows, so the preview follows without waiting
-for the store.
+for the store. A `409` whose `state` is `model` or `deterministic` — the mail
+was settled, perhaps by this very judgement when an earlier offer of it was
+written and its answer lost — and a `trim-source` that answers a settled
+state are taken the same way, with the text left to the store.
 
 #### The turn and the page
 
@@ -649,10 +656,13 @@ object `{"keep": [[first, last], …]}`. An answer parsed as that is a
 judgement and goes to `trim-result` as `keep`; one that does not parse is a
 judgement too and goes as `failed: "unparseable"`. A turn that ends without a
 judgement — a spawn error, a non-zero exit, a timeout, an auth or
-usage-limit failure — sends nothing, and the mail waits, longer after each:
-an hour (`MAIL_MODEL_TRIM_RETRY_SECONDS`, 3600), four, twenty-four. After
-`MAIL_MODEL_TRIM_ATTEMPTS` (3) of them the web gateway sends `failed:
-"gave_up"` and the mail is settled as untrimmed. The count is per mail and
+usage-limit failure — sends nothing, and the mail waits
+`MAIL_MODEL_TRIM_RETRY_SECONDS` (3600, an hour) after its first such turn and
+four times as long after the second (a day after any further one, where
+`MAIL_MODEL_TRIM_ATTEMPTS` allows more). The `MAIL_MODEL_TRIM_ATTEMPTS`-th
+settles it: the web gateway sends `failed: "gave_up"` and the mail stays as
+the rules trimmed it — with the default of 3, an hour's wait, a four hours'
+wait, and the third such turn ends it. The count is per mail and
 durable — beside the day's budget, in one small state file whose oldest
 entries go — so a restart does not hand a mail its attempts again. A model
 that could not be started at all (sign-in, the binary missing: no turn ran)
@@ -661,8 +671,9 @@ judgement, toward the feature's pause: three in a row rest it for ten
 minutes. A judgement the mail gateway cannot take right now (`503`, a hop
 timeout, the gateway away) is never thrown away: the web gateway keeps it,
 in memory, and offers it again after a short, growing wait — without a new
-turn and without a new charge — until it is taken, refused as stale (`409`,
-`404`, `410`) or about fifteen minutes have passed.
+turn and without a new charge — until it is taken, refused (`409`, `404`,
+`410`; a `409` that says the mail is settled counts as taken) or about
+fifteen minutes have passed.
 
 The chat page asks for a `wanting` bubble's trim once it has been at least
 half in view for a moment — not while the list is scrolled through — once per
@@ -704,10 +715,12 @@ inlined as `data:` URLs and links opening in a new tab. Remote images never
 load, so a tracking pixel never fires. The chat page's own policy gains
 `frame-src 'self'` for that one frame.
 
-**The record is never changed** by viewing, trimming or replying: the original
-parts are immutable, and the mailbox copy's content is never changed (a reply
-sets only `\Seen` on the thread, see "The mailbox follows the chat, never the
-reverse").
+**The record's original parts are never changed** by viewing, trimming or
+replying: they are immutable. What the model trim changes is the record's
+`kb:text`, which a valid choice replaces, and its `kb:trim`, which settling
+the mail sets (see "The model trim"). The mailbox copy's content is never
+changed (a reply sets only `\Seen` on the thread, see "The mailbox follows
+the chat, never the reverse").
 
 ## Writing (phase 2)
 

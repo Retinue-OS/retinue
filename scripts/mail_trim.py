@@ -855,7 +855,7 @@ def _squeeze(lines: list) -> list:
     """One blank line at most between paragraphs, none at either end."""
     out: list = []
     for line in lines:
-        if _visible(line):
+        if line.strip():
             out.append(line)
         elif out and out[-1]:
             out.append("")
@@ -2289,10 +2289,18 @@ _BLANK_LOOKALIKES = frozenset("\u2800\u3164\u115f\u1160\uffa0\u17b4\u17b5\u180e"
 
 def _visible(line: str) -> bool:
     """Whether a line shows anything: a letter, a number, a punctuation mark
-    or a symbol that is not one of the blank look-alikes. Length is no test
-    — "OK" is a whole message — and a lone "." is visible text."""
-    return any(unicodedata.category(ch)[0] in "LNPS" and ch not in _BLANK_LOOKALIKES
-               for ch in line)
+    or a symbol that is not one of the blank look-alikes, or a code point
+    this Python cannot name — unassigned (Cn: an emoji newer than its
+    Unicode tables) or private use (Co) — which cannot be known to be blank.
+    Length is no test — "OK" is a whole message — and a lone "." is visible
+    text. Only a model's choice is judged by it; trim()'s own rules keep any
+    line that is not whitespace."""
+    for ch in line:
+        category = unicodedata.category(ch)
+        if category in ("Cn", "Co") or (category[0] in "LNPS"
+                                         and ch not in _BLANK_LOOKALIKES):
+            return True
+    return False
 
 
 def _lines_digest(lines: list) -> str:

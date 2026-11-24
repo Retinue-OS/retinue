@@ -4083,6 +4083,35 @@ def test_a_choice_must_show_something():
     print("PASS apply_keep: a choice of lines that show nothing is no choice")
 
 
+def test_the_rules_keep_a_line_this_python_cannot_name():
+    """What a choice is judged by never changes trim()'s own rules: a line of
+    code points this Python does not know (an emoji newer than its Unicode
+    tables is unassigned to it), of private-use characters, or one that only
+    looks blank is kept as the rules always kept it — and to a choice, an
+    unknown or private-use code point shows something: what this Python
+    cannot name cannot be known to be blank."""
+    new_emoji, private = "\U0001FAE9", ""
+    for odd in (new_emoji, private):
+        result = mt.trim(odd, None)
+        assert (result.text, result.state) == (odd, "deterministic"), repr(odd)
+        result = mt.trim("Sounds good\n\n" + odd + odd, None)
+        assert result.text == "Sounds good\n\n" + odd + odd, repr(odd)
+        result = mt.trim(None, "<p>%s</p>" % odd)
+        assert (result.text, result.state) == (odd, "wanting"), repr(odd)
+        assert mt.apply_keep(["Hi", odd], [[2, 2]]) == odd, repr(odd)
+        assert mt.apply_keep(["Hi", odd, "Ann"], [[1, 3]]) == "Hi\n%s\nAnn" % odd, repr(odd)
+        source = mt.model_source(odd, None)
+        assert source is not None and source.lines == [odd], repr(odd)
+    # A line that only looks blank is the rules' to keep as they always did;
+    # only a model's choice reads it as no text.
+    text = "Hi,\n​\nthe venue moved\n\nAnn"
+    assert mt.trim(text, None).text == text
+    for blank in ("​", "⠀", "ㅤ", "ᅟ", "ᅠ", "ﾠ"):
+        assert mt.trim("Sounds good\n" + blank, None).text == "Sounds good\n" + blank, repr(blank)
+        assert mt.apply_keep(["Hi", blank], [[2, 2]]) is None, repr(blank)
+    print("PASS trim: the rules keep a line this Python cannot name, and so does a choice")
+
+
 def test_apply_keep_is_cheap_and_invents_nothing():
     import random
     lines = ["line %d" % i for i in range(1, 1501)]
@@ -4181,6 +4210,7 @@ def main():
     test_model_source_never_raises_and_stays_fast()
     test_apply_keep_takes_a_choice_and_only_a_choice()
     test_a_choice_must_show_something()
+    test_the_rules_keep_a_line_this_python_cannot_name()
     test_apply_keep_is_cheap_and_invents_nothing()
     test_module_is_standalone()
     print("all mail-trim tests passed")

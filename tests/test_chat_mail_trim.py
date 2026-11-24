@@ -155,8 +155,10 @@ class _MockMailGateway(BaseHTTPRequestHandler):
                                     "digest": _digest(src["lines"]), "subject": src["subject"],
                                     "sender": ANN, "is_reply": False, "bulk": True})
         if self.path == "/messages/trim-result":
-            if state != "wanting" or body.get("digest") != _digest(src["lines"]):
-                return self._json(409, {"error": "stale"})
+            if state != "wanting":
+                return self._json(409, {"error": "stale", "state": state or "deterministic"})
+            if body.get("digest") != _digest(src["lines"]):
+                return self._json(409, {"error": "stale", "state": "wanting"})
             text = _apply_keep(src["lines"], body["keep"]) if "keep" in body else None
             if text is None:
                 ist.update_message(src["path"], trim="deterministic")
@@ -447,6 +449,74 @@ def test_the_chat_list_follows_a_model_trim(r: Rig):
     r.wg._mail_trim_settle((CHAT, mid), "model", "Hi, the venue moved.")
     r.wg._chats_cache_invalidate()
     assert mail._chats(r.base)[CHAT]["last"]["text"] == "Hi, the venue moved."
+
+
+def _written_then_lost(r: Rig):
+    """The mail gateway writes the first offer of a judgement, and its answer
+    is lost on the way back (the hop times out after the write)."""
+    real, lost = r.wg._gateway_hop, []
+
+    def hop(gw, path, payload=None, **kwargs):
+        out = real(gw, path, payload, **kwargs)
+        if path == "/messages/trim-result" and not lost:
+            lost.append(out)
+            raise TimeoutError("timed out")
+        return out
+    return real, hop
+
+
+def test_a_judgement_settled_by_its_lost_offer_is_taken_as_settled(r: Rig):
+    """The re-offer of a judgement whose first offer was written is refused
+    409 stale with the state the record now has: the mail is settled, and
+    the list and the caches are told as a 200 tells them — the arrival's
+    live-overlay entry forgotten, the settled cache filled, no wait, no
+    count of attempts left."""
+    mid = r.mail()
+    shown = next(m for m in mail._messages(r.base, CHAT)["messages"] if m["id"] == mid)
+    r.wg._CHAT_OVERLAY.insert({"chat_id": CHAT, "channel": "email", "message_id": mid,
+                               "ts": shown["ts"], "direction": "in",
+                               "text": "\n".join(AUTHOR_LINES + FOOTER_LINES),
+                               "sender": ANN, "sender_name": "Ann Example"})
+    real, r.wg._gateway_hop = _written_then_lost(r)
+    try:
+        assert r.trim(mid)[0] == 202
+        r.idle()
+    finally:
+        r.wg._gateway_hop = real
+    assert len(_sent("/messages/trim-result")) == 2 and len(r.claude.calls) == 1
+    assert mail._one(r.record(mid), "trim") == "model"
+    assert not [e for e in r.wg._CHAT_OVERLAY.entries(CHAT) if e.get("message_id") == mid]
+    assert r.wg._mail_trim_settled_get(CHAT, mid) == ("model", None)
+    assert (CHAT, mid) not in r.wg._mail_trim_backoff and not r.wg._mail_trim_held
+    assert mail._chats(r.base)[CHAT]["last"]["text"] == "\n".join(AUTHOR_LINES)
+    assert _settled(r, mid) == {"state": "model", "text": "\n".join(AUTHOR_LINES)}
+    # No choice, settled the same way: deterministic, and nothing to wait for.
+    r.reset()
+    mid = r.mail()
+    r.claude.mode = ("answer", "I cannot tell.")
+    real, r.wg._gateway_hop = _written_then_lost(r)
+    try:
+        assert r.trim(mid)[0] == 202
+        r.idle()
+    finally:
+        r.wg._gateway_hop = real
+    assert len(_sent("/messages/trim-result")) == 2
+    assert mail._one(r.record(mid), "trim") == "deterministic"
+    assert r.wg._mail_trim_settled_get(CHAT, mid) == ("deterministic", None)
+    assert (CHAT, mid) not in r.wg._mail_trim_backoff
+    # A source the gateway says is settled already tells the list the same.
+    r.reset()
+    mid = r.mail()
+    shown = next(m for m in mail._messages(r.base, CHAT)["messages"] if m["id"] == mid)
+    r.wg._CHAT_OVERLAY.insert({"chat_id": CHAT, "channel": "email", "message_id": mid,
+                               "ts": shown["ts"], "direction": "in", "text": "before",
+                               "sender": ANN, "sender_name": "Ann Example"})
+    G["status"]["/messages/trim-source"] = (200, {"state": "model"})
+    assert r.trim(mid)[0] == 202
+    r.idle()
+    assert not r.claude.calls
+    assert not [e for e in r.wg._CHAT_OVERLAY.entries(CHAT) if e.get("message_id") == mid]
+    assert r.wg._mail_trim_settled_get(CHAT, mid) == ("model", None)
 
 
 def test_the_companion_is_told_a_model_chose(r: Rig):

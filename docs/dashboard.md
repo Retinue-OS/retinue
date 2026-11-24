@@ -1305,11 +1305,14 @@ judgement just now — busy (`503`: a pass holds its lock), another 5xx, the hop
 timed out or the gateway away — this process holds it (the digest and the
 ranges, in memory) and offers it again, first after five seconds and then
 twice as long each time up to two minutes, with no new turn and no new
-charge, until it is taken, refused as stale (`409`, `404`, `410`) or about
-fifteen minutes have passed; meanwhile the mail answers `202 queued`. Offering
+charge, until it is taken, refused (`409`, `404`, `410`) or about fifteen
+minutes have passed; meanwhile the mail answers `202 queued`. Offering
 it again is safe: the gateway rebuilds the source and compares the digest, so
 a judgement about lines that are no longer the mail's is refused, never
-applied.
+applied. A `409` whose `state` says the mail is settled — by this judgement,
+when an earlier offer was written and its answer lost on the way — is taken
+as a `200` is: the chat list is rebuilt without the arrival's overlay entry
+and the mail counts no attempts any more.
 
 *Only a judgement settles a mail — at most `MAIL_MODEL_TRIM_ATTEMPTS` turns
 without one.* A judgement is an answer: the ranges (`keep`, which the gateway
@@ -1322,8 +1325,10 @@ non-zero, printed no envelope, or reported an error in it (`is_error`, a
 subtype other than `success`) — sends nothing and leaves the record `wanting`.
 The mail can steer its turn there (an answer spun out past the timeout), so
 it costs the mail an attempt: it waits `MAIL_MODEL_TRIM_RETRY_SECONDS` (3600)
-after the first, four times as long after the second, a day after any later
-one, and after the `MAIL_MODEL_TRIM_ATTEMPTS`-th (3) this process sends
+after the first and four times as long after the second (a day after any
+further one, where `MAIL_MODEL_TRIM_ATTEMPTS` allows more), and the
+`MAIL_MODEL_TRIM_ATTEMPTS`-th (3: with the default, the third turn, after an
+hour's and a four hours' wait) makes this process send
 `failed: "gave_up"` and the mail is settled as the rules trimmed it — without
 another turn, and also by a process that only finds the count in the state
 file after a restart. The count is per mail and durable (the state file, at

@@ -14103,7 +14103,7 @@ def _mail_trim_work(job: dict) -> tuple[str, str]:
         # Settled already — by an earlier turn whose answer was lost here, or
         # by the gateway itself (a mail too long to hand over, or one whose
         # parts no longer give the text on record).
-        _mail_trim_settle(key, state, None)
+        _mail_trim_took(job, state, None)
         return "judged", "none"
     lines, digest = source.get("lines"), source.get("digest")
     if (state != "wanting" or not isinstance(lines, list) or not lines
@@ -14198,8 +14198,10 @@ def _mail_trim_offer_held(key: tuple, held: dict) -> str:
 
 def _mail_trim_offer(job: dict, gw: dict, body: dict) -> str:
     """POST /messages/trim-result once: ``judged`` (settled — and the chat
-    list is told), ``stale`` (409: the mail's source is not what the turn
-    was shown any more, or it was settled meanwhile), ``gone`` (404/410),
+    list is told; a 409 that says the mail is settled is that too: by this
+    very judgement, when an earlier offer of it was written and its answer
+    lost on the way, or by another), ``stale`` (409: the mail's source is
+    not what the turn was shown any more), ``gone`` (404/410),
     ``retry`` (the gateway could not take it just now: no answer, or a 5xx),
     or ``lost`` (an answer that will not change by asking again)."""
     try:
@@ -14213,6 +14215,12 @@ def _mail_trim_offer(job: dict, gw: dict, body: dict) -> str:
         _mail_trim_took(job, answer["state"], answer.get("text"))
         return "judged"
     if status == 409:
+        state = answer.get("state") if isinstance(answer, dict) else None
+        if state in ("model", "deterministic"):
+            # The refusal carries no text: the store's, once it has the
+            # rewrite, is the bubble's and the list's.
+            _mail_trim_took(job, state, None)
+            return "judged"
         return "stale"
     if status in (404, 410):
         return "gone"
@@ -14222,11 +14230,14 @@ def _mail_trim_offer(job: dict, gw: dict, body: dict) -> str:
 
 def _mail_trim_took(job: dict, state: str, text) -> None:
     """A trim settled on its record. The poll and the answer read it from
-    here until the store has the rewrite; and for a model trim the arrival's
-    live-overlay entry, which still carries the text from before and would
-    head the chat's row for the rest of its life, is forgotten and the list
-    rebuilt — the store already holds the record (the trim was asked for
-    from it), so nothing of the chat is lost with the entry."""
+    here until the store has the rewrite (where ``text`` is None — the
+    gateway said the mail is settled, not what it now says — the answer
+    reads the record's text, and the list the store's); and for a model
+    trim the arrival's live-overlay entry, which still carries the text from
+    before and would head the chat's row for the rest of its life, is
+    forgotten and the list rebuilt — the store already holds the record (the
+    trim was asked for from it), so nothing of the chat is lost with the
+    entry."""
     _mail_trim_settle(job["key"], state, text)
     if state == "model":
         _CHAT_OVERLAY.forget_messages(job["chat_id"], [job["message_id"]])
