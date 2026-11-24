@@ -38,6 +38,22 @@ one JSON document per chat under ``CHAT_STATE_DIR``:
   is gone from where it came from — a mail deleted in a client, a tombstone
   now — is no unread message: ``inbound_gone`` holds the places in the count
   of those (:meth:`ChatStateStore.forget_arrivals`).
+- ``untold`` / ``turn_attempts`` — for a mail, which counted arrivals the
+  user has not been told of yet, by message id: counted in the same write
+  that counts them, and told once the arrival's attention step and push have
+  run to the end (:meth:`ChatStateStore.told`). A mail's gateway offers what
+  this side did not accept again, and that offer finds here whether what the
+  first one owed was ever done — also after a restart, a merge or a later
+  arrival. And how many turns each mail has had (:meth:`note_turn_attempt`),
+  so one whose turn keeps failing is not worked for ever — and
+  ``turns_done``, the mails whose turn completed (:meth:`note_turn_done`),
+  so one offered again after a restart is not worked a second time; and
+  ``archive_asked``, those of them whose turn asked for the thread's
+  archive, which a later turn's archive may then reach
+  (:meth:`archive_through`) — until the user brings the thread back
+  (:meth:`set_flags` ``forget_asked``), which also counts on
+  ``asked_epoch``: a turn that asked before it asked for nothing
+  (:meth:`note_turn_done` ``epoch``).
 - ``inbound_ahead`` / ``read_ahead`` — the latest stamp an arrival carried
   from a little ahead of this clock, and how far past ``last_read`` the
   newest read reaches by it: a message stamped by a clock running fast lies
@@ -146,6 +162,12 @@ READ_SKEW_SECONDS = 120.0
 # a few messages later; this is far more than either needs, and small enough
 # to ride in every state write.
 INBOUND_RECENT_MAX = 64
+# How many mails of one chat can stand owed at once — told of, counted in
+# turns, or noted as worked — before the oldest note gives way. Far above the
+# newest arrivals remembered for telling a repeat (INBOUND_RECENT_MAX): what
+# is owed for a mail must not be lost because later mail came, only where a
+# thread is flooded past this.
+TURN_STATE_MAX = 1024
 
 # How many merges the store remembers (ChatStateStore.note_merged), newest
 # kept. A merge consumes a chat, so there are never more of them than there
@@ -424,6 +446,74 @@ def arrivals_after(doc: dict | None, seq: int | None) -> set[str]:
             and isinstance(pair[1], int) and not isinstance(pair[1], bool) and pair[1] > seq}
 
 
+def owes(doc: dict | None, message_id: str | None) -> bool:
+    """Whether the counted arrival with this id is still owed what an
+    arrival tells the user — its attention step and push
+    (:meth:`ChatStateStore.count_arrival`'s ``owe``, :meth:`ChatStateStore.told`).
+    False for a message without an id: nothing can be owed by name."""
+    return bool(message_id) and str(message_id) in ((doc or {}).get("untold") or [])
+
+
+def recent_place(doc: dict | None, message_id: str | None) -> int | None:
+    """The place in the chat's count of the arrival with this id, as
+    ``inbound_recent`` remembers it — or None where it does not (unlike
+    :func:`arrival_seq`, which then answers the count as it stands)."""
+    if not message_id:
+        return None
+    for pair in reversed((doc or {}).get("inbound_recent") or []):
+        if (isinstance(pair, list) and len(pair) == 2 and pair[0] == message_id
+                and isinstance(pair[1], int) and not isinstance(pair[1], bool)):
+            return int(pair[1])
+    return None
+
+
+def turn_attempts(doc: dict | None, message_id: str | None) -> int:
+    """How many turns the arrival with this id has had
+    (:meth:`ChatStateStore.note_turn_attempt`)."""
+    for pair in (doc or {}).get("turn_attempts") or []:
+        if isinstance(pair, list) and len(pair) == 2 and pair[0] == message_id:
+            return int(pair[1] or 0)
+    return 0
+
+
+def turn_done(doc: dict | None, message_id: str | None) -> bool:
+    """Whether a turn for the arrival with this id completed
+    (:meth:`ChatStateStore.note_turn_done`)."""
+    return bool(message_id) and str(message_id) in ((doc or {}).get("turns_done") or [])
+
+
+def archive_asked(doc: dict | None, message_id: str | None) -> bool:
+    """Whether the turn that completed last for the arrival with this id
+    asked for the thread's archive (:meth:`ChatStateStore.note_turn_done`)."""
+    return (turn_done(doc, message_id)
+            and str(message_id) in ((doc or {}).get("archive_asked") or []))
+
+
+def asked_epoch(doc: dict | None) -> int:
+    """How many times the user has brought the chat back so far
+    (:meth:`ChatStateStore.set_flags` ``forget_asked``): what a turn notes
+    when it asks for the archive, for :meth:`ChatStateStore.note_turn_done`
+    ``epoch``."""
+    return int((doc or {}).get("asked_epoch") or 0)
+
+
+def asked_through(doc: dict | None, cut: int) -> bool:
+    """Whether every arrival the chat counted after place ``cut`` was worked
+    by a completed turn that asked for the thread's archive
+    (:func:`archive_asked`) — or is gone from where it came from. Each place
+    must be accounted for by id (``inbound_recent``): one the chat no longer
+    remembers, or that has no id, cannot be said to have been worked."""
+    seq = int((doc or {}).get("inbound_seq") or 0)
+    places: dict[int, str] = {}
+    for pair in (doc or {}).get("inbound_recent") or []:
+        if (isinstance(pair, (list, tuple)) and len(pair) == 2 and pair[0]
+                and isinstance(pair[1], int) and not isinstance(pair[1], bool)):
+            places[pair[1]] = str(pair[0])
+    gone = set(gone_arrivals(doc))
+    return all(place in gone or archive_asked(doc, places.get(place))
+               for place in range(int(cut) + 1, seq + 1))
+
+
 def gone_arrivals(doc: dict | None) -> list[int]:
     """The places in the chat's arrival count of the counted arrivals that are
     gone from where they came from (``inbound_gone``), ascending — whatever of
@@ -648,6 +738,12 @@ class ChatStateStore:
             # has said; an empty list is an answer, None is not knowing.
             "participants": None,
             "peer": None,
+            # Whether a mail with a gate sender stands behind ``peer``: False
+            # where the latest arrival that named it was a mail the gate took
+            # for nobody (no From, several, only a Sender header), whose
+            # sender is shown and links no contact card; None where no
+            # arrival has said (a thread the user started, a messenger chat).
+            "peer_vouched": None,
             # The sends of this chat that wait in its gateway's queue for the
             # user's approval, oldest first (clean_pending). A copy: the
             # gateway's queue is the truth and this follows it (set_pending).
@@ -689,6 +785,34 @@ class ChatStateStore:
             # never goes back — and are no longer unread ones
             # (arrived_since_read, forget_arrivals).
             "inbound_gone": [],
+            # A mail's counted arrivals the user has not been told of yet, by
+            # message id, oldest first, at most TURN_STATE_MAX: written
+            # with the count (count_arrival's ``owe``) and taken out once the
+            # arrival's attention step and push have run to the end, or its
+            # ring that waited on a turn went out (told). One per arrival,
+            # never a high-water mark: an instructed sender's mail waits for
+            # its turn while later mail of the thread is attended, and a
+            # repeated offer of it must still find it owed.
+            "untold": [],
+            # How many turns each mail has had, as ``[message id, n]``, at
+            # most TURN_STATE_MAX (note_turn_attempt): the web gateway
+            # stops starting turns for one whose turn keeps failing.
+            "turn_attempts": [],
+            # The mails whose turn completed, at most TURN_STATE_MAX
+            # (note_turn_done): one offered again — its answer lost, this
+            # process restarted — is accepted without another turn.
+            "turns_done": [],
+            # Those of them whose completed turn asked for the thread's
+            # archive (note_turn_done's ``asked``), at most TURN_STATE_MAX:
+            # a turn worked later — an older mail's, left for a turn of its
+            # own — may archive the thread over them (archive_through).
+            "archive_asked": [],
+            # How many times the user brought the chat back, forgetting
+            # those asks (set_flags ``forget_asked``); a merge adds the two
+            # halves' up. A turn notes it when it asks for the archive, and
+            # its ask counts only while it still stands (note_turn_done
+            # ``epoch``).
+            "asked_epoch": 0,
             # The latest stamp a counted arrival carried from ahead of this
             # clock, no further than READ_SKEW_SECONDS: a sender's clock, or
             # a receiving phone's, running a little fast. The rail takes
@@ -906,6 +1030,7 @@ class ChatStateStore:
                      sender_name: str | None = None,
                      unknown_sender: bool | None = None,
                      participants=None, peer=None,
+                     peer_vouched: bool | None = None,
                      unsent: bool | None = None) -> dict:
         """Cache display metadata learned from a message event (the rail).
 
@@ -917,6 +1042,8 @@ class ChatStateStore:
         its gateway states them (see MAIL_CHANNEL); each replaces what was
         kept, cleaned (:func:`clean_parties`). None leaves them as they are,
         and a ``peer`` that does not read as one is not stored.
+        ``peer_vouched`` says whether a mail with a gate sender names that
+        peer (None leaves it).
 
         ``unsent`` says whether the chat is, so far, only a mail of the
         user's own that has not gone out (True — a queued new mail), or
@@ -930,6 +1057,8 @@ class ChatStateStore:
                 doc["participants"] = clean_parties(participants)
             if peer is not None:
                 doc["peer"] = clean_party(peer) or doc.get("peer")
+            if peer_vouched is not None:
+                doc["peer_vouched"] = bool(peer_vouched)
             if name:
                 doc["name"] = name
             if group is not None:
@@ -1043,7 +1172,11 @@ class ChatStateStore:
           message id (``inbound_recent``) and those that are gone
           (``inbound_gone``) come along, renumbered into the one count so
           that a place in it still says read or unread: what either chat's
-          read covered first, then what had landed since. Where the mark
+          read covered first, then what had landed since; so do the
+          arrivals either still owed the user (``untold``) and the turns
+          each mail had (``turn_attempts``), and the user's unarchives add
+          up (``asked_epoch``: the web gateway moves its running turns'
+          note of it along, _rekey_turns). Where the mark
           moved, the undo of the survivor's last *Mark as read* is dropped —
           it names a mark that no longer stands;
         - the **flags**: starred if either was; muted if either was (the user
@@ -1120,10 +1253,32 @@ class ChatStateStore:
             doc["inbound_gone"] = sorted(
                 {placed(seq, False) for seq in gone_arrivals(doc)}
                 | {placed(seq, True) for seq in gone_arrivals(gone)})[-INBOUND_RECENT_MAX:]
+            # What either half still owed its user, by message id: owed by
+            # the whole — a fold tells nobody of anything. And the turns
+            # each mail had, the most either half counted.
+            untold = list(dict.fromkeys(
+                [str(m) for m in (gone.get("untold") or []) if m]
+                + [str(m) for m in (doc.get("untold") or []) if m]))
+            doc["untold"] = untold[-TURN_STATE_MAX:]
+            attempts: dict[str, int] = {}
+            for source in (gone, doc):
+                for pair in source.get("turn_attempts") or []:
+                    if isinstance(pair, list) and len(pair) == 2 and pair[0]:
+                        attempts[str(pair[0])] = max(attempts.get(str(pair[0]), 0),
+                                                     int(pair[1] or 0))
+            doc["turn_attempts"] = [[m, n] for m, n in attempts.items()][-TURN_STATE_MAX:]
+            done = list(dict.fromkeys(
+                [str(m) for m in (gone.get("turns_done") or []) if m]
+                + [str(m) for m in (doc.get("turns_done") or []) if m]))
+            doc["turns_done"] = done[-TURN_STATE_MAX:]
+            asked = list(dict.fromkeys(
+                [str(m) for m in (gone.get("archive_asked") or []) if m]
+                + [str(m) for m in (doc.get("archive_asked") or []) if m]))
+            doc["archive_asked"] = asked[-TURN_STATE_MAX:]
 
             doc["read_inbound"] = mine_read + their_read if read_before else None
             doc["last_read"] = mark
-            for key in ("read_seq", "inbound_seq", "attended_seq"):
+            for key in ("read_seq", "inbound_seq", "attended_seq", "asked_epoch"):
                 doc[key] = int(doc.get(key) or 0) + int(gone.get(key) or 0)
             marks = [m for m in (doc.get("unread_since"), gone.get("unread_since")) if m]
             doc["unread_since"] = min(marks) if marks else None
@@ -1162,6 +1317,9 @@ class ChatStateStore:
             for key in ("instructed", "name", "peer", "contact"):
                 if not doc.get(key) and gone.get(key):
                     doc[key] = gone[key]
+                    if key == "peer":
+                        # What stands behind a peer travels with it.
+                        doc["peer_vouched"] = gone.get("peer_vouched")
             if not doc.get("gateway") and gone.get("gateway"):
                 # Slug and provenance travel as one, as everywhere.
                 doc["gateway"] = gone["gateway"]
@@ -1527,7 +1685,8 @@ class ChatStateStore:
 
     def count_arrival(self, chat_id: str, ts: str | float | None, *,
                       message_id: str | None = None,
-                      stamp: str | float | None = None) -> tuple[dict, bool, bool]:
+                      stamp: str | float | None = None,
+                      owe: bool = False) -> tuple[dict, bool, bool]:
         """Note one inbound landing unread; returns ``(doc, had_unread,
         counted)``.
 
@@ -1562,7 +1721,13 @@ class ChatStateStore:
         ahead by no more than READ_SKEW_SECONDS is kept as
         ``inbound_ahead``, for the read that covers this message
         (:meth:`_read_up_to`); one further ahead is no clock's error anyone
-        can vouch for, and is not."""
+        can vouch for, and is not.
+
+        ``owe`` (a mail's arrival) notes a counted arrival with an id as
+        owed to the user (``untold``) in the same write: whatever ends the
+        request between this count and the arrival's attention step — a
+        restart, a full disk — leaves it owed, and a repeated offer finds
+        it so (:func:`owes`, :meth:`told`)."""
         mark = iso_z(ts)
         stamp = mark if stamp is None else iso_z(stamp)
         now = time.time()
@@ -1582,6 +1747,9 @@ class ChatStateStore:
             if message_id:
                 recent.append([message_id, doc["inbound_seq"]])
                 doc["inbound_recent"] = recent[-INBOUND_RECENT_MAX:]
+                if owe:
+                    untold = [m for m in doc.get("untold") or [] if m != message_id]
+                    doc["untold"] = (untold + [message_id])[-TURN_STATE_MAX:]
             if (iso_z(now) < stamp <= iso_z(now + READ_SKEW_SECONDS)
                     and stamp > (doc.get("inbound_ahead") or "")):
                 doc["inbound_ahead"] = stamp
@@ -1618,6 +1786,86 @@ class ChatStateStore:
                 doc["unread_since"] = None
             self._write(doc)
             return doc
+
+    def told(self, chat_id: str, message_id: str | None) -> dict:
+        """The arrival with this id has been told to the user — its
+        attention step and push ran to the end, or the ring that waited on
+        its turn went out (or was put away by that turn): it is owed no
+        more. Returns the document; nothing is written where nothing was
+        owed, so a messenger's arrival, which never is, costs a read."""
+        with self._lock:
+            doc = self._read(chat_id)
+            if not owes(doc, message_id):
+                return doc
+            doc["untold"] = [m for m in doc.get("untold") or [] if m != str(message_id)]
+            self._write(doc)
+            return doc
+
+    def note_turn_attempt(self, chat_id: str, message_id: str | None) -> int:
+        """One more turn started for the arrival with this id; returns how
+        many it has had now (0 for a message without an id, which is never
+        offered again by it)."""
+        if not message_id:
+            return 0
+        with self._lock:
+            doc = self._read(chat_id)
+            pairs = [p for p in doc.get("turn_attempts") or []
+                     if isinstance(p, list) and len(p) == 2 and p[0] != message_id]
+            count = turn_attempts(doc, message_id) + 1
+            doc["turn_attempts"] = (pairs + [[str(message_id), count]])[-TURN_STATE_MAX:]
+            self._write(doc)
+            return count
+
+    def note_turn_done(self, chat_id: str, message_id: str | None, *,
+                       asked: bool = False, epoch: int | None = None) -> None:
+        """A turn for the arrival with this id completed: its next offer —
+        made because the answer to this one was lost — is no reason for
+        another (:func:`turn_done`). ``asked``: the turn asked for the
+        thread's archive (:func:`archive_asked`); a turn that did not takes
+        an earlier turn's ask off the mail.
+
+        ``epoch``: :func:`asked_epoch` as the turn found it when it asked.
+        Where the user has brought the chat back since, the ask is one they
+        have overruled, and is noted as no ask — decided here, in the write
+        that would record it, so an unarchive landing while the turn wraps
+        up is never overtaken by it."""
+        if not message_id:
+            return
+        mid = str(message_id)
+        with self._lock:
+            doc = self._read(chat_id)
+            if asked and epoch is not None and asked_epoch(doc) != int(epoch):
+                asked = False
+            done = [m for m in doc.get("turns_done") or [] if m != mid]
+            doc["turns_done"] = (done + [mid])[-TURN_STATE_MAX:]
+            ask = [m for m in doc.get("archive_asked") or [] if m != mid]
+            doc["archive_asked"] = (ask + [mid] if asked else ask)[-TURN_STATE_MAX:]
+            self._write(doc)
+
+    def archive_through(self, chat_id: str, cut: int) -> tuple[dict, bool]:
+        """Archive a chat for an agent's turn that was started for the
+        arrivals up to place ``cut`` in its count, unless one has been
+        counted since (``inbound_seq`` past ``cut``): the turn never saw it,
+        and archiving would put it away unseen. Returns ``(doc, done)``.
+        (Never a mute: a turn cannot mute — the web gateway's _turn_flags.)
+
+        An arrival counted since that a completed turn worked and asked to
+        archive too (:func:`asked_through`) is no such mail: a turn for
+        older mail — left for a turn of its own while the newer one's ran,
+        whose archive this very rule refused then — archives the thread
+        over it. Every arrival after ``cut`` must be one, or the chat stays.
+
+        One decision under the lock, like :meth:`archive_unless_arrived`:
+        an arrival counts itself before it unarchives, so either this sees
+        the count and leaves the chat be, or it archives first and the
+        arrival's unarchive brings the chat back."""
+        with self._lock:
+            doc = self._read(chat_id)
+            if int(doc.get("inbound_seq") or 0) > int(cut) and not asked_through(doc, cut):
+                return doc, False
+            doc["archived"] = True
+            self._write(doc)
+            return doc, True
 
     def archive_unless_arrived(self, chat_id: str) -> tuple[dict, bool]:
         """Archive a chat on its attention timer's behalf — unless a message
@@ -1658,7 +1906,8 @@ class ChatStateStore:
             return doc
 
     def set_flags(self, chat_id: str, *, archived: bool | None = None,
-                  muted: bool | None = None, starred: bool | None = None) -> dict:
+                  muted: bool | None = None, starred: bool | None = None,
+                  forget_asked: bool = False) -> dict:
         """Set a chat's user-facing flags, which say where the user wants
         the chat on their screen and nothing else. `starred` puts it at the
         top of whichever list it is in, and is independent of the other two. (Whether a message is
@@ -1674,11 +1923,22 @@ class ChatStateStore:
         until the next message brings it back, which is what un-muting is for.
 
         The inverse rule lives in :meth:`unarchive_unless_muted`, which an
-        arrival calls: a new message un-archives an unmuted chat."""
+        arrival calls: a new message un-archives an unmuted chat.
+
+        ``forget_asked``, with ``archived`` false: the user brought the
+        thread back, and what the turns that completed so far asked
+        (:func:`archive_asked`) is no archive a later turn may make over
+        their mails (:func:`asked_through`) — in the same write, so no turn
+        archives between the two. And ``asked_epoch`` moves on, so a turn
+        that asked before it notes no ask when it completes
+        (:meth:`note_turn_done` ``epoch``)."""
         with self._lock:
             doc = self._read(chat_id)
             if archived is not None:
                 doc["archived"] = bool(archived)
+                if forget_asked and not archived:
+                    doc["archive_asked"] = []
+                    doc["asked_epoch"] = asked_epoch(doc) + 1
             if muted is not None:
                 doc["muted"] = bool(muted)
                 if muted:

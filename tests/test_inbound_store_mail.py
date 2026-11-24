@@ -702,6 +702,40 @@ def test_iter_records():
     print("PASS test_iter_records")
 
 
+def test_the_gate_sender_and_a_tombstone_that_keeps_what_was_owed():
+    with tempfile.TemporaryDirectory() as tmp:
+        # The address the delivery gate goes by: its own triple, read back,
+        # kept through a rewrite and on a tombstone, like the sender.
+        urn, path, _refs = _mail(tmp, gate_sender="a@x.org")
+        text = path.read_text(encoding="utf-8")
+        assert f'<{urn}> <{ist.P_GATE_SENDER}> "a@x.org" .' in text
+        assert ist._parse(text)["gate_sender"] == "a@x.org"
+        ist.update_message(path, text="new", trim="model")
+        assert ist._parse(path.read_text())["gate_sender"] == "a@x.org"
+        # None, or empty: nobody — and no triple.
+        for none in (None, "", "  "):
+            _u, p, _r = _mail(tmp, timestamp=1001.0, gate_sender=none)
+            assert ist.P_GATE_SENDER not in p.read_text()
+            assert ist._parse(p.read_text())["gate_sender"] is None
+            p.unlink()
+        # A tombstone sets an owed mail delivered — unless its writer keeps
+        # the flag, for a mail owed again should it come back.
+        assert ist.tombstone_message(path, removed_at=2000.0, keep_delivered=True) is True
+        kept = ist._parse(path.read_text())
+        assert kept["removed_at"] and kept["delivered"] is False
+        assert kept["gate_sender"] == "a@x.org" and kept["text"] == ""
+        stamp = path.stat().st_mtime_ns
+        assert ist.tombstone_message(path, keep_delivered=True) is True
+        assert path.stat().st_mtime_ns == stamp, "idempotent: nothing rewritten"
+        assert ist.tombstone_message(path) is True
+        assert ist._parse(path.read_text())["delivered"] is True
+        # A delivered mail stays delivered either way.
+        _u, p2, _r = _mail(tmp, timestamp=1003.0, delivered=True)
+        assert ist.tombstone_message(p2, keep_delivered=True) is True
+        assert ist._parse(p2.read_text())["delivered"] is True
+    print("PASS test_the_gate_sender_and_a_tombstone_that_keeps_what_was_owed")
+
+
 def test_a_record_is_written_again_in_its_own_place():
     """``replace``: a mail's record written anew takes the old one's place —
     its file and its token — in one rename, as either direction; the blobs
@@ -779,5 +813,6 @@ if __name__ == "__main__":
     test_a_sent_mail_says_whom_the_server_refused_and_what_else_it_is_known_as()
     test_discard_media()
     test_iter_records()
+    test_the_gate_sender_and_a_tombstone_that_keeps_what_was_owed()
     test_a_record_is_written_again_in_its_own_place()
     print("all inbound_store mail tests passed")

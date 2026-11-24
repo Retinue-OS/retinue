@@ -212,8 +212,11 @@ pages). Inside the Android shell from RetinueShell/4 the gear opens the app's
 own settings page instead, which embeds *This instance* from
 `settings-instance.html` (docs/dashboard.md, "The settings page"). The address book (`contacts.html`,
 `components/contacts.js`; docs/contacts.md) is the *Contacts* tab — people,
-their handles on every channel, their attention settings, the VIP flag and
-the instruction their messages are worked by — over the live `/contacts` API. The outbox icon opens the gateway's `/sends`
+their handles on every channel, the e-mail domains they write from (sent as
+`domains` on a new contact, `add_domains` / `remove_domains` on a change),
+their attention settings, the VIP flag and
+the instruction their messages are worked by, mail included — over the live `/contacts` API
+(`tests/test_webapp_contacts.py`). The outbox icon opens the gateway's `/sends`
 page, the queue of messages waiting for approval: a queue that wants action,
 one tap away from every page. Those pages are the gateway's own; their one
 script is `gateway/sends.js`, which on the status page of a decided send
@@ -726,7 +729,12 @@ The API, as the components consume it:
   else changes — mute, restore and an arrival all leave it. `POST
   /chats/<id>/flags` (body `{archived?, muted?, starred?}`, any of them) is
   the one way in, and the answer carries the flags as they ended up — a
-  client reads them back rather than assuming what it asked for.
+  client reads them back rather than assuming what it asked for. Like a
+  send, it is accepted only through the reverse proxy: `403` from inside the
+  container where `EDGE_PROXY_PEERS` names the proxy — without it only from
+  loopback and from the address the caller dialled, so a caller coming in
+  from another of the container's addresses, or through a sibling that
+  relays, passes. An agent uses `scripts/chat-flags.py`.
 
   `POST /chats/<id>/delete` (no body) is not a flag but an erasure: every
   inbox gateway of the channel is asked to erase the chat (its own
@@ -756,9 +764,10 @@ The API, as the components consume it:
 
   These two flags replaced the messenger **sender blacklist**: not wanting to
   hear from someone is a chat one mutes, in the interface, on the chat one is
-  looking at — not an entry in a policy file only Ara can edit. (E-mail keeps
-  its own whitelist, which decides something else: frequent versus daily
-  triage on a pull channel.) Ara can set either flag too, through the same
+  looking at — not an entry in a policy file only Ara can edit. (E-mail has
+  no whitelist either: a mail chat is archived or muted like any other, and
+  whose mail is worked on arrival is a contact's VIP flag or instruction.)
+  Ara can set either flag too, through the same
   endpoint, but the user never has to go through her.
 
   Both are **independent of the triage delivery gate**, on purpose. Whether a

@@ -2,31 +2,38 @@
 
 ## Problem
 
-Every triage turn is a fresh `claude -p` session that reloads the whole static
-prefix (harness + tool schemas + `CLAUDE.md` + `MEMORY.md`) before it does any
-work, and re-reads that prefix on every tool round-trip. So cost scales as
-`prefix × round-trips × sessions`, and the dominant term is **sessions**: the
-e-mail triage job fires every 30 min (~48×/day) and every inbound messenger
-message spawns a session at the gateway — the large majority of them finding
-nothing that needed a model at all.
+Every model turn on an inbound message is a fresh `claude -p` session that
+reloads the whole static prefix (harness + tool schemas + `CLAUDE.md`) before
+it does any work, and re-reads that prefix on every tool round-trip. So cost
+scales as `prefix × round-trips × sessions`, and the dominant term is
+**sessions**. Before the gate, every inbound messenger message spawned a
+session at its gateway and an e-mail triage job polled the mailbox every half
+hour — the large majority of them finding nothing that needed a model at all.
 
 The fix is a **credit-free gate** in front of the spawn, mirroring
-`agent-self-review`: a plain script (or the gateway itself) decides whether a
-message is worth a model turn, and `claude -p` only starts on a hit. Nothing is
-lost — anything the gate holds back is picked up by a once-daily catch-all run.
+`agent-self-review`: the gateway that receives a message decides — from a
+policy file, in-process, for free — what the message is owed, and a model
+turn only starts on a hit. Nothing is lost, because delivery no longer depends
+on a turn: every message is persisted first and shown in its chat.
 
-This affects **inbox-mode accounts only** (accounts whose incoming mail/messages
-the system triages on the user's behalf). Control-mode and outbound identities
-are untouched.
+The gate is the same on every channel, **e-mail included**: persist, classify
+on two axes, notify the chat rail, and run a model turn only for a sender the
+user singled out. This document describes the policy and the messenger
+plumbing; what is particular to mail is summarised under *The e-mail axes*
+and *Where the gate runs* below and specified in [mail-chats.md](mail-chats.md).
+
+This affects **inbox-mode accounts only** (accounts whose incoming
+mail/messages the system handles on the user's behalf). Control-mode and
+outbound identities are untouched.
 
 ## Policy — two orthogonal axes (messenger)
 
 Messenger routing is decided on **two independent axes**, so the classes below
 are a *combination* of a sender status and a group's flags, not a single ladder:
 
-- **Sender** — a handle is or is not a **VIP** (messenger only; see *The VIP
-  axis* below). There is **no sender whitelist or blacklist on messenger**: see
-  *Why messenger has no whitelist* below.
+- **Sender** — a handle is or is not a **VIP** (see *The VIP axis* below), and
+  may carry the user's instruction. There is **no sender whitelist or
+  blacklist**, on any channel: see *Why messenger has no whitelist* below.
 - **Group** — three independent flags: **news** (its messages are also forwarded
   to the news feed / Herald), and at most one of **quieted** or **ignored**.
 
@@ -49,10 +56,11 @@ point of `vip` being sender-only: a quieted group is the user saying *do not
 interrupt me about this room*, not *and ignore this person when they write in
 it*. A VIP in such a group is worked quietly.
 
-E-mail keeps **both** axes, including its own whitelist, with one
-channel-specific twist: a mail's "group" is its **mailing list** (`List-Id`),
-and a mail that carries no usable list header is its own group of one, keyed on
-the sender address. See *E-mail groups* below.
+E-mail is routed on the **same two axes**, with one channel-specific twist on
+each: a mail's "group" is its **mailing list** (`List-Id`), and a mail that
+carries no usable list header is its own group of one, keyed on the sender
+address; and a sender may be matched by **domain** as well as by exact
+address. See *The e-mail axes* below.
 
 ### Why messenger has no whitelist
 
@@ -74,41 +82,55 @@ Existing `triageWhitelistHandle` / `triageBlacklistHandle` triples are simply
 no longer read: they are inert and drop out on the next policy write. A
 blacklist entry that mattered should be re-stated as a **muted chat**.
 
-E-mail is unaffected — there the whitelist still decides something real
-(frequent versus daily triage on a pull channel, where nothing arrives on a
-screen by itself).
+E-mail had a whitelist of its own for longer, because it was a pull channel:
+nothing arrived on a screen by itself, so the whitelist decided which mail a
+triage run looked at within the half hour and which waited for the daily one.
+With the mail gateway a mail arrives in its chat like any message, and that
+whitelist went the same way (see *The e-mail axes* below, and
+[mail-chats.md](mail-chats.md), "What retires").
 
-### Whitelist — exact addresses by default, wildcards by hand
+### The e-mail axes — domains for senders, lists for groups
 
-The whitelist is a list of match entries:
+Mail is gated like a messenger message, by the mail gateway, on arrival
+([mail-chats.md](mail-chats.md), "The gate"). Only what differs from the
+messengers is stated here.
 
-- **Auto-added:** exact addresses the user has corresponded with
-  (`alice@epfl.ch`). Mail sent through `email_client.py` whitelists its
-  recipients the moment it leaves (directly or on approval), so a reply reaches
-  the next frequent tick; the daily refresh from the Sent folder is the backstop
-  for mail sent from other clients.
-- **Manual:** a `*@domain` (or `*@*.domain`) **wildcard** the user adds
-  deliberately to trust a whole domain.
+**The sender axis: VIP, instructed, or neither.** A sender is a VIP or
+instructed because a **contact** says so: `contacts.sync_policy` projects the
+e-mail addresses of every VIP person and of every person with an instruction
+into the `email` channel's policy file, in the messenger shape
+(`triageVipHandle` / `triageInstructedHandle` under
+`urn:retinue:triage:email:contacts`). One thing exists only here: a contact
+may carry a **domain** (`kb:emailDomain`, `contacts.py … --add-domain`), which
+is projected as a wildcard handle — `*@example.org` for every address at that
+domain, `*@*.example.org` for the domain and everything below it — and
+`gate_decision("email", sender)` matches an exact address first, then the
+wildcards. That is how an organisation that writes from many addresses gets
+one instruction. On every other channel a handle is matched exactly and such
+a string is a handle nobody has.
 
-A message matches if its sender equals an exact entry **or** falls under a
-wildcard entry. Only exact addresses are ever auto-added — the system never
-auto-adds a domain. This is what makes freemail safe: emailing one
-`person@gmail.com` whitelists *that address*, never all of `gmail.com`. A
-freemail domain is only ever trusted if the user types the wildcard themselves.
+A domain is never added by the system: sending a mail to `person@gmail.com`
+makes nobody a VIP, and a freemail domain is covered only if the user files it
+on a contact themselves. Glob support is deliberately minimal — `*@domain` and
+`*@*.domain`, no regex.
 
-Glob support is deliberately minimal: `*@domain` and `*@*.domain`. No regex.
+| Sender | On arrival | A model turn |
+|---|---|---|
+| **VIP** | the chat shows the mail and it rings | yes, in the chat's companion |
+| **instructed** (not a VIP) | the chat shows it silently; the turn's verdict decides the ring (a failed or slow turn rings) | yes, briefed by the instruction |
+| anyone else | the chat shows it under *Unread*; **nothing is pushed** | no |
 
-### E-mail groups — the list axis, and the same three flags
+The last row is where mail differs from a messenger, on purpose: an arriving
+mail **pushes nothing by default**, and a contact can say otherwise — the VIP
+flag, an instruction, or the person's importance prior and permits in the
+attention model. There is no sweep for the rest: mail from a sender who is
+neither VIP nor instructed is listed and judged by nobody.
 
-A mailing list is not a sender. The people who post to a list change; the list
-does not, and it is the list one has an opinion about ("read-only", "I answer on
-this one"). So e-mail is routed on the same two axes as messenger:
-
-- the **sender** decides *how urgently* a mail is triaged — whitelisted means the
-  frequent run, anything else waits for the daily sweep (this axis is e-mail's
-  alone; messenger retired it, see above);
-- the **group** decides *where else it goes* — the same `news` / `quieted` /
-  `ignored` flags PR #114 introduced for messenger groups.
+**The group axis: the mailing list.** A mailing list is not a sender. The
+people who post to a list change; the list does not, and it is the list one
+has an opinion about ("read-only", "I answer on this one"). So a mail's group
+is its list, and the group carries the same `news` / `quieted` / `ignored`
+flags as a messenger group.
 
 The group id is the message's `List-Id` (RFC 2919), normalised: bracketed part,
 lowercased, and rejected unless it looks like a domain — no whitespace, at least
@@ -119,59 +141,58 @@ having none. A mail with no usable `List-Id` falls back to **its own sender
 address as its group** — a newsletter that carries no list header is a group of
 one, so the three flags apply to it with no second mechanism.
 
-| class | frequent | daily | in the feed |
-|---|---|---|---|
-| whitelisted sender | yes | yes | if the group is `news` |
-| unknown sender, `ignored` group | no | no | if the group is `news` |
-| unknown sender, `quieted` group | no | yes | if the group is `news` |
-| unknown sender, unflagged group | no | yes | no |
+| Group flag | What it does to a mail |
+|---|---|
+| `news` | filed into the news feed for the Herald; the mail **starts no chat** (it joins one only when it continues a thread that is already mirrored, or when its sender is a VIP or instructed) |
+| `quieted` | the chat shows the mail silently |
+| `ignored` | the same; and where the group is also `news`, the mail is consumed once the feed has it — marked seen and moved out of the INBOX |
+| none | as the sender axis says |
 
-The last two triage rows are deliberately identical: on a pull channel the daily
-sweep already *is* the quiet tier. `quieted` earns its keep as the explicit
-opposite of `ignored` — "in the feed **and** in the triage" — which is exactly
-the distinction between a list one only reads and one one also writes to:
+`quieted` and `ignored` are mutually exclusive, as on messenger; `news`
+combines with either. The canonical pairs:
 
-- a read-only newsletter → **`news` + `ignored`** (filed to the feed, never a
-  model turn). On messenger, that still leaves the chat in the dashboard's
-  list: whether a chat is *shown* is a separate pair of flags the user sets
-  there (Archive / Mute, on the full chats page — `POST /chats/<id>/flags`),
-  deliberately not implied by anything here. A group can be a news source and
-  still be a chat one reads and answers in, which is what the next line is;
-- a list one both reads and answers on → **`news` + `quieted`** (filed to the
-  feed *and* still triaged).
+- a read-only newsletter → **`news` + `ignored`** (in the feed, out of the
+  INBOX, never a chat);
+- a list one both reads and answers on → **`news` + `quieted`** (in the feed,
+  and the mail stays where it arrived).
 
-Group entries take the same two shapes as whitelist entries — an exact id, or a
-`*@domain` wildcard. On a group the wildcard also covers ids **beneath** the
-domain, because a `List-Id` is a namespace a platform hands out per publication:
-`*@substack.com` therefore matches both `no-reply@substack.com` and the list
+The two axes stay **independent**: no group flag stops a VIP's or an
+instructed sender's turn — a `news` group included: their mail is filed, and
+is also in its chat, offered and worked, and never taken out of the INBOX by
+the news rail — and declaring a group `news` makes nobody a VIP.
+
+Group entries take two shapes — an exact id, or a `*@domain` wildcard. On a
+group the wildcard also covers ids **beneath** the domain, because a `List-Id`
+is a namespace a platform hands out per publication: `*@substack.com`
+therefore matches both `no-reply@substack.com` and the list
 `sgcarney.substack.com`. It does **not** match a mailbox at a subdomain
 (`someone@sgcarney.substack.com`) — that stays the strict `*@*.domain` reading
-the whitelist relies on, so loosening the group axis never loosens trust.
+the sender axis relies on, so loosening the group axis never widens who a
+contact's domain covers.
 
 ```bash
 python3 scripts/triage_policy.py email-news-add   '*@substack.com'
 python3 scripts/triage_policy.py email-ignore-add '*@substack.com'
 python3 scripts/triage_policy.py email-quiet-add  members.list.example.org
-python3 scripts/triage_policy.py show-email       # whitelist / news / quiet / ignore
+python3 scripts/triage_policy.py show-email            # the group flags: news / quiet / ignore
+python3 scripts/triage_policy.py show --channel email  # the sender classes: vip / instructed
 python3 scripts/triage_policy.py check-email stranger@x.com \
     --list-id '<members.list.example.org>'
-# group   members.list.example.org
-# news    no
-# triage  group-quieted (frequent: no, daily: yes)
+# group      members.list.example.org
+# news       no
+# attention  quieted
+# sender     neither
 ```
 
-`quieted` and `ignored` are mutually exclusive, as on messenger; `news` combines
-with either. The axes stay **independent**: declaring a group `news` does not
-whitelist anyone, and a whitelisted correspondent is not turned into a feed
-source — a whitelisted sender writing to an `ignored` list is still triaged now.
+`check-email` exits 0 for a sender whose mail buys a turn (VIP or instructed)
+and 3 otherwise, as `check-handle` does.
 
-Everything lives in the **same** `.nt` file, which is why `save_email_policy()`
-is the only supported writer — a caller that rendered just the whitelist would
-silently erase the group flags (the Sent-folder refresh used to be exactly that
-shape).
-
-Like the messenger flags, this is edited by talking to Ara ("Newsletter X gehört
-in den Feed"); the CLI is what she runs.
+The group flags live in a file of their own
+(`…/messenger/email/policy/email-policy.nt`), beside the channel's `policy.nt`
+that holds the sender classes; `save_email_policy()` is its only supported
+writer. Like the messenger flags, they are edited by talking to Ara
+("newsletter X belongs in the feed"); the CLI is what she runs. A sender is
+never set there: who is a VIP or instructed is said on the contact.
 
 Address-level `news` entries written before list detection existed keep working:
 news is matched against the group **and** the bare sender address, so a
@@ -254,7 +275,7 @@ with the chat.
 
 ## State
 
-The VIP flag, the e-mail whitelist and the group flags are **emitted as `.nt`** — the same pattern
+The VIP and instructed handles and the group flags are **emitted as `.nt`** — the same pattern
 as the existing `_generated` registries (`agents.nt`, `conversation-models.nt`).
 That choice does three jobs at once: it indexes natively in qlever (no
 converter), it is trivial for a gateway to parse off disk, and it retires any
@@ -262,21 +283,24 @@ separate per-app JSON.
 
 **The retinue side writes the policy files; the gateways are readers** — the
 reverse direction of the message files. On the retinue side there are two
-writers: Ara (`triage_policy.py`, the Sent-folder derivation) and the web
-gateway's projection of the address book's VIPs; every read-modify-write holds
+writers: Ara (`triage_policy.py`) and the web gateway's projection of the
+address book's VIP and instructed persons; every read-modify-write holds
 the file's `policy_lock`, so neither drops the other's change. The messenger policy rides on the **same
 per-gateway volume as that channel's messages** (see the volume topology below),
 because the gateway must read it at classify time — see the next point. The
-e-mail policy (whitelist and group flags, one file) rides on the mail
-gateway's volume the same way, since that gateway reads the group flags at
-ingest: `_generated/messenger/email/policy/email-policy.nt`, beside the
-channel's own `policy.nt` (`triage_policy.email_whitelist_path()`;
-`TRIAGE_EMAIL_WHITELIST_PATH` overrides it). It used to live at
-`_generated/triage/email-whitelist.nt`, and
+e-mail policy rides on the mail gateway's volume the same way, as two files
+in its `policy/` folder: `policy.nt`, the channel's sender classes in the
+messenger shape, and `email-policy.nt`, the e-mail group flags
+(`triage_policy.email_whitelist_path()`; `TRIAGE_EMAIL_WHITELIST_PATH`
+overrides it — both keep the name of the whitelist the file once also held).
+The flags' file used to live at `_generated/triage/email-whitelist.nt`, and
 `triage_policy.ensure_email_policy_location()` moves it from there on the
 retinue side — first thing at container start, since the mail gateway's mirror
-waits for the file (docs/messaging.md, "E-mail (the mail gateway)"). News mail
-is still filed to the feed by this gate; the mail gateway only skips it.
+waits for the file (docs/messaging.md, "E-mail (the mail gateway)"). Triples
+of the retired whitelist that a file still holds (`triageWhitelistAddress`,
+`triageWhitelistWildcard`, the `…email-whitelist:contacts` subject) are not
+read and drop out on the file's next write; `scripts/migrate-triage.py` moves
+what they held onto contacts.
 
 **Why the gateway reads a raw file, never SPARQL.** Classification happens on the
 inbound hot path, in-process. If the gateway resolved the policy over
@@ -287,10 +311,10 @@ for the *query* path. Same file, two readers, different freshness needs, both
 satisfied.
 
 **The model is the normal editor of this state, not the user with a text
-editor.** Every change flows through Ara: instructions like "trust everyone at
-`*@epfl.ch`", "block that group" or "Mara's messages should be handled the
-moment they arrive" are conversational — Ara emits the wildcard, the group id or
-the VIP handle and confirms. The files stay plain, readable `.nt`, so they *can*
+editor.** Every change flows through Ara: instructions like "work everything
+from `epfl.ch` as I told you", "block that group" or "Mara's messages should
+be handled the moment they arrive" are conversational — Ara files the domain
+on a contact, sets the group flag or the VIP flag, and confirms. The files stay plain, readable `.nt`, so they *can*
 be corrected by hand, but that is a fallback. Ara also reads them (over SPARQL)
 to answer "who is a VIP?".
 
@@ -298,122 +322,74 @@ to answer "who is a VIP?".
 ([contacts.md](contacts.md)), the flag belongs on the person (`contacts.py
 update <id> --vip`, the VIP switch on the contact card or the Contacts page),
 not on one handle: `contacts.sync_policy` projects every handle of every VIP
-person into these files — messenger accounts as `triageVipHandle`, e-mail
-addresses as whitelisted addresses — under a subject of their own
-(`urn:retinue:triage:<channel>:contacts`, `…email-whitelist:contacts`). The
+person into these files as `triageVipHandle` — messenger accounts, and on the
+`email` channel their addresses and their domains as wildcards — under a
+subject of their own (`urn:retinue:triage:<channel>:contacts`). The
 projection is replaced wholesale on every change and on the gateway's tick;
-hand-set VIPs and the Sent-derived whitelist are never touched by it. Readers
+hand-set VIPs are never touched by it. Readers
 need no change: the loaders read the predicate and ignore the subject.
 `triage_policy.py vip-add` remains for a handle nobody has filed. The same
-projection writes every messenger handle of every person with an instruction
+projection writes every handle of every person with an instruction
 as `triageInstructedHandle` (the `instructed` class); `show` lists them and
-`check-handle` says `instructed` on a second line.
+`check-handle` says `instructed` on a second line, and exits 0 for it, as for
+a VIP.
 
 The one thing that is **not** hers alone is where a
 chat sits on the user's screen: Archive and Mute are buttons in the dashboard,
 and Ara can press them on request but is never in the way.
 
-## The two channels need the gate in different places
+## Where the gate runs
 
-E-mail is **pull**; messenger is **push**. The policy is shared; the plumbing is
-not.
+The policy is shared; the plumbing is each gateway's own. A messenger
+transport hands a message over exactly once, so its gateway *is* the backlog
+(next section). A mailbox can be asked again, so the mail gateway mirrors it
+and the mailbox stays the backlog.
 
-### E-mail — scheduler-gated poller (pull)
+### E-mail — the mail gateway
 
-IMAP has a queryable backlog. The gate is a scheduler `command` job (zero Claude
-credits):
+For every new mail in the INBOX that is not backfill, the mail gateway runs
+the messengers' inbound flow ([messenger-chats.md](messenger-chats.md),
+*Inbound flow*; the contract is [mail-chats.md](mail-chats.md), "The gate"):
 
-1. List **the INBOX** — all of it, not the unread subset. `unread` is a mailbox
-   flag the user can flip from any mail client; the status store (step 4) is
-   what decides whether a message is handled. "All of it" is literal: the
-   first listing is a small newest-first window, widened once when it
-   saturates, and a mailbox larger than the wide window is walked to the end
-   in pages by UID cursor (`search --uid-max`), so the oldest mail — the mail
-   the oldest-first slice wants — is never out of view behind a cap. A page
-   is one bulk header FETCH, not one per message, and whether it was full
-   is read off what the server matched (`scanned`), not off how many
-   summaries came back, so the walk is cheap and an unreadable header cannot
-   end it early.
-2. **Settle what has already been answered.** Each message whose thread subject
-   appears in a Sent listing with a later date is *nominated*, then confirmed
-   exactly by `email_client answered` — a server-side IMAP SEARCH for replies
-   citing its Message-ID, filtered back down to the same correspondent, the
-   same base subject and a strictly later timestamp; untracked replies go
-   through the same filter after an exact recipient search. The Sent listing
-   is bounded by **date**, not by count — `--since` the day before the oldest
-   INBOX message, because nothing sent earlier can answer anything still
-   open — so it is complete by construction and small in proportion to the
-   backlog's age. A residual cap guards against one very old open mail
-   dragging in years of Sent; when it bites the listing is incomplete, so the
-   gate nominates from what it listed, says so, and a reply older than the
-   window is not settled that tick — the mail stays in the INBOX and is
-   proposed, where the skill's own already-answered check sees it. The exact
-   checks themselves are bounded per run (oldest mail first; the rest wait
-   for the next run), and a negative is remembered under the Sent state it
-   was checked against (`.answered-checks.json` in the status dir), so the
-   cap is spent on candidates not yet checked rather than on the same ones
-   every tick. It never
-   widens to an exact check of the whole INBOX, which would put unbounded
-   work in front of the bounded slice. (No date read off a capped listing is
-   a safe boundary either: the cap keeps the newest UIDs, and UID order need
-   not be date order.)
-   A confirmed one is moved to `TRIAGE_ANSWERED_FOLDER` and recorded
-   `resolved`, so it never reaches a proposal again. Only the exact check ever
-   archives, and the action is a move, never a delete.
-3. **Route both rails in one pass** (`route()`, below): each message is asked for
-   a decision on its sender *and* its group. A `news` group is filed to the feed;
-   whether the mail is *also* left for triage is the group's `ignored`/`quieted`
-   flag, so a read-only newsletter can never buy a model turn while a list one
-   answers on still reaches triage.
-4. Dedup by message-id against the existing triage status (same sanitized
-   id-scheme triage already uses). A message that already has a status record
-   is **not new work** and does not arm the gate — whatever its status. Triage
-   never marks mail read (`unread ≠ unhandled`), so a classified message stays
-   unread in the INBOX until its disposition is executed, which for an omnibus
-   batch means waiting on the user; without this step every tick would re-spawn
-   a session over the same settled stack. Two exceptions, both because the gate is the *only*
-   thing that spawns a triage session — a state nothing else revisits is a
-   state nothing else can ever finish:
-   - **Stalled** (`_stalled`): a record on a non-terminal status untouched for
-     `TRIAGE_STALL_DAYS` (default 7) is abandoned rather than in progress, and
-     re-arming it is the only way its mail ever leaves the INBOX.
-   - **A due omnibus digest** (`omnibus_due`): the skill accrues
-     archive/delete candidates on `omnibus_pending` and sends one digest per
-     `EMAIL_PROCESSING_INTERVAL` — that accrual is what keeps the user from
-     being pinged several times a day. Since accrued mail sits on an open
-     status, the gate arms on the *bundle* instead: it reads
-     `omnibus_pending` records off the INBOX listing (not by walking the
-     status store — on a 30-minute tick that is not free) and, when the
-     interval since `.last-omnibus` has elapsed, spawns a run told to send the
-     digest. A missing or unparseable marker counts as due: the cost is one
-     digest, the alternative is bundled mail nobody sees. Due-ness is read
-     across the whole INBOX listing rather than the whitelisted subset, since
-     a bundle accrued by a daily run can hold mail the frequent pass does not
-     whitelist.
-5. Keep only whitelisted senders → spawn the model for those.
-6. The **daily** job runs for **any** sender (fixed morning hour, before the
-   briefing).
-7. **Hand over a bounded slice, oldest first.** The spawn payload is the
-   oldest `TRIAGE_BATCH_SIZE` (default 25) of the messages that armed the run
-   — never-seen and stalled ones — with each message's UID, so the session
-   can read, flag and move it without a listing of its own; recorded mail is
-   not handed over. A due omnibus bundle rides along as a *count*, not a
-   listing: the digest is composed from the status store and is one unit of
-   work whatever its size, so listing it would only unbound the prompt. The
-   prompt lists the slice in full and says it is the whole scope: the
-   session does not enumerate the INBOX for
-   more, records each message the moment its disposition is settled, and runs
-   the whole-picture passes (Phase 1's store→INBOX, done-but-still-there and
-   stalled repairs, Phase 5's reminders) only on the run told it drains the
-   backlog. When more is left, the gate exits **75** and the scheduler records
-   a `partial` run, so a job with `resume_after_seconds` comes back for the
-   next slice after minutes rather than after its interval
-   (`docs/scheduling.md`). The point is that the model's progress is durable
-   only per message — its status record — so a run that takes a slice it can
-   finish, and records it, beats one that takes the whole backlog and is
-   killed at its budget with nothing recorded. That was the failure mode: a
-   sweep that never finished never reduced its own backlog, so every run had
-   more to do than the last.
+1. **Persist** the record, `delivered: false`.
+2. **Gate**: the group axis by `triage_policy.email_gate_decision(sender,
+   list_id)` — which answers `{group, news, quieted, ignored}` and nothing
+   else — and the sender axis by `triage_policy.gate_decision("email", sender,
+   group)`, read for `vip` and `instructed`. The sender on both is the
+   **gate sender**: the one address of a mail with exactly one `From` header
+   holding exactly one address, lowercased by its ASCII letters (none where a
+   character folds into ASCII) — never the `Sender` header, never the first
+   of several addresses; a mail without one is from nobody and buys no turn
+   ([mail-chats.md](mail-chats.md), "Who the sender is"). An unreadable
+   policy fails **open** on the group axis (no flags) and **closed** on the
+   sender axis: nobody is a VIP or instructed, because a mail must not buy a
+   model turn for want of a readable file.
+3. **News**: a `news` group is filed to the feed (*The news rail on e-mail*
+   below) and starts no chat — unless the sender is a VIP or instructed, whose
+   mail goes on to the next step as well.
+4. **Notify the chat rail** with a handover. The rail's acceptance marks the
+   record delivered; for a VIP or an instructed sender it also starts the
+   turn in the chat's companion and the gateway waits on that job, exactly as
+   a messenger gateway does. Attachments ride along only for those two.
+
+Three things differ from a messenger, all deliberate:
+
+- **A mail pushes nothing by default** (the table under *The e-mail axes*
+  above).
+- **There is no triage fallback for mail.** A mail the rail could not take —
+  no answer, an uncertain answer, no acceptance — stays `delivered: false`
+  and the gateway offers it again on later polls. No session is spawned for
+  it, and the mail gateway has no `GET /undelivered`.
+- **No daily sweep.** Nothing reads the mail of senders who are neither VIP
+  nor instructed.
+
+E-mail triage — the scheduler-gated poller that used to stand here, its
+frequent and daily runs, the whitelist, the omnibus, the status store and the
+already-answered check — is retired. `scripts/triage-gate.py` is a stub that
+prints a notice and exits 0, for the jobs chambers may still declare; what
+triage knew about a sender was moved into instructions on contacts by
+`scripts/migrate-triage.py` ([mail-chats.md](mail-chats.md), "What retires",
+"The migration").
 
 ### Messenger — gateway-owned store + delivery flag (push)
 
@@ -441,8 +417,8 @@ because the constraint above is a choice for one of them:
 
 The Telegram gateway reads `iter_dialogs` for the conversation list and never
 reads messages that way. Nothing below depends on that staying true: the
-synthesized backlog is what the gate and the daily drain work from on every
-channel, so a future history read would be an extra source, not a replacement.
+synthesized backlog is what the gate and the recovery drain work from on every
+messenger channel, so a future history read would be an extra source, not a replacement.
 
 **Write path — one volume per gateway, not one across all of them.** Each gateway
 has its **own** volume; three gateways → three independent volumes, so Signal's
@@ -564,21 +540,26 @@ instruction as its brief and ends with a verdict
 (`POST /internal/chats/<id>/verdict`), and the web gateway then puts the
 message through the attention model with that importance and deadline. A turn
 that fails, sets no verdict or runs past `CHAT_INSTRUCTION_TIMEOUT` has the
-message pushed as a VIP's would be. The gate verdict carries the flag to the
+message pushed as a VIP's would be. (A mail's ring waits
+`MAIL_INSTRUCTION_TIMEOUT` instead, 600 s, and a mail gets at most
+`MAIL_ARRIVAL_TURN_ATTEMPTS` turns: [mail-chats.md](mail-chats.md), "The
+gate".) The gate verdict carries the flag to the
 rail as `gate.instructed`, and the message's attachments ride along as they do
 for a VIP. On the fallback path — the rail declining — an instructed sender is
 treated as a VIP is: never held, forwarded to triage.
 
 A rail that cannot take the message answers no acceptance and no handle, and
 the gateway falls back to everything it did before the chat surface existed —
-the held classes' `delivered_if_held` and the triage forward. **Triage itself
-is unchanged**, and still owns the e-mail channel and anything the rail hands
-back.
+the held classes' `delivered_if_held` and the triage forward. **Triage is
+that fallback and nothing else** (`.claude/skills/triage/SKILL.md`): what a
+messenger rail hands back. It does not own the e-mail channel any more.
 
-- The daily catch-all calls each inbox-mode gateway's
-  `GET /undelivered?since=…`, processes the returned messages; the flag flips as
+- A recovery run calls each inbox-mode messenger gateway's
+  `GET /undelivered?since=…` and processes the returned messages; the flag flips as
   a side effect of the fetch, so a re-run is naturally idempotent. It does **not**
-  read undelivered over SPARQL (that wouldn't clear the flag).
+  read undelivered over SPARQL (that wouldn't clear the flag). Nothing in the
+  framework schedules it: it runs when the user asks or a chamber declares a
+  job for it.
 
 **Forwarded ≠ delivered.** A forward POSTs the message with `async: true`, and
 the retinue gateway answers **202 Accepted** with a `job_url` — acceptance, not
@@ -586,7 +567,7 @@ completion. So the flip waits for that job: `job_delivery.confirm_delivery`
 polls `GET <job_url>` on a daemon thread and calls `mark_delivered` **only** on
 `status: "done"`. `status: "error"`, a 404 (the in-memory job record expired
 before the turn finished), and the poll deadline all leave `delivered: false`,
-so the daily drain re-surfaces the message. Without this, a triage turn that
+so the recovery drain re-surfaces the message. Without this, a triage turn that
 died — an upstream model outage, a crashed session — left the message on record
 as delivered and nothing ever looked at it again: a silent loss, exactly what
 the never-drop invariant exists to prevent. A gateway that answers
@@ -596,8 +577,8 @@ already run by then.
 **No-action-class messages** (status updates, voice-note echoes, the
 daily-briefing self-echo, note-to-self, and unknown senders in an **ignored**
 group) carry signal but demand nothing now; they are written with
-`delivered: true` already set. History stays complete and queryable; the daily
-drain never picks them up; they never prompt.
+`delivered: true` already set. History stays complete and queryable; the
+recovery drain never picks them up; they never prompt.
 
 ### The news rail
 
@@ -609,8 +590,7 @@ alongside the triage flags — but they run independently:
   hands the message to the web-gateway's `POST /internal/news`
   (`scripts/news_ingest.py` → `news_store.add_items`), which shapes it into a feed
   reference with no importance. The Herald scores it on the next curation tick.
-  No model turn is spent on the forward itself, and it happens on arrival — not on
-  the up-to-a-day triage drain.
+  No model turn is spent on the forward itself, and it happens on arrival.
 - **Cross-container by necessity.** The messenger gateways run in their own
   containers and cannot touch `NEWS_DIR` (the web-gateway owns it), hence the HTTP
   hand-off rather than a direct `news-add.py` call. `NEWS_INGEST_URL` defaults to
@@ -626,46 +606,46 @@ alongside the triage flags — but they run independently:
   it locked down sets `NEWS_INGEST_TOKEN` on the gateways and the web-gateway.
   It is deliberately *not* `CONVERSATION_BACKEND_TOKEN`: the entrypoint generates
   that one when it is missing, so "unset" would be unreachable.
-- **Parallel to the agent path.** A triage turn can still file a one-off item with
-  `news-add.py` (an e-mail newsletter met during triage, a linked page). The
+- **Parallel to the agent path.** An agent turn can still file a one-off item with
+  `news-add.py` (a newsletter met while working a chat, a linked page). The
   `news` group flag is the *automatic* rail for a whole broadcast source; that
   stays open for the ad-hoc case.
 
 #### The news rail on e-mail
 
-Same idea, same feed, different plumbing — because e-mail is pull. `triage-gate.py`
-runs the rail itself (`route()`), inside the retinue container, in the one pass
-that opens both modes:
+Same idea, same feed, and since the gate phase the same place: the gateway.
+The mail gateway runs the rail itself at ingest, for a mail whose group — or
+whose bare sender address — is `news`:
 
-1. Ask `tp.email_gate_decision(sender, list_id)` — one call answers both axes.
-2. `read --uid` the message, build the item — **Subject** as the title, a
-   `TRIAGE_NEWS_EXCERPT_CHARS`-capped body excerpt as the summary, `email:<addr>`
-   as the source id.
-3. The link is the newsletter's **own declared** web version: `Archived-At`
-   (RFC 5064) or `List-Archive` (RFC 2369), surfaced by `email_client.py read`.
-   Nothing is scraped from the body — the first URL in a newsletter is as often a
-   tracking pixel as the article, and the feed item's id is keyed off the URL, so
-   a wrong link is worse than none.
-4. On a successful forward: `flag --read`, then `move` to `TRIAGE_NEWS_FOLDER`
-   (default `Archive`, non-destructive — the feed holds a *reference*, so the mail
-   is archived, never deleted; set it empty to leave the mail in place).
-5. Write the triage **status file** — `disposition: news`, and `resolved` only if
-   the move actually happened. Triage's status store, not `\Seen`, is what stops a
-   message being re-proposed; a terminal status while the mail is still in the
-   INBOX is precisely the drift Phase 1's third pass repairs.
+1. Build the item — **Subject** as the title, a `MAIL_NEWS_EXCERPT_CHARS`-capped
+   excerpt of the mail's text as the summary, `email:<addr>` as the source id —
+   and hand it to `news_ingest.forward_news(channel="email", …)`, like a
+   messenger gateway (`NEWS_INGEST_URL`, optional `NEWS_INGEST_TOKEN`).
+2. The link is the newsletter's **own declared** web version: its
+   `Archived-At` (RFC 5064), which names this one mail. Not `List-Archive`
+   (RFC 2369): that names the list's archive, the same on every issue, and the
+   feed item's id is keyed off the URL — every issue after the first would be
+   taken for the first and dropped. Nothing is scraped from the body either —
+   the first URL in a newsletter is as often a tracking pixel as the article,
+   so a wrong link is worse than none. A mail without `Archived-At` is filed
+   with no link, its item keyed on its text.
+3. The mail starts no chat. It joins one only when its `References` reach a
+   thread that is already mirrored — normally because the user wrote in it —
+   or when its sender is a VIP or instructed, and is then in the feed *and*
+   in that chat. A news mail the reader could not read is neither filed nor a
+   chat; it is read again with the placeholders, and filed once it reads.
+4. Where the group is also `ignored` and the feed took the item, the mail is
+   consumed: `\Seen`, and a move to `MAIL_NEWS_FOLDER` (default: the archive
+   folder; empty leaves it in the INBOX; the retired `TRIAGE_NEWS_FOLDER` is
+   read where it is not set). Only a mail in no chat is consumed. The feed
+   holds a *reference*, so the
+   mail is archived, never deleted. A `news` + `quieted` mail is filed and
+   otherwise left where it arrived.
 
-Steps 4 and 5 — marking the mail read, moving it, writing a terminal status —
-run only when the decision says triage is **not** owed a look at it, i.e. for a
-`news` + `ignored` group. Otherwise (`news` + `quieted`, or a whitelisted sender
-on a `news` list) the item is filed and **nothing else is touched**: the mail
-stays unread in the INBOX so triage still sees it. Re-filing it on the next
-tick is a no-op — a feed item's id is a hash of its content, and the store skips
-ids it already holds — so no extra dedup marker is needed.
-
-Failure is always backwards-safe: if the feed rejects the item the mail is left
-untouched and falls through to normal triage — even for an `ignored` group — so a
-broken rail degrades to "a model turn looks at it", never to a silently swallowed
-message.
+Failure is backwards-safe: a feed that refuses the item leaves the mail
+untouched and it is offered again on a later poll. Re-filing is a no-op — a
+feed item's id is a hash of its content, and the store skips ids it already
+holds — so no dedup marker is needed.
 
 The two group flags encode **routing and whether personal interaction is
 possible** — never signal quality. Whether any single item is worth surfacing is
@@ -674,13 +654,14 @@ canonical combinations: a **feed-only broadcast source** (subscribed to purely a
 an information source; nobody there addresses the user personally) is
 **news + ignored** (kept in the feed, never bothers triage); a **group channel
 where personal interaction is possible** (an unknown sender there may actually be
-reaching out) is **news + quieted** (in the feed, and reaching triage on the
-daily drain). A source Herald consistently ranks at the bottom is not a channel
+reaching out) is **news + quieted** (in the feed, shown silently in its chat,
+and — when the rail could not take it — held for the recovery drain). A source Herald consistently ranks at the bottom is not a channel
 flag at all — it should be unsubscribed (or never marked `news`).
 
 The e-mail analogue is exact, with the mailing list in the group's place: a
 read-only newsletter (Substack, a press release list) is **news + ignored**; a
-list one both reads and posts to is **news + quieted**.
+list one both reads and posts to is **news + quieted** (see *The e-mail axes*
+above).
 
 **Schema.** Align the per-message triple shape with the session-logging
 unification (retinue#85) rather than inventing a parallel vocabulary — one RDF
@@ -692,32 +673,39 @@ There is a gap between a message arriving and it being queryable (qlever-dir's
 rebuild). It costs nothing, because the gateway's inbound handler already **has
 the message in-process** — it never queries the store to classify or to spawn.
 The only SPARQL consumers are the user's ad-hoc history questions, which are far
-past 15 s. And the daily drain reaches the backlog through the gateway endpoint,
+past 15 s. And the recovery drain reaches the backlog through the gateway endpoint,
 not through SPARQL, so it is never subject to the lag either.
 
 ## Rollout / tiers
 
 Tier-3 across both the framework and the gateway services:
 
-- **framework:** the e-mail gate scheduler job + script, the daily-drain jobs,
-  the shared state files, and this doc. The e-mail news rail adds two tunables on
-  the `retinue` service: `TRIAGE_NEWS_FOLDER` (default `Archive`; empty leaves the
-  mail in the INBOX) and `TRIAGE_NEWS_EXCERPT_CHARS` (default 600). It needs
-  `NEWS_INGEST_URL` like the gateways do. The sweep adds three more:
-  `TRIAGE_BATCH_SIZE` (default 25; how many never-seen or stalled messages one
-  run hands the model, oldest first — non-positive means as many as the
-  prompt lists, `TRIAGE_PROMPT_LIST_LIMIT`), `TRIAGE_SENT_RECONCILE` (default
-  `1`; `0` switches off the credit-free archiving of already-answered mail,
-  the one thing the gate does to the mailbox on its own) and
-  `TRIAGE_ANSWERED_FOLDER` (where answered mail goes; defaults to
-  `TRIAGE_NEWS_FOLDER`, so a deployment names its archive once). The scan
-  scope has no knob: the gate scans the INBOX, since `unread` is a mailbox
-  flag and the status store is what decides handled-state.
-- **gateways:** `signal-gateway` / `whatsapp-gateway` / `telegram-gateway` each
+- **framework:** the policy library (`scripts/triage_policy.py`), the address
+  book's projection into it (`contacts.sync_policy`), the shared state files,
+  and this doc. Nothing of the gate runs as a scheduler job any more. The
+  retired e-mail triage's `TRIAGE_INBOX_SCAN_*`, `TRIAGE_PROMPT_LIST_LIMIT`,
+  `TRIAGE_STALL_DAYS`, `TRIAGE_SENT_DERIVE_LIMIT`, `TRIAGE_BATCH_SIZE`,
+  `TRIAGE_SENT_RECONCILE`, `TRIAGE_ANSWERED_FOLDER`,
+  `EMAIL_PROCESSING_INTERVAL` and `RETINUE_TRIAGE_MODEL` are no longer read by
+  anything (`TRIAGE_NEWS_FOLDER` and `TRIAGE_NEWS_EXCERPT_CHARS` only by the
+  mail gateway, below). What stays are the two paths `TRIAGE_MESSENGER_DIR`
+  and `TRIAGE_EMAIL_WHITELIST_PATH`, and the one-time migration's settings
+  (`scripts/migrate-triage.py`, [mail-chats.md](mail-chats.md), "The
+  migration"): `TRIAGE_STATE_DIR` (its marker, cutoff file, snapshot and journal, and the
+  retired status store it reports on; keep it set wherever a deployment moved
+  it), `MAIL_OWN_ADDRESSES`, `RETINUE_TRIAGE_MIGRATION`,
+  `MIGRATE_TRIAGE_MODEL_TIMEOUT` and `MIGRATE_TRIAGE_MIRROR_WAIT`.
+- **gateways:** `signal-gateway` / `whatsapp-gateway` / `telegram-gateway` /
+  `sms-gateway` each
   get the shared volume mounted RW, per-message `.nt` writing, the
   classification gate on inbound, and `GET /undelivered?since=…`. For the news
   rail they also carry `scripts/news_ingest.py` and forward news-flagged messages
-  to the web-gateway (guarded by `NEWS_INGEST_URL`).
+  to the web-gateway (guarded by `NEWS_INGEST_URL`). The `mail-gateway` gates
+  the same way, with no `/undelivered`; its news rail has two tunables of its
+  own, `MAIL_NEWS_FOLDER` and `MAIL_NEWS_EXCERPT_CHARS` — the retired triage
+  gate's `TRIAGE_NEWS_FOLDER` and `TRIAGE_NEWS_EXCERPT_CHARS`, which it still
+  reads where the new name is not set (an empty value included: an upgrade
+  keeps an operator's setting), saying so at start.
 - **web-gateway:** the `POST /internal/news` endpoint that shapes a forwarded
   message into a feed item via `news_store` — open unless `NEWS_INGEST_TOKEN` is
   set (`_news_ingest_authorized`).
@@ -731,5 +719,3 @@ Takes effect on merge → `scripts/self-update.py` (rebuilds the gateway images)
 ## Open implementation questions (to resolve during build)
 
 1. Exact triple predicates for a message, reconciled with retinue#85.
-2. Whether the daily e-mail run and the daily messenger drain are one job or two.
-3. Recompute cadence for the derived e-mail whitelist (Sent-folder scan).

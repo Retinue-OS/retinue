@@ -41,8 +41,9 @@ the ontology defaults (docs/ontology.md):
   their importance prior (``kb:importance``, 0–5) and the Focus modes they may
   interrupt (``kb:permit <urn:retinue:mode:<id>>``); whether they are a
   VIP (``kb:vip true``), whose messages a model works the moment they arrive;
-  and the user's standing **instruction** for them (``kb:instruction``, free
-  text), the brief a model works each of their messages by;
+  the user's standing **instruction** for them (``kb:instruction``, free
+  text), the brief a model works each of their messages by; and the e-mail
+  **domains** they write from (``kb:emailDomain``, see *Domains* below);
 - each messaging-service handle: a ``foaf:OnlineAccount`` linked by
   ``foaf:account``, with ``foaf:accountName``, ``foaf:accountServiceHomepage``
   and ``kb:channel`` (the literal the message ledger carries, so an account
@@ -59,6 +60,21 @@ names who wrote. An account whose name is an E.164 number also gives the
 person that telephone. An account or an e-mail address belongs to at most one
 person across all chambers; telephones may be shared (a family landline).
 
+Domains
+-------
+An organisation, a shop that sends receipts, a team behind many mailboxes
+writes from a *domain*, not from one address. A person can carry such domains
+(record key ``domains``): ``example.org`` covers every address
+``@example.org``; ``*.example.org`` covers every address at ``example.org``
+or at any domain below it — the reading the delivery gate gives the same
+wildcard (``triage_policy._domain_matches_wildcard``). A domain is no handle:
+nothing can be sent to it, and it is not a ``(channel, handle)`` pair. It is a
+fallback for *who wrote this mail*: a lookup of an e-mail address answers the
+person who holds that exact address, else the person with the most specific
+domain covering it (``example.org`` before ``*.example.org``, a longer domain
+before a shorter one), and marks such a hit ``match: "domain"``. Like an
+address, one spelling of a domain belongs to at most one person.
+
 Library use (the web-gateway's contact card)::
 
     book = ContactBook()
@@ -72,6 +88,7 @@ Command line (agents)::
     contacts.py find --name mara
     contacts.py add --chamber private --name "Mara Keller" --email mara@example.org
     contacts.py update <id> --add-handle whatsapp:+41791234567
+    contacts.py update <id> --add-domain example.org --add-domain '*.example.org'
     contacts.py update <id> --vip --importance 4 --permit focused
     contacts.py update <id> <id> --instruction "Draft a reply; ring if it is about today."
 
@@ -142,12 +159,23 @@ _EMAIL_RE = re.compile(r"^[^@\s<>\"]+@[^@\s<>\"]+$")
 # longer run of digits is a national number, refused rather than guessed.
 _SMS_SENDER_ID_RE = re.compile(r"^(?=.*[A-Za-z])[A-Za-z0-9 ._&-]{1,16}$")
 _SMS_SHORT_CODE_RE = re.compile(r"^[0-9]{3,6}$")
+# Second-level labels under which country registries hand out names to anyone
+# ("co.uk", "com.au", "or.jp"). A domain of that shape is a public suffix, not
+# one sender's domain: filed on a VIP it would make a VIP of everyone there.
+# The public suffix list itself is not at hand (this module is stdlib-only),
+# so the rule is the shape — which also refuses the rare real domain of that
+# shape; its addresses are then filed one by one.
+_PUBLIC_SECOND_LEVELS = frozenset({
+    "ac", "co", "com", "edu", "go", "gob", "gov", "gv", "mil", "ne", "net", "nom", "or", "org"})
+_DOMAIN_MAX = 253
 
 _HEADER = ("# Contact managed by scripts/contacts.py (docs/contacts.md).\n"
            "# Lines it did not write are kept on every rewrite: add your own freely.\n")
 
 # An instruction is a brief, not a document: it rides in every prompt a
-# message of this person's buys, so it is kept to what a brief needs.
+# message of this person's buys, so it is kept to what a brief needs: every
+# write that sets one is held to this. Literals a hand edit or a merge joined
+# past it are read whole and left as they are until the user changes them.
 INSTRUCTION_MAX = 2000
 
 
@@ -184,6 +212,10 @@ def normalize_handle(channel: str, handle: str) -> tuple[str, str]:
         value = value.lower()
         if not _EMAIL_RE.match(value):
             raise ContactError(f"not an e-mail address: {handle!r}")
+        if _is_wildcard_address(value):
+            # "*@example.org" is the gate's spelling of a domain; filed as an
+            # address it would match nothing but itself.
+            raise ContactError(f"not an e-mail address: {handle!r} (a whole domain is filed as a domain)")
     elif channel == SMS:
         value = normalize_phone(value)
         if not _PHONE_RE.match(value):
@@ -210,6 +242,14 @@ def normalize_handle(channel: str, handle: str) -> tuple[str, str]:
     return channel, value
 
 
+def _is_wildcard_address(address: str) -> bool:
+    """Whether an "address" is a wildcard over a domain rather than a mailbox:
+    ``*`` for the whole local part, or anywhere in the domain. (Inside a
+    local part ``*`` is an ordinary character, rare as it is.)"""
+    local, _sep, domain = address.rpartition("@")
+    return local == "*" or "*" in domain
+
+
 def is_sms_sender_id(handle: str) -> bool:
     """Whether an SMS handle names a sender that is no phone number — an
     alphanumeric sender id or a short code, which cannot be written back to."""
@@ -227,6 +267,58 @@ def parse_handle(spec: str) -> tuple[str, str]:
     if not sep:
         raise ContactError(f"expected channel:handle, got {spec!r}")
     return normalize_handle(channel, handle)
+
+
+def normalize_domain(value: str) -> str:
+    """A domain a person writes e-mail from, as it is filed: ``example.org``
+    (every address ``@example.org``) or ``*.example.org`` (every address at
+    ``example.org`` or below it), lowercased. The gate's spelling of the same
+    two shapes (``*@example.org``, ``*@*.example.org``) and a leading ``@``
+    are read as what they mean. Refused: a wildcard anywhere but as that one
+    leading label, an address, a single label (``com``) and the shape of a
+    public suffix (``co.uk``) — a domain says "everyone there", so it has to
+    be somebody's."""
+    spec = str(value or "").strip().lower()
+    if spec.startswith("*@"):
+        spec = spec[2:]
+    elif spec.startswith("@"):
+        spec = spec[1:]
+    below = spec.startswith("*.")
+    base = spec[2:] if below else spec
+    labels = base.split(".")
+    if "@" in base:
+        raise ContactError(f"not a domain but an address: {value!r}")
+    if len(base) > _DOMAIN_MAX or not all(_is_domain_label(label) for label in labels):
+        raise ContactError(f"not an e-mail domain: {value!r} (expected example.org or *.example.org)")
+    if len(labels) < 2 or (len(labels) == 2 and len(labels[1]) == 2 and labels[0] in _PUBLIC_SECOND_LEVELS):
+        raise ContactError(f"{base!r} is a public suffix, not one sender's domain")
+    if labels[-1].isdigit():
+        raise ContactError(f"not an e-mail domain: {value!r} (an IP address is no domain)")
+    return ("*." if below else "") + base
+
+
+def _is_domain_label(label: str) -> bool:
+    # Letters and digits of any script — a domain is kept as it was written,
+    # like an address — and hyphens inside only.
+    return (0 < len(label) <= 63 and label[0] != "-" and label[-1] != "-"
+            and all(c.isalnum() or c == "-" for c in label))
+
+
+def domain_wildcard(spec: str) -> str:
+    """A filed domain in the delivery gate's spelling: ``*@example.org``,
+    ``*@*.example.org`` (triage_policy's wildcard forms)."""
+    return "*@" + spec
+
+
+def _domain_rank(spec: str, domain: str) -> tuple[int, int] | None:
+    """How specifically a filed domain covers an address's domain — None when
+    it does not. The domain itself outranks any wildcard, and among wildcards
+    the longer one wins; a wildcard also covers its own apex, as the gate
+    reads it (triage_policy._domain_matches_wildcard)."""
+    if not spec.startswith("*."):
+        return (1, len(spec)) if domain == spec else None
+    base = spec[2:]
+    return (0, len(base)) if domain == base or domain.endswith("." + base) else None
 
 
 def _canonical(channel: str, handle: str) -> tuple[str, str]:
@@ -385,6 +477,8 @@ def _person_triples(record: dict) -> set[tuple[str, str, str]]:
         out.add((s, _iri(KB + "instruction"), _lit(record["instruction"])))
     for address in record.get("emails") or []:
         out.add((s, _iri(VCARD + "hasEmail"), _iri("mailto:" + address)))
+    for spec in record.get("domains") or []:
+        out.add((s, _iri(KB + "emailDomain"), _lit(spec)))
     for number in record.get("phones") or []:
         out.add((s, _iri(VCARD + "hasTelephone"), _iri("tel:" + number)))
     for channel, handle in record.get("accounts") or []:
@@ -403,6 +497,83 @@ def _person_triples(record: dict) -> set[tuple[str, str, str]]:
     return out
 
 
+_VIP_SPELLINGS = {"true": True, "1": True, "false": False, "0": False}
+
+
+def _vip_value(term: str) -> bool | None:
+    """What a ``kb:vip`` literal says, or None for a spelling this module
+    does not read (it then says nothing)."""
+    return _VIP_SPELLINGS.get((_lit_value(term) or "").strip().lower())
+
+
+def _instruction_texts(terms) -> list[str]:
+    """The texts of a person's ``kb:instruction`` literals that say anything,
+    each once, in a fixed order (the literals' own, so that a rewrite that
+    re-sorts the file reads them the same)."""
+    texts = [(_lit_value(term) or "").replace("\r\n", "\n").strip() for term in sorted(terms)]
+    return list(dict.fromkeys(t for t in texts if t))
+
+
+def _read_spellings(record: dict, triples, new: dict | None = None) -> set[tuple[str, str, str]]:
+    """The person's triples a read TOOK into ``record`` from a spelling other
+    than the one _person_triples renders — a domain written by hand as
+    ``*@acme.org`` or ``ACME.org``, ``mailto:Mara@…``, ``tel:+41 79 …``, a VIP
+    flag as ``"1"``, an importance as ``"4.50"``, every instruction literal
+    the record's instruction was joined from (which only a rewrite that
+    changes the instruction replaces: _write). A rewrite takes them away with
+    the rest; otherwise a value the user removed stays in the file, and the
+    next read brings it back. ``new`` is what the rewrite writes (None: the
+    person is deleted).
+
+    A literal the read did not take stays exactly as it was written: a
+    domain that is none, an importance or VIP flag in a spelling this module
+    does not read, an empty instruction — and a second importance that the
+    record's (the highest) is not a spelling of, as long as the rewrite
+    leaves the importance as it was. A rewrite that changes the importance
+    replaces every literal it was read from: the user set the value they
+    were shown, and a lower one left behind would come back in its place."""
+    s = _iri(record["iri"])
+    phones = set(record.get("all_phones") or record.get("phones") or [])
+    out = set()
+    for triple in triples:
+        if triple[0] != s:
+            continue
+        pred, obj = _iri_value(triple[1]), triple[2]
+        if pred == KB + "emailDomain":
+            try:
+                hit = normalize_domain(_lit_value(obj) or "") in (record.get("domains") or [])
+            except ContactError:
+                hit = False
+        elif pred == VCARD + "hasEmail":
+            value = _iri_value(obj) or ""
+            hit = value.lower().startswith("mailto:") and value[7:].lower() in (record.get("emails") or [])
+        elif pred == VCARD + "hasTelephone":
+            value = _iri_value(obj) or ""
+            hit = value.lower().startswith("tel:") and normalize_phone(value[4:]) in phones
+        elif pred == KB + "vip":
+            # Read as "any literal says true": every literal that says what
+            # the record holds is a spelling of it. One that says the other
+            # value decides nothing (a "false" beside a "true") and stays.
+            said = _vip_value(obj)
+            hit = said is not None and (new is None or said == bool(record.get("vip")))
+        elif pred == KB + "instruction":
+            # The record holds every literal that says anything, joined.
+            hit = bool(_instruction_texts([obj]))
+        elif pred == KB + "importance":
+            try:
+                value = _importance(_lit_value(obj))
+            except ContactError:
+                value = None
+            hit = value is not None and (
+                value == record.get("importance") or new is None
+                or new.get("importance") != record.get("importance"))
+        else:
+            hit = False
+        if hit:
+            out.add(triple)
+    return out
+
+
 def _records_from(triples, path: Path, chamber: str, rel: str) -> list[dict]:
     by_subject: dict[str, list[tuple[str, str]]] = {}
     for s, p, o in triples:
@@ -415,8 +586,9 @@ def _records_from(triples, path: Path, chamber: str, rel: str) -> list[dict]:
             continue
         record = {"iri": iri, "name": "", "sphere": None, "tags": [], "emails": [],
                   "phones": [], "accounts": [], "created": None, "importance": None,
-                  "permits": [], "vip": False, "instruction": None}
+                  "permits": [], "vip": False, "instruction": None, "domains": []}
         tels = []
+        importances = []
         for p, o in sorted(props):
             pred = _iri_value(p)
             if pred in (VCARD + "fn", FOAF + "name", "http://schema.org/name") and not record["name"]:
@@ -429,17 +601,24 @@ def _records_from(triples, path: Path, chamber: str, rel: str) -> list[dict]:
                 record["tags"].append(urllib.parse.unquote(_iri_value(o)[len(SPHERE_PREFIX):]))
             elif pred == KB + "importance":
                 try:
-                    record["importance"] = _importance(_lit_value(o))
+                    value = _importance(_lit_value(o))
                 except ContactError:
-                    pass
+                    value = None
+                if value is not None:
+                    importances.append(value)
             elif pred == KB + "permit" and (_iri_value(o) or "").startswith(MODE_PREFIX):
                 record["permits"].append(urllib.parse.unquote(_iri_value(o)[len(MODE_PREFIX):]))
             elif pred == KB + "vip":
-                record["vip"] = (_lit_value(o) or "").strip().lower() in ("true", "1")
-            elif pred == KB + "instruction" and not record["instruction"]:
-                record["instruction"] = (_lit_value(o) or "").strip() or None
+                record["vip"] = record["vip"] or bool(_vip_value(o))
             elif pred == VCARD + "hasEmail" and (_iri_value(o) or "").lower().startswith("mailto:"):
                 record["emails"].append(_iri_value(o)[7:].lower())
+            elif pred == KB + "emailDomain":
+                # A value written by hand that is no domain is not matched on:
+                # it could cover far more than its author meant.
+                try:
+                    record["domains"].append(normalize_domain(_lit_value(o) or ""))
+                except ContactError:
+                    pass
             elif pred == VCARD + "hasTelephone" and (_iri_value(o) or "").lower().startswith("tel:"):
                 tels.append(normalize_phone(_iri_value(o)[4:]))
             elif pred == FOAF + "account" and _iri_value(o):
@@ -448,11 +627,18 @@ def _records_from(triples, path: Path, chamber: str, rel: str) -> list[dict]:
                 handle = _lit_value(acct.get(_iri(FOAF + "accountName"), "") or "")
                 if channel and handle:
                     record["accounts"].append((channel, handle))
+        # One value from however many literals a hand edit or a merge left:
+        # the highest importance, and every instruction, joined — no word of
+        # the user's is dropped, and a rewrite that changes it writes one.
+        record["importance"] = max(importances) if importances else None
+        record["instruction"] = "\n\n".join(_instruction_texts(
+            o for p, o in props if _iri_value(p) == KB + "instruction")) or None
         # A telephone an account already implies is not a number of its own.
         implied = {h for _c, h in record["accounts"] if _PHONE_RE.match(h)}
         record["phones"] = sorted({t for t in tels if t not in implied})
         record["all_phones"] = sorted(set(tels) | implied)
         record["emails"] = sorted(set(record["emails"]))
+        record["domains"] = sorted(set(record["domains"]))
         record["accounts"] = sorted(set(record["accounts"]))
         record["tags"] = sorted(set(record["tags"]))
         record["permits"] = sorted(set(record["permits"]))
@@ -482,15 +668,23 @@ def _importance(value) -> float | None:
     return number
 
 
-def _instruction(value) -> str | None:
+def _instruction_text(value) -> str | None:
+    """An instruction as it is compared and kept: trimmed, line ends
+    normalised, None for none."""
+    return None if value is None else (str(value).replace("\r\n", "\n").strip() or None)
+
+
+def _instruction(value, current: str | None = None) -> str | None:
     """A standing instruction as the person keeps it: the user's own words,
-    trimmed, or None for none."""
-    if value is None:
-        return None
-    text = str(value).replace("\r\n", "\n").strip()
-    if len(text) > INSTRUCTION_MAX:
-        raise ContactError(f"an instruction is at most {INSTRUCTION_MAX} characters, not {len(text)}")
-    return text or None
+    trimmed, or None for none — held to INSTRUCTION_MAX. ``current`` is the
+    one the person carries now, which the refusal states: joined from
+    several literals of a hand edit or a merge, it can be longer (read
+    whole, kept as it is by every write that leaves it: ContactBook.update)."""
+    text = _instruction_text(value)
+    if text and len(text) > INSTRUCTION_MAX:
+        now = f"; the one they carry now is {len(current)}" if current else ""
+        raise ContactError(f"an instruction is at most {INSTRUCTION_MAX} characters, not {len(text)}{now}")
+    return text
 
 
 def _modes(values) -> list[str]:
@@ -516,6 +710,7 @@ def public(record: dict) -> dict:
             "chamber": record["chamber"], "path": record["path"],
             "sphere": record.get("sphere"), "tags": list(record.get("tags") or []),
             "handles": handles_of(record), "phones": list(record.get("all_phones") or []),
+            "domains": list(record.get("domains") or []),
             "importance": record.get("importance"), "permits": list(record.get("permits") or []),
             "vip": bool(record.get("vip")), "instruction": record.get("instruction") or None,
             "created": record.get("created")}
@@ -642,8 +837,14 @@ class ContactBook:
                 return record
         return None
 
-    def find(self, channel: str, handle: str) -> dict | None:
-        """The person this handle belongs to, if anyone's."""
+    def find(self, channel: str, handle: str, *, exact: bool = False) -> dict | None:
+        """The person this handle belongs to, if anyone's. An e-mail address
+        nobody holds falls back to the person with the most specific domain
+        covering it; such a hit is a copy marked ``match: "domain"`` (and
+        ``match_domain``, the domain it came by), because it says who the
+        mail is from, not whose address it is. ``exact=True`` leaves the
+        fallback out — the question a writer asks before it files or moves
+        the address itself."""
         channel, handle = normalize_handle(channel, handle)
         key = _match_key(channel, handle)  # a sender id compares case-insensitively
         for record in self.all():
@@ -653,21 +854,52 @@ class ContactBook:
                 return record
             if any(_match_key(*account) == key for account in record["accounts"]):
                 return record
+        if channel == EMAIL and not exact:
+            return next(iter(self._by_domain(handle)), None)
         return None
+
+    def _by_domain(self, address: str) -> list[dict]:
+        """The people whose domains cover a normalized address, the most
+        specific first; each a marked copy (see :meth:`find`). Where a file
+        edited by hand gives two people the same domain, the first in the
+        book's order stands, as for a handle."""
+        domain = address.rsplit("@", 1)[1]
+        hits = []
+        for order, record in enumerate(self.all()):
+            ranked = [(rank, spec) for spec in record.get("domains") or []
+                      if (rank := _domain_rank(spec, domain)) is not None]
+            if ranked:
+                rank, spec = max(ranked)
+                hits.append((rank, -order, dict(record, match="domain", match_domain=spec)))
+        return [hit for _rank, _order, hit in sorted(hits, key=lambda h: h[:2], reverse=True)]
+
+    def email_matches(self, address: str) -> list[dict]:
+        """Everyone a mail from this address may be worked as, the most
+        specific first: the holder of the address, then the people whose
+        domains cover it (:meth:`find`'s order, continued). The delivery gate
+        calls a sender VIP or instructed if *any* of them is, so the reader
+        of a class walks this list to the first person who carries it."""
+        _channel, address = normalize_handle(EMAIL, address)
+        holder = self.find(EMAIL, address, exact=True)
+        return ([holder] if holder else []) + [
+            hit for hit in self._by_domain(address) if not holder or hit["iri"] != holder["iri"]]
 
     def suggest(self, channel: str, handle: str) -> list[dict]:
         """People this handle may belong to: its owner first, then anyone with
-        the same phone number on another channel."""
+        the same phone number on another channel — or, for an e-mail address
+        nobody holds, the person whose domain covers it."""
         try:
             channel, handle = normalize_handle(channel, handle)
         except ContactError:
             return []
-        exact = self.find(channel, handle)
+        exact = self.find(channel, handle, exact=True)
         out = [dict(exact, exact=True)] if exact else []
         if _PHONE_RE.match(handle):
             for record in self.all():
                 if (not exact or record["iri"] != exact["iri"]) and handle in record["all_phones"]:
                     out.append(dict(record, exact=False))
+        if channel == EMAIL and not exact:
+            out += [dict(record, exact=False) for record in self._by_domain(handle)[:1]]
         return out
 
     def search(self, text: str, limit: int = 20) -> list[dict]:
@@ -675,7 +907,8 @@ class ContactBook:
         if not needle:
             return []
         hits = [r for r in self.all()
-                if needle in r["name"].casefold() or any(needle in e for e in r["emails"])]
+                if needle in r["name"].casefold() or any(needle in e for e in r["emails"])
+                or any(needle in d for d in r.get("domains") or [])]
         return sorted(hits, key=lambda r: (not r["name"].casefold().startswith(needle), r["name"]))[:limit]
 
     # Writing
@@ -683,17 +916,35 @@ class ContactBook:
     def _claimed(self, channel: str, handle: str, but: str | None = None) -> dict | None:
         if _is_telephone(channel, handle):
             return None  # telephones may be shared
-        owner = self.find(channel, handle)
+        # Exact: an address inside somebody's domain is still free to be a
+        # person's own — the more specific filing wins every lookup.
+        owner = self.find(channel, handle, exact=True)
         return owner if owner and owner["iri"] != but else None
+
+    def _domain_claimed(self, spec: str, but: str | None = None) -> dict | None:
+        """Who else files this very domain. ``example.org`` and
+        ``*.example.org`` are two filings — the lookup ranks them — so only
+        the same spelling is a conflict."""
+        for record in self.all():
+            if spec in (record.get("domains") or []) and record["iri"] != but:
+                return record
+        return None
 
     def _write(self, path: Path, old: dict | None, new: dict | None) -> None:
         try:
             triples, other = _parse_nt(path.read_text(encoding="utf-8"))
         except FileNotFoundError:
             triples, other = [], []
-        keep = set(triples) - (_person_triples(old) if old else set())
+        keep = set(triples)
+        if old:
+            keep -= _person_triples(old) | _read_spellings(old, triples, new)
         if new:
             keep |= _person_triples(new)
+        if old and new and old.get("instruction") == new.get("instruction"):
+            # A rewrite that leaves the instruction leaves its literals as the
+            # user wrote them — two of them stay two, not one joined text.
+            s, pred = _iri(old["iri"]), _iri(KB + "instruction")
+            keep = {t for t in keep if t[:2] != (s, pred)} | {t for t in triples if t[:2] == (s, pred)}
         if not keep and not other:
             path.unlink(missing_ok=True)
         else:
@@ -705,7 +956,7 @@ class ContactBook:
 
     def create(self, chamber: str, name: str, handles=(), *, sphere: str | None = None,
                tags=(), created: str | None = None, importance=None, permits=(),
-               vip: bool = False, instruction: str | None = None) -> dict:
+               vip: bool = False, instruction: str | None = None, domains=()) -> dict:
         name = " ".join(str(name or "").split())
         if not name:
             raise ContactError("a contact needs a name")
@@ -718,11 +969,16 @@ class ContactBook:
                 owner = self._claimed(channel, handle)
                 if owner:
                     raise ContactError(f"{channel}:{handle} already belongs to {owner['name']} ({owner['key']})", 409)
+            specs = sorted({normalize_domain(d) for d in domains})
+            for spec in specs:
+                owner = self._domain_claimed(spec)
+                if owner:
+                    raise ContactError(f"the domain {spec} already belongs to {owner['name']} ({owner['key']})", 409)
             uid = str(uuid.uuid4())
             record = _blank(PERSON_PREFIX + uid, name, sphere, tags,
                             created or datetime.now(timezone.utc).replace(microsecond=0).isoformat())
             record.update(importance=_importance(importance), permits=_modes(permits), vip=bool(vip),
-                          instruction=_instruction(instruction))
+                          instruction=_instruction(instruction), domains=specs)
             for pair in pairs:
                 _add_pair(record, pair)
             path = loc["dir"] / f"{_slug(name)}-{uid[:8]}.nt"
@@ -731,10 +987,13 @@ class ContactBook:
 
     def update(self, key: str, *, name: str | None = None, sphere: str | None | bool = False,
                tags=None, add=(), remove=(), importance=False, permits=None,
-               vip: bool | None = None, instruction: str | None | bool = False) -> dict:
+               vip: bool | None = None, instruction: str | None | bool = False,
+               domains=None, add_domains=(), remove_domains=()) -> dict:
         """Change a person. ``sphere=False`` / ``importance=False`` /
         ``instruction=False`` leave the field; None (or an empty instruction)
-        clears it. ``tags`` / ``permits`` None leave them."""
+        clears it. ``tags`` / ``permits`` / ``domains`` None leave them; a
+        list replaces them, and ``add_domains`` / ``remove_domains`` then
+        change what stands."""
         with self._lock:
             old = self.get(key)
             if old is None:
@@ -755,8 +1014,12 @@ class ContactBook:
                 new["permits"] = _modes(permits)
             if vip is not None:
                 new["vip"] = bool(vip)
-            if instruction is not False:
-                new["instruction"] = _instruction(instruction)
+            if instruction is not False and _instruction_text(instruction) != old.get("instruction"):
+                # The instruction as it stands, sent back with a change to
+                # something else (the editors send what they showed), is
+                # left as it is — also one a hand edit or a merge joined
+                # past the limit: only a change is held to it.
+                new["instruction"] = _instruction(instruction, old.get("instruction"))
             for channel, handle in (normalize_handle(c, h) for c, h in remove):
                 _remove_pair(new, (channel, handle))
             for channel, handle in (normalize_handle(c, h) for c, h in add):
@@ -764,6 +1027,14 @@ class ContactBook:
                 if owner:
                     raise ContactError(f"{channel}:{handle} already belongs to {owner['name']} ({owner['key']})", 409)
                 _add_pair(new, (channel, handle))
+            specs = set(new.get("domains") or []) if domains is None else {normalize_domain(d) for d in domains}
+            specs -= {normalize_domain(d) for d in remove_domains}
+            specs |= {normalize_domain(d) for d in add_domains}
+            for spec in sorted(specs - set(old.get("domains") or [])):
+                owner = self._domain_claimed(spec, but=old["iri"])
+                if owner:
+                    raise ContactError(f"the domain {spec} already belongs to {owner['name']} ({owner['key']})", 409)
+            new["domains"] = sorted(specs)
             self._write(Path(old["file"]), old, new)
             return self.get(old["key"]) or new
 
@@ -790,7 +1061,7 @@ def _blank(iri, name, sphere, tags, created) -> dict:
     return {"iri": iri, "name": name, "sphere": sphere,
             "tags": sorted({str(t).strip().lower() for t in tags if str(t).strip()} - {sphere}),
             "emails": [], "phones": [], "accounts": [], "created": created,
-            "importance": None, "permits": [], "vip": False, "instruction": None}
+            "importance": None, "permits": [], "vip": False, "instruction": None, "domains": []}
 
 
 def _copy(record: dict) -> dict:
@@ -823,36 +1094,43 @@ def _remove_pair(record: dict, pair: tuple[str, str]) -> None:
 # ── The delivery gate ───────────────────────────────────────────────────────
 
 def _gate_handles(record: dict):
-    """Every messenger handle of one person as the delivery gate compares it:
-    their accounts, and their telephones for SMS."""
+    """Every handle of one person as the delivery gate compares it: their
+    accounts, their telephones for SMS, and on the ``email`` channel their
+    addresses and their domains — the latter in the gate's wildcard spelling
+    (:func:`domain_wildcard`), which only that channel reads as a wildcard."""
     for channel, handle in record.get("accounts") or []:
         # Project the current form, which is the one the gateways deliver.
         yield _canonical(channel, handle)
     for number in record.get("all_phones") or []:
         yield SMS, number
+    for address in record.get("emails") or []:
+        # A wildcard written as an address (a file edited by hand) names
+        # nobody here, and must not turn into a domain at the gate.
+        if not _is_wildcard_address(address):
+            yield EMAIL, address
+    for spec in record.get("domains") or []:
+        yield EMAIL, domain_wildcard(spec)
 
 
-def policy_projection(book: ContactBook) -> tuple[dict[str, set[str]], set[str]]:
-    """What the address book's VIP persons mean to the triage delivery gate:
-    the handles of each on every messenger channel (their telephones count
-    for SMS), and their e-mail addresses (whitelisted: worked on the frequent
-    run). docs/triage-delivery-gate.md."""
+def policy_projection(book: ContactBook) -> dict[str, set[str]]:
+    """What the address book's VIP persons mean to the delivery gate:
+    ``{channel: handles}`` — the handles of each on every messenger channel
+    (their telephones count for SMS), and under ``email`` their addresses and
+    domain wildcards. docs/triage-delivery-gate.md, docs/mail-chats.md."""
     handles: dict[str, set[str]] = {}
-    emails: set[str] = set()
     for record in book.all():
         if not record.get("vip"):
             continue
         for channel, handle in _gate_handles(record):
             handles.setdefault(channel, set()).add(handle)
-        emails |= set(record.get("emails") or [])
-    return handles, emails
+    return handles
 
 
 def instruction_projection(book: ContactBook) -> dict[str, set[str]]:
-    """The messenger handles of every person the user wrote an instruction
-    for — the gate's ``instructed`` class: each message of theirs buys a turn
-    with the instruction as its brief. Only the handle reaches the gate; the
-    words stay with the person, where the turn reads them
+    """The handles of every person the user wrote an instruction for — the
+    gate's ``instructed`` class, e-mail included: each message of theirs buys
+    a turn with the instruction as its brief. Only the handle reaches the
+    gate; the words stay with the person, where the turn reads them
     (:func:`instructed_person`)."""
     handles: dict[str, set[str]] = {}
     for record in book.all():
@@ -866,11 +1144,17 @@ def instructed_person(book: ContactBook, channel: str, handle: str) -> dict | No
     """The person whose instruction applies to a message from this handle, or
     None. Matched exactly as the gate matched it — the projected form,
     compared case-insensitively — so a message the gate called instructed
-    finds the instruction it was called that for."""
+    finds the instruction it was called that for. For a mail that is the most
+    specific instructed person: the holder of the address, else whoever's
+    domain covers it most closely (a marked copy, as :meth:`ContactBook.find`
+    gives one) — an organisation's brief stands for a member the book knows
+    by name but gives no brief of their own."""
     try:
         channel, handle = normalize_handle(channel, handle)
     except ContactError:
         return None
+    if channel == EMAIL:
+        return next((r for r in book.email_matches(handle) if r.get("instruction")), None)
     want = (channel, handle.strip().lower())
     for record in book.all():
         if not record.get("instruction"):
@@ -885,7 +1169,7 @@ def sync_policy(book: ContactBook) -> list[str]:
     contact-owned members). Idempotent and write-if-changed; returns the
     files it wrote."""
     import triage_policy
-    return triage_policy.sync_contacts(*policy_projection(book),
+    return triage_policy.sync_contacts(policy_projection(book),
                                        instructed_handles=instruction_projection(book))
 
 
@@ -932,10 +1216,12 @@ def _print(args, value) -> None:
         if "handles" not in row:
             print(f"{row['chamber']}\t{row['path']}")
             continue
-        handles = ", ".join(f"{h['channel']}:{h['handle']}" for h in row["handles"]) or "—"
+        handles = ", ".join([f"{h['channel']}:{h['handle']}" for h in row["handles"]]
+                            + [f"email-domain:{d}" for d in row.get("domains") or []]) or "—"
         spheres = " · ".join(filter(None, [row.get("sphere")] + row.get("tags", [])
                                     + (["VIP"] if row.get("vip") else [])))
-        note = " [same phone number, other channel]" if row.get("match") == "phone" else ""
+        note = {"phone": " [same phone number, other channel]",
+                "domain": f" [by the domain {row.get('match_domain')}, not this address]"}.get(row.get("match"), "")
         print(f"[{row['id']}] {row['name']} ({row['chamber']}){' — ' + spheres if spheres else ''}{note}\n    {handles}")
         if row.get("instruction"):
             print("    instruction: " + " ".join(row["instruction"].split()))
@@ -976,6 +1262,12 @@ def main(argv=None) -> int:
     p_add.add_argument("--email", action="append", default=[])
     p_add.add_argument("--phone", action="append", default=[], help="a telephone (also reachable by SMS)")
     p_add.add_argument("--handle", action="append", default=[], help="channel:handle (repeatable)")
+    for p in (p_add, p_upd):
+        p.add_argument("--add-domain", *(["--domain"] if p is p_add else []), action="append", default=[],
+                       metavar="DOMAIN",
+                       help="an e-mail domain they write from: example.org for every address there, "
+                            "'*.example.org' for every address there or below it (repeatable)")
+    p_upd.add_argument("--remove-domain", action="append", default=[], metavar="DOMAIN")
     p_upd.add_argument("id", nargs="+",
                        help="the contact; several to give a team the same facts (no name or handle changes then)")
     p_upd.add_argument("--no-instruction", action="store_true", help="remove the instruction")
@@ -1023,12 +1315,16 @@ def main(argv=None) -> int:
                 pair = (("email", args.email) if args.email else ("sms", args.phone) if args.phone
                         else parse_handle(args.handle))
                 # The owner first; then, for a phone number, whoever has it on
-                # another channel — marked, since that is a guess to confirm.
+                # another channel — marked, since that is a guess to confirm —
+                # and for an address nobody holds, whoever's domain covers it:
+                # marked too, since that says who wrote, not whose address.
                 hits = book.suggest(*pair)
             if not hits:
                 print("no match", file=sys.stderr)
                 return 1
-            _print(args, [dict(public(r), match="exact" if r.get("exact", True) else "phone") for r in hits])
+            _print(args, [dict(public(r), match="exact" if r.get("exact", True) else r.get("match", "phone"),
+                               **({"match_domain": r["match_domain"]} if r.get("match") == "domain" else {}))
+                          for r in hits])
         elif args.cmd == "show":
             record = book.get(args.id)
             if record is None:
@@ -1042,7 +1338,8 @@ def main(argv=None) -> int:
             instruction = instruction_arg()
             record = book.create(args.chamber, args.name, pairs, sphere=args.sphere, tags=args.tag or (),
                                  importance=args.importance or None, permits=args.permit or (),
-                                 vip=bool(args.vip), instruction=instruction or None)
+                                 vip=bool(args.vip), instruction=instruction or None,
+                                 domains=args.add_domain)
             sync_policy(book)
             commit(book.chambers_dir, record["path"], f"chore(contacts): add {record['name']}")
             _print(args, public(record))
@@ -1054,10 +1351,12 @@ def main(argv=None) -> int:
                       + [("sms", p) for p in args.remove_phone])
             ids = list(dict.fromkeys(args.id))
             # Several people take the same person-level facts — a team that
-            # shares one instruction, say. A name or a handle belongs to one
-            # person, so those changes name exactly one.
-            if len(ids) > 1 and (args.name is not None or add or remove):
-                raise ContactError("a name or a handle belongs to one person: update them one at a time")
+            # shares one instruction, say. A name, a handle or a domain
+            # belongs to one person, so those changes name exactly one.
+            if len(ids) > 1 and (args.name is not None or add or remove
+                                 or args.add_domain or args.remove_domain):
+                raise ContactError("a name, a handle or a domain belongs to one person: "
+                                   "update them one at a time")
             instruction = instruction_arg()
             # Every id is looked up before anything is written, so a typo in
             # the third one does not leave the first two changed.
@@ -1071,7 +1370,8 @@ def main(argv=None) -> int:
                                      tags=args.tag, add=add, remove=remove,
                                      importance=False if args.importance is None else (args.importance or None),
                                      permits=[] if args.no_permits else args.permit, vip=args.vip,
-                                     instruction=instruction)
+                                     instruction=instruction, add_domains=args.add_domain,
+                                     remove_domains=args.remove_domain)
                 records.append(record)
             sync_policy(book)
             for record in records:

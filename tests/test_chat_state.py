@@ -644,6 +644,165 @@ def test_archive_unless_arrived():
         print("PASS test_archive_unless_arrived")
 
 
+def test_what_an_arrival_owes_is_kept_per_arrival():
+    with tempfile.TemporaryDirectory() as tmp:
+        store = cs.ChatStateStore(tmp)
+        a, b = "email:~me@x.example:a@x.example", "email:~me@x.example:b@x.example"
+        # Owed in the write that counts it; a repeat counts and owes nothing
+        # more; told takes it out, and a second told writes nothing.
+        doc, _had, counted = store.count_arrival(a, 1000.0, message_id="m1", owe=True)
+        assert counted and cs.owes(doc, "m1") and doc["untold"] == ["m1"]
+        doc, _had, counted = store.count_arrival(a, 1000.0, message_id="m1", owe=True)
+        assert not counted and doc["untold"] == ["m1"] and doc["inbound_seq"] == 1
+        # A later arrival attended does not tell an earlier one (no
+        # high-water mark): m1 stays owed while m2 is attended past it.
+        store.count_arrival(a, 1001.0, message_id="m2", owe=True)
+        store.told(a, "m2")
+        doc = store.set_attention(a, {"state": "open"}, attended=2)
+        assert cs.owes(doc, "m1") and not cs.owes(doc, "m2"), doc["untold"]
+        # Without ``owe`` (a messenger) nothing is owed, and told is no write.
+        store.count_arrival("signal:+41790000081", 1000.0, message_id="s1")
+        assert not cs.owes(store.get("signal:+41790000081"), "s1")
+        assert not store.told("signal:+41790000082", "s1")["untold"]
+        assert not store.exists("signal:+41790000082"), "told wrote a document"
+        assert not cs.owes(doc, None) and not cs.owes(doc, "")
+        # The places: by id, or None — never the count as it stands.
+        assert cs.recent_place(doc, "m2") == 2 and cs.recent_place(doc, "nope") is None
+        # Turns per mail, counted on the chat.
+        assert store.note_turn_attempt(a, "m1") == 1
+        assert store.note_turn_attempt(a, "m1") == 2 and store.note_turn_attempt(a, None) == 0
+        assert cs.turn_attempts(store.get(a), "m1") == 2 and cs.turn_attempts(store.get(a), "m2") == 0
+        # A merge carries both: what either half owed, the most turns either
+        # counted.
+        store.count_arrival(b, 900.0, message_id="n1", owe=True)
+        store.note_turn_attempt(b, "m1")
+        doc, gone = store.merge(a, b)
+        assert gone is not None and set(doc["untold"]) == {"m1", "n1"}, doc["untold"]
+        assert cs.turn_attempts(doc, "m1") == 2
+        # A turn's archive: made only while nothing arrived past its cut.
+        doc, done = store.archive_through(b, cut=2)
+        assert not done and not doc["archived"], doc["inbound_seq"]
+        doc, done = store.archive_through(b, cut=doc["inbound_seq"])
+        assert done and doc["archived"] and not doc.get("muted"), "a turn's archive never mutes"
+        print("PASS test_what_an_arrival_owes_is_kept_per_arrival")
+
+
+def test_a_turn_archives_over_mail_whose_turn_asked_too():
+    """Decision AR: a turn's archive reaches past its cut exactly when every
+    arrival after it was worked by a completed turn that asked for the
+    archive (or is gone) — remembered on the mails, through a reload and a
+    merge; a later turn of a mail that did not ask takes the ask off it."""
+    with tempfile.TemporaryDirectory() as tmp:
+        store = cs.ChatStateStore(tmp)
+        a = "email:~me@x.example:chain@x.example"
+        for i, mid in enumerate(("old", "n1", "n2", "n3"), 1):
+            store.count_arrival(a, 1000.0 + i, message_id=mid, owe=True)
+        # The newer mails' turn asked and completed — two of three so far.
+        store.note_turn_done(a, "n1", asked=True)
+        store.note_turn_done(a, "n2", asked=True)
+        doc, done = store.archive_through(a, cut=1)
+        assert not done and not doc["archived"], "n3 was worked by no turn"
+        # n3's turn completed without asking: still no archive.
+        store.note_turn_done(a, "n3")
+        assert not cs.archive_asked(store.get(a), "n3") and cs.turn_done(store.get(a), "n3")
+        assert not store.archive_through(a, cut=1)[1]
+        # Its next turn asked: now everything after the cut asked, and the
+        # record outlasts the process.
+        store.note_turn_done(a, "n3", asked=True)
+        store = cs.ChatStateStore(tmp)
+        assert cs.asked_through(store.get(a), 1) and not cs.asked_through(store.get(a), 0)
+        # A later turn that did not ask takes the ask off again.
+        store.note_turn_done(a, "n2")
+        assert not cs.asked_through(store.get(a), 1)
+        store.note_turn_done(a, "n2", asked=True)
+        # A gone arrival after the cut is no reason to stay; one with no id
+        # (no place by id) is.
+        store.count_arrival(a, 1010.0, message_id="deleted", owe=True)
+        assert not cs.asked_through(store.get(a), 1)
+        store.forget_arrivals(a, ["deleted"])
+        assert cs.asked_through(store.get(a), 1)
+        store.count_arrival(a, 1011.0)
+        assert not store.archive_through(a, cut=1)[1]
+        # A merge keeps what either half asked; the places come with it.
+        b = "email:~me@x.example:chain-b@x.example"
+        store.count_arrival(b, 900.0, message_id="b1", owe=True)
+        store.note_turn_done(b, "b1", asked=True)
+        doc, _gone = store.merge(b, a)
+        assert cs.archive_asked(doc, "b1") and cs.archive_asked(doc, "n1"), doc["archive_asked"]
+        assert not cs.archive_asked(doc, "old")
+        print("PASS test_a_turn_archives_over_mail_whose_turn_asked_too")
+
+
+def test_what_is_owed_for_a_mail_outlasts_the_newest_arrivals():
+    """What a chat still owes for a mail — the telling, the count of its
+    turns, the note that its turn completed and asked — is not kept in the
+    cache of the newest arrivals (INBOUND_RECENT_MAX): more later mail than
+    that cache holds leaves all of it standing, also through a merge."""
+    with tempfile.TemporaryDirectory() as tmp:
+        store = cs.ChatStateStore(tmp)
+        a = "email:~me@x.example:owed@x.example"
+        b = "email:~me@x.example:other@x.example"
+        store.count_arrival(a, 1000.0, message_id="m0", owe=True)
+        assert store.note_turn_attempt(a, "m0") == 1
+        store.count_arrival(a, 1000.5, message_id="d0", owe=True)
+        store.note_turn_done(a, "d0", asked=True)
+        later = cs.INBOUND_RECENT_MAX + 1
+        for n in range(later):
+            store.count_arrival(a, 1001.0 + n, message_id=f"n{n}", owe=True)
+            store.note_turn_attempt(a, f"n{n}")
+            store.note_turn_done(a, f"n{n}")
+        doc = store.get(a)
+        assert len(doc["inbound_recent"]) == cs.INBOUND_RECENT_MAX
+        assert "m0" not in [mid for mid, _seq in doc["inbound_recent"]]
+        assert cs.owes(doc, "m0"), "still owed its telling"
+        assert cs.turn_attempts(doc, "m0") == 1 and store.note_turn_attempt(a, "m0") == 2
+        assert cs.turn_done(doc, "d0") and "d0" in doc["archive_asked"]
+        # … and folded into another chat, it is owed by the whole.
+        store.count_arrival(b, 900.0, message_id="b0", owe=True)
+        store.merge(a, b)
+        doc = store.get(b)
+        assert cs.owes(doc, "m0") and cs.owes(doc, "b0")
+        assert cs.turn_attempts(doc, "m0") == 2 and cs.turn_done(doc, "d0")
+        assert "d0" in doc["archive_asked"]
+        # The bound that remains is the flood's: the oldest note gives way.
+        assert cs.TURN_STATE_MAX >= 16 * cs.INBOUND_RECENT_MAX
+    print("PASS test_what_is_owed_for_a_mail_outlasts_the_newest_arrivals")
+
+
+def test_an_ask_from_before_the_users_unarchive_is_none():
+    """Decision AZ: the user's unarchive (set_flags ``forget_asked``) moves
+    the chat's asked_epoch on, and a turn that asked before it — its
+    ``epoch`` the one it found then — notes no ask when it completes,
+    decided in that same write; a turn that asked after it, or one
+    without an epoch, does. Neither an archive nor a turn's undo moves it;
+    a merge adds the halves' up."""
+    with tempfile.TemporaryDirectory() as tmp:
+        store = cs.ChatStateStore(tmp)
+        a = "email:~me@x.example:epoch@x.example"
+        store.count_arrival(a, 1000.0, message_id="m1", owe=True)
+        assert cs.asked_epoch(store.get(a)) == 0
+        started = cs.asked_epoch(store.get(a))
+        store.set_flags(a, archived=True, forget_asked=True)
+        store.set_flags(a, archived=False)
+        assert cs.asked_epoch(store.get(a)) == started, "no word of the user's"
+        store.set_flags(a, archived=False, forget_asked=True)
+        assert cs.asked_epoch(store.get(a)) == started + 1
+        store.note_turn_done(a, "m1", asked=True, epoch=started)
+        doc = store.get(a)
+        assert cs.turn_done(doc, "m1") and not cs.archive_asked(doc, "m1"), doc
+        store.note_turn_done(a, "m1", asked=True, epoch=cs.asked_epoch(doc))
+        assert cs.archive_asked(store.get(a), "m1")
+        store.note_turn_done(a, "m1", asked=True)
+        assert cs.archive_asked(store.get(a), "m1")
+        b = "email:~me@x.example:epoch-b@x.example"
+        store.count_arrival(b, 900.0, message_id="b1", owe=True)
+        store.set_flags(b, archived=False, forget_asked=True)
+        store.set_flags(b, archived=False, forget_asked=True)
+        doc, _gone = store.merge(b, a)
+        assert cs.asked_epoch(doc) == 3 and cs.asked_epoch(cs.ChatStateStore(tmp).get(a)) == 3
+        print("PASS test_an_ask_from_before_the_users_unarchive_is_none")
+
+
 def test_flags_and_note_message():
     with tempfile.TemporaryDirectory() as tmp:
         store = cs.ChatStateStore(tmp)
@@ -842,7 +1001,7 @@ def test_merge_folds_one_chat_into_another():
         # The absorbed: read later, two arrivals of which one came after.
         store.note_message(MAIL_B, name="Re: Offer", group=False,
                            participants=[{"address": "b@y.org", "name": "B"}],
-                           peer={"address": "b@y.org", "name": "B"},
+                           peer={"address": "b@y.org", "name": "B"}, peer_vouched=False,
                            sender="b@y.org", sender_name="B", unknown_sender=True)
         store.mark_unread(MAIL_B, cs.iso_z(200.0))
         store.advance_last_read(MAIL_B, cs.iso_z(300.0))
@@ -874,6 +1033,7 @@ def test_merge_folds_one_chat_into_another():
         assert doc["attention"] == {"state": "open", "importance": 4.0}
         # Its own name and peer; the absorbed chat's where it had none.
         assert doc["name"] == "Offer" and doc["peer"] == {"address": "a@x.org", "name": None}
+        assert doc["peer_vouched"] is None, "what stood behind the other peer stays with it"
         assert doc["contact"]["name"] == "B Person" and doc["unknown_sender"] is True
         assert doc["participants"] == [{"address": "a@x.org", "name": None},
                                        {"address": "b@y.org", "name": "B"}]
@@ -916,6 +1076,13 @@ def test_merge_folds_one_chat_into_another():
         doc, _gone = store.merge(e, f)
         assert doc["last_read"] == cs.iso_z(500.0) and cs.arrived_since_read(doc) == 2
         assert doc["unread_since"] is None or doc["unread_since"] > doc["last_read"]
+        # A survivor without a peer takes the other's, and with it whether a
+        # mail with a gate sender stands behind it.
+        g, h = "email:~me@example.org:g@x.org", "email:~me@example.org:h@x.org"
+        store.note_message(g, name="G")
+        store.note_message(h, peer={"address": "boss@corp.example"}, peer_vouched=False)
+        doc, _gone = store.merge(h, g)
+        assert doc["peer"]["address"] == "boss@corp.example" and doc["peer_vouched"] is False
     print("PASS test_merge_folds_one_chat_into_another")
 
 
@@ -1431,6 +1598,9 @@ if __name__ == "__main__":
     test_a_repeated_event_is_one_arrival()
     test_a_read_reaches_a_stamp_from_a_fast_clock()
     test_archive_unless_arrived()
+    test_what_an_arrival_owes_is_kept_per_arrival()
+    test_a_turn_archives_over_mail_whose_turn_asked_too()
+    test_an_ask_from_before_the_users_unarchive_is_none()
     test_flags_and_note_message()
     test_companion_link()
     test_overlay_merge_dedup_expiry()
@@ -1447,4 +1617,5 @@ if __name__ == "__main__":
     test_the_copy_follows_the_gateways_queue()
     test_a_send_that_was_decided_stays_as_decided()
     test_owed_calls_outlast_the_process()
+    test_what_is_owed_for_a_mail_outlasts_the_newest_arrivals()
     print("all chat-state tests passed")

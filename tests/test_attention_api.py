@@ -656,20 +656,21 @@ def test_a_person_carries_attention_and_vip(base, wg):
     assert all("Pia Frei" not in names for names in profile["permits"].values()), profile["permits"]
     status, out = _http(base, "POST", f"/contacts/{person}", {"permits": ["no-such-mode"]})
     assert status == 400, out
-    # VIP reaches the gate on every channel she has, and her address is
-    # whitelisted — beside what was set by hand, which it leaves alone.
+    # VIP reaches the gate on every channel she has, e-mail among them: her
+    # address is a VIP handle of the `email` channel, not a whitelist entry —
+    # beside what was set by hand, which it leaves alone.
     import triage_policy as tp  # the gateway's scripts/ is on sys.path
     tp._mutate_messenger("signal", vip_add=["+41790000999"])
     wg._contacts_sync_policy()
     assert tp.gate_decision("signal", pia)["vip"] is True
     assert tp.gate_decision("whatsapp", pia)["vip"] is True
     assert tp.gate_decision("signal", "+41790000999")["vip"] is True, "a hand-set VIP stays"
-    assert tp.email_gate_decision("pia@example.org")["triage_now"] is True
+    assert tp.gate_decision("email", "pia@example.org")["vip"] is True
     status, out = _http(base, "POST", f"/contacts/{person}", {"vip": False})
     assert status == 200 and out["contact"]["vip"] is False, out
     assert tp.gate_decision("signal", pia)["vip"] is False
     assert tp.gate_decision("signal", "+41790000999")["vip"] is True
-    assert tp.email_gate_decision("pia@example.org")["triage_now"] is False
+    assert tp.gate_decision("email", "pia@example.org")["vip"] is False
     _http(base, "POST", "/attention/items/done", {"id": cid})
     print("ok test_a_person_carries_attention_and_vip")
 

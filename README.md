@@ -90,7 +90,9 @@ Defines these core compose services:
   for one Signal account. Depending on the account's configured mode
   (see [Messaging accounts](#messaging-accounts)) it either runs incoming
   messages as prompts to `retinue` and replies in audio (**control** mode), or
-  hands them to the user's triage as incoming mail (**inbox** mode). Incoming
+  hands them to the dashboard's chat surface as the user's incoming mail
+  (**inbox** mode; a model turn works one only for a sender the user marked a
+  VIP or wrote an instruction for). Incoming
   voice notes are transcribed via the `stt` service, and incoming images are
   forwarded to the agent alongside the message text (all three messenger
   gateways do this — the image travels with the `POST /message` forward and is
@@ -108,11 +110,18 @@ Defines these core compose services:
   with its reason; the To/Cc line of a reply is the gateway's own answer, and a
   mail that may have gone out is never reported as not sent; agents send with
   `scripts/mail-push.py`), and Mark as read, Archive and Delete reach the
-  mailbox (Delete moves the thread to the Trash, which it never creates). It pushes nothing and starts
-  no model turn for an arriving mail yet, and e-mail triage runs beside it.
+  mailbox (Delete moves the thread to the Trash, which it never creates). It
+  gates each arriving mail like a messenger message: nothing is pushed by
+  default (a contact's importance and the modes they may interrupt can say
+  otherwise), a model turn works the mail only for a sender whose contact
+  carries the VIP flag or an instruction, and a mailing list flagged `news`
+  goes to the feed (a VIP's or instructed sender's mail in it still gets its
+  chat and its turn). There is no e-mail triage beside it.
   Opt-in: it mirrors nothing until `MAIL_GATEWAY_TOKEN` is set, so an upgrade
-  that changes nothing in `.env` mirrors nothing; with no mailbox configured
-  it idles. See
+  that changes nothing in `.env` mirrors nothing — and, with e-mail triage
+  retired, nobody handles e-mail until it is set: the boot says so in a
+  dashboard thread, and the one-time triage migration waits for it. With no
+  mailbox configured it idles. See
   [`docs/messaging.md`](docs/messaging.md), "E-mail (the mail gateway)".
 - **`stt`** — a small speech-to-text microservice that owns the single Whisper
   model in the stack and exposes `POST /transcribe`. Shared by the
@@ -295,13 +304,13 @@ inferred from a message's content. Set it with `SIGNAL_GATEWAY_MODE` (Signal),
 | Mode | The account is… | Inbound handling | Reply to sender? |
 |------|-----------------|------------------|------------------|
 | `control` | a control channel for operating Retinue (the classic gateway) | run as a prompt to Ara | yes — voice/text on the same channel |
-| `inbox` *(default)* | one of the user's own message sources, like an e-mail inbox | forwarded to triage as the user's incoming mail, surfaced on the dashboard as a push notification | no |
+| `inbox` *(default)* | one of the user's own message sources, like an e-mail inbox | shown in its chat on the dashboard and pushed as the user's incoming mail; a model turn only for a VIP or an instructed sender (the triage skill is the fallback when the chat surface cannot take a message) | no |
 
 The default is `inbox`, so an account left unconfigured **cannot drive the
 system** — exposure defaults closed. Turning an account into a control channel is
 an explicit opt-in (`SIGNAL_GATEWAY_MODE=control`) and still requires the sender
 to be on the accepted-requesters allowlist (below). Because the mode is a
-property of the account, the triage skill never has to decide whether an incoming
+property of the account, no session ever has to decide whether an incoming
 message is a system instruction or user mail.
 
 ### Linking a Signal account
@@ -362,14 +371,14 @@ user's personal number as an `inbox` source:
 ```yaml
 # docker-compose.override.yml
 services:
-  # Account #2: the user's personal number, an inbox source that feeds triage.
+  # Account #2: the user's personal number, an inbox source shown as chats.
   signal-gateway-personal:
     extends:
       file: docker-compose.yml
       service: signal-gateway
     environment:
       - SIGNAL_ACCOUNT=+15557654321      # this account's own number (E.164)
-      - SIGNAL_GATEWAY_MODE=inbox        # forward to triage, no reply
+      - SIGNAL_GATEWAY_MODE=inbox        # the user's own mail: no reply
     volumes:
       - signal-data-personal:/root/.local/share/signal-cli   # its OWN volume
       - piper-data:/models
@@ -426,7 +435,7 @@ Telegram is reached through the sibling `telegram-gateway` service, which logs i
 as the user's **own Telegram account** — an MTProto user client (Telethon), not a
 bot. Acting as the user is what makes it fit for purpose: it can message any of
 the user's contacts *as them*, read the user's own incoming DMs (so `inbox` mode
-genuinely triages the user's Telegram mail), and enumerate the real contact
+genuinely mirrors the user's Telegram mail), and enumerate the real contact
 directory — the same account access an MCP user client has, but with the
 credentials isolated in the container. Same `control`/`inbox` mode model
 (`TELEGRAM_GATEWAY_MODE`, default `inbox`) and the same email-style send-control

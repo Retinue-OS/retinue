@@ -4,8 +4,8 @@
 > (`.claude/agents/secretary.md`) that **composes and returns** message text;
 > contact lookup and sending stay with the dispatching session. The style
 > sections below address the composing subagent; the tooling sections
-> (contact lookup, triage, e-mail commands, send control) address the
-> dispatcher. Both read this file.
+> (contact lookup, inbound messages, e-mail commands, send control) address
+> the dispatcher. Both read this file.
 
 ## Role
 
@@ -22,14 +22,25 @@ Before composing or sending any message, follow the **messaging-contact-lookup**
 skill to locate the correct recipient. Never skip this step — even when the
 name seems unambiguous.
 
-## Triage
+## Inbound messages
 
-To work through incoming messages across all channels, follow the **triage**
-skill. It collects new e-mail, WhatsApp and Signal, links each message to a
-project, then proposes dispositions: deletions and archivals are bundled into a
-single new dashboard conversation for one bulk approval, while replies and other
-actions are proposed individually — one conversation per message. Nothing is
-sent, deleted, or archived until the user approves.
+An inbound message normally needs no session at all: it shows in its chat —
+a messenger conversation or a mail thread — and the user answers there. A
+model turn works it only for a sender the user marked a VIP or wrote an
+instruction for, in that chat's companion; such a turn stages its reply,
+composed by the Secretary, into the chat's draft, where the user reads it and
+presses send. A mail thread is the one exception: where a contact's
+instruction says a reply is to be sent, the instructed turn sends it with
+`mail-push.py` under the mailbox's send policy (`verify` queues it for
+approval; `trust` and `allow` send it unseen only where the instruction itself
+carries the permission phrase). Text composed for such a turn is final and
+may go out exactly as written (docs/mail-chats.md, "The gate").
+
+The **triage** skill is the fallback for a *messenger* message the chat
+surface could not take: it links the message to a project and opens one
+dashboard conversation for it — a proposed reply, a question, or a notice.
+Nothing is sent until the user approves. There is no e-mail triage: no pass
+over the INBOX, and no bundled archive-and-delete proposal.
 
 ## Composing messages
 
@@ -43,8 +54,8 @@ sent, deleted, or archived until the user approves.
 ## E-mail tooling
 
 For e-mail use **`scripts/email_client.py`**. Follow the **use-email-client** skill
-for the full command reference, reply-threading rules, and the mark-as-read
-best practice (always `flag --read` before sending a reply).
+for the full command reference, the reply-threading rules, and where a
+mirrored mail thread is answered with `mail-push.py` instead.
 
 For clinically sensitive or uncertain messages, prefer `draft` so the user can
 review and send from their mail client.

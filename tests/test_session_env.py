@@ -110,9 +110,18 @@ NEEDED = {
     "MAIL_GATEWAY_BASE_URL": "http://mail-gateway:8096",
     "MAIL_GATEWAY_SEND_URL": "http://mail-gateway:8096/send",
     "MAIL_GATEWAY_TIMEOUT": "120",
-    # non-secret mailbox setting the triage gate lists by name
-    "SENT_FOLDER": "Sent",
-    "TRIAGE_STATE_DIR": "/root/.retinue/triage",
+    # where the delivery gate's policy files are (triage_policy.py's CLI)
+    "TRIAGE_MESSENGER_DIR": "/workspace/chambers/_generated/messenger",
+    "TRIAGE_EMAIL_WHITELIST_PATH": "/workspace/chambers/_generated/messenger/email/policy/email-policy.nt",
+    # the triage migration, which the boot thread's chips send a session to
+    # run: its state directory and the user's own addresses (no contact),
+    # and the verdict timeouts its report states as they are set
+    "TRIAGE_STATE_DIR": "/data/triage",
+    "MAIL_OWN_ADDRESSES": "me@alias.example",
+    "MIGRATE_TRIAGE_MODEL_TIMEOUT": "300",
+    "MIGRATE_TRIAGE_MIRROR_WAIT": "21600",
+    "MAIL_INSTRUCTION_TIMEOUT": "900",
+    "CHAT_INSTRUCTION_TIMEOUT": "90",
     # git shim and python
     "GIT_SERIALIZE_LOCK_DIR": "/tmp/git-locks",
     "PYTHONPATH": "/workspace/scripts",
@@ -126,12 +135,20 @@ DAEMON_ONLY = {
     "IMAP_HOST": "imap.example.com",
     "SMTP_HOST": "smtp.example.com",
     "EMAIL_SEND_POLICY": "[]",
+    # a mailbox setting: the backend's, like the credentials it goes with
+    "SENT_FOLDER": "Sent",
+    # the retired e-mail triage's settings, should a deployment's environment
+    # still carry them: no session reads them, so none gets them
+    "TRIAGE_INBOX_SCAN_LIMIT": "50",
+    "TRIAGE_BATCH_SIZE": "25",
+    "TRIAGE_NEWS_FOLDER": "Archive",
+    "EMAIL_PROCESSING_INTERVAL": "86400",
+    "EMAIL_CLIENT_PATH": "/workspace/scripts/email_client.py",
     "MESSENGER_GATEWAYS": '[{"base_url":"http://x:1","token":"t"}]',
     "SCHEDULER_TICK_SECONDS": "30",
     # the mail gateway's own settings, should a deployment set them here
     "MAIL_ACCOUNT_NAME": "ari",
     "MAIL_BACKFILL_DAYS": "90",
-    "MAIL_OWN_ADDRESSES": "me@alias.example",
     # the web gateway's mail-chat tunables: the daemon reads them, no session does
     "MAIL_SEND_TIMEOUT": "120",
     "CHAT_PENDING_TIMEOUT": "4",
@@ -179,17 +196,20 @@ def test_daemon_only_configuration_is_dropped():
 
 
 def test_prefixes_admit_the_framework_namespaces():
-    src = _source(RETINUE_TRIAGE_MODEL="sonnet", RETINUE_ANYTHING_NEW="x",
+    src = _source(RETINUE_REPORT_MODEL="sonnet", RETINUE_ANYTHING_NEW="x",
                   SPARQL_ENDPOINT_GENOMICS="http://qlever-genomics:7001",
                   CLAUDE_CODE_FUTURE_FLAG="1", ANTHROPIC_SMALL_FAST_MODEL="haiku",
-                  LC_MESSAGES="C", NEWS_MAX_ITEMS="500", TRIAGE_INBOX_SCAN_LIMIT="50",
+                  LC_MESSAGES="C", NEWS_MAX_ITEMS="500",
                   GIT_AUTHOR_NAME="Ara", PYTHONUNBUFFERED="1")
     env = se.build(src)
-    for name in ("RETINUE_TRIAGE_MODEL", "RETINUE_ANYTHING_NEW",
+    for name in ("RETINUE_REPORT_MODEL", "RETINUE_ANYTHING_NEW",
                  "SPARQL_ENDPOINT_GENOMICS", "CLAUDE_CODE_FUTURE_FLAG",
                  "ANTHROPIC_SMALL_FAST_MODEL", "LC_MESSAGES", "NEWS_MAX_ITEMS",
-                 "TRIAGE_INBOX_SCAN_LIMIT", "GIT_AUTHOR_NAME", "PYTHONUNBUFFERED"):
+                 "GIT_AUTHOR_NAME", "PYTHONUNBUFFERED"):
         assert name in env, name
+    # TRIAGE_ is not a namespace: only the policy paths and the migration's
+    # state directory are named.
+    assert "TRIAGE_" not in se.SESSION_ENV_PREFIXES
     # A prefix never admits the one key that lives under an allowed namespace.
     assert "RETINUE_LITELLM_KEY" not in env
     print("ok: the RETINUE_/CLAUDE_/ANTHROPIC_/SPARQL_ENDPOINT_ namespaces pass, "
@@ -260,6 +280,48 @@ def test_per_spawn_stamps_are_never_inherited():
     print("ok: the model stamp, the escalation flag and the reply manifest are "
           "set per spawn, "
           "never inherited — not even through the escape hatch")
+
+
+def test_the_arrival_turn_token_is_set_per_spawn_only():
+    """RETINUE_ARRIVAL_TURN tells the web gateway that a chat-flags call is
+    the arrival turn's it was minted for: only the spawn of that turn carries
+    it, and never one that inherits it — a session holding a stale token, or
+    one the operator's escape hatch let through, would be taken for a turn
+    (or a turn's call for Ara's on the user's word)."""
+    src = _source(RETINUE_ARRIVAL_TURN="stale-turn")
+    assert "RETINUE_ARRIVAL_TURN" not in se.build(src)
+    for extra in ("RETINUE_ARRIVAL_TURN", "RETINUE_*"):
+        hatch = {**src, "RETINUE_SESSION_ENV_EXTRA": extra}
+        assert "RETINUE_ARRIVAL_TURN" not in se.build(hatch), extra
+        assert not se.allowed("RETINUE_ARRIVAL_TURN", hatch), extra
+    assert se.build(src, arrival_turn="0f" * 16)["RETINUE_ARRIVAL_TURN"] == "0f" * 16
+    # None and "" are "not an arrival turn".
+    for none in (None, ""):
+        assert "RETINUE_ARRIVAL_TURN" not in se.build(src, arrival_turn=none)
+    print("ok: the arrival-turn token is set per spawn, never inherited")
+
+
+def test_the_user_turn_proof_is_set_per_spawn_only():
+    """Decision AK: RETINUE_USER_TURN proves that a chat-flags call comes
+    from a dashboard thread's turn — the user's word. Only that spawn
+    carries it: a session another one spawns through build() never inherits
+    it (an arrival turn's child would hold the user's word), nor does the
+    escape hatch let it through, and an arrival turn's spawn is handed none."""
+    src = _source(RETINUE_USER_TURN="stale-proof", RETINUE_ARRIVAL_TURN="a-turn")
+    assert "RETINUE_USER_TURN" not in se.build(src)
+    for extra in ("RETINUE_USER_TURN", "RETINUE_*"):
+        hatch = {**src, "RETINUE_SESSION_ENV_EXTRA": extra}
+        assert "RETINUE_USER_TURN" not in se.build(hatch), extra
+        assert not se.allowed("RETINUE_USER_TURN", hatch), extra
+    env = se.build(src, user_turn="1e" * 16)
+    assert env["RETINUE_USER_TURN"] == "1e" * 16 and "RETINUE_ARRIVAL_TURN" not in env
+    turn = se.build(src, arrival_turn="0f" * 16)
+    assert "RETINUE_USER_TURN" not in turn, "an arrival turn was handed the user's word"
+    # The arrival turn's own child, built from the turn's environment.
+    assert "RETINUE_USER_TURN" not in se.build(turn)
+    for none in (None, ""):
+        assert "RETINUE_USER_TURN" not in se.build(src, user_turn=none)
+    print("ok: the user-turn proof is set per spawn, never inherited")
 
 
 def test_email_goes_through_the_gateway_backend():
@@ -354,6 +416,8 @@ def main():
     test_excluded_names_are_prefix_matches()
     test_gateway_client_suffixes_cover_deployment_added_gateways()
     test_per_spawn_stamps_are_never_inherited()
+    test_the_arrival_turn_token_is_set_per_spawn_only()
+    test_the_user_turn_proof_is_set_per_spawn_only()
     test_email_goes_through_the_gateway_backend()
     test_escape_hatch_admits_what_a_deployment_names()
     test_default_source_is_the_process_environment()

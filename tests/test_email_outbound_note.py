@@ -12,10 +12,10 @@ Best-effort: only where a gateway is configured, never failing the send that
 produced it, and a 404 (another account's gateway) is no error.
 
 **The send helpers as a library.** The gateway sends through ``_smtp_send``
-and ``_build_message``: a switch turns the whitelist-on-send off for a process
-that never writes policy, two hooks mark the moments a send journal needs,
-the refused addresses are returned, and a caller may mint the Message-ID. With
-none of that asked for, the helpers do exactly what they did.
+and ``_build_message``: two hooks mark the moments a send journal needs, the
+refused addresses are returned, and a caller may mint the Message-ID. With
+none of that asked for, the helpers do exactly what they did — and a send
+writes no policy: the whitelist-on-send went with the e-mail whitelist.
 
     python3 tests/test_email_outbound_note.py
 """
@@ -242,23 +242,29 @@ def test_the_send_helpers_as_a_library(ec, tp):
     smtplib.SMTP = _FakeSMTP
     try:
         with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / "email-whitelist.nt"
+            path = Path(tmp) / "email-policy.nt"
             os.environ["TRIAGE_EMAIL_WHITELIST_PATH"] = str(path)
             try:
-                # As before, with nothing asked for: the recipients are
-                # whitelisted, and the refused addresses come back.
+                # With nothing asked for: the mail goes out, and the refused
+                # addresses come back.
                 _FakeSMTP.log, _FakeSMTP.refuse = [], {"gone@example.org"}
                 refused = ec._smtp_send(_Cfg(), _msg(), ["ann@example.org", "gone@example.org"])
                 assert list(refused) == ["gone@example.org"]
                 assert _FakeSMTP.log == ["login", "envelope", "data", "quit"]
-                assert tp.load_email_policy(path).addresses == frozenset({"ann@example.org"})
-                # Switched off — as the mail gateway does for its whole
-                # process — a send writes no policy.
-                ec.WHITELIST_ON_SEND = False
-                _FakeSMTP.refuse = set()
-                assert ec._smtp_send(_Cfg(), _msg(), ["new@example.org"]) == {}
-                assert tp.load_email_policy(path).addresses == frozenset({"ann@example.org"})
-                ec.WHITELIST_ON_SEND = True
+                # A send is no statement about its recipients: it writes no
+                # policy, in the CLI's process as in the gateway's. (Sending
+                # to an address used to whitelist it for e-mail triage.)
+                calls = []
+                real_mutate = tp._mutate_email
+                tp._mutate_email = lambda **kw: calls.append(kw)
+                try:
+                    _FakeSMTP.refuse = set()
+                    assert ec._smtp_send(_Cfg(), _msg(), ["new@example.org"]) == {}
+                finally:
+                    tp._mutate_email = real_mutate
+                assert calls == [] and not path.exists(), "a send wrote policy"
+                assert not hasattr(ec, "_whitelist_recipients")
+                assert not hasattr(ec, "WHITELIST_ON_SEND")
 
                 # The hooks: just before the message is handed over, and as
                 # soon as the server said it took it — before the session ends.
@@ -294,7 +300,6 @@ def test_the_send_helpers_as_a_library(ec, tp):
                 assert "data" not in _FakeSMTP.log
             finally:
                 os.environ.pop("TRIAGE_EMAIL_WHITELIST_PATH", None)
-                ec.WHITELIST_ON_SEND = True
     finally:
         smtplib.SMTP = real
     # A caller may mint the Message-ID; by default one is made.

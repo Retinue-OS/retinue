@@ -963,15 +963,14 @@ def test_the_gateway_writes_no_policy():
         real = gw._triage._mutate_email
         gw._triage._mutate_email = lambda **kw: calls.append(kw)
         try:
-            assert gw._ec.WHITELIST_ON_SEND is False
             assert w.send(to=["new.person@gmail.com"])[0] == 200 and len(smtp.mails) == 1
         finally:
             gw._triage._mutate_email = real
         assert calls == [] and not gw.POLICY_PATH.exists(), \
-            "a mail the gateway sends whitelists nobody"
+            "a mail the gateway sends writes no policy"
     finally:
         done(w)
-    print("ok: email_client's whitelist-on-send does not run inside the gateway")
+    print("ok: a send through the gateway writes no policy")
 
 
 def test_a_merge_takes_a_queued_send_along():

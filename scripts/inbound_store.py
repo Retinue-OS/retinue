@@ -178,6 +178,14 @@ P_SUBJECT = KB + "subject"
 # from a client is recorded with its From as well (kb:sender then is the
 # account's own address).
 P_SENDER_NAME = KB + "senderName"
+# On an inbound mail: the address the delivery gate takes it to be from — the
+# one address of its one From header, where it has exactly that and the
+# address reads as one (docs/mail-chats.md, "The gate"); absent when it has
+# not. kb:sender is what the chat shows, and may come from the Sender header
+# or the first of several From addresses; this is what decides whether the
+# mail buys a model turn, and nothing else may stand in for it: a record
+# without it is from nobody the gate knows.
+P_GATE_SENDER = KB + "gateSender"
 # To and Cc addresses, one triple each. A set: the record is sorted, so header
 # order is not kept — which is why kb:references, whose order is its meaning,
 # is one literal instead.
@@ -241,6 +249,7 @@ TRIMS = ("deterministic", "wanting", "model")
 # the renderer, the parser and the writers alike, so a field cannot be written
 # by one of them and forgotten by another.
 _MAIL_LITERALS = (("subject_line", P_SUBJECT), ("sender_name", P_SENDER_NAME),
+                  ("gate_sender", P_GATE_SENDER),
                   ("in_reply_to", P_IN_REPLY_TO), ("references", P_REFERENCES),
                   ("list_id", P_LIST_ID), ("trim", P_TRIM))
 _MAIL_LISTS = (("recipients", P_RECIPIENT), ("cc", P_CC), ("reply_to", P_REPLY_TO),
@@ -539,8 +548,8 @@ def _parse(text: str) -> dict | None:
     :func:`_render`, so no rewrite here ever drops a newer writer's facts.
 
     The mail fields (see :data:`P_SUBJECT`) read as ``subject_line``,
-    ``sender_name``, ``recipients``, ``cc``, ``reply_to``, ``refused`` and
-    ``sent_as`` (lists), ``in_reply_to``,
+    ``sender_name``, ``gate_sender``, ``recipients``, ``cc``, ``reply_to``,
+    ``refused`` and ``sent_as`` (lists), ``in_reply_to``,
     ``references`` (the space-separated literal as stored), ``list_id``,
     ``body_part``/``html_part``/``header_part`` (media IRIs), ``trim``,
     ``removed_at`` and ``arrived_at`` (ISO-8601); an inline part's Content-ID is
@@ -732,7 +741,7 @@ def _check_trim(trim) -> str | None:
 def _mail_fields(*, subject=None, sender_name=None, recipients=None, cc=None,
                  in_reply_to=None, references=None, list_id=None, body_part=None,
                  html_part=None, header_part=None, trim=None, arrived_at=None,
-                 reply_to=None, refused=None) -> dict:
+                 reply_to=None, refused=None, gate_sender=None) -> dict:
     """The mail fields of a new record, normalised (see :data:`P_SUBJECT`).
 
     ``references`` is the References header's ids in header order, as one
@@ -746,6 +755,7 @@ def _mail_fields(*, subject=None, sender_name=None, recipients=None, cc=None,
         "arrived_at": None if arrived_at is None else _iso(float(arrived_at)),
         "subject_line": _one(subject),
         "sender_name": _one(sender_name),
+        "gate_sender": _one(gate_sender),
         "recipients": _many(recipients),
         "cc": _many(cc),
         "reply_to": _many(reply_to),
@@ -830,6 +840,7 @@ def write_message(
     content_ids: dict | None = None,
     arrived_at: float | None = None,
     reply_to: list[str] | None = None,
+    gate_sender: str | None = None,
     replace: str | Path | None = None,
     sent_as: list[str] | None = None,
 ) -> tuple[str, Path]:
@@ -865,6 +876,8 @@ def write_message(
     docs/mail-chats.md, "The record"): ``subject`` its Subject, ``sender_name``
     the display name on From, ``recipients``/``cc`` the To/Cc addresses,
     ``reply_to`` the Reply-To addresses (see :data:`P_REPLY_TO`),
+    ``gate_sender`` the address the delivery gate goes by (see
+    :data:`P_GATE_SENDER`; absent or empty: nobody),
     ``in_reply_to``/``references`` its threading headers, ``list_id``,
     ``body_part``/``html_part``/``header_part`` the media references of its
     parts (stored with :func:`store_media` first, like attachments, so their
@@ -889,7 +902,7 @@ def write_message(
                        cc=cc, in_reply_to=in_reply_to, references=references,
                        list_id=list_id, body_part=body_part, html_part=html_part,
                        header_part=header_part, trim=trim, arrived_at=arrived_at,
-                       reply_to=reply_to),
+                       reply_to=reply_to, gate_sender=gate_sender),
         "type": T_INBOUND,
         "subject": urn,
         "channel": channel,
@@ -1679,18 +1692,21 @@ def _blob_ids_referenced_elsewhere(store_dir: Path, ids: set[str],
 
 
 def tombstone_message(path: str | Path, removed_at: str | float | None = None, *,
-                      own_blobs: bool = False) -> bool:
+                      own_blobs: bool = False, keep_delivered: bool = False) -> bool:
     """Strip one record to its identity: the mail is gone from the mailbox.
 
     For a mail deleted, or moved out of the mirrored folders, in a client
     (docs/mail-chats.md, "The mirror"). The record stays — a chat whose mails
     are all gone is archived, not erased — and keeps who, where and when:
-    type, channel, chat, account, group, sender and sender name, author,
-    message id (and any id a provider gave it instead, ``kb:sentAs``),
+    type, channel, chat, account, group, sender, sender name and gate
+    sender, author, message id (and any id a provider gave it instead, ``kb:sentAs``),
     subject, the threading ids and the list id (a thread index
     rebuilt from the ledger needs every id a mail cited), its timestamps,
     and on an inbound record ``delivered`` — set true, since nothing is owed
-    for a mail that no longer exists. It loses what the mail said and to
+    for a mail that no longer exists; ``keep_delivered=True`` leaves it as it
+    was instead, for a caller whose mail was still owed when it went and is
+    owed again should it come back (the mail gateway: a tombstone is offered
+    to nobody, and the mail that replaces it reads the flag). It loses what the mail said and to
     whom: ``kb:text`` becomes the empty string (the triple stays: the parser
     and the web gateway's chat query require it), and the recipients, the Cc,
     the Reply-To and the refused addresses, the trim, the parts, the attachments with what was stated about them, a
@@ -1725,7 +1741,7 @@ def tombstone_message(path: str | Path, removed_at: str | float | None = None, *
         stripped |= {key for key in ("text", "trim", "media", "attachment_meta")
                      if fields.get(key)}
         owed = fields.get("type") == T_INBOUND and not fields.get("delivered")
-        if fields.get("removed_at") and not stripped and not owed:
+        if fields.get("removed_at") and not stripped and (keep_delivered or not owed):
             return True
         # The blobs go first, so a failed rewrite leaves a record a repeat
         # can still finish — never a record pointing at nothing it can name.
@@ -1755,7 +1771,7 @@ def tombstone_message(path: str | Path, removed_at: str | float | None = None, *
         fields["trim"] = None
         fields["media"] = None
         fields["attachment_meta"] = {}
-        if fields.get("type") == T_INBOUND:
+        if fields.get("type") == T_INBOUND and not keep_delivered:
             fields["delivered"] = True
         _atomic_write(_render(fields), p)
         return True

@@ -10,7 +10,9 @@ rebuilt from the ledger, the rail's queue, health and the HTTP API.
 
 The MIME shapes and size caps are in tests/test_mail_gateway_mime.py, the
 adapter itself (against a scripted IMAP server) in
-tests/test_mail_gateway_imap.py; both load this file for its helpers.
+tests/test_mail_gateway_imap.py, and the delivery gate — what a mail that
+arrives is offered with, every answer of the rail, the news rail — in
+tests/test_mail_gateway_gate.py; all load this file for its helpers.
 
     python3 tests/test_mail_gateway.py
 """
@@ -42,15 +44,19 @@ DAY = 86400.0
 T0 = 1_760_000_000.0
 NOW = T0 + 40 * DAY
 RAIL_URL = "http://rail.invalid/internal/chats/inbound"
+NEWS_URL = "http://rail.invalid/internal/news"
 
 _ENV_PREFIXES = ("MAIL_", "EMAIL_", "IMAP_", "SMTP_", "TRIAGE_")
-_ENV_NAMES = ("SENT_FOLDER", "DRAFTS_FOLDER", "INBOUND_STORE_DIR", "MESSENGER_BUILTIN_CHANNELS")
+_ENV_NAMES = ("SENT_FOLDER", "DRAFTS_FOLDER", "INBOUND_STORE_DIR", "MESSENGER_BUILTIN_CHANNELS",
+              "CHATS_INGEST_TOKEN")
 TOKEN = "gateway-token"
 
 
-def load(tmp, *, token=TOKEN, days=90, configured=True, rail=True, **env):
+def load(tmp, *, token=TOKEN, days=90, configured=True, rail=True, news=True, **env):
     """Import a fresh gateway module whose state lives under ``tmp``. With a
-    token, as every deployment that mirrors has one (``token=""`` for none)."""
+    token, as every deployment that mirrors has one (``token=""`` for none).
+    ``gw.filed`` collects what the gateway files to the news feed, which
+    takes everything until a test says otherwise (:func:`feed`)."""
     if str(SCRIPTS_DIR) not in sys.path:
         sys.path.insert(0, str(SCRIPTS_DIR))
     root = Path(tmp)
@@ -76,18 +82,55 @@ def load(tmp, *, token=TOKEN, days=90, configured=True, rail=True, **env):
     # chat_ingest is imported once per process; its endpoint is per test.
     gw._chats.CHATS_INGEST_URL = RAIL_URL if rail else ""
     gw._chats.CHATS_INGEST_TOKEN = "rail-token"
+    # So is news_ingest's.
+    gw._news.NEWS_INGEST_URL = NEWS_URL if news else ""
+    feed(gw)
     return gw
 
 
-def rail(gw, outcome="ok"):
-    """Capture what the gateway offers the rail; returns the list it fills."""
+def rail(gw, outcome="ok", answer=None, alive=False):
+    """Capture what the gateway tells and offers the rail; returns the list
+    it fills, ``(kind, payload)`` in the order sent — an offer (a mail that
+    arrived, with its handover) as ``"inbound"``, like every mail.
+
+    ``outcome`` is how the web gateway takes each event ("ok", "drop",
+    "later", "down", "uncertain" and "unanswered"), or a function of
+    ``(kind, payload)`` saying so. ``answer`` is what it answers an offer it
+    took: by default ``{"accepted": True}`` — the chat has the mail — else a
+    dict, or a function of the payload returning one. ``alive`` is what a
+    look at the rail after an "uncertain" event finds (``_rail_alive``): by
+    default that it is away, as "uncertain" was ever tested; a bool, or a
+    function of nothing."""
     events = []
+    gw._rail_alive = alive if callable(alive) else (lambda: bool(alive))
 
     def send(kind, payload):
         events.append((kind, payload))
         return outcome(kind, payload) if callable(outcome) else outcome
+
+    def offer(payload):
+        events.append(("inbound", payload))
+        said = outcome("inbound", payload) if callable(outcome) else outcome
+        if said != "ok":
+            return said, {}
+        body = answer(payload) if callable(answer) else answer
+        return "ok", {"accepted": True} if body is None else dict(body)
     gw._rail_send = send
+    gw._rail_offer = offer
     return events
+
+
+def feed(gw, takes=True):
+    """Stand in for the news feed: ``gw.filed`` collects every item the
+    gateway files; ``takes`` (a bool, or a function of the item) says
+    whether the feed took it."""
+    gw.filed = []
+
+    def send(item):
+        gw.filed.append(item)
+        return bool(takes(item) if callable(takes) else takes)
+    gw._news_send = send
+    return gw.filed
 
 
 def msg(mid="m1@x.org", *, sender="Ann Example <ann@x.org>", to=ACCOUNT, cc=None,
@@ -357,7 +400,7 @@ def test_a_thread_across_inbox_and_sent_is_one_chat():
         assert {r["channel"] for r in recs.values()} == {"email"}
         a, b, c = recs["a@x.org"], recs["b@example.org"], recs["c@x.org"]
         assert a["type"] == gw._ibstore.T_INBOUND and b["type"] == gw._ibstore.T_OUTBOUND
-        # Nothing is owed for a mirrored mail in this phase.
+        # The chat took both mails that arrived: nothing is owed for them.
         assert a["delivered"] is True and c["delivered"] is True
         assert a["sender"] == "ann@x.org" and a["sender_name"] == "Ann Example"
         assert a["subject_line"] == "Quarterly numbers"
@@ -381,11 +424,19 @@ def test_a_thread_across_inbox_and_sent_is_one_chat():
         for event in got:
             assert event["channel"] == "email" and event["account"] == ACCOUNT
             assert event["chat"] == "a@x.org" and event["chat_name"] == "Quarterly numbers"
-            assert event["gate"] == {"forward": False, "vip": False, "instructed": False,
-                                     "reason": "mirror"}
-            # No handover is offered, and new mail is not a backfill.
-            assert "handover" not in event and "backfill" not in event and "seen" not in event
+            # New mail is not a backfill.
+            assert "backfill" not in event and "seen" not in event
         sent, first, last = got
+        # A mail that arrived is offered: the gate's verdict and a handover.
+        # Nobody's VIP and nobody's instruction, so no file travels.
+        for event in (first, last):
+            assert event["gate"] == {"forward": True, "vip": False, "instructed": False,
+                                     "reason": "open"}
+            assert event["handover"] is True and "files" not in event
+        # The user's own mail is only told: held, and no handover.
+        assert sent["gate"] == {"forward": False, "vip": False, "instructed": False,
+                                "reason": "mirror"}
+        assert "handover" not in sent
         assert sent["direction"] == "out" and sent["author"] == "device"
         assert sent["sender"] == ACCOUNT and sent["sender_name"] == "Me Myself"
         assert first["direction"] == "in" and first["author"] is None
@@ -1698,7 +1749,7 @@ def test_no_backfill_mirrors_only_new_mail():
 # --------------------------------------------------------------------------
 
 def _write_policy(gw, **sets):
-    policy = gw._triage.EmailPolicy(frozenset(), frozenset())._replace(
+    policy = gw._triage.EmailPolicy(
         **{key: frozenset(values) for key, values in sets.items()})
     gw.POLICY_PATH.parent.mkdir(parents=True, exist_ok=True)
     gw.POLICY_PATH.write_text(gw._triage.render_email_policy(policy), encoding="utf-8")
@@ -1977,9 +2028,12 @@ def test_tombstones_and_merges_read_only_their_own_records():
             "m3@x.org", "m4@x.org", "m5@x.org"]
         assert recs["b@x.org"]["chat"] == "m0@x.org"
         # Three tombstones read three records; the merge read the one record
-        # of the absorbed chat (twice: to move it, and to see that it moved).
+        # of the absorbed chat (twice: to move it, and to see that it moved),
+        # and the offer of the mail that caused it read that mail's own.
         assert len(set(tombstone_reads)) == 3, tombstone_reads
-        assert len(set(merge_reads)) == 1, merge_reads
+        assert len(set(merge_reads)) == 2, merge_reads
+        assert {gw._ibstore.read_record(directory / name)["message_id"]
+                for name in set(merge_reads)} == {"b@x.org", "c@x.org"}
         media = {p.name for p in gw._ibstore.media_dir(gw.INBOUND_STORE_DIR).iterdir()
                  if "." not in p.name}
         named = {gw._ibstore.media_id_of(ref) for r in records(gw)
@@ -2084,7 +2138,7 @@ def _killed_at(n, setup, act, check) -> bool:
             return real
         act(box)
         ledger = ("write_message", "write_outbound", "store_media", "tombstone_message",
-                  "rekey_chat", "update_message")
+                  "rekey_chat", "update_message", "mark_delivered")
         saved = {name: arm(gw._ibstore, name) for name in ledger}
         for name in ("run", "atomic"):
             arm(mirror.index, name)
@@ -2137,6 +2191,12 @@ def test_wherever_it_is_killed_one_record_and_the_rail_is_told():
         mine = [e for e in inbound(events) if e["message_id"] == "a@x.org"]
         assert mine and "backfill" not in mine[0], (n, "a live mail is announced as one")
         assert len(mine[0]["attachments"]) == 1 and mine[0]["chat_name"] == "Quarterly numbers"
+        # It arrived, so it is offered — and wherever the stop came, the
+        # chat's acceptance ends up on the record, with nothing left owed.
+        assert all(e.get("handover") is True for e in mine), n
+        assert recs["a@x.org"]["delivered"] is True, n
+        assert mirror.index.one("SELECT COUNT(*) AS n FROM offers")["n"] == 0, n
+        assert mirror.index.one("SELECT COUNT(*) AS n FROM outbox")["n"] == 0, n
     points = _every_kill_point(
         lambda mirror, box: None,
         lambda box: box.put("INBOX", msg("a@x.org", day=1,
@@ -2147,6 +2207,10 @@ def test_wherever_it_is_killed_one_record_and_the_rail_is_told():
     def check_backfill(n, gw, events, mirror):
         mine = [e for e in inbound(events) if e["message_id"] == "old@x.org"]
         assert mine and mine[0].get("backfill") is True and mine[0].get("seen") is True, n
+        # Old mail is told, never offered, and owed to nobody.
+        assert not any(e.get("handover") for e in mine), n
+        assert by_id(gw)["old@x.org"]["delivered"] is True, n
+        assert mirror.index.one("SELECT COUNT(*) AS n FROM offers")["n"] == 0, n
 
     def old_mail(mirror, box):
         box.put("INBOX", msg("old@x.org", day=1), flags=["\\Seen"])
@@ -2167,6 +2231,8 @@ def test_wherever_it_is_killed_one_record_and_the_rail_is_told():
         assert merges and all(m["from"] == ["zz@x.org"] and m["into"] == "a@x.org"
                               for m in merges), (n, merges)
         assert any(e["message_id"] == "c@x.org" for e in inbound(events)), n
+        assert all(r["delivered"] is True for r in records(gw)), n
+        assert mirror.index.one("SELECT COUNT(*) AS n FROM offers")["n"] == 0, n
     points += _every_kill_point(
         two_chats,
         lambda box: box.put("INBOX", msg("c@x.org", refs=["a@x.org", "zz@x.org"],
@@ -2632,6 +2698,7 @@ def test_no_rail_configured_queues_nothing():
 
 class _RailStub(BaseHTTPRequestHandler):
     seen: list = []
+    bearer: list = []
     status = 200
 
     def log_message(self, fmt, *args):
@@ -2641,6 +2708,7 @@ class _RailStub(BaseHTTPRequestHandler):
         body = self.rfile.read(int(self.headers.get("Content-Length", "0")))
         type(self).seen.append((self.path, self.headers.get("X-Conversation-Backend-Token"),
                                 json.loads(body)))
+        type(self).bearer.append(self.headers.get("Authorization"))
         self.send_response(type(self).status)
         self.send_header("Content-Length", "2")
         self.end_headers()
@@ -2654,21 +2722,28 @@ def test_rail_posts_and_their_outcomes():
         threading.Thread(target=server.serve_forever, daemon=True).start()
         base = f"http://127.0.0.1:{server.server_address[1]}"
         gw._chats.CHATS_INGEST_URL = f"{base}/internal/chats/inbound"
-        _RailStub.seen = []
+        _RailStub.seen, _RailStub.bearer = [], []
         try:
             _RailStub.status = 200
             assert gw._rail_send("inbound", {"chat": "a"}) == "ok"
             assert gw._rail_send("merge", {"into": "a"}) == "ok"
             assert gw._rail_send("removed", {"chat": "a"}) == "ok"
-            # The two new endpoints are the inbound URL with its last segment replaced.
+            # The two new endpoints are the inbound URL with its last segment
+            # replaced. The token: the web gateway takes an e-mail event only
+            # with one, and with no CHATS_INGEST_TOKEN set it is the
+            # MAIL_GATEWAY_TOKEN both sides hold — never chat_ingest's value.
             assert [(path, token) for path, token, _b in _RailStub.seen] == [
-                ("/internal/chats/inbound", "rail-token"),
-                ("/internal/chats/merge", "rail-token"),
-                ("/internal/chats/removed", "rail-token")]
+                ("/internal/chats/inbound", TOKEN),
+                ("/internal/chats/merge", TOKEN),
+                ("/internal/chats/removed", TOKEN)]
+            assert _RailStub.bearer == [f"Bearer {TOKEN}"] * 3
             assert _RailStub.seen[0][2] == {"chat": "a"}
             for status, kind, outcome in ((400, "inbound", "drop"), (413, "inbound", "drop"),
-                                          (500, "inbound", "down"), (404, "inbound", "down"),
-                                          (404, "merge", "later"), (503, "removed", "later"),
+                                          (500, "inbound", "unanswered"),
+                                          (404, "inbound", "down"),
+                                          (404, "merge", "later"), (404, "removed", "later"),
+                                          (503, "removed", "unanswered"),
+                                          (500, "merge", "unanswered"),
                                           (401, "inbound", "down"), (403, "merge", "down")):
                 _RailStub.status = status
                 assert gw._rail_send(kind, {}) == outcome, (status, kind)
@@ -2676,6 +2751,21 @@ def test_rail_posts_and_their_outcomes():
             server.shutdown()
         gw._chats.CHATS_INGEST_URL = "http://127.0.0.1:9/internal/chats/inbound"
         assert gw._rail_send("inbound", {}) == "down"
+    with tempfile.TemporaryDirectory() as tmp:
+        # A CHATS_INGEST_TOKEN the deployment set is the one sent.
+        gw = load(tmp, CHATS_INGEST_TOKEN=" own-rail-token ")
+        assert gw.RAIL_TOKEN == "own-rail-token"
+        server = ThreadingHTTPServer(("127.0.0.1", 0), _RailStub)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        port = server.server_address[1]
+        gw._chats.CHATS_INGEST_URL = f"http://127.0.0.1:{port}/internal/chats/inbound"
+        _RailStub.seen, _RailStub.bearer, _RailStub.status = [], [], 200
+        try:
+            assert gw._rail_send("inbound", {"chat": "a"}) == "ok"
+            assert _RailStub.seen[0][1] == "own-rail-token"
+            assert _RailStub.bearer == ["Bearer own-rail-token"]
+        finally:
+            server.shutdown()
     with tempfile.TemporaryDirectory() as tmp:
         # Nothing that is not text leaves by the rail, whatever got into an
         # event: the receiver writes what it is sent into files.

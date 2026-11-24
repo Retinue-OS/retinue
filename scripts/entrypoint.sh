@@ -20,7 +20,8 @@ is_letterbox() { [[ "${1%/}" == "${LETTERBOX_DIR%/}" ]]; }
 
 # ── The e-mail policy file, first thing ──────────────────────────────
 # The mail gateway does not start its mirror until the e-mail policy file
-# (whitelist and group flags) is where it reads it, on the mail ledger volume
+# (the group flags; the sender policy is the contacts' projection beside it)
+# is where it reads it, on the mail ledger volume
 # (docs/mail-chats.md, docs/messaging.md "E-mail (the mail gateway)"): a
 # backfill without the `news` flags would turn every newsletter of the window
 # into a chat, for good. So the file is placed — moved from its old place, or
@@ -31,6 +32,21 @@ is_letterbox() { [[ "${1%/}" == "${LETTERBOX_DIR%/}" ]]; }
 python3 /workspace/scripts/triage_policy.py place-email-policy \
   | sed 's/^/[policy] e-mail policy file: /' \
   || echo "[policy][warn] could not place the e-mail policy file; the web gateway retries" >&2
+
+# ── Secure the legacy e-mail whitelist ───────────────────────────────
+# E-mail triage and its whitelist are retired, and what the whitelist held
+# becomes contacts (scripts/migrate-triage.py; docs/mail-chats.md, "The
+# migration"). Its triples live in the policy file placed above, and the code
+# that writes that file no longer knows them: the file's next write drops
+# them. So they are copied into the migration's state directory here, before
+# any daemon or session exists that could write it. The same call fixes the
+# migration's cutoff on the first start of this code: only a `sender:` memory
+# recorded before it was triage's to read. Standard library only, and nothing
+# to do once taken. Best effort: the migration below takes the snapshot itself
+# as its first act (and a policy file it cannot read fails this call, loudly,
+# rather than reading as "no whitelist").
+python3 /workspace/scripts/migrate-triage.py --step snapshot \
+  || echo "[migrate-triage][warn] could not secure the legacy e-mail whitelist; the migration retries" >&2
 
 # Retinue keeps its own session memory in the life store (scripts/memory.py,
 # CLAUDE.md "Memory"); Claude Code's built-in auto memory would be a second,
@@ -559,6 +575,21 @@ case "$MODE" in
     # immediate exits (scripts/letterbox-supervise.sh).
     echo "[claude] Starting letterbox intake watcher..."
     bash /workspace/scripts/letterbox-supervise.sh &
+    # One-time: what e-mail triage knew — the whitelist, the `sender:`
+    # memories — moves onto contacts (scripts/migrate-triage.py;
+    # docs/mail-chats.md, "The migration"). In the background and best effort,
+    # never in the boot's way: it waits for the life store and the model where
+    # it needs them, and for the mail mirror's first backfill (at most
+    # MIGRATE_TRIAGE_MIRROR_WAIT, 6 h by default, polling — so it may run for
+    # hours); it opens one dashboard thread with its report (hence after the
+    # web gateway), and a boot that finds the migration done exits at once.
+    # With MAIL_GATEWAY_TOKEN unset it migrates nothing and says, once, that
+    # no mail is handled. Forked here with the daemons, so it holds the
+    # environment they hold — it knows the user's own addresses by the mailbox
+    # variables that are scrubbed for the main session further down, and the
+    # gateway's opt-in by its token.
+    echo "[claude] Checking the one-time triage migration (background)..."
+    python3 /workspace/scripts/migrate-triage.py --boot &
     # Start the Claude.ai session only where it can actually connect. With a
     # base URL configured that takes two things: the deployment must hold a
     # Claude.ai sign-in at all (RETINUE_GATEWAY_USES_CLAUDE_OAUTH, as before),

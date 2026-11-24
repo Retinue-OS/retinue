@@ -3471,8 +3471,10 @@ def main():
         test_companion_is_told_the_gateway_and_the_policy(base, wg, work_url)
         test_an_unsent_chat_is_forgotten_with_its_send(base, wg)
         test_delete_goes_through_the_gateway_first(base, wg, work_url)
-        assert not mail.TURNS, "no model turn runs for a mail in this phase"
-        assert not mail.PUSHES, "and no mail pushes"
+        # Every mail here arrives held (mail.GATE): the gate's own tests are
+        # tests/test_chat_mail_gate.py.
+        assert not mail.TURNS, "a model turn ran for a mail that is neither a VIP's nor instructed"
+        assert not mail.PUSHES, "and a held mail pushed"
         server.shutdown()
     for mock in (sparql, gw_main, gw_work, signal):
         mock.shutdown()

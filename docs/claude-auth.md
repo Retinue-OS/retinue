@@ -95,7 +95,8 @@ its script loads a model, because the scheduler cannot know, and a chamber's
 script cannot be required to know about `claude_auth`), every gateway spawn (`_run_claude()` in
 `scripts/web-gateway.py`: conversation turns, transcript cleanup, the
 presentation lint), the base-job scripts (`agent-self-review.py`,
-`news-curate.py`, `triage-gate.py`), Ask-Ara answers (`ara-mcp-server.py`),
+`news-curate.py`, `inbox-sweep.py`, `memory-compact.py`,
+`migrate-triage.py`), Ask-Ara answers (`ara-mcp-server.py`),
 the chamber plugin sync when it has an install to do
 (`scripts/sync-plugins.py`), the remote-control session itself (the
 entrypoint, right before `exec`) and sub-sessions from the `spawn-session`

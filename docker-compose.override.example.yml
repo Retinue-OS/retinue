@@ -54,6 +54,12 @@ services:
       # - SMTP_HOST_ARI
       # - MY_CHAMBER_API_KEY
       # - RETINUE_SESSION_ENV_EXTRA=MY_CHAMBER_API_KEY
+      # Recommended: the address Traefik connects from (a fixed one on `web`,
+      # never a range that holds this container's own), for without it the
+      # user-authority endpoints refuse only loopback and the address a caller
+      # dialled, and take a caller inside this container that comes in from
+      # its other network or through egress-audit for the dashboard.
+      # - EDGE_PROXY_PEERS=172.30.0.2
     networks:
       - agents
       - web
@@ -282,7 +288,10 @@ services:
   # sends under the same policy, and its approval links are
   # /sends/mail-gateway-ari/<id> (the service name). Leave SEND_APPROVAL_SLUG
   # unset: one slug shared by two gateways would address both accounts'
-  # pending sends as one. The account's SMTP settings are the suffixed set
+  # pending sends as one. And it inherits the gate's two rails (CHATS_INGEST_*,
+  # NEWS_INGEST_*) and MAIL_NEWS_FOLDER: its mail is gated and its news mail
+  # filed like the default account's, by the same address book and the same
+  # group flags. The account's SMTP settings are the suffixed set
   # below too (add SMTP_PORT_ARI, IMAP_PORT_ARI, … where they are not the
   # defaults); a sent mail's From name is EMAIL_FROM_NAME_ARI.
   # retinue:

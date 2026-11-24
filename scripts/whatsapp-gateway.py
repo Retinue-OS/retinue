@@ -215,7 +215,7 @@ REPLY_TOKENS = ReplyTokenStore(
 def _attach_reply_tokens(messages: list) -> None:
     """Give each drained /undelivered message a reply token for its origin.
 
-    The drain hands raw ledger rows to the daily triage; without a token those
+    The drain hands raw ledger rows to triage; without a token those
     replies fall back to name resolution — the exact failure that by-token
     routing exists to prevent and that live forwards already avoid. The origin
     is the group chat when there is one, else the stored sender. For a 1:1 that is the
@@ -357,7 +357,7 @@ def _confirm_delivery(job_path: str, store_path, label: str,
     started taking messages.
 
     Polls in the background (see job_delivery): a job that errors, expires or
-    never finishes leaves delivered=False, so the daily drain retries it.
+    never finishes leaves delivered=False, so the recovery drain retries it.
     """
     if store_path is None:
         return
@@ -1783,7 +1783,7 @@ def _handle_message_event(event) -> None:
                     # Never-drop: retain the audio and persist the message up
                     # front, THEN transcribe. A failed or crashed STT run leaves a
                     # durable, re-transcribable record (delivered=False, media set)
-                    # for the daily drain — instead of vanishing at the skip-return
+                    # for the recovery drain — instead of vanishing at the skip-return
                     # below, downstream of where _forward_to_inbox persists.
                     #
                     # The retained copy is the *retry* artifact and is dropped once
@@ -1830,7 +1830,7 @@ def _handle_message_event(event) -> None:
     if not text and not files and not attachment_urls:
         if voice_store_path is not None:
             # A voice note whose transcription failed: not dropped — it is on disk
-            # (delivered=False, audio retained) for the daily drain / a re-transcribe.
+            # (delivered=False, audio retained) for the recovery drain / a re-transcribe.
             print(f"[whatsapp-gateway] voice note from {sender} not transcribed; "
                   f"retained for retry (not dropped)", flush=True)
         else:
@@ -2030,7 +2030,7 @@ def _forward_to_inbox(question: str, lang: str, sender: str,
     # inbound event has already been consumed from the WhatsApp session, so if it
     # is lost here it is gone for good. Writing it up front as delivered=False
     # means any later failure (a throwing gate, a crash mid-forward, a killed
-    # container) leaves the message on disk for the daily drain instead of
+    # container) leaves the message on disk for the recovery drain instead of
     # silently dropping it. The flag is flipped to true below once the message is
     # accounted for (forwarded to triage, or held in a fully-resolved class).
     # A voice note was already persisted before transcription; reuse that record.
@@ -2070,7 +2070,7 @@ def _forward_to_inbox(question: str, lang: str, sender: str,
     # the gate made of it. The mirror shows it, the user is pushed unless the
     # gate says to stay quiet, and the record says delivered. So every message
     # is offered to the rail, not only the ones that used to buy a triage
-    # session: that is what empties the undelivered backlog the daily drain
+    # session: that is what empties the undelivered backlog the recovery drain
     # existed to sweep, because there is no longer anything left un-handled.
     #
     # The call is synchronous because its answer decides what happens next, and
@@ -2231,7 +2231,7 @@ def _forward_to_inbox(question: str, lang: str, sender: str,
 
     # Flip the persisted message's delivered flag only once triage has actually
     # run. The POST answers 202 (accepted), not "handled": marking delivered on
-    # acceptance would hide a job that later fails from the daily drain, losing
+    # acceptance would hide a job that later fails from the recovery drain, losing
     # the message. So an async forward waits for `status: done` in the
     # background; a failed forward, and any job that errors, expires or times
     # out, stays delivered=False so the drain retries it. At-least-once: a
@@ -2268,7 +2268,7 @@ def _forward_status_to_inbox(text: str, lang: str, sender: str,
 
     # A status post is no-action-class: with the delivery gate on it never gets
     # a model turn, and it is persisted already accounted for (delivered:true) so
-    # the daily drain never re-surfaces it. History stays browsable in the store.
+    # the recovery drain never re-surfaces it. History stays browsable in the store.
     if INBOUND_GATE_ENABLED:
         _persist_inbound(text or "", sender, None, delivered=True)
         print(
@@ -2290,8 +2290,8 @@ def _forward_status_to_inbox(text: str, lang: str, sender: str,
         f"Invoke the triage skill scoped to this single status update (channel: "
         f"WhatsApp, kind: status_update, sender: {sender_label}). Handle it per the "
         f"skill's status-update policy: the default disposition is to file it "
-        f"silently — record it in the triage status store but raise NO dashboard "
-        f"conversation and send NO notification — unless a configured rule (e.g. a "
+        f"silently — the gateway's ledger already holds the post, so write nothing "
+        f"down; raise NO dashboard conversation and send NO notification — unless a configured rule (e.g. a "
         f"watched contact, or a news-agent feed) says otherwise. Do not reply to "
         f"the sender."
     )
@@ -2868,7 +2868,7 @@ class _PushHandler(BaseHTTPRequestHandler):
                 self._reply(502, {"error": f"recent-chats lookup failed: {exc}"})
             return
         if self.path.split("?", 1)[0].rstrip("/") == "/undelivered":
-            # The daily triage drain: return every inbound message not yet handed
+            # The triage recovery drain: return every inbound message not yet handed
             # to triage and mark it delivered in one pass (inbound_store owns the
             # flag). Optional ?since=<ISO|epoch> bounds the window.
             if not self._authorized():

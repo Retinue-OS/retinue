@@ -173,7 +173,7 @@ REPLY_TOKENS = ReplyTokenStore(
 def _attach_reply_tokens(messages: list) -> None:
     """Give each drained /undelivered message a reply token for its origin.
 
-    The drain hands raw ledger rows to the daily triage; without a token those
+    The drain hands raw ledger rows to triage; without a token those
     replies fall back to name resolution — the exact failure that by-token
     routing exists to prevent and that live forwards already avoid. The origin
     is the group (in the ``group:<id>`` form ``_signal_send`` accepts) when
@@ -340,7 +340,7 @@ def _confirm_delivery(job_path: str, store_path, label: str,
     started taking messages.
 
     Polls in the background (see job_delivery): a job that errors, expires or
-    never finishes leaves delivered=False, so the daily drain retries it.
+    never finishes leaves delivered=False, so the recovery drain retries it.
     """
     if store_path is None:
         return
@@ -1636,7 +1636,7 @@ def _handle_event(event: dict) -> None:
         print(f"[signal-gateway] processing voice message from {sender}", flush=True)
         # Never-drop: retain the audio and persist the message up front, THEN
         # transcribe. A failed or crashed STT run leaves a durable, re-
-        # transcribable record (delivered=False, media set) for the daily drain —
+        # transcribable record (delivered=False, media set) for the recovery drain —
         # instead of vanishing at the skip-return below, downstream of where
         # _forward_to_inbox persists. Only in inbox mode: a control account has no
         # triage drain that would pick a persisted record back up, so the never-
@@ -1682,7 +1682,7 @@ def _handle_event(event: dict) -> None:
     if not question and not files and not attachment_urls:
         if voice_store_path is not None:
             # A voice note whose transcription failed: not dropped — it is on disk
-            # (delivered=False, audio retained) for the daily drain / a re-transcribe.
+            # (delivered=False, audio retained) for the recovery drain / a re-transcribe.
             print(f"[signal-gateway] voice note from {sender} not transcribed; "
                   f"retained for retry (not dropped)", flush=True)
             return
@@ -1771,7 +1771,7 @@ def _forward_to_inbox(question: str, lang: str, sender: str,
     # signal-cli has already drained (acked) this message from the server, so if
     # it is lost here it is gone for good. Writing it up front as delivered=False
     # means that any later failure — a throwing gate, a crash mid-forward, a
-    # killed container — leaves the message on disk for the daily drain to catch
+    # killed container — leaves the message on disk for the recovery drain to catch
     # instead of silently dropping it. The flag is flipped to true below once the
     # message is actually accounted for (forwarded to triage, or held in a
     # fully-resolved class). A voice note was already persisted before
@@ -1820,7 +1820,7 @@ def _forward_to_inbox(question: str, lang: str, sender: str,
     # the gate made of it. The mirror shows it, the user is pushed unless the
     # gate says to stay quiet, and the record says delivered. So every message
     # is offered to the rail, not only the ones that used to buy a triage
-    # session: that is what empties the undelivered backlog the daily drain
+    # session: that is what empties the undelivered backlog the recovery drain
     # existed to sweep, because there is no longer anything left un-handled.
     #
     # The call is synchronous because its answer decides what happens next, and
@@ -1991,7 +1991,7 @@ def _forward_to_inbox(question: str, lang: str, sender: str,
 
     # Flip the persisted message's delivered flag only once triage has actually
     # run. The POST answers 202 (accepted), not "handled": marking delivered on
-    # acceptance would hide a job that later fails from the daily drain, losing
+    # acceptance would hide a job that later fails from the recovery drain, losing
     # the message. So an async forward waits for `status: done` in the
     # background; a failed forward, and any job that errors, expires or times
     # out, stays delivered=False so the drain retries it. At-least-once: a
@@ -2618,7 +2618,7 @@ class _PushHandler(BaseHTTPRequestHandler):
             return
         if self.path.split("?", 1)[0].rstrip("/") == "/undelivered":
             # Drain the backlog: return messages held for triage AND mark them
-            # delivered (the only mutator of that flag). The daily triage skill
+            # delivered (the only mutator of that flag). The triage skill
             # calls this per gateway; a plain SPARQL read of the store never
             # touches the flag, so browsing history does not consume anything.
             if not self._authorized():

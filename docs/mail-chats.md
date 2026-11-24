@@ -11,15 +11,16 @@ This document is the contract for that build. Read `docs/messenger-chats.md`
 first: a mail chat is a chat in every sense that document defines, and only
 what differs is stated here.
 
-**Status.** Built in five phases, each shippable alone:
+**Status.** Built in five phases, each shippable alone. The three groups and
+phases 1–3 are built; only the model trim (phase 4) is outstanding.
 
-| Phase | What ships |
-|---|---|
-| **Three groups** | Unread · Read · Archived for every channel; no read-on-open; *Mark as read* |
-| **1 — read-only mirror** | the mail gateway, mail chats rendered, the deterministic trim, the original view |
-| **2 — writing** | reply and compose under the send policy; the mailbox follows the chat |
-| **3 — the gate** | VIP / instructed turns for mail; triage and the whitelist retire; the migration |
-| **4 — the model trim** | one router-tier turn per mail the deterministic trim could not settle |
+| Phase | What ships | State |
+|---|---|---|
+| **Three groups** | Unread · Read · Archived for every channel; no read-on-open; *Mark as read* | built |
+| **1 — read-only mirror** | the mail gateway, mail chats rendered, the deterministic trim, the original view | built |
+| **2 — writing** | reply and compose under the send policy; the mailbox follows the chat | built |
+| **3 — the gate** | VIP / instructed turns for mail; triage and the whitelist retire; the migration | built |
+| **4 — the model trim** | one router-tier turn per mail the deterministic trim could not settle | outstanding |
 
 Phase 1's deployment is in place: the `mail-gateway` compose service and
 image, its `messenger-email` ledger and `mail-data` state volumes, the
@@ -35,9 +36,17 @@ now), the `retinue` service already carries the send URL, the base URL and the
 erase token and now also names the tunables the retinue-side code reads
 (`MAIL_SEND_TIMEOUT`, `MAIL_GATEWAY_TIMEOUT`, `CHAT_PENDING_*`,
 `MAILBOX_NONE_SECONDS`), and `scripts/mail-push.py` is the agents' way to send
-a mail it holds as a chat. The gate
-(phase 3) and the model trim (phase 4) are still to come: until then no mail
-pushes or starts a turn.
+a mail it holds as a chat.
+
+Phase 3 makes the mail gateway mail's delivery gate (*The gate*, below): a
+mail that arrives is persisted undelivered, gated and offered to the chats
+rail, and the gateway files news mail itself. E-mail triage, its whitelist,
+the omnibus, the status store and the already-answered check are retired;
+what triage knew lives on contacts (*The migration*). The gateway gains the
+news rail (`NEWS_INGEST_URL`, `NEWS_INGEST_TOKEN`) and `MAIL_NEWS_FOLDER`,
+`MAIL_NEWS_EXCERPT_CHARS`, `MAIL_RAIL_FILE_BYTES`, `MAIL_RAIL_JOB_TIMEOUT` and
+`MAIL_UNREAD_OFFER_WAIT`.
+The model trim (phase 4) is the one thing still to come.
 
 ## Decisions
 
@@ -191,10 +200,12 @@ a known person's priors, permits and spheres.
 ### What never becomes a chat
 
 - A mail from a **`news`** sender or carrying a `news` **`List-Id`**
-  (`triage_policy.email_gate_decision`) starts no chat. The news rail takes it
-  as before — until the gate phase that is e-mail triage's filing, which runs
-  beside the mirror unchanged; from then on the gateway's. (It joins a chat
-  only under the rule in *Decisions*.)
+  (`triage_policy.email_gate_decision`) starts no chat. The news rail takes
+  it — run by the gateway (*The gate*, "News"). (It joins a chat only under
+  the rule in *Decisions*, or when its sender is a VIP or instructed: the
+  two axes of the gate are independent.) Where no news rail is configured
+  (`NEWS_INGEST_URL` emptied) the flag does nothing and such mail is mirrored
+  like any other: with no feed to take it, it would be shown nowhere.
 - Pending-send drafts, and anything outside the mirrored folders.
 
 `ignored` and `quieted` keep their meaning: the chat shows the mail silently,
@@ -229,13 +240,19 @@ gateway reads that before it falls back to reading a slug.
 
 `/health` answers `{configured, connected, mode: "inbox", account, error,
 blocked, needs_repair: false, build, backfill: {done, pending, days},
-placeholders: {standing, made, why}, lost, can_send, cannot_send_reason,
+placeholders: {standing, made, why}, lost, waiting: {rail, since, news,
+failing, failing_since}, can_send, cannot_send_reason,
 rewritten_message_ids}` — `backfill.days` is the window fixed at the first
 run; `can_send` is false, with the reason, where no SMTP server is set, and
 `rewritten_message_ids` counts the gateway's own sends its provider was seen
-to file under a `Message-ID` of its own (see *Writing*). `blocked` names what holds the mirror when that is not the
-mailbox: `"policy"` (below) or `"mirror"` — it stopped on a fault of its own,
-and `error` says on what. `placeholders` counts the mail that could not be
+to file under a `Message-ID` of its own (see *Writing*). `waiting` says how
+many mirrored mails the chats rail has not taken yet (and since when the
+oldest of them has been in the mailbox), how many news mails wait for the
+feed or for their move out of the INBOX, and how many rail events the web
+gateway keeps failing on (*The gate*, "One queue, in order"). `blocked` names
+what holds the mirror when that is not the mailbox: `"policy"` (below) or
+`"mirror"` — it stopped on a fault of its own, and `error` says on what.
+`placeholders` counts the mail that could not be
 read (below): how many placeholders stand, how many were `made` since this
 start, and `why`, by reason — a mail that cannot be read leaves the mirror
 `connected`, so a run of them shows here, whatever the cause, and the
@@ -292,9 +309,13 @@ SPECIAL-USE marks) — and keeps a small index of where each mail lives
 - **A client's `\Seen` changes are ignored.**
 - **Backfill**: on first run, INBOX and Sent for `MAIL_BACKFILL_DAYS` (90),
   merged and ingested **oldest first**, so parents arrive before replies.
-  Backfilled mail is offered to the rail as `backfill: true`: it pushes
+  Backfilled mail is told to the rail as `backfill: true`: it pushes
   nothing, starts no turn, and carries `seen` so the read mark can start from
-  the mailbox.
+  the mailbox — the `\Seen` the mirror first saw it with, and only that: a
+  record written again in its place (a placeholder that reads) is told what
+  was told of it then (an arrival: unread), never the mailbox's `\Seen` of
+  the moment. It is never gated: written `delivered: true`, with no
+  handover offered, and not filed to the news feed.
 
 Nothing is reduced to text. Every MIME part is kept:
 
@@ -364,7 +385,8 @@ minutes, and what it does not get to waits for the next — a mail that took
 too long to read takes that long again), and takes its placeholder's place
 when it reads — that mail, and no other: the placeholder's record keeps the
 header block of the copy it was made from, and only a mail with that very
-header block replaces it, wherever it lies by then. A mail that merely
+header block replaces it, wherever it lies by then (and is owed the rail
+what the placeholder was: *The gate*, "As built"). A mail that merely
 arrives under a placeholder's `Message-ID` replaces nothing, whether it can
 be read or not; ids are their sender's to choose. While the placeholder
 stands it is set apart as another mail's: the placeholder is never read
@@ -448,9 +470,12 @@ not have it). A match whose header block does not come back counts as From
 nobody and comes last; it holds up nothing where the first is known to be
 the record's — a Sent copy, or one From the row's sender received when the
 row said (in the archive, for a row that said the mail was the user's).
-That one mail is read as any mail is read the first time where it lies —
-what a Sent copy holds is the user's, what is in the archive the user's when
-it is from one of the user's own addresses and left Sent unseen — with one
+That one mail is read as old mail — told to the rail, not offered: the
+chat had taken it, unless the rail still owed it an answer when its record
+went, and then it is offered once more (*The gate*, "As built") — and as
+any mail is read the first time where it lies — what a Sent copy holds is
+the user's, what is in the archive the user's when it is from one of the
+user's own addresses and left Sent unseen — with one
 difference: in the archive, From that very sender and received when the row
 said, where the row said the mail was the user's, it is the user's again,
 whatever address that is — and found under an id its provider gave a send of
@@ -530,9 +555,12 @@ at one. A fault delays only the work it was in. Following the folders — new
 mail, vanished mail — is done first and by itself, every poll interval; when
 that is what fails, it is tried again after one interval, then twice as long
 each time, up to an hour (every try fetches the mail in hand whole again).
-When the rest fails — finding mail again, reading mail again, the backfill —
-it is the rest that waits so, and new mail goes on being mirrored: `error`
-says that too.
+When the rest fails — finding mail again, reading mail again, the backfill,
+filing news — it is the rest that waits so, and new mail goes on being
+mirrored: `error` says that too. Filing news (*The gate*, "News") comes last
+in the rest and runs whatever became of the steps before it: one mail read
+again that fails at every pass keeps the feed waiting only as long as the
+rest's own wait, never for good.
 
 A record's time is the earlier of the mail's `Date` and the server's arrival
 time, never the future, so a forged date cannot pin a mail to the head of its
@@ -549,6 +577,7 @@ channels:
 |---|---|
 | `kb:subject` | the mail's own subject, decoded |
 | `kb:senderName` | the display name on `From` |
+| `kb:gateSender` | inbound: the address the gate takes the mail to be from (*The gate*, "Who the sender is") — absent when it has none, a header block cut at its bound included, and on a placeholder but one whose block names a VIP or an instructed sender (*The gate*, "As built") |
 | `kb:recipient` (multi) | `To` addresses |
 | `kb:cc` (multi) | `Cc` addresses |
 | `kb:inReplyTo` | the parent's id |
@@ -562,7 +591,9 @@ channels:
 
 `kb:text` is the **trimmed** text — what the bubble, the list preview, the
 companion and a SPARQL reader all want. `kb:sender` is the `From` address
-(inbound) and `kb:messageId` the `Message-ID` without brackets.
+(inbound; else the `Sender` header's, else `unknown`) — what the chat shows
+the mail as from, and nothing the gate goes by: that is `kb:gateSender`
+alone. `kb:messageId` is the `Message-ID` without brackets.
 
 New store operations: `update_message` learns `chat` and `trim`;
 `rekey_chat(store, chat, account, into)` re-keys a whole chat for a merge;
@@ -901,8 +932,8 @@ reverse").
   itself), and the provider's id is kept as `kb:sentAs`; a copy the reader
   cannot read is matched by that header with the account and the date — no
   placeholder of its own in a chat of its own. The
-  gateway never writes policy: `email_client`'s whitelist-on-send is disabled
-  inside it.
+  gateway never writes policy: sending to someone does not make them known to
+  the gate.
 - **New mail.** ＋ on the Chats page offers *E-mail* (what
   `GET /chats/compose` lists: channels whose gateway takes a new
   conversation): recipients, Cc, subject, text. `POST /chats/compose` hands it
@@ -918,12 +949,12 @@ reverse").
   arguments asks about that send again — answered as a repeat where the mail
   went out or waits, and carried out as a new attempt where nothing had left.
   (`--reply-to <token>` is
-  there for a gateway prompt that carries a token; nothing issues one for mail
-  in this phase, and agent-facing texts do not point at it.) A mail that
-  e-mail triage hands an agent — a UID, no chat id — is answered with
-  `email_client.py reply --uid`, as the `triage` skill still says, because
-  triage's status store records the `sent_uid` and the draft queue that `reply`
-  returns; that holds until triage retires in the gate phase. `email_client.py send/reply` keeps
+  there for a gateway prompt that carries a token; no reply token exists for
+  mail — the gateway forwards no mail to a session — and agent-facing texts
+  do not point at it.) A mail reaches an agent as a chat, and the turn the
+  gate starts for a VIP or an instructed sender answers with `mail-push.py
+  --chat <chat id>` (with `--url` for a thread on another account's gateway).
+  `email_client.py send/reply` keeps
   working as before and keeps its own queue (an IMAP draft, approved on
   `/sends` under `/sends/<account>/<id>`); after a successful send, direct or
   approved, it tells the gateway whose mail it was (`POST /outbound-note`,
@@ -961,7 +992,9 @@ touched; it is read or archived by a later action of its own.
 
 `POST /chats/<id>/read` and `POST /chats/<id>/flags` write to the real mailbox
 now, so they are the user's own act like send, compose and delete:
-**same-origin only**. Delete is the exception: it needs `X-Chat-Erase-Token`
+**same-origin only**. The flags, like a send, are also accepted only through
+the reverse proxy; an agent sets them through `POST
+/internal/chats/<id>/flags` (`chat-flags.py`). Delete is the exception: it needs `X-Chat-Erase-Token`
 (`CHAT_ERASE_TOKEN`; 503 while unset, 403 on a mismatch), and the gateway must
 succeed before the web gateway erases its own state — if any move fails, or a
 mail of the thread cannot be placed, nothing is erased and the answer reports
@@ -1000,9 +1033,11 @@ leftover no longer flagged `\Deleted` is its place again). And a move is
 noted before the server is asked, so a stop between the server's move and
 the index following it is put right at the next start: the source UID gone
 or flagged `\Deleted` is no place any more, and the copy in the archive is
-found. And where a mail is looked for in
-a folder — after a move whose new UID the server did not name, or by a
-delete — every mail there under its id is looked at, as the mirror looks:
+found. So is the move of a filed news mail (*The gate*, "News"): its copy
+kept flagged `\Deleted` is not copied out a second time. And where a mail
+is looked for in a folder — after a move whose new UID the server did not
+name, or by a delete — every mail there under its id is looked at, as the
+mirror looks:
 the mail of a placeholder is only the copy its record keeps the header block
 of, and another mail under the same id is neither moved nor flagged; once
 the placeholder is erased with its chat, that other mail is mirrored as the
@@ -1055,21 +1090,377 @@ The e-mail path of the delivery gate becomes the messengers' inbound flow
    everyone else**. `contacts.sync_policy` projects the e-mail addresses of
    VIP and instructed people into the `email` channel's policy file exactly as
    it projects messenger handles, and a person's `kb:emailDomain` as a
-   wildcard.
+   wildcard. The two axes are independent: no group flag — `news` included —
+   stops a VIP's or an instructed sender's mail.
 3. **Notify the chat rail.** **A mail pushes nothing by default; a contact can
    say otherwise** — VIP rings on arrival, an instruction's verdict decides,
    and a person's importance prior and permits are honoured because the
    attention item's sender is the person.
 4. **A model turn only for a VIP or an instructed sender**, in the chat's
    companion, briefed by the instruction, ending in a verdict, with the
-   messengers' timeout and failure-rings guarantee.
+   messengers' failure-rings guarantee — and a timeout of mail's own,
+   `MAIL_INSTRUCTION_TIMEOUT` (600 seconds, read by the web gateway), where a
+   messenger message's ring waits `CHAT_INSTRUCTION_TIMEOUT` (60): a mail is
+   not a chat message, ten minutes is a ring in time, and a turn that files a
+   document needs them.
+
+**Who the sender is.** Every header of a mail is its sender's to write, the
+`From` address included; the one barrier before it is the mailbox provider's
+check of the `From` domain (DMARC), and that check is only sure to have looked
+at a mail with exactly one `From` header holding exactly one address. So that
+is the only form the gate takes a sender from: the **gate sender**
+(`kb:gateSender`, `gate_sender` on the rail) is that one address, as the
+gateway's own address grammar reads it, lowercased by its ASCII letters alone
+and refused outright where a character of it stands in for an ASCII one on its
+own — its compatibility form is ASCII, or its lowercase or case fold is one
+ASCII character (a Kelvin sign, a long s, a fullwidth letter, a ligature of
+ASCII letters). A letter whose case mapping merely holds ASCII letters beside
+others, or several of them (`ß`, a dotless `ı`, a dotted `İ`), is a letter of
+an internationalised address like any other, and stays. A mail with no
+`From`, an empty one, a group, two addresses, two `From` headers, or an
+address the grammar rejects has **no gate sender** — and so has a mail whose
+header block was cut at its bound (256 KiB) or fetched short of its end
+(`MAIL_MAX_MAIL_BYTES`), since a second `From` past the cut is never seen and
+"exactly one" cannot be told: it reaches its chat, buys no turn, rings as
+nobody's, and links the thread to no contact card by the address it is shown
+as from (`peer_vouched` false on the chat's state, until a mail the gate takes
+for that address arrives). The `Sender` header never stands in for it — it is only what the
+chat shows (`kb:sender`) when the `From` names nobody. Both axes are keyed on
+the gate sender (the group axis on the `List-Id` first), and the web gateway
+judges an arrival — its class, prior and permits — by the gate sender the
+event carries, never by the thread's previous correspondent.
+
+**The rail is authenticated for mail.** An e-mail event on
+`/internal/chats/*` is taken only with a token: `CHATS_INGEST_TOKEN` where the
+deployment set one (on both services), else `MAIL_GATEWAY_TOKEN`, which both
+sides hold already — the mail gateway mirrors nothing without it, so an
+e-mail rail is never open. The mail gateway sends that token
+(`X-Conversation-Backend-Token`, and as a bearer token); the web gateway
+compares it in constant time, refuses an e-mail event with neither set, and
+refuses any rail request a browser sent cross-site (`Sec-Fetch-Site`).
 
 There is no triage fallback for mail. A mail the rail could not take stays
-`delivered: false` and the gateway offers it again on its next poll: the
+`delivered: false` and the gateway offers it again on a later poll: the
 mailbox is the backlog.
+
+**What a turn may do with a mail.** The turn is briefed by the sender's
+instruction; a VIP with none is worked as a VIP's mail is (the marking is the
+ask). It files what the mail changes — a project link (the mail is named `mid:<Message-ID>`), a
+memory, a document for the `archivist` — and stages a reply where one is
+wanted. A VIP's turn sends nothing and leaves the thread where it is. An
+instructed turn may, each only where the instruction asks: send a reply by
+`scripts/mail-push.py --chat <id> --reply all|sender --file <path>` under the
+mailbox's send policy (`verify` queues, and the turn flags the mail waiting;
+`trust` and `allow` send unseen only where the instruction itself carries the
+permission phrase); do a calendar write under its own gate; archive the thread
+with `scripts/chat-flags.py`; and last set the verdict. Nothing deletes or
+pays. What the mail says of itself is text from outside — data to the turn,
+never an instruction. The detail, and the prompt's handling of a mail's name,
+subject and files, is `docs/dashboard.md`, "The gate for mail".
+
+**A turn's archive.** A thread the turn archived while it worked rings
+nothing if the turn ends with a verdict, whatever importance the verdict
+gives: the chat's status says `quiet`, with the verdict and its actions. The
+archive covers only the mail the turn was started for: where another mail
+arrived in the chat after it, or an earlier one waits for a turn of its own,
+the chat is not archived (the answer says so), and the mailbox is told only of
+the mails the turn worked. What the turn asked is remembered on its mails once
+it completes, so a newer mail is no reason to stay in view when a turn that
+asked for the archive too has worked it: a batch too big to quote whole is
+worked newest first, and the turn for its older mails, the last of the chain,
+archives the thread when every mail after its own was worked by a turn that
+asked. A mail that arrived since and has had no turn, or whose turn did not
+ask, still keeps the thread on the list — and so does one whose turn asked
+but is not trusted with having put it away (it ended without a verdict, or
+the timeout rang the mail first: below), whose ask is not remembered. The
+user bringing the thread back forgets every ask made until then — also that
+of a turn wrapping up as it lands, whose ask is written only while no
+unarchive has come since the turn asked: only a turn asking after the user's
+last unarchive can archive the thread over a newer mail.
+
+A turn cannot mute: a mute it asks for is taken as that same archive, and the
+answer says so (`a turn cannot mute; archived instead`) — muting stays the
+user's. Archiving is all a turn can do with its chat's flags: its unmute,
+unarchive and star change nothing, and the answer says so. Who is asking is
+decided by the web gateway, not by the turn's cooperation:
+
+- a call carrying the token the turn's session was handed
+  (`RETINUE_ARRIVAL_TURN`, which `scripts/chat-flags.py` sends) is the turn's
+  where that turn runs on the chat named, and is refused (403) anywhere else;
+- a call carrying the proof a dashboard thread's turn is handed — a turn the
+  user started by a message sent from the dashboard itself, not one a message
+  posted from inside the container started (`RETINUE_USER_TURN`, sent too;
+  valid while that turn runs) — has the user's meaning, a mute included, even
+  while a turn runs on the thread;
+- a call carrying neither, on a mail thread while a mail's turn runs on it,
+  is taken as that turn's, and the answer says why (`a turn is running on
+  this chat; …`), so that a scheduled job or another session asks again once
+  the turn is over;
+- any other call — no turn running, a messenger chat — has the user's
+  meaning, as before the gate.
+
+The user's own endpoint, `POST /chats/<id>/flags`, needs no token. Like a
+chat's delete and send it is meant to be reached only through the reverse
+proxy, which the web gateway tells by the TCP peer of the request — and it is
+no way round that rule where `EDGE_PROXY_PEERS` names the reverse proxy: a
+peer it does not name is refused, a caller inside the container included.
+Without that setting the gateway refuses only a loopback peer and a peer that
+is the very address the caller dialled, and takes any other for the
+dashboard: a caller inside the container that comes in from another of the
+container's addresses (the documented deployment puts it on two networks), or
+through a sibling that relays (the egress-audit proxy), sets the flags with
+the user's meaning — a mail's turn too. And where the proxy itself arrives on
+loopback (host networking, `EDGE_PROXY_PEERS` including it) the gateway
+cannot tell the dashboard from a caller inside the container at all. So a
+deployment sets `EDGE_PROXY_PEERS` (`docker-compose.override.example.yml`).
+
+That rule holds for the turn's **own** chat **while the turn runs**, and no
+further. It is a guard against a turn that was talked into something, not a
+sandbox: an arrival turn's session holds the backend token every agent
+session holds, so without its token it can set **another** chat's flags with
+the user's meaning, and a process it leaves behind can do so on its own chat
+once the turn has ended. And while a dashboard turn the user started runs,
+its proof sits in that turn's process environment, which another session of
+the same uid can read: sessions are not sandboxed from one another. What
+keeps a turn to its brief there is the brief, as on the messengers.
+
+A turn that does not finish — it fails, runs past `MAIL_INSTRUCTION_TIMEOUT`,
+or sets no verdict — has the chat brought back (un-archived) and the mail rung
+by the failure rule, since a turn that did not finish is not trusted with
+having put a mail away. The user's own archive during a turn changes nothing
+about the ring.
+
+**The re-offer rule.** A mail offered again is taken once, by its
+`Message-ID`: a repeat un-archives nothing, reopens no settled item, and is
+answered with the handle of the turn that is running or done. Whether an
+arrival still owes its ring is kept per arrival, in the chat's state: it is
+told only once its attention step and its push ran to the end, so a repeated
+offer of one that never was runs them, and of one that was is a no-op. A
+merge of chats carries every turn the absorbed chat had to the surviving one.
+The handle of a turn that **failed** is handed back for
+`CHAT_ARRIVAL_RETRY_SECONDS` (900, read by the web gateway) and then gives way
+to a turn anew, so an outage's backlog is worked once it is over without a
+failing turn running once a poll — at most `MAIL_ARRIVAL_TURN_ATTEMPTS` (3)
+turns a mail: after the last the mail is accepted, has rung by the failure
+rule once, and the companion holds one note about it.
+
+**`CHAT_ARRIVAL_TURNS` off** is the one exception to "a turn only for a VIP or
+an instructed sender": the switch turns every arrival turn off, and a mail is
+**accepted all the same**, since the mail gateway has nowhere else to take it.
+No turn runs; a VIP's mail still rings, an instructed sender's is delivered
+like anyone's.
 
 **No daily sweep.** Mail from a sender who is neither VIP nor instructed is
 listed under Unread and judged by nobody.
+
+### As built (`scripts/mail-gateway.py`)
+
+- **What is gated** is a mail that *arrives*: first seen in INBOX (or, having
+  passed through it between two polls, in the archive) as somebody's mail to
+  the user. Backfilled mail is written `delivered: true` and told to the rail
+  without a handover; so is a mail that left the mailbox and came back after
+  the rail had taken it — one that left while still owed keeps that on its
+  tombstone and is offered when it comes back — and the user's own mail is
+  never owed. With no chats rail configured every mail is written delivered:
+  nobody is there to take it. **A record written again** (*The mirror*: a
+  placeholder that reads, under its own id or under the one of its bytes it
+  was on record by) is owed what the record it replaces was owed, and no
+  more: offered, with its gate sender, if the chat had not taken the
+  placeholder yet; told once, as old mail, if it had — never offered twice.
+  **A placeholder is from nobody** (no `kb:gateSender`, `gate_sender` empty on
+  the rail): it reaches its chat at once and buys no turn — a turn would work
+  a mail it cannot read, and its done would deliver the mail. **Unless its
+  header block names a VIP or an instructed sender**: where the block was
+  not cut and the gate calls its gate sender either, the mail must not lose
+  its ring or its turn to a reader that failed on it. Its placeholder keeps
+  that `kb:gateSender` and is written owed, its offer due once
+  `MAIL_UNREAD_OFFER_WAIT` (600 seconds) is over and no sooner — the index's
+  offers row is the wait, and survives a restart — and it is read again
+  once half that wait is over rather than with the next hourly round (those
+  early readings have a pass's share of the mirror's time and no more; one
+  not got to is offered at its bound). While it waits it has not been shown
+  to anyone, so a delete of its thread is refused until it has been offered
+  (`errors`, "not shown yet"). Read
+  by then, the record written in its place is still owed and is offered
+  once, under its real gate sender: one ring, one turn, on the real text.
+  Not read by then, the placeholder is offered under the gate sender its
+  block names: the VIP's ring, or the instructed turn and the ring of a turn
+  that has no verdict, goes out for a mail that says it could not be shown;
+  its reading later is only told. Never two rings for one mail, and such a
+  mail reaches its chat up to that wait late. Every other placeholder — of
+  nobody, of anyone else, of a block cut at its bound — is offered from
+  nobody at once. **The mail of a lost record** (one the ledger lost, found
+  again by its `Message-ID`) is told as old mail, not offered: the chat had
+  taken it — unless the rail still owed it an answer when the record went
+  (the index's `offers` row stood for it, kept as `owed` among the lost
+  ids' hints): then it is owed still, and offered once more (a repeat is
+  safe: the web gateway takes one once, by its message id). A copy of the
+  user's own send under the id its provider gave it is that send, told
+  under the id the gateway minted; a stranger's mail under that id is a mail
+  of its own, offered like any that arrives.
+- **The verdict** is asked when the offer is made, not when the mail arrived,
+  so a mail that waited is judged by the policy as it stands: `gate =
+  {"forward": not (quieted or ignored), "vip", "instructed", "reason"}`. The
+  group axis is `email_gate_decision` on the group flags; the sender axis is
+  `gate_decision("email", gate_sender, group)` on the policy file the address
+  book projects (`<ledger>/policy/policy.nt`), exact address first, then a
+  domain wildcard — on the record's `kb:gateSender` alone (*Who the sender
+  is*; a record without one is from nobody). The event carries `gate_sender`
+  beside `sender`. The two axes are independent: a quieted list does not stop
+  a VIP's turn. **The group flags unreadable** reads as no flags (fail open);
+  **the sender policy unreadable** reads as nobody special (fail closed, for
+  turns only) and is logged — a mail must not buy a model turn because a file
+  could not be read. The gate is never switched off for mail.
+- **Files** — the mail's attachments, in the `POST /message` shape — ride
+  along only for a VIP or an instructed sender, within the rail's limits
+  (`MAIL_RAIL_FILE_BYTES` a file; 20 files and 50 MiB an event). Of a file's
+  name only a short plain extension travels, on a name of the gateway's own;
+  its type goes as the one clean line the ledger keeps.
+- **The answer.** `{"accepted": true}` → `mark_delivered`. `accepted` with a
+  `job_url` → `job_delivery.confirm_delivery`, and delivered only when the job
+  reports done. The `job_url` must be a path on the rail's own host, checked
+  as it is parsed (printable ASCII; no scheme, no host, no `//`) and the
+  joined URL checked again for the rail's scheme and host; anything else is
+  no acceptance. Anything else — no acceptance, a refusal, no answer, a job
+  that failed, expired or did not finish within `MAIL_RAIL_JOB_TIMEOUT` —
+  leaves the record `delivered: false`. Nothing is forwarded anywhere else.
+- **One queue, in order.** The first offer of a mail has its place in the
+  gateway's durable outbox among the other rail events (merges, removals, the
+  user's own mail), so the web gateway hears things in the order they
+  happened — a reply from a mail client reads the chat up to it, and must not
+  be heard before the mail it answers. While the web gateway does not answer
+  at all — the connection refused, a 401/403/404, or no answer to an event
+  and none either to a GET that takes nothing — everything waits behind that
+  point, and tries back off (30 seconds, doubling to 15 minutes). **One mail
+  never holds back another**, for every rail event — an offer, the user's own
+  mail, a held or backfilled mail, a mail that came back: an answer that is
+  about one event — a 408, 429 or 5xx for it, or no answer for it while the
+  rail answers otherwise — backs off that event alone. It keeps its place in
+  the outbox and waits its own time (one minute, doubling to an hour), and
+  only its own chat's later events wait behind it — so the order within a
+  chat holds — while every other chat's go on. **A held event steps aside**:
+  it holds its chat back only while the failure is young, for three of its
+  own attempts (`RAIL_HOLD_ATTEMPTS`). Then a first offer leaves the outbox
+  for the re-offers below, and a told event keeps retrying on its own clock
+  without holding anything — and the chat's later events go on, so one mail
+  the web gateway always fails on cannot stall its thread (a VIP's reply in
+  it is offered, rings and is worked). The order within a chat is kept for a
+  young failure, not for one that persists. So a mail that stepped aside may
+  be offered after the user's answer to it from a mail client has been
+  heard: it is offered late, as an arrival — its turn's prompt shows the
+  user's answer, and it may ring once. That is the accepted cost of not
+  stalling the thread. **A late event says what is true when it is sent**:
+  a told event that stepped aside is checked against the mirror's index
+  when it goes, not sent as it was queued — a removal names only the mails
+  that are still gone, with the chat's `live` count as it is then, and is
+  dropped when none is; a told mail that is gone by then (or erased with
+  its chat) is not told at all; one that is there is told as its record
+  says then, under the chat it is in then. A young held event keeps what
+  it was queued with, since the hold keeps its chat's order. **A removal
+  waits for the merge of its chat**: while a merge queued before it that
+  joins its chat (on either side) is still queued, whatever that merge's
+  attempts, a removal is not sent — in the web gateway the mail may still be under the chat the
+  merge folds away, with the arrival it brings along — and nothing else
+  waits with it: its chat's later events go on, so it is marked as
+  overtaken and, once the merge is taken, sent as a late event is. A merge
+  queued after the removal does not hold it: the removal names its chat as
+  the web gateway still has it, and goes first, in its order. The wait
+  covers a merge that names the removal's own chat, not a chain of them: a
+  merge of X into Y that stepped aside, then one of Y into Z, and a removal
+  naming Z goes once the second is taken, while the web gateway still holds
+  the mail under X. So **a merge taken late re-announces what was removed
+  under it**: when a merge that stepped aside is finally taken, the same
+  transaction that takes it off the outbox queues a removal, built as a late
+  one is (the ids still gone, `live` as then), for the chat each chat it
+  absorbed is in now, naming every removed mail of that chat but those a
+  removal still queued names (that one goes after the merge and says it) —
+  the index does not remember which chat a mail was in before a merge, so
+  the chat's other removed mails go along, and a removal of a mail the web
+  gateway already holds as gone changes nothing. It is queued behind
+  everything, so it keeps its chat's order and waits for a merge of its
+  chat still queued. A first
+  offer's place names the chat it was queued in as well as the one its mail
+  is in now, so a merge meanwhile does not take it out of its old chat's
+  hold. This holds for a merge or a removal too: a 408, 429 or 5xx for one
+  is a failure about it;
+  only a 404 — an older web gateway that does not know the endpoint — makes
+  it wait without holding anything back. **A pass
+  is bounded**: a call that gets no answer in time costs `MAIL_RAIL_TIMEOUT`,
+  and after three of them in a row the rail counts as not answering for the
+  rest of the pass and its backoff, so a web gateway that is up and too slow
+  for every event costs a pass three timeouts, not one per owed mail.
+- **Offered again.** A mail that was answered for and not taken leaves the
+  outbox (its first offer has been made) and is offered again on later polls:
+  after one minute, then twice as
+  long each time up to an hour, at most 20 offers a poll, the oldest first,
+  and never while the job of a turn working it is still awaited — such a mail
+  is passed over and takes none of the 20. **The ledger's `delivered` flag is
+  the queue**: the gateway's index of it is rebuilt from the records at every
+  start, so the wait survives a restart and a lost state volume. An offer is
+  built from the record as it stands then — under the chat the mail is in
+  *now* if its thread was merged meanwhile; a record that cannot be read just
+  then waits its time and is offered again — and a mail that is gone is
+  offered to nobody (its tombstone keeps the flag it had, for the day the
+  mail comes back). An offer needs the ledger, not the mailbox: while the
+  mailbox does not answer, what has arrived is offered all the same (not
+  while the policy file is awaited). Offers are at-least-once; the web
+  gateway takes a repeat once, by its message id, and hands back the job it
+  started for it.
+- **News.** A mail of a `news` group is filed by the gateway
+  (`news_ingest.forward_news(channel="email", source_id="email:<address>",
+  title=<subject>, …)`): the sender as the source, the subject and an excerpt
+  of the trimmed text (`MAIL_NEWS_EXCERPT_CHARS`), and the link the mail
+  declares for itself — its `Archived-At` alone, http(s) only. Not
+  `List-Archive`, which names the list's archive and is the same on every
+  issue (the feed keys an item on its link: every issue after the first
+  would be dropped), and never a link picked out of the body; a mail without
+  one is filed with no link. Where the group is also `ignored` and the feed
+  took the item, the mail is marked `\Seen` and moved to `MAIL_NEWS_FOLDER`
+  (unset: the archive folder, by the gateway's own folder rules; set and
+  empty: left in the INBOX) through the adapter's write half, and the mirror
+  follows its own move. Only a mail that is in no chat is moved — a news mail
+  that joined a chat is filed, shown there, and left to the chat. **A VIP's
+  or an instructed sender's mail in a news group** is such a mail: filed —
+  once it reads, where it arrived unreadable — and also written, offered and
+  worked in its chat like any of theirs, and never moved. A feed that
+  refuses leaves the mail untouched and is asked again; the move never comes
+  before the filing. A news mail the reader could
+  not read is not filed before it reads: one that would be in no chat is no
+  chat either, and one that joins its chat (a VIP's, an instructed sender's,
+  or in a mirrored thread) is a placeholder of its chat meanwhile (*As
+  built*, above). Either is read again with the placeholders (hourly, less
+  often each time it still fails) and filed once it reads — the one in its
+  chat left in the INBOX. A placeholder that came as old mail is not filed
+  when it reads. Backfilled news mail is neither filed nor moved. With
+  `NEWS_INGEST_URL` emptied there is no feed to take the mail, so the `news`
+  flag does nothing: such mail is **mirrored as a chat** like any other,
+  filed nowhere and moved nowhere. `MAIL_NEWS_FOLDER` and
+  `MAIL_NEWS_EXCERPT_CHARS` were the retired triage gate's
+  `TRIAGE_NEWS_FOLDER` and `TRIAGE_NEWS_EXCERPT_CHARS`: an old name is still
+  read where the new one is not set (an empty value included), and the start
+  says so.
+- **`/health`** counts what waits (`waiting`), and says so in `error` while
+  the web gateway has not answered three times running and mail waits — and
+  while it answers and takes no mail: when every offer and event of a pass
+  (three at least) was answered with a failure, or with none, the notice says
+  "the chats rail answers but takes no mail" until a mail is taken. Events
+  that have stepped aside are counted as well: `waiting.failing` counts the
+  rail events (offers among them) the web gateway failed on three times or
+  more, and `waiting.failing_since` says when the oldest first failed. The
+  notice for them is worded from whether the rail has taken any event since
+  the **newest** of them began to fail (the gateway keeps when it last took
+  one, across a restart): if it has, "N rail event(s) keep failing while
+  others are taken — the oldest for …" is about those mails; if it has not —
+  a quiet mailbox or a short outage can fail on every call without a pass of
+  three, and an older failure (a mail that always fails) says nothing of
+  that — it says "N rail event(s) keep failing and the rail has taken
+  nothing since the newest of them began to fail, … ago", which points at
+  the web gateway, not at one mail (the log names them either way). An
+  index from before the gateway kept its last take knows neither: it says
+  "N rail event(s) keep failing — the oldest for …" until the first take
+  (or a pass that takes nothing, which has its notice above). When a
+  mail is taken again, what waited over the fault — each wait grown up to an
+  hour meanwhile — is offered and told again at once.
 
 ### What retires
 
@@ -1078,28 +1469,226 @@ daily triage runs, the already-answered check, the e-mail whitelist (addresses,
 wildcards, auto-add on send, the Sent-folder derivation, the contacts
 projection into it). What stays: the news rail (run by the gateway now), the
 group flags, `email_client.py`, and triage itself for a messenger message the
-chat rail could not take.
+chat rail could not take. Triage retires whether or not the mail gateway runs:
+a deployment without `MAIL_GATEWAY_TOKEN` has no e-mail handling at all after
+this upgrade, and the migration waits for the token (*The migration*).
 
 ### The migration (`scripts/migrate-triage.py`)
 
-Run once (idempotent; a marker records completion), by the entrypoint.
+Run once, by the entrypoint, in three steps. It is idempotent and resumable:
+a marker file (`.migrated-to-contacts.json` in the triage state directory,
+`TRIAGE_STATE_DIR`, `/root/.retinue/triage` by default) journals every
+outcome as it happens — and what it is about to write *before* it writes it —
+so a run killed at any point is finished by the next one, reporting what it
+did as done, and a second run changes nothing. **Nothing is deleted**:
+contacts are created or extended, memories are superseded, the old status
+store stays where it is. `--dry-run` writes nothing, spawns no model and
+prints what a run would do. Running it by hand: `docs/contributing.md`, "The
+triage migration".
 
-- **Every whitelisted address becomes a contact**, or an address on the person
-  who already has it, with the generic instruction. A person who already
-  carries an instruction keeps it. A wildcard (`*@domain`) becomes a contact
-  for the domain (`kb:emailDomain`).
-- **Receipt and filing rules move too.** A sender whose mails triage filed as
-  receipts, payslips, statements or invoices gets *"File the document with the
-  Archivist, book it, then archive the mail."*
-- **`sender:` memories are read once**, written as instruction text on the
-  contact they name, and superseded by a memory that says where the rule now
-  lives. A memory whose text reads as a message's content rather than the
-  user's instruction is left alone and reported.
-- **No filing rule lives outside a contact** afterwards.
+**It moves nothing while no mail is handled.** Triage retires with this
+upgrade whether or not the mail gateway runs, and the gateway is opt-in: with
+`MAIL_GATEWAY_TOKEN` unset **e-mail is handled by nobody** — no chat, no ring,
+no turn. Both steps then wait, writing nothing but the marker (an instruction
+that buys a turn per mail means nothing without the gate, and the steps need
+the mirror); the report says so first, the stub `triage-gate.py` a stale job
+still runs says so in its log line, and the boot run opens **one** dashboard
+thread of its own (importance 4, key `migrate-triage-mail-off`, fixed wording)
+on a deployment that had e-mail triage — opened again only after the gateway
+was switched on and off again. Once the token is set the steps also wait for
+the mirror's **first backfill** (the gateway's `/health`, `backfill.done`):
+names and the senders only the mirror has seen come from it. That wait is
+bounded — after `MIGRATE_TRIAGE_MIRROR_WAIT` (6 h by default) the migration
+goes ahead and the report says what it may have cost (a contact named after
+its address, a sender reported as unknown); a gateway that reports itself not
+configured is not waited for.
 
-The scheduled triage jobs live in chambers' `.schedule.json`; the migration
-reports any it finds so the operator can remove them, and the gate scripts
-they call answer with a notice instead of running.
+**Only what was triage's moves.** The first time this code runs — the
+entrypoint's `--step snapshot`, before any daemon — it fixes a **cutoff**,
+which never moves. Only `sender:` memories recorded before it are
+candidates: one recorded later is not triage's (the gate's own turns store
+such facts, out of mail) and is reported as such, never shown to the model,
+never carried by `--no-model`, never superseded. The cutoff is kept in three
+places — the marker, a one-line file of its own beside it
+(`.migration-cutoff`) and the snapshot — so that a marker that is lost,
+restored from elsewhere or moved aside (as the advice for an unreadable one
+says) does not move it: a run adopts the **earliest** of them and writes it
+back where it is missing. Only when none of the three holds one is "now"
+taken. One of them that is there and cannot be read stops the run, and the
+log says how to recover that very file (`docs/contributing.md`, "Exit
+status").
+
+**Step `whitelist`** — deterministic.
+
+- The legacy triples (`triageWhitelistAddress`, `triageWhitelistWildcard`)
+  are **snapshotted first**, into `.legacy-email-whitelist.json` beside the
+  marker: the policy file they live in is written by code that no longer
+  knows them, and its next write drops them. The entrypoint takes that
+  snapshot right after it places the policy file, before any daemon exists;
+  the snapshot is add-only, and the step works from it. A policy file that is
+  there and **cannot be read** is not "no whitelist": the entrypoint's call
+  fails loudly, and both steps stay pending, saying why, until it reads.
+- **An address a person already holds** goes to that person: with no
+  instruction they get the generic one (*Decisions*, 4), with one they keep
+  theirs.
+- **An address nobody holds** becomes a contact in the address book's default
+  chamber, named from the display name most of its mirrored mails carried
+  (`kb:senderName`, reduced to letters, digits and a little punctuation — it
+  is text from a mail), else the address's local part; with the generic
+  instruction. A new contact that shares its name with an existing one is
+  reported, never merged: a name a mail carried does not prove a person.
+- **A wildcard** becomes a contact for the domain (`kb:emailDomain`), named
+  after the domain; `*@d` and `*@*.d` are one contact with both spellings. A
+  domain somebody already files goes to them.
+- **Left alone, and reported:** the user's own addresses (`EMAIL_USER*` and
+  `MAIL_OWN_ADDRESSES` where the process holds them, the accounts the mirror
+  mirrors, and every address a mirrored mail of the user's went out under),
+  an entry that is no address, a wildcard over a public suffix, and the old
+  VIP projection (`…email-whitelist:contacts`: people already).
+- One projection into the gate's policy files and one commit per chamber, at
+  the end. Where **no chamber keeps contacts** nothing is written and the
+  step stays pending.
+
+**What a briefed contact costs** — the report and the thread say it. Every
+contact the migration briefs buys a model turn for each mail from then on,
+and the mail's ring waits for that turn's verdict, up to
+`MAIL_INSTRUCTION_TIMEOUT` (600 s by default). An instruction is the
+**person's, on every channel**: a briefed person's Signal, WhatsApp, Telegram
+and SMS messages buy a turn too, their ring waiting up to
+`CHAT_INSTRUCTION_TIMEOUT` — and an SMS sender id, or a mail from a briefed
+domain, can be forged (`SECURITY.md`). So the report counts the contacts
+briefed, names those of them who also hold a messenger handle or a phone
+(with the channels), counts the filing senders (a filing turn can outlast the
+timeout; its mail then rings as a VIP's would), and gives the command that
+takes an instruction off (`contacts.py update <id> --no-instruction`).
+**Briefed by this migration** are only the people whose **first**
+instruction it set, as its journal knows it — never as a contact's text
+happens to read: the whitelist step created or instructed them, or the
+memories step wrote where no instruction stood (it reads the contact and
+journals that *before* the write, so a run killed in between still knows).
+A contact the step is about to create is journaled with the creation time
+it then gives it, to the microsecond: the entry stands only for that
+contact, so where a run was killed before the create and the user filed the
+person by hand meanwhile, "before" is read from the contact they made.
+One of them whose instruction the user has added words to since is reported
+as **briefed and edited since** — still briefed, so their messages buy a
+turn because of the migration, but kept apart from the people the thread's
+chip takes the instruction off, since that would take the user's words too.
+**Extended** are the people a sender rule was appended to whose instruction
+stood before the migration: they bought a turn per message before, and the
+report gives the way to take the rule back off — editing the instruction —
+and never `--no-instruction`, which would take the user's own words with it.
+A person who kept their own instruction and whose memory it already held is
+none of these: nothing was written to them.
+
+**Step `memories`** — every candidate memory tagged `sender:…`, read through
+`memory.py`'s own recall query (a compaction summary is replaced by the
+members it keeps, each judged by its own time against the cutoff: its own
+text is a digest of a topic, not a rule).
+
+- **Whose rule it is** is established without reversing the tag, which is a
+  lossy slug: every address, domain and handle of the address book, every
+  sender the mirror has seen, every snapshot entry and every address or
+  domain the memory's own text spells out is slugged forward, as `memory.py`
+  slugs a tag, and compared. A tag two senders slug to is settled only by the
+  text naming one; a tag nothing slugs to is reported. A memory tagged with
+  an address *and* its domain goes on both contacts — the holder of an
+  address answers for it before the domain does. A sender with no contact
+  gets one, as in the whitelist step.
+- **What a memory is** is judgement, so one **model turn** classifies it
+  (frontier tier; no tools, no session, no project context; the memories
+  handed over as data, without the contacts — where a rule goes is the tags'
+  to say; a batch per forty), answering per memory only `{id, kind}`:
+  - `rule` — the user's standing rule for the sender: the contact gets the
+    **memory's own text** (cleaned of the invisible characters that hide or
+    reorder text, the joiners kept; never cut — a text longer than an
+    instruction stays a memory);
+  - `filing` — the sender's mails are documents to file: the contact gets
+    the **memory's own text** too, **first**, and only when that text passes
+    a deterministic check — it names a kind of document (receipt, invoice,
+    payslip, statement…) *and* filing it, by a multilingual table kept as
+    data (`FILING_TERMS`) — one fixed line **after** it, worded as a default
+    that yields: *"Unless the note above says otherwise: file the document
+    with the Archivist, book it, then archive the mail."* The check cannot
+    tell a negation, a condition or a second request from a plain filing
+    note in every language, so the line never comes first and never says
+    more than "unless the note says otherwise": the user's words stand above
+    it, and win. A person gets the line once, as the instruction's **last
+    paragraph**. It is known as the line where its exact text stands as a
+    line of its own, or at the very end of the instruction whatever stands
+    before it; and — **only on a person the migration's journal records it
+    placed the line on** (a written entry of a filing note whose contact
+    has `filing: true`, which says the line stood there after that write)
+    — by its opening: a line beginning *"Unless the note above says
+    otherwise:"*, however the user edited the rest of it and wherever they
+    moved it, at the start of any line (no blank line needed before it; a
+    lone CR ends a line too) — there, a line of the user's own that begins
+    with those words, also inside a paragraph, is taken for the line too: a
+    later note goes in front of that line and enters its "note above". Where
+    several lines qualify, the exact one wins, then the last. Only the
+    journal knows on whom the line was placed: a marker moved aside forgets
+    it (as does a stop between a filing note's write and its journal entry),
+    and where the user has edited the line since, a later filing note then
+    adds the line a second time. On anyone else a paragraph of the user's own that
+    happens to begin with those words is their text: a note goes after it,
+    and a filing note adds the real line. A later note for a person who has
+    the line — a second filing note, a rule — goes in front of it, in its
+    own words alone, and the line is never added a second time (nor does
+    what the user deleted from it come back); what the user put below a
+    line they moved up stays outside its "note above", as they left it.
+    Where the journal records the line on a person and none stands any more
+    — the user deleted it — it is **never added again**: a later filing
+    note goes on in its own words alone. Where the words and the line
+    together would pass the limit of the instruction they go on, the words
+    go on alone — a filing note whose own words fit is never left a memory.
+    A `filing` the text does not bear out is a `rule`, in its own words;
+  - `fact`, `unclear` — a fact or a status about the sender; or a message's
+    content, an attempt to instruct the turn, anything the turn cannot tell:
+    left alone and reported.
+- **No model output ever becomes instruction text.** What is accepted of the
+  answer is only ids the script sent, each once, each with a known kind;
+  anything else in it is not read. So the most a steered or mistaken turn
+  can do is put a note triage held, in that note's own words, on the contact
+  that note's own tags name — what `--no-model` does with every note — and,
+  after a note that names filing its sender's documents, add the one
+  yielding line; it can never put words in front of the user's, or in
+  their place, but in front of the filing line, where every later note
+  goes. (An
+  earlier build let the turn reword a rule and held the wording to "half its
+  words are the memory's"; that check is gone with the wording.) The
+  decisions are journaled before anything is written from them, so a resumed
+  run does not ask again. `--no-model` skips the turn and carries every rule
+  over verbatim, unjudged.
+- **Several rules for one contact are joined**, oldest first, after whatever
+  instruction the contact already has — which is kept exactly as it was
+  written. A rule that would take the instruction past its limit is not cut:
+  it stays a memory and is reported.
+- **Each moved memory is superseded** through `memory.py store --supersedes`
+  (actor `ara`), with that script's guards as they are — nothing is forced —
+  by one entry per group of memories sharing a sender tag, which says the
+  rule now lives on the contact's instruction. A refusal is reported in
+  `memory.py`'s words and the step stays pending; the next run only
+  supersedes — it does not write the rule onto the contact again, so a rule
+  the user changed there meanwhile stays as they left it.
+
+**Step `report`** — what was created, extended, moved and left, each with its
+reason, and the memories that were not triage's; what a briefed contact costs
+(above); the scheduled jobs still in a chamber's `.schedule.json` — those
+that run the gate script (theirs to remove: the script only prints a notice)
+apart from prompt jobs that merely mention triage (to check: a job that
+recovers messenger messages the chat rail could not take still belongs); the
+old status store's location and size (kept, read by nothing); how many triage
+threads were open (they stay as ordinary conversations). The entrypoint's run
+opens **one** dashboard thread with the counts — no name a mail carried and
+no memory text reaches it; the only names in it are of people the address
+book held, reduced to plain words — once the migration is complete, or on the
+third boot that leaves it pending, and **follows that thread up** when a
+migration it reported unfinished completes. A deployment with nothing to
+migrate gets none — decided only once the steps are complete: a boot that
+could not read the store settles nothing. While the mail gateway is off the
+report's thread waits; the thread of its own says what there is to say.
+
+After the migration **no filing rule lives outside a contact**.
 
 ## Out of scope
 
@@ -1117,8 +1706,9 @@ accounts. The points an operator meets first:
   `email_client.py`, and the base compose runs it in every deployment — but it
   mirrors and serves nothing until the token is set (both services read it).
   So an upgrade that changes nothing in `.env` mirrors nothing; setting the
-  token is the decision to mirror. `MAIL_BACKFILL_DAYS=0` starts the mirror
-  with no history.
+  token is the decision to mirror. After the upgrade that retires e-mail
+  triage nothing else handles mail: set the token as part of it.
+  `MAIL_BACKFILL_DAYS=0` starts the mirror with no history.
 - **A pinned channel set must name `email`.** A deployment that sets
   `MESSENGER_BUILTIN_CHANNELS` adds `email` to it, in `.env` (a value set only
   on the `retinue` service does not reach the gateway); without it the
@@ -1127,8 +1717,19 @@ accounts. The points an operator meets first:
   on the mailbox's mail — aliases and the user's other mirrored accounts —
   one value for every mail gateway.
 - **The credentials are in two containers**: the mail gateway's and, as
-  before, the `retinue` container's, whose `email_client.py` backend and
-  e-mail triage still use them (`SECURITY.md`).
+  before, the `retinue` container's, whose `email_client.py` backend still
+  uses them (`SECURITY.md`).
+- **The gate needs nothing set.** Compose wires the chats rail and the news
+  rail, and the rail takes a mail event only with a token: `CHATS_INGEST_TOKEN`
+  where `.env` sets one (compose then passes it to both services), else the
+  `MAIL_GATEWAY_TOKEN` both already hold; with neither it refuses every mail,
+  and a request a browser marks cross-site is refused whatever it carries.
+  Who is a VIP and who is instructed comes from the address book
+  (`contacts.py`, the Contacts page), which projects it into the ledger
+  volume's `policy/policy.nt`. `MAIL_NEWS_FOLDER` says where consumed news
+  mail goes (unset: the archive folder; set and empty: nowhere).
+  `/health.waiting` on the gateway says how many mails the chat surface has
+  not taken yet.
 - **Writing needs the policy and the erase token on the gateway**:
   `EMAIL_SEND_POLICY` (the same `.env` value `email_client.py` reads; unset,
   every send queues), `SEND_APPROVAL_BASE_URL` for the approval link and
@@ -1138,7 +1739,8 @@ accounts. The points an operator meets first:
   mail's Sent copy is waited for. On the `retinue` service compose names the
   web gateway's and `mail-push.py`'s own tunables (`MAIL_SEND_TIMEOUT`,
   `MAIL_GATEWAY_TIMEOUT`, `CHAT_PENDING_TIMEOUT`, `CHAT_PENDING_RETRY_SECONDS`,
-  `CHAT_PENDING_SYNC_SECONDS`, `MAILBOX_NONE_SECONDS`; table in
+  `CHAT_PENDING_SYNC_SECONDS`, `MAILBOX_NONE_SECONDS`, and for the gate
+  `CHAT_ARRIVAL_RETRY_SECONDS`; table in
   `docs/messaging.md`), since that service loads no `env_file`.
 - **`mail-data` holds data, not only an index**: besides the thread and mailbox
   indexes it keeps the mails waiting for approval with their attachments and
@@ -1159,7 +1761,4 @@ accounts. The points an operator meets first:
   monitor does not report the absent container as an outage. Only then does
   the mailbox password stay out of a second container: compose hands it to
   the gateway whether or not it mirrors.
-- **Not in this phase**: the gate, the gateway's own news filing and the
-  retirement of e-mail triage (phase 3), the model trim (phase 4). Until
-  phase 3 no mail pushes or starts a turn, whatever a contact's prior or VIP
-  flag says.
+- **Still to come**: the model trim (phase 4). Phases 1–3 are built.

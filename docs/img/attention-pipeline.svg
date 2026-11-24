@@ -8,8 +8,8 @@
     <text x="24" y="41" font-weight="700">Messenger chats</text>
     <text x="24" y="54" font-size="10.2" fill="#5d6b7a">delivery gate, sender prior</text>
     <rect x="16" y="68" width="176" height="32" rx="4" fill="#f3f5f7" stroke="#cfd6dd"/>
-    <text x="24" y="81" font-weight="700">E-mail triage</text>
-    <text x="24" y="94" font-size="10.2" fill="#5d6b7a">the Secretary’s judgement</text>
+    <text x="24" y="81" font-weight="700">Mail chats</text>
+    <text x="24" y="94" font-size="10.2" fill="#5d6b7a">gate, verdict, sender prior</text>
     <rect x="16" y="108" width="176" height="32" rx="4" fill="#f3f5f7" stroke="#cfd6dd"/>
     <text x="24" y="121" font-weight="700">Agent threads</text>
     <text x="24" y="134" font-size="10.2" fill="#5d6b7a">conversation-push flags</text>

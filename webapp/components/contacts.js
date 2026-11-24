@@ -4,19 +4,25 @@
 //
 //   - their handles — e-mail addresses, phone numbers, Signal / WhatsApp /
 //     Telegram accounts (or any other channel by name);
+//   - the e-mail domains they write from — an organisation, a shop that sends
+//     receipts: `example.org` for every address there, `*.example.org` for
+//     that domain and everything below it. A domain is not a handle (nothing
+//     is sent to it); it says whose mail a mail is when nobody holds the
+//     sender's address;
 //   - the attention model's facts about them — the sphere they belong to and
 //     further ones, their importance prior, the Focus modes they may
 //     interrupt;
-//   - the VIP flag: a model works their messages the moment they arrive, on
-//     every channel (their e-mail addresses are whitelisted);
+//   - the VIP flag: their messages ring at once and a model works them the
+//     moment they arrive, on every channel, e-mail included;
 //   - their instruction: the user's standing brief a model works each of
-//     their messages by — it decides what is done with a message and how
-//     loudly it rings. One can be copied from another person (a team).
+//     their messages by, mail included — it decides what is done with a
+//     message and how loudly it rings. One can be copied from another person
+//     (a team).
 //
 // Live endpoints, never cached by the service worker:
 //   GET  /contacts[?q=]         -> { locations, default, contacts }
-//   POST /contacts              -> create (needs `chamber`)
-//   POST /contacts/<id>         -> change
+//   POST /contacts              -> create (needs `chamber`; `domains`)
+//   POST /contacts/<id>         -> change (`add_domains` / `remove_domains`)
 //   GET  /attention/profile     -> { focus: { spheres, modes } } for the choices
 //
 // A new contact always names the chamber it is kept in; the address book's
@@ -69,6 +75,7 @@ const CSS = `
   .chips { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
   .handle { display: flex; align-items: center; gap: 6px; font-size: .86rem; }
   .handle .ch { color: var(--muted, #8b93a3); min-width: 72px; }
+  .handle .covers { color: var(--muted, #8b93a3); font-size: .76rem; }
   .handle .x { all: unset; cursor: pointer; color: var(--muted, #8b93a3); padding: 0 6px; }
   .add { display: flex; gap: 6px; flex-wrap: wrap; }
   .add input { flex: 1 1 160px; }
@@ -78,6 +85,35 @@ const CSS = `
 
 function sphereList(p) {
   return [p.sphere, ...(p.tags || [])].filter(Boolean);
+}
+
+// What the user typed, as the address book files a domain: lowercased, with
+// the delivery gate's spelling of the same two shapes (`*@example.org`,
+// `*@*.example.org`) and a leading `@` read as what they mean. Only the two
+// mistakes worth catching before the round trip are refused here — an
+// address, and something that is no domain at a glance. The server is the
+// authority on the rest (a public suffix, a domain somebody else has), and
+// its refusal is shown as it words it (docs/contacts.md, "E-mail domains").
+export function domainSpec(raw) {
+  let spec = String(raw == null ? '' : raw).trim().toLowerCase();
+  if (spec.startsWith('*@')) spec = spec.slice(2);
+  else if (spec.startsWith('@')) spec = spec.slice(1);
+  if (!spec) return { spec: '' };
+  if (spec.includes('@')) {
+    return { error: 'That is an address, not a domain — add it under “Reached by”.' };
+  }
+  const base = spec.startsWith('*.') ? spec.slice(2) : spec;
+  if (!base.includes('.') || base.includes('*') || /\s/.test(base)) {
+    return { error: 'A domain looks like example.org — or *.example.org for it and everything below it.' };
+  }
+  return { spec };
+}
+
+// In words, who a filed domain covers.
+export function domainCovers(spec) {
+  return spec.startsWith('*.')
+    ? `${spec.slice(2)} and every domain below it`
+    : `every address @${spec}`;
 }
 
 class RetinueContacts extends HTMLElement {
@@ -130,9 +166,11 @@ class RetinueContacts extends HTMLElement {
     this._form = c
       ? { name: c.name, sphere: c.sphere || '', tags: [...(c.tags || [])], importance: c.importance,
           permits: [...(c.permits || [])], vip: Boolean(c.vip), instruction: c.instruction || '',
-          handles: c.handles.map((h) => ({ ...h })), chamber: c.chamber, add: { channel: 'email', handle: '' } }
+          handles: c.handles.map((h) => ({ ...h })), domains: [...(c.domains || [])], chamber: c.chamber,
+          add: { channel: 'email', handle: '', domain: '' } }
       : { name: '', sphere: '', tags: [], importance: null, permits: [], vip: false, instruction: '', handles: [],
-          chamber: (this._data && this._data.default) || '', add: { channel: 'email', handle: '' } };
+          domains: [], chamber: (this._data && this._data.default) || '',
+          add: { channel: 'email', handle: '', domain: '' } };
     this.render();
     const input = this.shadowRoot.querySelector('[data-set="name"]');
     if (input && id === 'new') input.focus();
@@ -152,6 +190,7 @@ class RetinueContacts extends HTMLElement {
     if (what === 'name') this._form.name = el.value;
     else if (what === 'add-handle') this._form.add.handle = el.value;
     else if (what === 'add-channel') this._form.add.channel = el.value;
+    else if (what === 'add-domain') this._form.add.domain = el.value;
     else if (what === 'chamber') this._form.chamber = el.value;
     else if (what === 'instruction') this._form.instruction = el.value;
     else if (what === 'instruction-from' && e.type === 'change') {
@@ -180,6 +219,8 @@ class RetinueContacts extends HTMLElement {
       case 'vip': if (f) { f.vip = !f.vip; this.render(); } break;
       case 'drop-handle': if (f) { f.handles.splice(Number(arg), 1); this.render(); } break;
       case 'add-handle': this._addHandle(); break;
+      case 'drop-domain': if (f) { f.domains.splice(Number(arg), 1); this.render(); } break;
+      case 'add-domain': this._addDomain(); break;
       case 'save': this._save(); break;
       default: break;
     }
@@ -196,10 +237,25 @@ class RetinueContacts extends HTMLElement {
     this.render();
   }
 
+  // Take the domain field into the form. False when what is in the field is
+  // no domain: the field keeps it and the reason is shown, so nothing typed
+  // is dropped on the way to a save.
+  _addDomain() {
+    const f = this._form;
+    const got = domainSpec(f.add.domain);
+    if (got.error) { this._error = got.error; this.render(); return false; }
+    if (got.spec && !f.domains.includes(got.spec)) f.domains.push(got.spec);
+    f.add.domain = '';
+    this._error = '';
+    this.render();
+    return true;
+  }
+
   async _save() {
     const f = this._form;
     if (!f) return;
     if ((f.add.handle || '').trim()) this._addHandle();
+    if ((f.add.domain || '').trim() && !this._addDomain()) return;
     if (!f.name.trim()) { this._error = 'A name, so the person can be called something.'; this.render(); return; }
     const isNew = this._open === 'new';
     if (isNew && !f.chamber) { this._error = 'A chamber to keep the contact in.'; this.render(); return; }
@@ -208,6 +264,7 @@ class RetinueContacts extends HTMLElement {
     let body;
     if (isNew) {
       body = { ...facts, chamber: f.chamber, handles: f.handles };
+      if (f.domains.length) body.domains = f.domains;
     } else {
       const was = this._contact(this._open) || { handles: [] };
       const key = (h) => `${h.channel}:${h.handle}`;
@@ -216,6 +273,14 @@ class RetinueContacts extends HTMLElement {
       body = { ...facts,
         add: f.handles.filter((h) => !before.has(key(h))),
         remove: was.handles.filter((h) => !now.has(key(h))) };
+      // Domains travel as a difference too, and only when there is one: what
+      // this form did not touch is not restated, so a domain filed elsewhere
+      // meanwhile (the CLI, another device) is not undone by this save.
+      const had = was.domains || [];
+      const addDomains = f.domains.filter((d) => !had.includes(d));
+      const removeDomains = had.filter((d) => !f.domains.includes(d));
+      if (addDomains.length) body.add_domains = addDomains;
+      if (removeDomains.length) body.remove_domains = removeDomains;
     }
     this._busy = true;
     this.render();
@@ -238,7 +303,9 @@ class RetinueContacts extends HTMLElement {
   }
 
   _row(c) {
-    const handles = (c.handles || []).map((h) => h.handle).join(' · ') || 'no handles';
+    // A domain reads as "anyone at": @example.org, @*.example.org.
+    const handles = (c.handles || []).map((h) => h.handle)
+      .concat((c.domains || []).map((d) => `@${d}`)).join(' · ') || 'no handles';
     const spheres = sphereList(c);
     return `<li><button class="row" data-act="open" data-id="${esc(c.id)}">` +
       `<div class="name">${esc(c.name)}${c.vip ? '<span class="vip">VIP</span>' : ''}` +
@@ -267,6 +334,10 @@ class RetinueContacts extends HTMLElement {
     const handles = f.handles.map((h, i) =>
       `<div class="handle"><span class="ch">${esc(CHANNEL_LABEL[h.channel] || h.channel)}</span>` +
       `<span>${esc(h.handle)}</span><button class="x" data-act="drop-handle" data-v="${i}" aria-label="Remove">✕</button></div>`).join('');
+    const domains = f.domains.map((d, i) =>
+      `<div class="handle"><span class="ch">Domain</span><span>${esc(d)}</span>` +
+      `<span class="covers">${esc(domainCovers(d))}</span>` +
+      `<button class="x" data-act="drop-domain" data-v="${i}" aria-label="Remove the domain ${esc(d)}">✕</button></div>`).join('');
     return `<div class="editor">` +
       `<input type="text" data-set="name" value="${esc(f.name)}" placeholder="Their name" autocomplete="off">` +
       where +
@@ -275,6 +346,13 @@ class RetinueContacts extends HTMLElement {
       CHANNELS.map((c) => `<option value="${c}"${f.add.channel === c ? ' selected' : ''}>${CHANNEL_LABEL[c]}</option>`).join('') +
       `</select><input type="text" data-set="add-handle" value="${esc(f.add.handle)}" placeholder="address, +41 …, @name" autocomplete="off">` +
       `<button class="btn tiny" data-act="add-handle"${busy}>Add</button></div></div>` +
+      `<div><div class="k">Writes e-mail from</div>${domains || '<div class="note">No domain. Most people need none: their addresses above are enough.</div>'}` +
+      `<div class="add" style="margin-top:6px"><input type="text" data-set="add-domain" value="${esc(f.add.domain)}" ` +
+      `placeholder="example.org, or *.example.org" aria-label="An e-mail domain they write from" autocomplete="off" autocapitalize="off" spellcheck="false">` +
+      `<button class="btn tiny" data-act="add-domain"${busy}>Add</button></div>` +
+      `<div class="note">For an organisation that writes from many addresses: a mail from anyone at the domain is theirs, ` +
+      `unless a person of their own holds that address — so VIP and the instruction below apply to every sender there. ` +
+      `A mail's sender address is the sender's own claim; file people at a freemail provider by address, never by its domain.</div></div>` +
       `<div><div class="k">Belongs to</div><div class="chips">${spheres.map((s) => chip('sphere', s, f.sphere === s)).join('')}</div>` +
       `<div class="note">The sphere decides which modes let them through.</div></div>` +
       `<div><div class="k">Also</div><div class="chips">${spheres.filter((s) => s !== f.sphere).map((s) => chip('tag', s, f.tags.includes(s))).join('')}</div></div>` +
@@ -283,7 +361,9 @@ class RetinueContacts extends HTMLElement {
       `</select> <span class="note">the prior for a message of theirs; the sheet's − / + teach it too</span></div>` +
       `<div><div class="k">May interrupt in</div><div class="chips">${modes.map(([id, m]) => chip('permit', id, f.permits.includes(id), (m && m.name) || id)).join('')}</div></div>` +
       `<div><div class="chips">${chip('vip', 'vip', f.vip, 'VIP')}</div>` +
-      `<div class="note">A model works a VIP's messages the moment they arrive — on every channel above; their e-mail addresses are handled on the frequent run.</div></div>` +
+      `<div class="note">A VIP's messages ring at once, and a model works them the moment they arrive — on every channel above, ` +
+      `e-mail and its domains included. Mail from anyone who is neither a VIP nor instructed buys no model turn; ` +
+      `by default it is only listed, and it waits for the digest or rings only as their importance and the modes they may interrupt in say.</div></div>` +
       this._instructionField(f, busy) +
       `<div class="actions"><button class="btn primary" data-act="save"${busy}>${isNew ? 'Add the contact' : 'Save'}</button>` +
       `<button class="btn" data-act="cancel"${busy}>Cancel</button></div>` +
@@ -307,11 +387,13 @@ class RetinueContacts extends HTMLElement {
       `placeholder="e.g. Draft a reply to every message. When a visit moves, add it to the calendar — you have my approval for that. Ring me only if it is about today or tomorrow.">` +
       `${esc(f.instruction || '')}</textarea>` +
       (copy ? `<div class="chips" style="margin-top:6px">${copy}</div>` : '') +
-      `<div class="note">A model works each of their messages by this, on every messenger channel above: it stages a ` +
-      `reply in the chat's draft (never sends), takes the actions you name, and sets how important the message is — ` +
-      `which decides whether it rings, after the work is done. If that work fails or takes over a minute, the message ` +
-      `rings anyway. What they write decides how loudly it rings, so use this for senders you trust — and think twice ` +
-      `on SMS, where a sender is easily faked.</div></div>`;
+      `<div class="note">A model works each of their messages by this, on every channel above — a mail from one of ` +
+      `their addresses or domains included: it stages a ` +
+      `reply in the chat's draft (it sends a mail only where this says to, under the mailbox's send policy, and never a ` +
+      `message), takes the actions you name, and sets how important the message is — ` +
+      `which decides whether it rings, after the work is done. If that work fails or takes longer than a minute ` +
+      `(ten for a mail), the message rings anyway. What they write decides how loudly it rings, so use this for senders you trust — and think twice ` +
+      `on SMS and e-mail, where a sender is easily faked.</div></div>`;
   }
 
   render() {
@@ -330,7 +412,7 @@ class RetinueContacts extends HTMLElement {
     root.innerHTML = `<style>${CSS}</style>` +
       `<header><h2>Contacts${list.length ? ` · ${list.length}` : ''}</h2>` +
       `<button class="btn tiny" data-act="new"${this._busy ? ' disabled' : ''}>+ New contact</button></header>` +
-      `<input type="search" data-set="q" value="${esc(this._q)}" placeholder="Search names and e-mail addresses" autocomplete="off">` +
+      `<input type="search" data-set="q" value="${esc(this._q)}" placeholder="Search names, e-mail addresses and domains" autocomplete="off">` +
       (this._error && !this._form ? `<div class="err">${esc(this._error)}</div>` : '') + body;
     if (active) {
       const q = root.querySelector('[data-set="q"]');

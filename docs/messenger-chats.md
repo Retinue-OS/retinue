@@ -373,7 +373,13 @@ Because they reach a real mailbox now, **the read mark and the flags are the
 user's own act like a send**: `POST /chats/<id>/read` and
 `POST /chats/<id>/flags` answer 403 to a request another site's page made the
 browser send (a `Sec-Fetch-Site` other than `same-origin` or `none`), on
-every channel and for every body — the undo and a star included.
+every channel and for every body — the undo and a star included. The flags,
+like a send and a delete, are accepted only through the reverse proxy too —
+refusing a caller inside the container where `EDGE_PROXY_PEERS` names the
+proxy, and without it only a loopback peer and one that is the address the
+caller dialled ([dashboard.md](dashboard.md), "Who is asking"): an agent sets
+a chat's flags by its own door (`POST /internal/chats/<id>/flags`,
+`chat-flags.py`).
 
 ### Unread · Read · Archived
 
@@ -633,14 +639,18 @@ see *Context* below — and SPARQL covers anything older); **stage the draft**
 (`POST /internal/chats/<id>/draft`, with a thin `chat-draft.py` CLI, token-gated
 like `conversation-push.py`); **send** only as the channel's policy allows (see
 *Trust model*); **fork** a topic into a normal conversation; **link projects**
-exactly as triage does today. Before composing any draft it reads the Secretary
-persona plus the chambers' style overrides — the existing per-action compose
-rule, unchanged.
+exactly as triage does today; **archive or mute the chat** — when the user
+asks, or when a standing instruction told its turn to
+(`POST /internal/chats/<id>/flags`, `chat-flags.py`: the user's own flags by
+an agent's door, with no delete). Before composing any draft it reads the
+Secretary persona plus the chambers' style overrides — the existing per-action
+compose rule, unchanged.
 
 **What triggers a companion turn** (this is the whole "lightweight" point):
 
 - the user writes in the companion pane, or taps a quick pattern;
-- an inbound message the delivery gate forwards (see *Inbound flow*);
+- an inbound message from a VIP or from a sender with a standing instruction
+  (see *Inbound flow*);
 - nothing else. The user's own sends, draft edits, read events and scrolling
   never spend a turn.
 
@@ -664,9 +674,11 @@ problem for good: however old the chat, an engage prompt has a fixed ceiling.
 ## Inbound flow — where triage changes
 
 The **delivery gate is untouched**: same policy axes, same classes, same
-never-drop persist-before-anything, same news rail, same daily drain, same
+never-drop persist-before-anything, same news rail, same recovery drain, same
 at-least-once delivery confirmation. What changes is where a message *lands*
-and what a model turn is *for*:
+and what a model turn is *for*. (E-mail takes this flow too, with the
+differences a mailbox makes: *Mail takes the same flow*, at the end of this
+section.)
 
 1. **Persist** (as today, now with `kb:chat` + `kb:messageId`).
 2. **Gate** (as today).
@@ -731,6 +743,17 @@ and what a model turn is *for*:
    that a draft is on its way, then the verdict and what the turn flagged.
    A message the user answered or marked read while its turn worked is not
    rung afterwards; opening the chat is neither (*Unread · Read · Archived*).
+   The timeout only rings: what the turn did by then stands — a chat it
+   archived (`chat-flags.py --archive`, which the instruction asked for)
+   stays archived, also once its verdict comes. A turn can only archive: a
+   mute it asks for is taken as an archive, its unmute, unarchive and star
+   change nothing, and the answer says so. A flags call is the turn's only
+   when it carries the token the turn's session was handed
+   (`RETINUE_ARRIVAL_TURN`, which `chat-flags.py` sends); on a messenger
+   chat one without it is Ara on the user's word and mutes, also while a
+   turn runs. (A mail thread is stricter: there a call without the token,
+   while a mail's turn runs, is that turn's unless it carries a dashboard
+   thread turn's proof — docs/dashboard.md, "The gate for mail".)
 
    As built, five things are worth naming:
 
@@ -789,6 +812,63 @@ cost for a strictly better result.
 
 Control-mode accounts are out of scope: their messages are prompts, not mail,
 and keep today's ask-and-answer path.
+
+### Mail takes the same flow
+
+A mail thread is a chat ([mail-chats.md](mail-chats.md)), and a mail that
+just arrived goes through the four steps above: the mail gateway persists it
+undelivered, gates it — the group axis on the `List-Id` or the sender, the
+sender axis as VIP / instructed, by address or by an e-mail domain — and
+offers it to this rail with `handover`. The web gateway's side is the same
+code, and five things differ because the channel is a mailbox
+([dashboard.md](dashboard.md), "The gate for mail", has each in full):
+
+- **A mail pushes nothing by default; a contact can say otherwise.** The
+  arrival goes through the attention model like a message, but an unjudged
+  mail is passive (`attention_store.CHANNEL_DEFAULT_IMPORTANCE`): listed,
+  never pushed, in no digest. The item is about the person the mail is from —
+  the holder of the address, else whoever's domain covers it — so their
+  prior and permits apply; a VIP rings, an instruction's verdict decides.
+  There is no daily sweep: mail from anyone else is listed under *Unread*
+  and judged by nobody.
+- **The turn is worded for a mail and has a mail thread's means.** The
+  mail's sender, subject, id and trimmed text are quoted as data; the turn
+  may link a project, store a memory, hand a document to the Archivist,
+  stage a reply (the Secretary's words), and — an instructed turn, where the
+  instruction asks — send one with `mail-push.py --chat <id>` under the
+  mailbox's send policy, add a calendar event under its policy, and
+  **archive the thread** with `chat-flags.py`. It ends with the verdict. A
+  turn can only archive (a mute it asks for is an archive; an unmute, an
+  unarchive or a star changes nothing). A thread its turn
+  archived rings nothing; a turn that archived and did not finish — it
+  failed, set no verdict, or, for a mail unlike a messenger message, ran
+  past the timeout — has the chat brought back and the mail rung. A turn's
+  archive reaches only the mail it was given: a mail that arrived while it
+  worked, or waits for a turn of its own, keeps the thread in view and in
+  the inbox, and the mailbox hears of the turn's own mails by `Message-ID`.
+  A batch too big to quote whole is worked in turns: the oldest of it wait
+  for a turn of their own, and nothing the first turn settles is about
+  them. A merge of the thread while its turn runs moves the turn with it.
+- **There is no triage fallback.** Step 4's "forwards to triage exactly as
+  it always has" does not exist for mail: a mail the rail did not accept
+  stays `delivered: false` and the mail gateway offers it again on a later
+  poll — the mailbox is the backlog. So the rail takes a mail **once**, by
+  its `Message-ID`, and keeps per arrival whether the user was told of it:
+  a repeated offer of a mail they were told of un-archives nothing, reopens
+  no settled item and rings nothing, one of a mail whose first offer never
+  got that far does what it owed. The handle of a turn that failed is
+  handed back only for `CHAT_ARRIVAL_RETRY_SECONDS` before the next offer
+  starts the turn anew, and a mail gets at most `MAIL_ARRIVAL_TURN_ATTEMPTS`
+  turns — counted on the chat's state, with the mails whose turns are over,
+  so a restart buys a mail no further turn.
+- **`CHAT_ARRIVAL_TURNS=0` still accepts a mail** — its gateway has nowhere
+  else to take it — and runs no turn for it.
+- **The timeout is longer.** `MAIL_INSTRUCTION_TIMEOUT` (600 s) bounds how
+  long an instruction can hold a mail's ring — not the messengers'
+  `CHAT_INSTRUCTION_TIMEOUT` (60 s): a mail is not a chat message, and a
+  turn that files a document with the Archivist runs longer than one that
+  drafts a reply. Past it the mail rings as a VIP's, whatever the turn
+  decides afterwards; the failure rule is otherwise the same.
 
 ## Summaries — unbounded time, bounded context
 
@@ -928,16 +1008,17 @@ in-chat replies; the model turn spent on mere notification; the `messages.js`
 mock card.
 
 **Kept unchanged:** the delivery gate and its policy files; the never-drop
-ledger and `delivered` semantics; the news rail; the daily drain; reply tokens
-and the push CLIs (still the right tool for headless sends and escalations);
-the conversation concept, dashboard, and push machinery for everything that is
-not a messenger chat; e-mail triage in full (pull channel, own flow — it can
-adopt this pattern later, but nothing here depends on it). *It since has:*
+ledger and `delivered` semantics; the news rail; the recovery drain; reply
+tokens and the push CLIs (still the right tool for headless sends and
+escalations); the conversation concept, dashboard, and push machinery for
+everything that is not a messenger chat. E-mail was kept out at first (a pull
+channel with a flow of its own) and has since adopted the pattern:
 [mail-chats.md](mail-chats.md) mirrors the mailbox into this same ledger and
 shows a mail thread as a chat. Replies and new mail leave from the chat
-surface under the e-mail send policy, and the mailbox follows the chat
-(read, archive, delete). E-mail triage keeps running beside the mirror until
-the phase that gives mail the gate retires it.
+surface under the e-mail send policy, the mailbox follows the chat (read,
+archive, delete), and an arriving mail is gated as a message is (*Mail takes
+the same flow*, above). E-mail triage, its whitelist and its daily run are
+retired; triage remains for a messenger message this rail could not take.
 
 **Converges with:** issue #130 — the message-id plumbing is shared, and the
 chat page is the missing answer to where reactions and quoted replies surface.
