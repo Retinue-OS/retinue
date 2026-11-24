@@ -292,12 +292,47 @@ def test_reconnect_backoff():
         wg = _load_whatsapp_gateway(tmp)
         fake = _FakeClient()
         wg._wa_client = fake
+        wg.WHATSAPP_IQ_EXIT_AFTER = 0  # exit-on-stuck covered separately
         wg._maybe_iq_reconnect()
         wg._maybe_iq_reconnect()  # inside the backoff window — must not fire
         assert fake.disconnects == 1
         wg._last_iq_reconnect = 0.0  # backoff elapsed
         wg._maybe_iq_reconnect()
         assert fake.disconnects == 2
+
+
+def test_exit_when_teardowns_do_not_recover():
+    """Teardowns that bring no successful probe back end in a process exit —
+    the case where whatsmeow's autoreconnect gave up and disconnect() on the
+    dead socket never makes connect() return."""
+    with tempfile.TemporaryDirectory() as tmp:
+        wg = _load_whatsapp_gateway(tmp)
+        fake = _FakeClient()
+        wg._wa_client = fake
+        exits = []
+        wg._exit_process = exits.append
+        wg.WHATSAPP_IQ_EXIT_AFTER = 2
+        for _ in range(2):
+            wg._last_iq_reconnect = 0.0
+            wg._maybe_iq_reconnect()
+        assert fake.disconnects == 2 and exits == []
+        wg._last_iq_reconnect = 0.0
+        wg._maybe_iq_reconnect()
+        assert exits == [1] and fake.disconnects == 2  # exits instead of a third teardown
+
+        # A successful probe in between resets the count: a teardown that
+        # worked is not evidence of a stuck client.
+        wg = _load_whatsapp_gateway(tmp)
+        fake = _FakeClient()
+        wg._wa_client = fake
+        exits = []
+        wg._exit_process = exits.append
+        wg.WHATSAPP_IQ_EXIT_AFTER = 2
+        for _ in range(5):
+            wg._last_iq_reconnect = 0.0
+            wg._maybe_iq_reconnect()
+            wg._note_iq_result(True)
+        assert fake.disconnects == 5 and exits == []
 
 
 def _run_fake_bridge(wg):
@@ -390,6 +425,7 @@ def main() -> int:
              test_send_exhausted_records_lookup_failure,
              test_send_non_usync_error_propagates,
              test_reconnect_backoff,
+             test_exit_when_teardowns_do_not_recover,
              test_client_outdated_survives_the_disconnect_after_it]
     failures = 0
     for test in tests:

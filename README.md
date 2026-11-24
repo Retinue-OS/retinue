@@ -600,7 +600,8 @@ that gap:
   (`WHATSAPP_IQ_PROBE_SECONDS`, default 60; `WHATSAPP_IQ_PROBE_FAILURES`,
   default 2; on a sustained wedge the gateway also tears its connection down to
   force a reconnect, at most once per `WHATSAPP_IQ_RECONNECT_BACKOFF` seconds,
-  default 600) — and Telegram from the MTProto connection plus a
+  default 600, and exits for a container restart when `WHATSAPP_IQ_EXIT_AFTER`
+  teardowns, default 2, brought no probe back) — and Telegram from the MTProto connection plus a
   periodic session probe (which catches a session revoked from another device).
   The mail gateway reports whether its last IMAP login and poll succeeded —
   and, when it is not the mailbox that holds it (the mirror waiting for the
