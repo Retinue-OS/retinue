@@ -15,7 +15,7 @@
  *
  *   Retinue.version                 this client's API version (1)
  *   Retinue.app                     {chamber, id} of the running app
- *   Retinue.shell                   {version} inside the Android shell, else null
+ *   Retinue.shell                   {version, app, platform} inside the Android shell, else null
  *   Retinue.sparql(query, endpoint = "life")         → SPARQL JSON results
  *   Retinue.submit(name, blob, dir?, {replace}?)     → {path, bytes}
  *   Retinue.ask(agent, text, {thread, title, importance, due, …}?) → thread id
@@ -98,9 +98,15 @@
   var Retinue = {
     version: 1,
     app: app,
+    // The bridge's version is the number in the user agent (RetinueShell/7);
+    // RetinueShell.version is the app's own release. Members are
+    // feature-detected all the same, never assumed from the number.
     get shell() {
       var s = shellBridge();
-      return s ? { version: Number(s.version) || 0, platform: s.platform || null } : null;
+      if (!s) return null;
+      var ua = (window.navigator && window.navigator.userAgent) || '';
+      var m = ua.match(/RetinueShell\/(\d+)/);
+      return { version: m ? Number(m[1]) : 0, app: s.version || null, platform: s.platform || null };
     },
 
     sparql: function (query, endpoint) {

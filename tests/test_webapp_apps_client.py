@@ -30,7 +30,7 @@ import fs from 'node:fs';
 import vm from 'node:vm';
 const src = fs.readFileSync(process.argv[2], 'utf8');
 
-function page(href, { shell = null, preset = undefined } = {}) {
+function page(href, { shell = null, preset = undefined, ua = 'Mozilla/5.0' } = {}) {
   const calls = [];
   const listeners = {};
   const win = {
@@ -43,6 +43,7 @@ function page(href, { shell = null, preset = undefined } = {}) {
       calls.push({ url, method: init.method, body: init.body });
       return Promise.resolve({ ok: true, status: 200, text: () => Promise.resolve('{"jobs": [], "thread": "t1"}') });
     },
+    navigator: { userAgent: ua },
     Blob, URL, Promise, JSON, Object, Number, String, Math, setTimeout, clearTimeout, TypeError, Error,
     ArrayBuffer, encodeURIComponent, decodeURIComponent,
   };
@@ -97,11 +98,12 @@ const tick = () => new Promise((r) => setTimeout(r, 0));
   let changed = 0;
   const spoken = [];
   const notes = [];
-  const shell = { version: 7, platform: 'android', remindersChanged: () => { changed += 1; },
+  const shell = { version: '1.4.0', platform: 'android', remindersChanged: () => { changed += 1; },
                   speak: (t, l, id) => spoken.push({ t, l, id }), notify: (t, b) => notes.push([t, b]) };
-  const { win } = page('https://dash.example/apps/routines/routine/', { shell });
+  const { win } = page('https://dash.example/apps/routines/routine/', { shell, ua: 'Mozilla/5.0 RetinueShell/7 (Android)' });
   const R = win.Retinue;
   assert.equal(R.shell.version, 7);
+  assert.equal(R.shell.app, '1.4.0');
   await R.schedule({ id: 'a' }); await R.skip('a');
   assert.equal(changed, 2);
   const done = R.speak('Next set', 'en');
@@ -115,8 +117,8 @@ const tick = () => new Promise((r) => setTimeout(r, 0));
   console.log('ok: inside the shell, speak, notify and remindersChanged use its bridge');
 }
 {
-  const shell = { version: 6, platform: 'android' };   // an older shell: none of the members
-  const { win } = page('https://dash.example/apps/routines/routine/', { shell });
+  const shell = { version: '1.3.0', platform: 'android' };   // an older shell: none of the members
+  const { win } = page('https://dash.example/apps/routines/routine/', { shell, ua: 'Mozilla/5.0 RetinueShell/6 (Android)' });
   assert.equal(win.Retinue.shell.version, 6);
   await win.Retinue.schedule({ id: 'a' });               // no remindersChanged: nothing thrown
   assert.equal(await win.Retinue.speak('x'), false);     // no speechSynthesis in this stub

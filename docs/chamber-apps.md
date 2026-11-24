@@ -112,7 +112,7 @@ server's reason.
 |---|---|---|
 | `Retinue.version` | the client API's version, `1` | — |
 | `Retinue.app` | `{chamber, id}` of the running app | — |
-| `Retinue.shell` | `{version, platform}` inside the Android shell, else `null` | — |
+| `Retinue.shell` | `{version, app, platform}` inside the Android shell (`version`: the bridge, from the user agent's `RetinueShell/<n>`; `app`: the app's release), else `null` | — |
 | `sparql(query, endpoint = "life")` | read-only query, SPARQL JSON results; `endpoint` is `life` or the name of a deployment's `SPARQL_ENDPOINT_<NAME>`; updates and `SERVICE` are refused | `POST /apps/api/sparql` `{query, endpoint}` |
 | `submit(name, blob, dir, {replace})` | write a file into the app's chamber (`dir` relative to the chamber, default the chamber's first inbox in `.inbox.json`); converters / the Archivist pick it up | `PUT /apps/api/files/<chamber>/<dir>/<name>` (one segment: the inbox) |
 | `ask(agent, text, opts)` | open (or, with `opts.thread`, continue) a dashboard thread addressed to an agent, with attention fields (`importance`, `due`, `lead`, `sphere`, `tags`, `kind`); resolves to the thread id | `POST /apps/api/ask` |
