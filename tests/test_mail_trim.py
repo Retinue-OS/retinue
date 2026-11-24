@@ -2576,6 +2576,13 @@ def test_a_long_mail_is_trimmed_to_its_own_text():
         "Please view this message in an HTML capable mail client.", html))
     assert result.text.startswith("[screenshot]\n\nHi Ann,\n\nCan you call me"), result.text[:80]
     assert result.text.endswith("at some length.\n\nBob") and result.state == "wanting", result.text[-80:]
+    # (That it stands in a tag is read as a browser reads it, once: a
+    # megabyte of tags before it is not read again for each candidate.)
+    html = "<html><body>%s%s%s</body></html>" % (
+        '<b title="x>y">x</b>' * 45_000, image * 3, asks)
+    result = timed("a screenshot under a megabyte of tags", lambda: mt.trim(None, html))
+    assert result.text.endswith("[screenshot]" * 3 + "\n\nCan you call me before noon? "
+                                "The number is 555 0100."), result.text[-200:]
     # Markup that could be text is read to its bound, wherever that falls: of
     # a log too long for it, in one <pre>, the first megabyte — not none.
     html = ("<html><body><p>Nightly run, all green. Details:</p><pre>%s</pre><p>Regards, CI"
@@ -2801,6 +2808,8 @@ def test_what_one_mail_may_cost_is_bounded():
                 ('<div style="background:url(%s)">chart</div>', "chart\n\n"),
                 ("<div style=\"background: url('%s') no-repeat\">chart</div>", "chart\n\n"),
                 ('<div style="background:url(&quot;%s&quot;)">chart</div>', "chart\n\n"),
+                ("<style>div{background:url(%s)}</style><div>chart</div>", "chart\n\n"),
+                ('<img alt="1 > 0" src="%s">', "[1 > 0]\n\n"),
                 ('<img alt="screenshot" src="%s">' * 3, "[screenshot][screenshot][screenshot]\n\n")):
             # (As a client writes it, and folded as some do — which only a
             # value in quotes can be: without them it ends at the first blank.)
@@ -2834,11 +2843,20 @@ def test_what_one_mail_may_cost_is_bounded():
         assert result.state == "wanting" and mt.CUT_MARK not in result.text
         mt.MAX_HTML_CHARS = 2000
         # What is text stays text, and counts: a data: URL someone wrote
-        # out, one that is short, a word that only begins like one.
+        # out, one that is short, a word that only begins like one — and
+        # text shaped like one, which a browser shows as the words it is.
+        words = ["Please", "wire", "EUR", "9,800", "to", "IBAN", "XX00", "1234"] * 120
         for html in ("<p>Hi Ann,</p><p>%s</p>" % payload + after,
                      before + '<img alt="x" src="data:image/png;base64,iVBORw0KGgo=">' * 40 + after,
                      before + '<p title="data:, %s">a sentence</p>' % ("word " * 900) + after,
-                     before + '<p>(data:%s)</p>' % ("x" * 5000) + after):
+                     before + '<p>(data:%s)</p>' % ("x" * 5000) + after,
+                     before + '<p>Note="data:,%s"</p>' % "\n".join(words) + after,
+                     before + '<p>Note="data:,%s"</p>' % "&nbsp;".join(words) + after,
+                     # (A tag ends where a browser ends it.)
+                     before + '<p ="x>Note="data:,%s"</p>' % "\n".join(words) + after,
+                     before + '<p class= x="y>Note="data:,%s"</p>' % "\n".join(words) + after,
+                     before + '<p title="a>b">Note="data:,%s"</p>' % "\n".join(words) + after,
+                     before + '<pre>src="data:,%s"</pre>' % ("x" * 5000) + after):
             result = mt.trim(None, html)
             assert result.text.endswith(mt.CUT_MARK) and "555 0100" not in result.text, result.text[-80:]
         # Beside a plain part that is the mail's text, markup that was not
@@ -3018,6 +3036,25 @@ def test_html_to_text_links():
              'style="display:none">two <a href="https://b.example/2">three</a> '
              'four</b> five</span> six</a>',
              "one (https://a.example/1) five six"),
+            # What the browser took off its stack with the first link —
+            # the <span> that hid, a <b> it opens again inside what goes on
+            # hiding — ends nothing there with an end tag of its own …
+            ('<a href="https://h.example/">Read more<span style="display:none">'
+             '<font style="display:none"><a href="https://t.example/">x</span>'
+             'SECRET</font> TEND',
+             "Read more (https://h.example/) TEND"),
+            ('<a href="https://a.example/1">one<span style="display:none"><div '
+             'style="display:none"><a href="https://t.example/2">two</span> '
+             'three</div> four',
+             "one (https://a.example/1) four"),
+            ('<a href="https://a.example/1">one<b><span style="display:none">'
+             '<font style="display:none"><a href="https://t.example/2">two</b> '
+             'three</font> four',
+             "one (https://a.example/1) four"),
+            # … but a block it moves and keeps open does, and what hides in it.
+            ('<a href="https://a.example/1">one<h2><center style="display:none">'
+             'two <a href="https://b.example/2">three</h2> four',
+             "one\n\n(https://a.example/1)\n\nfour"),
             # A <span> and its like end with the link they were opened in,
             # and so does the hiding: the second link is shown, and the rest.
             ('<a href="https://a.example/1"><span style="display:none">tracking '
