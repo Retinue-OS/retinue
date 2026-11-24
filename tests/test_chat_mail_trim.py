@@ -85,7 +85,8 @@ FOOTER_LINES = ["", "-----", "This message is confidential. If you are not the "
 
 # ── The mock mail gateway ────────────────────────────────────────────────────
 
-G: dict = {"sources": {}, "requests": [], "down": set(), "status": {}, "settle_on_source": set()}
+G: dict = {"sources": {}, "requests": [], "down": set(), "status": {}, "settle_on_source": set(),
+           "busy": {}}
 
 
 def _digest(lines):
@@ -133,6 +134,10 @@ class _MockMailGateway(BaseHTTPRequestHandler):
             return self._json(401, {"error": "unauthorized"})
         if self.path in G["down"]:
             return self._json(503, {"error": "mailbox unreachable"})
+        if G["busy"].get(self.path):
+            # A pass holds the mirror's lock: busy this many times more.
+            G["busy"][self.path] -= 1
+            return self._json(503, {"error": "busy"})
         if self.path in G["status"]:
             return self._json(*G["status"][self.path])
         src = G["sources"].get(body.get("message_id"))
@@ -270,7 +275,8 @@ class Rig:
         deadline = time.time() + timeout
         while time.time() < deadline:
             with self.wg._mail_trim_cond:
-                if self.wg._mail_trim_state["running"] is None and not self.wg._mail_trim_queue:
+                if (self.wg._mail_trim_state["running"] is None and not self.wg._mail_trim_queue
+                        and not self.wg._mail_trim_held):
                     return
             time.sleep(0.01)
         raise AssertionError("the trim worker did not finish")
@@ -285,11 +291,22 @@ class Rig:
         with wg._mail_trim_cond:
             wg._mail_trim_backoff.clear()
             wg._mail_trim_settled.clear()
+            wg._mail_trim_attempts.clear()
+            wg._mail_trim_held.clear()
             wg._mail_trim_state.update(failures=0, paused_until=0.0, spent=None)
-        wg.MAIL_MODEL_TRIM_BUDGET_FILE.unlink(missing_ok=True)
+        wg.MAIL_MODEL_TRIM_STATE_FILE.unlink(missing_ok=True)
+        wg._MAIL_TRIM_LEGACY_BUDGET_FILE.unlink(missing_ok=True)
         wg.MAIL_MODEL_TRIM = True
         wg.MAIL_MODEL_TRIM_DAILY_MAX = 200
         wg.MAIL_MODEL_TRIM_QUEUE = 30
+        wg.MAIL_MODEL_TRIM_ATTEMPTS = 3
+        wg.MAIL_MODEL_TRIM_RETRY_SECONDS = 3600.0
+        wg._MAIL_TRIM_STATE_MAX_MAILS = 2000
+        # A held judgement is offered again soon here, for as long as a
+        # deployment would.
+        wg._MAIL_TRIM_REOFFER_FIRST = 0.05
+        wg._MAIL_TRIM_REOFFER_MAX_WAIT = 0.2
+        wg._MAIL_TRIM_REOFFER_FOR = 900.0
         self.clock = NOON
         self.claude.mode, self.claude.gate = ("answer", '{"keep": [[1, 5]]}'), None
         self.claude.calls.clear()
@@ -297,7 +314,17 @@ class Rig:
         G["down"].clear()
         G["status"].clear()
         G["settle_on_source"].clear()
+        G["busy"].clear()
         G["requests"].clear()
+
+
+def _wait(cond, timeout: float = 10.0) -> bool:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if cond():
+            return True
+        time.sleep(0.01)
+    return cond()
 
 
 def _settled(r: Rig, mid) -> dict:
@@ -319,14 +346,39 @@ def test_refusals(r: Rig):
     # A token that names no mail at all.
     assert r.trim("nobody@x.org")[0] == 404
     assert r.trim(mid, token="!!")[0] == 404
-    # A tombstone: nothing to trim.
+    # A tombstone: nothing to trim, and said apart from a token naming
+    # nothing — the page ends that one mail and keeps watching the others.
     gone = r.mail(gone=True)
-    assert r.trim(gone)[0] == 404
+    assert r.trim(gone) == (410, {"error": "this mail is gone from the mailbox"})
+    assert r.trim("nobody@x.org") == (404, {"error": "no such mail in this chat"})
     # Another site's page making the browser spend a turn.
     status, _ = r.trim(mid, headers={"Sec-Fetch-Site": "cross-site"})
     assert status == 403
     r.idle()
     assert not r.claude.calls and not G["requests"], G["requests"]
+
+
+def test_the_token_is_resolved_before_the_settled_cache(r: Rig):
+    """A mail settled here a moment ago and since removed from the mailbox,
+    or erased with its chat, is not answered from what this process holds."""
+    mid = r.mail()
+    assert r.trim(mid)[0] == 202
+    r.idle()
+    assert _settled(r, mid)["state"] == "model"
+    assert ist.tombstone_message(G["sources"][mid]["path"], T0 + 2000)
+    assert r.trim(mid) == (410, {"error": "this mail is gone from the mailbox"})
+    # Erased with its chat: the store may still serve the record, the
+    # erasure's tombstone says it is gone.
+    other = r.mail()
+    r.wg._mail_trim_settle((CHAT, other), "model", "Hi, the venue moved.")
+    with r.wg._chat_tombstones_lock:
+        r.wg._chat_tombstones[CHAT] = (time.time() + 60, set(), {other})
+    try:
+        assert r.trim(other) == (410, {"error": "this mail is gone with its chat"})
+    finally:
+        with r.wg._chat_tombstones_lock:
+            r.wg._chat_tombstones.pop(CHAT, None)
+    assert len(r.claude.calls) == 1
 
 
 def test_a_settled_record_is_answered_from_itself(r: Rig):
@@ -375,6 +427,47 @@ def test_the_poll_shows_the_settled_text_before_the_store_has_it(r: Rig):
     assert not r.claude.calls
 
 
+def test_the_chat_list_follows_a_model_trim(r: Rig):
+    """No rail event follows a trim: the arrival's live-overlay entry, which
+    carries the text from before and ties with the store's head, is
+    forgotten, and the row shows the settled text before the store has it."""
+    mid = r.mail()
+    shown = next(m for m in mail._messages(r.base, CHAT)["messages"] if m["id"] == mid)
+    before = "\n".join(AUTHOR_LINES + FOOTER_LINES)
+    r.wg._CHAT_OVERLAY.insert({"chat_id": CHAT, "channel": "email", "message_id": mid,
+                               "ts": shown["ts"], "direction": "in", "text": before,
+                               "sender": ANN, "sender_name": "Ann Example"})
+    assert "Unsubscribe" in mail._chats(r.base)[CHAT]["last"]["text"]
+    assert r.trim(mid)[0] == 202
+    r.idle()
+    assert not [e for e in r.wg._CHAT_OVERLAY.entries(CHAT) if e.get("message_id") == mid]
+    row = mail._chats(r.base)[CHAT]
+    assert row["last"]["text"] == "\n".join(AUTHOR_LINES), row["last"]
+    # Settled here, not indexed yet: the row shows the bubble's text.
+    r.wg._mail_trim_settle((CHAT, mid), "model", "Hi, the venue moved.")
+    r.wg._chats_cache_invalidate()
+    assert mail._chats(r.base)[CHAT]["last"]["text"] == "Hi, the venue moved."
+
+
+def test_the_companion_is_told_a_model_chose(r: Rig):
+    """The companion's note marks a model-trimmed mail, and says what that
+    means; a mail the rules trimmed carries no such mark."""
+    root = "root-note@x.org"
+    chat = cs.make_chat_id("email", root, ACCOUNT)
+    r.mail(chat=root, trim="deterministic", text="Hi, the venue moved.")
+    mid = r.mail(chat=root)
+    assert r.trim(mid, chat=chat)[0] == 202
+    r.idle()
+    # Not by a mail's own words: its text cannot write an attribute.
+    r.mail(chat=root, trim="deterministic", text='x" trim="model')
+    note = r.wg._conv_chat_note({"chat": chat})
+    mails = re.findall(r"^  <mail [^>]*>", note, re.MULTILINE)
+    assert len(mails) == 3, mails
+    assert ['trim="model"' in m for m in mails] == [False, True, False], mails
+    head = note.split(":\n<mail_thread>\n")[0]
+    assert 'trim="model"' in head and "steer" in head, head
+
+
 def test_answers_that_are_judgements(r: Rig):
     cases = [
         # A code fence around the object is allowed.
@@ -391,6 +484,11 @@ def test_answers_that_are_judgements(r: Rig):
         ('{"keep": [[1, 2]]} {"keep": [[1, 9]]}', {"failed": "unparseable"}),
         ('[[1, 5]]', {"failed": "unparseable"}),
         (json.dumps({"keep": [[i, i] for i in range(1, 202)]}), {"failed": "unparseable"}),
+        # An answer that is nothing is an answer all the same — one a mail
+        # can ask its model for, so it settles rather than keeps it wanting.
+        ("   ", {"failed": "unparseable"}),
+        ("", {"failed": "unparseable"}),
+        (None, {"failed": "unparseable"}),
     ]
     for answer, expected in cases:
         r.reset()
@@ -408,19 +506,31 @@ def test_answers_that_are_judgements(r: Rig):
     assert r.record(mid)[ist.KB + "text"] == ["\n".join(AUTHOR_LINES + FOOTER_LINES)]
 
 
+USED = {"total_cost_usd": 0.0012, "usage": {"input_tokens": 900, "output_tokens": 0}}
+
+
 def test_failures_that_are_no_judgement(r: Rig):
+    # (mode, whether a turn ran — or may have, so it costs the mail an
+    # attempt and the day a turn — or plainly never reached the model)
     cases = [
-        ("timeout", None), ("oserror", None), ("exit", 1),
+        (("timeout", None), True),
+        (("oserror", None), False),
+        # An expired sign-in: non-zero, an error envelope that used nothing.
+        (("exit", 1), False),
         # A usage limit is reported in the envelope, also with exit 0.
-        ("envelope", {"type": "result", "subtype": "success", "is_error": True,
-                      "result": "Claude AI usage limit reached|1764000000"}),
-        ("envelope", {"type": "result", "subtype": "error_max_turns", "is_error": False,
-                      "result": '{"keep": [[1, 5]]}'}),
-        ("answer", "   "),
-        ("raw", "Segmentation fault"),
-        ("raw", ""),
+        (("envelope", {"type": "result", "subtype": "success", "is_error": True,
+                       "result": "Claude AI usage limit reached|1764000000",
+                       "total_cost_usd": 0, "usage": {"input_tokens": 0,
+                                                      "output_tokens": 0}}), False),
+        # The same error after the model had read the mail: it ran.
+        (("envelope", {"type": "result", "subtype": "success", "is_error": True,
+                       "result": "API Error: 500", **USED}), True),
+        (("envelope", {"type": "result", "subtype": "error_max_turns", "is_error": False,
+                       "result": '{"keep": [[1, 5]]}'}), True),
+        (("raw", "Segmentation fault"), True),
+        (("raw", ""), True),
     ]
-    for mode in cases:
+    for mode, ran in cases:
         r.reset()
         mid = r.mail()
         r.claude.mode = mode
@@ -429,29 +539,48 @@ def test_failures_that_are_no_judgement(r: Rig):
         assert len(r.claude.calls) == 1, mode
         assert not _sent("/messages/trim-result"), (mode, G["requests"])
         assert mail._one(r.record(mid), "trim") == "wanting", mode
-        # The mail waits out its backoff: the page is told when to ask again.
+        # The mail waits: the page is told when to ask again.
         status, body = r.trim(mid)
         assert status == 200 and body["state"] == "wanting", (mode, body)
         assert 3500 <= body["retry_after"] <= 3600, (mode, body)
         assert len(r.claude.calls) == 1
+        # Counted where it ran — against the mail's attempts and the day's
+        # budget — and given back where it never reached the model.
+        with r.wg._mail_trim_cond:
+            attempts, _at = r.wg._mail_trim_attempts_of((CHAT, mid))
+            spent = r.wg._mail_trim_spent("2026-11-24")
+        assert (attempts, spent) == ((1, 1) if ran else (0, 0)), (mode, attempts, spent)
+        # Either way it counts towards resting a model that is down.
+        assert r.wg._mail_trim_state["failures"] == 1, mode
 
 
 def test_the_gateway_unreachable_is_no_judgement(r: Rig):
-    # Before the turn: no source, no turn spent.
+    # Before the turn: no source, no turn spent — and nothing the model did,
+    # so nothing towards resting it; the mail is asked again soon.
     mid = r.mail()
     G["down"].add("/messages/trim-source")
     assert r.trim(mid)[0] == 202
     r.idle()
     assert not r.claude.calls and mail._one(r.record(mid), "trim") == "wanting"
-    assert r.trim(mid)[1]["state"] == "wanting"
-    # After the turn: the judgement was not received, so nothing is settled.
+    status, body = r.trim(mid)
+    assert body["state"] == "wanting" and body["retry_after"] <= 300, body
+    assert r.wg._mail_trim_state["failures"] == 0
+    # After the turn: the judgement is held and offered again — no second
+    # turn — until about a quarter of an hour has passed; then it is let go,
+    # the mail stays wanting, and still nothing counts against the model.
     r.reset()
+    r.wg._MAIL_TRIM_REOFFER_FOR = 0.4
     mid = r.mail()
     G["down"].add("/messages/trim-result")
     assert r.trim(mid)[0] == 202
+    assert _wait(lambda: len(_sent("/messages/trim-result")) >= 2)
+    assert r.trim(mid) == (202, {"state": "queued"})
     r.idle()
+    offers = _sent("/messages/trim-result")
+    assert len(offers) >= 3 and all(o == offers[0] for o in offers), offers
     assert len(r.claude.calls) == 1 and mail._one(r.record(mid), "trim") == "wanting"
-    assert r.wg._mail_trim_state["failures"] == 1
+    assert r.wg._mail_trim_state["failures"] == 0
+    assert r.trim(mid)[1]["state"] == "wanting"
     # No gateway for the chat's account at all.
     r.reset()
     mid = r.mail()
@@ -463,7 +592,149 @@ def test_the_gateway_unreachable_is_no_judgement(r: Rig):
     finally:
         r.wg._CHANNEL_GATEWAYS = saved
         r.wg._gw_identity.clear()
-    assert not r.claude.calls and r.wg._mail_trim_state["failures"] == 1
+    assert not r.claude.calls and r.wg._mail_trim_state["failures"] == 0
+
+
+def test_a_judgement_the_gateway_could_not_take_is_offered_again(r: Rig):
+    """A pass holds the mail gateway's lock (503), or the hop is lost: the
+    paid judgement is kept and offered again, with no new turn and no new
+    charge, and taken once the gateway can."""
+    mid = r.mail()
+    G["busy"]["/messages/trim-result"] = 2
+    assert r.trim(mid)[0] == 202
+    r.idle()
+    offers = _sent("/messages/trim-result")
+    assert len(offers) == 3 and offers[0] == offers[1] == offers[2], offers
+    assert offers[0]["keep"] == [[1, 5]]
+    assert len(r.claude.calls) == 1
+    assert _settled(r, mid) == {"state": "model", "text": "\n".join(AUTHOR_LINES)}
+    with r.wg._mail_trim_cond:
+        assert r.wg._mail_trim_spent("2026-11-24") == 1
+    assert r.wg._mail_trim_state["failures"] == 0
+    # Refused as stale meanwhile (the mail changed, or was settled): let go.
+    r.reset()
+    mid = r.mail()
+    G["busy"]["/messages/trim-result"] = 1
+
+    def changed(prompt):
+        G["sources"][mid]["lines"] = G["sources"][mid]["lines"] + ["(read again)"]
+        return '{"keep": [[1, 5]]}'
+    r.claude.mode = ("answer", changed)
+    assert r.trim(mid)[0] == 202
+    r.idle()
+    assert len(_sent("/messages/trim-result")) == 2 and len(r.claude.calls) == 1
+    assert mail._one(r.record(mid), "trim") == "wanting"
+    assert not r.wg._mail_trim_held
+
+
+def _ask_when_due(r: Rig, mid, retry: float) -> None:
+    """Wait out the wait the page was told, then ask: queued."""
+    time.sleep(retry)
+    status, body = r.trim(mid)
+    assert status == 202, (status, body)
+    r.idle()
+
+
+def test_a_mail_cannot_keep_itself_wanting(r: Rig):
+    """A mail that steers every turn into no judgement (a turn run out of
+    time) gets MAIL_MODEL_TRIM_ATTEMPTS of them, each wait longer than the
+    last, and is then settled as the rules trimmed it — a judgement made by
+    the web gateway, without a fourth turn."""
+    r.wg.MAIL_MODEL_TRIM_RETRY_SECONDS = 0.3
+    r.claude.mode = ("timeout", None)
+    mid = r.mail()
+    assert r.trim(mid)[0] == 202
+    r.idle()
+    # 1st: the wait is MAIL_MODEL_TRIM_RETRY_SECONDS.
+    status, body = r.trim(mid)
+    assert (status, body["state"]) == (200, "wanting"), body
+    _ask_when_due(r, mid, 0.35)
+    assert len(r.claude.calls) == 2
+    # 2nd: four times as long — still waiting after the first wait.
+    time.sleep(0.35)
+    assert r.trim(mid)[1]["state"] == "wanting"
+    with r.wg._mail_trim_cond:
+        assert r.wg._mail_trim_attempts_of((CHAT, mid))[0] == 2
+    assert not _sent("/messages/trim-result")
+    _ask_when_due(r, mid, 0.9)
+    # 3rd: the last; the mail is settled, its text as it was.
+    assert len(r.claude.calls) == 3
+    [sent] = _sent("/messages/trim-result")
+    assert sent["failed"] == "gave_up" and "keep" not in sent, sent
+    assert mail._one(r.record(mid), "trim") == "deterministic"
+    assert _settled(r, mid)["state"] == "deterministic"
+    assert len(r.claude.calls) == 3
+    # Settled: nothing more is remembered about it.
+    stored = json.loads(r.wg.MAIL_MODEL_TRIM_STATE_FILE.read_text())
+    assert stored["mails"] == {}, stored
+
+
+def test_the_attempts_are_durable(r: Rig):
+    """A restart does not hand a mail its attempts again: the count is in the
+    state file, and a mail whose turns are used up is settled without a turn
+    by a process that only reads it there — neither the pause nor the
+    day's budget holds that back, since it spends nothing."""
+    r.claude.mode = ("timeout", None)
+    mid = r.mail()
+    assert r.trim(mid)[0] == 202
+    r.idle()
+    stored = json.loads(r.wg.MAIL_MODEL_TRIM_STATE_FILE.read_text())
+    [(name, entry)] = stored["mails"].items()
+    assert json.loads(name) == [CHAT, mid] and entry["n"] == 1, stored
+    # A second process over the same file knows it, and the wait.
+    wg2 = mail._load_gateway(r.tmp / "wg", r.sparql.server_address[1])
+    with wg2._mail_trim_cond:
+        assert wg2._mail_trim_attempts_of((CHAT, mid))[0] == 1
+    status, body = wg2._mail_trim_admit((CHAT, mid), {"key": (CHAT, mid)})
+    assert status == 200 and 3500 <= body["retry_after"] <= 3600, body
+    # A file lost under this process does not hand them out again either.
+    r.wg.MAIL_MODEL_TRIM_STATE_FILE.unlink()
+    with r.wg._mail_trim_cond:
+        assert r.wg._mail_trim_attempts_of((CHAT, mid))[0] == 1
+    # As a process that starts over a file whose mail used up its turns.
+    r.reset()
+    mid = r.mail()
+    r.wg.MAIL_MODEL_TRIM_STATE_FILE.write_text(json.dumps({
+        "day": "2026-11-24", "count": 0,
+        "mails": {json.dumps([CHAT, mid]): {"n": 3, "at": time.time()}}}), encoding="utf-8")
+    r.wg.MAIL_MODEL_TRIM_DAILY_MAX = 0
+    r.wg._mail_trim_state["paused_until"] = time.monotonic() + 600
+    assert r.trim(mid)[0] == 202
+    r.idle()
+    assert not r.claude.calls
+    [sent] = _sent("/messages/trim-result")
+    assert sent["failed"] == "gave_up", sent
+    assert mail._one(r.record(mid), "trim") == "deterministic"
+
+
+def test_a_model_that_could_not_start_costs_the_mail_no_attempt(r: Rig):
+    r.claude.mode = ("oserror", None)
+    r.wg.MAIL_MODEL_TRIM_RETRY_SECONDS = 0.05
+    mid = r.mail()
+    for _ in range(4):
+        with r.wg._mail_trim_cond:
+            r.wg._mail_trim_backoff.clear()
+            r.wg._mail_trim_state["paused_until"] = 0.0
+        assert r.trim(mid)[0] == 202
+        r.idle()
+    assert len(r.claude.calls) == 4 and not _sent("/messages/trim-result")
+    assert mail._one(r.record(mid), "trim") == "wanting"
+    with r.wg._mail_trim_cond:
+        assert r.wg._mail_trim_attempts_of((CHAT, mid))[0] == 0
+
+
+def test_the_state_file_is_bounded(r: Rig):
+    r.wg._MAIL_TRIM_STATE_MAX_MAILS = 3
+    r.claude.mode = ("timeout", None)
+    mids = [r.mail() for _ in range(5)]
+    for mid in mids:
+        with r.wg._mail_trim_cond:
+            r.wg._mail_trim_state["paused_until"] = 0.0
+        assert r.trim(mid)[0] == 202
+        r.idle()
+    stored = json.loads(r.wg.MAIL_MODEL_TRIM_STATE_FILE.read_text())
+    assert [json.loads(n)[1] for n in stored["mails"]] == mids[2:], stored
+    assert len(r.wg._mail_trim_attempts) == 3
 
 
 def test_three_failures_in_a_row_pause_the_feature(r: Rig):
@@ -515,7 +786,7 @@ def test_a_source_already_settled_spends_no_turn(r: Rig):
     assert not r.claude.calls and not _sent("/messages/trim-result")
     body = _settled(r, mid)
     assert body["state"] == "deterministic", body
-    assert not r.wg.MAIL_MODEL_TRIM_BUDGET_FILE.exists()
+    assert not r.wg.MAIL_MODEL_TRIM_STATE_FILE.exists()
 
 
 def test_a_mail_too_long_for_the_prompt_is_settled_without_a_turn(r: Rig):
@@ -547,8 +818,9 @@ def test_the_budget_a_restart_and_a_new_day(r: Rig):
         assert r.trim(mid)[0] == 202
         r.idle()
     assert len(r.claude.calls) == 2
-    stored = json.loads(r.wg.MAIL_MODEL_TRIM_BUDGET_FILE.read_text())
-    assert stored == {"day": "2026-11-24", "count": 2}, stored
+    stored = json.loads(r.wg.MAIL_MODEL_TRIM_STATE_FILE.read_text())
+    # Both were judged: no mail is left with attempts on record.
+    assert stored == {"day": "2026-11-24", "count": 2, "mails": {}}, stored
     status, body = r.trim(mids[2])
     assert status == 200 and body["state"] == "wanting", body
     # Until the local midnight: three hours from the clock's 21:00.
@@ -561,12 +833,15 @@ def test_the_budget_a_restart_and_a_new_day(r: Rig):
     finally:
         os.environ.pop("MAIL_MODEL_TRIM_DAILY_MAX", None)
     wg2.ATTENTION_CLOCK = lambda: NOON
-    assert wg2.MAIL_MODEL_TRIM_BUDGET_FILE == r.wg.MAIL_MODEL_TRIM_BUDGET_FILE
+    assert wg2.MAIL_MODEL_TRIM_STATE_FILE == r.wg.MAIL_MODEL_TRIM_STATE_FILE
     status, body = wg2._mail_trim_admit((CHAT, mids[2]), {"key": (CHAT, mids[2])})
     assert status == 200 and body["state"] == "wanting", body
     assert not wg2._mail_trim_queue and wg2._mail_trim_state["thread"] is None
-    # A file lost under a running process does not hand out the day again.
-    r.wg.MAIL_MODEL_TRIM_BUDGET_FILE.unlink()
+    # A file lost, or one that will not read, under a running process does
+    # not hand out the day again.
+    r.wg.MAIL_MODEL_TRIM_STATE_FILE.unlink()
+    assert r.trim(mids[2])[1]["state"] == "wanting"
+    r.wg.MAIL_MODEL_TRIM_STATE_FILE.write_text("{not json", encoding="utf-8")
     assert r.trim(mids[2])[1]["state"] == "wanting"
 
     # The next local day starts afresh.
@@ -574,8 +849,39 @@ def test_the_budget_a_restart_and_a_new_day(r: Rig):
     assert r.trim(mids[2])[0] == 202
     r.idle()
     assert len(r.claude.calls) == 3
-    assert json.loads(r.wg.MAIL_MODEL_TRIM_BUDGET_FILE.read_text()) == {
-        "day": "2026-11-25", "count": 1}
+    assert json.loads(r.wg.MAIL_MODEL_TRIM_STATE_FILE.read_text()) == {
+        "day": "2026-11-25", "count": 1, "mails": {}}
+
+
+def test_the_budget_file_of_before_is_read(r: Rig):
+    """Before the state file is first written, the day's count is the one
+    the budget-only file it replaced kept: an upgrade does not hand out a
+    day's budget a second time."""
+    r.wg.MAIL_MODEL_TRIM_DAILY_MAX = 2
+    r.wg._MAIL_TRIM_LEGACY_BUDGET_FILE.write_text(
+        json.dumps({"day": "2026-11-24", "count": 2}), encoding="utf-8")
+    mid = r.mail()
+    status, body = r.trim(mid)
+    assert status == 200 and body == {"state": "wanting", "retry_after": 3 * 3600}, body
+    assert not r.claude.calls
+
+
+def test_a_turn_that_never_reached_the_model_is_not_charged(r: Rig):
+    """An expired sign-in fails every spawn at once: those spawns spend none
+    of the day's budget, so signing in again finds the day's turns there."""
+    r.wg.MAIL_MODEL_TRIM_DAILY_MAX = 2
+    r.claude.mode = ("exit", 1)
+    mids = [r.mail() for _ in range(3)]
+    for mid in mids[:2]:
+        assert r.trim(mid)[0] == 202
+        r.idle()
+    assert len(r.claude.calls) == 2
+    with r.wg._mail_trim_cond:
+        assert r.wg._mail_trim_spent("2026-11-24") == 0
+    r.claude.mode = ("answer", '{"keep": [[1, 5]]}')
+    assert r.trim(mids[2])[0] == 202
+    r.idle()
+    assert mail._one(r.record(mids[2]), "trim") == "model"
 
 
 def test_what_is_queued_is_spoken_for(r: Rig):
@@ -585,9 +891,11 @@ def test_what_is_queued_is_spoken_for(r: Rig):
     assert r.trim(mids[0])[0] == 202
     assert r.claude.entered.wait(5)
     assert r.trim(mids[1])[0] == 202
-    # One running and counted, one queued: the day's two are spoken for.
+    # One running and counted, one queued: the day's two are spoken for —
+    # not spent: a queued mail may need no turn and give its place back, so
+    # the page is told to ask again soon, not at midnight.
     status, body = r.trim(mids[2])
-    assert status == 200 and body["state"] == "wanting", body
+    assert status == 200 and body == {"state": "wanting", "retry_after": 120}, body
     r.claude.gate.set()
     r.idle()
     assert len(r.claude.calls) == 2
@@ -660,7 +968,7 @@ def test_the_spawn_is_tool_less_and_sessionless(r: Rig):
     assert "EMAIL_PASS" not in call["env"] and "MAIL_GATEWAY_TOKEN" not in call["env"]
     assert call["env"]["PATH"]
     # The budget counted it before it ran.
-    assert json.loads(r.wg.MAIL_MODEL_TRIM_BUDGET_FILE.read_text())["count"] == 1
+    assert json.loads(r.wg.MAIL_MODEL_TRIM_STATE_FILE.read_text())["count"] == 1
 
 
 def test_the_model_falls_back_to_the_router_tier():
