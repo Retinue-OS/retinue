@@ -371,7 +371,7 @@ channels:
 |---|---|
 | `kb:subject` | the mail's own subject, decoded |
 | `kb:senderName` | the display name on `From` |
-| `kb:gateSender` | inbound: the address the gate takes the mail to be from (*The gate*, "Who the sender is") — absent when it has none |
+| `kb:gateSender` | inbound: the address the gate takes the mail to be from (*The gate*, "Who the sender is") — absent when it has none, a header block cut at its bound included |
 | `kb:recipient` (multi) | `To` addresses |
 | `kb:cc` (multi) | `Cc` addresses |
 | `kb:inReplyTo` | the parent's id |
@@ -840,10 +840,17 @@ at a mail with exactly one `From` header holding exactly one address. So that
 is the only form the gate takes a sender from: the **gate sender**
 (`kb:gateSender`, `gate_sender` on the rail) is that one address, as the
 gateway's own address grammar reads it, lowercased by its ASCII letters alone
-and refused outright where a character of it folds into ASCII on some reading
-(a Kelvin sign, a fullwidth letter). A mail with no `From`, an empty one, a
-group, two addresses, two `From` headers, or an address the grammar rejects
-has **no gate sender**: it reaches its chat, buys no turn, rings as
+and refused outright where a character of it stands in for an ASCII one on its
+own — its compatibility form is ASCII, or its lowercase or case fold is one
+ASCII character (a Kelvin sign, a long s, a fullwidth letter, a ligature of
+ASCII letters). A letter whose case mapping merely holds ASCII letters beside
+others, or several of them (`ß`, a dotless `ı`, a dotted `İ`), is a letter of
+an internationalised address like any other, and stays. A mail with no
+`From`, an empty one, a group, two addresses, two `From` headers, or an
+address the grammar rejects has **no gate sender** — and so has a mail whose
+header block was cut at its bound (256 KiB) or fetched short of its end
+(`MAIL_MAX_MAIL_BYTES`), since a second `From` past the cut is never seen and
+"exactly one" cannot be told: it reaches its chat, buys no turn, rings as
 nobody's, and links the thread to no contact card by the address it is shown
 as from (`peer_vouched` false on the chat's state, until a mail the gate takes
 for that address arrives). The `Sender` header never stands in for it — it is only what the
@@ -956,15 +963,24 @@ listed under Unread and judged by nobody.
   user's own mail), so the web gateway hears things in the order they
   happened — a reply from a mail client reads the chat up to it, and must not
   be heard before the mail it answers. While the web gateway does not answer
-  at all — the connection refused, a 401/403/404, or no answer to an offer
+  at all — the connection refused, a 401/403/404, or no answer to an event
   and none either to a GET that takes nothing — everything waits behind that
   point, and tries back off (30 seconds, doubling to 15 minutes). **One mail
-  never holds back another**: an answer that is about one mail — a 408, 429
-  or 5xx for it, or no answer for it while the rail answers otherwise — backs
-  off that mail alone, which leaves the outbox and waits its own time as a
-  mail not taken does.
+  never holds back another**, for every rail event — an offer, the user's own
+  mail, a held or backfilled mail, a mail that came back: an answer that is
+  about one event — a 408, 429 or 5xx for it, or no answer for it while the
+  rail answers otherwise — backs off that event alone. It keeps its place in
+  the outbox and waits its own time (one minute, doubling to an hour), and
+  only its own chat's later events wait behind it — so the order within a
+  chat holds — while every other chat's go on. A merge or removal an older
+  web gateway does not know yet waits without holding anything back. **A pass
+  is bounded**: a call that gets no answer in time costs `MAIL_RAIL_TIMEOUT`,
+  and after three of them in a row the rail counts as not answering for the
+  rest of the pass and its backoff, so a web gateway that is up and too slow
+  for every event costs a pass three timeouts, not one per owed mail.
 - **Offered again.** A mail that was answered for and not taken leaves the
-  outbox and is offered again on later polls: after one minute, then twice as
+  outbox (its first offer has been made) and is offered again on later polls:
+  after one minute, then twice as
   long each time up to an hour, at most 20 offers a poll, the oldest first,
   and never while the job of a turn working it is still awaited — such a mail
   is passed over and takes none of the 20. **The ledger's `delivered` flag is
@@ -1008,7 +1024,13 @@ listed under Unread and judged by nobody.
   read where the new one is not set (an empty value included), and the start
   says so.
 - **`/health`** counts what waits (`waiting`), and says so in `error` while
-  the web gateway has not answered three times running and mail waits.
+  the web gateway has not answered three times running and mail waits — and
+  while it answers and takes no mail: when every offer and event of a pass
+  (three at least) was answered with a failure, or with none, the notice says
+  "the chats rail answers but takes no mail" until a mail is taken. One mail
+  failing alone says nothing of the rail. When a mail is taken again, what
+  waited over the fault — each wait grown up to an hour meanwhile — is
+  offered and told again at once.
 
 ### What retires
 

@@ -422,10 +422,13 @@ arrives in INBOX:
    `gate_sender` on the rail): the one address of a mail with exactly one
    `From` header holding exactly one address — the only form the provider's
    DMARC check of the `From` domain is sure to have looked at — lowercased by
-   its ASCII letters, and none where a character of it folds into ASCII. A
-   mail with none (no `From`, a group, two addresses, two `From` headers) is
-   from nobody: it reaches its chat and buys no turn. The `Sender` header is
-   for display only (`docs/mail-chats.md`, "Who the sender is").
+   its ASCII letters, and none where a character of it stands in for an
+   ASCII one on its own (a Kelvin sign, a long s, a fullwidth letter; `ß`,
+   `ı` and `İ` are letters like any other). A mail with none (no `From`, a
+   group, two addresses, two `From` headers, a header block cut at its
+   256 KiB bound or fetched short of its end) is from nobody: it reaches its
+   chat and buys no turn. The `Sender` header is for display only
+   (`docs/mail-chats.md`, "Who the sender is").
 3. **Offer the chats rail** the mail, with the verdict (`gate: {forward, vip,
    instructed, reason}`) and `handover: true`. The web gateway decides what the
    arrival does: **a mail pushes nothing by default; a contact can say
@@ -458,9 +461,14 @@ poll, the oldest first — a mail whose turn is still at work is passed over
 and takes none of them. While the web gateway does not answer at all (the
 connection refused, a `401`/`403`/`404`, or no answer and none to a `GET`
 either) nothing is tried for 30 seconds, doubling up to 15 minutes. An answer
-about **one** mail — a `408`, `429` or `5xx` for it, or no answer for it while
-the rail answers otherwise — backs off that mail alone: one mail never holds
-back another. A record that cannot be read at that moment is offered again
+about **one** event — a `408`, `429` or `5xx` for it, or no answer for it while
+the rail answers otherwise — backs off that event alone, offer or not (the
+user's own mail, a held or backfilled one): it keeps its place, only its own
+chat's later events wait behind it, and every other chat's go on — one mail
+never holds back another. Three calls in a row with no answer in time end the
+pass as a rail that does not answer would, so a web gateway too slow for every
+event costs a pass three `MAIL_RAIL_TIMEOUT`s. A record that cannot be read at
+that moment is offered again
 later, and a mailbox that does not answer holds back only new mail: what has
 arrived is offered all the same. The web gateway takes a repeated offer once,
 by its message id. Mail from a sender who is neither VIP nor instructed is
@@ -507,7 +515,10 @@ mirrored mails the chats rail has not taken yet, since when the oldest of them
 has been in the mailbox, and how many news mails wait for the feed or for
 their move. While the web gateway has not answered three times running and
 mail waits, `error` carries a notice saying so (the gateway stays
-`connected`: the mailbox is fine).
+`connected`: the mailbox is fine) — and while it answers and takes no mail:
+once every offer and event of a pass (three at least) failed there, the notice
+says "the chats rail answers but takes no mail" until a mail is taken, and
+what waited over it is then offered again at once.
 
 ### Sending
 

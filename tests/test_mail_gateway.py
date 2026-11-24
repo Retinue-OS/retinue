@@ -92,20 +92,19 @@ def rail(gw, outcome="ok", answer=None, alive=False):
     arrived, with its handover) as ``"inbound"``, like every mail.
 
     ``outcome`` is how the web gateway takes each event ("ok", "drop",
-    "later", "down", and for an offer "uncertain" and "unanswered"), or a
-    function of ``(kind, payload)`` saying so. ``answer`` is what it answers
-    an offer it took: by default ``{"accepted": True}`` — the chat has the
-    mail — else a dict, or a function of the payload returning one.
-    ``alive`` is what a look at the rail after an "uncertain" offer finds
-    (``_rail_alive``): by default that it is away, as "uncertain" was ever
-    tested; a bool, or a function of nothing."""
+    "later", "down", "uncertain" and "unanswered"), or a function of
+    ``(kind, payload)`` saying so. ``answer`` is what it answers an offer it
+    took: by default ``{"accepted": True}`` — the chat has the mail — else a
+    dict, or a function of the payload returning one. ``alive`` is what a
+    look at the rail after an "uncertain" event finds (``_rail_alive``): by
+    default that it is away, as "uncertain" was ever tested; a bool, or a
+    function of nothing."""
     events = []
     gw._rail_alive = alive if callable(alive) else (lambda: bool(alive))
 
     def send(kind, payload):
         events.append((kind, payload))
-        said = outcome(kind, payload) if callable(outcome) else outcome
-        return "down" if said == "uncertain" else said
+        return outcome(kind, payload) if callable(outcome) else outcome
 
     def offer(payload):
         events.append(("inbound", payload))
@@ -2353,7 +2352,8 @@ def test_rail_posts_and_their_outcomes():
             assert _RailStub.bearer == [f"Bearer {TOKEN}"] * 3
             assert _RailStub.seen[0][2] == {"chat": "a"}
             for status, kind, outcome in ((400, "inbound", "drop"), (413, "inbound", "drop"),
-                                          (500, "inbound", "down"), (404, "inbound", "down"),
+                                          (500, "inbound", "unanswered"),
+                                          (404, "inbound", "down"),
                                           (404, "merge", "later"), (503, "removed", "later"),
                                           (401, "inbound", "down"), (403, "merge", "down")):
                 _RailStub.status = status

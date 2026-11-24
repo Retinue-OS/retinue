@@ -1195,10 +1195,13 @@ class _Rail(BaseHTTPRequestHandler):
             # no answer at all.
             self.close_connection = True
             return
-        self.send_response(type(self).status)
-        self.send_header("Content-Length", str(len(type(self).body)))
-        self.end_headers()
-        self.wfile.write(type(self).body)
+        try:
+            self.send_response(type(self).status)
+            self.send_header("Content-Length", str(len(type(self).body)))
+            self.end_headers()
+            self.wfile.write(type(self).body)
+        except OSError:
+            pass   # the gateway stopped waiting for this answer
 
     def do_GET(self):
         type(self).seen.append((self.path, None))
@@ -1239,14 +1242,15 @@ def test_an_offer_on_the_wire_and_what_each_answer_reads_as():
             # No answer in time: whether it landed is not known.
             _Rail.status, _Rail.body, _Rail.delay = 200, b'{"accepted": true}', 0.6
             assert gw._rail_post("inbound", {}, 0.2) == ("uncertain", {})
-            # An event that is only told reads that as "not answering".
+            # An event that is only told reads it the same: the mirror asks
+            # whether the rail is up (Mirror._rail_heard).
             gw.MAIL_RAIL_TIMEOUT = 0.2
-            assert gw._rail_send("merge", {}) == "down"
+            assert gw._rail_send("merge", {}) == "uncertain"
             # A connection closed with no answer: as unknown as a timeout —
             # and the rail, asked something that takes nothing, answers.
             _Rail.status, _Rail.delay = 0, 0.0
             assert gw._rail_post("inbound", {}, 2.0) == ("uncertain", {})
-            assert gw._rail_send("inbound", {}) == "down"
+            assert gw._rail_send("inbound", {}) == "uncertain"
             assert gw._rail_alive() is True
             assert _Rail.seen[-1] == ("/internal/chats/inbound", None)
         finally:
@@ -1420,6 +1424,76 @@ def test_the_gate_sender_is_the_one_address_of_the_one_from():
           "header, the first of several, or a lookalike")
 
 
+def test_a_cut_header_block_names_nobody():
+    with tempfile.TemporaryDirectory() as tmp:
+        gw = t.load(tmp, MAIL_MAX_MAIL_BYTES=str(64 * 1024))
+        senders(gw, vip={"boss@corp.example"})
+        events = t.rail(gw)
+
+        def padded(lines, mid, second=True):
+            pad = "".join(f"X-Pad-{n:06d}: {'a' * 60}\r\n" for n in range(lines))
+            return raw("From: boss@corp.example\r\n" + pad
+                       + ("From: Mallory <mallory@evil.example>\r\n" if second else ""), mid)
+        # The second From lies past MAX_HEADER_BYTES: the parser never sees
+        # it, so "exactly one From" cannot be told — and the mail is from
+        # nobody, whichever From it carries second, or none.
+        beyond = padded(3700, "cut@x.org")
+        assert beyond.index(b"From: Mallory") > gw.MAX_HEADER_BYTES
+        assert len(t.email.message_from_bytes(beyond).get_all("From")) == 2
+        for mail in (beyond, padded(3700, "cut1@x.org", second=False)):
+            assert gw.parse_mail(mail).gate_sender == ""
+            assert gw.stub_mail(mail, None, "test").gate_sender == ""
+            # What the chat shows still comes from the first From.
+            assert gw.parse_mail(mail).sender == "boss@corp.example"
+        # A whole header block of the same mail's kind is gated as ever.
+        assert gw.parse_mail(padded(100, "whole@x.org", second=False)).gate_sender \
+            == "boss@corp.example"
+        # Mirrored, and fetched only up to MAIL_MAX_MAIL_BYTES: a header
+        # block that goes on past what was fetched names nobody either.
+        mirror, box, _clock = begin(gw)
+        box.put("INBOX", beyond)
+        box.put("INBOX", padded(1500, "fetched@x.org"))
+        box.put("INBOX", padded(100, "small@x.org", second=False))
+        mirror.poll()
+        got = {p["message_id"]: p for _k, p in events}
+        for mid in ("cut@x.org", "fetched@x.org"):
+            assert got[mid]["gate_sender"] == "" and got[mid]["gate"] == OPEN, got[mid]["gate"]
+        assert got["small@x.org"]["gate"]["vip"] is True
+    print("ok: a mail whose header block was cut at its bound, or fetched short of its "
+          "end, has no gate sender")
+
+
+def test_an_internationalised_address_is_a_gate_sender():
+    with tempfile.TemporaryDirectory() as tmp:
+        gw = t.load(tmp)
+        cases = {
+            # Letters of their own: a case mapping that holds ASCII letters
+            # beside others, or several of them, is no lookalike.
+            "From: Boss <info@straße.example>\r\n": "info@straße.example",
+            "From: Boss <bılal@corp.example>\r\n": "bılal@corp.example",
+            "From: Boss <info@İstanbul.example>\r\n": "info@İstanbul.example",
+            "From: Boss <boss@münchen.example>\r\n": "boss@münchen.example",
+            # A character that turns into ASCII on its own names nobody.
+            "From: boss@cor\u212a.example\r\n": "",         # KELVIN SIGN: "k"
+            "From: boss@corp．example\r\n": "",             # FULLWIDTH FULL STOP: "."
+            "From: boſs@corp.example\r\n": "",              # LONG S: "s"
+            "From: ｂoss@corp.example\r\n": "",              # FULLWIDTH b
+            "From: oﬃce@corp.example\r\n": "",              # the ligature "ffi"
+        }
+        for headers, expected in cases.items():
+            assert gw.parse_mail(raw(headers)).gate_sender == expected, \
+                (headers, gw.parse_mail(raw(headers)).gate_sender)
+        senders(gw, vip={"info@straße.example"})
+        events = t.rail(gw)
+        mirror, box, _clock = begin(gw)
+        box.put("INBOX", raw("From: Boss <info@straße.example>\r\n", "sz@x.org"))
+        mirror.poll()
+        assert events[-1][1]["gate_sender"] == "info@straße.example"
+        assert events[-1][1]["gate"]["vip"] is True
+    print("ok: an address with ß, ı or İ is a gate sender; one with a character that "
+          "stands in for ASCII is not")
+
+
 def test_news_is_linked_by_archived_at_alone():
     with tempfile.TemporaryDirectory() as tmp:
         gw = t.load(tmp)
@@ -1558,12 +1632,19 @@ def test_one_mail_the_rail_fails_on_holds_back_no_other():
                 (failing, offered(events))
             records = t.by_id(gw)
             assert all(records[f"vip{n}@x.org"]["delivered"] for n in range(3))
-            # The one it fails on waits its own, growing, time — and keeps
-            # its place in nothing.
+            # The one it fails on waits its own, growing, time — in its
+            # place in the outbox, where only its own chat's later events
+            # would wait for it.
             assert records["poison@x.org"]["delivered"] is False
-            assert offers(mirror)["poison@x.org"]["attempts"] == 1
-            assert mirror.index.one("SELECT COUNT(*) AS n FROM outbox")["n"] == 0
+            marker = mirror.index.one("SELECT kind, attempts, due FROM outbox")
+            assert (marker["kind"], marker["attempts"]) == ("offer", 1), dict(marker)
+            assert marker["due"] == NOW + gw.RETRY_SECONDS, (marker["due"], NOW)
+            assert mirror.index.one("SELECT COUNT(*) AS n FROM outbox")["n"] == 1
             assert mirror.waiting()["rail"] == 1 and mirror._rail_down == 0
+            clock[0] = NOW + gw.RETRY_SECONDS
+            mirror.poll()
+            assert offered(events)[-1] == "poison@x.org", failing
+            assert mirror.index.one("SELECT attempts FROM outbox")["attempts"] == 2
     with tempfile.TemporaryDirectory() as tmp:
         # A rail that answers nothing at all is down: the order holds, and
         # nothing behind the mail goes.
@@ -1577,6 +1658,155 @@ def test_one_mail_the_rail_fails_on_holds_back_no_other():
         assert mirror.index.one("SELECT COUNT(*) AS n FROM outbox")["n"] == 2
     print("ok: one mail the rail fails on waits its own time; only a rail that answers "
           "nothing holds every mail back")
+
+
+def test_one_event_the_rail_fails_on_holds_back_only_its_chat():
+    for failing in ("unanswered", "uncertain"):
+        with tempfile.TemporaryDirectory() as tmp:
+            gw = t.load(tmp)
+            senders(gw, vip={"boss@corp.example"})
+            state = {"heal": False}
+            # The web gateway fails on the user's own mail (a 5xx from its
+            # handler; a handler that hung on it) and takes every other.
+            events = t.rail(gw, lambda kind, payload: "ok" if state["heal"] or payload.get(
+                "message_id") != "s@example.org" else failing, alive=True)
+            mirror, box, clock = begin(gw)
+            box.put("Sent", msg("s@example.org", sender=ME, to="ann@x.org", subject="Plans",
+                                day=38))
+            mirror.poll()
+            # The correspondent answers it; a VIP writes in a thread of its own.
+            clock[0] += 1
+            box.put("INBOX", msg("b@x.org", subject="Re: Plans", refs=["s@example.org"],
+                                 irt="s@example.org", day=39))
+            box.put("INBOX", msg("v@x.org", sender="boss@corp.example", subject="Urgent",
+                                 day=39))
+            mirror.poll()
+            records = t.by_id(gw)
+            assert records["b@x.org"]["chat"] == records["s@example.org"]["chat"]
+            # The VIP's mail is not held back by another chat's event ...
+            assert offered(events) == ["v@x.org"], (failing, offered(events))
+            assert records["v@x.org"]["delivered"] is True
+            # ... and the reply waits behind the mail it answers.
+            assert records["b@x.org"]["delivered"] is False
+            told = mirror.index.one("SELECT attempts, due FROM outbox WHERE kind = 'inbound'")
+            assert told["attempts"] == 1 and told["due"] == NOW + gw.RETRY_SECONDS, dict(told)
+            assert mirror._rail_down == 0 and mirror.health_notice() is None, failing
+            # Not tried again before its own wait is over; then in order.
+            mirror.poll()
+            assert [p["message_id"] for _k, p in events].count("s@example.org") == 1
+            state["heal"] = True
+            events.clear()
+            clock[0] = NOW + gw.RETRY_SECONDS
+            mirror.poll()
+            assert [(p["message_id"], p["direction"]) for _k, p in events] == [
+                ("s@example.org", "out"), ("b@x.org", "in")], (failing, events)
+            assert t.by_id(gw)["b@x.org"]["delivered"] is True
+            assert mirror.index.one("SELECT COUNT(*) AS n FROM outbox")["n"] == 0
+    with tempfile.TemporaryDirectory() as tmp:
+        # An index written before an event could wait its own time gains the
+        # clock, with what it queued due at once.
+        gw = t.load(tmp)
+        path = Path(tmp) / "older.sqlite"
+        older = gw._INDEX_SCHEMA.replace(
+            ",\n    attempts INTEGER NOT NULL DEFAULT 0, due REAL NOT NULL DEFAULT 0\n);",
+            "\n);", 1)
+        assert older != gw._INDEX_SCHEMA
+        conn = gw.sqlite3.connect(str(path))
+        conn.executescript(older)
+        conn.execute("PRAGMA user_version = 1")
+        conn.execute("INSERT INTO outbox (kind, payload) VALUES ('inbound', '{}')")
+        conn.commit()
+        conn.close()
+        index = gw.MailboxIndex(path)
+        assert [dict(r) for r in index.rows("SELECT attempts, due FROM outbox")] == [
+            {"attempts": 0, "due": 0.0}]
+        index.close()
+    print("ok: a told event the rail fails on waits its own time, and holds back only its "
+          "own chat's later events")
+
+
+def test_a_rail_that_takes_no_mail_says_so_and_is_bounded():
+    with tempfile.TemporaryDirectory() as tmp:
+        # The web gateway answers, and fails on every mail (a broken chat
+        # store; a proxy in front of a stopped backend).
+        gw = t.load(tmp)
+        senders(gw, vip={"boss@corp.example"})
+        state = {"answer": "unanswered"}
+        events = t.rail(gw, lambda kind, payload: state["answer"])
+        mirror, box, clock = begin(gw)
+        gw.MIRROR = mirror
+        for n in range(5):
+            box.put("INBOX", msg(f"vip{n}@x.org", sender="boss@corp.example",
+                                 subject=f"Urgent {n}", day=31 + n))
+        mirror.poll()
+        assert len(offered(events)) == 5 and mirror._rail_down == 0
+        notice = mirror.health_notice()
+        assert notice and "answers but takes no mail" in notice and "5 mail(s)" in notice, notice
+        assert gw._health_snapshot()["waiting"]["rail"] == 5
+        for _ in range(12):
+            clock[0] += 3600
+            mirror.poll()
+        assert "answers but takes no mail" in mirror.health_notice()
+        # The fault is fixed: what waited over it — each wait grown to an
+        # hour by now — is offered at once, in the pass that sees a mail taken.
+        state["answer"] = "ok"
+        clock[0] += gw.RETRY_MAX_SECONDS
+        events.clear()
+        mirror.poll()
+        assert sorted(offered(events)) == [f"vip{n}@x.org" for n in range(5)], offered(events)
+        assert all(r["delivered"] for r in t.records(gw))
+        assert mirror.health_notice() is None
+    with tempfile.TemporaryDirectory() as tmp:
+        # One mail failing, alone, says nothing of the rail.
+        gw = t.load(tmp)
+        events = t.rail(gw, lambda kind, payload: "unanswered" if payload.get(
+            "message_id") == "poison@x.org" else "ok")
+        mirror, box, clock = begin(gw)
+        box.put("INBOX", msg("poison@x.org", day=30))
+        for _ in range(5):
+            clock[0] += gw.RETRY_MAX_SECONDS
+            mirror.poll()
+        assert mirror.health_notice() is None
+    with tempfile.TemporaryDirectory() as tmp:
+        # Up (it answers a look), and no answer in time for any event: a
+        # pass spends at most RAIL_SILENT_MAX timeouts, and the rail counts
+        # as not answering — /health says so after RAIL_DOWN_NOTICE passes.
+        gw = t.load(tmp)
+        events = t.rail(gw, "uncertain", alive=True)
+        mirror, box, clock = begin(gw)
+        for n in range(12):
+            box.put("INBOX", msg(f"m{n}@x.org", sender=f"p{n}@corp.example",
+                                 subject=f"S{n}", day=39))
+        mirror.poll()
+        assert len(events) == gw.RAIL_SILENT_MAX, len(events)
+        assert mirror._rail_down == 1
+        for _ in range(gw.RAIL_DOWN_NOTICE - 1):
+            clock[0] += gw.RAIL_RETRY_MAX_SECONDS
+            mirror.poll()
+        assert len(events) == gw.RAIL_SILENT_MAX * gw.RAIL_DOWN_NOTICE
+        assert "chats rail is not answering" in mirror.health_notice()
+    with tempfile.TemporaryDirectory() as tmp:
+        # The same on the wire: a web gateway whose GET answers at once and
+        # whose inbound handler outlasts MAIL_RAIL_TIMEOUT for every mail.
+        gw = t.load(tmp, MAIL_RAIL_TIMEOUT="1")
+        mirror, box, clock = begin(gw)
+        for n in range(12):
+            box.put("INBOX", msg(f"m{n}@x.org", sender=f"p{n}@corp.example",
+                                 subject=f"S{n}", day=39))
+        server = _served(gw)
+        _Rail.delay = 1.5
+        try:
+            started = time.monotonic()
+            mirror.poll()
+            took = time.monotonic() - started
+        finally:
+            server.shutdown()
+        posts = [path for path, body in _Rail.seen if body is not None]
+        assert len(posts) == gw.RAIL_SILENT_MAX, _Rail.seen
+        assert took < gw.RAIL_SILENT_MAX * (1 + gw.RAIL_PROBE_TIMEOUT) + 2, took
+        assert mirror._rail_down == 1
+    print("ok: a rail that answers and takes no mail says so on /health, and one too slow "
+          "for every event costs a pass a bounded time")
 
 
 def test_what_has_arrived_is_offered_while_the_mailbox_is_away():

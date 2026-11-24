@@ -142,9 +142,12 @@ nothing new.
   narrow: a mail has a gate sender only when it carries exactly one `From`
   header holding exactly one address the mail gateway's own grammar accepts,
   lowercased by its ASCII letters alone — and none at all where a character
-  of that address folds into ASCII on some reading (a Kelvin sign, a
-  fullwidth letter), so no Unicode folding, on either side, can make it equal
-  to an address the address book holds. The `Sender` header, and the first of
+  of that address stands in for an ASCII one on its own (its compatibility
+  form is ASCII, or its lowercase or case fold is one ASCII character: a
+  Kelvin sign, a long s, a fullwidth letter), so no Unicode folding, on
+  either side, can make it equal to an ASCII address the address book holds;
+  nor where its header block was cut at its bound, since a second `From`
+  past the cut is never seen. The `Sender` header, and the first of
   several `From` addresses, are shown as who a mail is from and decide
   nothing. That address, or a domain a contact files, is what the gate
   matches against the VIP and instructed senders, what the instruction is

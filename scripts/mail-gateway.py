@@ -151,7 +151,9 @@ What it tells the web gateway, over the chats rail: every mail that arrived
 sender's mail its attachments), every old mail and every mail it sent (held,
 no handover — nothing rings and no turn starts), a thread merge, and a
 removal. All of it waits in one queue on the state volume while the web
-gateway is away, and leaves in order; the ledger is the record either way. A
+gateway is away, and leaves in order — an event the web gateway fails on
+waits its own time and holds back only its own chat's later events
+(``Mirror._flush_rail``); the ledger is the record either way. A
 mail is recorded exactly once and the rail is told at least once, wherever
 the process is stopped: an index change and the event that announces it are
 one transaction, and what a stop between the ledger and the index left
@@ -519,8 +521,16 @@ OFFER_BATCH = 20
 # further one, up to the maximum.
 RAIL_RETRY_SECONDS = 30.0
 RAIL_RETRY_MAX_SECONDS = 900.0
-# After this many failures in a row /health says so, while mails wait.
+# After this many failures in a row /health says so, while mails wait; and
+# when every offer and event of a pass — this many at least — was answered
+# with a failure (or with none while the web gateway answers otherwise), it
+# says the rail answers but takes no mail, until one is taken.
 RAIL_DOWN_NOTICE = 3
+# A rail call that gets no answer in time costs MAIL_RAIL_TIMEOUT. After this
+# many in a row the web gateway counts as not answering, for the rest of the
+# pass and its backoff: a rail that is up and too slow for every event does
+# not hold the mirror for a timeout per owed mail.
+RAIL_SILENT_MAX = 3
 
 # ── The news rail ─────────────────────────────────────────────────────────────
 # A mail of a `news` group is filed to the news feed (news_ingest; the
@@ -1176,14 +1186,23 @@ def _parse_bytes(raw: bytes):
     return parser.close()
 
 
-def _head_and_rest(raw: bytes) -> tuple[bytes, bytes]:
-    """A raw mail as ``(header block, everything from the empty line on)``,
-    the header block cut at the last whole line within MAX_HEADER_BYTES."""
+def _split_head(raw: bytes) -> tuple[bytes, bytes, bool]:
+    """A raw mail as ``(header block, everything from the empty line on,
+    cut)``: the header block cut at the last whole line within
+    MAX_HEADER_BYTES, and ``cut`` whether it had to be — whether headers
+    of the mail are left out of what is parsed."""
     end = _HEADER_END_RE.search(raw)
     head, rest = (raw[:end.start()], raw[end.start():]) if end else (raw, b"")
-    if len(head) > MAX_HEADER_BYTES:
+    cut = len(head) > MAX_HEADER_BYTES
+    if cut:
         head = head[:MAX_HEADER_BYTES]
         head = head[:head.rfind(b"\n") + 1].rstrip(b"\r\n")
+    return head, rest, cut
+
+
+def _head_and_rest(raw: bytes) -> tuple[bytes, bytes]:
+    """The same, without saying whether the header block was cut."""
+    head, rest, _cut = _split_head(raw)
     return head, rest
 
 
@@ -1283,13 +1302,23 @@ _ASCII_LOWER = str.maketrans("ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrst
 
 
 def _folds_into_ascii(ch: str) -> bool:
-    """Whether a character that is not ASCII stands for ASCII somewhere: its
-    case mappings or its compatibility form hold an ASCII character (KELVIN
-    SIGN lowercases to "k", a fullwidth letter is one, and so on)."""
+    """Whether a character that is not ASCII stands in for ASCII: it turns
+    into ASCII on its own under a reading another reader may apply — its
+    compatibility form is ASCII (a fullwidth letter, a ligature of ASCII
+    letters), or its lowercase or case fold is one ASCII character (KELVIN
+    SIGN is "k", LONG S is "s").
+
+    Not a letter whose case mapping merely holds ASCII letters beside
+    others, or as several: "ß" folds to "ss", "İ" lowercases to "i" and a
+    combining dot, "ı" folds to itself. Those are letters of their own in
+    an internationalised address, which no reader takes for its ASCII
+    neighbour one character for one."""
     if ch.isascii():
         return False
-    return any(c.isascii() for c in ch.lower() + ch.upper()
-               + unicodedata.normalize("NFKC", ch))
+    compatible = unicodedata.normalize("NFKC", ch)
+    if compatible and compatible.isascii():
+        return True
+    return any(len(mapped) == 1 and mapped.isascii() for mapped in (ch.lower(), ch.casefold()))
 
 
 def _gate_sender(msg) -> str:
@@ -1308,9 +1337,13 @@ def _gate_sender(msg) -> str:
     them: :func:`parse_mail`.)
 
     Lowercased by ASCII letters alone, and refused outright when it holds a
-    character that folds into ASCII on some reading (_folds_into_ascii):
+    character that stands in for ASCII on some reading (_folds_into_ascii):
     a lookalike must not compare equal to the address it imitates in a
-    reader that lowercases or normalises further."""
+    reader that lowercases or normalises further.
+
+    ``msg`` must be the whole header block: of a mail whose block was cut
+    at MAX_HEADER_BYTES the From headers are not all known, and the caller
+    takes it as from nobody (:func:`parse_mail`)."""
     try:
         if msg is None or len(msg.get_all("From") or []) != 1:
             return ""
@@ -1352,16 +1385,18 @@ def parse_mail(raw: bytes, internal_date: float | None = None) -> Mail:
     asks for more than can be parsed raises :class:`UnreadableMail` and is
     the caller's to set aside. Anything else it raises is not yet known to
     be the mail's fault: the mirror reads through :func:`read_mail`."""
-    head, rest = _head_and_rest(raw)
+    head, rest, cut = _split_head(raw)
     msg = _parse_bytes(head + rest)
     mail = Mail(message_id=_identify(msg, head), arrived=internal_date)
     mail.subject = _header_text(msg, "Subject")
     # What the chat shows the mail as from: the From, else the Sender. The
-    # gate goes by _gate_sender alone.
+    # gate goes by _gate_sender alone — and a header block cut at its bound
+    # names nobody: a second From past the cut is not seen, so "exactly one"
+    # cannot be told.
     sender = _addresses(msg, "From") or _addresses(msg, "Sender")
     if sender:
         mail.sender, mail.sender_name = sender[0]
-    mail.gate_sender = _gate_sender(msg)
+    mail.gate_sender = "" if cut else _gate_sender(msg)
     mail.to = _addresses(msg, "To")
     mail.cc = _addresses(msg, "Cc")
     mail.reply_to = _addresses(msg, "Reply-To")
@@ -1396,9 +1431,9 @@ def stub_mail(raw: bytes, internal_date: float | None, reason: str) -> Mail:
     id is the one the whole mail would have had, so the mail is still one
     record however many folders hold it, and is followed like any other."""
     try:
-        head = _head_and_rest(raw)[0]
-    except Exception:  # noqa: BLE001
-        head = bytes(raw[:MAX_HEADER_BYTES])
+        head, _rest, cut = _split_head(raw)
+    except Exception:  # noqa: BLE001 - whether it was cut is not known: it was
+        head, cut = bytes(raw[:MAX_HEADER_BYTES]), True
     try:
         msg = _parse_bytes(head + b"\r\n\r\n")
         mail = Mail(message_id=_identify(msg, head))
@@ -1413,7 +1448,7 @@ def stub_mail(raw: bytes, internal_date: float | None, reason: str) -> Mail:
         found = _addresses(msg, "From") or _addresses(msg, "Sender")
         if found:
             mail.sender = found[0][0]
-        mail.gate_sender = _gate_sender(msg)
+        mail.gate_sender = "" if cut else _gate_sender(msg)
 
     def date():
         mail.date = _read_date(msg, internal_date)
@@ -2275,7 +2310,11 @@ class Mailbox:
 #   outbox     rail events not yet taken by the web gateway, in order. A row
 #              of kind "offer" holds no event: it marks the place in that
 #              order at which a mail that arrived is first offered, and the
-#              event is made of the mail's record when its turn comes.
+#              event is made of the mail's record when its turn comes. A row
+#              the web gateway answered a failure for, or no answer while it
+#              answers otherwise, keeps its place and is tried again once
+#              `due` has passed, `attempts` counting those tries (Mirror.
+#              _flush_rail); meanwhile only its own chat's later rows wait.
 #   offers     the mails the chats rail still owes an answer for: every
 #              inbound record the ledger holds ``delivered: false`` — the
 #              ledger's flag is the queue, and this is its index (rebuilt
@@ -2328,7 +2367,8 @@ CREATE TABLE IF NOT EXISTS aliases (
 ) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS aliases_mid ON aliases (message_id);
 CREATE TABLE IF NOT EXISTS outbox (
-    seq INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL, payload TEXT NOT NULL
+    seq INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL, payload TEXT NOT NULL,
+    attempts INTEGER NOT NULL DEFAULT 0, due REAL NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS offers (
     message_id TEXT PRIMARY KEY, attempts INTEGER NOT NULL DEFAULT 0,
@@ -2365,6 +2405,13 @@ class MailboxIndex:
             if "arrived" not in {row["name"] for row in
                                  self._conn.execute("PRAGMA table_info(mails)")}:
                 self._conn.execute("ALTER TABLE mails ADD COLUMN arrived REAL")
+            # And one made before a rail event could wait its own time gains
+            # its clock, with every event due at once.
+            outbox = {row["name"] for row in self._conn.execute("PRAGMA table_info(outbox)")}
+            if "due" not in outbox:
+                self._conn.execute(
+                    "ALTER TABLE outbox ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0")
+                self._conn.execute("ALTER TABLE outbox ADD COLUMN due REAL NOT NULL DEFAULT 0")
 
     def close(self) -> None:
         with self._lock:
@@ -2487,17 +2534,19 @@ def _rail_post(kind: str, payload: dict, timeout: float) -> tuple:
 
 
 def _rail_send(kind: str, payload: dict) -> str:
-    """Tell the rail one event that needs no answer but "taken": ``"ok"``,
-    ``"drop"`` (dropped: a repeat would be refused again), ``"later"`` or
-    ``"down"`` (see _rail_post)."""
+    """Tell the rail one event that needs no answer but "taken": the outcome
+    as _rail_post gives it — ``"ok"``, ``"drop"`` (dropped: a repeat would
+    be refused again), ``"later"``, ``"down"``, ``"unanswered"`` (a failure
+    the web gateway answered with, for this event) or ``"uncertain"`` (no
+    answer in time; Mirror._rail_heard asks whether the rail is up)."""
     outcome, _answer = _rail_post(kind, payload, MAIL_RAIL_TIMEOUT)
-    return "down" if outcome in ("uncertain", "unanswered") else outcome
+    return outcome
 
 
 def _rail_alive() -> bool:
-    """Whether the web gateway answers at all — asked after an offer it gave
+    """Whether the web gateway answers at all — asked after an event it gave
     no answer for (``"uncertain"``), to tell a rail that is away from one
-    that is up and failed on that one mail. A GET of the rail's URL, which
+    that is up and failed on that one event. A GET of the rail's URL, which
     takes nothing and which any web server answers with something: any HTTP
     answer, a 404 or a 405 included, is a rail that is up."""
     try:
@@ -2652,9 +2701,16 @@ class Mirror:
         self._send_said: dict = {}    # send → why it is not finished, as last logged
         # The rail, as the last calls found it: how many in a row the web
         # gateway did not answer, and until when nothing is offered over
-        # that. In memory only — a restart tries at once.
+        # that; how many calls in a row got no answer in time while it
+        # answered otherwise (RAIL_SILENT_MAX); the calls of the pass under
+        # way and how many of them it failed on; and whether a pass ended
+        # with every one failed, and no mail was taken since — a rail that
+        # answers and takes no mail. In memory only — a restart tries at once.
         self._rail_down = 0
         self._rail_wait_until = 0.0
+        self._rail_silent = 0
+        self._rail_tally = [0, 0]
+        self._rail_refusing = False
         # Message-ID → the thread that waits for the job of the turn working
         # that mail (_await_job). In memory too: after a restart the mail is
         # offered again, and the web gateway hands a repeat its job back.
@@ -3019,6 +3075,14 @@ class Mirror:
                 return (f"the web gateway's chats rail is not answering: {owed} mail(s) are "
                         f"mirrored and wait to be taken by their chats — they are offered "
                         f"again when it answers")
+        if self._rail_refusing:
+            owed = self.waiting()["rail"]
+            told = self.index.one("SELECT COUNT(*) AS n FROM outbox WHERE kind != 'offer' "
+                                  "AND attempts > 0")["n"]
+            return (f"the web gateway's chats rail answers but takes no mail: it failed on "
+                    f"every offer and event of a pass — {owed} mail(s) wait to be taken by "
+                    f"their chats, {told} other event(s) to be heard; each is tried again "
+                    f"on its own clock, and all of them once one is taken")
         if not self.rewritten() or MAIL_CONFIG is None or not MAIL_CONFIG.save_sent:
             return None
         return ("the mail provider files its own copy of every sent mail, under a "
@@ -3116,7 +3180,7 @@ class Mirror:
         ``sync`` looks at the folders (new and vanished mail); a pass without
         it only works on what an earlier look left to do — the loop runs
         those between polls while a backfill is under way."""
-        with self._lock:
+        with self._lock, self.rail_pass():
             if self._reconcile:
                 # A record was written and the index could not be told (the
                 # state volume failed at that moment): match them up before
@@ -3163,7 +3227,7 @@ class Mirror:
         answer holds back what arrives, and none of what has arrived
         (_loop_step). Not while the index and the ledger disagree: a poll
         matches them up first."""
-        with self._lock:
+        with self._lock, self.rail_pass():
             if not self._reconcile and self._flush_rail():
                 self._offer_again(OFFER_BATCH)
 
@@ -3766,6 +3830,11 @@ class Mirror:
         except MirrorFault as exc:
             raise MirrorFault(f"{exc}: the mail at {where} is not set aside over it — the "
                               f"pass ends there, and nothing is skipped") from exc
+        if fetched.size > len(fetched.raw) and not _HEADER_END_RE.search(fetched.raw):
+            # Fetched up to MAIL_MAX_MAIL_BYTES, and its header block goes
+            # on past that: the From headers after the cut are not known, so
+            # the mail is from nobody the gate can name (_gate_sender).
+            mail.gate_sender = ""
         try:
             self._mirror_one(role, uid, mail, fetched, policy, backfill)
         except Exception as exc:  # noqa: BLE001 - writing: never this mail's fault
@@ -4470,21 +4539,31 @@ class Mirror:
     def _flush_rail(self) -> bool:
         """Hand the web gateway everything it has not taken, in order: the
         events, and — each in its place among them — the first offer of every
-        mail that arrived (:meth:`_offer`). An event it cannot take now stays
-        queued for the next poll. False when the web gateway is not answering
-        at all: nothing behind that point is sent, so the order holds, and
-        nothing is tried again until RAIL_RETRY_SECONDS have passed (longer
-        each time it fails again)."""
+        mail that arrived (:meth:`_offer`). False when the web gateway is not
+        answering at all: nothing behind that point is sent, so the order
+        holds, and nothing is tried again until RAIL_RETRY_SECONDS have
+        passed (longer each time it fails again).
+
+        **One event never holds back another.** An event the web gateway
+        answered a failure for (a 408, 429 or 5xx), or gave no answer for
+        while it answers otherwise, keeps its place and waits its own time
+        (:func:`_retry_after`), as a mail not taken does — and only its own
+        chat's later events wait behind it, so a reply from a mail client is
+        still never heard before the mail it answers. Every other chat's go
+        on. An event it cannot take yet (``"later"``: a merge an older web
+        gateway does not know) stays queued and holds nothing back."""
         if not _chats.chats_enabled():
             return True
         if self._clock() < self._rail_wait_until:
             return False
         self._flags = None
+        now = self._clock()
+        held: set = set()     # chats with an event that waits: their later ones wait too
         after = 0
         while True:
             batch = self.index.rows(
-                "SELECT seq, kind, payload FROM outbox WHERE seq > ? ORDER BY seq LIMIT 200",
-                (after,))
+                "SELECT seq, kind, payload, attempts, due FROM outbox WHERE seq > ? "
+                "ORDER BY seq LIMIT 200", (after,))
             if not batch:
                 return True
             for row in batch:
@@ -4493,28 +4572,135 @@ class Mirror:
                     payload = json.loads(row["payload"])
                 except ValueError:
                     payload = None
+                chats = self._event_chats(row["kind"], payload)
+                if row["due"] > now or chats & held:
+                    held |= chats
+                    continue
                 if row["kind"] == "offer":
                     mail = payload.get("message_id") if isinstance(payload, dict) else None
                     if not self._offer(mail if isinstance(mail, str) else "", seq=row["seq"]):
                         return False
+                    if self.index.one("SELECT seq FROM outbox WHERE seq = ?", (row["seq"],)):
+                        held |= chats   # its first offer failed, and keeps its place
                     continue
-                outcome = "drop" if payload is None else _rail_send(row["kind"], payload)
+                outcome = "drop" if payload is None else self._rail_heard(
+                    _rail_send(row["kind"], payload), f"a {row['kind']} event")
                 if outcome == "down":
-                    self._rail_failed()
                     return False
-                self._rail_answered()
                 if outcome in ("ok", "drop"):
                     self.index.run("DELETE FROM outbox WHERE seq = ?", (row["seq"],))
+                    if outcome == "ok":
+                        self._rail_took()
+                elif outcome == "unanswered":
+                    attempts = row["attempts"] + 1
+                    self.index.run("UPDATE outbox SET attempts = ?, due = ? WHERE seq = ?",
+                                   (attempts, now + _retry_after(attempts), row["seq"]))
+                    held |= chats
+                    if attempts == 1:
+                        print(f"[mail-gateway] the chats rail failed on a {row['kind']} event "
+                              f"of chat(s) {sorted(chats)!r}; it keeps its place and is told "
+                              f"again later, and only its chat's later events wait for it",
+                              flush=True)
+
+    def _event_chats(self, kind: str, payload) -> set:
+        """The chats a queued rail event is about — what keeps it in order
+        behind another (:meth:`_flush_rail`): a merge is about every chat it
+        joins, the first offer of a mail about the chat the mail is in now."""
+        if not isinstance(payload, dict):
+            return set()
+        if kind == "offer":
+            row = self.index.one("SELECT chat FROM mails WHERE message_id = ?",
+                                 (str(payload.get("message_id") or ""),))
+            return {row["chat"]} if row else set()
+        if kind == "merge":
+            named = list(payload.get("from") or []) + [payload.get("into")]
+            return {chat for chat in named if isinstance(chat, str)}
+        chat = payload.get("chat")
+        return {chat} if isinstance(chat, str) else set()
+
+    @contextlib.contextmanager
+    def rail_pass(self):
+        """One pass over the rail — a poll, or its rail's half between polls.
+        At its end: if every offer and event of it (RAIL_DOWN_NOTICE at
+        least) was answered with a failure, or with none while the web
+        gateway answers otherwise, the rail answers and takes no mail, and
+        /health says so until a mail is taken (:meth:`_rail_took`)."""
+        self._rail_tally = [0, 0]
+        try:
+            yield
+        finally:
+            calls, failed = self._rail_tally
+            self._rail_tally = [0, 0]
+            if calls >= RAIL_DOWN_NOTICE and failed == calls and not self._rail_refusing:
+                self._rail_refusing = True
+                print(f"[mail-gateway] the chats rail failed on all {calls} offers and events "
+                      f"of a pass: it answers, and takes no mail", flush=True)
+
+    def _rail_heard(self, outcome: str, what: str) -> str:
+        """One rail call's outcome, read for the queue, with the rail's state
+        brought up to date by it; ``what`` names the call for the log.
+
+        ``"uncertain"`` — no answer in time — is settled by asking whether
+        the web gateway answers at all (:func:`_rail_alive`): away, it is
+        ``"down"``; up, the call is ``"unanswered"``, about this one event —
+        except the RAIL_SILENT_MAX-th of those in a row, after which the rail
+        counts as down for the rest of the pass: one that is up and too slow
+        for every event must not hold the mirror for a timeout per owed
+        mail. ``"down"`` backs every call off (:meth:`_rail_failed`);
+        anything the web gateway answered with — a failure included — says
+        it is up."""
+        self._rail_tally[0] += 1
+        if outcome == "uncertain":
+            if not _rail_alive():
+                outcome = "down"
+            else:
+                self._rail_silent += 1
+                self._rail_tally[1] += 1
+                if self._rail_silent >= RAIL_SILENT_MAX:
+                    print(f"[mail-gateway] the chats rail gave no answer in time to "
+                          f"{self._rail_silent} calls in a row, {what} the last, though it "
+                          f"answers otherwise; it counts as not answering for now",
+                          flush=True)
+                    outcome = "down"
+                else:
+                    print(f"[mail-gateway] the chats rail gave no answer for {what}; whether "
+                          f"it landed is unknown — tried again later (the rail answers "
+                          f"otherwise: this one waits its own time)", flush=True)
+                    return "unanswered"
+            self._rail_failed()
+            return outcome
+        if outcome == "down":
+            self._rail_failed()
+            return outcome
+        if outcome == "unanswered":
+            self._rail_tally[1] += 1
+        self._rail_answered()
+        return outcome
 
     def _rail_failed(self) -> None:
         self._rail_down += 1
+        self._rail_silent = 0
         self._rail_wait_until = self._clock() + min(
             RAIL_RETRY_SECONDS * 2 ** min(self._rail_down - 1, 16), RAIL_RETRY_MAX_SECONDS)
 
     def _rail_answered(self) -> None:
         if self._rail_down:
             print("[mail-gateway] the chats rail answers again", flush=True)
-        self._rail_down, self._rail_wait_until = 0, 0.0
+        self._rail_down, self._rail_wait_until, self._rail_silent = 0, 0.0, 0
+
+    def _rail_took(self) -> None:
+        """The rail took a mail. If it had failed on every one of a pass,
+        what waited over that is due again at once — each such mail's own
+        wait grew while the fault lasted, up to an hour — and /health stops
+        saying it takes none."""
+        if not self._rail_refusing:
+            return
+        self._rail_refusing = False
+        print("[mail-gateway] the chats rail takes mail again; what waited for it is "
+              "offered and told again now", flush=True)
+        self.index.atomic([
+            ("UPDATE offers SET due = 0 WHERE queued = 0 AND attempts > 0", ()),
+            ("UPDATE outbox SET due = 0 WHERE attempts > 0", ())])
 
     # -- the gate: a mail that arrived is offered, until its chat takes it ------
     # The messengers' inbound flow (docs/messenger-chats.md, "Inbound flow"),
@@ -4666,8 +4852,8 @@ class Mirror:
 
         ``seq`` is the mail's marker in the outbox when this is its first
         offer, made in its place among the events; the marker goes with any
-        answer, and from then on the mail is offered by
-        :meth:`_offer_again`.
+        answer but a failure about this mail (``unanswered``, below), and
+        from then on the mail is offered by :meth:`_offer_again`.
 
           * ``accepted`` — the chat has the mail: its record is marked
             delivered, and nothing is owed.
@@ -4683,13 +4869,16 @@ class Mirror:
             event landed is not known. Neither a yes nor a no, and the mail
             is offered again, which is safe, since the web gateway takes a
             repeat once, by its message id, and hands back the job it
-            started for it. Whether it keeps its place is the rail's to
-            say (:func:`_rail_alive`): one that does not answer at all is
-            down, and nothing behind the mail goes; one that answers is up,
-            and did not answer for this mail — which then waits its own
-            time, like a mail the web gateway answered a failure for
-            (``unanswered``). One mail the other side keeps failing on must
-            hold back neither the mails behind it nor the events.
+            started for it. Whether everything behind it waits is the
+            rail's to say (:meth:`_rail_heard`): one that does not answer
+            at all is down, and nothing behind the mail goes; one that
+            answers is up, and did not answer for this mail — which then
+            waits its own time, like a mail the web gateway answered a
+            failure for (``unanswered``). One mail the other side keeps
+            failing on must hold back neither the other chats' mails nor
+            their events: a first offer that failed keeps its place in the
+            outbox, where only its own chat's later events wait for it
+            (:meth:`_flush_rail`), and is tried there again.
 
         A mail that is gone by now — tombstoned, erased with its chat,
         recorded anew as the user's own — is offered to nobody: its row
@@ -4741,20 +4930,21 @@ class Mirror:
             outcome, answer = "drop", {}
         else:
             outcome, answer = _rail_offer(event)
-            if outcome == "uncertain":
-                # Away, or up and failing on this one mail? The rail is
-                # asked something that takes nothing (_rail_alive).
-                alive = _rail_alive()
-                print(f"[mail-gateway] the chats rail gave no answer for {message_id!r}; "
-                      f"whether it landed is unknown — left undelivered and offered again"
-                      + (" (the rail answers otherwise: this mail waits its own time)"
-                         if alive else ""), flush=True)
-                if alive:
-                    outcome = "unanswered"
-            if outcome in ("down", "uncertain"):
-                self._rail_failed()
+            outcome = self._rail_heard(outcome, f"the offer of {message_id!r}")
+            if outcome == "down":
                 return False
-            self._rail_answered()
+            if outcome == "unanswered" and seq is not None:
+                # Its first offer: the mail keeps its place, so its chat's
+                # later events still come after it, and waits its own time.
+                marker = self.index.one("SELECT attempts FROM outbox WHERE seq = ?", (seq,))
+                attempts = (marker["attempts"] if marker else 0) + 1
+                self.index.run("UPDATE outbox SET attempts = ?, due = ? WHERE seq = ?",
+                               (attempts, now + _retry_after(attempts), seq))
+                if attempts == 1:
+                    print(f"[mail-gateway] the chats rail did not take {message_id!r} (it "
+                          f"failed on it); it stays undelivered, keeps its place and is "
+                          f"offered again", flush=True)
+                return True
         accepted = outcome == "ok" and answer.get("accepted") is True
         job_url = answer.get("job_url") if accepted else None
         resolved = _job_url(job_url) if job_url is not None else None
@@ -4763,6 +4953,8 @@ class Mirror:
             print(f"[mail-gateway] the chats rail named a job for {message_id!r} that is "
                   f"no path on it; taken as no acceptance", flush=True)
             accepted, job_url = False, None
+        if accepted:
+            self._rail_took()
         if accepted and not job_url:
             # Only an explicit acceptance is a handover. The chat has the
             # mail, nothing is owed a model, and that is the delivery.
@@ -7345,7 +7537,7 @@ def _between_polls(mirror: Mirror, mailbox: bool = True) -> bool:
     False when the mailbox was asked and something is still owed: the loop
     then leaves it alone until a poll has gone through again. Never raises."""
     try:
-        with mirror._lock:
+        with mirror._lock, mirror.rail_pass():
             mirror._resume_sends(mailbox=False)
             if mirror._flush_rail() and _policy_problem() is None:
                 # (A wake is no time to wait for: what is due is offered.)
