@@ -470,8 +470,8 @@ def _load_gateway(tmp: Path, sparql_port: int, gw_port: int):
     # These tests drive the handler directly over loopback, which the
     # user-authority gate refuses (see tests/test_chat_send_authority.py).
     # Pinning the harness's own peer is the same knob a deployment uses to name
-    # its reverse proxy, so the send paths run exactly as the dashboard reaches
-    # them; the gate itself is covered in its own file.
+    # its reverse proxy, so the send, delete and flags paths run exactly as the
+    # dashboard reaches them; the gate itself is covered in its own file.
     os.environ["EDGE_PROXY_PEERS"] = "127.0.0.1"
     os.environ["CHAT_STATE_DIR"] = str(tmp / "chat-state")
     os.environ["CHAT_LIST_CACHE_SECONDS"] = "0"

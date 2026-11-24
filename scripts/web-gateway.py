@@ -11065,9 +11065,14 @@ def _chat_arrival_worker(chat_id: str, cid: str, worker: object = None) -> None:
                 _RUNNING_TURNS[live] = left
             else:
                 _RUNNING_TURNS.pop(live, None)
+        # Whether what the turn asked counts once it is over: for an
+        # instructed turn, only where it is trusted with its put-away.
+        trusted = True
         if instructed:
+            trusted = False
             try:
-                _instructed_settle(live, arrivals, ok, record["verdict"], record=record)
+                trusted = _instructed_settle(live, arrivals, ok, record["verdict"],
+                                             record=record)
             except Exception as exc:  # noqa: BLE001 - never leave a ring hanging
                 print(f"[web-gateway] settling the instructed turn for {live} "
                       f"failed: {exc!r}", flush=True)
@@ -11079,7 +11084,7 @@ def _chat_arrival_worker(chat_id: str, cid: str, worker: object = None) -> None:
             # Durably: a mail whose turn completed is worked, also for the
             # process that comes after this one (_start_chat_arrival_turn).
             with _chat_turns_lock:
-                asked = bool(record.get("asked"))
+                asked = bool(record.get("asked")) and trusted
             for arrival in arrivals:
                 if arrival.get("mail"):
                     _turns_over(live, arrival.get("message_id"), asked=asked)
@@ -11347,7 +11352,7 @@ def _attention_note_verdict(chat_id: str, verdict: dict) -> None:
 
 
 def _instructed_settle(chat_id: str, arrivals: list[dict], ok: bool,
-                       verdict: dict | None, *, record: dict | None = None) -> None:
+                       verdict: dict | None, *, record: dict | None = None) -> bool:
     """After an instructed turn: deliver each ring that waited on it — by the
     verdict when the turn completed and set one, as a VIP's otherwise — and
     note the outcome on the chat. ``chat_id`` is the chat the turn works
@@ -11363,10 +11368,16 @@ def _instructed_settle(chat_id: str, arrivals: list[dict], ok: bool,
     ``quiet``, with that reason and the verdict. Without a verdict the turn
     did not finish, and it is not trusted with having put the message away
     either: what it archived is undone (_turn_flags_undo), and the message
-    rings by the failure rule like any other."""
+    rings by the failure rule like any other.
+
+    Returns whether the turn is trusted with having put its mails away: it
+    set a usable verdict, and the timeout had not rung for it already.
+    Only such a turn's ask for the archive is remembered on its mails
+    (_turns_over), for a later turn's archive to reach past them
+    (_turn_put_away) — decided here, with the ring, and nowhere else."""
     briefed = [a for a in arrivals if a.get("instruction")]
     if not briefed:
-        return
+        return True
     if not ok:
         why = "the turn did not complete"
     elif verdict is None:
@@ -11380,19 +11391,19 @@ def _instructed_settle(chat_id: str, arrivals: list[dict], ok: bool,
         _turn_flags_undo(record, "did not finish")
         still = False
     put_away = still and usable is not None
-    late = False
+    late = rung = False
     for arrival in briefed:
         if arrival.get("ring") and put_away:
             ring = _instructed_ring_take(arrival["ring"])
             if ring is None:
-                late = True  # the timeout rang it before the turn archived
+                late = rung = True  # the timeout rang it before the turn archived
             else:
                 _arrival_told(chat_id, ring.get("message_id"))
                 _instructed_note(chat_id, jobs={ring.get("job")}, delivery="quiet",
                                  reason="the turn archived the chat", fallback=None)
         elif arrival.get("ring"):
             if _instructed_ring_fire(arrival["ring"], usable, why or "") is None:
-                late = True  # the timeout rang it already
+                late = rung = True  # the timeout rang it already
         elif arrival.get("vip") or arrival.get("told"):
             late = True  # rung on arrival, or by an earlier turn's failure
         # Neither: a muted chat or a held group, which rings nothing — the
@@ -11404,6 +11415,7 @@ def _instructed_settle(chat_id: str, arrivals: list[dict], ok: bool,
                      finished=chat_state_mod.iso_z(), verdict=verdict, failure=why)
     if why:
         print(f"[web-gateway] instructed turn for {chat_id}: {why}", flush=True)
+    return usable is not None and not rung
 
 
 def _parse_verdict(payload: dict) -> dict:
@@ -13319,7 +13331,7 @@ def _read_chat_flags(payload: dict) -> dict[str, bool]:
     return flags
 
 
-def _set_chat_flags(chat_id: str, flags: dict[str, bool]) -> dict:
+def _set_chat_flags(chat_id: str, flags: dict[str, bool], *, user: bool = False) -> dict:
     """Set a chat's flags and everything that follows from them: the list,
     the attention item, the mailbox. Returns the chat's state document.
 
@@ -13327,9 +13339,18 @@ def _set_chat_flags(chat_id: str, flags: dict[str, bool]) -> dict:
     had archived the chat itself no longer counts as having done so
     (_turn_flags_overruled) — the user's archive or mute while the turn works is
     the user's, and stays when the turn fails. A turn's own call goes
-    through _turn_flags instead."""
+    through _turn_flags instead.
+
+    ``user``: the call is the user's word (their own endpoint, or an agent's
+    call with the user's meaning). Where it brings the chat back, the
+    archive the completed turns asked for is forgotten with it
+    (ChatStateStore.set_flags ``forget_asked``): only a turn asking after
+    the user's last unarchive can put the thread away over a newer mail
+    (_turn_put_away). The undo of a turn that did not finish is no such
+    word."""
     before = _CHAT_STATE.get(chat_id)
-    doc = _CHAT_STATE.set_flags(chat_id, **flags)
+    doc = _CHAT_STATE.set_flags(chat_id, **flags,
+                                forget_asked=user and flags.get("archived") is False)
     _turn_flags_overruled(chat_id, flags)
     return _chat_flags_follow(chat_id, flags, before, doc)
 
@@ -13483,11 +13504,13 @@ def _turn_put_away(record: dict, live: str) -> tuple[dict, dict]:
     the chat is archived.)
 
     What the turn asked is remembered on its mails once it completes
-    (``asked``, _turns_over), made or not: mail newer than the turn's own
-    whose turn asked as well is no reason to leave the chat in view — the
-    chain of turns a batch too big to quote whole leaves behind (the newest
-    mails' first, refused while the older ones wait) archives the thread
-    with its last turn (decision AR)."""
+    (``asked``, _turns_over), made or not — an instructed turn's only where
+    it is trusted with its put-away (_instructed_settle), and only until the
+    user brings the thread back (_set_chat_flags ``user``): mail newer than
+    the turn's own whose turn asked as well is no reason to leave the chat
+    in view — the chain of turns a batch too big to quote whole leaves
+    behind (the newest mails' first, refused while the older ones wait)
+    archives the thread with its last turn (decision AR)."""
     channel = (chat_state_mod.split_chat_id(live) or ("",))[0]
     flags = {"archived": True}
     if not _is_mail(channel):
@@ -17264,8 +17287,23 @@ class Handler(BaseHTTPRequestHandler):
         the user's interest is in a person.
 
         Same-origin only, like a send: archiving a mail chat moves real mail.
+        And, like a send, only through the reverse proxy (_request_from_edge):
+        these are the user's own flags, which a mail's turn running on the
+        chat must not be able to set by calling here instead of the internal
+        endpoint, whose rules decide who an agent's call is
+        (_handle_internal_chat_flags — scripts/chat-flags.py).
         """
         if not self._user_act_same_origin():
+            return
+        ok, reason = self._request_from_edge(f"chat flags of {raw_id}")
+        if not ok:
+            self._send_json(403, {
+                "error": "a chat's flags are the user's own and are set here only "
+                         "from the dashboard through the reverse proxy",
+                "detail": reason,
+                "remedy": "An agent sets a chat's flags with scripts/chat-flags.py "
+                          "(POST /internal/chats/<id>/flags).",
+            })
             return
         chat_id = self._chat_id_or_404(raw_id)
         if chat_id is None:
@@ -17279,7 +17317,7 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError as exc:
             self._send_json(400, {"error": str(exc)})
             return
-        doc = _set_chat_flags(chat_id, flags)
+        doc = _set_chat_flags(chat_id, flags, user=True)
         self._send_json(200, {"id": chat_id,
                               "archived": bool(doc.get("archived")),
                               "muted": bool(doc.get("muted")),
@@ -17379,7 +17417,7 @@ class Handler(BaseHTTPRequestHandler):
                                    + (f"; {extra['reason']}" if extra.get("reason") else "")
                                    + "; ask again once it is over")
         else:
-            doc = _set_chat_flags(chat_id, flags)
+            doc = _set_chat_flags(chat_id, flags, user=True)
         # What was done, which a turn's archive refused (``reason``) is not.
         who = ("a call taken as its turn's" if implied
                else "its turn" if record is not None else "an agent")

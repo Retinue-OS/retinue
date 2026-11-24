@@ -405,13 +405,22 @@ instruction without VIP and has it ask for a high importance.
   on it is the turn's whether it carries the turn's token
   (`RETINUE_ARRIVAL_TURN`, sent by `chat-flags.py`) or leaves it out — the
   answer then says `a turn is running on this chat; …` — unless it carries
-  the proof a dashboard thread's turn is handed (`RETINUE_USER_TURN`). So a
-  mail asking its turn to undo the user's mute on its own thread gets
-  nowhere while the turn runs. That is all it holds: the turn's session
-  holds the backend token every agent session holds, so it can set another
-  chat's flags with the user's meaning, and a process it leaves behind can
-  act once the turn has ended — a guard against a turn that was talked into
-  something, not a sandbox. Muting stays the user's — their own flags, or
+  the proof a dashboard thread's turn is handed (`RETINUE_USER_TURN`). The
+  user's own endpoint (`POST /chats/<id>/flags`, which needs no token) is
+  accepted only through the reverse proxy, like a chat's delete and send:
+  the web gateway refuses a caller on loopback or on the container's own
+  address — or, where `EDGE_PROXY_PEERS` names the proxy, any peer it does
+  not name — and only where the proxy itself arrives on loopback (host
+  networking, `EDGE_PROXY_PEERS` including it) can it not tell the
+  dashboard from a caller inside the container. So a mail asking its turn
+  to undo the user's mute on its own thread gets nowhere while the turn
+  runs. That is all it holds: the turn's session holds the backend token
+  every agent session holds, so it can set another chat's flags with the
+  user's meaning, and a process it leaves behind can act once the turn has
+  ended; and while a dashboard turn the user started runs, its proof sits
+  in that turn's process environment, which another session of the same
+  uid can read — sessions are not sandboxed from one another. A guard
+  against a turn that was talked into something, not a sandbox. Muting stays the user's — their own flags, or
   Ara acting on their word from their own dashboard thread, whose call
   carries that turn's proof and mutes even while a mail's turn runs (on a
   messenger chat, as before the gate, any call without a turn's token
@@ -425,9 +434,10 @@ instruction without VIP and has it ask for a high importance.
   turn's own, or waits for a turn of its own, the thread is not archived
   (the answer says `newer mail arrived`), and the mailbox is touched only
   for the mail the turn worked — unless every mail after the turn's own was
-  worked by a completed turn that asked for the archive too: the turn for
-  the older mails of a batch too big to quote whole, which runs last,
-  archives the thread then.
+  worked by a completed turn that asked for the archive too, and was
+  trusted with it (a verdict, set before the timeout rang), since the user
+  last brought the thread back: the turn for the older mails of a batch too
+  big to quote whole, which runs last, archives the thread then.
 - **No sending on a messenger.** A reply is only ever staged in the chat's
   draft; the user's send press is the only way a chat reply leaves in their
   name. That is how the chat surface works for every agent

@@ -50,7 +50,8 @@ one JSON document per chat under ``CHAT_STATE_DIR``:
   so one offered again after a restart is not worked a second time; and
   ``archive_asked``, those of them whose turn asked for the thread's
   archive, which a later turn's archive may then reach
-  (:meth:`archive_through`).
+  (:meth:`archive_through`) — until the user brings the thread back
+  (:meth:`set_flags` ``forget_asked``).
 - ``inbound_ahead`` / ``read_ahead`` — the latest stamp an arrival carried
   from a little ahead of this clock, and how far past ``last_read`` the
   newest read reaches by it: a message stamped by a clock running fast lies
@@ -1873,7 +1874,8 @@ class ChatStateStore:
             return doc
 
     def set_flags(self, chat_id: str, *, archived: bool | None = None,
-                  muted: bool | None = None, starred: bool | None = None) -> dict:
+                  muted: bool | None = None, starred: bool | None = None,
+                  forget_asked: bool = False) -> dict:
         """Set a chat's user-facing flags, which say where the user wants
         the chat on their screen and nothing else. `starred` puts it at the
         top of whichever list it is in, and is independent of the other two. (Whether a message is
@@ -1889,11 +1891,19 @@ class ChatStateStore:
         until the next message brings it back, which is what un-muting is for.
 
         The inverse rule lives in :meth:`unarchive_unless_muted`, which an
-        arrival calls: a new message un-archives an unmuted chat."""
+        arrival calls: a new message un-archives an unmuted chat.
+
+        ``forget_asked``, with ``archived`` false: the user brought the
+        thread back, and what the turns that completed so far asked
+        (:func:`archive_asked`) is no archive a later turn may make over
+        their mails (:func:`asked_through`) — in the same write, so no turn
+        archives between the two."""
         with self._lock:
             doc = self._read(chat_id)
             if archived is not None:
                 doc["archived"] = bool(archived)
+                if forget_asked and not archived:
+                    doc["archive_asked"] = []
             if muted is not None:
                 doc["muted"] = bool(muted)
                 if muted:

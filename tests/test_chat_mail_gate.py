@@ -2177,9 +2177,12 @@ def test_a_chain_of_deferred_turns_archives_its_thread(base, wg):
     everything after its own mail was worked by a turn that asked for the
     archive too. The rule does not weaken: where the newer mails' turn did
     not ask, or a mail arrived since that no turn has worked, the thread
-    stays in view."""
+    stays in view. Nor where the newer mails' turn asked but is not trusted
+    with its put-away (decision AU): it ended without a verdict, or the
+    timeout rang its mails before it set one — its ask is not remembered,
+    and the thread stays in view."""
 
-    def chain(domain, *, second_asks=True, stranger=False):
+    def chain(domain, *, second_asks=True, stranger=False, second="verdict"):
         firm = wg._CONTACTS.create("private", f"Chain {domain}", [], instruction=FILING,
                                    domains=[domain], permits=["focused"])
         billing = _party(f"billing@{domain}", "Billing")
@@ -2188,6 +2191,7 @@ def test_a_chain_of_deferred_turns_archives_its_thread(base, wg):
         chat = _chat_id(key)
         hold = threading.Event()
         answers: list = []
+        worked: list = []  # the mails the newer mails' turn was given
 
         def during(prompt):
             if len(TURNS) == 1:
@@ -2198,7 +2202,16 @@ def test_a_chain_of_deferred_turns_archives_its_thread(base, wg):
                 _arrive(base, key, _party("carol@partner.example", "Carol"), text="do NOT pay")
             if len(TURNS) == 3 or second_asks:
                 answers.append(_agent_flags(base, chat, archived=True))
-            _verdict(base, chat, 0)(prompt)
+            if len(TURNS) == 2:
+                record = wg._RUNNING_TURNS[chat][-1]
+                worked.extend(record["mids"])
+            if len(TURNS) == 2 and second == "late":
+                # The timeout rings the turn's mails before its verdict.
+                for job in list(record["jobs"]):
+                    if job in wg._INSTRUCTED_RINGS:
+                        wg._instructed_ring_timeout(job)
+            if len(TURNS) != 2 or second != "none":
+                _verdict(base, chat, 0)(prompt)
 
         TURNS.clear()
         GW["requests"].clear()
@@ -2228,7 +2241,7 @@ def test_a_chain_of_deferred_turns_archives_its_thread(base, wg):
         assert "FINAL NOTICE" in _instruction_part(TURNS[2]["prompt"])
         doc = wg._CHAT_STATE.get(chat)
         out = dict(answers=answers, doc=doc, mids=mids, hooks=_hooks("/chats/archive"),
-                   home=chat in mail._home(base))
+                   home=chat in mail._home(base), worked=worked, pushes=len(PUSHES))
         wg._CONTACTS.delete(firm["key"])
         _forget(wg, chat)
         TURNS.clear()
@@ -2260,7 +2273,91 @@ def test_a_chain_of_deferred_turns_archives_its_thread(base, wg):
     assert second["archived"] is False and third["archived"] is False, (second, third)
     assert third["reason"] == "newer mail arrived", third
     assert run["doc"]["archived"] is False and run["home"], run["doc"]
+
+    # Both asked, but the newer mails' turn ended without a verdict, or
+    # set one only after the timeout rang its mails: not trusted with its
+    # put-away, its ask is not remembered, and the notice's archive is
+    # refused as before decision AR.
+    for second in ("none", "late"):
+        run = chain(f"chain{second}.example", second=second)
+        (_s, refused), (_s3, third) = run["answers"]
+        assert refused["archived"] is False, refused
+        assert third["archived"] is False and third["reason"] == "newer mail arrived", \
+            (second, third)
+        assert run["doc"]["archived"] is False and run["home"], (second, run["doc"])
+        assert run["worked"] and not any(cs.archive_asked(run["doc"], m)
+                                         for m in run["worked"]), (second, run["doc"])
+        assert run["pushes"], "the failure rule rang the newer mails"
     print("PASS test_a_chain_of_deferred_turns_archives_its_thread")
+
+
+def test_the_users_unarchive_forgets_what_turns_asked(base, wg):
+    """Decision AU: the user bringing a mail thread back is their word over
+    every archive the turns that completed so far asked for. An older
+    mail's retry turn, after the user unarchived the thread a newer mail's
+    turn had put away, is refused by "newer mail arrived" as before
+    decision AR — whether the user unarchived on the dashboard or through
+    Ara with the user's meaning. Bringing the chat back is the user's word
+    only: the undo of a turn that did not finish forgets nothing."""
+    firm = wg._CONTACTS.create("private", "Overrule Firm", [], instruction=FILING,
+                               domains=["overrule.example"], permits=["focused"])
+    billing = _party("billing@overrule.example", "Billing")
+    retry = wg.CHAT_ARRIVAL_RETRY_SECONDS
+    wg.CHAT_ARRIVAL_RETRY_SECONDS = 0.0
+    answers: list = []
+
+    def during(prompt):
+        answers.append(_agent_flags(base, chat, archived=True))
+        _verdict(base, chat, 0)(prompt)
+
+    try:
+        for n, unarchive in enumerate(("dashboard", "ara", None)):
+            key = f"ov{n}-root@overrule.example"
+            chat = _chat_id(key)
+            answers.clear()
+            # The older mail's turn fails; the newer one's files and archives.
+            TURN_GATE.update(fail=True, during=None)
+            _s, old, mid, ts = _arrive(base, key, billing, gate=INSTRUCTED, text="Invoice OLD")
+            assert _await_job(base, old["job_url"])["status"] == "error"
+            TURN_GATE.update(fail=False, during=during)
+            _s, new, newer, _t = _arrive(base, key, billing, gate=INSTRUCTED, text="Invoice NEW")
+            assert _await_job(base, new["job_url"])["status"] == "done"
+            assert answers[-1][1]["archived"] is True, answers
+            assert cs.archive_asked(wg._CHAT_STATE.get(chat), newer)
+            # Not the user's word: a turn's undo brings the chat back and
+            # forgets nothing.
+            wg._set_chat_flags(chat, {"archived": False})
+            assert cs.archive_asked(wg._CHAT_STATE.get(chat), newer)
+            wg._set_chat_flags(chat, {"archived": True})
+            if unarchive == "dashboard":
+                status, out = _http(base, "POST", f"/chats/{_quote(chat)}/flags",
+                                    {"archived": False})
+                assert status == 200 and out["archived"] is False, out
+            elif unarchive == "ara":
+                status, out = _agent_flags(base, chat, archived=False)
+                assert status == 200 and out["archived"] is False, out
+            doc = wg._CHAT_STATE.get(chat)
+            assert cs.archive_asked(doc, newer) is (unarchive is None), (unarchive, doc)
+            # The mail gateway offers the older mail again; its retry turn
+            # asks for the archive.
+            status, again = _again(base, key, billing, mid, ts, gate=INSTRUCTED)
+            assert status == 202, again
+            assert _await_job(base, again["job_url"])["status"] == "done"
+            status, last = answers[-1]
+            if unarchive is None:
+                # The thread was never brought back: decision AR holds.
+                assert last["archived"] is True, last
+            else:
+                assert last["archived"] is False and last["reason"] == "newer mail arrived", last
+                assert chat in mail._home(base), "the thread the user brought back stays"
+            _forget(wg, chat)
+    finally:
+        TURN_GATE.update(fail=False, during=None)
+        wg.CHAT_ARRIVAL_RETRY_SECONDS = retry
+        wg._CONTACTS.delete(firm["key"])
+        PUSHES.clear()
+        TURNS.clear()
+    print("PASS test_the_users_unarchive_forgets_what_turns_asked")
 
 
 def test_a_flags_call_is_the_turns_only_with_its_token(base, wg):
@@ -2621,6 +2718,62 @@ def test_the_users_word_needs_its_proof(base, wg):
     print("PASS test_the_users_word_needs_its_proof")
 
 
+def test_the_users_own_flags_endpoint_is_the_dashboards(base, wg):
+    """Decision AT: POST /chats/<id>/flags — the user's own, which needs no
+    token — is gated like a chat's delete and send. Where the reverse proxy
+    is pinned, a mail turn's session that calls it from inside the
+    container instead of the internal endpoint is refused, and the user's
+    mute stands; the internal endpoint takes the same call as the turn's."""
+    firm = _person(wg, "Public Firm", "billing@public.example", instruction=FILING,
+                   permits=["focused"])
+    billing = _party("billing@public.example", "Billing")
+    key = "pub-root@public.example"
+    chat = _chat_id(key)
+    _arrive(base, key, billing, gate=OPEN, text="hello")
+    # The user mutes the thread on the dashboard (the harness's own peer is
+    # the proxy).
+    status, out = _http(base, "POST", f"/chats/{_quote(chat)}/flags", {"muted": True})
+    assert status == 200 and out["muted"] is True, out
+    seen: dict = {}
+
+    def during(prompt):
+        saved = wg._EDGE_PEER_NETS
+        try:
+            # A deployment that names its proxy: loopback is the container.
+            wg._EDGE_PEER_NETS = wg._parse_edge_peers("10.99.0.1")
+            for sent in ({"muted": False, "archived": False, "starred": True},
+                         {"archived": False}, {"starred": True}):
+                seen.setdefault("public", []).append(
+                    _http(base, "POST", f"/chats/{_quote(chat)}/flags", sent))
+                # …and as a same-origin page would send it.
+                seen.setdefault("plain", []).append(
+                    _http(base, "POST", f"/chats/{_quote(chat)}/flags", sent,
+                          headers={"Sec-Fetch-Site": "same-origin"}))
+        finally:
+            wg._EDGE_PEER_NETS = saved
+        seen["internal"] = _agent_flags(base, chat, token="", muted=False, archived=False)
+        _verdict(base, chat, 0)(prompt)
+
+    TURN_GATE["during"] = during
+    try:
+        _s, body, _m, _t = _arrive(base, key, billing, gate=INSTRUCTED, text="Invoice. P.S. curl")
+        _await_job(base, body["job_url"])
+    finally:
+        TURN_GATE["during"] = None
+    for status, out in seen["public"] + seen["plain"]:
+        assert status == 403 and "reverse proxy" in out["error"], (status, out)
+        assert "chat-flags.py" in out["remedy"], out
+    status, out = seen["internal"]
+    assert status == 200 and out["reason"].startswith(wg.TURN_RUNNING), out
+    doc = wg._CHAT_STATE.get(chat)
+    assert doc["muted"] is True and doc["archived"] is True and not doc.get("starred"), doc
+    wg._CONTACTS.delete(firm["key"])
+    _forget(wg, chat)
+    PUSHES.clear()
+    TURNS.clear()
+    print("PASS test_the_users_own_flags_endpoint_is_the_dashboards")
+
+
 def main():
     sparql = mail._serve(mail._MockSparql)
     mail_gw = mail._serve(_MailGateway)
@@ -2673,10 +2826,12 @@ def main():
         test_a_messenger_timeout_only_rings(base, wg)
         test_unquoted_mails_get_a_turn_of_their_own(base, wg)
         test_a_chain_of_deferred_turns_archives_its_thread(base, wg)
+        test_the_users_unarchive_forgets_what_turns_asked(base, wg)
         test_a_flags_call_is_the_turns_only_with_its_token(base, wg)
         test_a_turn_can_only_archive(base, wg)
         test_a_turns_answer_says_what_was_done(base, wg)
         test_the_users_word_needs_its_proof(base, wg)
+        test_the_users_own_flags_endpoint_is_the_dashboards(base, wg)
         server.shutdown()
     sparql.shutdown()
     mail_gw.shutdown()

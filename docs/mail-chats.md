@@ -900,7 +900,12 @@ asked for the archive too has worked it: a batch too big to quote whole is
 worked newest first, and the turn for its older mails, the last of the chain,
 archives the thread when every mail after its own was worked by a turn that
 asked. A mail that arrived since and has had no turn, or whose turn did not
-ask, still keeps the thread on the list.
+ask, still keeps the thread on the list — and so does one whose turn asked
+but is not trusted with having put it away (it ended without a verdict, or
+the timeout rang the mail first: below), whose ask is not remembered. The
+user bringing the thread back forgets every ask made until then: only a turn
+asking after the user's last unarchive can archive the thread over a newer
+mail.
 
 A turn cannot mute: a mute it asks for is taken as that same archive, and the
 answer says so (`a turn cannot mute; archived instead`) — muting stays the
@@ -923,13 +928,23 @@ decided by the web gateway, not by the turn's cooperation:
 - any other call — no turn running, a messenger chat — has the user's
   meaning, as before the gate.
 
+The user's own endpoint, `POST /chats/<id>/flags`, needs no token and is no
+way round that rule: like a chat's delete and send it is accepted only
+through the reverse proxy, and refuses a caller on loopback or on the
+container's own address — or, where `EDGE_PROXY_PEERS` names the proxy, any
+peer it does not name. Only where the proxy itself arrives on loopback (host
+networking, `EDGE_PROXY_PEERS` including it) can the web gateway not tell the
+dashboard from a caller inside the container, and such a call is the user's.
+
 That rule holds for the turn's **own** chat **while the turn runs**, and no
 further. It is a guard against a turn that was talked into something, not a
 sandbox: an arrival turn's session holds the backend token every agent
 session holds, so without its token it can set **another** chat's flags with
 the user's meaning, and a process it leaves behind can do so on its own chat
-once the turn has ended. What keeps a turn to its brief there is the brief,
-as on the messengers.
+once the turn has ended. And while a dashboard turn the user started runs,
+its proof sits in that turn's process environment, which another session of
+the same uid can read: sessions are not sandboxed from one another. What
+keeps a turn to its brief there is the brief, as on the messengers.
 
 A turn that does not finish — it fails, runs past `MAIL_INSTRUCTION_TIMEOUT`,
 or sets no verdict — has the chat brought back (un-archived) and the mail rung

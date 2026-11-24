@@ -170,11 +170,18 @@ nothing new.
   flags call on that thread as the turn's — its mute an archive, its unmute,
   unarchive and star nothing — whether or not the call carries the turn's
   token, unless it carries the proof a dashboard thread's turn is handed
-  (the user's word). That holds no further. The turn's session holds the
-  backend token every agent session holds, so it can set **another** chat's
-  flags — mute it — with the user's meaning, and a process it leaves behind
-  can do so on its own thread once the turn has ended; what keeps a turn to
-  its brief there is the brief. One that forges a contact with
+  (the user's word); the user's own flags endpoint, which needs no token, is
+  accepted only through the reverse proxy, like a chat's delete — refusing
+  loopback and the container's own address, or any peer `EDGE_PROXY_PEERS`
+  does not name, and unable to tell the dashboard from a caller inside the
+  container only where that proxy arrives on loopback (host networking).
+  That holds no further. The turn's session holds the backend token every
+  agent session holds, so it can set **another** chat's flags — mute it —
+  with the user's meaning, and a process it leaves behind can do so on its
+  own thread once the turn has ended; and while a dashboard turn the user
+  started runs, its proof sits in that turn's process environment, which
+  another session of the same uid can read — sessions are not sandboxed from
+  one another. What keeps a turn to its brief there is the brief. One that forges a contact with
   an importance prior or a permit rings as that contact would. The turn
   reads the mail as data: everything the mail says of itself — its sender's
   name, its subject, its id, its text, and the thread's earlier mails in the

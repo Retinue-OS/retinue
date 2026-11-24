@@ -1084,7 +1084,10 @@ for the tabs. (`group` on a chat is the boolean "a group chat", as before.)
   the dashboard's credential is ambient, and a `text/plain` form whose body
   is valid JSON needs no preflight. The dashboard's own fetches are
   same-origin; a caller that sends no such header (a script in the
-  container) passes, as on the other guarded routes.
+  container) passes the read mark, as on the other guarded routes. The
+  flags, like a send, are also accepted only through the reverse proxy
+  (`403` from inside the container — an agent has `POST
+  /internal/chats/<id>/flags`, "The gate for mail").
 
 The derivation, the endpoint's request and answer shapes, and what the store
 being away does to the counts are in
@@ -1483,13 +1486,26 @@ adopts). What the web gateway does with the event, by who sent the mail:
      they were: a call with the turn's token is the turn's, one without it
      the user's word.
 
+  The user's own `POST /chats/<id>/flags`, which needs no token, is no way
+  round this order: like a chat's delete and send it is accepted only
+  through the reverse proxy (`_request_from_edge`, `403` otherwise, with
+  `chat-flags.py` named as the agent's door), which refuses a caller on
+  loopback or on the container's own address — or, where `EDGE_PROXY_PEERS`
+  names the proxy, any peer it does not name. Only where the proxy itself
+  arrives on loopback (host networking, `EDGE_PROXY_PEERS` including it)
+  can the gateway not tell the dashboard from a caller inside the
+  container, and such a call is the user's.
+
   This holds for the turn's own chat while the turn runs, and no further.
   It is a guard against a turn that was talked into something, not a
   sandbox: an arrival turn's session holds the backend token every agent
   session holds, so without its token it can set another chat's flags with
   the user's meaning, and a process it leaves behind can act on its own
-  chat once the turn has ended. What keeps a turn to its brief there is the
-  brief, as on the messengers.
+  chat once the turn has ended. And while a dashboard turn the user started
+  runs, its proof sits in that turn's process environment, which another
+  session of the same uid can read — sessions are not sandboxed from one
+  another. What keeps a turn to its brief there is the brief, as on the
+  messengers.
 - **A turn can only archive its own mails.** A mute keeps every later
   message of the chat out of view and unrung, a VIP's included — the user's
   to decide, never a turn's that one message started — and so are taking a
@@ -1529,7 +1545,15 @@ adopts). What the web gateway does with the event, by who sent the mail:
   since and has had no turn, or whose turn did not ask, still keeps the
   thread on the list; a later turn of a mail that did not ask takes the
   ask off it, and so does the user bringing the thread back while the turn
-  runs.
+  runs. An instructed turn's ask is remembered only where the turn is
+  trusted with its put-away — it set a verdict, and the timeout had not
+  rung for it (`_instructed_settle` decides both) — so a turn that ended
+  without a verdict, or whose mails the timeout rang, leaves no ask behind.
+  And the user bringing the thread back (`archived: false` on their own
+  endpoint, or Ara's call with the user's meaning) forgets every ask made
+  until then, in the same write (`set_flags` `forget_asked`): only a turn
+  asking after the user's last unarchive can archive the thread over a
+  newer mail. The undo of a turn that did not finish forgets nothing.
 - **A thread its turn archived rings nothing.** What the turn archived is
   noted as its own. If the turn then ends with a verdict, the ring that
   waited on it is not delivered — whatever importance the verdict gives —
