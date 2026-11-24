@@ -37,7 +37,7 @@ else: most of what this skill used to describe no longer exists.
 | the INBOX pass, the frequent and daily e-mail runs, `triage-gate.py` (a stub that prints a notice) | the **mail gateway** mirrors the mailbox into chats and gates each mail on arrival (docs/mail-chats.md, "The gate") |
 | the e-mail **whitelist** (addresses, wildcards, auto-add on send, the Sent-folder derivation) | a **contact**: the VIP flag or an instruction on the person, a domain on the contact for a whole organisation (`contacts.py`, docs/contacts.md) |
 | the **omnibus** (archive and delete, batch approval) | nothing: a mail nobody is VIP or instructed for is listed under *Unread* on the Chats page and judged by nobody; the user archives or deletes a chat there |
-| the **status store** (`TRIAGE_STATE_DIR`, one file per message, `.last-omnibus`) | nothing reads it; the files that exist are inert. Handled-state for mail is the chat (read mark, archived) and the mailbox follows the chat |
+| the **status store** (`TRIAGE_STATE_DIR`, one file per message, `.last-omnibus`) | nothing works from it; the files that exist are inert (the one-time migration, `scripts/migrate-triage.py`, only reports on them). Handled-state for mail is the chat (read mark, archived) and the mailbox follows the chat |
 | the **already-answered check** and the archiving of answered mail | a reply from anywhere marks the chat read; nothing is moved on its own |
 | **`sender:` memories** as standing instructions about a sender | the instruction **on the contact** (`contacts.py update <id> --instruction "…"`); do not store or recall `sender:` memories for this |
 | reminders on un-engaged proposals, the stalled-item passes | a thread's importance and deadline (the attention model) are what bring it back |

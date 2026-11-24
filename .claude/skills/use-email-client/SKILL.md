@@ -50,18 +50,15 @@ is taken back with `mail-push.py --retract`, whereas a `send`/`reply` of this
 client waits as an IMAP draft and is taken back with `retract --request-id`.
 Both are approved on `/sends`.
 
-**A mail triage hands you** — a UID or Message-ID from e-mail triage, not a
-chat id — keeps using `email_client.py reply --uid <UID>` (the `triage` skill),
-because triage's status store records the `sent_uid` and the draft queue that
-`reply` returns and `mail-push.py` does not. Do not guess a chat id from a UID.
-This holds until triage retires in the gate phase.
+Do not guess a chat id from a UID: holding only a UID, answer with
+`email_client.py reply --uid <UID>` (below).
 
 Use this client for everything else too — reading, searching, flags, moving,
 drafts, attachments of a mail you have a UID for, and an account the gateway
 does not serve. A mail sent with it from a mirrored account still lands in its
-chat once it is in the Sent folder. The gateway never writes policy: a mail
-sent with `mail-push.py` does not add its recipient to the e-mail whitelist,
-one sent with this client does.
+chat once it is in the Sent folder. Neither send makes the recipient known to
+the gate: whose mail is worked on arrival is decided by a contact's VIP flag or
+instruction alone (`contacts.py`, docs/contacts.md).
 
 ---
 

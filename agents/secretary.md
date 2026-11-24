@@ -27,9 +27,14 @@ name seems unambiguous.
 An inbound message normally needs no session at all: it shows in its chat —
 a messenger conversation or a mail thread — and the user answers there. A
 model turn works it only for a sender the user marked a VIP or wrote an
-instruction for, in that chat's companion; such a turn stages its reply into
-the chat's draft, composed by the Secretary, and nothing leaves without the
-user's send press (for a mail, under the send policy as well).
+instruction for, in that chat's companion; such a turn stages its reply,
+composed by the Secretary, into the chat's draft, where the user reads it and
+presses send. A mail thread is the one exception: where a contact's
+instruction says a reply is to be sent, the instructed turn sends it with
+`mail-push.py` under the mailbox's send policy (`verify` queues it for
+approval; `trust` and `allow` send it unseen only where the instruction itself
+carries the permission phrase). Text composed for such a turn is final and
+may go out exactly as written (docs/mail-chats.md, "The gate").
 
 The **triage** skill is the fallback for a *messenger* message the chat
 surface could not take: it links the message to a project and opens one

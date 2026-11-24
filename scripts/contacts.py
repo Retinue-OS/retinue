@@ -495,6 +495,47 @@ def _person_triples(record: dict) -> set[tuple[str, str, str]]:
     return out
 
 
+def _read_spellings(record: dict, triples) -> set[tuple[str, str, str]]:
+    """The person's triples a read took into ``record`` from a spelling other
+    than the one _person_triples renders — a domain written by hand as
+    ``*@acme.org`` or ``ACME.org``, ``mailto:Mara@…``, ``tel:+41 79 …``, a VIP
+    flag as ``"1"``. A rewrite takes them away with the rest; otherwise a value
+    the user removed stays in the file, and the next read brings it back. A
+    line that read nothing into the record (a domain that is none) is left."""
+    s = _iri(record["iri"])
+    phones = set(record.get("all_phones") or record.get("phones") or [])
+    out = set()
+    for triple in triples:
+        if triple[0] != s:
+            continue
+        pred, obj = _iri_value(triple[1]), triple[2]
+        if pred == KB + "emailDomain":
+            try:
+                hit = normalize_domain(_lit_value(obj) or "") in (record.get("domains") or [])
+            except ContactError:
+                hit = False
+        elif pred == VCARD + "hasEmail":
+            value = _iri_value(obj) or ""
+            hit = value.lower().startswith("mailto:") and value[7:].lower() in (record.get("emails") or [])
+        elif pred == VCARD + "hasTelephone":
+            value = _iri_value(obj) or ""
+            hit = value.lower().startswith("tel:") and normalize_phone(value[4:]) in phones
+        elif pred in (KB + "vip", KB + "instruction"):
+            # One value of the person's, read from whichever literal decides;
+            # one left behind would surface the moment the user changes it.
+            hit = _lit_value(obj) is not None
+        elif pred == KB + "importance":
+            try:
+                hit = _importance(_lit_value(obj)) is not None
+            except ContactError:
+                hit = False
+        else:
+            hit = False
+        if hit:
+            out.add(triple)
+    return out
+
+
 def _records_from(triples, path: Path, chamber: str, rel: str) -> list[dict]:
     by_subject: dict[str, list[tuple[str, str]]] = {}
     for s, p, o in triples:
@@ -841,7 +882,9 @@ class ContactBook:
             triples, other = _parse_nt(path.read_text(encoding="utf-8"))
         except FileNotFoundError:
             triples, other = [], []
-        keep = set(triples) - (_person_triples(old) if old else set())
+        keep = set(triples)
+        if old:
+            keep -= _person_triples(old) | _read_spellings(old, triples)
         if new:
             keep |= _person_triples(new)
         if not keep and not other:

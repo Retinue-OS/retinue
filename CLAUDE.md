@@ -258,8 +258,9 @@ modes they may interrupt), the **VIP flag** (`--vip`: a model works their
 messages on every channel, e-mail included, and they ring on arrival) and the user's
 **instruction** (`--instruction "…"`: the brief a model works each of their
 messages by, mail included; its verdict decides whether the message rings) — set
-these on the person, not per handle. A mail from anyone else pushes nothing and
-buys no model turn; there is no e-mail whitelist. The dashboard's contact card and its Contacts page (a
+these on the person, not per handle. A mail from anyone else buys no model turn
+and pushes nothing by default — their importance and the modes they may
+interrupt can say otherwise; there is no e-mail whitelist. The dashboard's contact card and its Contacts page (a
 tab of the navigation row) write the same files. Vocabulary and file format:
 `docs/contacts.md`.
 

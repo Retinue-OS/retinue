@@ -210,7 +210,11 @@ rare real domain of that shape; file its addresses one by one. A domain is
 compared as written, like an address: an internationalised domain is filed in
 the spelling its mail carries (normally the `xn--` form). A value written into
 a file by hand that is no domain by these rules is not matched on, and stays
-in the file.
+in the file. One that is a domain in another spelling (`*@acme.org`,
+`ACME.org`) is matched as that domain and rewritten in the filed spelling on
+the person's next write — so removing the domain removes that line too, as it
+does for an address in capitals or a spaced telephone number written by
+hand.
 
 **Uniqueness.** One spelling of a domain belongs to at most one person, across
 all chambers — claiming it twice answers 409 with the owner's name, like a
@@ -222,6 +226,17 @@ always be filed on a person of its own.
 instruction — applies to every sender under it, and the `From` address of a
 mail is what its sender says it is. A VIP on a freemail domain makes a VIP of
 everyone who has an account there; file those people by address.
+
+**Whom the gate takes for a mail's sender.** Only the `From` header, and only
+when the mail carries exactly one `From` header holding exactly one address the
+mail gateway's own grammar accepts — that address, lowercased in its ASCII
+letters only, is the mail's *gate sender* (`kb:gateSender` beside
+`kb:sender`), and the one thing an address or a domain here is compared with.
+The `Sender` header, a second `From`, or a `From` that lists several addresses
+is shown, never matched: with no gate sender nobody is special — the mail
+reaches its chat, buys no model turn, and rings as nobody's mail would. The
+web gateway judges every arrival by its own gate sender (its class, the
+person's prior and permits), never by whoever wrote last in the thread.
 
 ### Example
 
@@ -284,8 +299,10 @@ applies to each message**, and that brief, not the arrival, should decide how
 loudly the message rings.
 
 That is the **instruction**: free text the user writes on the person
-(`kb:instruction`; at most 2000 characters). When a message arrives from a
-person with an instruction:
+(`kb:instruction`; at most 2000 characters). It is the **person's, on every
+channel**: an instruction written for their mail also briefs a turn for each
+of their Signal, WhatsApp, Telegram and SMS messages, whose ring then waits for
+that turn's verdict. When a message arrives from a person with an instruction:
 
 1. **One model turn works it, with the instruction as its brief** — the same
    rail VIP uses (a turn in the chat's companion thread, the chat's recent
@@ -325,22 +342,37 @@ instruction without VIP and has it ask for a high importance.
 **What the system holds, whatever the instruction says:**
 
 - **Failure rings.** A turn that errors, ends without a verdict, or runs past
-  `CHAT_INSTRUCTION_TIMEOUT` (60 seconds by default) has the message rung as
-  a VIP's would be — the reason line says the turn did not finish, not that
-  the sender is a VIP. An instruction can delay a ring by at most that long
+  its timeout has the message rung as a VIP's would be — the reason line says
+  the turn did not finish, not that the sender is a VIP. The timeout is
+  `CHAT_INSTRUCTION_TIMEOUT` (60 seconds by default) for a messenger message
+  and `MAIL_INSTRUCTION_TIMEOUT` (600 seconds by default) for a mail: a mail
+  is not a chat message, ten minutes is a ring in time, and a turn that files
+  a document needs them. An instruction can delay a ring by at most that long
   and never prevent one; a draft that finishes later still lands. So does a
-  message whose turn could not be started at all. The timeout rings; it does
-  not stop the turn. A turn that files a document (the `archivist` takes
+  message whose turn could not be started at all. A mail whose turn keeps
+  failing is given at most three attempts (`MAIL_ARRIVAL_TURN_ATTEMPTS`): it
+  rings by this rule once, not once per attempt, and after the last it is
+  delivered, with one note about it in the companion. The timeout rings; it
+  does not stop the turn. A turn that files a document (the `archivist` takes
   longer than a reply does) can outlast it: the message rings as a VIP's when
   the timeout passes, the turn goes on, what it files and stages still lands,
-  and its verdict then only records. An instruction that files documents wants
-  a deployment that raises `CHAT_INSTRUCTION_TIMEOUT`, or its filed messages
-  ring. Besides a muted chat, only
-  a message the user has marked read or answered while the turn worked stays
-  quiet (opening the chat is neither, and a mark taken back before the ring
-  is due does not count): a ring would tell them nothing new, and would
-  reopen the item their reply or mark settled. See *Unread · Read · Archived*
-  in docs/messenger-chats.md.
+  and its verdict then only records. On a
+  messenger, an instruction that files documents wants a deployment that
+  raises `CHAT_INSTRUCTION_TIMEOUT`, or its filed messages ring. Besides a chat
+  the user muted, only a message the user has marked read or answered while
+  the turn worked stays quiet (opening the chat is neither, and a mark taken
+  back before the ring is due does not count): a ring would tell them nothing
+  new, and would reopen the item their reply or mark settled. See *Unread ·
+  Read · Archived* in docs/messenger-chats.md.
+- **A turn cannot silence the mail it was given.** An instructed mail turn
+  may archive its thread (`scripts/chat-flags.py`) where the instruction
+  asks. An archive or a mute the turn sets is recorded as the turn's own: a
+  turn that ends with a verdict keeps them, and the mail rings nothing; a turn
+  that fails, ends without a verdict or times out has them undone — the thread
+  un-archived and un-muted — before the failure ring. And a turn's archive covers only what
+  the turn was started for: if another mail arrived in the thread after the
+  turn's own, the thread is not archived (the answer says `newer mail
+  arrived`), and the mailbox is touched only for the mail the turn worked.
 - **No sending on a messenger.** A reply is only ever staged in the chat's
   draft; the user's send press is the only way a chat reply leaves in their
   name. That is how the chat surface works for every agent
@@ -394,11 +426,19 @@ carry both classes.
 are projected like their messenger handles, so a mail from an instructed
 sender buys the same turn — in the mail chat's companion, briefed by the
 instruction, ending in a verdict — and a mail from a sender who is neither
-VIP nor instructed buys none and pushes nothing (docs/mail-chats.md, "The
-gate", which also says what such a turn may do with a mail). This is where
+VIP nor instructed buys none and pushes nothing by default; only that
+person's importance prior and the modes they may interrupt can raise it to
+the digest or a ring (docs/mail-chats.md, "The gate", which also says what
+such a turn may do with a mail). This is where
 what e-mail triage used to know lives now: a standing rule about a sender is
 an instruction on their contact, and a rule about everything an organisation
-sends is an instruction on a contact that carries its domain.
+sends is an instruction on a contact that carries its domain. Being the
+person's, an instruction put on someone for their mail reaches their messenger
+messages too: the one-time migration of what triage knew
+(`scripts/migrate-triage.py`, docs/mail-chats.md, "The migration") briefs
+people the book already holds, and its report names those of them who also
+have a messenger handle. An instruction is taken off with
+`contacts.py update <id> --no-instruction`.
 
 *Whose* instruction applies to a mail follows the lookup of *E-mail domains*:
 `instructed_person(book, "email", address)` walks from the holder of the
@@ -415,10 +455,12 @@ then what the turn did, its verdict and anything it flagged; the attention
 sheet shows the same next to the importance, and the reason line says why the
 message rang or was held.
 
-**Cost.** One model turn per message from an instructed person, trivial ones
-included — fine for a few people, and it adds up with many; an instruction on
-a domain buys one for every mail from every address under it. For a person who
-is not a VIP, one turn's delay before a message rings, bounded by the timeout.
+**Cost.** One model turn per message from an instructed person, on every
+channel, trivial ones included — fine for a few people, and it adds up with
+many; an instruction on a domain buys one for every mail from every address
+under it. For a person who is not a VIP, one turn's delay before a message
+rings, bounded by the timeout: a minute for a messenger message, ten for a
+mail, by default.
 
 ### The projection
 

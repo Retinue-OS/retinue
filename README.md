@@ -112,12 +112,16 @@ Defines these core compose services:
   `scripts/mail-push.py`), and Mark as read, Archive and Delete reach the
   mailbox (Delete moves the thread to the Trash, which it never creates). It
   gates each arriving mail like a messenger message: nothing is pushed by
-  default, a model turn works the mail only for a sender whose contact carries
-  the VIP flag or an instruction, and a mailing list flagged `news` goes to the
-  feed. There is no e-mail triage beside it.
+  default (a contact's importance and the modes they may interrupt can say
+  otherwise), a model turn works the mail only for a sender whose contact
+  carries the VIP flag or an instruction, and a mailing list flagged `news`
+  goes to the feed (a VIP's or instructed sender's mail in it still gets its
+  chat and its turn). There is no e-mail triage beside it.
   Opt-in: it mirrors nothing until `MAIL_GATEWAY_TOKEN` is set, so an upgrade
-  that changes nothing in `.env` mirrors nothing; with no mailbox configured
-  it idles. See
+  that changes nothing in `.env` mirrors nothing — and, with e-mail triage
+  retired, nobody handles e-mail until it is set: the boot says so in a
+  dashboard thread, and the one-time triage migration waits for it. With no
+  mailbox configured it idles. See
   [`docs/messaging.md`](docs/messaging.md), "E-mail (the mail gateway)".
 - **`stt`** — a small speech-to-text microservice that owns the single Whisper
   model in the stack and exposes `POST /transcribe`. Shared by the

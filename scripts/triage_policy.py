@@ -605,9 +605,15 @@ def email_gate_decision(
 # Messenger policy                                                            #
 # --------------------------------------------------------------------------- #
 
+_ASCII_LOWER = str.maketrans("ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz")
+
+
 def _norm_handle(handle: str) -> str:
     # Phone numbers/JIDs are case-insensitive digits; usernames case-insensitive.
-    return (handle or "").strip().lower()
+    # Only ASCII letters are folded: a full Unicode lowercasing would turn a
+    # sender's KELVIN SIGN (U+212A) into "k", so that a mail from "<U+212A>ate@…"
+    # matched the VIP kate@… — a class is never reached by a look-alike.
+    return (handle or "").strip().translate(_ASCII_LOWER)
 
 
 # A mail sender a domain wildcard may be matched against: one "@", and nothing
@@ -1066,14 +1072,23 @@ def main(argv: list[str] | None = None) -> int:
         _mutate_messenger(args.channel, news_del=args.group)
     elif args.cmd == "check-handle":
         # One question left about a sender: does a model work their messages?
-        pol = load_messenger_policy(args.channel)
-        vip = _sender_member(args.channel, args.handle, set(pol.vip) | set(pol.vip_contacts))
+        # Yes for a VIP and for an instructed sender alike (exit 0), as
+        # check-email answers; the lines say which.
+        if args.channel == EMAIL_CHANNEL:
+            # Mail reads the policy as its gate does: unreadable is nobody special.
+            sender = gate_decision(EMAIL_CHANNEL, args.handle)
+            vip, instructed = sender["vip"], sender["instructed"]
+        else:
+            pol = load_messenger_policy(args.channel)
+            vip = _sender_member(args.channel, args.handle, set(pol.vip) | set(pol.vip_contacts))
+            instructed = _sender_member(args.channel, args.handle, pol.instructed_contacts)
         print("vip" if vip else "not-vip")
-        # The second question, asked only when it is answered yes: is there a
-        # brief the turn works their messages by?
-        if _sender_member(args.channel, args.handle, pol.instructed_contacts):
+        # The second question: is there a brief the turn works their messages by?
+        if instructed:
             print("instructed")
-        return 0 if vip else 3
+        if args.channel == EMAIL_CHANNEL and sender["reason"] == "policy-unreadable":
+            print("(the policy file could not be read)")
+        return 0 if (vip or instructed) else 3
     return 0
 
 

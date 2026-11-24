@@ -850,6 +850,25 @@ def test_check_email_reports_the_sender_class():
         proc = subprocess.run([sys.executable, str(SCRIPT), "check-handle", "--channel", "email",
                                "billing@acme.example"], capture_output=True, text=True, env=env)
         assert proc.returncode == 0 and proc.stdout.split() == ["vip", "instructed"], proc.stdout
+        # Its exit code answers as check-email's does: an instructed sender's
+        # mail buys a turn too (0); nobody special is 3.
+        for handle, code, lines in (("team@spitex.example", 0, ["not-vip", "instructed"]),
+                                    ("rechnung@acme.example", 0, ["vip", "instructed"]),
+                                    ("stranger@x.com", 3, ["not-vip"])):
+            proc = subprocess.run([sys.executable, str(SCRIPT), "check-handle", "--channel", "email",
+                                   handle], capture_output=True, text=True, env=env)
+            assert (proc.returncode, proc.stdout.split()) == (code, lines), (handle, proc.returncode, proc.stdout)
+        # Only ASCII letters are folded: a KELVIN SIGN never makes a look-alike
+        # of an address a class covers (its Unicode lowercase is "k").
+        assert cli("vip-add", "--channel", "email", "--handle", "kate@work.com")[0] == 0
+        code, out, _ = cli("check-email", "KATE@work.com")
+        assert code == 0 and out["sender"] == "vip", (code, out)
+        code, out, _ = cli("check-email", "\u212aate@work.com")
+        assert code == 3 and out["sender"] == "neither", (code, out)
+        assert cli("vip-add", "--channel", "email", "--handle", "*@kfz.example")[0] == 0
+        assert cli("check-email", "info@KFZ.example")[0] == 0
+        code, out, _ = cli("check-email", "info@\u212afz.example")
+        assert code == 3 and out["sender"] == "neither", (code, out)
         # …and the channel's members are listed like any channel's.
         proc = subprocess.run([sys.executable, str(SCRIPT), "show", "--channel", "email"],
                               capture_output=True, text=True, env=env)
@@ -893,6 +912,8 @@ def test_instructed_handles():
             proc = subprocess.run([sys.executable, str(SCRIPT), "check-handle", "--channel", "signal",
                                    "+41790000005"], capture_output=True, text=True, env=os.environ)
             assert proc.stdout.split() == ["not-vip", "instructed"], proc.stdout
+            # …and answers yes (0): a model works this sender's messages.
+            assert proc.returncode == 0, proc.returncode
             # A sync without instructed handles clears the class only.
             tp.sync_contacts({"signal": {"+41790000002"}})
             pol = tp.load_messenger_policy("signal")

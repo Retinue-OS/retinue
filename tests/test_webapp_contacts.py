@@ -291,7 +291,10 @@ await ok('the copy: no whitelist, e-mail reached by VIP and the instruction, dom
   assert.ok(!/whitelist/i.test(h) && !/frequent run/i.test(h), 'the retired e-mail triage is not described');
   assert.ok(h.includes('placeholder="Search names, e-mail addresses and domains"'));
   assert.ok(/A VIP's messages ring at once.*e-mail and its domains included/.test(h), h);
-  assert.ok(h.includes('neither a VIP nor instructed rings nothing'), 'a mail pushes nothing by default');
+  assert.ok(!h.includes('rings nothing'), 'a prior and permits can ring a mail: the page never says it cannot');
+  assert.ok(/neither a VIP nor instructed buys no model turn; by default it is only listed, and it waits for the digest or rings only as their importance and the modes they may interrupt in say/.test(h), h);
+  assert.ok(/longer than a minute \(ten for a mail\), the message rings anyway/.test(h), 'the mail verdict timeout is its own');
+  assert.ok(!h.includes('(never sends)') && h.includes('it sends a mail only where this says to, under the mailbox'), 'an instructed mail turn may send');
   assert.ok(/works each of their messages by this, on every channel above — a mail from one of their addresses or domains included/.test(h), h);
   assert.ok(!h.includes('every messenger channel above'), 'the instruction is not said to be messenger-only');
   assert.ok(h.includes('Writes e-mail from'));

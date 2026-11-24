@@ -362,7 +362,8 @@ class RetinueContacts extends HTMLElement {
       `<div><div class="k">May interrupt in</div><div class="chips">${modes.map(([id, m]) => chip('permit', id, f.permits.includes(id), (m && m.name) || id)).join('')}</div></div>` +
       `<div><div class="chips">${chip('vip', 'vip', f.vip, 'VIP')}</div>` +
       `<div class="note">A VIP's messages ring at once, and a model works them the moment they arrive — on every channel above, ` +
-      `e-mail and its domains included. Mail from anyone who is neither a VIP nor instructed rings nothing and is only listed.</div></div>` +
+      `e-mail and its domains included. Mail from anyone who is neither a VIP nor instructed buys no model turn; ` +
+      `by default it is only listed, and it waits for the digest or rings only as their importance and the modes they may interrupt in say.</div></div>` +
       this._instructionField(f, busy) +
       `<div class="actions"><button class="btn primary" data-act="save"${busy}>${isNew ? 'Add the contact' : 'Save'}</button>` +
       `<button class="btn" data-act="cancel"${busy}>Cancel</button></div>` +
@@ -388,9 +389,10 @@ class RetinueContacts extends HTMLElement {
       (copy ? `<div class="chips" style="margin-top:6px">${copy}</div>` : '') +
       `<div class="note">A model works each of their messages by this, on every channel above — a mail from one of ` +
       `their addresses or domains included: it stages a ` +
-      `reply in the chat's draft (never sends), takes the actions you name, and sets how important the message is — ` +
-      `which decides whether it rings, after the work is done. If that work fails or takes over a minute, the message ` +
-      `rings anyway. What they write decides how loudly it rings, so use this for senders you trust — and think twice ` +
+      `reply in the chat's draft (it sends a mail only where this says to, under the mailbox's send policy, and never a ` +
+      `message), takes the actions you name, and sets how important the message is — ` +
+      `which decides whether it rings, after the work is done. If that work fails or takes longer than a minute ` +
+      `(ten for a mail), the message rings anyway. What they write decides how loudly it rings, so use this for senders you trust — and think twice ` +
       `on SMS and e-mail, where a sender is easily faked.</div></div>`;
   }
 

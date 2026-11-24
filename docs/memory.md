@@ -190,9 +190,12 @@ month of memories.
   wants *done* with a sender's messages is not a memory: that is the
   instruction on the contact (docs/contacts.md, "The instruction"), which
   briefs the turn that works them. E-mail triage used to keep such rules as
-  `sender:` memories; `scripts/migrate-triage.py` wrote them onto the
-  contacts and superseded each with a memory that says where the rule lives
-  now (docs/mail-chats.md, "The migration").
+  `sender:` memories; `scripts/migrate-triage.py` moved those recorded before
+  it first ran — and only those that state a rule, in the memory's own words —
+  onto the contacts, and superseded each with a memory that says where the
+  rule lives now. A fact about a sender stays a memory, and a `sender:` memory
+  stored after that cutoff is never moved (docs/mail-chats.md, "The
+  migration").
 - **Name the actor.** A subagent's session inherits the `ara` default, so a
   dispatch prompt that asks a subagent to store must say `--actor <its
   basename>` explicitly.

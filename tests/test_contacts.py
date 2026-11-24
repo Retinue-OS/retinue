@@ -538,8 +538,42 @@ def test_domains(chambers, manifest):
     assert book.find("email", "a@anything.com") is None
     assert book.find("email", "a@wild.example") is None
     book.update(hand["key"], vip=True)
-    assert '"com"' in path.read_text(encoding="utf-8"), "a line this module would not write is kept"
+    text = path.read_text(encoding="utf-8")
+    assert '"com"' in text, "a line this module would not write is kept"
+    assert '"Hand.Example"' not in text and '"hand.example"' in text, "rewritten in today's spelling"
     assert contacts.policy_projection(book)["email"] == {"*@*.acme.example", "*@hand.example"}
+
+    # A value read from a spelling of its own is removed like any other: the
+    # domain written in the gate's spelling, an address in capitals, a spaced
+    # telephone, a VIP flag "1" — none comes back on the next read.
+    spelled = chambers / "work" / "contacts" / "hand-spelled.nt"
+    person = "<https://example.org/orgs#spelled>"
+    spelled.write_text(
+        f'{person} <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://xmlns.com/foaf/0.1/Person> .\n'
+        f'{person} <http://xmlns.com/foaf/0.1/name> "Spelled Org" .\n'
+        f'{person} <https://w3id.org/retinue/kb#emailDomain> "*@spelled.example" .\n'
+        f'{person} <https://w3id.org/retinue/kb#vip> "1" .\n'
+        f'{person} <https://w3id.org/retinue/kb#importance> "4.50" .\n'
+        f'{person} <http://www.w3.org/2006/vcard/ns#hasEmail> <mailto:Info@Spelled.example> .\n'
+        f'{person} <http://www.w3.org/2006/vcard/ns#hasTelephone> <tel:+41 44 111 11 11> .\n',
+        encoding="utf-8")
+    sp = book.find("email", "a@spelled.example")
+    assert (sp["domains"], sp["vip"], sp["emails"], sp["phones"], sp["importance"]) == (
+        ["spelled.example"], True, ["info@spelled.example"], ["+41441111111"], 4.5), sp
+    assert "*@spelled.example" in contacts.policy_projection(book)["email"]
+    book.update(sp["key"], remove_domains=["spelled.example"], vip=False, importance=None,
+                remove=[("email", "info@spelled.example"), ("sms", "+41441111111")])
+    book._cache.clear()
+    sp = book.get(sp["key"])
+    assert (sp["domains"], sp["vip"], sp["emails"], sp["phones"], sp["importance"]) == (
+        [], False, [], [], None), sp
+    assert "*@spelled.example" not in contacts.policy_projection(book).get("email", set())
+    text = spelled.read_text(encoding="utf-8")
+    for gone in ("emailDomain", "kb#vip", "importance", "Info@", "tel:"):
+        assert gone not in text, (gone, text)
+    assert '"Spelled Org"' in text
+    book.delete(sp["key"])
+    assert not spelled.exists() or "emailDomain" not in spelled.read_text(encoding="utf-8")
 
     for person in (acme, group, eu, jo, hand):
         book.delete(person["key"])
