@@ -2618,24 +2618,28 @@ def _environment(exc: BaseException) -> bool:
 #       Mirror._prepare). Its mail is looked for by its Message-ID in every
 #       folder, and one mail found is read as a mail read the first time
 #       where it lies — for a record that was the user's, a Sent copy
-#       first, then the copy received when the record said, then the
-#       archive; for any other, the one From the sender the lost record had
-#       — and it is the user's own again only in Sent, or in the archive
-#       From that sender: a copy the user can have put there. Never in
-#       INBOX on the strength of its From, which is its sender's to write
-#       (Mirror._read_lost, Mirror._read_found). A mail that cannot be told
-#       yet stays looked for, and /health counts it — LOST_TRIES times at
-#       most; then what is found is read as mail nothing is known of.
-#       Nothing else is carried over to whatever mail is found under its id.
-#       The limits, as they stand: while the archive does not answer, every
-#       lost id waits (/health says the archive does not answer, and counts
-#       them); an id whose mail is in no folder leaves the list with a log
-#       line and no "removed" event (there is no record to tombstone); a
-#       ledger restored from an older backup over a live one can leave two
-#       record files for one id (a record written as the first time takes a
-#       name of its own, and the backup brings back the one it had before);
-#       and a mail to oneself whose Sent copy is gone comes back as one
-#       that came in.
+#       first, then the copy received when the record said, then the rest;
+#       for any other, the one From the sender the lost record had — and it
+#       is the user's own again only in Sent, or in the archive From that
+#       sender and received when the record said (a move keeps the arrival
+#       time). A From is never evidence by itself: it is its sender's to
+#       write, and whoever was sent a mail knows its id — so a copy From
+#       that sender is known to be the record's only when it also came
+#       when the record said (Mirror._read_lost, Mirror._read_found). A
+#       mail that cannot be told yet stays looked for, and /health counts
+#       it — LOST_TRIES times at most; then what is found is read as mail
+#       nothing is known of. Nothing else is carried over to whatever mail
+#       is found under its id. The limits, as they stand: while the archive
+#       does not answer, every lost id waits (/health says the archive does
+#       not answer, and counts them); an id whose mail is in no folder, or
+#       no more where it was found, leaves the list with a log line and no
+#       "removed" event (there is no record to tombstone); a ledger restored
+#       from an older backup over a live one can leave two record files for
+#       one id (a record written as the first time takes a name of its own,
+#       and the backup brings back the one it had before); a mail to
+#       oneself whose Sent copy is gone comes back as one that came in; and
+#       so, on a server that stamps a moved mail with a new arrival time,
+#       does an archived sent mail.
 #
 #   I4  A FAULT DELAYS ONLY THE WORK THAT FAILED. Following the folders —
 #       new mail, vanished mail — keeps the poll interval whatever the rest
@@ -3833,29 +3837,31 @@ class Mirror:
         The mail read as the record's is ONE of what lies under the id. For
         a row that said "out": a Sent copy, whenever the server received it
         (a client may append its Sent copy late); then the copy the server
-        received when the row said the mail arrived; then an archive copy;
+        received when the row said the mail arrived, an archive copy first;
         then the rest. For any other: the copy From the sender the lost row
         named — the one received when the row said, else the first. A match
         whose header block does not come back counts as From nobody, and
         comes last (in Sent, still before the rest): it holds up nothing
-        where the first is known to be the record's — a Sent copy, an
-        archive copy From that sender for "out", one From that sender for
-        any other — and holds up the id where it may be the record's
-        itself. The one is read as a mail read for the first time where
-        it lies (_ingest), with one thing more: in the archive, From that
-        sender, where the row said "out", it is the user's own — a copy the
-        user can have put there, the same sender the lost record had
-        (_mirror_one). Never in INBOX: a From there is its sender's to write,
-        and whoever was sent a mail knows its id. The others are then read
-        as any further copy is: one more place of the record, marked as
-        another mail's, or a placeholder, by their own evidence.
+        where the first is known to be the record's — a Sent copy, or one
+        From that sender received when the row said (in the archive, for
+        "out") — and holds up the id where it may be the record's itself.
+        A From alone is no evidence: whoever was sent a mail knows its id
+        and can write any From. The one is read as a mail read for the
+        first time where it lies (_ingest), with one thing more: in the
+        archive, From that sender and received when the row said, where the
+        row said "out", it is the user's own — a move keeps the arrival
+        time, a look-alike delivered later does not have it (_mirror_one).
+        Never in INBOX, nor in the archive on its From alone. The others are
+        then read as any further copy is: one more place of the record,
+        marked as another mail's, or a placeholder, by their own evidence.
 
         When the row said the mail arrived is the search's only bound where
         an id cannot be searched for (_find), and a copy received just then
         is read without waiting for the scan to be whole. ``plain``: the id
         was looked for LOST_TRIES times in vain, and nothing more is waited
         for — what is found is read as mail nothing is known of (no hint),
-        and the id leaves `lost`, found or not (_read_lost)."""
+        and the id leaves `lost`, found or not, or gone since the search
+        (_read_lost)."""
         mid = hint["message_id"]
         found, sure = [], True
         for order, role in enumerate(("sent", "inbox", "archive")):
@@ -3899,23 +3905,37 @@ class Mirror:
                 late = not (got.date is not None and arrived is not None
                             and abs(got.date - arrived) < 1.0)
                 timely = timely or not late
-                key = ((role != "sent", unread, late, role != "archive", theirs) if out
-                       else (unread, theirs, late))
+                # (An archive copy received later than the row said is no
+                # more the user's than any other: ranked like any other.)
+                key = ((role != "sent", unread, late, role != "archive" or late, theirs)
+                       if out else (unread, theirs, late))
                 ranked.append(((*key, got.date is None, got.date or 0.0, order, uid),
-                               (order, role, name, uid), unread, theirs))
+                               (order, role, name, uid), unread, theirs, late))
+            if not ranked:
+                # Every match gone since the search, on the last try: not
+                # found, as where the search names none.
+                self.index.run("DELETE FROM lost WHERE message_id = ?", (mid,))
+                print(f"[mail-gateway] the mail {mid!r}, whose record is gone from the "
+                      f"ledger, is no more where it was found: there is no record to "
+                      f"tombstone", flush=True)
+                return True
             if not sure and not plain and not timely:
                 return False   # the scan reads on: the mail may be among the rest
             ranked.sort(key=lambda entry: entry[0])
-            _rank, (_order, top, _name, _uid), _unread, stranger = ranked[0]
-            told = (top == "sent" or (top == "archive" and not stranger)) if out \
-                else not stranger
+            _rank, (_order, top, _name, _uid), _unread, stranger, toplate = ranked[0]
+            # Known to be the record's: a Sent copy (only the user's client
+            # or the gateway puts one there), or a copy From that sender
+            # received when the row said — a From alone is anybody's to
+            # write, and a move keeps the arrival time.
+            told = (top == "sent" or (top == "archive" and not stranger and not toplate)) \
+                if out else not (stranger or toplate)
             if not plain and not told and len(ranked) > 1 \
-                    and any(unread for _rank, _where, unread, _theirs in ranked):
+                    and any(unread for _rank, _where, unread, _theirs, _late in ranked):
                 # A match that did not come back may be the record's, and the
                 # first of those that did is not known to be: which one is,
                 # is not known yet (I1).
                 return False
-            found = [where for _rank, where, _unread, _theirs in ranked]
+            found = [where for _rank, where, _unread, _theirs, _late in ranked]
         for n, (_order, role, name, uid) in enumerate(found):
             first = n == 0 and not plain
             try:
@@ -4124,16 +4144,23 @@ class Mirror:
         known = self.index.one("SELECT * FROM mails WHERE message_id = ? AND record != ''",
                                (mail.message_id,))
         if lost is not None and known is None and mail.message_id == lost["message_id"] \
-                and role in ("sent", "archive") and mail.sender \
-                and mail.sender == lost["sender"] and lost["direction"] == "out":
+                and mail.sender and mail.sender == lost["sender"] \
+                and lost["direction"] == "out" and (role == "sent" or (
+                    role == "archive" and fetched.date is not None
+                    and lost["arrived"] is not None
+                    and abs(fetched.date - lost["arrived"]) < 1.0)):
             # The mail of a record gone from the ledger (_read_found), From the
-            # very sender that record had, which was the user's own, in a
-            # folder the user can have put it in: the user's again, whatever
-            # address that is (a plus-address, an alias nobody listed). Never
-            # in INBOX — a From there is its sender's to write, and whoever
-            # was sent a mail knows its id: a mail to oneself whose Sent copy
-            # is gone comes back as one that came in. Any other is read as a
-            # first reading here is.
+            # very sender that record had, which was the user's own, in Sent,
+            # or in the archive received when that record said (a move keeps
+            # the arrival time; a look-alike delivered later does not have
+            # it): the user's again, whatever address that is (a plus-address,
+            # an alias nobody listed). Never on the strength of its From alone
+            # — that is its sender's to write, and whoever was sent a mail
+            # knows its id: a look-alike archived, or in an "all mail"
+            # archive, stays a mail that came in, and so do a mail to oneself
+            # whose Sent copy is gone and, on a server that stamps a moved
+            # mail with a new arrival time, an archived sent mail. Any other
+            # is read as a first reading here is.
             outbound = True
         if direction is not None and known is None:
             # What the record it had under another id said (see _ingest): the

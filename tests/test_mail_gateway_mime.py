@@ -4272,6 +4272,26 @@ _HOSTILE = t.msg("evil@x.org", sender="Mallory <m@evil.org>", subject="hostile",
                  body="Never read.\n", day=39.8)
 _HOSTILE_LIKE = t.msg("m@x.org", sender="Mallory <m@evil.org>", subject="hostile",
                       body="Never read either.\n", day=39.95)
+# A look-alike under the id of Ann's mail From Ann's own address, as anyone
+# she sent it to can write.
+_ANN_LIKE = t.msg("m@x.org", subject="Re: hello", body="Pay Mallory 5000.\n", day=39.95)
+
+
+def _gone_from_under_the_search(box) -> None:
+    """Ann's mail deleted, where the server's search still names it — in
+    INBOX, and at a UID of the archive — and FETCH finds nothing there (an
+    index that lags, or the mail expunged between the two): every match
+    gone on the last try, which here is the first (LOST_TRIES)."""
+    box.remove("INBOX", 1)
+    find = box.find
+
+    def lagging(folder, mid):
+        got = find(folder, mid)
+        if mid != "m@x.org" or folder not in ("INBOX", "Archive"):
+            return got
+        return box.gw.Matches(tuple(got.uids) + (1,), got.whole)
+    box.find = lagging
+    box.gw.LOST_TRIES = 1
 
 
 def _via(raw: bytes, n: int) -> bytes:
@@ -4407,6 +4427,16 @@ _WALKS = {
     "lost from the ledger, a look-alike under its id that never reads": dict(
         first=[("INBOX", _via(_ANN, 1))], then=[("INBOX", _HOSTILE_LIKE)], lost="all",
         hostile=_HOSTILE_LIKE, mail=[_via(_ANN, 1)], out=False),
+    "lost from the ledger, a look-alike From its own sender": dict(
+        first=[("INBOX", _via(_ANN, 1))], then=[("INBOX", _via(_ANN_LIKE, 9))], lost=True,
+        mail=[_via(_ANN, 1)], out=False),
+    "lost from the ledger, a forged From archived, its Sent copy deleted": dict(
+        first=[("Sent", _MINE)], then=[("INBOX", _via(_FORGED_LIKE, 9))],
+        does=lambda box: (box.move_mail("INBOX", 1, "Archive"), box.remove("Sent", 1)),
+        lost=True, mail=[_MINE], out=True),
+    "lost from the ledger, every match gone on the last try": dict(
+        first=[("INBOX", _ANN)], does=_gone_from_under_the_search, lost=True,
+        mail=[_ANN], out=False),
     "its record file gone under the running gateway, the mail back from the Trash": dict(
         first=[("INBOX", _ANN)], does=lambda box: box.remove("INBOX", 1),
         during={0: lambda h: h.vanish(), 1: lambda h: h.box.put("INBOX", _ANN)},
@@ -4519,9 +4549,11 @@ def _walk(name: str, *, late=(), kill=None, fault: int = 0) -> dict:
             else:
                 assert not mine, f"{where}: a mail that left is still on record as there"
                 # … and left a tombstone (or what lies there under its id is
-                # on record as itself).
-                assert under is not None and (under["removed_at"] or any(
-                    head_of(raw) == made_from(under) for raw in held)), \
+                # on record as itself; or, its record lost from the ledger,
+                # nothing: there is no record to tombstone — the stated limit).
+                assert (under is None and walk.get("lost")) or under is not None and (
+                    under["removed_at"] or any(
+                        head_of(raw) == made_from(under) for raw in held)), \
                     f"{where}: a mail left with no tombstone"
             # Every mail the mailbox holds is on record, whole (a mail that
             # never reads: a placeholder under the id of its bytes, or one
@@ -4649,10 +4681,12 @@ def test_the_invariants_hold_wherever_the_walk_is_cut():
     archived in the back-off and the process restarted, the mail deleted;
     its record lost from the ledger with a look-alike beside it (in INBOX,
     the user's own mail in Sent or the archive, one From the user's address,
-    one that never reads), then archived before it is read again, then its
-    folder renumbered or rebuilt, behind a hostile mail that never reads, a
-    forged From in the archive, a mail to oneself, a mail sent from a
-    plus-address; its record file gone while the process runs — with the
+    one From the record's own sender, one that never reads), then archived
+    before it is read again, then its folder renumbered or rebuilt, behind a
+    hostile mail that never reads, a forged From in the archive (and one
+    archived, the Sent copy deleted), a mail to oneself, a mail sent from a
+    plus-address, every match gone from under the search on the last try;
+    its record file gone while the process runs — with the
     reader late at each header reading in turn (once, and twice running,
     which is "no answer"), the process killed after each write in turn,
     both at once, and a write that fails for a while as new mail arrives. At every step: no mail that is in the mailbox is

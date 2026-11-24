@@ -385,20 +385,26 @@ tried least recently first, before the backfill and never in the way of
 new mail. Of what is found, ONE mail is read as the record's: for a row
 that said the mail was the user's, a Sent copy, whenever the server
 received it (a client may append its Sent copy late); then the copy the
-server received when the row said the mail arrived; then an archive copy;
+server received when the row said the mail arrived, an archive copy first;
 then the rest. For any other row, the copy From the sender the row named
-(the one received when the row said, else the first). A match whose header
-block does not come back counts as From nobody and comes last; it holds up
-nothing where the first is known to be the record's. That one mail is read
-as any mail is read the first time where it lies — what a Sent copy holds
-is the user's, what is in the archive the user's when it is from one of the
-user's own addresses and left Sent unseen — with one difference: in the
-archive, From that very sender, where the row said the mail was the
-user's, it is the user's again, whatever address that is (a copy the user
-can have put there). Never in INBOX: a From there is its sender's to write,
-and whoever was sent a mail knows its `Message-ID`, so a look-alike From
-the user's own address stays a mail that came in, and a second copy where
-the Sent copy is there. The others found are read as further copies of any
+(the one received when the row said, else the first). A From is never
+evidence by itself: whoever was sent a mail knows its `Message-ID` and can
+write any From. What is: a copy in Sent (only the user's client or the
+gateway puts one there), or a copy received when the row said (a move
+keeps the arrival time; a look-alike delivered later does not have it). A
+match whose header block does not come back counts as From nobody and comes
+last; it holds up nothing where the first is known to be the record's — a
+Sent copy, or one From the row's sender received when the row said (in the
+archive, for a row that said the mail was the user's). That one mail is
+read as any mail is read the first time where it lies — what a Sent copy
+holds is the user's, what is in the archive the user's when it is from one
+of the user's own addresses and left Sent unseen — with one difference: in
+the archive, From that very sender and received when the row said, where
+the row said the mail was the user's, it is the user's again, whatever
+address that is. Never in INBOX, nor in the archive on its From alone: a
+look-alike From the user's own address stays a mail that came in — in
+INBOX, archived, or in an "all mail" archive — and a second copy where the
+Sent copy is there. The others found are read as further copies of any
 mail are (one more place, another mail's, or a placeholder). Found in no
 folder, with every folder sure of it, the id is dropped. Where that cannot
 be told yet — a folder that would not answer, a header block that did not
@@ -412,13 +418,15 @@ line says so, and the id is looked for no more.
 
 What this leaves, plainly: while the archive does not answer, every lost id
 waits (`/health` says the archive does not answer, and counts them); an id
-whose mail is in no folder leaves the list with a log line and no `removed`
-event — there is no record to tombstone; a ledger restored from an older
-backup over a live one can leave two record files for one id (a record
-written as the first time takes a name of its own, and the backup brings
-back the one it had before); and a mail to oneself whose Sent copy is gone
-comes back as a mail that came in — nothing but its From says the user
-wrote it.
+whose mail is in no folder, or no more where the search found it, leaves
+the list with a log line and no `removed` event — there is no record to
+tombstone; a ledger restored from an older backup over a live one can leave
+two record files for one id (a record written as the first time takes a
+name of its own, and the backup brings back the one it had before); a mail
+to oneself whose Sent copy is gone comes back as a mail that came in —
+nothing but its From says the user wrote it; and on a server that stamps a
+moved mail with a new arrival time, an archived sent mail comes back as a
+mail that came in too — its From is all that is left to say so.
 
 The bookkeeping behind this keeps four rules, written out above `class
 Mirror` in the gateway: an answer that was not obtained is never an answer; a
