@@ -3457,6 +3457,19 @@ def test_one_press_is_one_mail():
         status, said = w.send(to=["ann@x.org"], message="No.", request_key="q-2")
         assert status == 409 and said["status"] == "rejected" and len(smtp.mails) == 1
         assert said["repeat"] is True
+        # The same words with another file are another mail too: the key is
+        # held to the attachments themselves, not to how many there are.
+        one = {"filename": "a.txt", "content_type": "text/plain",
+               "data": base64.b64encode(b"one").decode()}
+        two = dict(one, data=base64.b64encode(b"two").decode())
+        filed = dict(to=["ann@x.org"], message="With a file.", request_key="q-file")
+        status, first = w.send(images=[one], **filed)
+        assert status in (200, 202), first
+        status, same = w.send(images=[one], **filed)
+        assert same.get("repeat") is True and same.get("request_id") == first.get("request_id")
+        status, said = w.send(images=[two], **filed)
+        assert status == 409 and "request_key" in said["error"] and "repeat" not in said, said
+        assert len(gw.SENDS.entries()) == len({e["id"] for e in gw.SENDS.entries()})
     finally:
         done(w)
     print("ok: a request_key makes a repeat of /send answer the first one's outcome, unsent")

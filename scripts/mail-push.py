@@ -296,7 +296,7 @@ def main() -> int:
         if repeat:
             print(repeat)
         return 0
-    if 200 <= status < 300:
+    if 200 <= status < 300 and not body.get("unconfirmed"):
         print(f"mail-push: sent (message id {body.get('message_id', '?')}, "
               f"thread {body.get('chat', '?')})")
         refused = body.get("refused") or []
@@ -307,6 +307,8 @@ def main() -> int:
         if repeat:
             print(repeat)
         return 0
+    # (An answer that says "unconfirmed" is that whatever its status: a
+    # relay's 202 for the gateway's 502 is never taken for "sent".)
     print(f"mail-push: gateway returned {status}: {body.get('error', '')}", file=sys.stderr)
     if body.get("unconfirmed"):
         print(unknown, file=sys.stderr)
