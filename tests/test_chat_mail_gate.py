@@ -1402,6 +1402,23 @@ def test_a_ring_owed_outlives_what_came_after(base, wg):
     assert status == 202 and body["pushed"] is True and len(PUSHES) == 1, (body, PUSHES)
     assert len(TURNS) == 1, "a second turn ran for a ring"
     assert not cs.owes(wg._CHAT_STATE.get(chat), mid)
+    # The ring rung late, the mail is done with: its handle answers done, so
+    # the gateway accepts it — also once the retry window is over, when an
+    # error would buy it a second turn (decision V) — and after a restart
+    # the chat's own record says its turn is over.
+    assert _await_job(base, body["job_url"])["status"] == "done"
+    retry = wg.CHAT_ARRIVAL_RETRY_SECONDS
+    wg.CHAT_ARRIVAL_RETRY_SECONDS = 0.0
+    try:
+        for restarted in (False, True):
+            if restarted:
+                _restart(wg, chat)
+            status, again = _again(base, key, o, mid, ts, gate=INSTRUCTED)
+            assert status == 202 and again["accepted"] is True, (restarted, again)
+            assert _await_job(base, again["job_url"])["status"] == "done", restarted
+            assert len(TURNS) == 1 and len(PUSHES) == 1, (restarted, len(TURNS), PUSHES)
+    finally:
+        wg.CHAT_ARRIVAL_RETRY_SECONDS = retry
 
     wg._CONTACTS.delete(office["key"])
     _forget(wg, *chats)
@@ -1468,15 +1485,49 @@ def test_a_turns_archive_reaches_only_its_mail(base, wg):
     assert _instructed(wg, chat)["delivery"] != "quiet", _instructed(wg, chat)
     assert (chat, "archive") not in wg._mailbox_owed
 
+    # A reply the mirror has already written to the store, whose offer the
+    # rail has not counted yet (its backoff, a slow rail): the archive is
+    # made — the chat's count knows of nothing newer — and the mailbox
+    # hears of the turn's own mail alone, named at the decision; the reply
+    # stays in the inbox, and its offer brings the thread back.
+    key2 = "scope-later@firm.example"
+    chat2 = _chat_id(key2)
+    GW["requests"].clear()
+    later: dict = {}
+
+    def files_while_a_reply_waits(prompt):
+        SEQ["n"] += 1
+        later["mid"], later["ts"] = f"carol-{SEQ['n']}@partner.example", NOW - 3000 + SEQ["n"]
+        mail._mail(key2, later["mid"], later["ts"], sender=carol["address"], text="do NOT pay")
+        later["flags"] = _agent_flags(base, chat2, archived=True)
+        _verdict(base, chat2, 0)(prompt)
+
+    TURN_GATE["during"] = files_while_a_reply_waits
+    try:
+        status, body, mid2, _t = _arrive(base, key2, billing, gate=INSTRUCTED, text="Invoice 8")
+        assert status == 202, body
+        assert _await_job(base, body["job_url"])["status"] == "done"
+    finally:
+        TURN_GATE["during"] = None
+    wg._mailbox_wait()
+    status, out = later["flags"]
+    assert status == 200 and out["archived"] is True and "reason" not in out, out
+    assert _hooks("/chats/archive") == [
+        {"chat": key2, "account": ACCOUNT, "message_ids": [mid2]}], GW["requests"]
+    _again(base, key2, carol, later["mid"], later["ts"])
+    assert wg._CHAT_STATE.get(chat2)["archived"] is False
+
     wg._CONTACTS.delete(office["key"])
-    _forget(wg, chat)
+    _forget(wg, chat, chat2)
     print("PASS test_a_turns_archive_reaches_only_its_mail")
 
 
-def test_a_turns_mute_is_undone_with_its_archive(base, wg):
-    """A turn's mute is its archive: kept with a verdict, undone — un-muted
-    and un-archived — before the failure ring when the turn ends without
-    one, fails or runs past the timeout. A mute the user set stays."""
+def test_a_turn_cannot_mute(base, wg):
+    """Decision S: a mute asked by a running arrival turn is the archive it
+    also is, and the answer says so. That archive is the turn's like any
+    other — kept with a verdict, undone before the failure ring when the
+    turn ends without one, fails or runs past the timeout — and the chat's
+    next mail brings it back, a VIP's rung. A mute the user set stays."""
     office = _person(wg, "Mute Office", "office@mute.example", instruction=FILING,
                      permits=["focused"])
     sender = _party("office@mute.example", "Office")
@@ -1485,7 +1536,9 @@ def test_a_turns_mute_is_undone_with_its_archive(base, wg):
 
     def mutes(prompt):
         status, out = _agent_flags(base, chat, muted=True)
-        assert status == 200 and out["muted"] is True, out
+        assert status == 200 and out["muted"] is False and out["archived"] is True, out
+        assert out["reason"] == "a turn cannot mute; archived instead", out
+        assert wg._CHAT_STATE.get(chat)["muted"] is False
 
     for how in ("no verdict", "fails"):
         PUSHES.clear()
@@ -1520,6 +1573,52 @@ def test_a_turns_mute_is_undone_with_its_archive(base, wg):
     _await_job(base, body["job_url"])
     assert len(PUSHES) == 1
 
+    # A mute and a verdict: the archive stands — and the thread's next
+    # mails, which the turn never saw, bring it back: a correspondent's
+    # listed, a VIP's rung. (A mute would have kept both away for good.)
+    vip = _person(wg, "Mute Vip", "vip@mute.example", vip=True)
+    PUSHES.clear()
+
+    def mutes_then_judges(prompt):
+        mutes(prompt)
+        _verdict(base, chat, 0)(prompt)
+
+    TURN_GATE["during"] = mutes_then_judges
+    try:
+        status, body, _m, _t = _arrive(base, key, sender, gate=INSTRUCTED, text="invoice")
+        assert _await_job(base, body["job_url"])["status"] == "done"
+    finally:
+        TURN_GATE["during"] = None
+    doc = wg._CHAT_STATE.get(chat)
+    assert doc["archived"] is True and doc["muted"] is False and not PUSHES, doc
+    _arrive(base, key, _party("carol@partner.example", "Carol"), text="do NOT pay")
+    doc = wg._CHAT_STATE.get(chat)
+    assert doc["archived"] is False and chat in mail._home(base), doc
+    status, body, _m, _t = _arrive(base, key, _party("vip@mute.example", "Vip"), gate=VIP,
+                                   text="call me")
+    assert body["pushed"] is True and len(PUSHES) == 1, (body, PUSHES)
+    _await_job(base, body["job_url"])
+
+    # A VIP's turn that mutes and then fails leaves no mute behind either:
+    # the VIP's next mail rings.
+    _http(base, "POST", f"/chats/{_quote(chat)}/flags", {"archived": False})
+    PUSHES.clear()
+    TURN_GATE.update(during=mutes, fail=True)
+    try:
+        status, body, _m, _t = _arrive(base, key, _party("vip@mute.example", "Vip"), gate=VIP,
+                                       text="mute this thread")
+        assert _await_job(base, body["job_url"])["status"] == "error"
+    finally:
+        TURN_GATE.update(during=None, fail=False)
+    assert wg._CHAT_STATE.get(chat)["muted"] is False
+    PUSHES.clear()
+    status, body, _m, _t = _arrive(base, key, _party("vip@mute.example", "Vip"), gate=VIP,
+                                   text="are you there?")
+    assert body["pushed"] is True and len(PUSHES) == 1, (body, PUSHES)
+    assert wg._CHAT_STATE.get(chat)["archived"] is False
+    _await_job(base, body["job_url"])
+    wg._CONTACTS.delete(vip["key"])
+
     # The user's mute while the turn works is theirs: it stays, quiet.
     PUSHES.clear()
 
@@ -1536,8 +1635,8 @@ def test_a_turns_mute_is_undone_with_its_archive(base, wg):
     doc = wg._CHAT_STATE.get(chat)
     assert doc["muted"] is True and not PUSHES, (doc["muted"], PUSHES)
     assert _instructed(wg, chat)["delivery"] == "quiet"
-    # The user's mute overrules the turn's too: the turn muted, the user
-    # muted after it — the mute is the user's and stays.
+    # The user's mute overrules the turn's archive too: the turn asked to
+    # mute, the user muted after it — the mute is the user's and stays.
     _http(base, "POST", f"/chats/{_quote(chat)}/flags", {"muted": False, "archived": False})
 
     def both_mute(prompt):
@@ -1554,7 +1653,7 @@ def test_a_turns_mute_is_undone_with_its_archive(base, wg):
 
     wg._CONTACTS.delete(office["key"])
     _forget(wg, chat)
-    print("PASS test_a_turns_mute_is_undone_with_its_archive")
+    print("PASS test_a_turn_cannot_mute")
 
 
 def test_a_thread_merged_while_its_turn_runs(base, wg):
@@ -1675,8 +1774,53 @@ def test_a_failing_turn_gives_up(base, wg):
     assert len(said) == 1 and said[0].startswith("I tried 3 times"), said
     assert not any("Please try again" in s for s in said)
 
+    # The process dies during the last attempt: the next offer finds the
+    # count on the chat's state and gives up there — no fourth turn, one
+    # note — and a further restart buys the mail nothing either.
+    key2 = "fail-restart@fail.example"
+    chat2 = _chat_id(key2)
+    TURNS.clear()
+    PUSHES.clear()
+    hold = threading.Event()
+    wg.CHAT_ARRIVAL_RETRY_SECONDS = 0.0
+    TURN_GATE["fail"] = True
+
+    def notes():
+        conv = wg._load_conv(wg._CHAT_STATE.get(chat2)["companion"])
+        return [m["text"] for m in conv["messages"] if m.get("role") == "assistant"]
+
+    try:
+        status, body, mid2, ts2 = _arrive(base, key2, o, gate=INSTRUCTED)
+        _await_job(base, body["job_url"])
+        _await_job(base, _again(base, key2, o, mid2, ts2, gate=INSTRUCTED)[1]["job_url"])
+        TURN_GATE["hold"] = hold
+        _again(base, key2, o, mid2, ts2, gate=INSTRUCTED)
+        _wait_for(lambda: len(TURNS) == 3, "the last attempt to start")
+        for _restarts in range(2):
+            _restart(wg, chat2)
+            with wg._chat_turns_lock:
+                wg._CHAT_TURNS.pop(chat2, None)
+                wg._RUNNING_TURNS.pop(chat2, None)
+            status, body = _again(base, key2, o, mid2, ts2, gate=INSTRUCTED)
+            job = _await_job(base, body["job_url"])
+            assert status == 202 and job["status"] == "done", job
+            assert len(TURNS) == 3, "a restart bought the mail another turn"
+            said = notes()
+            assert len(said) == 1 and said[0].startswith("I tried 3 times"), said
+    finally:
+        TURN_GATE.update(fail=False)
+        hold.set()
+        TURN_GATE.update(hold=None)
+        wg.CHAT_ARRIVAL_RETRY_SECONDS = retry
+    # (The turn held here, which a real restart would have killed, ends.)
+    for thread in threading.enumerate():
+        if thread.name.startswith("chat-turn-"):
+            thread.join(10)
+    gave_up = [n for n in notes() if n.startswith("I tried")]
+    assert len(gave_up) == 1 and len(TURNS) == 3, (notes(), len(TURNS))
+
     wg._CONTACTS.delete(office["key"])
-    _forget(wg, chat)
+    _forget(wg, chat, chat2)
     PUSHES.clear()
     print("PASS test_a_failing_turn_gives_up")
 
@@ -1840,6 +1984,49 @@ def test_a_messenger_turn_is_worded_as_before(base, wg):
     print("PASS test_a_messenger_turn_is_worded_as_before")
 
 
+def test_a_messenger_timeout_only_rings(base, wg):
+    """Decision S: a messenger instructed turn behaves as before the gate
+    phase — its timeout rings, and undoes nothing the turn did: a turn that
+    archives its chat and outlasts CHAT_INSTRUCTION_TIMEOUT leaves it
+    archived, also once its verdict comes."""
+    person = wg._CONTACTS.create("private", "Spitex Timeout", [("telegram", "888001")],
+                                 instruction="File what they send, then archive the chat.",
+                                 permits=["focused"])
+    chat = "telegram:888001"
+    event = {"direction": "in", "channel": "telegram", "chat": "888001", "sender": "888001",
+             "sender_name": "Spitex", "group": False, "message_id": "tm1",
+             "text": "invoice attached", "handover": True, "gate": dict(INSTRUCTED)}
+    seen: dict = {}
+
+    def during(prompt):
+        status, out = _agent_flags(base, chat, archived=True)
+        assert status == 200 and out["archived"] is True, out
+        _wait_for(lambda: len(PUSHES) == 1, "the timeout to ring the message")
+        seen["archived"] = wg._CHAT_STATE.get(chat).get("archived")
+        _verdict(base, chat, 1)(prompt)
+
+    timeout = wg.CHAT_INSTRUCTION_TIMEOUT
+    wg.CHAT_INSTRUCTION_TIMEOUT = 0.3
+    PUSHES.clear()
+    TURN_GATE["during"] = during
+    try:
+        status, body = _http(base, "POST", "/internal/chats/inbound", event)
+        assert status == 202, body
+        assert _await_job(base, body["job_url"])["status"] == "done"
+    finally:
+        TURN_GATE["during"] = None
+        wg.CHAT_INSTRUCTION_TIMEOUT = timeout
+    assert seen["archived"] is True, "the timeout un-archived a messenger chat"
+    doc = wg._CHAT_STATE.get(chat)
+    assert doc["archived"] is True and len(PUSHES) == 1, (doc.get("archived"), PUSHES)
+    assert doc["instructed"]["delivery"] == "rang", doc["instructed"]
+    wg._CONTACTS.delete(person["key"])
+    wg._CHAT_STATE.delete(chat)
+    wg._CHAT_OVERLAY.forget(chat)
+    PUSHES.clear()
+    print("PASS test_a_messenger_timeout_only_rings")
+
+
 def main():
     sparql = mail._serve(mail._MockSparql)
     mail_gw = mail._serve(_MailGateway)
@@ -1883,12 +2070,13 @@ def main():
         test_a_repeated_offer_is_told_by_what_its_arrival_owes(base, wg)
         test_a_ring_owed_outlives_what_came_after(base, wg)
         test_a_turns_archive_reaches_only_its_mail(base, wg)
-        test_a_turns_mute_is_undone_with_its_archive(base, wg)
+        test_a_turn_cannot_mute(base, wg)
         test_a_thread_merged_while_its_turn_runs(base, wg)
         test_a_failing_turn_gives_up(base, wg)
         test_turns_switched_off(base, wg)
         test_contacts_api_takes_domains(base, wg)
         test_a_messenger_turn_is_worded_as_before(base, wg)
+        test_a_messenger_timeout_only_rings(base, wg)
         server.shutdown()
     sparql.shutdown()
     mail_gw.shutdown()

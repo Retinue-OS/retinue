@@ -737,6 +737,11 @@ section.)
    that a draft is on its way, then the verdict and what the turn flagged.
    A message the user answered or marked read while its turn worked is not
    rung afterwards; opening the chat is neither (*Unread · Read · Archived*).
+   The timeout only rings: what the turn did by then stands — a chat it
+   archived (`chat-flags.py --archive`, which the instruction asked for)
+   stays archived, also once its verdict comes. A turn cannot mute: a mute
+   it asks for is taken as an archive, and the answer says so
+   (docs/dashboard.md, "The gate for mail").
 
    As built, five things are worth naming:
 
@@ -821,11 +826,14 @@ code, and five things differ because the channel is a mailbox
   instruction asks — send one with `mail-push.py --chat <id>` under the
   mailbox's send policy, add a calendar event under its policy, and
   **archive the thread** with `chat-flags.py`. It ends with the verdict. A
-  thread its turn archived rings nothing; a turn that archived (or muted)
-  and did not finish has the chat brought back — un-archived and un-muted —
-  and the mail rung. A turn's archive reaches only the mail it was given: a
-  mail that arrived while it worked keeps the thread in view and in the
-  inbox. A merge of the thread while its turn runs moves the turn with it.
+  turn cannot mute (a mute it asks for is an archive). A thread its turn
+  archived rings nothing; a turn that archived and did not finish — it
+  failed, set no verdict, or, for a mail unlike a messenger message, ran
+  past the timeout — has the chat brought back and the mail rung. A turn's
+  archive reaches only the mail it was given: a mail that arrived while it
+  worked keeps the thread in view and in the inbox, and the mailbox hears
+  of the turn's own mails by `Message-ID`. A merge of the thread while its
+  turn runs moves the turn with it.
 - **There is no triage fallback.** Step 4's "forwards to triage exactly as
   it always has" does not exist for mail: a mail the rail did not accept
   stays `delivered: false` and the mail gateway offers it again on a later
@@ -836,7 +844,8 @@ code, and five things differ because the channel is a mailbox
   got that far does what it owed. The handle of a turn that failed is
   handed back only for `CHAT_ARRIVAL_RETRY_SECONDS` before the next offer
   starts the turn anew, and a mail gets at most `MAIL_ARRIVAL_TURN_ATTEMPTS`
-  turns.
+  turns — counted on the chat's state, with the mails whose turns are over,
+  so a restart buys a mail no further turn.
 - **`CHAT_ARRIVAL_TURNS=0` still accepts a mail** — its gateway has nowhere
   else to take it — and runs no turn for it.
 - **The timeout is longer.** `MAIL_INSTRUCTION_TIMEOUT` (600 s) bounds how

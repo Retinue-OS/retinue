@@ -488,12 +488,23 @@ def chat_item(chat: dict, state: dict, profile: dict) -> dict:
     The sender (:func:`chat_sender`) is also the key the profile's priors and
     permits use, and the item's title — but for a mail from an address
     nobody in the address book holds, whose key is the address and whose
-    title is the name the mail carried, when it carried one."""
+    title is the name the mail carried, when it carried one.
+
+    An item whose block says it is about **nobody** (``nobody``: the arrival
+    that opened it was a mail the gate took for nobody's, and none with a
+    sender has come since — the web gateway's _attention_arrive_chat) is
+    nobody's however it is rebuilt: the chat's peer on record is whoever
+    wrote last with an address, and must not lend that mail their name,
+    card, prior or permits — on the home list, in the sweep, in a
+    correction (:data:`MAIL_NOBODY`)."""
     block = dict((state or {}).get("attention") or {})
     # Read before the defaults below fill the block in.
     predates_model = not block
-    name = chat_sender(chat, state)
     mail = chat.get("channel") == MAIL_CHANNEL
+    nobody = mail and block.get("nobody") is True
+    if nobody:
+        chat = dict(chat, peer=dict(MAIL_NOBODY))
+    name = chat_sender(chat, state)
     peer = (chat.get("peer") or (state or {}).get("peer") or {}) if mail else {}
     title = peer.get("name") if mail and name == peer.get("address") else None
     # The card that speaks for the chat: none for a mail thread that is no
@@ -560,6 +571,9 @@ def chat_item(chat: dict, state: dict, profile: dict) -> dict:
         # with nothing unread in it (chat_wants_attention). Kept in the
         # block (block_for) while the judgement it belongs to is.
         "declared": bool(block.get("declared")),
+        # About nobody (see above): kept in the block (block_for) until an
+        # arrival with a sender judges the item afresh.
+        "nobody": nobody,
         # How a standing instruction is working, or worked, its newest
         # message (the web gateway's _instructed_note), for the details sheet.
         "instructed": (state or {}).get("instructed") or None,
@@ -733,12 +747,15 @@ def _humanize_sphere(value: str) -> str:
 def block_for(item: dict) -> dict:
     """The ``attention`` block to store back on the item's document — for a
     project with the snapshot of its frontmatter (see project_item), for a
-    chat an agent declared attention on with that fact (see chat_item)."""
+    chat an agent declared attention on with that fact, and for a mail
+    chat's item about nobody with that one (see chat_item)."""
     block = policy.item_to_attention(item)
     if item.get("frontmatter") is not None:
         block["frontmatter"] = item["frontmatter"]
     if item.get("declared"):
         block["declared"] = True
+    if item.get("nobody"):
+        block["nobody"] = True
     return block
 
 

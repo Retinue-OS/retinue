@@ -622,6 +622,47 @@ def test_news_and_a_vip_in_the_list(w: World):
     print("PASS test_news_and_a_vip_in_the_list")
 
 
+def test_a_turns_mute_is_an_archive(w: World):
+    """Decision S across the seam: a turn that runs `chat-flags.py --mute`
+    archives — the mailbox moves the turn's own mail, the answer says the
+    mute was not made — and the thread's next mail, a VIP's, brings it back
+    and rings."""
+    _reset()
+    w.archived.clear()
+    key = "inv4@pay.bills.example"
+    answers: list = []
+
+    def mutes(prompt):
+        code, out = w.script("chat-flags.py", "--chat", w.chat(key), "--mute")
+        answers.append(out)
+        assert code == 0, out
+        code, out = w.script("chat-verdict.py", "--chat", w.chat(key), "--importance", "0")
+        assert code == 0, out
+
+    TURN_GATE["during"] = mutes
+    w.arrives(key, sender="Billing <invoices@bills.example>", subject="Invoice 9")
+    _wait(lambda: w.delivered(key), "delivered")
+    TURN_GATE["during"] = None
+    w.wg._mailbox_wait()
+    assert answers and "a turn cannot mute; archived instead" in answers[0], answers
+    assert w.archived == [(key, {key})], w.archived
+    doc = w.doc(key)
+    assert doc["archived"] is True and doc["muted"] is False, doc
+    assert not PUSHES
+    hold = TURN_GATE["hold"] = threading.Event()
+    try:
+        w.arrives("inv5@corp.example", sender="Boss <boss@corp.example>",
+                  subject="Re: Invoice 9", refs=[key], irt=key)
+        _wait(lambda: len(PUSHES) == 1, "the VIP's reply to ring")
+        assert w.rec("inv5@corp.example")["chat"] == key
+        assert w.doc(key)["archived"] is False and w.listed(key)
+    finally:
+        hold.set()
+        TURN_GATE["hold"] = None
+    _wait(lambda: w.delivered("inv5@corp.example"), "the VIP's reply delivered")
+    print("PASS test_a_turns_mute_is_an_archive")
+
+
 def main():
     started = time.time()
     with tempfile.TemporaryDirectory() as tmp:
@@ -646,6 +687,7 @@ def main():
             test_the_turn_archives_its_mail(w)
             test_a_newer_mail_keeps_the_chat(w)
             test_news_and_a_vip_in_the_list(w)
+            test_a_turns_mute_is_an_archive(w)
         finally:
             TURN_GATE.update(during=None, fail=False)
             if TURN_GATE.get("hold") is not None:

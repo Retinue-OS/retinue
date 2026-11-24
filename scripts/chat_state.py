@@ -45,7 +45,9 @@ one JSON document per chat under ``CHAT_STATE_DIR``:
   this side did not accept again, and that offer finds here whether what the
   first one owed was ever done — also after a restart, a merge or a later
   arrival. And how many turns each mail has had (:meth:`note_turn_attempt`),
-  so one whose turn keeps failing is not worked for ever.
+  so one whose turn keeps failing is not worked for ever — and
+  ``turns_done``, the mails whose turn completed (:meth:`note_turn_done`),
+  so one offered again after a restart is not worked a second time.
 - ``inbound_ahead`` / ``read_ahead`` — the latest stamp an arrival carried
   from a little ahead of this clock, and how far past ``last_read`` the
   newest read reaches by it: a message stamped by a clock running fast lies
@@ -462,6 +464,12 @@ def turn_attempts(doc: dict | None, message_id: str | None) -> int:
     return 0
 
 
+def turn_done(doc: dict | None, message_id: str | None) -> bool:
+    """Whether a turn for the arrival with this id completed
+    (:meth:`ChatStateStore.note_turn_done`)."""
+    return bool(message_id) and str(message_id) in ((doc or {}).get("turns_done") or [])
+
+
 def gone_arrivals(doc: dict | None) -> list[int]:
     """The places in the chat's arrival count of the counted arrivals that are
     gone from where they came from (``inbound_gone``), ascending — whatever of
@@ -746,6 +754,10 @@ class ChatStateStore:
             # most INBOUND_RECENT_MAX (note_turn_attempt): the web gateway
             # stops starting turns for one whose turn keeps failing.
             "turn_attempts": [],
+            # The mails whose turn completed, at most INBOUND_RECENT_MAX
+            # (note_turn_done): one offered again — its answer lost, this
+            # process restarted — is accepted without another turn.
+            "turns_done": [],
             # The latest stamp a counted arrival carried from ahead of this
             # clock, no further than READ_SKEW_SECONDS: a sender's clock, or
             # a receiving phone's, running a little fast. The rail takes
@@ -1198,6 +1210,10 @@ class ChatStateStore:
                         attempts[str(pair[0])] = max(attempts.get(str(pair[0]), 0),
                                                      int(pair[1] or 0))
             doc["turn_attempts"] = [[m, n] for m, n in attempts.items()][-INBOUND_RECENT_MAX:]
+            done = list(dict.fromkeys(
+                [str(m) for m in (gone.get("turns_done") or []) if m]
+                + [str(m) for m in (doc.get("turns_done") or []) if m]))
+            doc["turns_done"] = done[-INBOUND_RECENT_MAX:]
 
             doc["read_inbound"] = mine_read + their_read if read_before else None
             doc["last_read"] = mark
@@ -1739,25 +1755,34 @@ class ChatStateStore:
             self._write(doc)
             return count
 
-    def archive_through(self, chat_id: str, cut: int, *,
-                        muted: bool = False) -> tuple[dict, bool]:
-        """Archive — and with ``muted`` mute — a chat for an agent's turn
-        that was started for the arrivals up to place ``cut`` in its count,
-        unless one has been counted since (``inbound_seq`` past ``cut``):
-        the turn never saw it, and archiving would put it away unseen.
-        Returns ``(doc, done)``.
+    def note_turn_done(self, chat_id: str, message_id: str | None) -> None:
+        """A turn for the arrival with this id completed: its next offer —
+        made because the answer to this one was lost — is no reason for
+        another (:func:`turn_done`)."""
+        if not message_id:
+            return
+        with self._lock:
+            doc = self._read(chat_id)
+            done = [m for m in doc.get("turns_done") or [] if m != str(message_id)]
+            doc["turns_done"] = (done + [str(message_id)])[-INBOUND_RECENT_MAX:]
+            self._write(doc)
+
+    def archive_through(self, chat_id: str, cut: int) -> tuple[dict, bool]:
+        """Archive a chat for an agent's turn that was started for the
+        arrivals up to place ``cut`` in its count, unless one has been
+        counted since (``inbound_seq`` past ``cut``): the turn never saw it,
+        and archiving would put it away unseen. Returns ``(doc, done)``.
+        (Never a mute: a turn cannot mute — the web gateway's _turn_flags.)
 
         One decision under the lock, like :meth:`archive_unless_arrived`:
         an arrival counts itself before it unarchives, so either this sees
         the count and leaves the chat be, or it archives first and the
-        arrival's unarchive brings the chat back (unless this muted it)."""
+        arrival's unarchive brings the chat back."""
         with self._lock:
             doc = self._read(chat_id)
             if int(doc.get("inbound_seq") or 0) > int(cut):
                 return doc, False
             doc["archived"] = True
-            if muted:
-                doc["muted"] = True
             self._write(doc)
             return doc, True
 

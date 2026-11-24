@@ -17,7 +17,8 @@ Two callers have a reason to. A turn worked by a sender's standing instruction
 (docs/contacts.md, "The instruction") archives the mail the instruction told
 it to file — "File the document with the Archivist, book it, then archive the
 mail." — and names that in its verdict (`chat-verdict.py --action "archived
-the mail"`). And Ara archives or mutes a chat when the user asks her to.
+the mail"`). And Ara archives or mutes a chat when the user asks her to —
+outside an arrival turn: muting is the user's alone.
 
 For a mail thread the mailbox follows the chat, exactly as when the user
 archives it themselves (docs/mail-chats.md, "The mailbox follows the chat"):
@@ -32,8 +33,16 @@ thread since the turn's own, the thread is not archived — the turn never saw
 that mail — and only the mails the turn worked leave the inbox; the answer
 says so (``"archived": false, "reason": "newer mail arrived"``) and this
 prints a note: say it in the verdict, and let the verdict's importance
-decide. An archive or mute such a turn made is undone if it ends without a
-verdict, fails or runs past its timeout, and the mail then rings.
+decide. An archive such a turn made is undone if it ends without a verdict
+or fails — in a mail thread also once it runs past its timeout — and the
+message then rings.
+
+A turn cannot mute. A mute keeps every later message of the chat out of
+view and unrung, a VIP's included, and that is the user's to decide. So
+``--mute`` from a running arrival turn is taken as the archive it also is,
+and the answer says so (``"muted": false, "reason": "a turn cannot mute;
+archived instead"``, beside what the archive itself answered); this prints
+a note. The next message brings the chat back, as after any archive.
 
 `--star` / `--unstar` exist for the same reason they do on a dashboard thread
 (conversation-push.py): the star is the user's, so set or clear it only on
@@ -84,7 +93,9 @@ def main() -> int:
                          help="back into the list (the mailbox is not touched)")
     mute = parser.add_mutually_exclusive_group()
     mute.add_argument("--mute", dest="muted", action="store_const", const=True,
-                      help="archive it, and let no new message bring it back")
+                      help="archive it, and let no new message bring it back — only on "
+                           "the user's word; from a running arrival turn it is an "
+                           "archive")
     mute.add_argument("--unmute", dest="muted", action="store_const", const=False,
                       help="let the next message bring it back (it stays archived until then)")
     star = parser.add_mutually_exclusive_group()
@@ -142,6 +153,11 @@ def main() -> int:
         return 1
 
     print(json.dumps(body, ensure_ascii=False))
+    if payload.get("muted") is True and body.get("muted") is False \
+            and str(body.get("reason") or "").startswith("a turn cannot mute"):
+        print("chat-flags: a turn cannot mute; the chat was archived instead, and its "
+              "next message brings it back. Muting is the user's to decide.",
+              file=sys.stderr)
     if body.get("reason") and payload.get("archived") is not False \
             and not body.get("archived"):
         print(f"chat-flags: the thread was not archived ({body['reason']}): it stays in "

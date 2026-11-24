@@ -682,8 +682,8 @@ def test_what_an_arrival_owes_is_kept_per_arrival():
         # A turn's archive: made only while nothing arrived past its cut.
         doc, done = store.archive_through(b, cut=2)
         assert not done and not doc["archived"], doc["inbound_seq"]
-        doc, done = store.archive_through(b, cut=doc["inbound_seq"], muted=True)
-        assert done and doc["archived"] and doc["muted"]
+        doc, done = store.archive_through(b, cut=doc["inbound_seq"])
+        assert done and doc["archived"] and not doc.get("muted"), "a turn's archive never mutes"
         print("PASS test_what_an_arrival_owes_is_kept_per_arrival")
 
 
