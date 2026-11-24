@@ -482,6 +482,12 @@ def test_email_gate_decision_answers_the_group_axis():
         "group": "sgcarney.substack.com", "news": True, "quieted": False, "ignored": True}
     # A news group that is neither quieted nor ignored.
     assert axis("anyone@x.com", "<digest.list.example.org>")["news"] is True
+    # Only ASCII letters are folded, on the group axis too: a KELVIN SIGN
+    # (Unicode lowercase "k") is no look-alike of a flagged sender or list.
+    assert axis("NO-REPLY@SUBSTACK.COM")["ignored"] is True
+    assert axis("no-reply@substacK.com")["ignored"] is False
+    assert axis("x@x.com", "<SGCARNEY.SUBSTACK.COM>")["ignored"] is True
+    assert axis("x@x.com", "<sgcarney.substacK.com>")["ignored"] is False
     # Nothing here knows a sender class — that is gate_decision("email", …) —
     # and nothing of e-mail triage's two runs is answered any more.
     d = tp.email_gate_decision("peer@list.example.org", "<noise.list.example.org>", pol=pol)

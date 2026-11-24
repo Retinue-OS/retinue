@@ -893,7 +893,9 @@ daily triage runs, the already-answered check, the e-mail whitelist (addresses,
 wildcards, auto-add on send, the Sent-folder derivation, the contacts
 projection into it). What stays: the news rail (run by the gateway now), the
 group flags, `email_client.py`, and triage itself for a messenger message the
-chat rail could not take.
+chat rail could not take. Triage retires whether or not the mail gateway runs:
+a deployment without `MAIL_GATEWAY_TOKEN` has no e-mail handling at all after
+this upgrade, and the migration waits for the token (*The migration*).
 
 ### The migration (`scripts/migrate-triage.py`)
 
@@ -1064,8 +1066,9 @@ accounts. The points an operator meets first:
   `email_client.py`, and the base compose runs it in every deployment — but it
   mirrors and serves nothing until the token is set (both services read it).
   So an upgrade that changes nothing in `.env` mirrors nothing; setting the
-  token is the decision to mirror. `MAIL_BACKFILL_DAYS=0` starts the mirror
-  with no history.
+  token is the decision to mirror. After the upgrade that retires e-mail
+  triage nothing else handles mail: set the token as part of it.
+  `MAIL_BACKFILL_DAYS=0` starts the mirror with no history.
 - **A pinned channel set must name `email`.** A deployment that sets
   `MESSENGER_BUILTIN_CHANNELS` adds `email` to it, in `.env` (a value set only
   on the `retinue` service does not reach the gateway); without it the
@@ -1077,7 +1080,11 @@ accounts. The points an operator meets first:
   before, the `retinue` container's, whose `email_client.py` backend still
   uses them (`SECURITY.md`).
 - **The gate needs nothing set.** Compose wires the chats rail and the news
-  rail; who is a VIP and who is instructed comes from the address book
+  rail, and the rail takes a mail event only with a token: `CHATS_INGEST_TOKEN`
+  where `.env` sets one (compose then passes it to both services), else the
+  `MAIL_GATEWAY_TOKEN` both already hold; with neither it refuses every mail,
+  and a request a browser marks cross-site is refused whatever it carries.
+  Who is a VIP and who is instructed comes from the address book
   (`contacts.py`, the Contacts page), which projects it into the ledger
   volume's `policy/policy.nt`. `MAIL_NEWS_FOLDER` says where consumed news
   mail goes (unset: the archive folder; set and empty: nowhere).

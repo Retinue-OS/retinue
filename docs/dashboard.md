@@ -491,8 +491,11 @@ knowing nothing of VIP or critical, what it had just released — a second
 message into a chat with something unread counted as a *reply*, and the
 default setting dropped it. A device is notified or disabled, nothing in
 between. `ATTENTION_PUSH_GATE=0` is the rollback: every
-arrival pushes as before the model, while the list, the digest and the sweep
-keep working.
+messenger arrival pushes as before the model, while the list, the digest and
+the sweep keep working. It does not apply to mail, which pushed nothing
+before the model: a mail pushes only on the model's word (a VIP, a prior or
+a permit, an instruction's verdict or its failure rule), and the rail's
+answer and the chat's status say it rang only where it did.
 
 **The digest** is that one push, and it is ranked as the list is — level,
 importance, the nearest deadline (`attention.rank_key`) — with a line per
@@ -1250,7 +1253,15 @@ where it cannot send. No other channel's chat carries the field. The shared draf
 
 **The rail.** `POST /internal/chats/inbound` takes five more fields for a
 mail (`scripts/chat_ingest.py`): `subject` (this mail's own), `participants`
-and `peer` (the thread's), `backfill` and `seen`. A mail that just arrived is
+and `peer` (the thread's), `backfill` and `seen` — and from the mail gateway
+`gate_sender` beside `sender` ("The gate for mail"). An e-mail event is
+taken only with a token, as `X-Conversation-Backend-Token` or a bearer
+token: `CHATS_INGEST_TOKEN` where it is set, else `MAIL_GATEWAY_TOKEN`,
+compared in constant time; with neither set every e-mail event is refused
+(`403`), and so is any rail call a browser marks cross-site
+(`Sec-Fetch-Site`). A `GET` of it is answered at once (`405`) — the mail
+gateway's look at whether the rail is up — and an event the handler fails
+on is answered `500`, never left without an answer. A mail that just arrived is
 offered like a messenger message, with its `gate` verdict, `handover` and —
 for a VIP's or an instructed sender's — its `files` ("The gate for mail"
 below). A **backfilled** mail —
@@ -1261,9 +1272,10 @@ chat's read mark up to that mail (forward only) — the one place the
 mailbox's `\Seen` is ever honoured; a backfilled mail that was not read
 counts as an arrival like any other — once, by its message id, like a live
 one: the mirror delivers every event at least once. Two further calls,
-authorized like the rail, keep the chats in step with the mailbox. They are
-a mailbox's operations and are **refused for any other channel** (`400`): no
-messenger chat merges or loses messages, and the rail — open unless
+authorized as an e-mail event is (the token above, never open), keep the
+chats in step with the mailbox. They are a mailbox's operations and are
+**refused for any other channel** (`400`): no messenger chat merges or loses
+messages, and the rail — open to a messenger event unless
 `CHATS_INGEST_TOKEN` is set — must not be a way to fold one correspondent's
 chat into another's or to archive one. The gateway retries each on its own,
 so either may name a chat that has been folded away since it was queued; it
@@ -1298,6 +1310,13 @@ is then about the chat that one is part of now.
 **The companion.** A mail thread's note names the thread by its id where it
 gives instructions and carries the subject and the participants as data, in
 a block beside the mails — a subject is the first thing a stranger writes.
+Both are elements of their own, everything in them escaped so nothing a mail
+says can close them: `<mail_thread_facts>` holds the subject and the
+participants, and `<mail_thread>` the mails, one `<mail>` element each, its
+content the mail's text and its attributes `at`, `from` (who a mail sent to
+the user says it is from), `by` (who of the user's side sent one — this
+system's label, which no mail can write), `attachments`, `removed` and
+`cut`.
 It says the texts are the trimmed ones and lists attachments by type under
 the rule in "Attachments". Then the draft, as in every chat's note: what the
 shared draft holds, that the `secretary` writes the words, and the

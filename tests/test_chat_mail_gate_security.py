@@ -165,6 +165,42 @@ def test_a_cross_site_post_is_refused(base, wg):
     print("PASS test_a_cross_site_post_is_refused")
 
 
+def test_the_rail_always_answers(base, wg):
+    """The mail gateway tells a rail that is away from one that failed on
+    one mail by what it hears back: a GET of the rail is its liveness probe,
+    answered at once, and an event the handler fails on is answered 5xx —
+    that mail not taken — never left without an answer. A disk that cannot
+    store a mail's file costs the file, not the mail."""
+    status, out = _http(base, "GET", "/internal/chats/inbound")
+    assert status == 405, (status, out)
+    key = "boom-root@a.example"
+    real = wg._attention_arrive_chat
+
+    def boom(*_a, **_k):
+        raise RuntimeError("the attention store is broken")
+
+    wg._attention_arrive_chat = boom
+    try:
+        status, out = _http(base, "POST", "/internal/chats/inbound",
+                            _event(key, "a@a.example", handover=False))
+    finally:
+        wg._attention_arrive_chat = real
+    assert status == 500, (status, out)
+    files_dir = wg.MESSAGE_FILES_DIR
+    blocker = Path(tempfile.mkdtemp()) / "a-file"
+    blocker.write_text("not a directory")
+    wg.MESSAGE_FILES_DIR = blocker / "files"
+    try:
+        stored = wg._store_message_files([{"filename": "a.pdf", "content_type": "application/pdf",
+                                           "data": "JVBERi0xLjcK"}])
+    finally:
+        wg.MESSAGE_FILES_DIR = files_dir
+    assert stored == [], stored
+    _forget(wg, _chat_id(key))
+    PUSHES.clear()
+    print("PASS test_the_rail_always_answers")
+
+
 # ── Who the mail is from ──────────────────────────────────────────────────────
 
 def test_a_mail_from_nobody_is_nobodys(base, wg):
@@ -296,8 +332,10 @@ def test_the_rollback_pushes_no_mail(base, wg):
     TURNS.clear()
     wg.ATTENTION_PUSH_GATE = False
     try:
-        _arrive(base, keys[0], _party("shop@shop.example", "Shop"), text="Sale!")
+        status, body, _m, _t = _arrive(base, keys[0], _party("shop@shop.example", "Shop"),
+                                       text="Sale!")
         assert not PUSHES, "an ordinary mail pushed under the rollback"
+        assert body["pushed"] is False, "the answer claims a push that never went out"
         status, body, _m, _t = _arrive(base, keys[1], _party("vera@rb.example", "V"), gate=VIP)
         gate._await_job(base, body["job_url"])
         (args, kw), = PUSHES
@@ -312,6 +350,8 @@ def test_the_rollback_pushes_no_mail(base, wg):
         finally:
             TURN_GATE["during"] = None
         assert not PUSHES, PUSHES
+        delivery = wg._CHAT_STATE.get(_chat_id(keys[2]))["instructed"]["delivery"]
+        assert delivery != "rang", "the chat note claims a ring that never went out"
         # A messenger arrival still pushes as it did before the model.
         status, out = _http(base, "POST", "/internal/chats/inbound", {
             "channel": "signal", "direction": "in", "chat": "+41790000997",
@@ -499,6 +539,7 @@ def main():
 
         test_the_rail_takes_mail_only_with_a_token(base, wg)
         test_a_cross_site_post_is_refused(base, wg)
+        test_the_rail_always_answers(base, wg)
         test_a_mail_from_nobody_is_nobodys(base, wg)
         test_another_senders_judgement_is_not_inherited(base, wg)
         test_the_rollback_pushes_no_mail(base, wg)

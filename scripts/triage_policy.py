@@ -445,7 +445,7 @@ def load_email_policy(path: Path | None = None) -> EmailPolicy:
         P_BLOCKED_GROUP: "ignored",
     }
     for _subj, pred, lit in _parse(path):
-        low = lit.strip().lower()
+        low = lit.strip().translate(_ASCII_LOWER)
         key = by_predicate.get(pred)
         if low and key:
             buckets[key].add(low)
@@ -493,7 +493,7 @@ def email_news_sender(addr: str, news: set[str], news_wildcards: set[str]) -> bo
     The address-keyed special case of :func:`email_group_member`, kept because
     that is all a caller holding only a sender address needs.
     """
-    low = (addr or "").strip().lower()
+    low = (addr or "").strip().translate(_ASCII_LOWER)
     if not low or "@" not in low:
         return False
     return email_group_member(low, news, news_wildcards)
@@ -519,7 +519,7 @@ def email_list_id(raw: str) -> str:
     if not value:
         return ""
     match = _LIST_ID_BRACKETED.search(value)
-    candidate = (match.group(1) if match else value).strip().lower()
+    candidate = (match.group(1) if match else value).strip().translate(_ASCII_LOWER)
     if not candidate or len(candidate) > 200:
         return ""
     if any(c.isspace() for c in candidate) or "." not in candidate:
@@ -535,7 +535,7 @@ def email_group_id(list_id: str, sender: str) -> str:
     stated about a newsletter that carries no ``List-Id`` just as about a real
     list, with no second mechanism.
     """
-    return email_list_id(list_id) or (sender or "").strip().lower()
+    return email_list_id(list_id) or (sender or "").strip().translate(_ASCII_LOWER)
 
 
 def email_group_member(group: str, entries: set[str], wildcards: set[str]) -> bool:
@@ -548,7 +548,7 @@ def email_group_member(group: str, entries: set[str], wildcards: set[str]) -> bo
     as "that platform" and has to catch `sgcarney.substack.com` too, without
     thereby trusting a mailbox at that subdomain.
     """
-    low = (group or "").strip().lower()
+    low = (group or "").strip().translate(_ASCII_LOWER)
     if not low:
         return False
     if low in entries:
@@ -588,7 +588,7 @@ def email_gate_decision(
     sender's doing alone, whatever group the mail arrived on.
     """
     pol = pol if pol is not None else load_email_policy(path)
-    addr = (sender or "").strip().lower()
+    addr = (sender or "").strip().translate(_ASCII_LOWER)
     group = email_group_id(list_id, addr)
     # News is checked against the group *and* the bare sender address so an
     # address-level entry written before list detection keeps matching mail that
@@ -835,13 +835,13 @@ def _mutate_email_locked(*, news_add=(), news_remove=(),
 
     def _add(entries, exact_key, wildcard_key):
         for entry in entries:
-            e = entry.strip().lower()
+            e = entry.strip().translate(_ASCII_LOWER)
             if e:
                 sets[wildcard_key if e.startswith("*@") else exact_key].add(e)
 
     def _drop(entries, *keys):
         for entry in entries:
-            e = entry.strip().lower()
+            e = entry.strip().translate(_ASCII_LOWER)
             for key in keys:
                 sets[key].discard(e)
 

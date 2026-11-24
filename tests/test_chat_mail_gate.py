@@ -642,7 +642,7 @@ def test_an_instructed_mail_waits_for_its_verdict(base, wg):
     assert f"chat-verdict.py --chat {quoted} --importance <0-5>" in own
     assert "\"archived the mail\"" in own
     assert "until you set it, the user has not been told the message arrived" in own
-    assert f"runs past {wg.CHAT_INSTRUCTION_TIMEOUT:g} seconds" in own
+    assert f"runs past {wg.MAIL_INSTRUCTION_TIMEOUT:g} seconds" in own
     assert "marked its sender a VIP" not in own
     # The messenger's rule — a reply is never sent — is not a mail thread's.
     assert "never sent" not in own
@@ -1234,7 +1234,8 @@ def _fails_once(owner, name, exc=None):
 
 def _offer(base, key, party, mid, ts, **more):
     """One offer of a mail whose request may die on the way: the mail
-    gateway then gets no answer (None), and offers again later."""
+    gateway then gets a 500 (or, where the connection drops, no answer:
+    None), and offers again later."""
     try:
         return _arrive(base, key, party, mid=mid, ts=ts, record=False, **more)[:2]
     except Exception as exc:  # noqa: BLE001 - a dropped connection is the point
@@ -1289,7 +1290,9 @@ def test_a_repeated_offer_is_told_by_what_its_arrival_owes(base, wg):
         finally:
             if undo:
                 undo()
-        assert (status is None) == (die is not None), (tag, status, body)
+        # A request that dies there is answered 500 all the same, never
+        # left without an answer (_handle_chats_inbound).
+        assert (status == 500) == (die is not None), (tag, status, body)
         counts = [len(PUSHES)]
         for _repeat in range(2):
             _restart(wg, chat)
@@ -1649,6 +1652,11 @@ def test_a_failing_turn_gives_up(base, wg):
         TURN_GATE["fail"] = False
         wg.CHAT_ARRIVAL_RETRY_SECONDS = retry
     assert len(TURNS) == 3, len(TURNS)
+    # A retried turn is told an earlier one may already have done part of
+    # the work; the first is not.
+    retried = "An earlier turn for this mail did not finish"
+    assert retried not in TURNS[0]["prompt"]
+    assert all(retried in turn["prompt"] for turn in TURNS[1:]), "the retry is not said"
     assert [j["status"] for j in jobs] == ["error", "error", "done", "done", "done"], jobs
     assert jobs[2]["gave_up"] is True and jobs[2]["attempts"] == 3, jobs[2]
     assert jobs[3] == jobs[2], "the mail was worked again after its turns gave up"

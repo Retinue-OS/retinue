@@ -331,7 +331,8 @@ need no change: the loaders read the predicate and ignore the subject.
 `triage_policy.py vip-add` remains for a handle nobody has filed. The same
 projection writes every handle of every person with an instruction
 as `triageInstructedHandle` (the `instructed` class); `show` lists them and
-`check-handle` says `instructed` on a second line.
+`check-handle` says `instructed` on a second line, and exits 0 for it, as for
+a VIP.
 
 The one thing that is **not** hers alone is where a
 chat sits on the user's screen: Archive and Mute are buttons in the dashboard,
@@ -539,7 +540,10 @@ instruction as its brief and ends with a verdict
 (`POST /internal/chats/<id>/verdict`), and the web gateway then puts the
 message through the attention model with that importance and deadline. A turn
 that fails, sets no verdict or runs past `CHAT_INSTRUCTION_TIMEOUT` has the
-message pushed as a VIP's would be. The gate verdict carries the flag to the
+message pushed as a VIP's would be. (A mail's ring waits
+`MAIL_INSTRUCTION_TIMEOUT` instead, 600 s, and a mail gets at most
+`MAIL_ARRIVAL_TURN_ATTEMPTS` turns: [mail-chats.md](mail-chats.md), "The
+gate".) The gate verdict carries the flag to the
 rail as `gate.instructed`, and the message's attachments ride along as they do
 for a VIP. On the fallback path — the rail declining — an instructed sender is
 treated as a VIP is: never held, forwarded to triage.
@@ -678,15 +682,19 @@ Tier-3 across both the framework and the gateway services:
 
 - **framework:** the policy library (`scripts/triage_policy.py`), the address
   book's projection into it (`contacts.sync_policy`), the shared state files,
-  and this doc. Nothing of the gate runs as a scheduler job any more, and the
-  `retinue` service carries no triage tunable: the retired e-mail triage's
-  `TRIAGE_STATE_DIR`, `TRIAGE_INBOX_SCAN_*`, `TRIAGE_PROMPT_LIST_LIMIT`,
+  and this doc. Nothing of the gate runs as a scheduler job any more. The
+  retired e-mail triage's `TRIAGE_INBOX_SCAN_*`, `TRIAGE_PROMPT_LIST_LIMIT`,
   `TRIAGE_STALL_DAYS`, `TRIAGE_SENT_DERIVE_LIMIT`, `TRIAGE_BATCH_SIZE`,
   `TRIAGE_SENT_RECONCILE`, `TRIAGE_ANSWERED_FOLDER`,
   `EMAIL_PROCESSING_INTERVAL` and `RETINUE_TRIAGE_MODEL` are no longer read by
   anything (`TRIAGE_NEWS_FOLDER` and `TRIAGE_NEWS_EXCERPT_CHARS` only by the
-  mail gateway, below). What stays are the
-  two paths `TRIAGE_MESSENGER_DIR` and `TRIAGE_EMAIL_WHITELIST_PATH`.
+  mail gateway, below). What stays are the two paths `TRIAGE_MESSENGER_DIR`
+  and `TRIAGE_EMAIL_WHITELIST_PATH`, and the one-time migration's settings
+  (`scripts/migrate-triage.py`, [mail-chats.md](mail-chats.md), "The
+  migration"): `TRIAGE_STATE_DIR` (its marker, snapshot and journal, and the
+  retired status store it reports on; keep it set wherever a deployment moved
+  it), `MAIL_OWN_ADDRESSES`, `RETINUE_TRIAGE_MIGRATION`,
+  `MIGRATE_TRIAGE_MODEL_TIMEOUT` and `MIGRATE_TRIAGE_MIRROR_WAIT`.
 - **gateways:** `signal-gateway` / `whatsapp-gateway` / `telegram-gateway` /
   `sms-gateway` each
   get the shared volume mounted RW, per-message `.nt` writing, the

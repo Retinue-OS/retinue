@@ -141,8 +141,10 @@ nothing new.
 - **A mail's sender is not authenticated.** Who the gate takes a mail for is
   narrow: a mail has a gate sender only when it carries exactly one `From`
   header holding exactly one address the mail gateway's own grammar accepts,
-  lower-cased and plain ASCII (so no Unicode folding can turn it into an
-  address the address book holds). The `Sender` header, and the first of
+  lowercased by its ASCII letters alone — and none at all where a character
+  of that address folds into ASCII on some reading (a Kelvin sign, a
+  fullwidth letter), so no Unicode folding, on either side, can make it equal
+  to an address the address book holds. The `Sender` header, and the first of
   several `From` addresses, are shown as who a mail is from and decide
   nothing. That address, or a domain a contact files, is what the gate
   matches against the VIP and instructed senders, what the instruction is
