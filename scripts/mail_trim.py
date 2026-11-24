@@ -5,7 +5,8 @@ A mail chat shows each mail like a message, so the bubble wants what this mail
 the legal notice their server glued on. This module is that reduction, plus
 the two HTML services the mail surface needs beside it:
 
-  * :func:`trim` — ``(plain, html) -> TrimResult(text, state, removed)``.
+  * :func:`trim` — ``(plain, html, subject=None, *, is_reply=None,
+    bulk=None) -> TrimResult(text, state, removed)``.
   * :func:`html_to_text` — a readable plain rendering of an HTML part.
   * :func:`sanitize_html` — the HTML part made safe for the *Original* view.
   * :func:`is_tracking_pixel` — the size test the gateway applies to images.
@@ -17,13 +18,13 @@ trips yields the untrimmed text, not an exception.
 What the trim removes, in this order
 ====================================
 
-1. **Quoted history** — ``>`` blocks with their attribution line, Outlook's
-   "-----Original Message-----" separator, the ``From:/Sent:/To:/Subject:``
-   header block, and (when the text comes from HTML) the quote containers the
-   clients write.
+1. **Quoted history** — ``>`` blocks with their attribution line; and, in a
+   mail known to be a reply, Outlook's "-----Original Message-----"
+   separator, the ``From:/Sent:/To:/Subject:`` header block and (when the
+   text comes from HTML) the containers the clients write around them.
 2. **Signatures** — the ``-- `` delimiter and the mobile "Sent from my …" line.
-3. **Footers and disclaimers** — confidentiality notices, unsubscribe blocks
-   and mailing-list footers, at the END of the mail only.
+3. **Footers and disclaimers** — confidentiality notices; and, in bulk mail,
+   unsubscribe blocks and mailing-list footers. At the END of the mail only.
 4. **Tracking pixels** — counted when the HTML part is the source.
 
 Structure before words
@@ -41,44 +42,77 @@ The trim is language-agnostic by mechanism wherever a structural test exists:
     (``blockquote[type=cite]``, ``.gmail_quote``, ``#divRplyFwdMsg``, …).
 
 Where words are unavoidable — which label is "From", which separator says
-"forwarded" rather than "original", what "Sent from my" is in Danish — they
-live in the data tables below, keyed by language, covering English, German,
-French, Italian, Spanish, Dutch, Portuguese, Danish, Norwegian, Swedish,
-Finnish, Polish and Czech. No language is privileged: every table is folded
-(case and diacritics) and consulted as one set. Extending a language is adding
-a row.
+"forwarded" rather than "original", which subject prefix is a reply's, what
+"Sent from my" is in Danish — they live in the data tables below, keyed by
+language, covering English, German, French, Italian, Spanish, Dutch,
+Portuguese, Danish, Norwegian, Swedish, Finnish, Polish and Czech (the
+subject prefixes a dozen more). No language is privileged: every table is
+folded (case and diacritics) and consulted as one set. Extending a language
+is adding a row.
+
+**A language outside the tables fails safe.** Wherever a word decides, it
+decides for cutting: the word must be there for text to go. A mail in a
+language no table knows keeps what a table would have removed, and its state
+says ``wanting``. No table is ever the reason text is lost.
 
 Rules that outrank recall
 =========================
 
-**Never cut what the author wrote.** Every heuristic here is tuned to miss
-rather than to over-reach, and the state says so when it missed:
+**Never cut what the author wrote.** Every rule here is tuned to miss rather
+than to over-reach, and where a shape alone cannot tell a quote, a signature
+or a footer from the message, the rule asks for evidence from outside the
+text — and without it leaves the text in and the state ``wanting``:
 
   * *Interleaved replies.* Only the quoted lines go. Text between, above and
     below quote blocks stays, so top-, bottom- and inline-posting all keep the
     author's lines.
   * *A lead-in is not an attribution.* "As you said:" before a quote has no
-    address and no date, so it stays; only the quote under it goes. Where no
-    ``>`` block follows at all (some clients quote as bare text), a line cuts
-    the rest of the mail only if it also carries the verb, ends on the verb
-    or the address, and opens its paragraph — a sentence that happens to
-    hold a date and "wrote" does not.
+    address and no date, so it stays; only the quote under it goes.
+  * *History without ``>`` needs a reply.* A separator, a header block, an
+    attribution above bare text, Outlook's ``#divRplyFwdMsg``: the same shapes
+    are the CONTENT of a form mailer's notification, a helpdesk update, a
+    memo, a mail pasted to ask about it — and of a forward. They are cut, to
+    the end, only when the caller says the mail cites an earlier one
+    (``is_reply``) and its subject carries a reply's prefix. Either alone is
+    not enough: Exchange puts In-Reply-To on forwards too, and "Re:" is also
+    how people head a new letter.
+  * *A header block alone needs to be the whole block.* With no separator
+    above it, it must open with From or Sent, name a To and a Subject, and
+    carry a time of day: "From: Zurich / To: Bern / Date: …" is an itinerary,
+    "From / Date / Subject / Phone" a web form.
+  * *An attribution above bare text* (some clients quote without ``>``) must
+    also carry the verb, end on the verb, the address or the verb and the
+    name, and open its paragraph — a sentence that happens to hold a date and
+    "wrote" does not.
   * *A forward's body is the content.* A forward marker ("---------- Forwarded
     message ---------", "Begin forwarded message:", and their kin) ends the
     trimming: the intro above it is trimmed like any text, the forwarded
     message below is kept whole (Apple Mail's ``>`` quoting of it removed). An
     Outlook forward carries no marker of its own and looks exactly like a
-    reply; pass ``subject=`` and a ``Fwd:``-style prefix settles it, in which
-    case a plain marker line is written above the kept message so the result
-    reads — and re-trims — as a forward.
-  * *Header blocks need a From, a date and a Subject.* "From: Zurich / To:
-    Bern / Date: …" is an itinerary, and "From: … / Subject: …" pasted to
-    talk about it is the author's text.
-  * *Footers need two cues, and the end.* A paragraph is a disclaimer only
-    when it names both confidentiality and a recipient; an unsubscribe line
-    only when it carries a link or an address; either only when little or
-    nothing follows it. A notice glued under "Regards / Bob" goes without
-    them.
+    reply; a ``Fwd:``-style prefix on the subject settles it, in which case a
+    plain marker line is written above the kept message so the result reads
+    as a forward. With a prefix no table knows, it is kept as it stands.
+  * *A signature is under the standard's delimiter, once.* ``-- `` with its
+    trailing blank, the only one within reach of the end. Two within reach
+    are dividers between sections; a bare ``--`` is as often a divider someone
+    typed. A phone's line is the mail's last paragraph, short and without a
+    clause, and beside the table's words it holds the name of the sender's
+    device or of a product, and names only — "Sent from the warehouse this
+    morning: 14 boxes." is the message, and so is "Sent from my iPhone to
+    yours yesterday".
+  * *A legal notice is what the mail ends on, under the sign-off.* The
+    paragraph names the mail itself, confidentiality and a recipient, opens
+    on two of them, has nothing but more notices after it, and stands under
+    a line that closes the author's text. A paragraph about a confidential
+    document with "Kind regards" still to come is the message.
+  * *An unsubscribe block needs bulk mail.* "Please unsubscribe me, my
+    address is …" is a request, and nothing in its shape tells it from a
+    footer: unsubscribe blocks and list footers go only when the caller says
+    the mail's headers call it bulk (``bulk``). A person's post that a list
+    passed on is bulk mail too, so the block must also have the shape
+    software gives it: it ends on the link or the list server's address it
+    hands over, stands under a message, and has nothing under it but more
+    of its kind and the sender's imprint.
   * *An empty result falls back to the untrimmed text.* A bubble is never
     blank because the trim was greedy.
 
@@ -108,9 +142,12 @@ second look. The opposite error — an unfenced ``> ls`` on a paragraph of its
 own — is cut, and is the price of removing quotes that have no attribution.
 
 Other limits: an Outlook-style history (no ``>``) is cut to the end, so
-comments a sender wrote *into* such a history are lost with it; a quoted line
-a client re-wrapped leaves its overflow word behind as if the author wrote it;
-a signature without the ``-- `` delimiter is the author's sign-off and stays.
+comments a sender wrote *into* such a history are lost with it — as is what
+stands under a client's whole header block that the author of a reply pasted
+in; in bulk mail a last paragraph that names unsubscribing and ends on its
+link is taken for the footer it all but always is; a quoted line a client
+re-wrapped leaves its overflow word behind as if the author wrote it; a
+signature without the ``-- `` delimiter is the author's sign-off and stays.
 
 Which part is the source
 ========================
@@ -134,22 +171,31 @@ State
 ``deterministic`` unless the trim could not settle, which is ``wanting`` — a
 model trim is due on first view: the mail is HTML-only (or its plain part a
 stub), or more than ``WANTING_CHARS`` remain (``MAIL_TRIM_WANTING_CHARS``,
-default 2500), or a quote marker survived.
+default 2500), or a quote marker survived, or a rule saw its shape and held
+back for want of evidence (history in a mail not known to be a reply, an
+unsubscribe block in mail not known to be bulk, a bare ``--``, a notice with
+no sign-off above it, an attribution in a language without a verb here).
 
 Idempotence
 ===========
 
 ``trim(trim(x).text, None).text == trim(x).text``. The pipeline runs to a
 fixpoint inside one call, and whatever it keeps is kept in a form the next
-call recognises the same way. A text built never to settle gets no trim at
-all, which is the same answer however often it is asked for.
+call recognises the same way — a call with no evidence cuts nothing that a
+call with evidence kept. A text built never to settle gets no trim at all,
+which is the same answer however often it is asked for.
 
 Cost
 ====
 
-Linear in the size of the mail, for hostile mail too: every look-ahead and
-look-back is bounded, element nesting is tracked to a fixed depth, and the
-stages that repeat work only on the end of the text.
+Linear in the size of the mail, for hostile mail too. Every look-ahead and
+look-back is bounded by a count of lines AND by the length an attribution or
+a footer can have, so one long line is never read once per short line beside
+it; a judgement that came out "no" is not asked again of the same lines; the
+stages that repeat work only on the end of the text; element nesting is
+tracked through an index, not by walking a stack; and what quoting and
+listing add to the text made from HTML — the prefixes — is bounded by the
+size of the markup, whatever a mail nests.
 """
 from __future__ import annotations
 
@@ -215,6 +261,8 @@ _FOLD_EXTRA = str.maketrans({
 
 def _fold(text: str) -> str:
     """Case- and diacritic-insensitive form: "Envoyé :" → "envoye :"."""
+    if text.isascii():
+        return text.casefold()      # nothing to decompose: most lines
     text = unicodedata.normalize("NFKD", text.casefold().translate(_FOLD_EXTRA))
     return "".join(ch for ch in text if not unicodedata.combining(ch))
 
@@ -256,11 +304,11 @@ _HEADER_LABELS = {
 # wrote:" would be one.
 _ATTRIBUTION_VERBS = {
     "en": ("wrote",),
-    "de": ("schrieb",),
+    "de": ("schrieb", "geschrieben"),
     "fr": ("a écrit",),
     "it": ("ha scritto",),
     "es": ("escribió",),
-    "nl": ("schreef",),
+    "nl": ("schreef", "geschreven"),
     "pt": ("escreveu",),
     "da": ("skrev",),
     "nb": ("skrev",),
@@ -305,8 +353,10 @@ _FORWARD_STEMS = {
     "cs": ("přeposlan",),
 }
 
-# The subject prefix a client puts on a forward. Only the outermost prefix
-# counts: "Re: Fwd: x" is a reply.
+# The subject prefix a client puts on a forward, and the one it puts on a
+# reply. Only the outermost prefix counts: "Re: Fwd: x" is a reply. A prefix
+# that is a forward's in one language and a reply's in another ("VS": Danish
+# Videresendt, Finnish Vastaus) says neither.
 _FORWARD_PREFIXES = {
     "en": ("Fwd", "Fw"),
     "de": ("WG",),
@@ -320,32 +370,127 @@ _FORWARD_PREFIXES = {
     "sv": ("VB",),
     "fi": ("VL",),
     "pl": ("PD",),
-    "cs": ("FW",),
+    "cs": ("FW", "Př"),
+    "tr": ("İLT",),
+    "id": ("TRS",),
+    "cy": ("YML",),
+    "el": ("ΠΡΘ",),
+    "ru": ("Пересл",),
+    "he": ("העבר",),
+    "zh": ("转发", "轉寄", "轉發"),
+}
+_REPLY_PREFIXES = {
+    "en": ("Re",),
+    "de": ("AW",),
+    "fr": ("RE", "Réf"),
+    "it": ("R", "RIF"),
+    "es": ("RE",),
+    "nl": ("Antw",),
+    "pt": ("RES",),
+    "da": ("SV",),
+    "nb": ("SV",),
+    "sv": ("SV",),
+    "fi": ("VS",),
+    "pl": ("Odp",),
+    "cs": ("Odp",),
+    "tr": ("YNT",),
+    "id": ("BLS",),
+    "lv": ("ATB",),
+    "lt": ("ATS",),
+    "el": ("ΑΠ", "ΣΧΕΤ"),
+    "ru": ("Отв",),
+    "he": ("השב",),
+    "zh": ("回复", "回覆", "答复"),
 }
 
-# The line a phone or an app signs with. Each entry is how the line STARTS;
-# `*` stands for a short run of anything (the device's name).
+# The line a phone or an app signs with, as the line STARTS; `*` stands for a
+# short run of anything (the device's name). These are how little but a
+# signing line starts ("Sent from my …", "Get Outlook for …") …
 _MOBILE_SIGNATURES = {
-    "en": ("Sent from", "Sent with", "Sent via", "Sent using",
-           "Get Outlook for"),
-    "de": ("Von meinem * gesendet", "Gesendet von", "Gesendet mit",
-           "Gesendet über", "Diese Nachricht wurde von meinem * gesendet",
+    "en": ("Sent from my", "Get Outlook for",
+           "Sent with Proton Mail secure email"),
+    "de": ("Von meinem * gesendet", "Gesendet von meinem",
+           "Diese Nachricht wurde von meinem * gesendet",
            "Outlook für * beziehen", "Outlook für * herunterladen"),
-    "fr": ("Envoyé de", "Envoyé depuis", "Envoyé à partir de", "Envoyé avec",
+    "fr": ("Envoyé de mon", "Envoyé depuis mon", "Envoyé à partir de mon",
            "Télécharger Outlook pour", "Obtenir Outlook pour"),
-    "it": ("Inviato da", "Inviato dal", "Inviato dall", "Inviato con",
-           "Scarica Outlook per"),
-    "es": ("Enviado desde", "Enviado con", "Obtener Outlook para"),
-    "nl": ("Verzonden vanaf", "Verstuurd vanaf", "Verzonden met",
-           "Verstuurd met", "Outlook voor * downloaden"),
-    "pt": ("Enviado do", "Enviado a partir do", "Enviado com",
+    "it": ("Inviato dal mio", "Inviato dalla mia", "Scarica Outlook per"),
+    "es": ("Enviado desde mi", "Obtener Outlook para"),
+    "nl": ("Verzonden vanaf mijn", "Verstuurd vanaf mijn",
+           "Outlook voor * downloaden"),
+    "pt": ("Enviado do meu", "Enviado a partir do meu",
            "Obter o Outlook para"),
-    "da": ("Sendt fra", "Sendt med", "Hent Outlook til"),
-    "nb": ("Sendt fra", "Sendt med", "Skaff deg Outlook for"),
-    "sv": ("Skickat från", "Skickat med", "Hämta Outlook för"),
+    "da": ("Sendt fra min", "Hent Outlook til"),
+    "nb": ("Sendt fra min", "Skaff deg Outlook for"),
+    "sv": ("Skickat från min", "Hämta Outlook för"),
+    "pl": ("Wysłane z mojego", "Wysłano z mojego"),
+    "cs": ("Odesláno z mého",),
+}
+# … and these are how any sentence about a shipment starts too ("Sent from
+# the warehouse"). Neither signs a mail by its words alone: the line must
+# also name what sent it (below) — "Sent from my office." is an answer.
+_MOBILE_PARTICIPLES = {
+    "en": ("Sent from", "Sent with", "Sent via", "Sent using"),
+    "de": ("Gesendet von", "Gesendet mit", "Gesendet über"),
+    "fr": ("Envoyé de", "Envoyé depuis", "Envoyé à partir de", "Envoyé avec"),
+    "it": ("Inviato da", "Inviato dal", "Inviato dall", "Inviato con"),
+    "es": ("Enviado desde", "Enviado con"),
+    "nl": ("Verzonden vanaf", "Verstuurd vanaf", "Verzonden met",
+           "Verstuurd met"),
+    "pt": ("Enviado do", "Enviado a partir do", "Enviado com"),
+    "da": ("Sendt fra", "Sendt med"),
+    "nb": ("Sendt fra", "Sendt med"),
+    "sv": ("Skickat från", "Skickat med"),
     "fi": ("Lähetetty",),
     "pl": ("Wysłane z", "Wysłano z"),
     "cs": ("Odesláno z",),
+}
+# What sent it. Names, not words of a language: the devices and the mail apps
+# that sign. Matched as the start of a word, so "iPhonesta" (Finnish) is an
+# iPhone …
+_MOBILE_PRODUCTS = (
+    "iphone", "ipad", "ipod", "ios", "android", "galaxy", "samsung", "huawei",
+    "xiaomi", "nokia", "blackberry", "windows", "outlook", "yahoo", "proton",
+    "gmx", "web.de", "gmail", "aol", "thunderbird", "mailbird", "superhuman",
+    "tutanota", "zoho", "fastmail", "mail.ru", "pixel", "oneplus", "fairphone",
+    "motorola", "sony", "xperia", "oppo", "honor", "lumia")
+# … and the words for a device, where the line names no make ("Sent from my
+# mobile device"). Stems, cut where the language inflects.
+_MOBILE_DEVICES = {
+    "en": ("phone", "smartphone", "mobile", "device", "tablet", "handheld"),
+    "de": ("handy", "telefon", "mobiltelefon", "smartphone", "tablet",
+           "gerät", "mobilgerät"),
+    "fr": ("téléphone", "mobile", "portable", "appareil", "smartphone",
+           "tablette"),
+    "it": ("telefono", "cellulare", "dispositivo", "smartphone", "tablet"),
+    "es": ("teléfono", "móvil", "celular", "dispositivo", "smartphone",
+           "tableta"),
+    "nl": ("telefoon", "mobiel", "toestel", "smartphone", "tablet"),
+    "pt": ("telemóvel", "telefone", "celular", "dispositivo", "smartphone",
+           "tablet"),
+    "da": ("telefon", "mobil", "enhed", "smartphone", "tablet"),
+    "nb": ("telefon", "mobil", "enhet", "smarttelefon", "nettbrett"),
+    "sv": ("telefon", "mobil", "enhet", "smartphone", "surfplatta"),
+    "fi": ("puhelim", "älypuhelim", "laitte", "tablet"),
+    "pl": ("telefon", "smartfon", "urządzeni", "tablet"),
+    "cs": ("telefon", "mobil", "zařízení", "tablet"),
+}
+# The word that joins two names on a signing line ("Yahoo Mail on Android",
+# "Mail für Windows", "mit der GMX Mail App"). It counts only right before a
+# name of the two tables above: "on Monday" and "for Bob" make a sentence.
+_MOBILE_JOINERS = {
+    "en": ("for", "on", "the"),
+    "de": ("für", "auf", "mit", "der", "dem"),
+    "fr": ("pour", "sur", "le", "la"),
+    "it": ("per", "su", "il", "la"),
+    "es": ("para", "en", "el", "la"),
+    "nl": ("voor", "op", "de", "het"),
+    "pt": ("para", "no", "o", "a"),
+    "da": ("til", "på", "for"),
+    "nb": ("for", "på", "til"),
+    "sv": ("för", "på", "till"),
+    "pl": ("dla", "na"),
+    "cs": ("pro", "na"),
 }
 
 # The word that makes a closing paragraph an unsubscribe block — together
@@ -368,8 +513,27 @@ _UNSUBSCRIBE_STEMS = {
     "cs": ("odhlásit",),
 }
 
-# A legal notice names BOTH of these: that the mail is confidential, and whom
-# it is meant for. One of them is ordinary prose.
+# A legal notice names ALL FOUR of these: the mail itself, that it is
+# confidential, whom it is meant for, and what a reader it was not meant for
+# is to do. Fewer are a sentence of the author's ("the papers are
+# confidential, you are the only recipient"; "please treat this mail as
+# confidential, the recipient of the parcel does not know yet").
+_MESSAGE_STEMS = {
+    "en": ("e-mail", "email", "mail", "message", "communication",
+           "transmission"),
+    "de": ("e-mail", "mail", "nachricht", "mitteilung"),
+    "fr": ("message", "courriel", "e-mail", "mail", "courrier"),
+    "it": ("messaggio", "e-mail", "mail", "comunicazione"),
+    "es": ("mensaje", "correo", "e-mail", "comunicación"),
+    "nl": ("bericht", "e-mail", "mail"),
+    "pt": ("mensagem", "e-mail", "correio", "comunicação"),
+    "da": ("e-mail", "mail", "meddelelse", "besked"),
+    "nb": ("e-post", "melding", "e-mail"),
+    "sv": ("meddelande", "e-post", "mejl", "mail"),
+    "fi": ("viesti", "sähköposti"),
+    "pl": ("wiadomość", "e-mail", "mail"),
+    "cs": ("zpráva", "e-mail", "mail"),
+}
 _CONFIDENTIAL_STEMS = {
     "en": ("confidential", "privileged"),
     "de": ("vertraulich",),
@@ -401,15 +565,61 @@ _RECIPIENT_STEMS = {
     "pl": ("adresat", "odbiorc"),
     "cs": ("adresát", "příjemc"),
 }
+# "… received it in error … notify the sender … delete it."
+_MISDIRECTED_STEMS = {
+    "en": ("in error", "notify", "sender", "delete", "destroy"),
+    "de": ("irrtümlich", "versehentlich", "absender", "lösch", "vernicht"),
+    "fr": ("par erreur", "expéditeur", "supprim", "détrui"),
+    "it": ("per errore", "mittente", "cancell", "elimin", "distrugg"),
+    "es": ("por error", "remitente", "elimin", "borr", "destru"),
+    "nl": ("ten onrechte", "abusievelijk", "per vergissing", "afzender",
+           "verwijder", "vernietig"),
+    "pt": ("por engano", "por erro", "remetente", "elimin", "apag", "destru"),
+    "da": ("ved en fejl", "fejlagtigt", "afsender", "slet"),
+    "nb": ("ved en feil", "feilaktig", "avsender", "slett"),
+    "sv": ("av misstag", "avsändare", "radera", "förstör"),
+    "fi": ("vahingossa", "erehdyksessä", "lähettäjä", "poista", "tuhoa"),
+    "pl": ("omyłkowo", "pomyłkowo", "nadawc", "usuń", "usun", "zniszcz"),
+    "cs": ("omylem", "odesílatel", "smažte", "vymažte", "odstraňte", "zničte"),
+}
 
 
 def _stems(table: dict) -> tuple:
     return tuple(sorted({_fold(word) for words in table.values() for word in words}))
 
 
+def _alternation(stems) -> str:
+    # Longest first, so "e-mail" is tried before "e-" could end a shorter one.
+    return "|".join(re.escape(stem).replace(r"\ ", r"\s+")
+                    for stem in sorted(stems, key=len, reverse=True))
+
+
 def _words_re(table: dict) -> "re.Pattern":
-    return re.compile(r"(?<!\w)(?:%s)(?!\w)" % "|".join(
-        re.escape(stem).replace(r"\ ", r"\s+") for stem in _stems(table)))
+    """The table's entries as whole words."""
+    return re.compile(r"(?<!\w)(?:%s)(?!\w)" % _alternation(_stems(table)))
+
+
+def _stems_re(table: dict) -> "re.Pattern":
+    """The table's entries as the START of a word: a stem is cut where its
+    language starts to inflect ("confidenci", "afmeld"), but it never begins
+    in the middle of another word ("Paketempfänger" is not an "Empfänger")."""
+    return re.compile(r"(?<!\w)(?:%s)" % _alternation(_stems(table)))
+
+
+def _subject_re(prefixes) -> "re.Pattern":
+    """A subject whose outermost prefix (list tags aside) is one of these —
+    counted ("Re[2]:"), abbreviated with a dot, with any colon and spacing."""
+    return re.compile(
+        r"^\s*(?:\[[^\]]{0,60}\]\s*)*(?:%s)\s*(?:\[\d+\]|\(\d+\)|\^\d+)?"
+        r"\.?\s*[:：]" % _alternation(prefixes))
+
+
+def _starts_re(table: dict) -> "re.Pattern":
+    # What stands for an entry's `*` is captured: it is the sender's text.
+    return re.compile(r"^\W{0,3}(?:%s)(?!\w)" % "|".join(
+        "(.{1,40}?)".join(re.escape(part).replace(r"\ ", r"\s+")
+                          for part in entry.split("*"))
+        for entry in _stems(table)))
 
 
 _HEADER_ROLE = {
@@ -422,16 +632,21 @@ _VERB_RE = _words_re(_ATTRIBUTION_VERBS)
 _VERB_END_RE = re.compile(_VERB_RE.pattern + r"\W{0,6}$")
 _ORIGINAL = _stems(_ORIGINAL_STEMS)
 _FORWARD = _stems(_FORWARD_STEMS)
-_UNSUBSCRIBE = _stems(_UNSUBSCRIBE_STEMS)
-_CONFIDENTIAL = _stems(_CONFIDENTIAL_STEMS)
-_RECIPIENT = _stems(_RECIPIENT_STEMS)
-_FORWARD_SUBJECT_RE = re.compile(
-    r"^\s*(?:\[[^\]]{0,60}\]\s*)*(?:%s)\s*:" % "|".join(
-        re.escape(prefix) for prefix in _stems(_FORWARD_PREFIXES)))
-_MOBILE_RE = re.compile(r"^\W{0,3}(?:%s)(?!\w)" % "|".join(
-    ".{1,40}?".join(re.escape(part).replace(r"\ ", r"\s+")
-                    for part in entry.split("*"))
-    for entry in _stems(_MOBILE_SIGNATURES)))
+_UNSUBSCRIBE_RE = _stems_re(_UNSUBSCRIBE_STEMS)
+_MESSAGE_RE = _stems_re(_MESSAGE_STEMS)
+_CONFIDENTIAL_RE = _stems_re(_CONFIDENTIAL_STEMS)
+_RECIPIENT_RE = _stems_re(_RECIPIENT_STEMS)
+_MISDIRECTED_RE = _stems_re(_MISDIRECTED_STEMS)
+_AMBIGUOUS_PREFIXES = set(_stems(_FORWARD_PREFIXES)) & set(_stems(_REPLY_PREFIXES))
+_FORWARD_SUBJECT_RE = _subject_re(
+    set(_stems(_FORWARD_PREFIXES)) - _AMBIGUOUS_PREFIXES)
+_REPLY_SUBJECT_RE = _subject_re(
+    set(_stems(_REPLY_PREFIXES)) - _AMBIGUOUS_PREFIXES)
+_MOBILE_OWN_RE = _starts_re(_MOBILE_SIGNATURES)
+_MOBILE_SENT_RE = _starts_re(_MOBILE_PARTICIPLES)
+_MOBILE_NAME_RE = re.compile(r"(?<!\w)(?:%s)" % _alternation(
+    _MOBILE_PRODUCTS + _stems(_MOBILE_DEVICES)))
+_MOBILE_JOINER = frozenset(_stems(_MOBILE_JOINERS))
 
 
 def _has_stem(text: str, stems: tuple) -> bool:
@@ -454,6 +669,8 @@ _MARKS_RE = re.compile("[\x01\x02]")
 # Up to three spaces of indent: four make a code block, and code that starts
 # with ">" is not a quote.
 _QUOTE_RE = re.compile(r"^ {0,3}>")
+# Every quote level a line starts with, each as `_unquote` takes one off.
+_QUOTE_LEVELS_RE = re.compile(r"(?: {0,3}> ?)*")
 _FENCE_RE = re.compile(r"^ {0,3}(```|~~~)")
 _DIFF_HUNK_RE = re.compile(r"^(?:\d+(?:,\d+)?[acd]\d+(?:,\d+)?|---|< .*|<)$")
 _COLON_END_RE = re.compile(r"[:：]\s*$")
@@ -477,9 +694,35 @@ _TIME_RE = re.compile(
     r"|\bkl\.?\s?\d{1,2}[.:]\d{2}"         # kl. 14.02
     r"|(?<!\d)\d{1,2}\s?[ap]\.?m\b",       # 2 pm
     re.I)
+# The time of day on a quoted mail's Sent line; also "14.02", which in a
+# sentence could as well be a date and is therefore not in _TIME_RE.
+_CLOCK_RE = re.compile(
+    _TIME_RE.pattern + r"|(?<![\d.])[0-2]?\d\.[0-5]\d(?![\d.])", re.I)
+# No attribution is longer than this, folded lines joined.
+_ATTRIBUTION_MAX = 320
 _URL_RE = re.compile(r"https?://\S+|www\.\S+|mailto:\S+", re.I)
-_BARE_LINK_RE = re.compile(
-    r"<?(?:https?://\S+|www\.\S+|[\w.+-]{1,64}@[\w-]+(?:\.[\w-]+)+)>?", re.I)
+# The link a client hangs on its app's line ("Get Outlook for iOS<https://…>").
+_HUNG_LINK_RE = re.compile(r"[<(\[]?\s*https?://\S+", re.I)
+# What a sentence has and a signing line has not: a clause, a second
+# sentence, a question, a number worth writing down.
+_PROSE_RE = re.compile(r"[,;:?!]|\.\s+\S|\d{3}")
+# A line that is nothing but a link, or nothing but an address.
+_BARE_URL_RE = re.compile(r"<?(?:https?://\S+|www\.\S+)>?", re.I)
+_BARE_ADDRESS_RE = re.compile(r"<?[\w.+-]{1,64}@[\w-]+(?:\.[\w-]+)+>?")
+# The names a list server gives the address that takes a reader off the list
+# ("dev+unsubscribe@…", "news-leave@…"): a protocol's, not a language's.
+_LIST_COMMAND_RE = re.compile(
+    r"unsub|leave|signoff|sign-off|optout|opt-out|remove")
+# … and to the place the list lives at ("lists.example.org/mailman/listinfo").
+_LIST_PLACE_RE = re.compile(r"list|mailman|group|sympa", re.I)
+# What stands under an unsubscribe block is the sender's imprint — a postal
+# address, a copyright line, more links — and has a number, a link or a sign
+# in it. Plain words under the block are the author's: a sign-off, the next
+# sentence. So are the steps of a list ("1. log in").
+_IMPRINT_RE = re.compile(r"\d|[©®™|•·@]|https?://|www\.", re.I)
+_LIST_ITEM_RE = re.compile(r"\s*(?:\d{1,3}[.)]|[-*])\s")
+# What may still stand after the link a footer hands over.
+_LINK_CLOSERS = " .)>]\"'»"
 # "Label: value". The colon must end the line or be followed by whitespace,
 # which is what keeps "https://…" and "12:30" from being labels.
 _LABEL_RE = re.compile(
@@ -524,7 +767,17 @@ def _clean_lines(text: str, keep_marks: bool = False) -> list:
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     if not keep_marks:
         text = _MARKS_RE.sub("", text)
-    return _squeeze([line.rstrip() for line in text.split("\n")])
+    return _squeeze([_rstrip(line) for line in text.split("\n")])
+
+
+#: The signature delimiter as RFC 3676 writes it: dash, dash, space. The one
+#: line whose trailing blank means something, so the pipeline carries it as
+#: it came and only the finished text loses the blank.
+SIGNATURE_DELIMITER = "-- "
+
+
+def _rstrip(line: str) -> str:
+    return line if line == SIGNATURE_DELIMITER else line.rstrip()
 
 
 def _chars(lines) -> int:
@@ -556,39 +809,91 @@ def _label_role(line: str) -> str | None:
     return _HEADER_ROLE.get(" ".join(_fold(match.group(1)).split()))
 
 
-def _header_block_at(lines: list, index: int) -> bool:
-    """Does a quoted mail's header block start at `lines[index]`?
+def _header_block(lines: list, index: int, known: dict | None = None) -> int:
+    """Does a quoted mail's header block start at `lines[index]`? 0, 1 or 2.
 
-    A run of ``Label: value`` lines whose labels cover a From, a Sent/Date
-    and one more header in some language of the table — the block every
-    client writes. Requiring the Subject (or an address on the From line)
-    tells a quoted mail from an itinerary's "From: … To: … Date: …";
-    requiring the date tells it from two or three headers an author pasted
-    to talk about them.
+    1 — a run of ``Label: value`` lines whose labels cover a From, a
+    Sent/Date and one more header in some language of the table. Requiring
+    the Subject (or an address on the From line) tells a quoted mail from an
+    itinerary's "From: … To: … Date: …"; requiring the date tells it from two
+    or three headers an author pasted to talk about them. Enough under a
+    separator or inside an element only a quoting client writes.
+
+    2 — the block as a client writes it and little else is written: it opens
+    with the From or the Sent line, has a To and a Subject as well, and its
+    Sent line carries a time of day. A form mailer's "From / Date / Subject /
+    Phone", a helpdesk's "From / Date / Subject" and a memo's "TO / FROM /
+    DATE" all stop at 1. Only this stands for itself, with no separator.
+
+    `known` remembers what each line was found to be: in a mail of nothing
+    but headers every line is looked at from each of the sixteen above it,
+    and is read once.
     """
-    if _label_role(lines[index]) is None:
-        return False
+    if known is None:
+        known = {}
+
+    def header(position: int) -> tuple:
+        # (role, and for a From its address, for a Sent its time of day)
+        found = known.get(position)
+        if found is None:
+            match = _LABEL_RE.match(lines[position])
+            role = match and _HEADER_ROLE.get(
+                " ".join(_fold(match.group(1)).split()))
+            value = match.group(2) or "" if role else ""
+            found = known[position] = (role or None, bool(
+                role == "from" and _ADDRESS_RE.search(value)
+                or role == "sent" and _CLOCK_RE.search(value)))
+        return found
+
+    first = header(index)[0]
+    if first is None:
+        return 0
     roles = set()
-    from_has_address = False
+    from_has_address = timed = False
     position = index
     # A header block is a dozen lines at most; the bound also keeps a mail
     # made of nothing but "From:" lines from costing a scan per line.
     last = min(len(lines), index + 16)
     while position < last and lines[position].strip():
-        match = _LABEL_RE.match(lines[position])
-        role = _label_role(lines[position]) if match else None
+        role, vouched = header(position)
         if role:
             roles.add(role)
-            if role == "from" and _ADDRESS_RE.search(match.group(2) or ""):
+            if vouched and role == "from":
                 from_has_address = True
-        elif not any(_label_role(line)
-                     for line in lines[position + 1:position + 4]):
+            elif vouched:
+                timed = True
+        elif not any(header(ahead)[0] for ahead in
+                     range(position + 1, min(position + 4, len(lines)))):
             # Neither a header nor the wrapped tail of one (a long To: list
             # runs over several lines before the next label).
             break
         position += 1
-    return ("from" in roles and "sent" in roles and len(roles) >= 3
-            and ("subject" in roles or from_has_address))
+    if not ("from" in roles and "sent" in roles and len(roles) >= 3
+            and ("subject" in roles or from_has_address)):
+        return 0
+    if (first in ("from", "sent") and timed and "to" in roles
+            and "subject" in roles):
+        return 2
+    return 1
+
+
+def _verb_then_name(line: str, folded: str) -> bool:
+    """Does the line end on its verb and then a name? ("… schrieb Bob Example:")
+
+    The languages that put the verb before the name end an attribution so.
+    Nothing but a name may follow: a few words, each capitalised — which
+    "wrote off the balance:" is not.
+    """
+    match = None
+    for match in _VERB_RE.finditer(folded):
+        pass
+    if match is None:
+        return False
+    count = len(folded[match.end():].rstrip(" :：").split())
+    if not 1 <= count <= 4:
+        return False
+    words = line.rstrip(" :：").split()[-count:]
+    return all(word[0].isupper() or not word[0].isalpha() for word in words)
 
 
 def _is_attribution(line: str, need_verb: bool = False) -> bool:
@@ -600,18 +905,20 @@ def _is_attribution(line: str, need_verb: bool = False) -> bool:
     being wrong would cut the rest of the mail.
     """
     line = line.strip()
-    if len(line) > 320 or not _COLON_END_RE.search(line):
+    if len(line) > _ATTRIBUTION_MAX or not _COLON_END_RE.search(line):
         return False
     bracketed = bool(_BRACKET_ADDRESS_RE.search(line))
     dated = bool(_DATE_RE.search(line)) and bool(_TIME_RE.search(line))
     folded = _fold(line)
     verb = bool(_VERB_RE.search(folded))
     if need_verb:
-        # … and the line must END as an attribution does, on the verb or on
-        # the address: "the invoice of 03.03.2025 14:02 wrote off the
-        # balance:" has the verb and the date and is a sentence.
+        # … and the line must END as an attribution does — on the verb, on
+        # the address, or on the verb and the name: "the invoice of
+        # 03.03.2025 14:02 wrote off the balance:" has the verb and the date
+        # and is a sentence.
         return verb and (bracketed or dated) and bool(
-            _VERB_END_RE.search(folded) or _ADDRESS_END_RE.search(line))
+            _VERB_END_RE.search(folded) or _ADDRESS_END_RE.search(line)
+            or _verb_then_name(line, folded))
     if bracketed or dated:
         return True
     return verb and bool(_ADDRESS_RE.search(line) or _DATE_RE.search(line)
@@ -634,26 +941,32 @@ def _wrapped(group: list) -> bool:
     return True
 
 
-def _attribution_tail(kept: list, need_verb: bool = False) -> int:
+def _attribution_tail(kept: list, marked: list, need_verb: bool = False) -> int:
     """How many trailing lines of `kept` are an attribution (0: none).
 
-    Trailing blank lines count into the answer, so the caller can cut them
-    with it. A line the HTML marked is an attribution outright; otherwise the
-    last line must have the shape, alone or as the end of a folded line — and
-    a folded line must start its paragraph and not end a sentence, so the
-    author's own closing words are never read into it.
+    `kept` are lines without marks, a blank one being ``""``; `marked` says
+    of each whether the HTML marked it an attribution. Trailing blank lines
+    count into the answer, so the caller can cut them with it. A marked line
+    is an attribution outright; otherwise the last line must have the shape,
+    alone or as the end of a folded line — and a folded line must start its
+    paragraph and not end a sentence, so the author's own closing words are
+    never read into it.
+
+    The cost is that of a few short lines: nothing longer than an attribution
+    is looked into, however long the line above one is.
     """
     end = len(kept)
-    while end and not _unmark(kept[end - 1]).strip():
+    while end and not kept[end - 1]:
         end -= 1
     if not end:
         return 0
-    if kept[end - 1].startswith(_ATTR):
+    if marked[end - 1]:
         start = end
-        while start and kept[start - 1].startswith(_ATTR):
+        while start and marked[start - 1]:
             start -= 1
         return len(kept) - start
-    if not _COLON_END_RE.search(kept[end - 1]):
+    last = kept[end - 1]
+    if len(last) > _ATTRIBUTION_MAX or not _COLON_END_RE.search(last):
         return 0
     # The folded forms first: "…, Ann Example\n<ann@example.org> wrote:" has a
     # last line that passes on its own and would leave its head behind.
@@ -661,12 +974,12 @@ def _attribution_tail(kept: list, need_verb: bool = False) -> int:
         start = end - span
         if start < 0:
             break
-        group = [_unmark(line) for line in kept[start:end]]
+        group = kept[start:end]
         head = group[0]
-        if (not head.strip() or _QUOTE_RE.match(head)
-                or _SENTENCE_END_RE.search(head)):
+        if (not head or sum(map(len, group)) > _ATTRIBUTION_MAX
+                or _QUOTE_RE.match(head) or _SENTENCE_END_RE.search(head)):
             break
-        if start and _unmark(kept[start - 1]).strip():
+        if start and kept[start - 1]:
             continue              # not where the paragraph begins
         lead = " ".join(group[:-1])
         if not (_DATE_RE.search(lead) or _TIME_RE.search(lead)):
@@ -675,9 +988,9 @@ def _attribution_tail(kept: list, need_verb: bool = False) -> int:
             continue
         if _is_attribution(" ".join(part.strip() for part in group), need_verb):
             return len(kept) - start
-    if need_verb and end > 1 and _unmark(kept[end - 2]).strip():
+    if need_verb and end > 1 and kept[end - 2]:
         return 0                  # mid-paragraph: a sentence of the author's
-    if _is_attribution(_unmark(kept[end - 1]), need_verb):
+    if _is_attribution(last, need_verb):
         return len(kept) - end + 1
     return 0
 
@@ -714,12 +1027,11 @@ def _forward_body(lines: list) -> list:
     first = _next_content(lines, 1)
     if first is None:
         return lines
-    head = lines[first]
-    levels = 0
-    while _QUOTE_RE.match(head):
-        head = _unquote(head)
-        levels += 1
-    if not levels or _label_role(head) is None:
+    # All the levels at once: taking them off one by one copies the line once
+    # per level, and a line can be nothing but ">".
+    quoting = _QUOTE_LEVELS_RE.match(lines[first])
+    levels = quoting.group().count(">")
+    if not levels or _label_role(lines[first][quoting.end():]) is None:
         return lines
     prefix = re.compile(r"(?: {0,3}> ?){1,%d}" % levels)
     return [lines[0]] + [prefix.sub("", line, count=1) if _QUOTE_RE.match(line)
@@ -761,7 +1073,36 @@ def _mid_sentence(lines: list, start: int) -> bool:
         _SENTENCE_END_RE.search(above) or _COLON_END_RE.search(above))
 
 
-def _history_event(lines: list, quoted: list, index: int, kept: list) -> int | None:
+class _Evidence:
+    """What the caller knows of the mail, and what a pass had to leave open.
+
+    `forward` — the subject carries a forward's prefix. `history` — the mail
+    cites an earlier one AND its subject carries a reply's prefix: the two
+    together license cutting history that no ``>`` marks. `bulk` — the mail's
+    headers say it is bulk mail.
+
+    `unsettled` is set by a rule that saw its shape and held back for want of
+    that evidence; it makes the state ``wanting``, so what the rule could not
+    decide a model may. Each pass starts it afresh, since only what the text
+    still shows at the end is open. `held` is the same for what only the
+    FIRST pass can see — a mark the HTML left, gone from the text after it —
+    and is kept for the whole trim.
+    """
+
+    __slots__ = ("forward", "history", "bulk", "unsettled", "held")
+
+    def __init__(self, forward: bool = False, history: bool = False,
+                 bulk: bool = False):
+        self.forward = forward
+        self.history = history
+        self.bulk = bulk
+        self.unsettled = False
+        self.held = False
+
+
+def _history_event(lines: list, quoted: list, index: int, kept: list,
+                   marked: list, evidence: _Evidence,
+                   known: dict) -> int | None:
     """Does quoted history that carries no ``>`` start at `lines[index]`?
 
     Answers how many trailing lines of `kept` belong to it (0 normally; the
@@ -775,11 +1116,16 @@ def _history_event(lines: list, quoted: list, index: int, kept: list) -> int | N
         if _has_stem(match.group(1), _ORIGINAL):
             return 0
         following = _next_content(lines, index + 1, 2)
-        if following is not None and _header_block_at(lines, following):
+        if following is not None and _header_block(lines, following, known):
             return 0
         return None
-    if _header_block_at(lines, index):
+    block = _header_block(lines, index, known)
+    if block == 2:
         return 0
+    if block:
+        # Headers, but not the block a client writes: a form mailer's, a
+        # helpdesk's, a memo's, a mail pasted to ask about it. They stay.
+        evidence.unsettled = True
     if _LIST_RULER_RE.match(line) and index + 1 < len(lines):
         # Outlook's rule above its header block, in a language the tables do
         # not cover: the shape carries it — "Label: Someone <address>" right
@@ -797,18 +1143,25 @@ def _history_event(lines: list, quoted: list, index: int, kept: list) -> int | N
         following = _next_content(lines, index + 1)
         if following is None or not quoted[following]:
             kept.append(lines[index])
-            span = _attribution_tail(kept, need_verb=True)
+            marked.append(False)
+            span = _attribution_tail(kept, marked, need_verb=True)
             kept.pop()
+            marked.pop()
             if span:
                 return span - 1
     return None
 
 
-def _boundary_confirmed(lines: list, index: int, hard: bool) -> bool:
+def _boundary_confirmed(lines: list, index: int, hard: bool,
+                        known: dict) -> bool:
     """Is the element the HTML marked at `index` really a quoted header?"""
     found = []
+    # A header block stands right under its mark. The window is the one
+    # _header_block looks through; without it a mail of nothing but marked
+    # elements (which read as blank lines) is scanned to its end from each.
+    last = min(len(lines), index + 17)
     position = index + 1
-    while position < len(lines) and len(found) < 6:
+    while position < last and len(found) < 6:
         if lines[position].strip():
             found.append(position)
         position += 1
@@ -819,32 +1172,49 @@ def _boundary_confirmed(lines: list, index: int, hard: bool) -> bool:
         # #divRplyFwdMsg is Outlook's own; any two "Label: value" lines under
         # it are its header block, in whatever language.
         return len(labels) >= 2
-    if _header_block_at(lines, found[0]):
+    if _header_block(lines, found[0], known):
         return True
     first = _LABEL_RE.match(lines[found[0]])
     return bool(first and len(labels) >= 3
                 and _BRACKET_ADDRESS_RE.search(first.group(2) or ""))
 
 
-def _strip_quotes(raw: list, forward_hint: bool):
-    """Stage 1. Answers ``(intro, forwarded, removed_chars)``.
+def _strip_quotes(raw: list, evidence: _Evidence):
+    """Stage 1. Answers ``(intro, forwarded, removed_chars, end_cut)``.
 
     `intro` is the author's own lines; `forwarded` is None, or the forwarded
     message from its marker on, which is content and is kept as it stands.
+    `end_cut` says that what stood under the intro's last line was cut.
+
+    ``>`` blocks go on their own evidence. History that carries no ``>`` —
+    a separator, a header block, an attribution above bare text, an element
+    the HTML marked — is cut to the end only when `evidence.history` says
+    the mail is a reply; under a forward's subject it is the message being
+    passed on; with neither it stays where it is and the pass is unsettled.
     """
     lines = [_unmark(line) for line in raw]
     quoted = _quote_flags(lines)
     lone = sum(quoted) == 1
-    kept: list = []
+    kept: list = []         # the author's lines so far; a blank one is ""
+    marked: list = []       # of each: did the HTML mark it an attribution?
+    judged = -1             # len(kept) when its tail last proved to be none
+    known: dict = {}        # see _header_block
     removed = 0
+    end_cut = False
     index = 0
     total = len(lines)
 
-    def keep(line: str) -> None:
+    def keep(line: str, mark: bool = False) -> None:
         # Never two blank lines in a row: the look-back for an attribution
         # skips the blank tail of `kept`, and must not have a long one to skip.
-        if line.strip() or (kept and kept[-1].strip()):
+        nonlocal end_cut
+        if line.strip():
             kept.append(line)
+            marked.append(mark)
+            end_cut = False
+        elif kept and kept[-1]:
+            kept.append("")
+            marked.append(False)
 
     while index < total:
         if quoted[index]:
@@ -853,7 +1223,8 @@ def _strip_quotes(raw: list, forward_hint: bool):
                 end += 1
             if index and (_DIFF_HUNK_RE.match(lines[index - 1].strip())
                           or (lone and _mid_sentence(lines, index))):
-                kept.extend(lines[index:end])      # content, not a quote
+                for line in lines[index:end]:      # content, not a quote
+                    keep(line)
                 index = end
                 continue
             inner = [_unquote(line) for line in lines[index:end]]
@@ -861,32 +1232,51 @@ def _strip_quotes(raw: list, forward_hint: bool):
             if first is not None and _is_forward_marker(inner, first):
                 # Apple Mail (HTML) and Yahoo quote the whole forward, marker
                 # included.
-                return kept, _forward_body(inner[first:] + lines[end:]), removed
-            drop = _attribution_tail(kept)
+                return (kept, _forward_body(inner[first:] + lines[end:]),
+                        removed, False)
+            # A tail already found to be no attribution is not asked again
+            # by the next quote block: a mail of a thousand blocks under one
+            # line would ask a thousand times.
+            drop = 0 if len(kept) == judged else _attribution_tail(kept, marked)
             if drop:
                 removed += _chars(kept[len(kept) - drop:])
                 del kept[len(kept) - drop:]
+                del marked[len(marked) - drop:]
             removed += _chars(lines[index:end])
             keep("")                # a paragraph break where the quote stood
+            end_cut = True
+            if not drop:
+                judged = len(kept)
             index = end
             continue
         event = None
         if raw[index].startswith(_BOUNDARY):
-            if _boundary_confirmed(lines, index, raw[index] == _MARK_HARD):
+            if _boundary_confirmed(lines, index, raw[index] == _MARK_HARD,
+                                   known):
                 event = 0
         elif _is_forward_marker(lines, index):
-            return kept, _forward_body(lines[index:]), removed
+            return kept, _forward_body(lines[index:]), removed, False
         else:
-            event = _history_event(lines, quoted, index, kept)
+            event = _history_event(lines, quoted, index, kept, marked,
+                                   evidence, known)
+        if event is not None and not (evidence.forward or evidence.history):
+            # History by its shape — but nothing says this mail answers
+            # another, and in a notification, a memo or a forward whose
+            # subject no table knows, the same shape is the content.
+            evidence.unsettled = True
+            if raw[index].startswith(_BOUNDARY):
+                evidence.held = True
+            event = None
         if event is None:
-            keep(raw[index])
+            keep(lines[index], raw[index].startswith(_ATTR))
             index += 1
             continue
-        rest = [_unmark(line) for line in kept[len(kept) - event:]] if event else []
+        rest = kept[len(kept) - event:] if event else []
         if event:
             del kept[len(kept) - event:]
+            del marked[len(marked) - event:]
         rest += lines[index:]
-        if forward_hint:
+        if evidence.forward:
             # An Outlook forward: the "history" is the message being passed
             # on. Its rule or separator would read as a reply's on the next
             # pass, so the plain forward marker replaces it.
@@ -896,10 +1286,11 @@ def _strip_quotes(raw: list, forward_hint: bool):
                     or _DASHED_RE.match(rest[start].strip())):
                 start = _next_content(rest, start + 1)
             rest = rest[start:] if start is not None else []
-            return kept, [FORWARD_MARKER] + rest, removed
+            return kept, [FORWARD_MARKER] + rest, removed, False
         removed += _chars(rest)
+        end_cut = True
         break
-    return kept, None, removed
+    return kept, None, removed, end_cut
 
 
 def _drop_from(lines: list, index: int) -> int:
@@ -914,43 +1305,143 @@ def _drop_from(lines: list, index: int) -> int:
 # The tail stages below work on the END of the text and look no further up
 # than a signature or a footer can reach, so repeating them until nothing
 # changes costs what they remove — not a scan of the mail per repetition,
-# which a mail built to be slow could otherwise turn into hours.
+# which a mail built to be slow could otherwise turn into hours. They are
+# handed squeezed lines: a blank line is "", and never two in a row.
 
-def _strip_signature(lines: list) -> int:
+_WORD_EDGES = ".,;:!?()[]<>\"'«»*_"
+
+
+def _names_only(words: list) -> bool:
+    """Are these words names and nothing else?
+
+    A device or a product of the tables; a word with a capital or a digit in
+    it, which is how a make and a model are written ("Galaxy S8", "iMac");
+    or a joining word right before a table's name ("for iPhone"). Any other
+    word is a word of a sentence: "… to yours yesterday", "… on Monday".
+    """
+    for position, word in enumerate(words):
+        word = word.strip(_WORD_EDGES)
+        folded = _fold(word)
+        if (not word or _MOBILE_NAME_RE.search(folded)
+                or word != word.lower() or any(ch.isdigit() for ch in word)):
+            continue
+        if not (folded in _MOBILE_JOINER and position + 1 < len(words)
+                and _MOBILE_NAME_RE.search(_fold(words[position + 1]))):
+            return False
+    return True
+
+
+def _mobile_line(lines: list, index: int) -> int:
+    """Is `lines[index]` the line a phone or an app signs with?
+
+    2 — yes: the table's words, the shape of a signing line (short, no
+    clause, no second sentence, no number), a paragraph of its own, the name
+    of what sent it — a product, or a word for a device — and beside the
+    table's words nothing but names. 1 — it has the words and the shape, and
+    lacks the paragraph or the names ("Sent from Hamburg on Monday", "Sent
+    from my office", "Sent from my iPhone to yours yesterday"): not cut, but
+    not settled. 0 — a sentence that starts like one ("Sent with DHL,
+    tracking 12345").
+    """
+    line = lines[index]
+    if len(line) > 120:
+        return 0
+    bare = _HUNG_LINK_RE.sub("", line).strip()
+    # Folded word by word, so that a place in the folded line is a word of
+    # the line as it was written, capitals and all.
+    words, parts = [], []
+    for word in bare.split():
+        part = "".join(_fold(word).split())
+        if part:
+            words.append(word)
+            parts.append(part)
+    folded = " ".join(parts)
+    match = _MOBILE_OWN_RE.match(folded)
+    own = match is not None
+    if not own:
+        match = _MOBILE_SENT_RE.match(folded)
+        if match is None:
+            return 0
+    if _PROSE_RE.search(bare) or len(words) > (12 if own else 8):
+        return 1 if own else 0
+    if index and lines[index - 1]:
+        return 1                    # under a line of text: maybe a sentence
+    if not _MOBILE_NAME_RE.search(folded):
+        return 1
+    # The sender's own words in the line: what stands for an entry's `*`,
+    # and whatever follows the table's words.
+    after = sum(1 for part in folded[match.end():].split()
+                if part.strip(_WORD_EDGES))
+    said = words[len(words) - after:] if after else []
+    if match.lastindex:
+        start = folded.count(" ", 0, match.start(match.lastindex))
+        count = len(match.group(match.lastindex).split())
+        said = words[start:start + count] + said
+    return 2 if _names_only(said) else 1
+
+
+def _strip_signature(lines: list, evidence: _Evidence) -> int:
     """Stage 2, in place: the ``-- `` delimiter, then the phone's closing line.
 
     Walking up from the end, a delimiter counts while no more than
-    SIGNATURE_MAX_LINES lines separate it from the end — or from a delimiter
-    already found below it, which is how a signature under a signature goes
-    in one go.
+    SIGNATURE_MAX_LINES lines separate it from the end. It cuts when it is
+    the only one within that reach and is written as the standard writes it,
+    with its trailing blank. Two within reach of each other are dividers
+    between sections; a bare ``--`` is as likely a divider someone typed as
+    a delimiter a relay stripped. Both stay, and leave the pass unsettled.
     """
     removed = 0
-    cut = None
+    found = []
     below = 0
     for index in range(len(lines) - 1, -1, -1):
-        # Clients strip trailing blanks as often as not, so "--" counts too.
-        if lines[index] == "--":
-            cut = index
+        line = lines[index]
+        if line == SIGNATURE_DELIMITER or line == "--":
+            found.append(index)
+            if len(found) == 2:
+                break
             below = 0
-        elif lines[index].strip():
+        elif line:
             below += 1
             if below > SIGNATURE_MAX_LINES:
                 break
-    if cut is not None:
-        removed += _drop_from(lines, cut)
-    while lines and len(lines[-1]) <= 120 and _MOBILE_RE.match(_fold(lines[-1])):
-        removed += _drop_from(lines, len(lines) - 1)
+    if len(found) == 1 and lines[found[0]] == SIGNATURE_DELIMITER:
+        removed += _drop_from(lines, found[0])
+    elif found:
+        evidence.unsettled = True
+    if lines:
+        verdict = _mobile_line(lines, len(lines) - 1)
+        if verdict == 2:
+            removed += _drop_from(lines, len(lines) - 1)
+        elif verdict:
+            evidence.unsettled = True
     return removed
 
 
+# No footer paragraph is longer than this many lines, or characters.
+_FOOTER_MAX_LINES = 40
+_FOOTER_MAX_CHARS = 6000
+# How many lines may still follow an unsubscribe paragraph: the sender's
+# postal address under the link.
+_UNSUBSCRIBE_MAX_AFTER = 6
+
+
 def _tail_paragraphs(lines: list, count: int) -> list:
-    """``(start, end)`` of the last `count` runs of non-blank lines, in order."""
+    """``(start, end)`` of the last `count` runs of non-blank lines, in order.
+
+    The walk up ends at a run longer than a footer can be: it is none, and
+    more follows everything above it than may follow a footer. So the walk
+    is short however the mail is built — one paragraph of a million lines
+    included.
+    """
     spans = []
     end = None
     for index in range(len(lines) - 1, -2, -1):
-        if index >= 0 and lines[index].strip():
+        if index >= 0 and lines[index]:
             if end is None:
                 end = index + 1
+            elif end - index > _FOOTER_MAX_LINES:
+                spans.append((index, end))
+                break
         elif end is not None:
             spans.append((index + 1, end))
             end = None
@@ -959,42 +1450,106 @@ def _tail_paragraphs(lines: list, count: int) -> list:
     return spans[::-1]
 
 
-# How many lines may still follow a footer paragraph: the sender's postal
-# address under an unsubscribe link; the same notice again in a second
-# language under a disclaimer.
-_FOOTER_MAX_AFTER = {"unsubscribe": 6, "disclaimer": 25}
-# No footer paragraph is longer than this many lines.
-_FOOTER_MAX_LINES = 40
+def _paragraph(lines: list, start: int, end: int) -> str:
+    """The paragraph as one text; none when it is too long to be a footer."""
+    if (end - start > _FOOTER_MAX_LINES
+            or sum(map(len, lines[start:end])) > _FOOTER_MAX_CHARS):
+        return ""
+    return " ".join(lines[start:end])
 
 
-def _footer_kind(text: str) -> str | None:
+_FIRST_SENTENCE_RE = re.compile(r".{0,300}?[.!?…](?=\s|$)", re.S)
+
+
+def _notice_cues(text: str) -> int:
+    """How much of a legal notice is this text? 0, 2 or 3.
+
+    3 — it names the mail itself, confidentiality, a recipient and what a
+    reader it was not meant for is to do, and it OPENS as a notice: two of
+    the first three in its first sentence ("This e-mail is confidential …").
+    2 — it speaks of confidentiality and of a recipient: a notice in words
+    no table has for the rest, or a sentence about a document. Never cut,
+    but not settled either.
+    """
+    if len(text) < 100:
+        return 0
     folded = _fold(text)
-    if any(stem in folded for stem in _UNSUBSCRIBE):
-        # The word alone is prose ("tell me if you want to unsubscribe"); a
-        # footer hands over the means.
-        if _URL_RE.search(text) or _ADDRESS_RE.search(text):
-            return "unsubscribe"
-    if (len(text) >= 100
-            and any(stem in folded for stem in _CONFIDENTIAL)
-            and any(stem in folded for stem in _RECIPIENT)):
-        return "disclaimer"
-    return None
+    if not (_CONFIDENTIAL_RE.search(folded) and _RECIPIENT_RE.search(folded)):
+        return 0
+    if not (_MESSAGE_RE.search(folded) and _MISDIRECTED_RE.search(folded)):
+        return 2
+    first = _FIRST_SENTENCE_RE.match(folded)
+    opening = first.group() if first else folded[:300]
+    kinds = sum(1 for cue in (_MESSAGE_RE, _CONFIDENTIAL_RE, _RECIPIENT_RE)
+                if cue.search(opening))
+    return 3 if kinds >= 2 else 2
 
 
-def _footer_start(lines: list, start: int, end: int, kind: str) -> int:
-    """Where in its paragraph a footer begins.
+def _signs_off(line: str) -> bool:
+    """A name, "Kind regards", a company: short, and no finished sentence."""
+    line = line.strip()
+    return (len(line) < 50 and not _SENTENCE_END_RE.search(line)
+            and not _COLON_END_RE.search(line))
+
+
+def _closes(lines: list, index: int) -> bool:
+    """Does `lines[index]` close the author's text?
+
+    A sign-off or the phone's line — and not the first line of the mail,
+    which is short for another reason: it is the greeting.
+    """
+    return index > 0 and (_signs_off(lines[index])
+                          or _mobile_line(lines, index) == 2)
+
+
+def _notice_start(lines: list, start: int, end: int) -> int:
+    """Where in its paragraph a legal notice begins.
 
     A server glues its notice right under the sender's last line as often as
     it leaves a blank line, so the paragraph can open with "Regards / Bob".
-    The footer starts at its first line that carries a cue word, taken back
-    over the lines of the sentence the cue stands in — a full-width line
-    above, or a line this one continues in lower case — and never over a
-    short, finished line, which is a sign-off.
+    The notice begins at the lowest line that follows a sign-off, starts a
+    sentence and, with what is under it, is a whole notice still — so the
+    author's lines above it stay. Failing that the paragraph is the notice.
     """
-    cues = _UNSUBSCRIBE if kind == "unsubscribe" else _CONFIDENTIAL + _RECIPIENT
+    for first in range(end - 1, start, -1):
+        if (_signs_off(lines[first - 1])
+                and not lines[first].lstrip()[:1].islower()
+                and _notice_cues(" ".join(lines[first:end])) == 3):
+            return first
+    return start
+
+
+def _unsubscribe_cue(text: str) -> int:
+    """How much of an unsubscribe block is this text? 0, 1 or 2.
+
+    0 — none: the word alone is prose ("tell me if you want to unsubscribe").
+    2 — the word and the means, which is what a footer hands over: a link,
+    or the address of a list server. 1 — the word and somebody's address,
+    which is how a request reads ("please unsubscribe me, my address is …"):
+    never cut, but not settled.
+    """
+    if not text or not _UNSUBSCRIBE_RE.search(_fold(text)):
+        return 0
+    if _URL_RE.search(text):
+        return 2
+    cue = 0
+    for match in _ADDRESS_RE.finditer(text):
+        if _LIST_COMMAND_RE.search(match.group().partition("@")[0].lower()):
+            return 2
+        cue = 1
+    return cue
+
+
+def _unsubscribe_start(lines: list, start: int, end: int) -> int:
+    """Where in its paragraph an unsubscribe block begins.
+
+    At its first line that carries the word, taken back over the lines of
+    the sentence the word stands in — a full-width line above, or a line
+    this one continues in lower case — and never over a short, finished
+    line, which is a sign-off.
+    """
     for first in range(start, end):
-        folded = _fold(lines[first])
-        if any(stem in folded for stem in cues):
+        if _UNSUBSCRIBE_RE.search(_fold(lines[first])):
             break
     else:
         return start
@@ -1007,81 +1562,196 @@ def _footer_start(lines: list, start: int, end: int, kind: str) -> int:
             break
         first -= 1
     # Cut short only if what is cut is still the whole footer.
-    if _footer_kind(" ".join(lines[first:end])) == kind:
+    if _unsubscribe_cue(" ".join(lines[first:end])) == 2:
         return first
     return start
 
 
-def _strip_footer(lines: list) -> int:
-    """Stage 3, in place: legal notices, unsubscribe blocks, list footers.
+def _under_a_message(lines: list, cut: int) -> bool:
+    """Do two lines of text, at least, stand above `cut`?
 
-    "At the end" is enforced, not assumed: a footer paragraph is cut together
-    with what follows it only when little follows it. An unsubscribe line at
-    the top of a notification, with the news under it, is not a footer.
+    A footer stands under a mail. Under a greeting alone, or under nothing,
+    the block is what the mail is about.
     """
-    removed = 0
-    for start, end in _tail_paragraphs(lines, FOOTER_MAX_PARAGRAPHS):
-        if end - start > _FOOTER_MAX_LINES:
-            continue
-        kind = _footer_kind(" ".join(lines[start:end]))
-        if not kind:
-            continue
-        after = sum(1 for line in lines[end:] if line.strip())
-        if after <= _FOOTER_MAX_AFTER[kind]:
-            removed += _drop_from(lines, _footer_start(lines, start, end, kind))
-            break
-    # A mailing list's footer: a long underscore rule, then a few lines that
-    # say where the list lives — one of them nothing but its URL or address,
-    # which a postscript under a rule would not be.
+    above = [line for line in lines[max(0, cut - 4):cut] if line]
+    return len(above) >= 2
+
+
+def _list_footer(lines: list):
+    """``(start, whole)`` of a mailing list's footer at the end, or None.
+
+    A long underscore rule, then a few lines that say where the list lives,
+    one of them nothing but its URL or address. `whole` — it is the footer as
+    the list software writes it: the list's name in words, its address and
+    its page, each on a line of its own. A postscript under a rule ("see
+    also", and a link; two links) is not.
+    """
     tail = []
     for index in range(len(lines) - 1, -1, -1):
         line = lines[index].strip()
         if _LIST_RULER_RE.match(line):
-            if any(_BARE_LINK_RE.fullmatch(item) for item in tail):
-                removed += _drop_from(lines, index)
-            break
+            urls = sum(1 for item in tail if _BARE_URL_RE.fullmatch(item))
+            addresses = sum(1 for item in tail
+                            if _BARE_ADDRESS_RE.fullmatch(item))
+            if not urls and not addresses:
+                return None
+            # … and one of the two is a list server's: under the same rule,
+            # a name, an address and a homepage are somebody's contact block.
+            placed = any(_LIST_PLACE_RE.search(item) for item in tail
+                         if _BARE_URL_RE.fullmatch(item)
+                         or _BARE_ADDRESS_RE.fullmatch(item))
+            return index, bool(urls and addresses and placed
+                               and urls + addresses < len(tail))
         if line:
             tail.append(line)
             if len(tail) > 6:
                 break
+    return None
+
+
+def _ends_on_link(line: str) -> bool:
+    """Does the line end on a link or an address, closing marks aside?"""
+    words = line.rstrip(_LINK_CLOSERS).rsplit(None, 1)
+    return bool(words) and bool(
+        _URL_RE.search(words[-1]) or _ADDRESS_RE.search(words[-1]))
+
+
+def _judged(lines: list, span: tuple, judged: dict) -> tuple:
+    """``(notice cues, unsubscribe cue, imprint?, ends on a link?)`` of the
+    paragraph at `span`, worked out once: the tail stages only ever cut the
+    END off `lines`, so what stands at a span is the same for as long as it
+    stands there — however often the stages are repeated under it."""
+    verdict = judged.get(span)
+    if verdict is None:
+        text = _paragraph(lines, *span)
+        start, end = span
+        verdict = judged[span] = (
+            _notice_cues(text), _unsubscribe_cue(text),
+            bool(text and _IMPRINT_RE.search(text) and not any(
+                _LIST_ITEM_RE.match(line) for line in lines[start:end])),
+            bool(text) and _ends_on_link(lines[end - 1]))
+    return verdict
+
+
+def _closes_a_footer(verdict: tuple) -> bool:
+    """May this paragraph stand under an unsubscribe block and go with it?
+
+    Another block that hands over its link, a whole legal notice, or the
+    sender's imprint. Not a paragraph that merely mentions unsubscribing or
+    confidentiality: under a footer or not, that is somebody's sentence.
+    """
+    notice, cue, imprint, linked = verdict
+    if cue:
+        return cue == 2 and linked
+    return notice == 3 or (not notice and imprint)
+
+
+def _strip_footer(lines: list, evidence: _Evidence, judged: dict) -> int:
+    """Stage 3, in place: one footer per call, the caller repeats.
+
+    *Legal notices* — the run of notice paragraphs the mail ENDS on, and
+    only under a line that closes the author's text. A paragraph that
+    mentions confidentiality with the sign-off still to come, or right under
+    a finished sentence, is what the author had to say.
+
+    *Unsubscribe blocks and list footers* — only in mail whose headers say
+    it is bulk mail, and only in the shape software gives them: the block
+    hands over the means and ends on it, stands under a message and has
+    nothing under it but more of its kind and an imprint. In a person's mail
+    "please unsubscribe me, my address is …" and a line of dashes above a
+    link are the message — and a person's post that a list passed on is bulk
+    mail by its headers: "can someone unsubscribe me? https://… does not
+    work" goes on after its link, and stays, also above the list's own
+    block.
+
+    Whatever looks like one of these and stays leaves the pass unsettled.
+    """
+    spans = _tail_paragraphs(lines, FOOTER_MAX_PARAGRAPHS)
+    found = [_judged(lines, span, judged) for span in spans]
+    cut = None
+    for (start, end), verdict in zip(reversed(spans), reversed(found)):
+        if verdict[0] < 3:
+            break
+        cut = _notice_start(lines, start, end)
+        if cut > start:
+            break                   # the author's lines open this paragraph
+    if cut:
+        above = cut - 1 if lines[cut - 1] else cut - 2
+        if _closes(lines, above):
+            return _drop_from(lines, cut)
+    if any(verdict[0] for verdict in found):
+        evidence.unsettled = True
+    # "At the end" is enforced, not assumed: an unsubscribe line at the top
+    # of a notification, with the news under it, is not a footer. Nor is one
+    # with words under it — a sign-off, the next step of a how-to.
+    for position, (start, end) in enumerate(spans):
+        cue, linked = found[position][1], found[position][3]
+        if not cue:
+            continue
+        if sum(1 for line in lines[end:] if line) > _UNSUBSCRIBE_MAX_AFTER:
+            continue
+        if (evidence.bulk and cue == 2 and linked and all(
+                _closes_a_footer(verdict) for verdict in found[position + 1:])):
+            cut = _unsubscribe_start(lines, start, end)
+            if _under_a_message(lines, cut):
+                return _drop_from(lines, cut)
+        # Not a footer — which the next paragraph with the word may still be.
+        evidence.unsettled = True
+    footer = _list_footer(lines)
+    removed = 0
+    # (Footers stacked under one another go in one call.)
+    while (footer and footer[1] and evidence.bulk
+           and _under_a_message(lines, footer[0])):
+        removed += _drop_from(lines, footer[0])
+        footer = _list_footer(lines)
+    if footer and not removed:
+        evidence.unsettled = True
     return removed
 
 
-def _strip_tail(lines: list, removed: dict, history_cut: bool) -> None:
+def _strip_tail(lines: list, removed: dict, end_cut: bool,
+                evidence: _Evidence) -> None:
     """Stages 2 and 3, repeated until the end of the text is settled.
 
     They uncover work for each other — a notice under the phone's closing
     line hides that line from the signature stage until the footer stage has
     run — so neither is done before both find nothing.
+
+    `end_cut`: what stood under these lines was quoted history, and is gone.
     """
+    counter = "quote"
+    judged: dict = {}       # see _judged
     while True:
         size = len(lines)
-        # The rule a client draws above the history it appends stays behind
-        # when the history goes; it belongs to what was cut.
-        while lines and _RULER_RE.match(lines[-1]):
-            removed["quote" if history_cut else "footer"] += _drop_from(
-                lines, len(lines) - 1)
-        removed["signature"] += _strip_signature(lines)
-        removed["footer"] += _strip_footer(lines)
+        # The rule a client draws above the history it appends (or a sender
+        # above their footer) stays behind when that goes; it belongs to
+        # what was cut. A rule nothing was cut under is the author's line.
+        while end_cut and lines and _RULER_RE.match(lines[-1]):
+            removed[counter] += _drop_from(lines, len(lines) - 1)
+        before = len(lines)
+        removed["signature"] += _strip_signature(lines, evidence)
+        removed["footer"] += _strip_footer(lines, evidence, judged)
+        end_cut, counter = len(lines) < before, "footer"
         if len(lines) == size:
             return
 
 
-def _pass(raw: list, forward_hint: bool, removed: dict) -> list:
-    intro, forwarded, cut = _strip_quotes(raw, forward_hint)
+def _pass(raw: list, evidence: _Evidence, removed: dict) -> list:
+    evidence.unsettled = False      # what the LAST pass leaves open counts
+    intro, forwarded, cut, end_cut = _strip_quotes(raw, evidence)
     removed["quote"] += cut
-    intro = _squeeze([_unmark(line) for line in intro])
-    _strip_tail(intro, removed, bool(cut))
+    intro = _squeeze(intro)
+    _strip_tail(intro, removed, end_cut, evidence)
     if forwarded is not None:
         intro = intro + [""] + forwarded
-    return _squeeze([line.rstrip() for line in intro])
+    return _squeeze([_rstrip(line) for line in intro])
 
 
 #: Passes after which a text that still changes is given up on.
 _MAX_PASSES = 20
 
 
-def _trim_lines(raw: list, forward_hint: bool, removed: dict) -> list:
+def _trim_lines(raw: list, evidence: _Evidence, removed: dict) -> list:
     """The pipeline, to its fixpoint.
 
     Removing the end of a text can change how the rest reads (a quote that
@@ -1094,7 +1764,7 @@ def _trim_lines(raw: list, forward_hint: bool, removed: dict) -> list:
     """
     lines = raw
     for _ in range(_MAX_PASSES):
-        after = _pass(lines, forward_hint, removed)
+        after = _pass(lines, evidence, removed)
         if after == lines:
             return lines
         lines = after
@@ -1102,36 +1772,58 @@ def _trim_lines(raw: list, forward_hint: bool, removed: dict) -> list:
 
 
 def _marker_survives(lines: list) -> bool:
-    """Did quoting the trim could not settle stay in the text?"""
-    if any(_QUOTE_RE.match(line) for line in lines):
-        return True
-    for line in reversed(lines):
-        if line.strip():
-            # An attribution left hanging at the very end.
-            return _is_attribution(line)
-    return False
+    """Did quoting the trim could not settle stay in the text?
+
+    A ``>`` line; or a line with the shape of an attribution where one
+    stands — opening its paragraph, or hanging at the very end. Such a line
+    with text under it and no ``>`` is how a client quotes in a language no
+    table here has the verb of: it was kept, and the state must say so.
+    """
+    last = None
+    for index, line in enumerate(lines):
+        if not line:
+            continue
+        last = line
+        if _QUOTE_RE.match(line):
+            return True
+        if ((not index or not lines[index - 1])
+                and len(line) <= _ATTRIBUTION_MAX and _is_attribution(line)):
+            return True
+    return bool(last is not None and len(last) <= _ATTRIBUTION_MAX
+                and _is_attribution(last))
 
 
 def is_forward_subject(subject: str | None) -> bool:
     """Is the subject's outermost prefix a forward's ("Fwd:", "WG:", "TR:", …)?"""
-    return bool(subject and _FORWARD_SUBJECT_RE.match(_fold(subject)))
+    return bool(isinstance(subject, str)
+                and _FORWARD_SUBJECT_RE.match(_fold(subject)))
 
 
-def _settle(raw: list, forward_hint: bool) -> tuple:
-    """``(lines, removed)`` of one source; no lines when the trim failed or
-    left nothing."""
+def is_reply_subject(subject: str | None) -> bool:
+    """Is the subject's outermost prefix a reply's ("Re:", "AW:", "SV:", …)?"""
+    return bool(isinstance(subject, str)
+                and _REPLY_SUBJECT_RE.match(_fold(subject)))
+
+
+def _settle(raw: list, evidence: _Evidence) -> tuple:
+    """``(lines, removed, unsettled)`` of one source; no lines when the trim
+    failed or left nothing."""
     removed = {"quote": 0, "signature": 0, "footer": 0, "pixels": 0}
+    evidence.held = False
     try:
-        return _trim_lines(raw, forward_hint, removed), removed
+        lines = _trim_lines(raw, evidence, removed)
     except Exception:       # a bubble with too much in it beats no bubble
-        return [], removed
+        return [], removed, True
+    return lines, removed, evidence.unsettled or evidence.held or not lines
 
 
 # A quote container some client wrote into the HTML part: worth a parse when
-# the plain part showed no quote.
+# the plain part showed no quote. (The last is desktop Outlook's: a div with
+# a rule above it around the quoted header block.)
 _HTML_QUOTE_HINT_RE = re.compile(
     r"divRplyFwdMsg|appendonsend|gmail_quote|yahoo_quoted|protonmail_quote"
-    r"|moz-cite-prefix|type\s*=\s*[\"']?cite", re.I)
+    r"|moz-cite-prefix|type\s*=\s*[\"']?cite"
+    r"|border-top\s*:(?!\s*(?:none|0|hidden))", re.I)
 
 #: A plain part shorter than this, beside an HTML part that says
 #: `STUB_RATIO` times as much (and a good deal in absolute terms), is a stub
@@ -1146,18 +1838,33 @@ def _is_stub(plain: str, marked: str) -> bool:
     return says > 1000 and says > STUB_RATIO * said
 
 
-def trim(plain: str | None, html: str | None, subject: str | None = None) -> TrimResult:
+def trim(plain: str | None, html: str | None, subject: str | None = None, *,
+         is_reply: bool | None = None, bulk: bool | None = None) -> TrimResult:
     """Reduce a mail to its own new text. See the module docstring.
 
     `plain` and `html` are the mail's two body parts, either may be None. The
     plain part is the source whenever it is the mail's text; see "Which part
     is the source" in the module docstring for when it is not.
 
-    `subject` is optional and only ever widens what is kept: a forward's
-    prefix on it makes Outlook-style history, which no marker tells from a
-    reply's, the forwarded message it is.
+    The rest is evidence, and all of it optional: what is not given is not
+    known, and what is not known is never a reason to cut.
+
+    `subject` — the mail's Subject. A forward's prefix on it makes history
+    that no marker tells from a reply's the forwarded message it is; a
+    reply's prefix is one half of what lets such history be cut.
+
+    `is_reply` — whether the mail cites an earlier one (an In-Reply-To or a
+    References header). The other half: history that carries no ``>`` is cut
+    only in a mail that cites one AND is subjected as a reply.
+
+    `bulk` — whether the mail's headers call it bulk mail (List-Unsubscribe,
+    List-Id, ``Precedence: bulk``). Unsubscribe blocks and list footers are
+    cut only then.
     """
-    forward = is_forward_subject(subject)
+    evidence = _Evidence(
+        forward=is_forward_subject(subject),
+        history=is_reply is True and is_reply_subject(subject),
+        bulk=bulk is True)
     has_plain = isinstance(plain, str) and bool(plain.strip())
     has_html = isinstance(html, str) and bool(html.strip())
     converted = None            # (marked text, pixels) of the HTML part, once
@@ -1175,35 +1882,51 @@ def trim(plain: str | None, html: str | None, subject: str | None = None) -> Tri
 
     lines: list = []
     untrimmed: list = []
+    unsettled = False
     removed = {"quote": 0, "signature": 0, "footer": 0, "pixels": 0}
     if has_plain:
         untrimmed = _clean_lines(plain)
-        lines, removed = _settle(untrimmed, forward)
+        lines, removed, unsettled = _settle(untrimmed, evidence)
     if has_html and (not has_plain or (
             not removed["quote"] and _HTML_QUOTE_HINT_RE.search(html))):
         marked, pixels = html_source()
         raw = _clean_lines(marked, keep_marks=True)
-        candidate, counted = _settle(raw, forward)
+        candidate, counted, open_ = _settle(raw, evidence)
         if not candidate:
             # The marks made the trim take everything. What the text alone
             # supports is what a later trim of this result would arrive at,
             # so it is the answer now.
-            candidate, counted = _settle(_unmarked(raw), forward)
+            candidate, counted, open_ = _settle(_unmarked(raw), evidence)
         counted["pixels"] = pixels
         if not has_plain:
             untrimmed = _unmarked(raw)
-            lines, removed = candidate, counted
+            lines, removed, unsettled = candidate, counted, open_
         elif candidate and counted["quote"] and (
                 not lines or _chars(candidate) < _chars(lines)):
-            lines, removed = candidate, counted
+            lines, removed, unsettled = candidate, counted, open_
+        else:
+            # Not the source — but what the markup showed and no rule could
+            # act on (history, in a mail not known to be a reply) is as
+            # open in the plain part, which merely could not see it.
+            unsettled = unsettled or open_
     if not lines:
         # Greedy to the point of nothing: the mail was all quote, or all
-        # signature. Show it as it came.
-        lines = untrimmed
-        removed.update(quote=0, signature=0, footer=0)
-    text = "\n".join(lines)
+        # signature. The answer is what a later trim of the mail as it came
+        # would make of it — its text alone, no evidence beside it — and, if
+        # that is nothing too, the mail as it came.
+        pixels = removed["pixels"]
+        untrimmed = [line.rstrip() for line in untrimmed]
+        lines, removed, _ = _settle(untrimmed, _Evidence())
+        if not lines:
+            lines = untrimmed
+            removed.update(quote=0, signature=0, footer=0)
+        removed["pixels"] = pixels
+        unsettled = True
+    # The delimiter's blank and (never, by now) a mark go last.
+    text = _MARKS_RE.sub("", "\n".join(line.rstrip() for line in lines))
     wanting = bool(text) and (
-        not has_plain or len(text) > WANTING_CHARS or _marker_survives(lines))
+        not has_plain or unsettled or len(text) > WANTING_CHARS
+        or _marker_survives(lines))
     return TrimResult(text, "wanting" if wanting else "deterministic", removed)
 
 
@@ -1269,9 +1992,22 @@ _BORDER_TOP_RE = re.compile(r"border-top:(?!none|0|hidden)")
 _NO_MARGIN_RE = re.compile(r"(?:^|;)margin(?:-top|-bottom)?:0(?:[a-z%]*)(?:;|!|\s|$)")
 _HR_TEXT = "-" * 20
 # How deep elements are tracked, in the converter and in the sanitiser. Real
-# mail nests a few dozen levels (layout tables); the bound is what keeps the
-# cost of a mail linear in its size whatever it nests.
+# mail nests a few dozen levels (layout tables); deeper elements are passed
+# through untracked.
 _MAX_DEPTH = 256
+# How many containers deep a line is finished as part of a block of its own
+# and then handed outwards — prefixed with "> " by a quote, indented by a list
+# item, copied by a cell. This, not _MAX_DEPTH, bounds what nesting can cost:
+# each line is copied at most this often.
+_MAX_BLOCKS = 16
+# … and what it can make of a mail: all the prefixes of a conversion together
+# may be this many characters per character of markup (and a little for a
+# short mail). A line of real mail has more markup around it than quote
+# marks before it; "x<br>" a hundred thousand times inside sixteen quotes
+# has not, and its innermost quotes are then written as paragraphs.
+_PREFIX_ALLOWANCE = 2
+_PREFIX_FLOOR = 4096
+_MAX_ANCHORS = 4
 
 
 def _style_of(attrs: dict) -> str:
@@ -1303,7 +2039,12 @@ def _pixels(value) -> float | None:
         return None
     if isinstance(value, (int, float)):
         return float(value)
-    match = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*(?:px)?\s*", str(value), re.I)
+    # Stripped and measured first: a pattern with blanks to skip on either
+    # side of an optional unit takes the square of a long blank value.
+    text = str(value).strip()
+    if len(text) > 16:
+        return None
+    match = re.fullmatch(r"(\d+(?:\.\d+)?)\s?(?:px)?", text, re.I)
     return float(match.group(1)) if match else None
 
 
@@ -1352,13 +2093,15 @@ def _link_note(href: str | None, text: str) -> str | None:
     address. Only http(s), mailto and tel targets are ever written; a fragment
     or a script pseudo-link is no destination.
     """
-    href = (href or "").strip()
+    # A target is the sender's text like any other: no mark and no padding
+    # of theirs reaches a line through it — nor through what it decodes to.
+    href = (href or "").translate(_INVISIBLE).strip()
     if not href or not text:
         return None
     low = href.lower()
     if low.startswith("mailto:"):
         address, _, query = href[7:].partition("?")
-        address = unquote(address).strip()
+        address = unquote(address).translate(_INVISIBLE).strip()
         if not address:
             return None
         if query:               # ?subject=/&body= is part of the action
@@ -1430,7 +2173,8 @@ class _Block:
         self.lines.append(line)
 
     def newline(self) -> None:                  # <br>: ends even an empty line
-        self.emit("".join(self.cur).rstrip(" "))
+        line = "".join(self.cur)
+        self.emit(line if line == SIGNATURE_DELIMITER else line.rstrip(" "))
         self.cur = []
 
     def brk(self) -> None:                      # a block edge: ends a begun line
@@ -1474,12 +2218,18 @@ class _TextConverter(HTMLParser):
     is an attribution, where Outlook's quoted header starts.
     """
 
-    def __init__(self, marks: bool = False):
+    def __init__(self, marks: bool = False, allowance: int = _PREFIX_FLOOR):
         super().__init__(convert_charrefs=True)
         self.marks = marks
         self.pixels = 0
         self._blocks = [_Block()]
+        self._allowance = allowance     # prefix characters still to give out
         self._stack: list = []
+        # Where each tag is open in the stack (indices, ascending), and where
+        # the open cells and tables are: every question the parser asks of
+        # the stack is answered from these, so none of them walks it.
+        self._where: dict = {}
+        self._walls: list = []
         self._inert = 0         # depth inside muted or hidden elements
         self._overflow = None   # [tag, depth] of a muted element past _MAX_DEPTH
         self._pre = 0
@@ -1491,24 +2241,51 @@ class _TextConverter(HTMLParser):
 
     # ── stack discipline ──
 
+    def _push(self, element: _Element) -> None:
+        self._where.setdefault(element.tag, []).append(len(self._stack))
+        if element.kind in ("cell", "table"):
+            self._walls.append(len(self._stack))
+        self._stack.append(element)
+
     def _pop_to(self, index: int) -> None:
         while len(self._stack) > index:
-            self._close(self._stack.pop())
+            element = self._stack.pop()
+            self._where[element.tag].pop()
+            if self._walls and self._walls[-1] == len(self._stack):
+                self._walls.pop()
+            self._close(element)
+
+    def _last(self, tags) -> int:
+        """The innermost open element with one of these tags, or -1."""
+        where = self._where
+        best = -1
+        for tag in tags:
+            open_at = where.get(tag)
+            if open_at and open_at[-1] > best:
+                best = open_at[-1]
+        return best
 
     def _find(self, tags, barriers=()) -> int | None:
-        for index in range(len(self._stack) - 1, -1, -1):
-            tag = self._stack[index].tag
-            if tag in tags:
-                return index
-            if tag in barriers:
-                return None
-        return None
+        """The innermost open element with one of `tags` that no element with
+        one of `barriers` stands inside of; None when there is none."""
+        found = self._last(tags)
+        if found < 0 or self._last(barriers) > found:
+            return None
+        return found
+
+    def _leave_head(self) -> None:
+        """An unclosed <head> ends at the first thing that cannot stand in
+        one — text, a <br>, an image — as it does in a browser. Only when the
+        head itself is the open element: text inside its <title> is the
+        title's."""
+        if self._stack and self._stack[-1].tag == "head":
+            self._pop_to(len(self._stack) - 1)
 
     def _implied_end(self, tag: str) -> None:
         """Close what this start tag closes implicitly, as a browser would."""
         if self._stack and tag != "head":
-            head = self._find(("head",))
-            if head is not None and (tag == "body" or (
+            head = self._last(("head",))
+            if head >= 0 and (tag == "body" or (
                     self._stack[-1].tag == "head"
                     and tag not in _HEAD_TAGS and ":" not in tag)):
                 self._pop_to(head)
@@ -1518,6 +2295,10 @@ class _TextConverter(HTMLParser):
             found = self._find(("td", "th"), ("tr", "table"))
         elif tag in ("tr", "thead", "tbody", "tfoot"):
             found = self._find(("tr",), ("table",))
+        elif tag == "a":
+            # A link does not nest: a second <a> ends the first. (Else every
+            # word of a mail could be written into 256 open links at once.)
+            found = self._find(("a",), ("td", "th", "table"))
         elif tag in _CLOSES_P:
             found = self._find(("p",), _P_BARRIERS)
         else:
@@ -1542,25 +2323,27 @@ class _TextConverter(HTMLParser):
                 self._overflow[1] += 1
             return
         if tag in _VOID_TAGS:
+            if tag not in _HEAD_TAGS:
+                self._leave_head()
             if not self._inert:
                 self._void(tag, a)
             return
         self._implied_end(tag)
         mute = tag in _MUTE_TAGS or _is_hidden(a)
         if len(self._stack) >= _MAX_DEPTH:
-            # Deeper than any mail nests: the element is not tracked, so every
-            # walk of the stack stays short. What it would have hidden is
-            # still hidden, by counting its own tag until it closes.
+            # Deeper than any mail nests: the element is not tracked. What it
+            # would have hidden is still hidden, by counting its own tag
+            # until it closes.
             if mute and not self._inert:
                 self._overflow = [tag, 1]
             return
         if self._inert:
-            self._stack.append(_Element(tag, "inert"))
+            self._push(_Element(tag, "inert"))
         elif mute:
-            self._stack.append(_Element(tag, "mute"))
+            self._push(_Element(tag, "mute"))
             self._inert += 1
         else:
-            self._stack.append(self._open(tag, a))
+            self._push(self._open(tag, a))
 
     def _open(self, tag: str, a: dict) -> _Element:
         blk = self._blk
@@ -1570,6 +2353,12 @@ class _TextConverter(HTMLParser):
         # a line of the block: inside a quote, a list item or a table cell the
         # line gets a prefix, and a mark that is not at its start is no mark.
         marks = self.marks and len(self._blocks) == 1
+        # A container that is finished as a block of its own (a quote, a list
+        # item, a cell) hands each of its lines to the one around it, with a
+        # prefix. Past this depth containers are written into the block they
+        # stand in, so a line is copied and prefixed a bounded number of
+        # times whatever a mail nests.
+        deep = len(self._blocks) > _MAX_BLOCKS
         if marks:
             if ident.endswith(_HISTORY_IDS):
                 blk.para()
@@ -1578,12 +2367,18 @@ class _TextConverter(HTMLParser):
                 blk.para()
                 blk.emit(_MARK_SOFT)
         cited = classes & _QUOTE_ANY_CLASSES or ident.startswith("yahoo_quoted")
+        # type=cite is what the mail clients write. A cite attribute alone is
+        # HTML's way to name the source of any quotation — a testimonial in a
+        # newsletter — unless it names a mail ("mid:", as Thunderbird does).
         if tag == "blockquote" and (
-                (a.get("type") or "").lower() == "cite" or "cite" in a
+                (a.get("type") or "").lower() == "cite"
+                or (a.get("cite") or "").lower().startswith("mid:")
                 or classes & _QUOTE_BLOCK_CLASSES):
             cited = True
         if cited:
             blk.para()
+            if deep:                # still inside the outer quotes' ">" lines
+                return _Element(tag, "paragraph")
             self._blocks.append(_Block())
             return _Element(tag, "quote")
         if marks and classes & _ATTRIBUTION_CLASSES:
@@ -1599,6 +2394,8 @@ class _TextConverter(HTMLParser):
                 "nested": nested})
         if tag == "li":
             blk.brk()
+            if deep:
+                return _Element(tag, "block")
             parent = self._find(("ul", "ol"), ("td", "th", "table"))
             marker = "- "
             data = self._stack[parent].data if parent is not None else None
@@ -1614,8 +2411,11 @@ class _TextConverter(HTMLParser):
             blk.brk()
             return _Element(tag, "row", [])
         if tag in ("td", "th"):
+            if deep:
+                blk.brk()
+                return _Element(tag, "block")
             if self._find(("tr",), ("table",)) is None:
-                self._stack.append(_Element("tr", "row", []))   # a row-less cell
+                self._push(_Element("tr", "row", []))           # a row-less cell
             self._blocks.append(_Block())
             return _Element(tag, "cell")
         if tag == "pre":
@@ -1670,15 +2470,14 @@ class _TextConverter(HTMLParser):
             return
         if tag in _VOID_TAGS:
             return
-        structural = tag in _TABLE_TAGS
-        for index in range(len(self._stack) - 1, -1, -1):
-            element = self._stack[index]
-            if element.tag == tag:
-                self._pop_to(index)
-                return
-            # A stray </div> inside a cell must not close the table around it.
-            if not structural and element.kind in ("cell", "table"):
-                return
+        open_at = self._where.get(tag)
+        if not open_at:
+            return
+        index = open_at[-1]
+        # A stray </div> inside a cell must not close the table around it.
+        if tag not in _TABLE_TAGS and self._walls and self._walls[-1] > index:
+            return
+        self._pop_to(index)
 
     def _close(self, element: _Element) -> None:
         kind = element.kind
@@ -1699,15 +2498,19 @@ class _TextConverter(HTMLParser):
             blk = self._blk
             if kind == "quote":
                 blk.para()
-                blk.add(["> " + line if line else ">" for line in lines])
+                if self._afford(2, lines):
+                    lines = ["> " + line if line else ">" for line in lines]
+                blk.add(lines)
                 blk.gap = True
             elif kind == "attribution":
                 blk.add([_ATTR + line if line else line for line in lines])
             elif kind == "item":
                 marker = element.data
                 pad = " " * len(marker)
-                blk.add([(marker if n == 0 else pad) + line if line else line
-                         for n, line in enumerate(lines)])
+                if self._afford(len(marker), lines):
+                    lines = [(marker if n == 0 else pad) + line if line else line
+                             for n, line in enumerate(lines)]
+                blk.add(lines)
             else:
                 row = self._find(("tr",), ("table",))
                 if row is not None and self._stack[row].kind == "row":
@@ -1727,6 +2530,14 @@ class _TextConverter(HTMLParser):
             blk.para()
         else:
             blk.brk()
+
+    def _afford(self, width: int, lines: list) -> bool:
+        """May these lines each get a prefix of `width`? (_PREFIX_ALLOWANCE)"""
+        cost = width * len(lines)
+        if cost > self._allowance:
+            return False
+        self._allowance -= cost
+        return True
 
     def _row(self, cells: list) -> None:
         """One table row. Cells of a line each share a line; a cell that is a
@@ -1753,10 +2564,14 @@ class _TextConverter(HTMLParser):
             self._blk.raw(data)
         else:
             self._blk.text(data)
-        for anchor in self._anchors:
+        # A link inside a link needs a table between them; the innermost few
+        # are all that ever take the text, however many a mail stacks.
+        for anchor in self._anchors[-_MAX_ANCHORS:]:
             anchor.data["parts"].append(data)
 
     def handle_data(self, data):
+        if data.strip(" \t\n\r\f"):
+            self._leave_head()
         if not self._inert and not self._overflow:
             self._write(data.translate(_INVISIBLE))
 
@@ -1768,7 +2583,8 @@ class _TextConverter(HTMLParser):
 
 def _convert(html: str, marks: bool = False):
     """``(text, tracking pixels)`` of an HTML part."""
-    converter = _TextConverter(marks)
+    converter = _TextConverter(
+        marks, _PREFIX_ALLOWANCE * len(html) + _PREFIX_FLOOR)
     try:
         converter.feed(html)
         lines = converter.finish()
@@ -1777,9 +2593,15 @@ def _convert(html: str, marks: bool = False):
         lines = _html.unescape(re.sub(r"<[^<>]*>", " ", html)).split("\n")
     out = []
     for line in lines:
-        line = line.replace("\xa0", " ").rstrip()
+        # The trim is handed the signature delimiter with its blank; the
+        # public rendering has no trailing blanks at all.
+        line = line.replace("\xa0", " ")
+        line = _rstrip(line) if marks else line.rstrip()
         out.append(line if line.strip(" \u200c\u200d\u2060") else "")
-    return "\n".join(_squeeze(out)), converter.pixels
+    text = "\n".join(_squeeze(out))
+    if not marks:
+        text = _MARKS_RE.sub("", text)      # belt: no input reaches a line raw
+    return text, converter.pixels
 
 
 def html_to_text(html: str | None) -> str:
@@ -1804,8 +2626,9 @@ def html_to_text(html: str | None) -> str:
 # attribute value escaped. Of the elements whose content a browser reads as
 # raw text (script, style, textarea, title, xmp, …) it contains exactly one:
 # the single <style> in the head, whose content is rebuilt from validated
-# tokens and cannot hold a "<". So the browser's parse of the output cannot
-# differ from the parse made here.
+# pieces (see _clean_stylesheet for why a browser cannot read it differently
+# than it was built). So the browser's parse of the output cannot differ from
+# the parse made here.
 
 _SAFE_TAGS = frozenset((
     "a abbr address article aside b bdi bdo big blockquote br caption center "
@@ -1837,10 +2660,20 @@ _SAFE_TAG_ATTRS = {
 _SIZE_ATTR_RE = re.compile(r"\d{1,5}(?:\.\d+)?(?:%|px)?")
 _CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
 _CSS_PROPERTY_RE = re.compile(r"-?[a-z][a-z0-9-]*")
-# No colon, backslash, angle bracket, brace, semicolon or at-sign can reach a
-# value: no URL scheme, no CSS escape, no at-rule, no way out of a <style>.
+# A value, by the characters one is made of. No colon, backslash, angle
+# bracket, brace, semicolon or at-sign can reach it: no URL scheme, no CSS
+# escape, no at-rule, no way out of a block. In a style ATTRIBUTE a value may
+# hold strings (the attribute ends where HTML says, whatever CSS makes of
+# it); in the style SHEET it may not — see _clean_stylesheet.
 _CSS_VALUE_RE = re.compile(r"[\w\s#%.,()\-+/'\"!*]*")
-_CSS_FUNCTION_RE = re.compile(r"([\w-]*)\s*\(")
+_CSS_BARE_VALUE_RE = re.compile(r"[\w\s#%.,()\-+/!*]*")
+# A string that says no more than the words in it (a font's name, a class):
+# in the sheet it is written without its quotes.
+_CSS_QUOTED_RE = re.compile(r"\"([\w \-]*)\"|'([\w \-]*)'")
+_CSS_QUOTED_WORD_RE = re.compile(r"\"([\w-]+)\"|'([\w-]+)'")
+# The name before a parenthesis. Anchored where a name starts: a pattern
+# free to start anywhere reads a long word once from each of its letters.
+_CSS_FUNCTION_RE = re.compile(r"(?<![\w-])([\w-]*)\s*\(")
 _CSS_FUNCTIONS = frozenset((
     "rgb", "rgba", "hsl", "hsla", "calc", "min", "max", "clamp",
     "linear-gradient", "radial-gradient", "repeating-linear-gradient",
@@ -1848,12 +2681,22 @@ _CSS_FUNCTIONS = frozenset((
 _CSS_BAD_WORDS = ("expression", "behavior", "binding", "script")
 _CSS_BAD_PROPERTIES = frozenset(("behavior", "-moz-binding"))
 # A selector, by the characters one is made of — none of which can open a
-# tag, close a block or start an escape.
-_CSS_SELECTOR_RE = re.compile(r"[\w\s.#:,>+~*\[\]=\"'()^$|%-]{1,500}")
+# tag, a string or a comment, close a block or start an escape.
+_CSS_SELECTOR_RE = re.compile(r"[\w\s.#:,>+~*\[\]=()^$|%-]{1,500}")
+_CSS_SELECTOR_FUNCTIONS = frozenset((
+    "not", "is", "where", "lang", "dir", "nth-child", "nth-last-child",
+    "nth-of-type", "nth-last-of-type"))
 _CSS_MEDIA_RE = re.compile(r"@media[\w\s(),:.%/-]{0,300}", re.I)
 _CSS_BRACE_RE = re.compile(r"[{}]")
+# What the finished sheet must not hold (the last word on _clean_stylesheet).
+_CSS_SHEET_FORBIDDEN_RE = re.compile(r"[<\\\"']|/\*|@(?!media[\s({])", re.I)
+_CSS_SHEET_CALL_RE = re.compile(r"(?<![\w-])([\w-]*)\(")
+_CSS_SHEET_CALLS = _CSS_FUNCTIONS | _CSS_SELECTOR_FUNCTIONS | {""}
 #: A mail's style sheets beyond this size are dropped whole.
 _CSS_MAX_CHARS = 200_000
+#: How much the document may grow by showing inline images AGAIN: each is
+#: written out once, and repeated only while the repeats fit in this.
+_IMAGE_REPEAT_CHARS = 1_000_000
 _HREF_RE = re.compile(r"(?:https?://[^\s/?#]|mailto:[^\s])", re.I)
 # The schemes that run code, spelled so this file never holds either whole.
 _SCRIPT_SCHEME_RE = re.compile("(java" "script|vb" "script)(\\s*):", re.I)
@@ -1872,7 +2715,9 @@ def _css_uncomment(css: str) -> str:
     """CSS without its comments; an unclosed one takes the rest with it.
 
     By hand rather than by pattern: a pattern rescans from every ``/*`` that
-    has no end, which a sheet of nothing but ``/*`` turns into minutes.
+    has no end, which a sheet of nothing but ``/*`` turns into minutes. The
+    pieces are joined by a blank, so what stood on either side of a comment
+    cannot meet and spell the start of a new one.
     """
     if "/*" not in css:
         return css
@@ -1891,15 +2736,50 @@ def _css_uncomment(css: str) -> str:
     return " ".join(out)
 
 
-def _clean_style(value: str) -> str:
+def _css_balanced(text: str) -> bool:
+    """Does every string, parenthesis and bracket in `text` close within it?
+
+    One left open reads on into whatever is written after it: a string
+    swallows the brace that ends its rule, and what was checked as the next
+    rule's selector becomes the rest of this rule's value.
+    """
+    quote = None
+    closers = []
+    for char in text:
+        if quote:
+            if char == quote:
+                quote = None
+        elif char in "\"'":
+            quote = char
+        elif char == "(":
+            closers.append(")")
+        elif char == "[":
+            closers.append("]")
+        elif char in ")]":
+            if not closers or closers.pop() != char:
+                return False
+    return quote is None and not closers
+
+
+def _css_unquoted(match) -> str:
+    return match.group(1) or match.group(2) or ""
+
+
+def _clean_style(value: str, strings: bool = True) -> str:
     """Style declarations with everything that can load or run taken out.
 
     Each declaration is kept only if its property is a plain name and its
-    value is made of harmless characters and allow-listed functions — so no
-    ``url()``, ``image-set()``, ``expression()``, ``@import``, ``behavior``,
-    no escape that could spell one of them. ``position: fixed`` goes too: a
-    mail has no business pinning itself over its own text.
+    value is made of harmless characters and allow-listed functions, with
+    every string and parenthesis closed — so no ``url()``, ``image-set()``,
+    ``expression()``, ``@import``, ``behavior``, no escape that could spell
+    one of them. ``position: fixed`` goes too: a mail has no business pinning
+    itself over its own text.
+
+    Without `strings` (the style sheet) a value holds no quote at all: a
+    string that is only words loses its quotes, any other loses its
+    declaration.
     """
+    allowed = _CSS_VALUE_RE if strings else _CSS_BARE_VALUE_RE
     kept = []
     for declaration in _css_uncomment(value).split(";"):
         prop, colon, val = declaration.partition(":")
@@ -1907,8 +2787,11 @@ def _clean_style(value: str) -> str:
         val = " ".join(val.split())
         if (not colon or not val or len(val) > 300
                 or not _CSS_PROPERTY_RE.fullmatch(prop)
-                or prop in _CSS_BAD_PROPERTIES
-                or not _CSS_VALUE_RE.fullmatch(val)):
+                or prop in _CSS_BAD_PROPERTIES):
+            continue
+        if not strings:
+            val = _CSS_QUOTED_RE.sub(_css_unquoted, val).strip()
+        if not val or not allowed.fullmatch(val) or not _css_balanced(val):
             continue
         low = val.lower()
         if any(word in low for word in _CSS_BAD_WORDS):
@@ -1932,6 +2815,22 @@ def _css_block_end(css: str, brace: int) -> int:
     return len(css)
 
 
+def _css_selector(prelude: str) -> str | None:
+    """The selector as it may be written into the sheet, or None.
+
+    Made of selector characters only, its brackets and parentheses closed,
+    its pseudo-class functions on the list, and no quote in it: an attribute
+    value that is one word is written bare, any other costs the rule.
+    """
+    selector = _CSS_QUOTED_WORD_RE.sub(_css_unquoted, prelude)
+    if (not _CSS_SELECTOR_RE.fullmatch(selector)
+            or not _css_balanced(selector)
+            or any(name.lower() not in _CSS_SELECTOR_FUNCTIONS
+                   for name in _CSS_SHEET_CALL_RE.findall(selector))):
+        return None
+    return selector
+
+
 def _css_rules(css: str, out: list, nested: bool) -> None:
     position = 0
     while True:
@@ -1946,16 +2845,32 @@ def _css_rules(css: str, out: list, nested: bool) -> None:
         if prelude.startswith("@"):
             # @media is the one at-rule a mail needs (its phone layout); one
             # level of it. @font-face, @import, @keyframes and the rest go.
-            if not nested and _CSS_MEDIA_RE.fullmatch(prelude):
+            if (not nested and _CSS_MEDIA_RE.fullmatch(prelude)
+                    and _css_balanced(prelude)
+                    and not any(_CSS_SHEET_CALL_RE.findall(prelude))):
                 inner: list = []
                 _css_rules(body, inner, True)
                 if inner:
                     out.append("%s{%s}" % (prelude, "".join(inner)))
-        elif "{" not in body and _CSS_SELECTOR_RE.fullmatch(prelude):
-            declarations = _clean_style(body)
+        elif "{" not in body:
+            selector = _css_selector(prelude)
+            declarations = _clean_style(body, strings=False) if selector else ""
             if declarations:
-                out.append("%s{%s}" % (prelude, declarations))
+                out.append("%s{%s}" % (selector, declarations))
         position = close + 1
+
+
+def _css_sheet_is_inert(sheet: str) -> bool:
+    """The last word on a rebuilt sheet, asked of the text itself.
+
+    No ``<``, no backslash, no quote, no ``/*``, no at-sign but ``@media``,
+    and no name before a ``(`` that is not on a list. Whatever the code that
+    built the sheet did, a text of which this holds has no string, no
+    comment, no escape and no ``url()`` in it.
+    """
+    return not _CSS_SHEET_FORBIDDEN_RE.search(sheet) and all(
+        name.lower() in _CSS_SHEET_CALLS
+        for name in _CSS_SHEET_CALL_RE.findall(sheet))
 
 
 def _clean_stylesheet(css: str) -> str:
@@ -1963,10 +2878,27 @@ def _clean_stylesheet(css: str) -> str:
 
     Not filtered but rebuilt: every rule emitted is a selector made of
     selector characters, and declarations that passed :func:`_clean_style`.
-    Nothing else of the sheet survives — so the result holds no ``<`` (it
-    cannot end the ``<style>`` element it is written into), no ``url()``, no
-    ``@import``, no ``@font-face``. What does survive is what makes a mail
-    look like itself on a phone: its classes and its ``@media`` rules.
+    Nothing else of the sheet survives. What does survive is what makes a
+    mail look like itself on a phone: its classes and its ``@media`` rules.
+
+    Why a browser reads the result exactly as it was built. CSS has four
+    constructs that change what the text after them means: a string, a
+    comment, an escape and an unquoted ``url(``. The rebuilt sheet has no
+    quote character, no ``/*``, no backslash, and no function name off the
+    lists — so none of the four can begin in it. What is left to nest is
+    brackets, and every piece closes its own: ``(`` and ``[`` within the
+    selector or the value they open in, ``{`` by the rule that wrote it.
+    The rules a browser sees are therefore the rules checked here, each
+    with the selector and the declarations checked here — and no piece
+    holds ``<`` (the ``<style>`` element cannot end early), ``url()``,
+    ``@import`` or ``@font-face``. :func:`_css_sheet_is_inert` asks all of
+    that of the finished text once more, and a sheet that fails is dropped
+    whole.
+
+    (The parse made HERE of the mail's sheet is not string-aware, and need
+    not be: a brace inside a string of the mail's can only make this code
+    cut the sheet into different pieces than the mail's author meant, and
+    each piece is then judged on its own.)
     """
     if len(css) > _CSS_MAX_CHARS:
         return ""
@@ -1975,7 +2907,7 @@ def _clean_stylesheet(css: str) -> str:
     out: list = []
     _css_rules(css, out, False)
     sheet = "".join(out)
-    return "" if "<" in sheet else sheet
+    return sheet if _css_sheet_is_inert(sheet) else ""
 
 
 def _safe_href(value: str | None) -> str | None:
@@ -1993,38 +2925,53 @@ def _safe_href(value: str | None) -> str | None:
     return url.replace(" ", "%20")
 
 
-def _cid_source(value: str | None, cid_map) -> str | None:
-    """The ``data:`` URL of a ``cid:`` image, when the mail carries it."""
-    if not value or not cid_map:
+def _cid_key(content_id) -> str:
+    """A content-id as it is compared: no brackets, no case."""
+    return str(content_id).strip().strip("<>").lower()
+
+
+def _is_image_url(source) -> bool:
+    """A ``data:`` URL of an image, with nothing in it that could end the
+    attribute it is written into."""
+    return bool(isinstance(source, str)
+                and re.match(r"data:image/[\w.+-]+[;,]", source, re.I)
+                and not _CONTROL_RE.search(source)
+                and not re.search(r"[\s\"'<>]", source))
+
+
+def _cid_reference(value: str | None) -> str | None:
+    """The key (see :func:`_cid_key`) a ``cid:`` reference names, or None."""
+    if not value:
         return None
     value = value.strip()
     if value[:4].lower() != "cid:":
         return None
-    wanted = unquote(value[4:]).strip().strip("<>")
-    source = cid_map.get(wanted)
-    if source is None:
-        for key, candidate in cid_map.items():
-            if str(key).strip().strip("<>").lower() == wanted.lower():
-                source = candidate
-                break
-    if (not isinstance(source, str)
-            or not re.match(r"data:image/[\w.+-]+[;,]", source, re.I)
-            or _CONTROL_RE.search(source) or re.search(r"[\s\"'<>]", source)):
-        return None
-    return source
+    return _cid_key(unquote(value[4:]))
 
 
 class _Sanitizer(HTMLParser):
     def __init__(self, cid_map=None):
         super().__init__(convert_charrefs=True)
-        self._cids = cid_map
+        # Keyed and judged once for the whole mail: a mail of a thousand
+        # images and a thousand parts is a thousand look-ups, and no image is
+        # read through once per reference to it.
+        self._cids: dict = {}
+        for key, source in (cid_map or {}).items():
+            if _is_image_url(source):
+                self._cids.setdefault(_cid_key(key), source)
+        self._shown: set = set()
+        self._repeats = _IMAGE_REPEAT_CHARS
         self._out: list = []
         self._open: list = []       # emitted and not yet closed
+        self._open_at: dict = {}    # tag → where in _open it is open
         # The outermost open element whose content is dropped, and how many
         # of its own tag are open inside it. Leaving the state early only
         # ever hands more markup to the allow-lists, never past them.
         self._drop = None
         self._drop_depth = 0
+        # Inside a dropped <head>: the element of its own (title, style, …)
+        # whose text is being read, if any.
+        self._head_child = None
         self._seen_body = False
         self._in_style = False
         self.css: list = []         # the mail's <style> contents, raw
@@ -2050,6 +2997,25 @@ class _Sanitizer(HTMLParser):
             out.append(' %s="%s"' % (name, _html.escape(value, quote=True)))
         return "".join(out)
 
+    def _image(self, value: str | None) -> str | None:
+        """The ``data:`` URL of a ``cid:`` image, when the mail carries it.
+
+        An image is written out where the mail first shows it. Shown again,
+        it is written again only within an allowance: a bullet may repeat a
+        hundred times, but twenty bytes of markup must not each become
+        another megabyte of the document.
+        """
+        key = _cid_reference(value)
+        source = self._cids.get(key) if key is not None else None
+        if source is None:
+            return None
+        if key in self._shown:
+            if len(source) > self._repeats:
+                return None
+            self._repeats -= len(source)
+        self._shown.add(key)
+        return source
+
     def handle_startendtag(self, tag, attrs):
         if tag in ("svg", "math") or ":" in tag:
             return
@@ -2073,9 +3039,13 @@ class _Sanitizer(HTMLParser):
         if self._drop:
             if tag == self._drop:
                 self._drop_depth += 1
+            elif (self._drop == "head" and self._head_child is None
+                    and tag not in _VOID_TAGS):
+                self._head_child = tag
             return
         if tag in _DROP_TAGS:
             self._drop, self._drop_depth = tag, 1
+            self._head_child = None
             return
         if tag not in _SAFE_TAGS:
             return                  # unwrapped: the tag goes, its content stays
@@ -2085,7 +3055,7 @@ class _Sanitizer(HTMLParser):
         if tag == "img":
             if is_tracking_pixel(None, None, attrs):
                 return
-            source = _cid_source(dict(attrs).get("src"), self._cids)
+            source = self._image(dict(attrs).get("src"))
             if source:
                 extra = ' src="%s"' % _html.escape(source, quote=True)
         elif tag == "a":
@@ -2095,11 +3065,20 @@ class _Sanitizer(HTMLParser):
                          % _html.escape(href, quote=True))
         self._out.append("<%s%s%s>" % (tag, extra, self._attrs(tag, attrs)))
         if tag not in _SAFE_VOID:
+            self._open_at.setdefault(tag, []).append(len(self._open))
             self._open.append(tag)
+
+    def _close_to(self, index: int) -> None:
+        while len(self._open) > index:
+            tag = self._open.pop()
+            self._open_at[tag].pop()
+            self._out.append("</%s>" % tag)
 
     def handle_endtag(self, tag):
         if tag == "style":
             self._in_style = False
+        if tag == self._head_child:
+            self._head_child = None
         if self._drop:
             if tag == self._drop:
                 self._drop_depth -= 1
@@ -2108,26 +3087,34 @@ class _Sanitizer(HTMLParser):
             return
         if tag in _SAFE_VOID or tag not in _SAFE_TAGS:
             return
-        structural = tag in _TABLE_TAGS
-        for index in range(len(self._open) - 1, -1, -1):
-            if self._open[index] == tag:
-                while len(self._open) > index:
-                    self._out.append("</%s>" % self._open.pop())
-                return
+        # Asked of the index, not walked: a mail of stray end tags inside a
+        # deep nest would walk the nest for each.
+        open_at = self._open_at.get(tag)
+        if not open_at:
+            return
+        index = open_at[-1]
+        if tag not in _TABLE_TAGS:
             # A stray </div> inside a cell must not close the table around it.
-            if not structural and self._open[index] in ("td", "th", "table"):
-                return
+            for wall in ("td", "th", "table"):
+                inside = self._open_at.get(wall)
+                if inside and inside[-1] > index:
+                    return
+        self._close_to(index)
 
     def handle_data(self, data):
         if self._in_style:
             self.css.append(data)
+        elif (self._drop == "head" and self._head_child is None
+                and data.strip(" \t\n\r\f")):
+            # An unclosed head ends at the first text that is not its own —
+            # as it does in a browser, which shows that text.
+            self._drop = None
         if not self._drop:
             self._out.append(_html.escape(_CONTROL_RE.sub("", data), quote=False))
 
     def finish(self) -> str:
         self.close()
-        while self._open:
-            self._out.append("</%s>" % self._open.pop())
+        self._close_to(0)
         return "".join(self._out)
 
 

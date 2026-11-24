@@ -20,7 +20,15 @@ any mail whatsoever:
 What matters more than recall is pinned down by cases of its own: an author's
 lines between quotes, a lead-in above a quote, a forward's body, ">" lines
 that are code, an itinerary that looks like a header block, the word
-"confidential" in a sentence — all of it must stay.
+"confidential" in a sentence — all of it must stay. So must everything whose
+shape alone does not say what it is: a header block in a mail not known to be
+a reply, a request to be unsubscribed, a closing line that starts "Sent from",
+a "--" between sections. Those cases say which evidence the trim was given
+(`is_reply`, `bulk`, the subject) and that without it the text stays and the
+state is "wanting".
+
+Cost is pinned the same way: every stage, plain and HTML, on inputs built to
+make it slow, must take time in proportion to the mail.
 
 No real people's data: every name, address and company is made up.
 
@@ -28,9 +36,11 @@ No real people's data: every name, address and company is made up.
 """
 import importlib.util
 import os
+import re
 import subprocess
 import sys
 import time
+from html.parser import HTMLParser
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -51,6 +61,117 @@ def _load():
 
 mt = _load()
 
+# The policy web-gateway serves the sanitised Original under. The sanitiser
+# is tested against it from both sides: nothing in a document needs more than
+# it allows (or the mail would look broken), and nothing in a document is
+# something only the policy would stop (or the sanitiser would not be safe on
+# its own, which it promises to be).
+SERVED_POLICY = ("sandbox allow-popups allow-popups-to-escape-sandbox; "
+                 "default-src 'none'; img-src data:; style-src 'unsafe-inline'")
+
+_DOCUMENT_ONLY_TAGS = {"html", "head", "meta", "style", "body"}
+# What a style may call: colours, sizes, gradients, and the selector
+# functions. Listed here on its own, not read from the module under test.
+_STYLE_CALLS = {
+    "", "rgb", "rgba", "hsl", "hsla", "calc", "min", "max", "clamp",
+    "linear-gradient", "radial-gradient", "repeating-linear-gradient",
+    "repeating-radial-gradient", "not", "is", "where", "lang", "dir",
+    "nth-child", "nth-last-child", "nth-of-type", "nth-last-of-type"}
+
+
+class _Audit(HTMLParser):
+    """A sanitised document, read back the way a browser reads it."""
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.problems = []
+        self.count = {}
+        self.sheets = []
+        self._in_style = False
+
+    def handle_starttag(self, tag, attrs):
+        self.count[tag] = self.count.get(tag, 0) + 1
+        if tag not in _DOCUMENT_ONLY_TAGS and tag not in mt._SAFE_TAGS:
+            self.problems.append("element <%s>" % tag)
+        if tag == "style":
+            self._in_style = True
+        given = dict(attrs)
+        if len(given) != len(attrs):
+            self.problems.append("<%s> repeats an attribute" % tag)
+        for name, value in attrs:
+            value = value or ""
+            if name == "src":
+                # img-src data: — and nothing else has a src at all.
+                if tag != "img" or not re.match(r"data:image/[\w.+-]+[;,]", value):
+                    self.problems.append("src=%r on <%s>" % (value[:40], tag))
+            elif name == "href":
+                # Navigation is not fetched under the policy, it is followed:
+                # only where a person may be sent, and only in a new tab that
+                # the sandbox lets out (allow-popups-to-escape-sandbox).
+                if (tag != "a" or not re.match(r"(?i)(https?://|mailto:)", value)
+                        or given.get("target") != "_blank"
+                        or given.get("rel") != "noopener noreferrer"):
+                    self.problems.append("href=%r on <%s>" % (value[:40], tag))
+            elif name in ("target", "rel"):
+                if tag != "a" or "href" not in given:
+                    self.problems.append("%s on <%s>" % (name, tag))
+            elif name == "charset":
+                if tag != "meta":
+                    self.problems.append("charset on <%s>" % tag)
+            elif name == "style":
+                # style-src 'unsafe-inline' lets it apply; default-src 'none'
+                # would have to stop anything it tried to load.
+                self._style(value, "style attribute", strings=True)
+            elif (name not in mt._SAFE_ATTRS
+                    and name not in mt._SAFE_TAG_ATTRS.get(tag, ())):
+                self.problems.append("attribute %s on <%s>" % (name, tag))
+
+    def handle_endtag(self, tag):
+        if tag == "style":
+            self._in_style = False
+
+    def handle_data(self, data):
+        if self._in_style:
+            self.sheets.append(data)
+
+    def _style(self, css, where, strings):
+        banned = r"[<\\@{}]|/\*|url\s*\(|expression|behaviou?r|binding|script"
+        if not strings:
+            banned = r"[<\\\"']|/\*|url\s*\(|expression|behaviou?r|binding|script|@(?!media[\s({])"
+        found = re.search(banned, css, re.I)
+        if found:
+            self.problems.append("%s holds %r" % (where, found.group()))
+        calls = set(name.lower() for name in re.findall(r"([\w-]*)\s*\(", css))
+        if not strings:
+            calls |= set(name.lower() for name in re.findall(r"([\w-]*)\(", css))
+            calls -= {"media", "and", "only", "or"}     # "@media x and (…)"
+        if calls - _STYLE_CALLS:
+            self.problems.append("%s calls %s" % (where, sorted(calls - _STYLE_CALLS)))
+        quote = None
+        for char in css:
+            if quote:
+                quote = None if char == quote else quote
+            elif char in "\"'":
+                quote = char
+        if quote:
+            self.problems.append("%s leaves a string open" % where)
+        if not strings and css.count("{") != css.count("}"):
+            self.problems.append("%s leaves a block open" % where)
+
+
+def _policy_problems(document):
+    """What in a sanitised document goes beyond, or leans on, SERVED_POLICY."""
+    audit = _Audit()
+    audit.feed(document)
+    audit.close()
+    for tag in ("html", "head", "meta", "style", "body"):
+        if audit.count.get(tag) != 1:
+            audit.problems.append("%d <%s>" % (audit.count.get(tag, 0), tag))
+    for sheet in audit.sheets:
+        audit._style(sheet, "style sheet", strings=False)
+    return audit.problems
+
+
 ANN = "Ann Example <ann@example.org>"
 BOB = "Bob Example <bob@example.net>"
 ATTRIBUTION = "On Mon, 3 Mar 2025 at 14:02, %s wrote:" % ANN
@@ -62,16 +183,27 @@ CASES = []
 
 
 def case(name, plain=None, html=None, subject=None, text=None, keeps=(),
-         drops=(), state=None, removed=(), unchanged=False):
+         drops=(), state=None, removed=(), unchanged=False, reply=False,
+         is_reply=None, bulk=None):
     """One mail and what its trim must be.
 
     `text` is the exact result; `unchanged` says the result is the mail itself
     (trailing blanks aside); `keeps`/`drops` are substrings that must / must
     not be in it; `removed` names the counters that must be above zero.
+
+    The evidence a gateway hands over: `is_reply` (the mail cites an earlier
+    one) and `bulk` (its headers call it bulk mail) go to trim() as they
+    are; `reply=True` is the common case in one word — a mail that cites its
+    parent AND is subjected "Re: …", which is what lets history without a
+    ``>`` be cut.
     """
+    if reply:
+        is_reply = True
+        subject = subject or "Re: Meeting"
     CASES.append(dict(name=name, plain=plain, html=html, subject=subject,
                       text=text, keeps=keeps, drops=drops, state=state,
-                      removed=removed, unchanged=unchanged))
+                      removed=removed, unchanged=unchanged, is_reply=is_reply,
+                      bulk=bulk))
 
 
 # ── Replies, plain text ──
@@ -206,6 +338,7 @@ case("only a phone signature and a quote: falls back too",
      unchanged=True, state="wanting")
 
 case("yahoo, plain: the earlier mail quoted as bare text",
+     reply=True,
      plain="Great, thanks!\n\n"
            "    On Monday, March 3, 2025 at 02:02:11 PM GMT+1, %s wrote:  \n"
            " \n Here is the report you asked for.\nAnn\n" % ANN,
@@ -224,6 +357,7 @@ case("CRLF line endings",
 # ── Outlook, plain text ──
 
 case("outlook desktop, -----Original Message-----",
+     reply=True,
      plain="Hi Ann,\n\nWorks for me.\n\nRegards,\nBob\n\n"
            "-----Original Message-----\n"
            "From: %s\nSent: Monday, March 3, 2025 2:02 PM\nTo: %s\n"
@@ -231,6 +365,7 @@ case("outlook desktop, -----Original Message-----",
      text="Hi Ann,\n\nWorks for me.\n\nRegards,\nBob", removed=("quote",))
 
 case("outlook web, the rule and a folded Cc list",
+     reply=True,
      plain="Works for me.\n\n________________________________\n"
            "From: %s\nSent: Monday, March 3, 2025 2:02 PM\nTo: %s\n"
            "Cc: Carol Example <carol@example.net>; Dave Example <dave@example.net>; Erin\n"
@@ -239,6 +374,7 @@ case("outlook web, the rule and a folded Cc list",
      text="Works for me.")
 
 case("outlook mobile, app line above the rule",
+     reply=True,
      plain="Ok, will do.\n\nGet Outlook for iOS<https://aka.ms/o0ukef>\n"
            "________________________________\n"
            "From: %s\nSent: Monday, March 3, 2025 2:02:11 PM\nTo: %s\n"
@@ -246,11 +382,13 @@ case("outlook mobile, app line above the rule",
      text="Ok, will do.", removed=("quote", "signature"))
 
 case("outlook header block without any address",
+     reply=True,
      plain="Fine.\n\nFrom: Ann Example\nSent: Monday, March 3, 2025 2:02 PM\n"
            "To: Bob Example\nSubject: Meeting\n\nCan we meet?\n",
      text="Fine.")
 
 case("header block with bold markers, as a plain rendering of HTML has them",
+     reply=True,
      plain="See below.\n\n*From:* %s\n*Sent:* Monday, March 3, 2025 2:02 PM\n"
            "*To:* %s\n*Subject:* Meeting\n\nCan we meet?\n" % (ANN, BOB),
      text="See below.")
@@ -267,7 +405,7 @@ for _lang, _block in (
         ("nb", "Fra: %s\nSendt: mandag 3. mars 2025 14:02\nTil: %s\nEmne: Møte"),
         ("sv", "Från: %s\nSkickat: den 3 mars 2025 14:02\nTill: %s\nÄmne: Möte"),
         ("fi", "Lähettäjä: %s\nLähetetty: maanantai 3. maaliskuuta 2025 14.02\nVastaanottaja: %s\nAihe: Kokous")):
-    case("outlook header block — " + _lang,
+    case("outlook header block — " + _lang, reply=True,
          plain="OK.\n\n" + _block % (ANN, BOB) + "\n\nEarlier text.\n",
          text="OK.", state="deterministic", removed=("quote",))
 
@@ -277,7 +415,7 @@ for _lang, _line in (
         ("nl", "-----Oorspronkelijk bericht-----"),
         ("es", "-----Mensaje original-----"),
         ("samsung", "-------- Original message --------")):
-    case("original-message separator — " + _lang,
+    case("original-message separator — " + _lang, reply=True,
          plain="OK.\n\n%s\nFrom: %s\nDate: 03/03/2025 14:02 (GMT+01:00)\n"
                "To: %s\nSubject: Meeting\n\nEarlier text.\n" % (_line, ANN, BOB),
          text="OK.")
@@ -372,11 +510,16 @@ case("outlook forward, told apart by its subject",
           "Hi Bob, the numbers are attached." % (ANN, BOB),
      state="deterministic")
 
-case("the same mail without a subject reads as a reply",
-     plain=_OUTLOOK_FORWARD, text="FYI")
+case("the same mail with nothing to say what it is: kept whole, unsettled",
+     plain=_OUTLOOK_FORWARD, unchanged=True, state="wanting")
+
+case("the same mail as a reply: history",
+     plain=_OUTLOOK_FORWARD, subject="RE: Quarterly numbers", is_reply=True,
+     text="FYI", state="deterministic", removed=("quote",))
 
 case("a reply to a forward is a reply",
-     plain=_OUTLOOK_FORWARD, subject="RE: FW: Quarterly numbers", text="FYI")
+     plain=_OUTLOOK_FORWARD, subject="RE: FW: Quarterly numbers",
+     is_reply=True, text="FYI")
 
 case("outlook forward, German prefix, separator replaced by the marker",
      plain="Zur Info\n\n-----Ursprüngliche Nachricht-----\n"
@@ -410,8 +553,8 @@ case("the signature delimiter",
      plain="See you.\n\n-- \nBob Example\nExample GmbH\n+41 44 000 00 00\n",
      text="See you.", removed=("signature",))
 
-case("the delimiter after a client stripped its blank",
-     plain="See you.\n\n--\nBob Example\n", text="See you.")
+case("a bare -- is a stripped delimiter or a divider: it stays, unsettled",
+     plain="See you.\n\n--\nBob Example\n", unchanged=True, state="wanting")
 
 case("a dash line with a long tail is not a signature",
      plain="Agenda\n--\n" + "\n".join("Point %d of the agenda" % n
@@ -499,7 +642,7 @@ case("a glued notice, folded narrow: its first line goes with it",
            "intended recipient, please notify the\nsender and delete it.\n",
      text="Please find the offer attached.\n\nKind regards\nBob")
 
-case("an unsubscribe line glued under the sign-off",
+case("an unsubscribe line glued under the sign-off", bulk=True,
      plain="The new price list is attached.\n\nBest,\nBob\n"
            "Unsubscribe: https://news.example.com/u/abc\n",
      text="The new price list is attached.\n\nBest,\nBob")
@@ -511,6 +654,7 @@ case("'confidential' in a sentence is the author's",
      unchanged=True)
 
 case("a notice above outlook history goes with it",
+     reply=True,
      plain="Agreed.\n\nBob\n\n%s\n\nFrom: %s\nSent: Monday, March 3, 2025 2:02 PM\n"
            "To: %s\nSubject: Offer\n\nIs the offer acceptable?\n"
            % (_DISCLAIMERS["en"], ANN, BOB),
@@ -520,7 +664,7 @@ case("a notice under the phone's line: both go",
      plain="Ok.\n\nSent from my iPhone\n\n%s\n" % _DISCLAIMERS["en"],
      text="Ok.", removed=("signature", "footer"))
 
-case("a plain-text newsletter's footer",
+case("a plain-text newsletter's footer", bulk=True,
      plain="ACME Weekly\n\nThis week: three new features and a bug fix.\n\n"
            "Read more: https://news.example.com/weekly/42\n\n"
            "You are receiving this email because you signed up at example.com.\n"
@@ -541,9 +685,15 @@ for _lang, _line in (
         ("nb", "Meld deg av her: https://news.example.com/u/abc"),
         ("sv", "Avsluta prenumerationen: https://news.example.com/u/abc"),
         ("en, by mail", "To opt out, write to leave@news.example.com")):
-    case("unsubscribe block — " + _lang,
-         plain="Three new features this week.\n\n%s\n\nACME Inc., 1 Example Road\n" % _line,
-         text="Three new features this week.", removed=("footer",))
+    case("unsubscribe block — " + _lang, bulk=True,
+         plain="ACME Weekly\n\nThree new features this week.\n\n%s\n\n"
+               "ACME Inc., 1 Example Road\n" % _line,
+         text="ACME Weekly\n\nThree new features this week.",
+         state="deterministic", removed=("footer",))
+    case("unsubscribe block, mail not known to be bulk — " + _lang,
+         plain="ACME Weekly\n\nThree new features this week.\n\n%s\n\n"
+               "ACME Inc., 1 Example Road\n" % _line,
+         unchanged=True, state="wanting")
 
 case("'unsubscribe' in a sentence is the author's",
      plain="If you would rather not get these updates, just tell me and I "
@@ -556,7 +706,7 @@ case("an unsubscribe line at the top is not a footer",
                        for n in range(1, 11)) + "\n",
      unchanged=True)
 
-case("a mailman footer",
+case("a mailman footer", bulk=True,
      plain="I think the patch is fine.\n\nBob\n"
            "_______________________________________________\n"
            "Users mailing list\nUsers@lists.example.org\n"
@@ -738,6 +888,7 @@ _OUTLOOK_DESKTOP_HTML = (
     ' week?<o:p></o:p></p></div></body></html>')
 
 case("outlook desktop HTML (Word markup)",
+     reply=True,
      html=_OUTLOOK_DESKTOP_HTML,
      text="Hi Ann,\n\nWorks for me.\nBob", removed=("quote",))
 
@@ -780,10 +931,12 @@ def _outlook_web(labels, intro="Works for me, see you Tuesday."):
 
 
 case("outlook web HTML (#appendonsend, #divRplyFwdMsg)",
+     reply=True,
      html=_outlook_web(("From", "Sent", "To", "Subject")),
      text="Works for me, see you Tuesday.", removed=("quote",))
 
 case("outlook web HTML in a language the tables do not know",
+     reply=True,
      html=_outlook_web(("Feladó", "Elküldve", "Címzett", "Tárgy")),
      text="Works for me, see you Tuesday.")
 
@@ -793,6 +946,7 @@ _HU_PLAIN = ("Rendben.\n\n________________________________\n"
              "Címzett: %s\nTárgy: Meeting\n\nCan we meet next week?\n" % (ANN, BOB))
 
 case("outlook's rule and header block in a language the tables do not know",
+     reply=True,
      plain=_HU_PLAIN, text="Rendben.", state="deterministic",
      removed=("quote",))
 
@@ -807,6 +961,7 @@ case("an unknown header block with nothing to vouch for it is left alone",
 
 # … but the markup of the same mail's HTML part does.
 case("multipart: the plain part shows no quote, the HTML part's markup does",
+     reply=True,
      plain=_HU_BARE, html=_outlook_web(_HU_LABELS, intro="Rendben."),
      text="Rendben.", state="deterministic", removed=("quote",))
 
@@ -832,6 +987,7 @@ case("multipart forward: the HTML part's container changes nothing",
      unchanged=True, state="deterministic")
 
 case("outlook HTML whose ids Exchange has prefixed",
+     reply=True,
      html=_outlook_web(("From", "Sent", "To", "Subject"))
      .replace('id="divRplyFwdMsg"', 'id="x_divRplyFwdMsg"')
      .replace('id="appendonsend"', 'id="x_appendonsend"'),
@@ -854,6 +1010,7 @@ case("outlook web HTML forward, told apart by its subject",
           "Subject: Meeting\n\nCan we meet next week?" % (ANN, BOB))
 
 case("outlook mobile HTML",
+     reply=True,
      html='<html><head><meta http-equiv="Content-Type" content="text/html; '
           'charset=utf-8"></head><body><div dir="ltr"><div></div><div><div>Ok, '
           'will do.</div><div dir="ltr"><br></div><div '
@@ -881,6 +1038,7 @@ case("thunderbird HTML: a name-only attribution, known by its class",
      removed=("quote", "signature"))
 
 case("yahoo HTML (.yahoo_quoted)",
+     reply=True,
      html='<html><head></head><body><div class="ydp6d0a4e1ayahoo-style-wrap" '
           'style="font-family:Helvetica Neue, Helvetica, Arial, sans-serif;'
           'font-size:13px;"><div dir="ltr" data-setdir="false">Great, thanks!'
@@ -929,7 +1087,7 @@ _MARKETING_HTML = (
     'window.track()</script></body></html>')
 
 case("HTML-only marketing mail",
-     html=_MARKETING_HTML,
+     html=_MARKETING_HTML, bulk=True,
      text="[ACME]\n\nThree new features\n\nThis week we shipped dark mode, "
           "export and search.\n\nRead the full story "
           "(https://news.example.com/c/abc123?u=42)",
@@ -941,6 +1099,16 @@ case("an indenting blockquote is not a quote",
           'Simplicity is prerequisite for reliability.</blockquote><p>Bob</p>',
      text="Quote of the day:\n\nSimplicity is prerequisite for reliability."
           "\n\nBob")
+
+case("a quotation with its source is not a quoted mail",
+     html='<p>What they say:</p><blockquote cite="https://example.com/review">'
+          'Best tool we ever bought.</blockquote><p>Bob</p>',
+     text="What they say:\n\nBest tool we ever bought.\n\nBob")
+
+case("a blockquote that cites a mail is one",
+     html='<p>Sure.</p><blockquote cite="mid:abc123@example.org">Could you '
+          'send me the numbers?</blockquote>',
+     text="Sure.", removed=("quote",))
 
 case("a transactional mail's tables read row by row",
      html='<html><body><p>Thank you for your order.</p><table border="1"><tr>'
@@ -961,6 +1129,500 @@ case("a border-top div above an order summary is not outlook history",
           '</div><p>See you soon.</p>',
      text="Thank you for your order.\n\nOrder: 12345\nDate: 03.03.2025 14:02\n"
           "Total: 30.00\n\nSee you soon.")
+
+
+# ── History without ">" needs a reply ──
+#
+# A separator, a header block, an attribution above bare text: what Outlook
+# and Yahoo put above a quoted mail is also what a form mailer, a helpdesk, a
+# memo and a forward are MADE of. Cut only when the mail cites an earlier one
+# and is subjected as a reply; kept, and unsettled, on anything less.
+
+_ENQUIRY = ("New enquiry via the website:\n\n"
+            "From: Ann Example <ann@example.org>\nDate: 3 March 2025 14:02\n"
+            "Subject: Kitchen quote\nPhone: 555 1234\n\n"
+            "Hello, I would like a quote for a new kitchen. Could you call me "
+            "back this week?\n")
+_TICKET = ("Ticket #4411 was updated.\n\nVon: Bob Kunde\nDatum: 03.03.2025\n"
+           "Betreff: Drucker defekt\n\nDer Drucker im 2. Stock ist defekt.\n")
+_MEMO = ("Dear all,\n\nTO: All staff\nFROM: Ann Example, Facilities\n"
+         "DATE: 3 March 2025\nSUBJECT: Car park closure\n\n"
+         "The north car park is closed next week.\n")
+_HANDED_ON = ("Can you handle this one? Thanks.\n\n"
+              "From: Bob Example <bob@example.net>\n"
+              "Sent: Monday, 3 March 2025 14:02\nTo: Ann Example <ann@example.org>\n"
+              "Subject: Offer 4411\n\nOur offer: 10,000 EUR, delivery in 3 weeks.\n")
+_PASTED = "I got this:\n\nFrom: x\nDate: y\nSubject: z\n\nIs it legit?\n"
+
+for _name, _plain, _subject in (
+        ("a web form's notification", _ENQUIRY, "[Website] New enquiry"),
+        ("a helpdesk update", _TICKET, "[Ticket #4411] Drucker defekt"),
+        ("a memo", _MEMO, "Car park closure"),
+        ("a forward whose subject was rewritten", _HANDED_ON,
+         "Please handle: offer from Bob"),
+        ("a mail pasted to ask about it", _PASTED, "weird mail")):
+    # Whatever the headers say: on their own (Exchange cites the original on
+    # a forward too), and when the mail does thread onto an earlier one.
+    for _is_reply in (None, False, True):
+        case("%s keeps its header block (is_reply=%s)" % (_name, _is_reply),
+             plain=_plain, subject=_subject, is_reply=_is_reply,
+             unchanged=True, state="wanting")
+
+# Threaded AND subjected as replies, the first three still are not history:
+# their blocks are not the block a client writes (no To; no time of day).
+for _name, _plain in (("a web form's notification", _ENQUIRY),
+                      ("a helpdesk update", _TICKET), ("a memo", _MEMO),
+                      ("a mail pasted to ask about it", _PASTED)):
+    case(_name + ", in a thread of replies, keeps its header block",
+         plain=_plain, reply=True, unchanged=True, state="wanting")
+
+case("outlook history needs both halves: the citation alone is not enough",
+     plain=_HANDED_ON, is_reply=True, unchanged=True, state="wanting")
+case("outlook history needs both halves: nor is a Re: on the subject",
+     plain=_HANDED_ON, subject="Re: Offer 4411", unchanged=True, state="wanting")
+case("outlook history needs both halves: nor a Re: on a mail that cites nothing",
+     plain=_HANDED_ON, subject="Re: Offer 4411", is_reply=False,
+     unchanged=True, state="wanting")
+case("outlook history, with both halves",
+     plain=_HANDED_ON, subject="RE: Offer 4411", is_reply=True,
+     text="Can you handle this one? Thanks.", state="deterministic",
+     removed=("quote",))
+
+case("an original-message separator in a mail that is no reply stays",
+     plain="Zur Info\n\n-----Ursprüngliche Nachricht-----\n"
+           "Von: %s\nGesendet: Montag, 3. März 2025 14:02\nAn: %s\n"
+           "Betreff: Zahlen\n\nHallo Bob, anbei die Zahlen.\n" % (ANN, BOB),
+     subject="Zahlen", is_reply=False, unchanged=True, state="wanting")
+
+case("a bare-text attribution in a mail that is no reply stays",
+     plain="This is what she sent me:\n\n"
+           "On Monday, March 3, 2025 at 02:02:11 PM GMT+1, %s wrote:\n\n"
+           "Here is the report you asked for.\nAnn\n" % ANN,
+     subject="the report", is_reply=False, unchanged=True, state="wanting")
+
+# The subject's language. A forward's prefix from the table keeps the message
+# under a marker; a reply's lets the history go; a prefix NO table has says
+# nothing, and nothing is cut on it.
+_TR_BODY = ("________________________________\n"
+            "Kimden: Bob Example <bob@example.org>\n"
+            "Gönderildi: 3 Mart 2025 Pazartesi 14:02\nKime: Ann\nKonu: Teklif\n\n"
+            "Teklifimiz: 10.000 TL, teslim 3 hafta.\n")
+for _subject in ("İLT: Teklif", "转发: Teklif", "轉寄: Teklif", "FW: Teklif",
+                 "Пересл.: Teklif", "ΠΡΘ: Teklif"):
+    for _is_reply in (None, True):
+        case("a forward in a language of the prefix table — %s (is_reply=%s)"
+             % (_subject, _is_reply),
+             plain="Bilginize, ekteki teklif.\n" + _TR_BODY, subject=_subject,
+             is_reply=_is_reply,
+             text="Bilginize, ekteki teklif.\n\n"
+                  "---------- Forwarded message ----------\n"
+                  + _TR_BODY.split("\n", 1)[1].rstrip("\n"),
+             state="deterministic")
+
+for _subject in ("Továbbítás: Teklif", "Edasi: Teklif", "VS: Teklif", "Teklif",
+                 None):
+    case("a forward whose prefix no table settles stays whole — %s" % _subject,
+         plain="Bilginize, ekteki teklif.\n" + _TR_BODY, subject=_subject,
+         is_reply=True, unchanged=True, state="wanting")
+
+for _subject in ("YNT: Teklif", "RE: Teklif", "Antw: Teklif", "SV: Teklif",
+                 "回复: Teklif", "Re[2]: Teklif", "[liste] Re: Teklif"):
+    case("a reply in a language of the prefix table — " + _subject,
+         plain="Tamam, kabul.\n" + _TR_BODY, subject=_subject, is_reply=True,
+         text="Tamam, kabul.", state="deterministic", removed=("quote",))
+
+# ── Attributions above bare text ──
+
+for _lang, _line in (
+        ("de", "Am 03.03.2025 um 14:02 schrieb Bob Example:"),
+        ("nl", "Op 3 mrt 2025 om 14:02 schreef Bob Example:"),
+        ("sv", "Den 3 mars 2025 kl. 14:02 skrev Bob Example:"),
+        ("da", "Den 3. mar. 2025 kl. 14.02 skrev Bob Example:"),
+        ("de, yahoo", "Am Montag, 3. März 2025 um 14:02:11 MEZ hat Bob Example "
+                      "<bob@example.net> Folgendes geschrieben:"),
+        ("en", "On 3 Mar 2025, at 14:02, Bob Example wrote:")):
+    case("bare-text attribution, the verb before the name — " + _lang,
+         plain="Klar.\n\n%s\n\nKannst du kommen?\nBring die Unterlagen mit.\n" % _line,
+         reply=True, text="Klar.", state="deterministic", removed=("quote",))
+    case("bare-text attribution in a mail not known to be a reply — " + _lang,
+         plain="Klar.\n\n%s\n\nKannst du kommen?\nBring die Unterlagen mit.\n" % _line,
+         unchanged=True, state="wanting")
+
+case("the verb, a date and a time, and then a sentence: not an attribution",
+     plain="Klar.\n\nAm 03.03.2025 um 14:02 schrieb die Bank den Betrag gut:\n\n"
+           "1.200 Franken, wie vereinbart.\n",
+     reply=True, unchanged=True)
+
+for _lang, _line in (
+        ("hu", "2025. márc. 3., H 14:02 dátummal Bob Example ezt írta:"),
+        ("ru", "3 марта 2025 г. в 14:02 Bob Example написал:"),
+        ("tr", "3 Mart 2025 Pazartesi 14:02 tarihinde Bob Example şunu yazdı:"),
+        ("ja", "2025年3月3日(月) 14:02 Bob Example <bob@example.net>:")):
+    case("bare-text attribution in a language without a verb here: kept, "
+         "unsettled — " + _lang,
+         plain="OK.\n\n%s\n\nEarlier text, quoted bare.\nMore of it.\n" % _line,
+         reply=True, unchanged=True, state="wanting")
+
+# ── Dividers ──
+
+case("-- between sections is a divider, not a delimiter",
+     plain="Agenda\n\n--\nItem 1: budget\nWe need to cut 10%.\n\n--\n"
+           "Item 2: hiring\nTwo open roles.\n",
+     unchanged=True, state="wanting")
+
+case("dividers, three sections of prose",
+     plain="Part one of my notes.\n\n--\nPart two of my notes, after the "
+           "divider I like to use.\nMore text here.\n\n--\nPart three.\n",
+     unchanged=True)
+
+case("one bare divider with a short section under it",
+     plain="Agenda\n\n--\nItem 1: budget\nWe need to cut 10%.\n",
+     unchanged=True, state="wanting")
+
+case("two standard delimiters within reach are dividers too",
+     plain="Agenda\n\n-- \nItem 1: budget\nWe need to cut 10%.\n\n-- \n"
+           "Item 2: hiring\nTwo open roles.\n",
+     text="Agenda\n\n--\nItem 1: budget\nWe need to cut 10%.\n\n--\n"
+          "Item 2: hiring\nTwo open roles.",
+     state="wanting")
+
+case("a signature under a list footer's delimiter: neither is cut on a guess",
+     plain="I think the patch is fine.\n\n-- \nBob Example\nExample GmbH\n\n-- \n"
+           "You received this message because you are subscribed to the list.\n",
+     keeps=("Bob Example", "You received this message"), state="wanting")
+
+case("a rule as the last line of a mail is the author's line",
+     plain="The totals:\n\nA    10\nB    20\n==========\n", unchanged=True,
+     state="deterministic")
+
+case("a rule above a signature goes with the signature",
+     plain="See you.\n\n----------\n-- \nBob Example\n", text="See you.")
+
+# ── A phone's line, and sentences that start like one ──
+
+for _plain in (
+        "Hi Bob,\n\nthe parcel is on its way.\nSent with DHL Express, tracking 12345.\n",
+        "Hi,\n\nSent from the warehouse this morning: 14 boxes.\n",
+        "Shipment log:\nSent from Hamburg on 3 March\nSent via Bremen on 4 March\n"
+        "Sent with DHL on 5 March\n",
+        "Hallo,\n\ndas Paket ist unterwegs.\n\nGesendet von Hamburg am Montag, "
+        "Ankunft Mittwoch.\n",
+        "Hei,\n\nLähetetty eilen, saapuu huomenna.\n",
+        "Ciao,\n\nIl pacco è partito.\nInviato da Milano ieri sera.\n",
+        "Hi,\n\nSent from Hamburg on Monday.\n",
+        "Hi,\n\nSent from Hamburg on Monday\n",
+        "Bonjour,\n\nEnvoyé de Lyon hier\n",
+        "Hi,\n\nthe files are on their way.\n\nSent via the courier you recommended\n",
+        "Hi,\n\nSent from my iPhone 14 to yours yesterday, did you get the photos?\n",
+        "Ok, see you at ten.\nSent from my iPhone\n",
+        # "Sent from my …" and no device: where it was sent from.
+        "Where did you send it from?\n\nSent from my office\n",
+        "Hi,\n\nwhere is it?\n\nSent from my warehouse yesterday\n",
+        "Hi,\n\nSent from my office this morning.\n",
+        "Salut,\n\nEnvoyé de mon bureau ce matin\n",
+        "Hallo,\n\nVon meinem Büro aus gesendet\n",
+        "Hi,\n\nSent with love\n"):
+    case("a closing sentence that starts like a phone's line stays — %r"
+         % _plain.rstrip("\n").split("\n")[-1],
+         plain=_plain, unchanged=True)
+
+# The device named, and still a sentence: beside the table's words a signing
+# line holds names only — a make, a model, a product — and a clause has words.
+_DEVICE_SENTENCES = (
+    "Sent from my iPhone yesterday",
+    "Sent from my iPhone to yours yesterday",
+    "Sent from my iPhone on Monday",
+    "Sent from my iPhone for Bob",
+    "Sent from my iPad at 5 am",
+    "Sent from my phone as I am out",
+    "Sent from my Samsung to the printer but nothing came out",
+    "Sent from my Gmail account yesterday",
+    "Sent from my Windows machine",
+    "Sent from Hamburg with my phone",
+    "Sent via the courier for Windows users",
+    "Get Outlook for the whole team",
+    "Von meinem Handy aus dem Urlaub gesendet",
+    "Gesendet von meinem iPhone am Montag",
+    "Envoyé de mon iPhone hier soir",
+    "Enviado desde mi iPhone ayer",
+    "Inviato dal mio telefono ieri",
+    "Verzonden vanaf mijn telefoon gisteren",
+    "Sendt fra min telefon i går",
+    "Skickat från min telefon igår")
+for _line in _DEVICE_SENTENCES:
+    for _above in ("Hi,", "Did you get it?"):
+        case("a sentence that names a device is a sentence — %r under %r"
+             % (_line, _above),
+             plain="%s\n\n%s\n" % (_above, _line), unchanged=True,
+             state="wanting")
+
+for _plain in ("Where did you send it from?\n\nSent from my office\n",
+               "Hi,\n\nSent from Hamburg on Monday\n",
+               "Hi,\n\nSent with love\n",
+               "Ok, see you at ten.\nSent from my iPhone\n"):
+    case("… and the state says the line was held back — %r"
+         % _plain.rstrip("\n").split("\n")[-1],
+         plain=_plain, unchanged=True, state="wanting")
+
+for _line in ("Sent from Yahoo Mail on Android", "Sent from Outlook for iOS",
+              "Sent from my iPad Pro", "Sent from my iPhone 15 Pro Max",
+              "Sent from my Galaxy S23 Ultra", "Sent via the Samsung Galaxy S8",
+              "Sent from my Samsung Galaxy smartphone.",
+              "Sent from my T-Mobile 5G Device", "Sent from Mail for Windows 10",
+              "Sent with Proton Mail secure email.", "Sent from Proton Mail for iOS",
+              "*Sent from my iPhone*", "Get Outlook for iOS<https://aka.ms/o0ukef>",
+              "Outlook für Android herunterladen",
+              "Gesendet von Yahoo Mail auf Android",
+              "Enviado desde Yahoo Mail para Android",
+              "Envoyé depuis mon mobile Orange",
+              "Verzonden vanaf mijn mobiele telefoon"):
+    case("phone signature, a make and a model — " + _line,
+         plain="Ok, see you at ten.\n\n%s\n" % _line,
+         text="Ok, see you at ten.", state="deterministic",
+         removed=("signature",))
+
+for _line in ("Sent from my mobile device", "Sent from my phone",
+              "Sent from my Pixel", "Von meinem Handy gesendet",
+              "Gesendet von meinem Mobiltelefon", "Envoyé de mon téléphone",
+              "Inviato dal mio telefono", "Enviado desde mi móvil",
+              "Verzonden vanaf mijn telefoon", "Enviado do meu telemóvel",
+              "Sendt fra min telefon", "Skickat från min telefon",
+              "Wysłane z mojego telefonu", "Odesláno z mého telefonu"):
+    case("phone signature, a device and no make — " + _line,
+         plain="Ok, see you at ten.\n\n%s\n" % _line,
+         text="Ok, see you at ten.", state="deterministic",
+         removed=("signature",))
+
+# ── Requests and how-tos that mention unsubscribing ──
+
+_UNSUBSCRIBE_REQUESTS = (
+    "Hi,\n\nPlease unsubscribe me from this list. My address is "
+    "ann@example.org.\n\nThanks\nAnn\n",
+    "Hallo Bob,\n\nkannst du mich bitte für Samstag abmelden? Die Liste ist "
+    "unter https://verein.example/termine zu finden.\n\nDanke und Gruss\nAnn\n",
+    "Hoi Bob,\n\nik moet me helaas afmelden voor het etentje van vrijdag, mail "
+    "anders even naar ann@example.org.\n\nGroetjes\nAnn\n",
+    "Hi Bob,\n\nI'd like to opt out of the Friday on-call rota; the form at "
+    "https://hr.example/rota won't let me. Can you do it for me?\n\nThanks\nAnn\n",
+    "Hi Ann,\n\nYou asked how to get off the list. Here is how:\n\n"
+    "To unsubscribe, go to https://lists.example.org/options/dev and enter "
+    "your address.\n\nThen confirm the mail you get.\n\nBob\n",
+    "Hej,\n\nkan du afmelde mig fra turen? Skriv til ann@example.org hvis der "
+    "er noget.\n\nAnn\n",
+    "Ahoj,\n\nmůžeš mě prosím odhlásit z té akce? Formulář je na "
+    "https://klub.example/akce.\n\nAnn\n")
+# … with or without the evidence: a person's post that a mailing list passed
+# on is bulk mail by its headers, and a list is where such a request goes.
+for _n, _plain in enumerate(_UNSUBSCRIBE_REQUESTS, 1):
+    for _bulk in (None, False, True):
+        case("a person's mail about unsubscribing is the message — %d (bulk=%s)"
+             % (_n, _bulk),
+             plain=_plain, bulk=_bulk, unchanged=True, state="wanting")
+
+for _name, _plain in (
+        ("a request with no sign-off, under a greeting",
+         "Hi,\n\nPlease unsubscribe me from this list. My address is "
+         "ann@example.org.\n"),
+        ("a request with no sign-off, under a sentence",
+         "Hi all,\n\nI have changed jobs.\n\nPlease unsubscribe me from this "
+         "list. My address is ann@example.org.\n"),
+        ("a cancellation with a link, under a greeting",
+         "Hallo zusammen,\n\nich muss mich leider für Samstag abmelden, hier "
+         "ist die Liste: https://verein.example/termine\n"),
+        ("a how-to that names the list server, the next step under it",
+         "Hi Ann,\n\nHere is how:\n\nTo unsubscribe, write to "
+         "dev-leave@lists.example.org from the address you subscribed with."
+         "\n\nThen answer the confirmation.\n\nBob\n"),
+        ("a newsletter's block with words under it",
+         "ACME Weekly\n\nThree new features this week.\n\n"
+         "Unsubscribe: https://news.example.com/u/abc\n\nYour ACME team\n"),
+        # A footer hands over its link and ends on it; a sentence goes on.
+        ("a request that goes on after its link",
+         "Hi all,\n\nI have changed jobs.\n\nCan someone unsubscribe me? "
+         "https://lists.example.org/options/dev does not work for me\n"),
+        ("news about a list, the link in mid-sentence",
+         "Hi all,\n\nthe old archive is gone.\n\nTo unsubscribe from the old "
+         "list go to https://old.example/unsub, the new one needs nothing "
+         "from you.\n"),
+        ("a how-to from experience",
+         "Hi all,\n\nhere is the info.\n\nIf you want to leave: send a mail to "
+         "dev-leave@lists.example.org and you are unsubscribed. I did it last "
+         "year and it took 3 days.\n"),
+        ("a request, and the sender's name and number under it",
+         "Hi all,\n\nI have changed jobs.\n\nPlease unsubscribe me, the page "
+         "https://lists.example.org/options/dev does not work for me.\n\n"
+         "Bob Example\nTel. 555 1234\n"),
+        ("a question with numbered steps under it",
+         "Hello list,\n\nquestion below.\n\nIs this how I unsubscribe my old "
+         "address: https://lists.example.org/options/dev\n\n1. log in\n"
+         "2. click the button\n"),
+        ("a block, and a sentence about confidentiality under it",
+         "ACME Weekly\n\nThree new features this week.\n\n"
+         "Unsubscribe: https://news.example.com/u/abc\n\nPlease keep the 3 "
+         "figures above confidential, you are the only intended recipient of "
+         "this early edition and the others get theirs on Friday.\n")):
+    case("on a list: " + _name, plain=_plain, bulk=True, unchanged=True,
+         state="wanting")
+
+case("on a list: a request stays, the list's own block under it goes",
+     plain="Hi all,\n\nI have changed jobs.\n\nPlease unsubscribe me, the page "
+           "https://lists.example.org/options/dev does not work for me.\n\n"
+           "To unsubscribe from this list, write to dev-leave@lists.example.org\n",
+     bulk=True,
+     text="Hi all,\n\nI have changed jobs.\n\nPlease unsubscribe me, the page "
+          "https://lists.example.org/options/dev does not work for me.",
+     state="wanting", removed=("footer",))
+
+case("on a list: a contact block under a rule is not the list's footer",
+     plain="Hi all,\n\nminutes attached.\n\nMy new contact:\n________________\n"
+           "Bob Example\nbob@example.org\nhttps://bob.example.org\n",
+     bulk=True, unchanged=True, state="wanting")
+
+for _bulk in (None, True):
+    case("a rule above bare links is a postscript (bulk=%s)" % _bulk,
+         plain="The two documents:\n________________\n"
+               "https://files.example.com/contract\n"
+               "https://files.example.com/annex\n",
+         bulk=_bulk, unchanged=True, state="wanting")
+    case("a rule above 'see also' and a link is a postscript (bulk=%s)" % _bulk,
+         plain="I think the patch is fine.\n\nBob\n________________\n"
+               "See also\nhttps://example.org/patches/42\n",
+         bulk=_bulk, unchanged=True, state="wanting")
+
+case("a mailman footer in mail not known to be bulk stays",
+     plain="I think the patch is fine.\n\nBob\n"
+           "_______________________________________________\n"
+           "Users mailing list\nUsers@lists.example.org\n"
+           "https://lists.example.org/mailman/listinfo/users\n",
+     unchanged=True, state="wanting")
+
+case("'unsubscribed' inside another word is no cue",
+     plain="News.\n\nThe resubscribed users are listed at "
+           "https://stats.example.com/resub\n", bulk=True, unchanged=True)
+
+# ── Paragraphs that mention confidentiality ──
+
+_ADVICE = ("Dear Mr Example,\n\nYou asked what the clause means. Here is my "
+           "advice.\n\nThe documents we sent you on Monday are confidential "
+           "and privileged, and you are the only intended recipient of them; "
+           "please do not forward them to the counterparty under any "
+           "circumstances.\n")
+case("a paragraph about confidential documents, the sign-off still to come",
+     plain=_ADVICE + "\nKind regards\nDr. Law\n", unchanged=True, state="wanting")
+case("the same paragraph ending the mail",
+     plain=_ADVICE, unchanged=True, state="wanting")
+case("the same paragraph under a line with no full stop",
+     plain=_ADVICE.replace("Here is my advice.", "Here is my advice"),
+     unchanged=True, state="wanting")
+
+case("vertraulich and Empfänger in a sentence of the author's",
+     plain="Hallo Bob,\n\nkurze Info vorab.\n\nBitte behandle die Liste "
+           "vertraulich; der Empfänger des Pakets ist noch nicht informiert "
+           "und soll es erst am Freitag erfahren, wenn alles geklärt ist.\n\n"
+           "Ann\n",
+     unchanged=True, state="wanting")
+
+_NEWS_IN_CONFIDENCE = (
+    "Please treat this e-mail as confidential; you are the only intended "
+    "recipient and I have not told Carol yet that we plan to close the Bern "
+    "office in June.\n")
+case("news told in confidence, the name under it",
+     plain="Hi Bob,\n\n" + _NEWS_IN_CONFIDENCE + "\nAnn\n",
+     unchanged=True, state="wanting")
+case("news told in confidence, right under the greeting",
+     plain="Hi Bob,\n\n" + _NEWS_IN_CONFIDENCE, unchanged=True, state="wanting")
+case("news told in confidence, under a finished sentence",
+     plain="Hi Bob,\n\nplease read this carefully.\n\n" + _NEWS_IN_CONFIDENCE,
+     unchanged=True, state="wanting")
+
+# All three words, opening the paragraph, the mail's last lines, under a line
+# with no full stop — and still what the author had to say: nothing in it
+# tells a reader it was not meant for what to do.
+for _name, _plain in (
+        ("en", "Hi Bob,\n\nQuick one\n\nThis message is confidential and "
+               "intended only for you as recipient: the salary list for 2025 "
+               "is attached, please review it and send me your comments by "
+               "Friday at the latest.\n"),
+        ("de", "Hallo Bob\n\nkurze Info vorab\n\nBitte behandle die Mail "
+               "vertraulich; der Empfänger des Pakets ist noch nicht "
+               "informiert und soll es erst am Freitag erfahren, wenn alles "
+               "geklärt ist.\n"),
+        ("fr", "Bonjour Bob\n\nun mot rapide\n\nCe message est confidentiel "
+               "et tu en es le seul destinataire : le contrat sera signé "
+               "lundi, merci de ne rien dire à personne avant cette date.\n")):
+    case("a confidential message under a short line is the message — " + _name,
+         plain=_plain, unchanged=True, state="wanting")
+
+case("a notice that tells nobody what to do: held back",
+     plain="Please find the offer attached.\n\nKind regards\nBob\n\n"
+           "This e-mail and its attachments are confidential and intended "
+           "solely for the addressee. Any other use of it is prohibited.\n",
+     unchanged=True, state="wanting")
+
+case("a notice under a finished sentence, no sign-off: not cut on a guess",
+     plain="Ok, thanks.\n\n%s\n" % _DISCLAIMERS["en"],
+     unchanged=True, state="wanting")
+
+case("a notice in the middle of a mail is not a footer",
+     plain="Hi Bob,\n\n%s\n\nThat is the wording legal wants under every "
+           "mail from now on. Can you set it up?\n\nAnn\n" % _DISCLAIMERS["en"],
+     unchanged=True)
+
+case("the author's own lines glued above a notice stay, cue word or not",
+     plain="Hi Ann,\n\nsee attached\n\nThe report is confidential\nBob\n%s\n"
+           % _DISCLAIMERS["en"],
+     text="Hi Ann,\n\nsee attached\n\nThe report is confidential\nBob",
+     removed=("footer",))
+
+case("a sentence glued above a notice: where the notice starts is a guess",
+     plain="Hi Ann,\n\nthanks\n\nI will mail you the report tomorrow.\n%s\n"
+           % _DISCLAIMERS["en"],
+     unchanged=True, state="wanting")
+
+# A notice in a language without the words here is, to the trim, a paragraph
+# of the author's — so the notice under it stands under a finished sentence,
+# and neither goes. Unsettled, not cut: a missing table row never loses text.
+case("a notice in a language without the words here, and one in English",
+     plain="Rendben.\n\nBob\n\nEz az e-mail bizalmas, és kizárólag a címzettnek "
+           "szól. Ha Ön nem a címzett, kérjük, értesítse a feladót és törölje "
+           "az üzenetet.\n\n%s\n" % _DISCLAIMERS["en"],
+     unchanged=True, state="wanting")
+
+# ── Outlook on the desktop, in a language the tables do not know ──
+
+
+def _outlook_desktop(labels, intro, quoted):
+    return (
+        '<html><body lang=HU><div class=WordSection1>'
+        + "".join("<p class=MsoNormal>%s<o:p></o:p></p>" % line for line in intro)
+        + "<p class=MsoNormal><o:p>&nbsp;</o:p></p><div><div style='border:none;"
+          "border-top:solid #E1E1E1 1.0pt;padding:3.0pt 0cm 0cm 0cm'><p "
+          "class=MsoNormal><b>%s:</b> Bob Example &lt;bob@example.net&gt;<br>"
+          "<b>%s:</b> 2025. 03. 03. 14:02<br><b>%s:</b> Ann Example &lt;"
+          "ann@example.org&gt;<br><b>%s:</b> Docs<o:p></o:p></p></div></div>"
+          % labels
+        + "<p class=MsoNormal><o:p>&nbsp;</o:p></p>"
+        + "".join("<p class=MsoNormal>%s<o:p></o:p></p>" % line for line in quoted)
+        + "</div></body></html>")
+
+
+for _lang, _labels in (("hu", ("Feladó", "Küldve", "Címzett", "Tárgy")),
+                       ("ru", ("От", "Отправлено", "Кому", "Тема")),
+                       ("tr", ("Kimden", "Gönderildi", "Kime", "Konu"))):
+    _intro = ["Köszönöm, jó lesz.", "Ann"]
+    _quoted = ["Can you come Tuesday?", "And bring the docs."]
+    _plain = ("\n".join(_intro) + "\n\n%s: Bob Example <bob@example.net>\n"
+              "%s: 2025. 03. 03. 14:02\n%s: Ann Example <ann@example.org>\n"
+              "%s: Docs\n\n" % _labels + "\n".join(_quoted) + "\n")
+    _html = _outlook_desktop(_labels, _intro, _quoted)
+    case("desktop outlook, multipart, unknown labels: the border-top div "
+         "vouches — " + _lang,
+         plain=_plain, html=_html, reply=True,
+         text="Köszönöm, jó lesz.\nAnn", state="deterministic",
+         removed=("quote",))
+    case("desktop outlook, multipart, unknown labels, not known to be a "
+         "reply — " + _lang,
+         plain=_plain, html=_html, unchanged=True, state="wanting")
 
 
 # ── Running the corpus ───────────────────────────────────────────────────────
@@ -993,7 +1655,8 @@ def _source_lines(plain):
 
 
 def check_case(c):
-    result = mt.trim(c["plain"], c["html"], subject=c["subject"])
+    result = mt.trim(c["plain"], c["html"], subject=c["subject"],
+                     is_reply=c["is_reply"], bulk=c["bulk"])
     where = "case %r" % c["name"]
     assert isinstance(result, mt.TrimResult) and isinstance(result, tuple), where
     assert set(result.removed) == {"quote", "signature", "footer", "pixels"}, (
@@ -1121,12 +1784,24 @@ def test_stub_plain_part():
 def test_surviving_marker_is_wanting():
     kept_quote = mt.trim("```\n> ls\n```\n", None)
     assert kept_quote.state == "wanting", kept_quote
-    hanging = mt.trim("Thanks!\n\n" + ATTRIBUTION + "\n", None)
-    # An attribution with no quote under it is cut when the verb vouches…
-    assert hanging.text == "Thanks!", hanging
-    # … and one the trim cannot be sure of stays, and says so.
-    unsure = mt.trim("Thanks!\n\n2025-03-03 14:02 GMT+01:00 %s:\n" % ANN, None)
-    assert "2025-03-03" in unsure.text and unsure.state == "wanting", unsure
+    # An attribution with no quote under it is cut when the verb vouches and
+    # the mail is a reply …
+    hanging = "Thanks!\n\n" + ATTRIBUTION + "\n"
+    cut = mt.trim(hanging, None, subject="Re: x", is_reply=True)
+    assert cut.text == "Thanks!" and cut.state == "deterministic", cut
+    # … stays in a mail not known to be one, and says so …
+    kept = mt.trim(hanging, None)
+    assert ATTRIBUTION in kept.text and kept.state == "wanting", kept
+    # … as does one the trim cannot be sure of, reply or not.
+    for evidence in ({}, {"subject": "Re: x", "is_reply": True}):
+        unsure = mt.trim("Thanks!\n\n2025-03-03 14:02 GMT+01:00 %s:\n" % ANN,
+                         None, **evidence)
+        assert "2025-03-03" in unsure.text and unsure.state == "wanting", unsure
+    # An attribution-shaped line in the MIDDLE, with text under it and no
+    # ">" — a client quoting bare in a language without a verb here — is a
+    # marker that survived too, not only one hanging at the end.
+    middle = mt.trim("OK.\n\n2025年3月3日(月) 14:02 %s:\n\nEarlier text.\n" % ANN, None)
+    assert "Earlier text." in middle.text and middle.state == "wanting", middle
     print("PASS a surviving quote marker: wanting")
 
 
@@ -1201,6 +1876,12 @@ _FUZZ_PLAIN = [
     "https://lists.example.org/mailman/listinfo/users",
     "a line that ends with a colon:", "the value must be", "> 100 francs",
     "\x01marked", "\x02H", "trailing blanks   ", "\tTabbed", "   > three spaces",
+    "-- ", "-- ", "Sent from Hamburg on Monday", "Sent with DHL, tracking 12345.",
+    "Kind regards", "Regards,", "________________", "To: " + BOB,
+    "Please unsubscribe me, my address is ann@example.org.",
+    "Am 03.03.2025 um 14:02 schrieb Bob Example:",
+    "The documents are confidential and you are the only intended recipient "
+    "of them; please do not forward them to anyone before Friday.",
 ]
 _FUZZ_HTML = [
     "<p>Hi</p>", "<div>text</div>", "<br>", "text ", "<b>bold</b>",
@@ -1220,6 +1901,10 @@ _FUZZ_HTML = [
     "---------- Forwarded message ---------<br>", "Begin forwarded message:<br>",
     "<style>p{color:red}</style>", "<script>x</script>",
     "<p class=MsoNormal>&nbsp;</p>",
+    "<head>", "</head>", "<title>T</title>", '<a href="https://x.example/\x02H">',
+    "</a>", "<b>To:</b> Bob &lt;bob@example.net&gt;<br>", "<ol>", "</li>",
+    '<style>a::before{content:"}" url(http:x.example) "{color:red}</style>',
+    "Unsubscribe: https://news.example.com/u/abc<br>",
 ]
 
 
@@ -1241,9 +1926,12 @@ def test_random_mails_hold_the_invariants():
         if mode in (0, 3):
             html = "".join(rng.choice(_FUZZ_HTML)
                            for _ in range(rng.randint(1, 24)))
-        subject = rng.choice((None, None, "Re: x", "Fwd: x", "WG: x"))
-        result = mt.trim(plain, html, subject=subject)
-        context = (n, plain, html, subject, result.text)
+        subject = rng.choice((None, None, "Re: x", "Re: x", "Fwd: x", "WG: x"))
+        is_reply = rng.choice((None, True, True, False))
+        bulk = rng.choice((None, None, True, False))
+        result = mt.trim(plain, html, subject=subject, is_reply=is_reply,
+                         bulk=bulk)
+        context = (n, plain, html, subject, is_reply, bulk, result.text)
         assert mt.trim(result.text, None).text == result.text, context
         assert "\x01" not in result.text and "\x02" not in result.text, context
         assert result.state in ("deterministic", "wanting"), context
@@ -1252,22 +1940,104 @@ def test_random_mails_hold_the_invariants():
             assert all(line in allowed for line in result.text.split("\n")), context
             assert result.text or not plain.strip("\n\t \x01\x02"), context
         if html:
-            assert mt.sanitize_html(html).endswith("</body></html>"), context
-            assert isinstance(mt.html_to_text(html), str)
+            document = mt.sanitize_html(html)
+            assert document.endswith("</body></html>"), context
+            assert not _policy_problems(document), (context, _policy_problems(document))
+            text = mt.html_to_text(html)
+            assert "\x01" not in text and "\x02" not in text, context
+        # With no evidence at all nothing that only evidence licenses is cut:
+        # the same mail keeps at least what it kept as a reply or as bulk
+        # mail. (A forward's subject works the other way: it protects. And a
+        # mail the evidence trimmed to nothing comes back as its text alone
+        # reads — in which the standard's delimiter has lost its blank and
+        # cuts no more, so mails with one are left out of the comparison. So
+        # are the mails with an HTML part: there the same fallback reads the
+        # text without the markup's marks, and of two parts that say
+        # different things the source depends on what the plain one let go.)
+        if (html is None and not mt.is_forward_subject(subject)
+                and "-- " not in plain.split("\n")):
+            bare = mt.trim(plain, html)
+            assert len(bare.text) >= len(result.text), (context, bare.text)
     print("PASS %d random mails: idempotent, nothing invented, no mark leaks" % rounds)
 
 
-def test_forward_subject_prefixes():
-    yes = ("Fwd: x", "FW: x", "fw: x", "WG: x", "TR: x", "I: x", "RV: x",
-           "Doorst: x", "ENC: x", "VS: x", "VB: x", "VL: x", "PD: x",
-           "[list] Fwd: x", "  Fwd : x")
-    no = ("Re: Fwd: x", "AW: WG: x", "Forward planning", "x", "", None,
-          "Re: x", "Invoice: x")
-    for subject in yes:
+def test_subject_prefixes():
+    """The outermost prefix decides, in every language of the two tables; a
+    prefix that is a forward's in one language and a reply's in another, and
+    one no table has, say neither."""
+    forwards = ("Fwd: x", "FW: x", "fw: x", "WG: x", "TR: x", "I: x", "RV: x",
+                "Doorst: x", "ENC: x", "VB: x", "VL: x", "PD: x", "İLT: x",
+                "ilt: x", "转发: x", "轉寄：x", "Пересл.: x", "ΠΡΘ: x", "TRS: x",
+                "YML: x", "העבר: x", "[list] Fwd: x", "  Fwd : x", "Fwd[2]: x")
+    replies = ("Re: x", "RE: x", "re : x", "AW: x", "Antw: x", "SV: x", "R: x",
+               "RIF: x", "RES: x", "Odp: x", "Odp.: x", "YNT: x", "Отв: x",
+               "ΑΠ: x", "回复: x", "答复：x", "Re[2]: x", "Re(3): x", "RE^2: x",
+               "[list] Re: x", "Re: Fwd: x", "AW: WG: x")
+    neither = ("VS: x", "Forward planning", "Regarding: x", "Invoice: x", "x",
+               "Továbbítás: x", "Re x", "Reply", "", None,
+               b"Re: x", 5, ["Fwd: x"])     # not a string: says nothing
+    for subject in forwards:
         assert mt.is_forward_subject(subject), subject
-    for subject in no:
+        assert not mt.is_reply_subject(subject), subject
+    for subject in replies:
+        assert mt.is_reply_subject(subject), subject
         assert not mt.is_forward_subject(subject), subject
-    print("PASS forward subjects: the outermost prefix decides")
+    for subject in neither:
+        assert not mt.is_forward_subject(subject), subject
+        assert not mt.is_reply_subject(subject), subject
+    # The thread index strips the same prefixes when it names a chat. Every
+    # one it knows is known here too, as one or the other or as ambiguous —
+    # the two tables may not drift apart.
+    try:
+        spec = importlib.util.spec_from_file_location(
+            "mail_threads", SCRIPTS_DIR / "mail_threads.py")
+        threads = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(threads)
+        known = threads.REPLY_FORWARD_PREFIXES
+    except (OSError, AttributeError):
+        known = ()
+    for prefix in known:
+        subject = prefix + ": x"
+        assert (mt.is_forward_subject(subject) or mt.is_reply_subject(subject)
+                or mt._fold(prefix) in mt._AMBIGUOUS_PREFIXES), prefix
+    print("PASS subjects: the outermost prefix decides; %d of the thread "
+          "index's prefixes known" % len(known))
+
+
+def test_evidence_is_optional_and_only_ever_cuts():
+    """trim() with nothing but the two parts is the most careful trim there
+    is: every piece of evidence is optional, defaults to "not known", and
+    what is not known is never a reason to cut."""
+    import inspect
+    parameters = inspect.signature(mt.trim).parameters
+    assert list(parameters) == ["plain", "html", "subject", "is_reply", "bulk"]
+    for name in ("subject", "is_reply", "bulk"):
+        assert parameters[name].default is None, name
+    for name in ("is_reply", "bulk"):
+        assert parameters[name].kind is inspect.Parameter.KEYWORD_ONLY, name
+    history = ("Fine.\n\nFrom: %s\nSent: Monday, March 3, 2025 2:02 PM\n"
+               "To: %s\nSubject: Meeting\n\nCan we meet?\n" % (ANN, BOB))
+    footer = "ACME Weekly\n\nNews.\n\nUnsubscribe: https://news.example.com/u/abc\n"
+    # Only True is evidence; False, None and anything else are its absence.
+    for is_reply in (None, False, 0, "", "yes", 1):
+        result = mt.trim(history, None, subject="Re: Meeting", is_reply=is_reply)
+        assert "Can we meet?" in result.text and result.state == "wanting", is_reply
+    for bulk in (None, False, 0, "", "yes", 1):
+        result = mt.trim(footer, None, bulk=bulk)
+        assert "Unsubscribe" in result.text and result.state == "wanting", bulk
+    assert mt.trim(history, None, subject="Re: Meeting", is_reply=True).text == "Fine."
+    assert mt.trim(footer, None, bulk=True).text == "ACME Weekly\n\nNews."
+    # Every corpus mail, stripped of its evidence: nothing a rule holds back
+    # is lost, so the bare trim keeps at least as much. (A forward's subject
+    # works the other way — it protects — and is left out.)
+    for c in CASES:
+        bare = mt.trim(c["plain"], c["html"])
+        assert mt.trim(bare.text, None).text == bare.text, c["name"]
+        if not mt.is_forward_subject(c["subject"]):
+            told = mt.trim(c["plain"], c["html"], subject=c["subject"],
+                           is_reply=c["is_reply"], bulk=c["bulk"])
+            assert len(bare.text) >= len(told.text), c["name"]
+    print("PASS evidence: optional, None by default, and only ever a reason to cut")
 
 
 def test_tables_cover_the_languages():
@@ -1276,8 +2046,11 @@ def test_tables_cover_the_languages():
     required = {"en", "de", "fr", "it", "es", "nl", "pt", "da", "nb", "sv"}
     tables = {name: getattr(mt, name) for name in (
         "_HEADER_LABELS", "_ATTRIBUTION_VERBS", "_ORIGINAL_STEMS",
-        "_FORWARD_STEMS", "_FORWARD_PREFIXES", "_MOBILE_SIGNATURES",
-        "_UNSUBSCRIBE_STEMS", "_CONFIDENTIAL_STEMS", "_RECIPIENT_STEMS")}
+        "_FORWARD_STEMS", "_FORWARD_PREFIXES", "_REPLY_PREFIXES",
+        "_MOBILE_SIGNATURES", "_MOBILE_PARTICIPLES", "_MOBILE_DEVICES",
+        "_MOBILE_JOINERS",
+        "_UNSUBSCRIBE_STEMS", "_MESSAGE_STEMS", "_CONFIDENTIAL_STEMS",
+        "_RECIPIENT_STEMS", "_MISDIRECTED_STEMS")}
     for name, table in tables.items():
         missing = required - set(table)
         assert not missing, (name, missing)
@@ -1328,32 +2101,101 @@ def test_never_raises_and_stays_fast():
 def test_cost_grows_with_size_not_its_square():
     """A mail built to be slow must not be: four times the mail may take
     about four times as long, never sixteen. Each shape below is one that a
-    look-back, a look-ahead or a repeated stage could turn quadratic."""
+    look-back, a look-ahead, a repeated stage or a walk of the element stack
+    could turn quadratic — for every stage of the trim, on plain text and on
+    HTML, and for the sanitiser."""
     disclaimer = _DISCLAIMERS["en"]
     shapes = {
-        "signature delimiters": lambda n: "--\n" * n,
+        # Stage 1: quotes, attributions, history.
         "lines ending in a colon": lambda n: "a:\n" * n,
         "quote, blank, quote": lambda n: "> a\n\n" * n,
         "header labels": lambda n: "From: a\n" * n,
-        "phone line and notice, repeated":
-            lambda n: ("Sent from my iPhone\n\n%s\n\n" % disclaimer) * (n // 4),
+        "whole header blocks": lambda n: (
+            "From: a\nSent: 3 March 2025 14:02\nTo: b\nSubject: c\n\n") * (n // 4),
         "fences": lambda n: "```\n> a\n" * n,
         "separators": lambda n: "----- x -----\n" * n,
+        "rules above labels": lambda n: ("_" * 32 + "\nA: b <c@d.ee>\n") * n,
         "attributions": lambda n: (ATTRIBUTION + "\n") * n,
+        "attributions, verb first":
+            lambda n: "Am 03.03.2025 um 14:02 schrieb Bob Example:\n\n" * n,
+        "forward lead-ins": lambda n: "forwarded:\n\n" * n,
         "one long token": lambda n: "a" * (40 * n) + ":",
         "addresses": lambda n: "a@" * (10 * n),
+        "one long line above many quote blocks":
+            lambda n: "x" * (20 * n) + ":\n" + "> q\n\n" * n,
+        "one long line, then attribution and quote, repeated":
+            lambda n: "x" * (20 * n) + "\n" + (ATTRIBUTION + "\n> q\n") * n,
+        "one long label line among labels":
+            lambda n: "From: a\n" * n + "To: " + "b" * (20 * n) + "\n" + "From: a\n" * n,
+        # Stage 2: signatures.
+        "signature delimiters": lambda n: "--\n" * n,
+        "standard delimiters": lambda n: "-- \na\n" * n,
+        "delimiters, then phone lines":
+            lambda n: "--\n" * n + "\nSent from my iPhone\n" * (n // 2),
+        "phone lines, a paragraph each": lambda n: "Sent from my iPhone\n\n" * n,
+        "phone line and rule, repeated": lambda n: "Sent from x\n-----\n" * n,
+        "sentences that name a device":
+            lambda n: "Sent from my iPhone to yours yesterday\n\n" * n,
+        "one long line above phone lines":
+            lambda n: "y" * (40 * n) + "\n\n" + "Sent from my iPhone\n\n" * n,
+        # Stage 3: footers.
+        "phone line and notice, repeated":
+            lambda n: ("Sent from my iPhone\n\n%s\n\n" % disclaimer) * (n // 4),
+        "notices, a paragraph each": lambda n: (disclaimer + "\n\n") * (n // 4),
+        "notices, one paragraph": lambda n: (disclaimer + "\n") * (n // 4),
+        "notices glued under sign-offs":
+            lambda n: ("Bob\n%s\n\n" % disclaimer) * (n // 4),
+        "list footers, whole": lambda n: (
+            "a\nb\n" + "_" * 16 + "\nUsers list\nu@lists.a.bb\nhttp://lists.a.bb/c\n")
+            * (n // 4),
+        "unsubscribe blocks above imprints":
+            lambda n: "a\n\nb\n\nUnsubscribe: https://a.b/u\n\n1 Road\n\n" * (n // 2),
+        "list footers, one paragraph":
+            lambda n: ("_" * 16 + "\nhttp://a.b\n") * n,
+        "list footers, a paragraph each":
+            lambda n: ("_" * 16 + "\nhttp://a.b\n\n") * n,
+        "unsubscribe lines": lambda n: "Unsubscribe: https://a.b/u\n\n" * n,
+        "unsubscribe lines, one paragraph":
+            lambda n: "Unsubscribe: https://a.b/u\n" * n,
+        "rules": lambda n: "-----\n" * n,
+        "one line of dashes": lambda n: "-" * (20 * n) + "a" + "-" * (20 * n) + "b",
     }
     markup = {
         "open divs": lambda n: "<div>" * n + "x",
         "stray end tags": lambda n: "<b>" * n + "</i>" * n,
+        "stray end tags in a deep nest":
+            lambda n: "<div><table><tr><td>" + "<b>" * 250 + "</div>" * n,
+        "elements under a deep nest": lambda n: "<b>" * 255 + "<div></div>" * n,
         "cells without a table": lambda n: "<td>a" * n,
+        "rows of one table": lambda n: "<table>" + "<tr><td>a<td>b" * n,
         "items without a list": lambda n: "<li>a" * n,
+        "items of one list": lambda n: "<ol>" + "<li>x" * n,
         "nested hidden": lambda n: "<div hidden>" * n + "x" + "</div>" * n,
         "nested quotes": lambda n: '<blockquote type="cite">' * n + "x",
+        "lines in deep quotes":
+            lambda n: '<blockquote type="cite">' * 250 + "x<br>" * n,
+        "lines in deep lists": lambda n: "<ul><li>" * 120 + "x<br>" * n,
+        "lines in deep tables": lambda n: "<table><tr><td>" * 80 + "x<br>" * n,
+        "links in links": lambda n: '<a href="https://a.b/c">' * n + "x",
+        "lines in links in tables":
+            lambda n: '<table><tr><td><a href="https://a.b/c">' * 60 + "x<br>" * n,
+        "outlook's marker elements": lambda n: "<p id=appendonsend>" * n,
+        "marker elements and quotes": lambda n: (
+            '<p id=appendonsend></p><blockquote type=cite>q</blockquote>') * n,
+        "border-top elements": lambda n: '<div style="border-top:solid 1pt">a:</div>' * n,
+        "attribution elements": lambda n: '<div class="gmail_attr">a wrote:</div>' * n,
+        "a blank size": lambda n: '<img width="1' + " " * (40 * n) + 'x">',
+        "a long style": lambda n: '<p style="width:' + "1" * (40 * n) + 'x">a</p>',
+        "unclosed heads": lambda n: "<head>" * n + "x",
         "style comments": lambda n: "<style>" + "/*" * (4 * n) + "</style>x",
         "style braces": lambda n: "<style>" + "{" * (4 * n) + "</style>x",
+        "style quotes": lambda n: "<style>" + 'a{b:"}' * n + "</style>x",
+        "style parentheses": lambda n: "<style>a{b:" + "(" * (4 * n) + "}</style>x",
         "inline style": lambda n: '<p style="' + "/*a:b;" * n + '">x</p>',
+        "inline style strings": lambda n: '<p style="a:' + "'" * (4 * n) + '">x</p>',
+        "cid images": lambda n: '<img src="cid:a%d">' * n % tuple(range(n)),
     }
+    cids = {"b%d" % n: "data:image/png;base64,AAAA" for n in range(20000)}
 
     def cost(run, text):
         started = time.perf_counter()
@@ -1361,18 +2203,67 @@ def test_cost_grows_with_size_not_its_square():
         return time.perf_counter() - started
 
     def check(name, make, run):
-        small = cost(run, make(5000))
         large = cost(run, make(20000))
-        # Linear is 4x; quadratic 16x. The floor is for the timer's noise.
-        assert large < max(1.5, 9 * small), (
+        if large < 1.5:
+            return      # (the inputs that were quadratic took a minute here)
+        # Slow, then, but in proportion? Linear is 4x; quadratic 16x.
+        small = cost(run, make(5000))
+        assert large < 9 * small, (
             "%s: %.2fs for 5000, %.2fs for 20000" % (name, small, large))
 
     for name, make in shapes.items():
         check(name, make, lambda text: mt.trim(text, None))
+        check(name + " (a reply, bulk)", make, lambda text: mt.trim(
+            text, None, subject="Re: x", is_reply=True, bulk=True))
+        check(name + " (a forward)", make, lambda text: mt.trim(
+            text, None, subject="Fwd: x"))
     for name, make in markup.items():
         check(name + " (trim)", make, lambda text: mt.trim(None, text))
-        check(name + " (sanitize)", make, mt.sanitize_html)
-    print("PASS cost: linear on %d hostile shapes" % (len(shapes) + len(markup)))
+        check(name + " (trim, a reply)", make, lambda text: mt.trim(
+            "hello", text, subject="Re: x", is_reply=True, bulk=True))
+        check(name + " (text)", make, mt.html_to_text)
+        check(name + " (sanitize)", make, lambda text: mt.sanitize_html(text, cids))
+    print("PASS cost: linear on %d hostile shapes" % (
+        3 * len(shapes) + 4 * len(markup)))
+
+
+def test_cost_at_a_megabyte():
+    """The two inputs that took minutes, at the size a hostile mail has: a
+    second or two, not a stalled mirror."""
+    for name, run in (
+            ("stacked list footers", lambda: mt.trim(("_" * 16 + "\nhttp://a.b\n") * 40000, None)),
+            ("phone line and rule", lambda: mt.trim("Sent from x\n-----\n" * 60000, None)),
+            ("marker elements", lambda: mt.trim("hello", "<p id=appendonsend>" * 55000)),
+            ("marker elements, a reply", lambda: mt.trim(
+                "hello", "<p id=appendonsend>" * 55000, subject="Re: x", is_reply=True))):
+        started = time.perf_counter()
+        run()
+        elapsed = time.perf_counter() - started
+        assert elapsed < 10, "%s: %.1fs for a megabyte" % (name, elapsed)
+    print("PASS cost: a megabyte of the worst in seconds")
+
+
+def test_nesting_does_not_inflate():
+    """Containers nested to the limit do not multiply the text: each line
+    gets a bounded number of prefixes, so a megabyte of markup cannot become
+    a hundred megabytes of bubble."""
+    lines = "x<br>" * 4000
+    for name, opening in (("quotes", '<blockquote type="cite">'),
+                          ("lists", "<ul><li>"), ("ordered lists", "<ol><li>"),
+                          ("tables", "<table><tr><td>"),
+                          ("quotes in lists", '<ul><li><blockquote type="cite">')):
+        for depth in (20, 85, 255):
+            html = opening * depth + lines
+            for text in (mt.trim(None, html).text, mt.html_to_text(html),
+                         mt.trim("hello", html, subject="Re: x", is_reply=True).text):
+                assert len(text) <= 12 * len(html), (name, depth, len(html), len(text))
+            assert len(mt.sanitize_html(html)) <= 2 * len(html) + 1000, (name, depth)
+    # The quotes are still quotes and the items still items, to the cap.
+    text = mt.html_to_text('<blockquote type="cite">' * 40 + "deep")
+    assert text == "> " * mt._MAX_BLOCKS + "deep", text
+    assert mt.trim(None, '<p>mine</p>' + '<blockquote type="cite">' * 40 + "deep").text == "mine"
+    assert mt.html_to_text("<ul><li>" * 3 + "x") == "- - - x"
+    print("PASS nesting: the text stays within a small multiple of the markup")
 
 
 # ── html_to_text() ───────────────────────────────────────────────────────────
@@ -1445,7 +2336,58 @@ def test_html_to_text_links():
     assert h('<a href="https://example.com/x"></a>after') == "after"
     assert h('See <a href="https://example.com/x">this</a>, please.') == \
         "See this (https://example.com/x), please."
+    # A link does not nest: the second ends the first.
+    assert h('<a href="https://a.example/1">one <a href="https://b.example/2">'
+             'two</a></a>') == "one (https://a.example/1)two (https://b.example/2)"
     print("PASS html_to_text: a link's target only when it adds information")
+
+
+def test_link_targets_carry_no_marks():
+    """A link's target is the sender's text like any other. The control
+    characters the trim marks lines with, and the padding a sender hides,
+    reach the text through it no more than through a text node — raw,
+    percent-encoded or as a character reference."""
+    for html, want in (
+            ('<p>Please <a href="http://e.org/\x02H">click</a> now</p>',
+             "Please click (http://e.org/H) now"),
+            ('<p>Please <a href="http://e.org/\x01x">click</a> now</p>',
+             "Please click (http://e.org/x) now"),
+            ('<p>Please <a href="http://e.org/&#2;H">click</a> now</p>',
+             "Please click (http://e.org/H) now"),
+            ('<p>Write <a href="mailto:a%02b@e.org">me</a></p>',
+             "Write me (ab@e.org)"),
+            ('<p>Write <a href="mailto:a%01b@e.org?subject=x">me</a></p>',
+             "Write me (mailto:a%01b@e.org?subject=x)"),
+            ('<p>Call <a href="tel:+41\x0244">us</a></p>', "Call us (+4144)"),
+            ('<p><a href="http://e.org/a\u200bb\x00c">x</a></p>',
+             "x (http://e.org/abc)")):
+        for text in (mt.html_to_text(html), mt.trim(None, html).text):
+            assert text == want, (html, text)
+            assert mt.trim(text, None).text == text, (html, text)
+    print("PASS link targets: no mark and no padding reaches the text")
+
+
+def test_unclosed_head_keeps_the_text():
+    """Text right after an unclosed <head> is the mail. A browser shows it,
+    so the bubble and the Original do — never a blank bubble."""
+    html = '<html><head><meta charset="utf-8">Hi Bob, short answer: yes.<br>Ann</html>'
+    result = mt.trim(None, html)
+    assert result.text == "Hi Bob, short answer: yes.\nAnn", result
+    assert result.state == "wanting", result
+    assert _clean(html) == "Hi Bob, short answer: yes.<br>Ann", _clean(html)
+    html = "<html><head><title>x</title>Hi Bob, short answer: yes.<p>Ann</p></html>"
+    assert mt.trim(None, html).text == "Hi Bob, short answer: yes.\n\nAnn"
+    assert _clean(html) == "Hi Bob, short answer: yes.<p>Ann</p>", _clean(html)
+    # What belongs to the head stays out of both, closed or not.
+    for html in ("<head><title>T</title></head><body>Body</body>",
+                 "<head><title>T</title><style>p{color:red}</style>"
+                 "<script>x()</script>\n<meta charset=utf-8>\nBody",
+                 "<head>\n  <title>T</title>\n  Body"):
+        assert mt.html_to_text(html) == "Body", (html, mt.html_to_text(html))
+        assert _clean(html).strip() == "Body", (html, _clean(html))
+    # A style in an unclosed head is still collected, and never shown.
+    assert _sheet("<head><style>p{color:red}</style>Body") == "p{color:red}"
+    print("PASS an unclosed head: its text is shown, its own elements are not")
 
 
 def test_html_to_text_tables():
@@ -1476,9 +2418,19 @@ def test_html_to_text_drops_what_is_not_shown():
              "</html>") == "Body"
     assert h("a<script>alert(1)</script>b<style>.x{}</style>c") == "abc"
     assert h("a<!-- comment -->b<!--[if mso]><p>Outlook only</p><![endif]-->c") == "abc"
-    # An unclosed head ends where the body begins, tagged or not.
+    # An unclosed head ends where the body begins, tagged or not — at a
+    # body tag, at an element that cannot stand in a head, at a <br>, at
+    # plain text. The title's own text stays the title's.
     assert h("<head><meta charset=utf-8><title>T</title><body>Body") == "Body"
     assert h("<head><meta charset=utf-8><div>Body</div>") == "Body"
+    assert h('<html><head><meta charset="utf-8">Hi Bob, short answer: yes.'
+             "<br>Ann</html>") == "Hi Bob, short answer: yes.\nAnn"
+    assert h("<head><title>T</title>Hi Bob.<p>Ann</p>") == "Hi Bob.\n\nAnn"
+    assert h("<head><title>T</title>\n  <meta charset=utf-8>\n<br>Body") == "Body"
+    assert h('<head><img src="x.png" alt="Logo">Body') == "[Logo]Body"
+    assert h("<head><title>T</title></head>") == ""
+    assert h("<head><style>p{color:red}</style><script>x()</script>Body") == "Body"
+    assert h("<div hidden><head>still hidden</div>shown") == "shown"
     for hidden in (
             '<div style="display:none">X</div>',
             '<div style="display: none !important">X</div>',
@@ -1580,12 +2532,12 @@ def _clean(html, cid_map=None):
                  "<textarea", "<select", "<base", "<link", "<svg", "<math",
                  "http-equiv", "srcset", "url(", "expression(", "@import"):
         assert word not in low, (word, document)
-    import re
     assert not re.search(r"<[^>]*\son\w+\s*=", low), document
     for source in re.findall(r'\ssrc="([^"]*)"', document):
         assert source.startswith("data:image/"), source
     for target in re.findall(r'\shref="([^"]*)"', document):
         assert re.match(r"(?i)(https?://|mailto:)", target), target
+    assert not _policy_problems(document), (_policy_problems(document), document)
     return _body(document)
 
 
@@ -1766,6 +2718,15 @@ def test_sanitize_styles():
     assert _clean('<p style="margin:0 !important;position:relative">x</p>') == \
         '<p style="margin:0 !important;position:relative">x</p>'
     assert _clean('<p style="position:STICKY;top:0">x</p>') == '<p style="top:0">x</p>'
+    # A string or a parenthesis left open reads on into the next declaration:
+    # the declaration that opens one is dropped.
+    for bad in ("font-family:'Helvetica", 'content:"', "width:calc(1px",
+                "width:calc(1px))", "font-family:'a\"", "content:'\"'\""):
+        body = _clean('<p style="color:red;%s;margin:0">x</p>'
+                      % bad.replace('"', "&quot;"))
+        assert body == '<p style="color:red;margin:0">x</p>', (bad, body)
+    assert _clean('<p style="font-family:&quot;Helvetica Neue&quot;,Arial">x</p>') == \
+        '<p style="font-family:&quot;Helvetica Neue&quot;,Arial">x</p>'
     # A linked sheet cannot load, so it is not there.
     assert _clean('<link rel="stylesheet" href="https://t.example/x.css"><p>x</p>') == "<p>x</p>"
     print("PASS sanitize: inline styles kept, nothing in them loads or runs")
@@ -1850,6 +2811,162 @@ def test_sanitize_stylesheets():
     print("PASS sanitize: style sheets rebuilt from harmless rules only")
 
 
+def test_sanitize_stylesheet_has_no_strings():
+    """The rebuilt sheet is string-free, so no piece of it can read on into
+    the next. The hole this closes: a value of one unbalanced quote opened a
+    string that swallowed its rule's "}", and the next rule's "selector" —
+    checked as a selector, where a url() means nothing — closed the string
+    and stood in the value."""
+    smuggled = ('<html><head><style>p::before{content:"}" url(http:127.0.0.1:8765) '
+                '"{color:red}</style></head><body><p>hi</p></body></html>')
+    assert _sheet(smuggled) == "", _sheet(smuggled)
+    for attack in (
+            'p::before{content:"}" url(http:x.example) "{color:red}',
+            "p::before{content:'}' url(http:x.example) '{color:red}",
+            'a{b:"}c{d:e}" url(x) "{f:g}',
+            'a{font-family:"} @import url(x); b{"}',
+            'a{color:red;x:"}b[c="] url(x) [d="]{color:blue}',
+            "a{content:'}b:not( url(x) ){color:red}",
+            'a{width:calc(}b{) url(x) (}c{color:red}',
+            "a[b='}'] url(x) c[d='{']{color:red}",
+            'a{b:"\\"}c{d:"} url(x) "}',
+            'a{b:"/*"}c{d:url(x)}e{f:"*/"}',
+            '@media screen{a{b:"}}" url(x) "{c:d}}',
+            '@media (min-width:"}") url(x) "{a{c:d}}',
+            'a{b:c}/*"*/d{e:"}" url(x) "{f:g}',
+            'a{b:\'}c{d:"}e{f:\'} url(x) "{g:h}'):
+        sheet = _sheet("<style>%s</style><p>x</p>" % attack)
+        for needle in ("url", '"', "'", "\\", "/*", "import"):
+            assert needle not in sheet, (attack, needle, sheet)
+        assert sheet.count("{") == sheet.count("}"), (attack, sheet)
+    # What a string-free sheet still carries: a quoted word is written bare.
+    assert _sheet("<style>p{font-family:\"Helvetica Neue\",'Arial',sans-serif}</style>") == \
+        "p{font-family:Helvetica Neue,Arial,sans-serif}"
+    assert _sheet('<style>div[class="mobile"] td[align=\'left\']{width:100%}</style>') == \
+        "div[class=mobile] td[align=left]{width:100%}"
+    assert _sheet("<style>li:not(.a):nth-child(2n+1){color:red}</style>") == \
+        "li:not(.a):nth-child(2n+1){color:red}"
+    # … and what it drops: a string that is more than words, a function a
+    # selector has no use for, brackets left open.
+    assert _sheet('<style>a::after{content:"→ (x)"}b{color:red}</style>') == "b{color:red}"
+    assert _sheet('<style>a[href="http://x.example/"]{color:red}b{color:red}</style>') == \
+        "b{color:red}"
+    assert _sheet("<style>a:url(x){color:red}a:host(b){color:red}a:not(b{color:red}"
+                  "c[d{color:red}e{color:red}</style>") == "e{color:red}"
+    # The last word is asked of the finished text, whatever built it.
+    for sheet in ('a{b:"c"}', "a{b:'c'}", "a{b:c\\64 }", "a{b:c}/*", "a<b{c:d}",
+                  "@import x;", "@font-face{a:b}", "a{b:url(c)}", "a{b:URL(c)}",
+                  "a{b:image-set(c)}", "a:host(b){c:d}"):
+        assert not mt._css_sheet_is_inert(sheet), sheet
+    for sheet in ("", "a{b:c}", "@media screen and (max-width:600px){a{b:c}}",
+                  "a:not(.b){c:rgb(1,2,3)}", mt._DOCUMENT_STYLE):
+        assert mt._css_sheet_is_inert(sheet), sheet
+    print("PASS sanitize: the rebuilt sheet has no strings, so nothing reads on")
+
+
+_FUZZ_CSS = [
+    "a", "b.c", "#d", "p::before", "td > span", "[x=y]", '[x="y"]', "[x='", ":not(",
+    ":nth-child(2)", "{", "{", "}", "}", ";", ":", "color:red", "content:", '"', '"',
+    "'", "'", "url(http://t.example/x)", "url(", ")", "(", "@import ", "@media screen",
+    "@media (max-width:1px)", "@font-face", "/*", "*/", "\\", "\\75rl(", "<", "</style>",
+    "<!--", "-->", " ", "\n", "expression(1)", "rgb(1,2,3)", "calc(1px + 2px)",
+    "font-family:", "Helvetica Neue", ",", "!important", "position:fixed",
+    "image-set(", "attr(x)", "u", "rl(", "\x00", "\x0c",
+]
+
+
+def test_sanitize_random_stylesheets_stay_inert():
+    """Style sheets thrown together from every piece that could matter —
+    quotes, braces, comments, escapes, url() — as a sheet and as a style
+    attribute. Whatever comes out holds no string, no comment, no escape, no
+    url() and no at-rule but @media. (Seeded: the same sheets on every run.)"""
+    import random
+    rng = random.Random(20250304)
+    rounds = 4000
+    for n in range(rounds):
+        css = "".join(rng.choice(_FUZZ_CSS) for _ in range(rng.randint(1, 30)))
+        document = mt.sanitize_html("<style>%s</style><p>x</p>" % css)
+        assert not _policy_problems(document), (css, _policy_problems(document))
+        # (A "</style>" among the pieces ends the element; what follows it is
+        # then the body's text, escaped, and no concern of the sheet's.)
+        start = document.index("<style>") + len("<style>") + len(mt._DOCUMENT_STYLE)
+        sheet = document[start:document.index("</style>")]
+        assert mt._css_sheet_is_inert(sheet), (css, sheet)
+        assert not re.search(r"[\"'\\<]|/\*|url|import|font-face|expression", sheet), (css, sheet)
+        # The same pieces as a style attribute: strings may stay there, but
+        # each closes within its declaration, and nothing in them loads.
+        value = css.replace('"', "&quot;").replace("<", "&lt;")
+        document = mt.sanitize_html('<p style="%s">x</p>' % value)
+        assert not _policy_problems(document), (css, _policy_problems(document))
+    print("PASS %d random style sheets: inert, as a sheet and as an attribute" % rounds)
+
+
+def test_sanitize_under_the_served_policy():
+    """Every document the sanitiser makes, read back and held against the
+    policy it is served under (SERVED_POLICY) — and against having no policy
+    at all. Nothing to fetch but data: images, nothing to run, nothing to
+    submit, no link but http(s)/mailto in a new tab without an opener."""
+    assert "default-src 'none'" in SERVED_POLICY and "img-src data:" in SERVED_POLICY
+    assert "script-src" not in SERVED_POLICY and "allow-scripts" not in SERVED_POLICY
+    assert "allow-same-origin" not in SERVED_POLICY and "allow-forms" not in SERVED_POLICY
+    cid = {"logo@example.org": "data:image/png;base64,iVBORw0KGgo="}
+    documents = [c["html"] for c in CASES if c["html"]]
+    documents += [
+        _MARKETING_HTML.replace("https://cdn.example.com/logo.png", "cid:logo@example.org"),
+        '<body background="https://t.example/b.png" style="background:url(x)">x',
+        '<table background="x"><tr><td style="background-image:url(\'x\')">x',
+        '<img src="cid:logo@example.org" srcset="https://t.example/x 2x" '
+        'style="content:url(x)">',
+        '<a href="https://example.com" target="_top" ping="https://t.example">x</a>',
+        '<a href="' + JS + 'alert(1)" target="_blank">x</a><a target="_top">y</a>',
+        '<form action="https://t.example"><input name=a><button>b</button></form>',
+        '<link rel="stylesheet" href="https://t.example/x.css"><link rel="preload" '
+        'href="https://t.example/f.woff" as="font">',
+        '<style>@import "https://t.example/x.css";@font-face{font-family:x;'
+        'src:url(https://t.example/f.woff)}p{background:url(https://t.example/p.gif)}'
+        'a::before{content:"}" url(https://t.example/q.gif) "{color:red}</style><p>x</p>',
+        '<meta http-equiv="refresh" content="0;url=https://t.example">x',
+        '<meta http-equiv="Content-Security-Policy" content="default-src *">x',
+        '<base href="https://t.example/" target="_top"><a href="x">l</a>',
+        '<iframe src="https://t.example"></iframe><embed src="x"><object data="x"></object>',
+        '<video poster="https://t.example/p.png"><source src="x"></video>'
+        '<audio src="x"></audio><track src="x">',
+        '<svg><image href="https://t.example/x.png"/><use href="#a"/></svg>',
+        '<div style="position:fixed;top:0;left:0;width:100%;height:100%">x</div>',
+        '<p style="font-family:\'x\';background:url(https://t.example/i.gif)">x</p>',
+        '<html><head><title>T</title><style>p{color:red}</style>text in the head',
+    ]
+    for html in documents:
+        document = mt.sanitize_html(html, cid)
+        problems = _policy_problems(document)
+        assert not problems, (problems, html[:200], document)
+        assert "t.example" not in document.replace(
+            'href="https://t.example', ""), (html[:200], document)
+    # The audit is not blind: each of these it must object to.
+    for sheet, body in (
+            ("", '<img src="https://t.example/p.gif">'),
+            ("", '<img src="data:text/html,x">'),
+            ("", '<a href="https://x.example">x</a>'),
+            ("", '<a href="/x" target="_blank" rel="noopener noreferrer">x</a>'),
+            ("", '<p onclick="x()">x</p>'),
+            ("", '<p style="background:url(x)">x</p>'),
+            ("", '<p style="font-family:\'x">x</p>'),
+            ("", "<script>x()</script>"),
+            ("", '<form action="x"></form>'),
+            ("", '<iframe src="x"></iframe>'),
+            ("", "<style>a{b:c}</style>"),
+            ("a{b:url(x)}", "x"), ('a{b:"c"}', "x"), ("@import x;", "x"),
+            ("a{b:c", "x"), ("a{b:c}/*", "x"), ("a{b:\\75rl(x)}", "x")):
+        document = ('<!doctype html>\n<html><head><meta charset="utf-8"><style>%s'
+                    "</style></head><body>%s</body></html>" % (sheet, body))
+        assert _policy_problems(document), (sheet, body)
+    assert not _policy_problems(
+        '<!doctype html>\n<html><head><meta charset="utf-8"><style>a{b:c}</style>'
+        '</head><body><p style="font-family:&quot;it\'s&quot;">x</p></body></html>')
+    print("PASS sanitize: %d documents within the served policy, and safe "
+          "without it" % len(documents))
+
+
 def test_sanitize_forms_frames_and_meta():
     assert _clean('<form action="https://evil.example/login" method="post">Your '
                   'password: <input type="password" name="p"><input type="submit">'
@@ -1923,7 +3040,6 @@ def test_sanitize_malformed_markup():
             "<div><span><b>" * 2000 + "unclosed"):
         _clean(hostile)             # the invariants are asserted in there
     # Every element opened is closed, in order.
-    import re
     body = _clean("<div><ul><li>a<li>b<table><tr><td><b>c")
     opened = []
     for closing, tag in re.findall(r"<(/?)([a-z0-9]+)[^>]*>", body):
@@ -1981,13 +3097,18 @@ def main():
     test_marks_cannot_be_forged()
     test_marks_in_nested_blocks_do_not_leak()
     test_random_mails_hold_the_invariants()
-    test_forward_subject_prefixes()
+    test_subject_prefixes()
+    test_evidence_is_optional_and_only_ever_cuts()
     test_tables_cover_the_languages()
     test_never_raises_and_stays_fast()
     test_cost_grows_with_size_not_its_square()
+    test_cost_at_a_megabyte()
+    test_nesting_does_not_inflate()
     test_html_to_text_structure()
     test_html_to_text_lists()
     test_html_to_text_links()
+    test_link_targets_carry_no_marks()
+    test_unclosed_head_keeps_the_text()
     test_html_to_text_tables()
     test_html_to_text_drops_what_is_not_shown()
     test_html_to_text_images_and_quotes()
@@ -1999,6 +3120,9 @@ def main():
     test_sanitize_images()
     test_sanitize_styles()
     test_sanitize_stylesheets()
+    test_sanitize_stylesheet_has_no_strings()
+    test_sanitize_random_stylesheets_stay_inert()
+    test_sanitize_under_the_served_policy()
     test_sanitize_forms_frames_and_meta()
     test_sanitize_malformed_markup()
     test_sanitize_keeps_a_real_mail_readable()
