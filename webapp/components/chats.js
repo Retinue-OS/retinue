@@ -108,7 +108,7 @@ import {
   RetinueCard, esc, fmtAge, isWideFrame, onFrameChange, starredFirst, deepActiveElement, onPressOutside,
 } from './base.js';
 import { shelf } from './shelf-store.js';
-import { SwipeRows, SWIPE_CSS, STAR_MARK, offerUndo, starButtonHtml, UNDO_MS } from './swipe-rows.js';
+import { SwipeRows, SWIPE_CSS, STAR_MARK, offerUndo, showNotice, starButtonHtml, UNDO_MS } from './swipe-rows.js';
 import { openComposeSheet } from './compose-sheet.js';
 
 const LIST_URL = '/chats';
@@ -945,7 +945,16 @@ class RetinueChats extends RetinueCard {
       offerUndo(`${ACTIONS.spam.done} ${ids.length}`, () => {
         ids.forEach((id) => this._pending.delete(id));
         this._hidden();
-      }, { commit: (keepalive) => this._commitMany(ids, 'spam', keepalive) });
+      }, {
+        commit: async (keepalive) => {
+          const outs = await this._commitMany(ids, 'spam', keepalive);
+          const ok = outs.filter((o) => o && o.ok).length;
+          // A page on its way out has no one to tell.
+          if (!keepalive && ok < ids.length) {
+            showNotice(`${ACTIONS.spam.done} ${ok} of ${ids.length} — ${ids.length - ok} failed`);
+          }
+        },
+      });
       return;
     }
     this._rerender();
@@ -963,10 +972,12 @@ class RetinueChats extends RetinueCard {
     this._changed();
     const undos = outs.filter((o) => o && o.ok && o.undo).map((o) => o.undo);
     const ok = outs.filter((o) => o && o.ok).length;
-    if (!ok) return;
     const said = ok === ids.length ? `${ACTIONS[what].done} ${ok}`
       : `${ACTIONS[what].done} ${ok} of ${ids.length} — ${ids.length - ok} failed`;
-    if (!undos.length) return;
+    if (!undos.length) {
+      if (ok < ids.length) showNotice(said);
+      return;
+    }
     offerUndo(said, async () => {
       this._flagging = true;
       try {

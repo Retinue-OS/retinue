@@ -5674,6 +5674,40 @@ def test_spam_moves_the_threads_inbound_mails_to_junk():
     print("ok: spam moves the thread's inbound INBOX and archive mails to Junk, nothing else")
 
 
+def test_spam_fails_where_a_folder_goes_under_the_move():
+    """A source folder that vanishes between the listing and the move leaves
+    its mails out of Junk: spam fails rather than report them moved."""
+    w = spam_world()
+    try:
+        gw, box, mirror = w.gw, w.box, w.mirror
+        thread_of_three(w)
+        real_move = box.move
+
+        def move(folder, uids, target, validity=None):
+            if folder == "Archive":
+                return None     # the server: no such folder
+            return real_move(folder, uids, target, validity=validity)
+
+        box.move = move
+        try:
+            mirror.spam("a@x.org")
+            raise AssertionError("spam reported success with a folder gone")
+        except gw.MailboxError as exc:
+            said = str(exc)
+        assert "1 mail(s) were not moved" in said and "(1 were)" in said, said
+        assert held_in(box, "Junk") == ["a@x.org"]
+        assert held_in(box, "Archive") == ["b@x.org"]
+        assert mirror.index.get("moving") is None, "nothing left noted"
+        assert not t.by_id(gw)["b@x.org"]["removed_at"], "the index was not told it moved"
+        # Once the folder answers again, a second try moves the rest.
+        box.move = real_move
+        assert mirror.spam("a@x.org") == {"moved": 1, "flagged": 0}
+        assert held_in(box, "Junk") == ["a@x.org", "b@x.org"]
+    finally:
+        done(w)
+    print("ok: spam fails, and moves nothing it cannot, where a folder goes under it")
+
+
 def test_spam_never_invents_a_junk_folder():
     for env in ({}, {"MAIL_JUNK_FOLDER": "Bulk"}):
         w = world(**env)        # INBOX, Sent, Archive, Trash: no Junk

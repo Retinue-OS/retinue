@@ -87,7 +87,8 @@ class ToastHost extends FakeElement {
   attachShadow() {
     const self = this;
     this.shadowRoot = {
-      set innerHTML(h) { this._h = h; if (!h) toast = null; },
+      // A notice (no button) is kept as a toast with no Undo.
+      set innerHTML(h) { this._h = h; toast = h && !h.includes('<button') ? { text: h, undo: null } : (h ? toast : null); },
       get innerHTML() { return this._h || ''; },
       querySelector(sel) {
         if (sel !== 'button') return { addEventListener() {} };
@@ -149,7 +150,7 @@ await import('./chats.js');
 const List = registry.get('retinue-chats');
 assert.ok(List, 'the element registered itself');
 const { listGroup, deriveListGroup, HANDOFF_KEY } = await import('./chats.js');
-const { flushPendingCommit, hasPendingCommit, UNDO_MS } = await import('./swipe-rows.js');
+const { dismissUndo, flushPendingCommit, hasPendingCommit, UNDO_MS } = await import('./swipe-rows.js');
 // What the list tells the shelf (the minimized chat's count).
 const { shelf } = await import('./shelf-store.js');
 const observed = [];
@@ -803,6 +804,25 @@ await ok('a bulk spam: offered only when every chat is a mail; deferred like one
   flushPendingCommit(false);
   const posts = await answerAll((w) => w.method === 'POST', { archived: true, muted: true });
   assert.deepEqual(posts.map((w) => w.url).sort(), ['/chats/mu/spam', '/chats/mu2/spam']);
+});
+
+await ok('a deferred bulk spam that partly fails says so, with no Undo', async () => {
+  const el = await mount(payload([...MIXED, mailChat('mu2', { unread: 1, list_group: 'unread' }),
+    mailChat('mu3', { unread: 1, list_group: 'unread' })]));
+  el._enterSelect('mu');
+  el._toggleSelect('mu2', {});
+  el._toggleSelect('mu3', {});
+  el._bulk('spam');
+  dismissUndo();      // the window ends: the commit goes out
+  await answerAll((w) => w.method === 'POST',
+    (w) => (w.url.includes('mu3') ? { error: 'the mailbox has no Junk folder' } : { archived: true, muted: true }),
+    (w) => (w.url.includes('mu3') ? 502 : 200));
+  await settle();
+  assert.ok(toast && toast.text.includes('Marked as spam 2 of 3 — 1 failed'), toast && toast.text);
+  assert.equal(toast.undo, null, 'a notice, no Undo');
+  assert.deepEqual(rowIds(html(el)).filter((id) => id.startsWith('mu')), ['mu3'], 'the failed one is back');
+  assert.ok(liOf(html(el), 'mu3').includes('Not marked as spam: The mailbox has no Junk folder'));
+  dismissUndo();
 });
 
 await ok('a poll that drops a selected row drops it from the selection', async () => {

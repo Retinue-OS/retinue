@@ -7960,7 +7960,7 @@ class Mirror:
             if not places:
                 return {"moved": 0, "flagged": 0}
             junk = self._destination("junk", MAIL_JUNK_FOLDER, make=False)
-            moved = flagged = 0
+            moved = flagged = missed = 0
             for role, uids in places.items():
                 folder = self._folder(role)
                 if folder["name"] == junk:
@@ -7973,13 +7973,23 @@ class Mirror:
                     self._moved_noted()
                     raise
                 if result is None:
-                    result = Moved({}, {}, tuple(uids))   # the folder is gone
+                    # The folder went between the listing and the move: its
+                    # mails are not in Junk. Unlike the Trash's, this is no
+                    # success — the next pass follows the folder's going.
+                    self._moved_noted()
+                    missed += len(uids)
+                    continue
                 self._follow_move(role, uids, result)
                 self._moved_noted()
                 moved += len(result.moved) + len(result.left)
                 flagged += len(result.left)
             print(f"[mail-gateway] spam: {moved} mail(s) of chat {chat!r} moved to {junk!r}",
                   flush=True)
+            if missed:
+                raise MailboxError(
+                    f"A folder of this thread changed while it was being marked as spam: "
+                    f"{missed} mail(s) were not moved to {junk!r} ({moved} were). "
+                    f"Try again.")
             return {"moved": moved, "flagged": flagged}
 
     def _note_move(self, source: str, uids: dict, target: str | None) -> None:

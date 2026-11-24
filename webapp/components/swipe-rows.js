@@ -458,6 +458,12 @@ let toastHeld = null;
 // true: the request must outlive the page). Undo drops it unmade.
 let pendingCommit = null;
 let leaveWired = false;
+// Whether the toast on screen offers Undo, and a notice waiting for it to go:
+// a notice never takes the way back from a newer change away.
+let undoLive = false;
+let queuedNotice = null;
+// How long a notice (no Undo) stays.
+export const NOTICE_MS = 6000;
 // Once let go, a toast that was held stays at least this long more.
 const TOAST_AFTER_HOLD_MS = 2500;
 
@@ -479,8 +485,60 @@ const nowMs = () => (typeof performance !== 'undefined' ? performance.now() : Da
 export function dismissUndo() {
   clearTimeout(toastTimer);
   toastHeld = null;
+  undoLive = false;
   if (toastHost && toastHost.shadowRoot) toastHost.shadowRoot.innerHTML = '';
   flushPendingCommit(false);
+  if (queuedNotice !== null && !undoLive) {
+    const text = queuedNotice;
+    queuedNotice = null;
+    showNotice(text);
+  }
+}
+
+// Say something that offers no way back — an outcome, a partial failure —
+// for NOTICE_MS. While an Undo toast is up it waits for that one to go.
+export function showNotice(text) {
+  if (typeof document === 'undefined') return;
+  if (undoLive) {
+    queuedNotice = String(text);
+    return;
+  }
+  renderToast(text, false);
+  armToast(NOTICE_MS);
+}
+
+function renderToast(text, withUndo) {
+  clearTimeout(toastTimer);
+  toastHeld = null;
+  if (!toastHost || !toastHost.isConnected) {
+    toastHost = document.createElement('div');
+    toastHost.setAttribute('data-undo-toast', '');
+    toastHost.attachShadow({ mode: 'open' });
+    document.body.appendChild(toastHost);
+  }
+  const esc = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  toastHost.shadowRoot.innerHTML = `<style>${TOAST_CSS}</style>` +
+    `<div class="toast" role="status"><span class="t">${esc(text)}</span>` +
+    (withUndo ? `<button type="button">Undo</button>` : '') + `</div>`;
+  undoLive = !!withUndo;
+  const toast = toastHost.shadowRoot.querySelector('.toast');
+  if (toast && toast.addEventListener) {
+    const hold = () => {
+      if (toastHeld !== null) return;
+      clearTimeout(toastTimer);
+      toastHeld = Math.max(0, toastDeadline - nowMs());
+    };
+    const release = (e) => {
+      if (toastHeld === null) return;
+      // A mouse that clicks stays over the toast: only leaving lets it go.
+      if (e && e.type === 'pointerup' && e.pointerType === 'mouse') return;
+      const left = toastHeld;
+      toastHeld = null;
+      armToast(Math.max(left, TOAST_AFTER_HOLD_MS));
+    };
+    ['pointerenter', 'pointerdown'].forEach((t) => toast.addEventListener(t, hold));
+    ['pointerleave', 'pointercancel', 'pointerup'].forEach((t) => toast.addEventListener(t, release));
+  }
 }
 
 // Make the deferred commit now, if one waits; `keepalive` for a page on its
@@ -507,6 +565,7 @@ function wireLeave() {
     if (!pendingCommit) return;
     clearTimeout(toastTimer);
     toastHeld = null;
+    undoLive = false;
     if (toastHost && toastHost.shadowRoot) toastHost.shadowRoot.innerHTML = '';
     flushPendingCommit(true);
   };
@@ -534,17 +593,9 @@ export function offerUndo(text, onUndo, { commit = null } = {}) {
   // an older deferred one is made now.
   clearTimeout(toastTimer);
   toastHeld = null;
+  undoLive = false;
   flushPendingCommit(false);
-  if (!toastHost || !toastHost.isConnected) {
-    toastHost = document.createElement('div');
-    toastHost.setAttribute('data-undo-toast', '');
-    toastHost.attachShadow({ mode: 'open' });
-    document.body.appendChild(toastHost);
-  }
-  const esc = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-  toastHost.shadowRoot.innerHTML = `<style>${TOAST_CSS}</style>` +
-    `<div class="toast" role="status"><span class="t">${esc(text)}</span>` +
-    `<button type="button">Undo</button></div>`;
+  renderToast(text, true);
   pendingCommit = typeof commit === 'function' ? commit : null;
   if (pendingCommit) wireLeave();
   toastHost.shadowRoot.querySelector('button').addEventListener('click', () => {
@@ -552,23 +603,5 @@ export function offerUndo(text, onUndo, { commit = null } = {}) {
     dismissUndo();
     onUndo();
   });
-  const toast = toastHost.shadowRoot.querySelector('.toast');
-  if (toast && toast.addEventListener) {
-    const hold = () => {
-      if (toastHeld !== null) return;
-      clearTimeout(toastTimer);
-      toastHeld = Math.max(0, toastDeadline - nowMs());
-    };
-    const release = (e) => {
-      if (toastHeld === null) return;
-      // A mouse that clicks stays over the toast: only leaving lets it go.
-      if (e && e.type === 'pointerup' && e.pointerType === 'mouse') return;
-      const left = toastHeld;
-      toastHeld = null;
-      armToast(Math.max(left, TOAST_AFTER_HOLD_MS));
-    };
-    ['pointerenter', 'pointerdown'].forEach((t) => toast.addEventListener(t, hold));
-    ['pointerleave', 'pointercancel', 'pointerup'].forEach((t) => toast.addEventListener(t, release));
-  }
   armToast(UNDO_MS);
 }

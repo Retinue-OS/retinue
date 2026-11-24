@@ -1297,7 +1297,12 @@ chat, which has no Junk folder — it is muted instead) asks the thread's
 gateway — `POST /chats/spam {chat, account, message_ids}`, authenticated with
 the gateway's token as /chats/archive is, the ids those the chat holds now —
 and only on its success mutes and archives the chat on the user's word
-(settling its attention item, as a mute does). On any failure (no gateway for
+(settling its attention item, as a mute does). The archive that the mute
+brings reaches those same `message_ids` only: a mail that landed while the
+gateway worked was not what the user marked, and stays in the inbox. A
+source folder that vanishes between the gateway's listing and its move is a
+failure, not a success — its mails are not in Junk, the answer says how many
+were left, and the chat stays as it was for a retry. On any failure (no gateway for
 the mailbox, the store unable to name the mails, the gateway's refusal) the
 chat is left as it was and the answer's `error` is one sentence saying why;
 the dashboard shows it on the row. The gateway moves the mails with the same

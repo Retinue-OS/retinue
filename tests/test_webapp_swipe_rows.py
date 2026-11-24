@@ -107,7 +107,7 @@ class ToastRoot {
   constructor() { this.html = ''; this.button = null; this.toast = null; }
   set innerHTML(h) {
     this.html = h;
-    this.button = h ? new El('button') : null;
+    this.button = h && h.includes('<button') ? new El('button') : null;
     this.toast = h ? new El('div', 'toast') : null;
   }
   get innerHTML() { return this.html; }
@@ -135,7 +135,7 @@ const pressOutside = (target) => {
 };
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-const { SwipeRows, offerUndo, UNDO_MS, hasPendingCommit, LONG_PRESS_MS } = await import('./swipe-rows.js');
+const { SwipeRows, offerUndo, dismissUndo, showNotice, NOTICE_MS, UNDO_MS, hasPendingCommit, LONG_PRESS_MS } = await import('./swipe-rows.js');
 const { starredFirst } = await import('./base.js');
 
 const ROW_W = 360;
@@ -748,6 +748,37 @@ await check('a page hidden or left commits what waits, at once and with keepaliv
     offerUndo('Archived · D', () => {});
     for (const f of winListeners.pagehide || []) f({ type: 'pagehide' });
     assert.ok(toastRoot().innerHTML, 'an ordinary Undo stays');
+  } finally {
+    realTime();
+  }
+});
+
+await check('a notice offers no Undo, and never takes one away', async () => {
+  fakeTime();
+  try {
+    dismissUndo();    // (the toast an earlier check left up)
+    showNotice('Marked as spam 2 of 3 — 1 failed');
+    const root = toastRoot();
+    assert.ok(root.innerHTML.includes('2 of 3'));
+    assert.equal(root.button, null, 'no Undo');
+    advance(NOTICE_MS + 10);
+    assert.equal(root.innerHTML, '', 'it lapses');
+    // An Undo toast on screen: the notice waits for it to go.
+    const made = [];
+    offerUndo('Archived · D', () => {}, { commit: (k) => made.push(k) });
+    showNotice('Archived 1 of 2 — 1 failed');
+    assert.ok(toastRoot().innerHTML.includes('Archived · D'), 'the Undo stays');
+    assert.ok(toastRoot().button, 'with its button');
+    advance(UNDO_MS + 10);
+    assert.deepEqual(made, [false]);
+    assert.ok(toastRoot().innerHTML.includes('1 of 2'), 'then the notice');
+    assert.equal(toastRoot().button, null);
+    advance(NOTICE_MS + 10);
+    assert.equal(toastRoot().innerHTML, '');
+    // A notice on screen is replaced by a newer Undo.
+    showNotice('X failed');
+    offerUndo('Muted · E', () => {});
+    assert.ok(toastRoot().innerHTML.includes('Muted · E') && toastRoot().button);
   } finally {
     realTime();
   }

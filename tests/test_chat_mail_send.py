@@ -3484,7 +3484,18 @@ def test_spam_goes_through_the_gateway_first(base, wg):
         # archived, its attention item settled like a mute's.
         GW["spam"] = "ok"
         GW["requests"].clear()
+
+        def late():
+            # A mail that lands while the gateway moves the others: the
+            # user's Spam was not about it, and the archive leaves it too.
+            held.append(untouched())
+            _rail(base, chat=ROOT_B, sender=BOB, sender_name="Bob",
+                  message_id="b-late@y.org", ts=time.time(), text="a real question",
+                  chat_name="Street party", group=True, participants=B_PARTIES,
+                  peer={"address": BOB, "name": "Bob"})
+        GW["on_spam"] = late
         status, out = _http(base, "POST", quoted, None, {"Sec-Fetch-Site": "same-origin"})
+        GW["on_spam"] = lambda: held.append(untouched())
         assert status == 200, out
         assert (out["spam"], out["muted"], out["archived"]) == (True, True, True), out
         assert out["moved"] >= 1
@@ -3498,6 +3509,10 @@ def test_spam_goes_through_the_gateway_first(base, wg):
         block = doc.get("attention") or {}
         assert not block or block.get("state") == "done", block
         _settle(wg)
+        spammed = _scopes(GW, "/chats/spam")[0]
+        assert "b-late@y.org" not in spammed
+        archived = _scopes(GW, "/chats/archive")
+        assert archived and all(sorted(a) == sorted(spammed) for a in archived), archived
         # Restore: the chat comes back; the mailbox is asked for nothing —
         # the mails stay in Junk (it follows the chat, never back).
         GW["requests"].clear()

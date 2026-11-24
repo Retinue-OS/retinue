@@ -12210,7 +12210,10 @@ def _spam_chat(chat_id: str) -> tuple[int, dict]:
               f"{said or answer!r}", flush=True)
         return 502, {"error": said or f"the mail gateway answered HTTP {status}; the chat "
                                       f"is unchanged"}
-    doc = _set_chat_flags(chat_id, {"muted": True, "archived": True}, user=True)
+    # The archive that muting brings reaches the mails the user marked, never
+    # one that came since (the gateway left that one where it is, too).
+    doc = _set_chat_flags(chat_id, {"muted": True, "archived": True}, user=True,
+                          scope=scope)
     print(f"[web-gateway] chat {chat_id} marked as spam: {answer.get('moved')} mail(s) "
           f"to Junk", flush=True)
     return 200, {"id": chat_id, "spam": True,
@@ -13561,7 +13564,8 @@ def _read_chat_flags(payload: dict) -> dict[str, bool]:
     return flags
 
 
-def _set_chat_flags(chat_id: str, flags: dict[str, bool], *, user: bool = False) -> dict:
+def _set_chat_flags(chat_id: str, flags: dict[str, bool], *, user: bool = False,
+                    scope: list[str] | None = None) -> dict:
     """Set a chat's flags and everything that follows from them: the list,
     the attention item, the mailbox. Returns the chat's state document.
 
@@ -13578,12 +13582,16 @@ def _set_chat_flags(chat_id: str, flags: dict[str, bool], *, user: bool = False)
     the user's last unarchive can put the thread away over a newer mail
     (_turn_put_away) — also where the turn is wrapping up as this lands
     (the record's ``epoch``). The undo of a turn that did not finish is no
-    such word."""
+    such word.
+
+    ``scope``: the Message-IDs the mailbox's archive reaches, where the
+    action was about those only (Spam: the mails the chat held when the user
+    acted), as for _chat_flags_follow; else everything that has landed."""
     before = _CHAT_STATE.get(chat_id)
     doc = _CHAT_STATE.set_flags(chat_id, **flags,
                                 forget_asked=user and flags.get("archived") is False)
     _turn_flags_overruled(chat_id, flags)
-    return _chat_flags_follow(chat_id, flags, before, doc)
+    return _chat_flags_follow(chat_id, flags, before, doc, scope=scope)
 
 
 def _turn_flags_overruled(chat_id: str, flags: dict[str, bool]) -> None:
