@@ -11127,6 +11127,18 @@ def _chat_handle(chat_id: str, doc: dict | None = None) -> tuple[str, str] | Non
         return None
 
 
+def _chat_card(chat_id: str, doc: dict) -> dict:
+    """The contact card that speaks for a chat, from its state document —
+    ``{}`` where none does (attention_store.chat_card). The card the list row
+    and the attention item show, so the one a write about "this chat's
+    person" acts on: a mail thread keeps the card filed for the peer it once
+    had, and the document's own copy may name somebody the user is told is
+    not on the thread."""
+    if not doc.get("contact"):
+        return {}
+    return attention_store.chat_card(_attention_chat_row_from_state(chat_id, doc), doc)
+
+
 def _chat_handle_names(chat_id: str, doc: dict) -> list[str]:
     """The names a chat's item has gone by so far: what the user taught under
     them follows the chat to the person a card links it to, or renames it to
@@ -11135,11 +11147,13 @@ def _chat_handle_names(chat_id: str, doc: dict) -> list[str]:
     address, the two things its item is ever filed under besides a person of
     the address book (attention_store.chat_sender) — never the thread's
     name, which is a subject, nor the name a mail carried, which is the
-    sender's own word."""
+    sender's own word. The card is the one that speaks for the thread
+    (_chat_card): under a hidden card's name its item was not filed, and what
+    the profile knows under that name is that person's, not the thread's."""
     channel, key = chat_state_mod.split_chat_id(chat_id) or ("", chat_id)
     if not _is_mail(channel):
         return [_chat_display_name(doc, channel, key)]
-    names = ((doc.get("contact") or {}).get("name"), (doc.get("peer") or {}).get("address"))
+    names = (_chat_card(chat_id, doc).get("name"), (doc.get("peer") or {}).get("address"))
     return [n for n in dict.fromkeys(names) if n]
 
 
@@ -13719,7 +13733,10 @@ class Handler(BaseHTTPRequestHandler):
           chamber the body names (``chamber``, required — a contact always
           belongs to one); ``person`` links the handle to an existing contact
           instead; a card already filed updates its person, and every other
-          chat of theirs follows.
+          chat of theirs follows. The card is the one that speaks for the
+          chat (_chat_card): a mail thread whose peer is no longer the card's
+          person shows none, and its save files that peer — the person on
+          the hidden card is not touched.
 
         An empty name removes the card: the handle leaves the person (who
         stays in the address book), the chat is a handle again, its item goes
@@ -13770,7 +13787,11 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json(400, {"error": "unknown sphere"})
                 return
             try:
-                record, verb = _contact_file_card(handle, (before or {}).get("contact") or {}, name=name,
+                # The card that speaks for the chat, as the sheet showed it —
+                # never a mail thread's hidden one (_chat_card): the save the
+                # user was offered as "add a contact" must not rewrite the
+                # person they were told is not on the thread.
+                record, verb = _contact_file_card(handle, _chat_card(chat_id, before), name=name,
                                                   sphere=sphere, tags=tags, chamber=chamber,
                                                   person=person_ref, vip=vip, instruction=instruction)
             except contacts_mod.ContactError as exc:
@@ -15192,6 +15213,16 @@ class Handler(BaseHTTPRequestHandler):
                         t for t in (block.get("tags") or []) if t != block["sphere"]]
                 _ATTENTION.save_profile(profile)
             effect = attention_policy.reevaluate(revised, focus, profile, now, "the agent's declaration")
+            if (revised["kind"] == "chat" and _is_mail(revised.get("channel"))
+                    and revised.get("state", "open") == "open"):
+                # A mail thread is listed by its unread mail, not by its
+                # block (attention_store.chat_wants_attention), and what an
+                # agent declares is about the thread whatever is unread in
+                # it: the block says so (``declared``), and the thread is on
+                # the list until the user settles it. Not ``pulled``, the
+                # user's own hand: that shows an item through a mode's fold,
+                # and *Later* takes it back.
+                revised["declared"] = True
             _attention_persist(revised)
             if effect and effect["type"] == "push":
                 _attention_push_item(revised, effect.get("reason", ""))

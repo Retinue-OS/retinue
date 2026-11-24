@@ -1770,6 +1770,95 @@ def test_home_list_follows_unread_mail(base, wg):
     print("PASS test_home_list_follows_unread_mail")
 
 
+def test_agent_declaration_lists_a_read_thread(base, wg):
+    """What an agent declares about a mail thread (attention-set.py) is
+    somebody's word, not a block that happens to exist: the thread is on the
+    home list with nothing unread in it, until the user settles it."""
+    now = float(int(time.time()))
+    key = "decl-root@x.org"
+    chat_id = cs.make_chat_id("email", key, ACCOUNT)
+    agent = {"X-Conversation-Backend-Token": "agent-token"}
+
+    def block(of=chat_id):
+        return wg._CHAT_STATE.get(of)["attention"] or {}
+
+    def declare(of=chat_id, **spec):
+        status, out = _http(base, "POST", "/internal/attention/set",
+                            dict(id="chat:" + of, **spec), agent)
+        assert status == 200, out
+        return out["item"]
+
+    def section():
+        status, body = _http(base, "GET", "/attention")
+        assert status == 200, body
+        return next((name for name, rows in body["sections"].items() for row in rows
+                     if row.get("id") == "chat:" + chat_id), None)
+
+    def mark_read():
+        status, out = _http(base, "POST", "/chats/" + _quote(chat_id) + "/read",
+                            {"seen": _chats(base)[chat_id]["inbound_seq"]})
+        assert status == 200 and out["unread"] == 0 and section() is None, out
+
+    _mail(key, "decl-1@x.org", now - 5000)
+    _rail(base, message_id="decl-1@x.org", ts=now - 5000, text="hi", **_thread(key))
+    mark_read()
+
+    # "Bring it back by then": the answer says open, and the list shows it.
+    item = declare(importance=2, due="2099-01-01", state="open")
+    assert item["state"] == "open" and item["due"], item
+    assert section() is not None, "the answer said open, and the list has no such item"
+    assert _unread(base, chat_id) == (0, "read")
+    # By the agent's word, not as if the user had pulled it.
+    assert block()["declared"] is True and block()["pulled"] is False, block()
+    # The sweep sees its deadline, and writes the block back as it found it.
+    _sweep(wg)
+    assert block()["declared"] is True and block()["due"] and section() is not None
+    # *Later* holds it for the digest; it does not take it off the list.
+    status, out = _http(base, "POST", "/attention/later", {"id": "chat:" + chat_id})
+    assert status == 200 and block()["released"] is False, out
+    assert section() == "held", "a deadline nobody lists is one nobody is reminded of"
+    # *Mark handled* settles it, and the next mail starts afresh: listed by
+    # its unread mail, and off the list once that is read.
+    status, out = _http(base, "POST", "/attention/done", {"id": "chat:" + chat_id})
+    assert status == 200 and section() is None, out
+    _mail(key, "decl-2@x.org", now - 4000)
+    _rail(base, message_id="decl-2@x.org", ts=now - 4000, text="more", **_thread(key))
+    assert section() is not None and not block().get("declared"), block()
+    mark_read()
+
+    # Any declaration that leaves the item open lists the thread — parked on
+    # somebody, or just opened again; one that leaves it settled does not.
+    assert declare(importance=3)["state"] == "done" and section() is None
+    assert not block().get("declared"), block()
+    assert declare(actor="Publisher", state="open")["actor"] == "Publisher"
+    assert section() == "waiting" and block()["declared"] is True
+    assert declare(state="done")["state"] == "done" and section() is None
+    assert declare(state="open")["state"] == "open" and section() is not None
+    # A mail arriving meanwhile leaves the open item as it is, and *Mark as
+    # read* settles a declared thread like any other.
+    _mail(key, "decl-3@x.org", now - 3000)
+    _rail(base, message_id="decl-3@x.org", ts=now - 3000, text="and more", **_thread(key))
+    assert block()["declared"] is True and section() is not None
+    mark_read()
+    assert declare(state="open")["state"] == "open" and section() is not None
+    assert declare(sphere="customers", state="done")["state"] == "done" and section() is None
+
+    # A messenger chat's block decides by itself, and gains nothing.
+    before = block(CHAT_S)
+    declare(CHAT_S, importance=2)
+    assert "declared" not in block(CHAT_S), block(CHAT_S)
+    wg._CHAT_STATE.set_attention(CHAT_S, before or None)
+    wants = wg.attention_store.chat_wants_attention
+    read = {"channel": "email", "unread": 0}
+    assert wants(read, {"attention": {"state": "open", "declared": True}})
+    assert not wants(read, {"attention": {"state": "done", "declared": True}})
+    assert not wants(dict(read, archived=True), {"attention": {"state": "open", "declared": True}})
+    PUSHES.clear()
+    wg._CHAT_STATE.delete(chat_id)
+    wg._CHAT_OVERLAY.forget(chat_id)
+    print("PASS test_agent_declaration_lists_a_read_thread")
+
+
 def test_backfill_events_are_idempotent(base, wg):
     """A backfilled unseen mail is counted once, however often its event is
     delivered — the mirror's outbox re-posts what it saw no answer to."""
@@ -1877,6 +1966,96 @@ def test_group_thread_keeps_no_card(base, wg):
     wg._CHAT_STATE.delete(chat_id)
     wg._CHAT_OVERLAY.forget(chat_id)
     print("PASS test_group_thread_keeps_no_card")
+
+
+def test_contact_save_acts_on_the_shown_card(base, wg):
+    """The contact card's save acts on the card that speaks for the chat. A
+    thread whose card is hidden shows "Add a contact", and that save files
+    the thread's peer: it does not rewrite the person on the hidden card, nor
+    move what the profile knows about them."""
+    now = float(int(time.time()))
+    card_of = lambda chat_id: wg._CHAT_STATE.get(chat_id)["contact"]  # noqa: E731
+
+    def sheet(chat_id):
+        status, body = _http(base, "GET", "/attention/item?id=" + _quote("chat:" + chat_id))
+        assert status == 200, body
+        return body["item"], body["contact_book"]
+
+    def add_contact(chat_id, name):
+        """What the sheet posts from "Add a contact" (attention-sheet.js)."""
+        status, out = _http(base, "POST", "/chats/" + _quote(chat_id) + "/contact",
+                            {"name": name, "sphere": None, "tags": [], "permit": False,
+                             "chamber": "private", "person": None, "vip": False,
+                             "instruction": ""})
+        assert status == 200 and out["contact"]["name"] == name, out
+        return out
+
+    # The thread's peer is somebody else now: a stranger who signs as her.
+    key = "save-root@q.org"
+    chat_id = cs.make_chat_id("email", key, ACCOUNT)
+    nora = {"address": "nora@q.org", "name": "Nora"}
+    crook = {"address": "crook@evil.example", "name": "Nora Example"}
+    person = wg._CONTACTS.create("private", "Nora Example", [("email", "nora@q.org")],
+                                 sphere="customers", vip=True, instruction="Answer at once.")
+    _mail(key, "save-1@q.org", now - 500, sender="nora@q.org")
+    _rail(base, message_id="save-1@q.org", ts=now - 500, text="hi", **_thread(key, nora))
+    assert card_of(chat_id)["person"] == person["key"], "auto-linked while one-to-one"
+    profile = wg._ATTENTION.profile()
+    profile.setdefault("priors", {})["Nora Example"] = 5.0
+    wg._ATTENTION.save_profile(profile)
+    _mail(key, "save-2@evil.example", now - 40, sender="crook@evil.example")
+    _rail(base, message_id="save-2@evil.example", ts=now - 40, text="again", **_thread(key, crook))
+    item, book = sheet(chat_id)
+    assert item["contact"] is None and item["handle"] == "crook@evil.example", item
+    assert not book["person"], "the sheet offers a new contact, not hers"
+    assert card_of(chat_id)["person"] == person["key"], "the hidden card is still on record"
+    add_contact(chat_id, "Mallory Crook")
+    kept = wg._CONTACTS.get(person["key"])
+    assert kept["name"] == "Nora Example" and kept["emails"] == ["nora@q.org"], kept
+    assert kept["vip"] is True and kept["instruction"] == "Answer at once.", kept
+    filed = wg._CONTACTS.find("email", "crook@evil.example")
+    assert filed["key"] != person["key"] and filed["name"] == "Mallory Crook", filed
+    assert not filed["vip"] and not filed["instruction"]
+    assert card_of(chat_id)["person"] == filed["key"]
+    assert _chats(base)[chat_id]["contact"]["name"] == "Mallory Crook"
+    priors = wg._ATTENTION.profile()["priors"]
+    assert priors.get("Nora Example") == 5.0 and "Mallory Crook" not in priors, priors
+
+    # The address book no longer gives the peer's address to the card's
+    # person: the same. The address is filed anew; the person it was taken
+    # off does not get it back under another name.
+    key = "save-book@q.org"
+    other = cs.make_chat_id("email", key, ACCOUNT)
+    otto = {"address": "otto@q.org", "name": "Otto"}
+    was = wg._CONTACTS.create("private", "Otto Example", [("email", "otto@q.org")], vip=True)
+    _mail(key, "save-3@q.org", now - 300, sender="otto@q.org")
+    _rail(base, message_id="save-3@q.org", ts=now - 300, text="hi", **_thread(key, otto))
+    assert card_of(other)["person"] == was["key"]
+    wg._CONTACTS.update(was["key"], remove=[("email", "otto@q.org")])
+    item, book = sheet(other)
+    assert item["contact"] is None and not book["person"], (item, book)
+    add_contact(other, "Otto at home")
+    kept = wg._CONTACTS.get(was["key"])
+    assert kept["name"] == "Otto Example" and kept["emails"] == [] and kept["vip"] is True, kept
+    filed = wg._CONTACTS.find("email", "otto@q.org")
+    assert filed["key"] != was["key"] and filed["name"] == "Otto at home", filed
+
+    # A card that speaks for its thread is the one a save updates, as before.
+    status, out = _http(base, "POST", "/chats/" + _quote(other) + "/contact",
+                        {"name": "Otto H.", "sphere": "friends"})
+    assert status == 200 and wg._CONTACTS.get(filed["key"])["name"] == "Otto H.", out
+    assert wg._chat_card(other, wg._CHAT_STATE.get(other))["name"] == "Otto H."
+    # A messenger chat's card always speaks; a chat without one has none.
+    assert wg._chat_card(CHAT_S, {"contact": {"name": "Sig", "person": "p"}})["name"] == "Sig"
+    assert wg._chat_card(chat_id, {}) == {}
+    profile = wg._ATTENTION.profile()
+    profile["priors"].pop("Nora Example", None)
+    wg._ATTENTION.save_profile(profile)
+    PUSHES.clear()
+    for cid in (chat_id, other):
+        wg._CHAT_STATE.delete(cid)
+        wg._CHAT_OVERLAY.forget(cid)
+    print("PASS test_contact_save_acts_on_the_shown_card")
 
 
 def test_merge_and_removed_are_mail_only(base, wg):
@@ -2115,8 +2294,10 @@ def main():
         test_removed(base, wg)
         test_tombstones_are_not_unread(base, wg)
         test_home_list_follows_unread_mail(base, wg)
+        test_agent_declaration_lists_a_read_thread(base, wg)
         test_backfill_events_are_idempotent(base, wg)
         test_group_thread_keeps_no_card(base, wg)
+        test_contact_save_acts_on_the_shown_card(base, wg)
         test_merge_and_removed_are_mail_only(base, wg)
         test_merged_chat_leaves_no_ghost(base, wg)
         test_same_mail_on_two_accounts(base, wg)

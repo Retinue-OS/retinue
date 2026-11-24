@@ -896,10 +896,11 @@ class RetinueChatPage extends HTMLElement {
       for (const m of msgs) {
         if (m && this._seen.has(m.id)) this._reconcileChanged(m, stick);
       }
-      // Then the ones not seen yet, each at its place by time. Most are the
-      // newest and are appended; a mail thread is not monotonic, though — a
-      // merge brings another chat's mails, a parent arrives after its reply —
-      // and those go in between (_insertChatMessage).
+      // Then the ones not seen yet. A messenger message is appended, as it
+      // arrived; a mail goes to its place by time — most are the newest and
+      // are appended too, but a mail thread is not monotonic: a merge brings
+      // another chat's mails, a parent arrives after its reply, and those go
+      // in between (_insertChatMessage).
       let added = false;
       for (const m of msgs) {
         if (!m || this._seen.has(m.id)) continue;
@@ -1036,20 +1037,34 @@ class RetinueChatPage extends HTMLElement {
     return true;
   }
 
-  // One message not on screen yet, into the thread at its place by time:
-  // after the last message not newer than it. That is the end for nearly
-  // every arrival (appended, _appendChatMessage); a mail a merge brought from
-  // another chat, or a parent arriving after its reply, goes in before the
-  // first newer bubble instead — the bubbles around it stay the nodes they
-  // are (an open Original's frame, a focused control), the day separators
-  // and the waterline are drawn again around them (_reflowSeparators), and
-  // the reader keeps the message they were looking at, or the bottom.
-  // `_messages` stays in time order, so its last inbound message is the
-  // newest one, the one the Mark as read row belongs under.
+  // One message not on screen yet, into the thread at its place.
+  //
+  // On a messenger chat that is the end, whatever its stamp says. The stamp
+  // is the sender's clock (Signal) or the receiving phone's (SMS), a message
+  // can land after ones stamped later than it, and the server counts it
+  // unread by arrival (docs/messenger-chats.md, "By arrival order"). Placed
+  // by its stamp it would go in above what the reader has read — out of
+  // view, above the waterline, above their own message still on its way
+  // (stamped by this device's clock) — and Mark as read would be offered for
+  // a message they never saw.
+  //
+  // A mail thread is the one stream that is out of order by design, and
+  // there the place is by time: after the last message not newer than it.
+  // That is the end for nearly every arrival (appended, _appendChatMessage);
+  // a mail a merge brought from another chat, or a parent arriving after its
+  // reply, goes in before the first newer bubble instead — the bubbles
+  // around it stay the nodes they are (an open Original's frame, a focused
+  // control), the day separators and the waterline are drawn again around
+  // them (_reflowSeparators), and the reader keeps the message they were
+  // looking at, or the bottom. So a mail thread's `_messages` stays in time
+  // order, and its last inbound message is the newest one, the one the Mark
+  // as read row belongs under; a messenger chat's is the last to arrive.
   _insertChatMessage(m, stick) {
-    const t = tsMs(m);
     let i = this._messages.length;
-    while (i > 0 && tsMs(this._messages[i - 1]) > t) i -= 1;
+    if (isMail(this._chat)) {
+      const t = tsMs(m);
+      while (i > 0 && tsMs(this._messages[i - 1]) > t) i -= 1;
+    }
     const thread = this.shadowRoot.querySelector('[data-chat-thread]');
     const next = thread && i < this._messages.length ? this._bubbleNode(this._messages[i].id) : null;
     if (!next) {

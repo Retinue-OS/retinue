@@ -325,8 +325,13 @@ def chat_wants_attention(chat: dict, state: dict) -> bool:
       unread mail was deleted in a client leaves the list by itself;
     - the next mail brings a settled thread back: the gateway reopens the
       block for every counted arrival (its _attention_relist_chat);
-    - and a thread the user put back on the list by hand (``pulled``) stays
-      until they settle it, read or not."""
+    - and a thread somebody put on the list stays until the user settles it,
+      read or not: one they put back by hand (``pulled``), and one an agent
+      declared attention on and left open (``declared``, set by the
+      gateway's /internal/attention/set — importance, a deadline, an actor,
+      or just open). Such a block does not "happen to exist": it is
+      somebody's word about the thread, whatever is unread in it, and a
+      deadline nobody lists is a deadline nobody is reminded of."""
     if chat.get("archived"):
         return False
     block = (state or {}).get("attention") or {}
@@ -334,7 +339,7 @@ def chat_wants_attention(chat: dict, state: dict) -> bool:
     if chat.get("channel") == MAIL_CHANNEL:
         if block.get("state", "open") != "open":
             return False
-        return unread or bool(block.get("pulled"))
+        return unread or bool(block.get("pulled")) or bool(block.get("declared"))
     if block:
         return block.get("state", "open") == "open"
     return unread
@@ -502,6 +507,11 @@ def chat_item(chat: dict, state: dict, profile: dict) -> dict:
         "stranger": stranger,
         "unknown_sender": chat_screened({"stranger": stranger, "sphere": sphere}),
         "contact": card or None,
+        # An agent declared attention on this chat (the gateway's
+        # /internal/attention/set): what keeps a mail thread on the list
+        # with nothing unread in it (chat_wants_attention). Kept in the
+        # block (block_for) while the judgement it belongs to is.
+        "declared": bool(block.get("declared")),
         # How a standing instruction is working, or worked, its newest
         # message (the web gateway's _instructed_note), for the details sheet.
         "instructed": (state or {}).get("instructed") or None,
@@ -674,10 +684,13 @@ def _humanize_sphere(value: str) -> str:
 
 def block_for(item: dict) -> dict:
     """The ``attention`` block to store back on the item's document — for a
-    project with the snapshot of its frontmatter (see project_item)."""
+    project with the snapshot of its frontmatter (see project_item), for a
+    chat an agent declared attention on with that fact (see chat_item)."""
     block = policy.item_to_attention(item)
     if item.get("frontmatter") is not None:
         block["frontmatter"] = item["frontmatter"]
+    if item.get("declared"):
+        block["declared"] = True
     return block
 
 

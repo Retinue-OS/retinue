@@ -1102,7 +1102,12 @@ a thread's entry in `GET /chats` has `contact: null`, and its attention item
 takes no sender, sphere or tags from the card: the newcomer is judged as
 whoever their own address makes them. The card stays in the state document
 (nothing is rewritten on a mail's say-so), and applies again once the thread
-is one-to-one with its person.
+is one-to-one with its person. A write follows what is shown: the contact
+card's save (`POST /chats/<id>/contact`) acts on the card that speaks for the
+thread. A group is refused, as any group chat is; a thread whose peer is no
+longer the card's person files that peer's address — under the person who
+holds it, else as a new one — and neither rewrites the person on the hidden
+card nor moves what the profile learned under their name.
 
 **A mail pushes nothing by default**: an unjudged mail is passive — listed,
 never pushed, in no digest — whether the thread is one-to-one or not
@@ -1119,7 +1124,13 @@ settles it; a mail that is gone from the mailbox is not unread, so the
 thread leaves by itself; and the next mail brings a settled thread back —
 the rail reopens its block for every mail it counts, listed and never pushed
 (`_attention_relist_chat`), once per mail however often the event is
-delivered. A thread the user puts back by hand stays until they settle it.
+delivered. A thread somebody put on the list stays until the user settles
+it, read or not: one they put back by hand (`pulled`), and one an agent
+declared attention on and left open — `attention-set.py chat:<id> …` with a
+deadline, an actor, an importance, or just `--reopen` — which the block
+records as `declared`. That one is an item like any other until then: its
+deadline is swept, and *Later* holds it for the digest instead of taking it
+off the list.
 
 **The list.** A mail chat's entry in `GET /chats` carries, beyond every
 chat's, `participants` (`[{address, name, contact}]`, resolved through the

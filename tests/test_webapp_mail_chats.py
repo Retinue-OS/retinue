@@ -886,6 +886,51 @@ await ok('a late mail with the reader at the bottom keeps them there; an empty t
   assert.deepEqual(empty._thread.layoutFull().map((x) => x.split(' ')[0]), ['DAY', 'first']);
 });
 
+await ok('a messenger message is appended where the reader sees it, whatever its stamp', async () => {
+  // Placing by time is for mail threads. A messenger stamp is the sender's
+  // clock, and the server counts the message unread by arrival.
+  const SID = 'signal:~+41000:+41999';
+  const SIG = { id: SID, channel: 'signal', account: '+41000', key: '+41999', name: 'Mara', group: false,
+                participants: undefined, participants_more: undefined, peer: undefined, inbound_seq: 1,
+                can_send: true, cannot_send_reason: undefined, messages: '/chats/s/messages' };
+  const sig = (id, direction, ts) => ({ id, chat: SID, direction, ts, text: `text of ${id}`, sender: '+41999',
+                                         sender_name: 'Mara', ...(direction === 'out' ? { author: 'user' } : {}) });
+  const inView = (el, mid) => {
+    const r = el._thread.rectOf(el._thread.node(mid));
+    return r.top >= 0 && r.bottom <= el._thread.clientHeight;
+  };
+  // Her phone's clock is three minutes slow: the reply to 10:09 is stamped
+  // 10:06:30, and the store serves it between 10:06 and 10:07.
+  const ten = Array.from({ length: 10 }, (_, i) => sig(`m${i}`, i % 2 ? 'out' : 'in', `2026-11-20T10:0${i}:00Z`));
+  let el = await open(SIG, ten, SID);
+  el._thread.scrollTop = 1e6;
+  const slow = sig('slow', 'in', '2026-11-20T10:06:30Z');
+  await poll(el, { ...SIG, unread: 1, list_group: 'unread', inbound_seq: 2 }, [...ten.slice(0, 7), slow, ...ten.slice(7)]);
+  assert.deepEqual(el._thread.layout().slice(-3), ['m9', 'slow', 'ROW'], 'below the user\'s own 10:09');
+  assert.equal(el._messages.at(-1).id, 'slow');
+  assert.ok(inView(el, 'slow'), 'on screen for a reader at the bottom');
+  assert.equal(el._markReadAnchor().id, 'slow', 'Mark as read is offered under what arrived');
+  // A reply stamped before the user's own message that is still on its way
+  // (the device's clock stamps that one): below it, not above.
+  const local = { id: 'local-1', chat: SID, direction: 'out', author: 'user', text: 'mine', ts: '2026-11-20T10:20:00Z' };
+  el._messages.push(local);
+  el._appendChatMessage(local);
+  await poll(el, { ...SIG, unread: 2, list_group: 'unread', inbound_seq: 3 },
+             [...ten.slice(0, 7), slow, ...ten.slice(7), sig('early', 'in', '2026-11-20T10:19:00Z')]);
+  assert.deepEqual(el._thread.layout().slice(-3), ['local-1', 'early', 'ROW']);
+  // A late delivery stamped before everything, into a chat with a waterline:
+  // it is new, so it is below the line — and below what was read above it.
+  const eleven = Array.from({ length: 10 }, (_, i) => sig(`n${i}`, 'in', `2026-11-20T11:0${i}:00Z`));
+  el = await open({ ...SIG, unread: 2, list_group: 'unread', inbound_seq: 5 }, eleven, SID);
+  const full = () => el._thread.layoutFull().filter((x) => !x.startsWith('DAY'));
+  assert.deepEqual(full().slice(-4), ['NEW', 'n8', 'n9', 'ROW']);
+  el._thread.scrollTop = 1e6;
+  const late = sig('late', 'in', '2026-11-20T10:00:00Z');
+  await poll(el, { ...SIG, unread: 3, list_group: 'unread', inbound_seq: 6 }, [late, ...eleven]);
+  assert.deepEqual(full(), ['n0', 'n1', 'n2', 'n3', 'n4', 'n5', 'n6', 'n7', 'NEW', 'n8', 'n9', 'late', 'ROW']);
+  assert.ok(inView(el, 'late'));
+});
+
 await ok('the reader keeps their place when a bubble changes height above the view', async () => {
   // A long Original closed from its foot: the mail comes back into view.
   const el = await open({}, [...BASE, ...MORE]);
