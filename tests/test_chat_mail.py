@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Mail threads as chats, as the web gateway serves them (docs/mail-chats.md):
 the mirror — what a mail chat is and how it is read. Writing (reply, compose,
-queued sends, the mailbox following the chat) is tests/test_chat_mail_send.py.
+queued sends, the mailbox following the chat) is tests/test_chat_mail_send.py;
+the gate (what an arriving mail rings, and whose is worked by a model turn)
+is tests/test_chat_mail_gate.py.
 
 Runs the REAL web-gateway handler on a local port. The mails are real ledger
 records — written by scripts/inbound_store.py, tombstoned by it — and a tiny
@@ -480,11 +482,16 @@ def _messages(base, chat_id, query=""):
     return body
 
 
+# The verdict these tests' events carry unless they name another: a mail the
+# gate holds (a quieted or ignored group's), which nothing judges — the
+# mirror's own behaviour, with no attention arrival, push or turn in the way.
+# What the gate does with every other mail is tests/test_chat_mail_gate.py.
 GATE = {"forward": False, "vip": False, "instructed": False, "reason": "mirror"}
 
 
 def _rail(base, **event):
-    """One event as the mail gateway sends it; a mirrored mail arrives held."""
+    """One event as the mail gateway sends it — held by the gate (GATE)
+    unless the event says otherwise."""
     payload = {"channel": "email", "account": ACCOUNT, "direction": "in", "gate": GATE}
     payload.update(event)
     if payload["direction"] == "out":
@@ -557,7 +564,7 @@ def test_rail_mail_fields(base, wg):
     assert doc["gateway_source"] == cs.GATEWAY_SOURCE_ACCOUNT
     assert doc["inbound_seq"] == 1 and doc["unknown_sender"] is True
     assert doc["roster"] == {ANN: "Ann Example"}
-    # A mirrored mail arrives held: no push, no attention block, no turn.
+    # A mail the gate holds: no push, no attention block, no turn.
     assert not PUSHES and not TURNS and doc["attention"] is None
     # The overlay entry carries the mail's own subject, on one line.
     entry = wg._CHAT_OVERLAY.entries(CHAT_A)[-1]
@@ -2369,7 +2376,7 @@ def main():
         test_merged_chat_leaves_no_ghost(base, wg)
         test_same_mail_on_two_accounts(base, wg)
         test_list_carries_previews_not_bodies(base, wg)
-        assert not TURNS, "no model turn runs for a mail in this phase"
+        assert not TURNS, "a model turn ran for a mail that is neither a VIP's nor instructed"
         server.shutdown()
     sparql.shutdown()
     mail_gw.shutdown()

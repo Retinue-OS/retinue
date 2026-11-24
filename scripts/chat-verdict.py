@@ -17,6 +17,15 @@ and, where it carries one, its deadline — and what it did and flags:
     chat-verdict.py --chat "telegram:774301992" --importance 3 \
         --flag "asks for the door code — kept out of the draft"
 
+    chat-verdict.py --chat "email:~me@example.org:root-id@example.org" \
+        --importance 1 --action "filed the invoice with the Archivist" \
+        --action "archived the mail"
+
+A mail thread is a chat like any other here (docs/mail-chats.md, "The gate"):
+a mail from an instructed sender is worked by the same kind of turn, which
+ends with the same verdict. What that turn archived (chat-flags.py) it names
+as an action.
+
 For a sender who is not also a VIP the verdict is what decides whether the
 message rings now, waits for the next digest, or is only listed: the gateway
 holds the ring until the turn ends and then puts the message through the
@@ -28,7 +37,8 @@ The verdict is taken only while such a turn is running for the chat (HTTP 409
 otherwise); a second call in the same turn replaces the first.
 
 This is the retinue-side client for the gateway's token-gated
-``POST /internal/chats/<id>/verdict`` — the sibling of chat-draft.py.
+``POST /internal/chats/<id>/verdict`` — the sibling of chat-draft.py and
+chat-flags.py.
 
 Configuration (environment):
     CHAT_DRAFT_BACKEND_URL      default http://localhost:${WEB_GATEWAY_PORT}/internal/chats
@@ -55,14 +65,16 @@ def main() -> int:
         description="Set the verdict of the turn a sender's standing instruction started."
     )
     parser.add_argument("--chat", required=True, metavar="ID",
-                        help="the chat id, <channel>:<chat-key> (e.g. signal:+41791234567)")
+                        help="the chat id, <channel>:<chat-key> (e.g. signal:+41791234567, "
+                             "or a mail thread's email:~<account>:<message-id>)")
     parser.add_argument("--importance", required=True, type=float,
                         help="0–5: 0–1 trivial (listed), 2–3 ordinary (next digest), "
                              "4–5 important (rings where the Focus mode admits the sender)")
     parser.add_argument("--due", metavar="WHEN",
                         help="the deadline the message carries: an ISO date-time or YYYY-MM-DD")
     parser.add_argument("--action", action="append", default=[],
-                        help="one thing the turn did (repeatable), as the user should read it")
+                        help="one thing the turn did (repeatable), as the user should read it "
+                             "(\"staged a reply\", \"archived the mail\")")
     parser.add_argument("--flag", action="append", default=[],
                         help="one thing the user must look at (repeatable): a sensitive "
                              "request kept out of the draft, a conflict, a doubt")
