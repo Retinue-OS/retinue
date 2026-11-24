@@ -70,7 +70,7 @@ An app loads `/apps/retinue.js` (a framework file) and feature-detects
 | `sparql(query, endpoint = "life")` | read-only query, JSON results | `POST /apps/api/sparql` |
 | `submit(name, blob, dir)` | write a file into the app's chamber (`dir` relative to the chamber, default the chamber's inbox); converters / the Archivist pick it up | `PUT /apps/api/files/<chamber>/<dir>/<name>` |
 | `ask(agent, text, opts)` | open or continue a dashboard thread addressed to an agent, with attention fields (`importance`, `due`, …); returns the thread id | `POST /apps/api/ask` |
-| `schedule(job)` / `unschedule(id)` / `jobs()` | reminders (a notification at a time) and agent jobs (a prompt run by the scheduler, once or recurring) | `/apps/api/schedule` |
+| `schedule(job)` / `unschedule(id)` / `jobs()` / `done(id)` / `skip(id)` | reminders (a notification at a time) and agent jobs (a prompt run by the scheduler, once or recurring) | `/apps/api/schedule` |
 | `speak(text, lang)` | speech output | client-side (`speechSynthesis` / the shell) |
 | `notify(title, body)` | an immediate notification **while the app is open** ("next set in 10 s"); not a reminder — see below | client-side (Notification API / the shell) |
 
