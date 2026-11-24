@@ -3993,7 +3993,9 @@ class Mirror:
 
     def mark_read(self, chat: str, only=None) -> int:
         """``\\Seen`` on every mail of the thread in INBOX or the archive
-        folder; how many were flagged. A reply, or "Mark as read".
+        folder; how many were flagged — counted where they are: a mail the
+        mailbox shows in both folders (a label mailbox) is flagged, and
+        counted, in each. A reply, or "Mark as read".
 
         ``only`` (a set of Message-IDs) is what the chat held when the user
         acted: the call is made after the act and served later still — it
@@ -4114,13 +4116,23 @@ class Mirror:
         the Trash* (this call, or an earlier one, moved it there — or it is
         in a mirrored folder that is the Trash) nor *positively absent from
         every mirrored folder* (each of them answered that it does not hold
-        it). A mail the index places and the folder no longer holds is
-        neither — a client moved it since the last poll — and so is one in
-        a folder that could not say: the answer then reports ``errors``, and
-        the chat stays. A chat that vanished here while its mails stayed in
-        the mailbox would only come back, and one erased before its mails
-        were safe in the Trash could not. What was moved stays moved; the
-        call is made again and finishes.
+        it). A chat that vanished here while its mails stayed in the mailbox
+        would only come back, and one erased before its mails were safe in
+        the Trash could not.
+
+        A mail the index places and the folder no longer holds is neither
+        yet. Two things look like that from the folder: a client moved the
+        mail since the last poll — or this very call did, through the
+        mail's other place. A mailbox may show one message in two mirrored
+        folders (a label mailbox: its INBOX and its archive), and moving it
+        to the Trash from the one takes it out of the other. So such a mail
+        is no error by itself: once every place was tried it is looked for,
+        in every mirrored folder, within the same call (as a mail without a
+        place is, before anything moves). Found, it is moved to the Trash
+        from where it is; in none of them, it is positively absent. Only a
+        folder that cannot say leaves it open — the answer then reports
+        ``errors``, with the reason in ``error``, and the chat stays. What
+        was moved stays moved; the call is made again and finishes.
 
         ``delete_chat``'s answer (inbound_store) plus ``trashed``,
         ``pending_sends`` and ``recent``."""
@@ -4168,36 +4180,44 @@ class Mirror:
                     result["errors"] = sum(map(len, places.values()))
                     result["error"] = str(exc)[:500]
                     return result
+            # The mails that were not where the index had them, by id, in
+            # the order met.
+            missing: dict = {}
             for role, uids in places.items():
-                folder = self._folder(role)
-                if folder["name"] == trash:
-                    continue    # (a mailbox whose Trash is one of the mirrored folders)
-                try:
-                    moved = self.mailbox.move(folder["name"], list(uids), trash,
-                                              validity=folder["uidvalidity"])
-                except MailboxError as exc:
-                    print(f"[mail-gateway] {len(uids)} mail(s) of chat {chat!r} could not be "
-                          f"moved from {folder['name']!r} to the Trash: {exc}", flush=True)
-                    result["errors"] += len(uids)
-                    result["error"] = str(exc)[:500]
-                    continue
-                if moved is None:
-                    moved = Moved({}, {}, tuple(uids))   # the folder is gone
-                self._follow_move(role, uids, moved)
-                result["trashed"] += len(moved.moved) + len(moved.left)
-                if moved.absent:
-                    # Not there to be moved, so not in the Trash by this
-                    # call — and where it is, nobody has asked yet. Its
-                    # place is dropped (above); the call made again looks
-                    # for it in every folder first.
-                    print(f"[mail-gateway] {len(moved.absent)} mail(s) of chat {chat!r} "
-                          f"were no longer in {folder['name']!r}: not deleted until they "
-                          f"are found or known to be gone", flush=True)
-                    result["errors"] += len(moved.absent)
-                    result.setdefault("error", (
-                        f"{len(moved.absent)} mail(s) of this thread were moved in the "
-                        f"mailbox since the mirror last looked; the chat is not deleted "
-                        f"until they are found — try again in a minute"))
+                missing.update(dict.fromkeys(self._to_trash(chat, role, uids, trash, result)))
+            # Each of those is looked for now, in every mirrored folder —
+            # after all the moves, since one of them may be what took it out
+            # of its other place. Where it is found it goes to the Trash
+            # from there; where every folder says it is not held, it is
+            # gone, and no reason to keep the chat.
+            unfound = 0
+            for message_id in missing:
+                row = self.index.one("SELECT ts, arrived FROM mails WHERE message_id = ?",
+                                     (message_id,))
+                unsure = False
+                for role in ("inbox", "archive", "sent"):
+                    try:
+                        uid = self._whereabouts(role, message_id, row["ts"] if row else None,
+                                                row["arrived"] if row else None)
+                    except MailboxError:
+                        uid = UNSURE
+                    if uid is UNSURE:
+                        unsure = True
+                    elif uid is not None:
+                        self._locate(role, uid, message_id)
+                        # (Gone again while this call looked: still open.)
+                        unsure = bool(self._to_trash(chat, role, {uid: message_id}, trash,
+                                                     result)) or unsure
+                unfound += unsure
+            if unfound:
+                print(f"[mail-gateway] chat {chat!r} is not deleted: {unfound} of its mail(s) "
+                      f"were moved in the mailbox since the mirror last looked, and the "
+                      f"mailbox cannot say yet where they are", flush=True)
+                result["errors"] += unfound
+                result.setdefault("error", (
+                    f"{unfound} mail(s) of this thread were moved in the mailbox since the "
+                    f"mirror last looked, and the mailbox cannot say yet where they are; "
+                    f"the chat is not deleted until they are found — try again in a minute"))
             if result["errors"]:
                 return result
             erased = _ibstore.delete_chat(INBOUND_STORE_DIR, chat, ACCOUNT)
@@ -4209,6 +4229,31 @@ class Mirror:
                   f"Trash, {result['messages']} record(s), {result['media']} blob(s), "
                   f"{result['errors']} error(s)", flush=True)
             return result
+
+    def _to_trash(self, chat: str, role: str, uids: dict, trash: str, result: dict) -> list:
+        """One step of a delete: move these mails of a chat — ``{UID:
+        Message-ID}`` in the folder of ``role`` — to the Trash, have the
+        index follow, and count into ``result`` what went (``trashed``) and
+        what the server refused to move (``errors``, with its ``error``).
+        Returns the ids of the mails that were not there to be moved: no
+        error yet — the caller finds out where they are."""
+        folder = self._folder(role)
+        if folder["name"] == trash:
+            return []       # (a mailbox whose Trash is one of the mirrored folders)
+        try:
+            moved = self.mailbox.move(folder["name"], list(uids), trash,
+                                      validity=folder["uidvalidity"])
+        except MailboxError as exc:
+            print(f"[mail-gateway] {len(uids)} mail(s) of chat {chat!r} could not be "
+                  f"moved from {folder['name']!r} to the Trash: {exc}", flush=True)
+            result["errors"] += len(uids)
+            result["error"] = str(exc)[:500]
+            return []
+        if moved is None:
+            moved = Moved({}, {}, tuple(uids))   # the folder is gone
+        self._follow_move(role, uids, moved)
+        result["trashed"] += len(moved.moved) + len(moved.left)
+        return [uids[uid] for uid in moved.absent]
 
     def _forget_chat(self, chat: str, *, whole: bool) -> None:
         """Take an erased chat out of the indexes: every mail of it whose
@@ -4543,12 +4588,17 @@ class Busy(Exception):
 # stays listed, with its reason and whether the mail may have gone out all
 # the same (``outcome_unknown``), until POST …/dismiss; nothing in any
 # status but ``pending`` can be approved, so a failed mail is never sent
-# by a later press.
+# by a later press on the approval page.
 #
 #   sending, no phase   The decision stands; nothing was handed to the SMTP
 #                       server. After a stop an approved entry is sent — the
-#                       approval was given — and a direct one is dropped: its
-#                       caller got no answer, and sends again if it wants to.
+#                       approval was given. A direct one is not: its caller
+#                       was given no answer, and may have told its user "not
+#                       confirmed yet". One that named its request ends as an
+#                       error that says so for certain — "stopped before the
+#                       mail was handed over; it was not sent" — and is
+#                       listed, where the chat finds it; one that named none
+#                       has nobody to ask after it, and is dropped.
 #   sending, "data"     Written the moment before the message itself is handed
 #                       to the server (email_client._smtp_send, on_data). If
 #                       nothing follows it, nobody saw the server's answer,
@@ -4572,8 +4622,9 @@ class Busy(Exception):
 #                       at once while the mailbox answers, else at its next
 #                       poll — and never by the request, which has answered
 #                       by then.
-#   error               It did not go (``error`` says why), or nobody knows
-#                       (``outcome_unknown``). Kept and listed: a queued
+#   error               It did not go (``error`` says why; ``outcome_unknown``
+#                       false: nothing left the gateway), or nobody knows
+#                       (``outcome_unknown`` true). Kept and listed: a queued
 #                       send's always; a direct send's when nobody knows, or
 #                       when its caller had gone before the answer was ready
 #                       — one whose caller has the failure as its answer is
@@ -4584,7 +4635,45 @@ class Busy(Exception):
 # answer, where no mark can be written in time and only the mailbox can say.
 # And one press is one mail: a request that names itself (``request_key``)
 # is carried out once, and every repeat of it within REQUEST_KEY_SECONDS is
-# answered from its entry (``_repeat_send``).
+# answered from its entry (``_repeat_send``) — and says that it is one
+# (``"repeat": true``): what the answer tells of happened before, and whoever
+# acts on a mail going out (a draft cleared, a chat marked read) did so then.
+#
+# **A send that failed for certain ends its press; only an unknown outcome
+# keeps its key.** What a repeat under a known key does, by the entry it
+# finds — after a stop as well, since each line is what the disk says:
+#
+#   pending                         answered 202 from the entry; sends nothing
+#   sending, no phase, approved     answered 202 "sending"; the approval is
+#                                   carried out once (at a start: by the start)
+#   sending, no phase, direct       in flight: waited for, then answered from
+#                                   the entry — or, where that is gone by then,
+#                                   from how the flight ended. After a stop it
+#                                   is no longer this — it became the certain
+#                                   error below
+#   sending, "data"                 502 ``unconfirmed``; sends nothing — the
+#                                   mail was handed over, only Sent can say
+#   approved (done or not)          200 "sent", the same Message-ID
+#   error, outcome_unknown true     502 ``unconfirmed`` + ``outcome_unknown``;
+#                                   sends nothing, dismissed or not, for as
+#                                   long as the key is remembered
+#   error, outcome_unknown false    **a new attempt**: nothing left the gateway
+#                                   under this key, so the entry is removed
+#                                   and the mail composed and sent afresh
+#                                   (queued afresh, where the policy queues)
+#   rejected / retracted            409; sends nothing
+#
+# "For certain" is said only where the gateway knows it: the SMTP server
+# refused, or the send ended before the mark "data" — which is on disk before
+# any of the message is on the wire. Everything after that mark and before
+# the server's answer is "unknown", and is never sent again.
+#
+# The answers say which it is in fields of their own, never by their wording
+# or their status alone: ``"sent": false`` — nothing left the gateway under
+# this request (the certain failure's 502, and the 503s of a gateway that
+# cannot send or could not write the send down); ``"unconfirmed": true`` —
+# the mail may have gone out, or still may. /send has no 5xx with neither: a
+# fault nobody planned for is answered as one of the two (_send_unplanned).
 
 def _now() -> float:
     """The sending side's clock (one place, so a test can set it)."""
@@ -4646,7 +4735,18 @@ UNKNOWN_OUTCOME = (
     "the mail server was handed this mail and its answer was never seen: it is not "
     "known whether the mail went out. It was not sent again, and no copy of it is "
     "in the Sent folder — check with the recipient before sending it anew")
+# How a direct send ends that a stop caught before anything was handed over.
+STOPPED_UNSENT = ("the mail gateway was stopped before this mail was handed to the mail "
+                  "server; it was not sent")
 _send_said: dict = {}
+
+
+def _failed_for_certain(entry: dict) -> bool:
+    """Whether a send ended with nothing having left the gateway: an error
+    whose entry *says* the outcome is known. An entry that does not say
+    (``outcome_unknown`` true, or absent) is never taken for unsent — this is
+    what decides whether a repeat of its request may send."""
+    return entry.get("status") == "error" and entry.get("outcome_unknown") is False
 
 
 def _send_trouble(request_id: str, said: str | None) -> None:
@@ -4732,16 +4832,21 @@ class Sends:
                 and (chat is None or entry.get("chat") == chat)]
 
     def by_key(self, key: str) -> dict | None:
-        """The send a ``request_key`` was first used for, while the key is
-        remembered (REQUEST_KEY_SECONDS)."""
+        """The send a ``request_key`` stands for, while the key is
+        remembered (REQUEST_KEY_SECONDS). One that is not over for certain
+        before one that is: the latter only waits to be replaced
+        (:meth:`create`)."""
+        failed = None
         for entry in reversed(self.entries()):
             try:
                 fresh = _now() - float(entry.get("created") or 0.0) <= REQUEST_KEY_SECONDS
             except (TypeError, ValueError):
                 fresh = False
             if fresh and entry.get("request_key") == key:
-                return entry
-        return None
+                if not _failed_for_certain(entry):
+                    return entry
+                failed = failed or entry
+        return failed
 
     def by_message_id(self, message_id: str) -> dict | None:
         """The send whose mail has this Message-ID. The mirror asks for
@@ -4768,10 +4873,16 @@ class Sends:
         An entry that names its request (``request_key``) is added only if
         no send of that key is remembered: otherwise nothing is written and
         that earlier entry is returned — looked for and added under one
-        lock, so two requests of one press cannot both be new."""
+        lock, so two requests of one press cannot both be new.
+
+        But for an earlier send that failed for certain: nothing left the
+        gateway under that key, the press it named is over, and this is a
+        new attempt. The new entry is written, then the failed one removed —
+        in that order, so that a disk that takes no write leaves the failed
+        send where the chat shows it."""
         with self._lock:
             earlier = self.by_key(entry["request_key"]) if entry.get("request_key") else None
-            if earlier is not None:
+            if earlier is not None and not _failed_for_certain(earlier):
                 return earlier
             self._dir.mkdir(parents=True, exist_ok=True)
             if images:
@@ -4779,6 +4890,15 @@ class Sends:
             _atomic_json(self._dir / f"{entry['id']}.json", entry)
             if self._ids is not None and entry.get("message_id"):
                 self._ids[entry["message_id"]] = entry["id"]
+            if earlier is not None:
+                print(f"[mail-gateway] send {earlier['id']} failed with nothing sent; its "
+                      f"request_key now names a new attempt ({entry['id']})", flush=True)
+                try:
+                    self.remove(earlier["id"])
+                except OSError as exc:
+                    # (It stays, as failed; by_key answers with the new one.)
+                    print(f"[mail-gateway] could not clear the failed send "
+                          f"{earlier['id']}: {exc}", flush=True)
             return None
 
     def images(self, request_id) -> list:
@@ -4847,9 +4967,16 @@ class Sends:
         """Clear a failed send out of its chat: ``(entry | None, whether this
         call did)``. Only one that ended as an error — a send that waits is
         rejected or retracted, and one on its way has no outcome to dismiss.
-        Nothing is ever sent by this, and nothing can be sent again after
-        it: the entry of a keyed send stays, marked, for as long as its key
-        is remembered (a repeat of that request is still told it failed)."""
+        Nothing is ever sent by this.
+
+        A send whose outcome is not known, and that named its request, stays
+        — marked ``dismissed``, no longer listed — for as long as its key is
+        remembered: a repeat of that request must still be told that the
+        mail may have gone out, and send nothing. A dismissed entry is over
+        for every reader; it is kept for that answer alone. Every other
+        failed send is removed: one that failed for certain has nothing to
+        remember (a repeat under its key is a new attempt, see
+        :meth:`create`)."""
         with self._lock:
             path = self._path(request_id)
             entry = self._read(path) if path else None
@@ -4857,7 +4984,7 @@ class Sends:
                 return None, False
             if entry.get("status") != "error" or entry.get("dismissed"):
                 return entry, False
-            if entry.get("request_key"):
+            if entry.get("request_key") and not _failed_for_certain(entry):
                 entry["dismissed"] = True
                 _atomic_json(path, entry)
             else:
@@ -4881,18 +5008,38 @@ class Sends:
     def recover(self) -> list:
         """At start, what a stop left behind (see the table above). Returns
         the ids of approved sends that were never begun — the caller's to
-        send now; entries with a mark are left to the mirror loop, a direct
-        send without one is dropped, and old decided entries are cleared."""
+        send now; entries with a mark are left to the mirror loop, and old
+        decided entries are cleared.
+
+        A direct send without a mark was stopped before anything was handed
+        over (the mark is on disk first), and its caller was given no
+        answer. One that named its request ends as a failed send — for
+        certain, and listed: whoever was told "not confirmed yet" finds it
+        in the chat with its reason, and a repeat under its key sends the
+        mail, for the first time. One that named none is dropped: nobody can
+        ask after it."""
         begin = []
         for entry in self.entries():
             request_id, status = entry.get("id"), entry.get("status")
             if status == "sending" and not entry.get("phase"):
-                if entry.get("direct"):
-                    print(f"[mail-gateway] send {request_id} was stopped before anything "
-                          f"left; dropped (its caller was given no answer)", flush=True)
-                    self.remove(request_id)
-                else:
+                if not entry.get("direct"):
                     begin.append(request_id)
+                elif entry.get("request_key"):
+                    print(f"[mail-gateway] send {request_id} was stopped before anything "
+                          f"left; it ends as not sent, and is listed as failed", flush=True)
+                    try:
+                        self.update(request_id, status="error", error=STOPPED_UNSENT,
+                                    outcome_unknown=False)
+                        self.release(request_id)
+                    except OSError as exc:
+                        # (It stays "sending"; the next start ends it.)
+                        print(f"[mail-gateway] could not note the end of send "
+                              f"{request_id}: {exc}", flush=True)
+                else:
+                    print(f"[mail-gateway] send {request_id} was stopped before anything "
+                          f"left; dropped (its caller was given no answer, and no key "
+                          f"to ask by)", flush=True)
+                    self.remove(request_id)
             elif status == "sending" or (status == "approved" and not entry.get("done")):
                 self.owe(request_id)
         self.sweep(force=True)
@@ -4909,7 +5056,8 @@ class Sends:
         and about hourly from the mirror loop. A decided entry (sent,
         rejected, retracted, failed) after PENDING_KEEP_SECONDS; one that is
         kept only because its request named a key — a direct send that is
-        over, a failed one that was dismissed — once the key is forgotten.
+        over, one of unknown outcome that was dismissed — once the key is
+        forgotten.
         Never one that waits, is being sent, or still has work owed."""
         now = _now()
         if not force and now - self._swept < 3600.0:
@@ -5447,7 +5595,10 @@ def _send_answer(entry: dict, host_header) -> tuple:
     ``unconfirmed``, and it stays that when the word never came
     (``outcome_unknown``). Only a send that is known not to have left —
     refused by the server, or failed before anything was handed over — is
-    answered as a plain failure."""
+    answered as a plain failure, and that answer says so in a field of its
+    own (``"sent": false``): the status, 502, is the unconfirmed answer's
+    too, and whoever reads it must not have to tell the two by their
+    wording."""
     status = entry.get("status")
     ids = {"message_id": entry["message_id"], "chat": entry["chat"]}
     told = {key: entry[key] for key in ("refused", "skipped") if entry.get(key)}
@@ -5472,34 +5623,89 @@ def _send_answer(entry: dict, host_header) -> tuple:
                               "known yet whether it went out. It is not sent again, and "
                               "shows in the thread if it did.",
                      "unconfirmed": True, "request_id": entry["id"], **ids}
-    if status == "error" and entry.get("outcome_unknown"):
+    if status == "error" and not _failed_for_certain(entry):
+        # (Also an entry that does not say either way: never taken for unsent.)
         return 502, {"error": f"send not confirmed: {entry.get('error') or UNKNOWN_OUTCOME}",
                      "unconfirmed": True, "outcome_unknown": True,
                      "request_id": entry["id"], **ids}
     if status == "error":
-        return 502, {"error": f"send failed: {entry.get('error') or 'the send was lost'}"}
+        return 502, {"error": f"send failed: {entry.get('error') or 'the send was lost'}",
+                     "sent": False}
     return 409, {"error": f"this send was {status} before it went out; nothing was sent",
                  "status": status, "request_id": entry["id"], **ids}
 
 
-# The direct sends that are with the SMTP server right now: request id → an
-# event set when that is over, for a repeat of the request to wait on.
+class _Flight(threading.Event):
+    """One direct send while its request works on it: set when the SMTP
+    session is over, with the entry as the send ended (``final``) — which a
+    repeat that waited is answered from when the entry itself is gone by
+    then (a send that failed for certain, cleared by its own request)."""
+    final = None
+
+
+# The direct sends that are with the SMTP server right now: request id → its
+# flight, for a repeat of the request to wait on.
 _IN_FLIGHT: dict = {}
 
 
 def _repeat_send(earlier: dict, press: str, host_header) -> tuple:
-    """A /send whose ``request_key`` was seen before: what became of that
-    send. Nothing is composed, queued or sent."""
+    """A /send whose ``request_key`` stands for an earlier send: what became
+    of that send. Nothing is composed, queued or sent.
+
+    The answer is that send's own, and says that it is a repeat
+    (``"repeat": true``): what it tells of — a mail that went out, one that
+    waits — happened before this request, and this request did none of it.
+    A caller that does something when a mail goes out (clears a draft,
+    marks a chat read) must not do it a second time on this answer.
+
+    (An earlier send that failed for certain never comes here from
+    ``_accept_send`` — a request under its key is a new attempt. The one way
+    it does: this request waited for a send still in flight, and that send
+    then failed. Its caller has the failure as its answer, and so has this
+    one — one press, one attempt: "send failed", ``"sent": false``, as a
+    repeat. The request that made the attempt clears its entry at once, so
+    the answer is then made from what the flight says of its end.)"""
     if earlier.get("press") not in (None, press):
         return 409, {"error": "this request_key was already used for another mail; "
                               "nothing was sent — a key names one press of Send"}
     flight = _IN_FLIGHT.get(earlier["id"])
     if flight is not None:
         flight.wait(REPEAT_WAIT_SECONDS)
-    entry = SENDS.get(earlier["id"]) or earlier
+    entry = SENDS.get(earlier["id"]) or (flight.final if flight is not None else None) \
+        or earlier
     print(f"[mail-gateway] a repeat of send {entry['id']} (same request_key) is answered "
           f"with its outcome ({entry.get('status')}); nothing is sent", flush=True)
-    return _send_answer(entry, host_header)
+    status, answer = _send_answer(entry, host_header)
+    return status, {**answer, "repeat": True}
+
+
+def _send_fault(entry: dict, exc: BaseException) -> dict:
+    """``_execute_send`` is written never to raise. Where it does all the
+    same, what is known of the send is what its entry says on disk, and the
+    answer is made from that — never from the fault, which could have come
+    before the hand-over or after it:
+
+      * no mark "data": nothing was handed over (the mark is written
+        first) — the send ends as failed, for certain;
+      * the mark, and no answer of the server's noted: nobody knows — left
+        to the mirror loop, which asks Sent; the caller hears "unconfirmed";
+      * anything else: the entry as it stands (sent, or already ended).
+
+    An entry that is gone is taken for the second case: a send that went
+    out and was cleared looks the same from here."""
+    request_id = entry["id"]
+    said = _clean_line(exc, 300) or type(exc).__name__
+    print(f"[mail-gateway] send {request_id}: an unexpected fault ({said})\n"
+          f"{traceback.format_exc()}", flush=True)
+    stands = SENDS.get(request_id)
+    if stands is None:
+        return {**entry, "status": "sending", "phase": "data"}
+    if stands.get("status") == "sending" and not stands.get("phase"):
+        return _fail_send(stands, said)
+    if stands.get("status") == "sending":
+        SENDS.owe(request_id)
+        _wake()
+    return stands
 
 
 def _accept_send(payload: dict, host_header, caller_waits=None) -> tuple:
@@ -5514,20 +5720,32 @@ def _accept_send(payload: dict, host_header, caller_waits=None) -> tuple:
     direct send that failed for certain is over once its caller has that
     answer; one whose caller is gone (it timed out, and may have told its
     user "not confirmed yet") keeps its entry as a failed send, where the
-    chat finds it."""
+    chat finds it.
+
+    A request under a ``request_key`` that stands for an earlier send is
+    answered from that send and sends nothing (``_repeat_send``) — unless
+    that send failed for certain: then nothing left the gateway under the
+    key, and this request is a new attempt, composed, decided by the policy
+    and sent afresh; the failed entry gives way to the new one
+    (``Sends.create``). A send of unknown outcome is never such a one."""
     mirror = MIRROR
-    if mirror is None or MAIL_CONFIG is None:
-        return 503, {"error": "the mail gateway is not configured"}
-    if SMTP_PROBLEM is not None:
-        return 503, {"error": SMTP_PROBLEM}
     key = payload.get("request_key")
     if key is not None and not (isinstance(key, str) and _REQUEST_KEY_RE.fullmatch(key)):
         return 400, {"error": "'request_key' must be a token of 1 to 64 printable ASCII "
                               "characters, without spaces"}
     press = _press_digest(payload) if key else None
+    # What became of an earlier send is said before anything else — also by
+    # a gateway that cannot send (any more): the mail may be out.
     earlier = SENDS.by_key(key) if key else None
-    if earlier is not None:
+    if earlier is not None and not _failed_for_certain(earlier):
         return _repeat_send(earlier, press, host_header)
+    # (From here on nothing stands under the key. An answer that nothing was
+    # sent says so — ``"sent": false`` — where its status is one a caller
+    # could read as "the outcome is open".)
+    if mirror is None or MAIL_CONFIG is None:
+        return 503, {"error": "the mail gateway is not configured", "sent": False}
+    if SMTP_PROBLEM is not None:
+        return 503, {"error": SMTP_PROBLEM, "sent": False}
     try:
         entry, files = _compose(payload, mirror)
         # Built once now: no approval is asked for a mail that could only
@@ -5537,6 +5755,11 @@ def _accept_send(payload: dict, host_header, caller_waits=None) -> tuple:
         return exc.status, {"error": str(exc)}
     except (ValueError, LookupError, TypeError) as exc:
         return 400, {"error": f"this mail cannot be written: {_clean_line(exc, 200)}"}
+    except Exception as exc:  # noqa: BLE001 - before any entry stands: nothing was sent
+        print(f"[mail-gateway] a send could not be composed: {exc}\n"
+              f"{traceback.format_exc()}", flush=True)
+        return 502, {"error": f"send failed: {_clean_line(exc, 300) or type(exc).__name__}",
+                     "sent": False}
     category = _send_category()
     direct = _send_is_direct(category, payload.get("user_approved") is True)
     entry.update(id=uuid.uuid4().hex, category=category, created=_now(),
@@ -5545,14 +5768,15 @@ def _accept_send(payload: dict, host_header, caller_waits=None) -> tuple:
     if key:
         entry.update(request_key=key, press=press)
     # (In flight from before its entry stands: a repeat that finds the entry
-    # finds this to wait on.)
-    flight = _IN_FLIGHT[entry["id"]] = threading.Event()
+    # finds this to wait on — and until this request is done with the entry,
+    # so that a repeat never finds the one gone and the other too.)
+    flight = _IN_FLIGHT[entry["id"]] = _Flight()
     try:
         try:
             earlier = SENDS.create(entry, payload.get("images") or [])
         except OSError as exc:
             print(f"[mail-gateway] could not persist a send: {exc}", flush=True)
-            return 503, {"error": "could not queue the send; retry later"}
+            return 503, {"error": "could not queue the send; retry later", "sent": False}
         if earlier is not None:
             # (The same press, twice at once: the other request was first.)
             return _repeat_send(earlier, press, host_header)
@@ -5560,19 +5784,54 @@ def _accept_send(payload: dict, host_header, caller_waits=None) -> tuple:
             print(f"[mail-gateway] pending send registered for chat {entry['chat']!r} "
                   f"(category={category}, id={entry['id']})", flush=True)
             return _send_answer(entry, host_header)
-        final = _execute_send(entry["id"]) or {**entry, "status": "error",
-                                               "error": "the send was lost"}
-    finally:
-        _IN_FLIGHT.pop(entry["id"], None)
-        flight.set()
-    if final.get("status") == "error" and not final.get("outcome_unknown") \
-            and (caller_waits is None or caller_waits()):
         try:
-            SENDS.dismiss(final["id"])
-        except OSError as exc:
-            print(f"[mail-gateway] could not clear the failed send {final['id']}: {exc}",
-                  flush=True)
-    return _send_answer(final, host_header)
+            final = _execute_send(entry["id"])
+        except Exception as exc:  # noqa: BLE001 - answered from the entry, not the fault
+            final = _send_fault(entry, exc)
+        # (No entry to carry out: nothing was begun, and nothing left.)
+        final = final or {**entry, "status": "error", "error": "the send was lost",
+                          "outcome_unknown": False}
+        flight.final = final
+        flight.set()
+        if _failed_for_certain(final) and (caller_waits is None or caller_waits()):
+            try:
+                SENDS.dismiss(final["id"])
+            except OSError as exc:
+                print(f"[mail-gateway] could not clear the failed send {final['id']}: {exc}",
+                      flush=True)
+        return _send_answer(final, host_header)
+    finally:
+        flight.set()
+        _IN_FLIGHT.pop(entry["id"], None)
+
+
+def _send_unplanned(payload: dict, host_header, exc: BaseException) -> tuple:
+    """``(HTTP status, answer)`` for a /send that raised where nothing was
+    planned to. The fault says nothing of the mail — it could have come
+    before the hand-over or after it — so the answer is not made from it:
+
+      * the request named itself (``request_key``): what stands under the
+        key is what became of it. An entry — answered as it stands. None —
+        nothing was queued or handed over (a request that names itself has
+        its entry from before anything is sent until its key is forgotten):
+        failed, for certain;
+      * it named nothing: nobody can say from here. That is answered as
+        ``unconfirmed`` — never as "failed", which a caller would follow
+        with a second mail."""
+    said = _clean_line(exc, 300) or type(exc).__name__
+    key = payload.get("request_key")
+    if isinstance(key, str) and _REQUEST_KEY_RE.fullmatch(key):
+        try:
+            entry = SENDS.by_key(key)
+            if entry is None:
+                return 502, {"error": f"send failed: {said}", "sent": False}
+            return _send_answer(entry, host_header)
+        except Exception:  # noqa: BLE001 - then nobody can say
+            pass
+    return 502, {"error": f"the mail gateway failed while it worked on this send ({said}); "
+                          f"it is not known here whether the mail went out. It is not sent "
+                          f"again — look in the thread before writing it anew.",
+                 "unconfirmed": True}
 
 
 def _reply_preview(body: dict) -> tuple:
@@ -5732,7 +5991,9 @@ def _fail_send(entry: dict, said: str, *, unknown: bool = False) -> dict:
     whoever reads the entry must not take it for unsent.
 
     (A direct send that failed for certain, and whose caller has that
-    answer, is cleared by the request itself: ``_accept_send``.)"""
+    answer, is cleared by the request itself: ``_accept_send``. And any send
+    that failed for certain gives way to a new attempt under its
+    ``request_key``: ``Sends.create``.)"""
     request_id = entry["id"]
     changes = {"status": "error", "error": said, "outcome_unknown": bool(unknown)}
     ended = {**entry, **changes}
@@ -6118,6 +6379,12 @@ class _Handler(BaseHTTPRequestHandler):
             return
         pending = _PENDING_SEND_RE.match(path)
         if pending and not pending.group(2):
+            # One entry, in whatever status — also one the list above no
+            # longer names. ``dismissed`` true on an "error" means it is
+            # over: kept only so that a repeat of its request is still told
+            # that the mail may have gone out (Sends.dismiss), and nothing
+            # for a chat to show. And an "error" is read with its
+            # ``outcome_unknown``: true is "nobody knows", never "not sent".
             entry = SENDS.get(pending.group(1))
             if entry is None:
                 self._reply(404, {"error": "not found"})
@@ -6199,7 +6466,7 @@ class _Handler(BaseHTTPRequestHandler):
                                           caller_waits=self._caller_waits)
         except Exception as exc:  # noqa: BLE001 - an answer, never a dropped connection
             print(f"[mail-gateway] /send failed: {exc}\n{traceback.format_exc()}", flush=True)
-            status, answer = 502, {"error": f"send failed: {_clean_line(exc, 300)}"}
+            status, answer = _send_unplanned(payload, self.headers.get("Host"), exc)
         try:
             self._reply(status, answer)
         except OSError as exc:

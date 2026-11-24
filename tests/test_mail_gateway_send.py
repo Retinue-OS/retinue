@@ -1353,12 +1353,16 @@ class _Kill(BaseException):
     """The process dies here: no handler runs, nothing is cleaned up."""
 
 
-def _stopped_after(n: int, *, direct: bool, save_sent: bool):
+def _stopped_after(n: int, *, direct: bool, save_sent: bool, keyed: bool = False):
     """One send with the process killed right after its n-th write — to the
     send's own entry, the ledger, either index, or the mailbox — then a
     restart, and the mirror left to settle. None when the send has fewer
     writes; else what was found, checked against what must hold wherever the
-    stop came."""
+    stop came.
+
+    ``keyed``: the request names itself, and is made again after the restart
+    — what a caller does that lost the answer. Whatever the stop left, the
+    repeat sends the mail only where nothing of it had left the gateway."""
     w = world(policy="allow" if direct else "verify", save_sent=save_sent)
     try:
         gw, box, mirror, smtp = w.gw, w.box, w.mirror, w.smtp
@@ -1366,6 +1370,8 @@ def _stopped_after(n: int, *, direct: bool, save_sent: bool):
         mirror.poll()
         payload = dict(recipient="a@x.org", images=[
             {"filename": "a.txt", "data": base64.b64encode(b"file").decode()}])
+        if keyed:
+            payload["request_key"] = "stop-1"
         queued = None if direct else w.send(**payload)[1]
         count = {"n": 0}
         armed = []
@@ -1402,6 +1408,12 @@ def _stopped_after(n: int, *, direct: bool, save_sent: bool):
                 setattr(owner, name, real)
         if not killed:
             return None
+        # (What stood of the request when the stop came — on disk, which is
+        # all a start has to go by: status, mark, and whether it was direct.)
+        on_disk = gw.SENDS.by_key("stop-1") if keyed else None
+        stood = on_disk is not None
+        on_disk = on_disk and (on_disk["status"], on_disk.get("phase"),
+                               bool(on_disk.get("direct")))
 
         def provider():
             # Where the provider files the Sent copy, it does so for a mail
@@ -1435,16 +1447,24 @@ def _stopped_after(n: int, *, direct: bool, save_sent: bool):
         if taken:
             assert records[0]["message_id"] == mid and records[0]["text"] == "Thanks."
             assert len(records[0]["attachments"]) == 1 and records[0]["author"] == "agent"
-        if direct and taken:
+        if direct and taken and not keyed:
             assert gw.SENDS.entries() == [], (n, "no entry outlives a direct send that went out")
+        elif direct and taken:
+            # (One that named its request stays, done, for the repeat's answer.)
+            (left,) = gw.SENDS.entries()
+            assert left["status"] == "approved" and left["done"] and gw.SENDS.listed() == []
         elif direct:
-            # Stopped before anything was handed over: dropped, its caller
-            # had no answer. Stopped after the mark "handed over": nobody
-            # can know — kept, saying so, where the chat lists it.
+            # Stopped before anything was handed over: its caller had no
+            # answer. Without a key it is dropped; with one it ends as not
+            # sent, for certain, and is listed. Stopped after the mark
+            # "handed over": nobody can know — kept, saying so, where the
+            # chat lists it.
             left = gw.SENDS.entries()
             assert len(left) <= 1 and all(
-                e["status"] == "error" and e["outcome_unknown"] is True
-                and e["error"] == gw.UNKNOWN_OUTCOME for e in left), (n, left)
+                e["status"] == "error"
+                and (e["outcome_unknown"], e["error"]) in (
+                    [(True, gw.UNKNOWN_OUTCOME), (False, gw.STOPPED_UNSENT)] if keyed
+                    else [(True, gw.UNKNOWN_OUTCOME)]) for e in left), (n, left)
             assert gw.SENDS.listed() == left
         elif taken:
             assert entry["status"] == "approved" and entry["done"] and "images" not in entry, n
@@ -1458,7 +1478,52 @@ def _stopped_after(n: int, *, direct: bool, save_sent: bool):
         index = {row["message_id"] for row in mirror.index.rows("SELECT message_id FROM mails")}
         assert index == {r["message_id"] for r in t.records(gw)}, n
         assert referenced(gw) <= blobs(gw), (n, "no record refers to a blob that is gone")
-        return {"taken": taken, "status": (entry or {}).get("status")}
+        found = {"taken": taken, "status": (entry or {}).get("status"),
+                 "left": on_disk}
+        if not keyed:
+            return found
+
+        # The same request again, as its caller makes it who got no answer.
+        # What the stop left on disk, by status and mark, decides:
+        #   no entry (stopped before it stood)        the first send: carried out
+        #   error, outcome known (nothing had left)   a new attempt: carried out
+        #   error, outcome unknown (handed over)      answered so; nothing is sent
+        #   approved (the server took it)             answered "sent"; nothing is sent
+        # ("Carried out" is: sent, where the policy sends; queued, where it queues.)
+        before = gw.SENDS.by_key("stop-1")
+        state = (None if before is None
+                 else (before["status"], before.get("phase"), before.get("outcome_unknown")))
+        # A send that named its request never just goes: what stood when the
+        # stop came stands after it, as what became of it.
+        assert (state is not None) == stood, (n, state, stood)
+        sessions = smtp.sessions
+        status, answer = w.send(**payload)
+        for _ in range(2):
+            provider()
+            mirror.poll()
+            gw._between_polls(mirror)
+        assert len(smtp.mails) <= 1, (n, state, "never sent twice")
+        if state is None or state == ("error", None, False):
+            assert not taken and "repeat" not in answer, (n, state, answer)
+            assert direct and status == 200 and answer["status"] == "sent", (n, state, answer)
+            assert len(smtp.mails) == 1 and smtp.sessions == sessions + 1
+            assert gw.SENDS.by_key("stop-1")["message_id"] == answer["message_id"]
+            found["repeat"] = "sent"
+        elif state == ("error", None, True):
+            assert not taken and status == 502 and answer["unconfirmed"] is True, (n, answer)
+            assert answer["outcome_unknown"] is True and answer["repeat"] is True
+            assert "sent" not in answer and smtp.sessions == sessions and not smtp.mails
+            found["repeat"] = "unknown"
+        else:
+            assert state[0] == "approved" and taken, (n, state)
+            assert status == 200 and answer["repeat"] is True and answer["message_id"] == mid
+            assert smtp.sessions == sessions
+            found["repeat"] = "told"
+        assert len(gw.SENDS.listed()) == (1 if found["repeat"] == "unknown" else 0), n
+        records = [r for r in t.records(gw) if r["type"] == gw._ibstore.T_OUTBOUND]
+        assert len(records) == len(smtp.mails) == len(w.sent_copies()), (n, records)
+        assert gw.SENDS.due() == [], n
+        return found
     finally:
         done(w)
 
@@ -1480,8 +1545,150 @@ def test_a_send_stopped_anywhere_is_never_made_twice():
             sent = [o for o in outcomes if o["taken"]]
             assert sent and (direct or len(outcomes) - len(sent) == 1), outcomes
             points += len(outcomes)
-    print(f"ok: stopped after any of {points} writes, a send is made at most once, and "
-          f"what the server took is on record")
+    # The same walk for a request that names itself and is made again after
+    # the restart (a caller that lost the answer): wherever the stop came,
+    # the repeat sends the mail only where nothing of it had left — and every
+    # way a repeat can end is met on the way.
+    walked: dict = {}
+    for direct in (False, True):
+        for save_sent in (True, False):
+            n, outcomes = 1, []
+            while True:
+                found = _stopped_after(n, direct=direct, save_sent=save_sent, keyed=True)
+                if found is None:
+                    break
+                outcomes.append(found)
+                n += 1
+            ended = [o["repeat"] for o in outcomes]
+            # The hand-over's one blind spot is met once, and a mail the
+            # server took is "sent" to the repeat ever after.
+            assert ended.count("unknown") == 1 and "told" in ended, ended
+            if direct:
+                # A stop before the hand-over, then the blind spot, then a
+                # mail the server took: in that order, and no other — the
+                # repeat is what sends a direct send that had not left.
+                assert ended == sorted(ended, key=("sent", "unknown", "told").index), ended
+                assert ended.count("sent") >= 2, ended
+            else:
+                # An approval given is carried out by the start itself: the
+                # repeat never has anything to send.
+                assert "sent" not in ended, ended
+            for o in outcomes:
+                walked.setdefault(o["left"], set()).add(o["repeat"])
+            points += len(outcomes)
+    # Every state a stop leaves a send in, and what the same request made
+    # again after the restart does there. A repeat sends in two of them, and
+    # in both nothing of the mail had left the gateway: the mark "data" is on
+    # disk before any of the message is on the wire, so an entry without it
+    # was never handed over.
+    assert walked == {
+        # (status, mark, direct) on disk      the repeat
+        None:                                 {"sent"},     # no entry stood: the first send
+        ("sending", None, True):              {"sent"},     # ended "not sent" by the start;
+                                                            # the repeat is a new attempt
+        ("sending", None, False):             {"told"},     # allowed: the start sends it, once
+        ("sending", "data", True):            {"unknown"},  # handed over, no answer seen:
+        ("sending", "data", False):           {"unknown"},  # never sent again
+        ("approved", "sent", True):           {"told"},     # the server took it
+        ("approved", "sent", False):          {"told"},
+    }, walked
+    _the_states_no_stop_changes()
+    print(f"ok: stopped after any of {points} writes, a send is made at most once — also "
+          f"by a repeat of its request — and what the server took is on record")
+
+
+def _the_states_no_stop_changes():
+    """The rest of what a start can find under a request's key — the states
+    a send rests in, which a stop leaves as they are — and what a repeat of
+    the request does in each, before a restart and after one. It sends in
+    one: a send that failed with nothing having left the gateway."""
+    def rest(make, *, policy, expect, sends):
+        w = world(policy=policy)
+        try:
+            gw, box, smtp = w.gw, w.box, w.smtp
+            box.put("INBOX", t.msg("a@x.org", day=1))
+            w.mirror.poll()
+            press = dict(recipient="a@x.org", message="Once.", request_key="rest-1")
+            first = make(w, press)
+            mails, sessions = len(smtp.mails), smtp.sessions
+            for again in (False, True):
+                if again:
+                    w.restart()
+                    assert (len(smtp.mails), smtp.sessions) == (mails, sessions), \
+                        (expect, "a start sends nothing of a send at rest")
+                elif sends:
+                    continue    # (asked once, after the restart: it sends)
+                status, answer = w.send(**press)
+                if sends:
+                    break
+                assert status == expect[0], (expect, again, status, answer)
+                assert answer["repeat"] is True and "sent" not in answer, (expect, answer)
+                for name, value in expect[1].items():
+                    assert answer[name] == value, (expect, name, answer)
+                assert answer["message_id"] == first["message_id"]
+                assert (len(smtp.mails), smtp.sessions) == (mails, sessions), expect
+            if sends:
+                assert status == expect[0] and "repeat" not in answer, (expect, answer)
+                assert answer["message_id"] != first["message_id"], "composed afresh"
+                assert (len(smtp.mails), smtp.sessions) == (mails + 1, sessions + 1)
+                assert gw.SENDS.get(first["id"]) is None
+                # …and that new attempt is a send like any other: remembered.
+                assert w.send(**press) == (200, {**answer, "repeat": True})
+                assert len(smtp.mails) == mails + 1
+        finally:
+            done(w)
+
+    def queued(w, press):
+        _s, answer = w.send(**press)
+        return w.gw.SENDS.get(answer["request_id"])
+
+    def decided(verb):
+        def make(w, press):
+            entry = queued(w, press)
+            w.gw._decide_send(entry["id"], verb)
+            return entry
+        return make
+
+    def sent(w, press):
+        w.send(**press)
+        return w.gw.SENDS.by_key(press["request_key"])
+
+    def unknown(dismissed):
+        def make(w, press):
+            w.smtp.drop = "dot"
+            w.send(**press)
+            w.smtp.drop = None
+            entry = w.gw.SENDS.by_key(press["request_key"])
+            assert entry["status"] == "error" and entry["outcome_unknown"] is True
+            if dismissed:
+                w.gw.SENDS.dismiss(entry["id"])
+            return entry
+        return make
+
+    def failed(w, press):
+        w.smtp.reject_data = "554 5.7.1 content rejected"
+        w.gw._accept_send(dict(press), HOST, caller_waits=lambda: False)
+        w.smtp.reject_data = None
+        entry = w.gw.SENDS.by_key(press["request_key"])
+        assert entry["status"] == "error" and entry["outcome_unknown"] is False
+        return entry
+
+    def unsaid(w, press):
+        entry = failed(w, press)
+        return w.gw.SENDS.update(entry["id"], drop=("outcome_unknown",))
+
+    not_known = {"unconfirmed": True, "outcome_unknown": True}
+    #    the entry at rest                              a repeat is answered     and sends
+    rest(queued, policy="verify", expect=(202, {"status": "pending_approval"}), sends=False)
+    rest(decided("reject"), policy="verify", expect=(409, {"status": "rejected"}), sends=False)
+    rest(decided("retract"), policy="verify", expect=(409, {"status": "retracted"}),
+         sends=False)
+    rest(decided("approve"), policy="verify", expect=(200, {"status": "sent"}), sends=False)
+    rest(sent, policy="allow", expect=(200, {"status": "sent"}), sends=False)
+    rest(unknown(False), policy="allow", expect=(502, not_known), sends=False)
+    rest(unknown(True), policy="allow", expect=(502, not_known), sends=False)
+    rest(unsaid, policy="allow", expect=(502, not_known), sends=False)
+    rest(failed, policy="allow", expect=(200, {"status": "sent"}), sends=True)
 
 
 def test_the_stop_between_the_servers_answer_and_its_mark():
@@ -1493,7 +1700,8 @@ def test_the_stop_between_the_servers_answer_and_its_mark():
             gw, box, mirror, smtp = w.gw, w.box, w.mirror, w.smtp
             box.put("INBOX", t.msg("a@x.org", day=1))
             mirror.poll()
-            _s, queued = w.send(recipient="a@x.org")
+            press = dict(recipient="a@x.org", request_key="blind-1")
+            _s, queued = w.send(**press)
             rid, mid = queued["request_id"], queued["message_id"]
             real_update = gw.SENDS.update
 
@@ -1516,14 +1724,22 @@ def test_the_stop_between_the_servers_answer_and_its_mark():
                 gw._between_polls(mirror)
             entry = gw.SENDS.get(rid)
             assert smtp.sessions == 1 and len(smtp.mails) == 1, "not sent again"
+            status, said = w.send(**press)
             if save_sent:
                 # Nothing can say: reported as what it is, text and all.
                 assert entry["status"] == "error" and entry["error"] == gw.UNKNOWN_OUTCOME
                 assert entry["message"] == "Thanks." and mid not in t.by_id(gw)
+                # …and to the request made again: not known — never "failed",
+                # never a new attempt.
+                assert status == 502 and said["unconfirmed"] is True, said
+                assert said["outcome_unknown"] is True and "sent" not in said
             else:
                 # The provider's Sent copy says it went out: finished.
                 assert entry["status"] == "approved" and entry["done"]
                 assert t.by_id(gw)[mid]["author"] == "agent" and len(w.told()) == 1
+                assert status == 200 and said["status"] == "sent" and said["message_id"] == mid
+            assert said["repeat"] is True
+            assert smtp.sessions == 1 and len(smtp.mails) == 1, "nor by the repeat"
         finally:
             done(w)
     print("ok: a stop between the server's answer and its mark never resends; Sent decides "
@@ -2017,8 +2233,9 @@ def test_a_delete_erases_nothing_while_a_mail_is_neither_trashed_nor_known_gone(
         done(w)
 
     # A mail a client moved since the last poll is not where the index says:
-    # not there to be trashed, and not known to be gone. The chat stays; the
-    # call made again looks for it, finds it, and finishes.
+    # not there to be trashed, and not known to be gone. It is looked for at
+    # once, in every mirrored folder — and while one of them cannot say, the
+    # chat stays; the call made again finds the mail, and finishes.
     w = world()
     try:
         gw, box, mirror = w.gw, w.box, w.mirror
@@ -2029,21 +2246,69 @@ def test_a_delete_erases_nothing_while_a_mail_is_neither_trashed_nor_known_gone(
         mirror.poll()
         events = len(w.events)
         box.move_mail("INBOX", box.uid_of("INBOX", "b@x.org"), "Archive")
+        box.refused.add("Archive")
         result = mirror.delete_chat("a@x.org")
         assert result["errors"] == 1 and result["trashed"] == 1 and result["messages"] == 0
-        assert "not deleted" in result["error"]
+        assert "not deleted" in result["error"] and "cannot say" in result["error"]
         assert held_in(box, "Archive") == ["b@x.org"] and held_in(box, "Trash") == ["a@x.org"]
         assert len(t.records(gw)) == 3 and mirror.thread("a@x.org")["live"] == 2
         assert len(w.events) == events, "nothing is told: the chat is as it was"
+        box.refused.clear()
         result = mirror.delete_chat("a@x.org")
         assert result["errors"] == 0 and result["trashed"] == 1 and result["messages"] == 2
         assert held_in(box, "Trash") == ["a@x.org", "b@x.org"] and held_in(box, "Archive") == []
         assert [r["message_id"] for r in t.records(gw)] == ["other@x.org"]
     finally:
         done(w)
+    # Where every folder answers, one call does it: the mail is found where
+    # the client put it, and goes to the Trash from there.
+    w = world()
+    try:
+        gw, box, mirror = w.gw, w.box, w.mirror
+        box.put("INBOX", t.msg("a@x.org", day=1))
+        box.put("INBOX", t.msg("b@x.org", subject="Re: Quarterly numbers", refs=["a@x.org"],
+                               day=2))
+        box.put("INBOX", t.msg("other@x.org", subject="Other", day=3))
+        mirror.poll()
+        box.move_mail("INBOX", box.uid_of("INBOX", "b@x.org"), "Archive")
+        result = mirror.delete_chat("a@x.org")
+        assert result["errors"] == 0 and result["trashed"] == 2 and result["messages"] == 2
+        assert "error" not in result
+        assert held_in(box, "Trash") == ["a@x.org", "b@x.org"] and held_in(box, "Archive") == []
+        assert [r["message_id"] for r in t.records(gw)] == ["other@x.org"]
+        for _ in range(2):
+            mirror.poll()
+        assert [r["message_id"] for r in t.records(gw)] == ["other@x.org"]
+    finally:
+        done(w)
+    # …but one that is moved on again while the call looks is still open.
+    w = world()
+    try:
+        gw, box, mirror = w.gw, w.box, w.mirror
+        box.put("INBOX", t.msg("a@x.org", day=1))
+        box.put("INBOX", t.msg("b@x.org", subject="Re: Quarterly numbers", refs=["a@x.org"],
+                               day=2))
+        mirror.poll()
+        box.move_mail("INBOX", box.uid_of("INBOX", "b@x.org"), "Archive")
+        real_move = box.move
 
-    # One a client deleted outright: the first call cannot know it is gone;
-    # the second has every folder's answer that it is, and erases.
+        def not_there(folder, uids, to_folder, **kwargs):
+            if folder == "Archive":     # a client was quicker, once more
+                box.move_mail("Archive", box.uid_of("Archive", "b@x.org"), "INBOX")
+            return real_move(folder, uids, to_folder, **kwargs)
+        box.move = not_there
+        result = mirror.delete_chat("a@x.org")
+        box.move = real_move
+        assert result["errors"] == 1 and result["trashed"] == 1 and result["messages"] == 0
+        assert held_in(box, "INBOX") == ["b@x.org"] and len(t.records(gw)) == 2
+        result = mirror.delete_chat("a@x.org")
+        assert result["errors"] == 0 and result["trashed"] == 1 and result["messages"] == 2
+        assert held_in(box, "Trash") == ["a@x.org", "b@x.org"] and t.records(gw) == []
+    finally:
+        done(w)
+
+    # One a client deleted outright: gone is said only once every folder has
+    # answered that it does not hold it.
     w = world()
     try:
         gw, box, mirror = w.gw, w.box, w.mirror
@@ -2052,10 +2317,10 @@ def test_a_delete_erases_nothing_while_a_mail_is_neither_trashed_nor_known_gone(
                                day=2))
         mirror.poll()
         box.remove("INBOX", box.uid_of("INBOX", "b@x.org"))
-        result = mirror.delete_chat("a@x.org")
-        assert result["errors"] == 1 and result["trashed"] == 1 and len(t.records(gw)) == 2
         # While one folder will not say, "gone" is not said either.
         box.refused.add("Archive")
+        result = mirror.delete_chat("a@x.org")
+        assert result["errors"] == 1 and result["trashed"] == 1 and len(t.records(gw)) == 2
         result = mirror.delete_chat("a@x.org")
         assert result["errors"] >= 1 and result["messages"] == 0 and len(t.records(gw)) == 2
         box.refused.clear()
@@ -2064,22 +2329,186 @@ def test_a_delete_erases_nothing_while_a_mail_is_neither_trashed_nor_known_gone(
         assert t.records(gw) == [] and held_in(box, "Trash") == ["a@x.org"]
     finally:
         done(w)
+    w = world()
+    try:
+        gw, box, mirror = w.gw, w.box, w.mirror
+        box.put("INBOX", t.msg("a@x.org", day=1))
+        box.put("INBOX", t.msg("b@x.org", subject="Re: Quarterly numbers", refs=["a@x.org"],
+                               day=2))
+        mirror.poll()
+        box.remove("INBOX", box.uid_of("INBOX", "b@x.org"))
+        found = len(box.found)
+        result = mirror.delete_chat("a@x.org")
+        assert result["errors"] == 0 and result["trashed"] == 1 and result["messages"] == 2
+        # (Every mirrored folder was asked for it before it was called gone.)
+        assert sorted(box.found[found:]) == [
+            ("Archive", "b@x.org"), ("INBOX", "b@x.org"), ("Sent", "b@x.org")]
+        assert t.records(gw) == [] and held_in(box, "Trash") == ["a@x.org"]
+    finally:
+        done(w)
 
-    # A mirrored folder that is gone altogether: the same rule.
+    # A mirrored folder that is gone altogether: the same rule — the server
+    # says it has no such folder, so nothing is in it.
     w = world()
     try:
         gw, box, mirror = w.gw, w.box, w.mirror
         thread_of_three(w)
         del box.boxes["Archive"]
         result = mirror.delete_chat("a@x.org")
-        assert result["errors"] == 1 and result["trashed"] == 2 and result["messages"] == 0
-        assert len(t.records(gw)) == 4
-        result = mirror.delete_chat("a@x.org")
-        assert result["errors"] == 0 and result["messages"] == 3
+        assert result["errors"] == 0 and result["trashed"] == 2 and result["messages"] == 3
         assert [r["message_id"] for r in t.records(gw)] == ["other@x.org"]
     finally:
         done(w)
     print("ok: delete erases only once every mail is in the Trash or known to be in no folder")
+
+
+def label_mailbox(box, labels=("INBOX", "Archive")) -> None:
+    """Make the fake a mailbox in which a folder is a label: one message
+    shows in every folder whose label it has, and in the Trash it has none.
+    So a move to the Trash from one of them takes the message out of the
+    others, and a move to a folder it is in already adds no second copy —
+    the server names the place it has there."""
+    real = box.move
+
+    def held(folder) -> dict:
+        return {uid: (email.message_from_bytes(mail["raw"]).get("Message-ID") or "")
+                .strip("<>") for uid, mail in box.boxes[folder]["mails"].items()}
+
+    def move(folder, uids, to_folder, *, validity=None):
+        if folder not in labels or folder not in box.boxes or to_folder not in box.boxes:
+            return real(folder, uids, to_folder, validity=validity)
+        before = held(folder)
+        there = {mid: uid for uid, mid in held(to_folder).items()}
+        result = real(folder, uids, to_folder, validity=validity)
+        moved = dict(result.moved)
+        for uid, new in result.moved.items():
+            if to_folder in labels and before[uid] in there:
+                added = max(u for u, mid in held(to_folder).items() if mid == before[uid])
+                del box.boxes[to_folder]["mails"][added]
+                moved[uid] = there[before[uid]] if box.names_uids else None
+            elif to_folder not in labels:
+                for other in labels:
+                    for u, mid in held(other).items():
+                        if other != folder and mid == before[uid]:
+                            del box.boxes[other]["mails"][u]
+        return box.gw.Moved(moved, result.left, result.absent)
+    box.move = move
+
+
+def test_one_message_in_two_folders_is_read_archived_and_deleted_as_one():
+    """A mailbox that shows one message in two mirrored folders — a label
+    mailbox, where the archive holds every mail of the INBOX as well. The
+    mirror gives such a mail both places itself. Moving it to the Trash from
+    the one takes it out of the other, and that is no mail a client moved
+    away: the delete completes, in one call."""
+    w = world()
+    try:
+        gw, box, mirror = w.gw, w.box, w.mirror
+        label_mailbox(box)
+
+        def arrive(raw):
+            box.put("INBOX", raw)
+            box.put("Archive", raw)
+        arrive(t.msg("old@x.org", day=1))
+        mirror.poll()
+        mirror.poll()
+        # Between two polls: two mails arrive and stay, and a third is
+        # archived on the phone at once — which has the mirror look for the
+        # archive's copies of what it holds.
+        arrive(t.msg("y@x.org", sender="Yves <y@x.org>", subject="Lunch?", day=later(10)))
+        arrive(t.msg("x@x.org", sender="Xena <x@x.org>", subject="Dinner?", day=later(15)))
+        arrive(t.msg("z@x.org", sender="Zoe <z@x.org>", subject="Invoice", day=later(20)))
+        box.remove("INBOX", box.uid_of("INBOX", "z@x.org"))
+        for _ in range(3):
+            mirror.poll()
+        chat, other = t.by_id(gw)["y@x.org"]["chat"], t.by_id(gw)["x@x.org"]["chat"]
+        for mail, of in (("y@x.org", chat), ("x@x.org", other)):
+            assert mirror._places(of, ("inbox", "sent", "archive")) == {
+                "archive": {box.uid_of("Archive", mail): mail},
+                "inbox": {box.uid_of("INBOX", mail): mail}}, "one mail, two places"
+        events = len(w.events)
+
+        # Read: flagged where it is — in both — and nothing else is touched.
+        assert mirror.mark_read(chat) == 2
+        assert "\\Seen" in flags(box, "INBOX", "y@x.org")
+        assert "\\Seen" in flags(box, "Archive", "y@x.org")
+        assert flags(box, "INBOX", "x@x.org") == frozenset()
+
+        # Delete: to the Trash from the first place; the second is then
+        # empty by this call's own doing. No error, no second call.
+        result = mirror.delete_chat(chat)
+        assert result["errors"] == 0 and "error" not in result, result
+        assert result["trashed"] == 1 and result["messages"] == 1
+        assert held_in(box, "Trash") == ["y@x.org"]
+        assert "y@x.org" not in held_in(box, "INBOX") + held_in(box, "Archive")
+        assert "y@x.org" not in t.by_id(gw) and mirror.thread(chat) is None
+        assert mirror.index.one("SELECT COUNT(*) AS n FROM locations WHERE message_id = "
+                                "'y@x.org'")["n"] == 0
+        for _ in range(3):
+            mirror.poll()
+        assert "y@x.org" not in t.by_id(gw), "nothing comes back"
+
+        # Archive: out of the INBOX, and the place it has in the archive is
+        # the one the index keeps — no second copy, nothing called gone.
+        events = len(w.events)
+        kept = box.uid_of("Archive", "x@x.org")
+        assert mirror.archive(other) == {"moved": 1, "flagged": 0}
+        assert "x@x.org" not in held_in(box, "INBOX")
+        assert held_in(box, "Archive").count("x@x.org") == 1
+        assert mirror._places(other, ("inbox", "sent", "archive")) == {
+            "archive": {kept: "x@x.org"}}
+        assert settling(mirror, "x@x.org") is None
+        for _ in range(3):
+            mirror.poll()
+        assert len(w.events) == events and not t.by_id(gw)["x@x.org"]["removed_at"]
+        assert mirror.mark_read(other) == 1
+        # …the same where the server does not say which place that is.
+        arrive(t.msg("v@x.org", sender="Vera <v@x.org>", subject="Tea?", day=later(30)))
+        arrive(t.msg("u@x.org", sender="Udo <u@x.org>", subject="Bill", day=later(35)))
+        box.remove("INBOX", box.uid_of("INBOX", "u@x.org"))
+        for _ in range(3):
+            mirror.poll()
+        third = t.by_id(gw)["v@x.org"]["chat"]
+        assert set(mirror._places(third, ("inbox", "archive"))) == {"archive", "inbox"}
+        box.names_uids = False
+        assert mirror.archive(third) == {"moved": 1, "flagged": 0}
+        assert mirror._places(third, ("inbox", "sent", "archive")) == {
+            "archive": {box.uid_of("Archive", "v@x.org"): "v@x.org"}}
+        box.names_uids = True
+        # And the archived chat is deleted like any other.
+        result = mirror.delete_chat(other)
+        assert result["errors"] == 0 and result["trashed"] == 1 and result["messages"] == 1
+        assert held_in(box, "Trash") == ["x@x.org", "y@x.org"]
+    finally:
+        done(w)
+
+    # Two real copies, where folders are folders: each is moved, and one
+    # that a client took away meanwhile is looked for — not taken for the
+    # other copy's move.
+    w = world()
+    try:
+        gw, box, mirror = w.gw, w.box, w.mirror
+        raw = t.msg("a@x.org", day=1)
+        box.put("INBOX", raw)
+        box.put("Archive", raw)
+        mirror.poll()
+        mirror.poll()
+        if set(mirror._places("a@x.org", ("inbox", "archive"))) != {"archive", "inbox"}:
+            mirror._locate("archive", box.uid_of("Archive", "a@x.org"), "a@x.org")
+        # The INBOX copy is moved by a client into the archive: a second
+        # copy there, under a UID no index knows.
+        box.move_mail("INBOX", box.uid_of("INBOX", "a@x.org"), "Archive")
+        result = mirror.delete_chat("a@x.org")
+        assert result["errors"] == 0 and result["trashed"] == 2 and result["messages"] == 1
+        assert held_in(box, "Trash") == ["a@x.org", "a@x.org"]
+        assert held_in(box, "Archive") == [] and held_in(box, "INBOX") == []
+        for _ in range(3):
+            mirror.poll()
+        assert t.records(gw) == [], "no copy was left behind to bring the chat back"
+    finally:
+        done(w)
+    print("ok: one message in two folders is flagged, archived and deleted as the one mail "
+          "it is")
 
 
 def test_the_mailbox_endpoints_and_the_erase_capability():
@@ -2460,10 +2889,39 @@ def test_without_an_smtp_server_nothing_is_sent_and_the_mirror_runs():
         assert snap["can_send"] is False and "SMTP_HOST" in snap["cannot_send_reason"]
         status, answer = w.send(recipient="a@x.org")
         assert status == 503 and "SMTP_HOST" in answer["error"], answer
+        # (A 5xx a caller could read as "outcome open" says that it is not.)
+        assert answer["sent"] is False
         assert smtp.sessions == 0 and gw.SENDS.entries() == []
         # The mailbox still follows the chat: that is IMAP.
         assert mirror.mark_read("a@x.org") == 1
         assert mirror.archive("a@x.org") == {"moved": 1, "flagged": 0}
+    finally:
+        done(w)
+
+    w = world()
+    try:
+        gw, smtp = w.gw, w.smtp
+        # Nor is anything sent where the send could not even be written down.
+        real_create = gw.SENDS.create
+
+        def full(*args, **kwargs):
+            raise OSError(28, "No space left on device")
+        gw.SENDS.create = full
+        status, answer = w.send(to=["ann@x.org"], request_key="disk-1")
+        gw.SENDS.create = real_create
+        assert status == 503 and answer["sent"] is False and "retry" in answer["error"]
+        assert smtp.sessions == 0 and gw.SENDS.entries() == []
+        # But what became of an earlier send is said first — by a gateway
+        # that can send no more as well: "nothing was sent" is never said
+        # over a mail that went out under the key.
+        status, sent = w.send(to=["ann@x.org"], request_key="out-1")
+        assert status == 200 and smtp.sessions == 1
+        w.restart()
+        gw.SMTP_PROBLEM = "SMTP_HOST is not set"
+        assert w.send(to=["ann@x.org"], request_key="out-1") == (200, {**sent, "repeat": True})
+        status, answer = w.send(to=["ann@x.org"], request_key="out-2")
+        assert status == 503 and answer == {"error": "SMTP_HOST is not set", "sent": False}
+        assert smtp.sessions == 1
     finally:
         done(w)
     print("ok: with no SMTP server the mailbox is mirrored and followed, and a send says why not")
@@ -2646,7 +3104,8 @@ def test_the_loop_files_the_copy_while_the_mailbox_answers_and_not_after_it_fail
 
 def test_one_press_is_one_mail():
     """``request_key``: a repeat of a request is answered with what became
-    of the first — the same Message-ID — and sends nothing."""
+    of the first — the same Message-ID — and sends nothing. And says that it
+    is a repeat: the mail went out before, not by this request."""
     w = world()
     try:
         gw, box, mirror, smtp = w.gw, w.box, w.mirror, w.smtp
@@ -2655,24 +3114,27 @@ def test_one_press_is_one_mail():
         press = dict(recipient="a@x.org", message="Once.", request_key="press-1")
         status, first = w.send(**press)
         assert status == 200 and first["status"] == "sent"
+        assert "repeat" not in first, "the request that sent the mail is no repeat"
+        again = {**first, "repeat": True}
         for _ in range(3):
-            assert w.send(**press) == (200, first)
+            assert w.send(**press) == (200, again)
         assert len(smtp.mails) == 1 and smtp.sessions == 1
         (told,) = w.told()
         assert told["request_key"] == "press-1" and told["message_id"] == first["message_id"]
-        assert w.send(**press) == (200, first) and len(w.sent_copies()) == 1
+        assert w.send(**press) == (200, again) and len(w.sent_copies()) == 1
         # The entry is what remembers the key: kept, done, and not listed.
         (entry,) = gw.SENDS.entries()
         assert entry["done"] is True and entry["request_key"] == "press-1"
         assert gw.SENDS.listed() == [] and "press" not in gw._public(entry)
         # Also after a restart.
         w.restart()
-        assert w.send(**press) == (200, first) and len(smtp.mails) == 1
+        assert w.send(**press) == (200, again) and len(smtp.mails) == 1
         # A key names one press: used for another mail it is a mistake, said
         # as one — never answered with the first mail's "sent".
         status, said = w.send(recipient="a@x.org", message="Something else.",
                               request_key="press-1")
         assert status == 409 and "request_key" in said["error"] and len(smtp.mails) == 1
+        assert "repeat" not in said, "no answer of the first send's"
         # What a key is.
         for bad in ("", "x" * 65, "two words", "tab\there", "ünï", 7, ["k"], {"k": 1}):
             status, said = w.send(recipient="a@x.org", request_key=bad)
@@ -2719,6 +3181,7 @@ def test_one_press_is_one_mail():
             assert entered.wait(10)
             status, said = w.send(**press)
             assert status == 502 and said["unconfirmed"] is True, said
+            assert said["repeat"] is True and "sent" not in said
             assert said["message_id"] == gw.SENDS.by_key("slow-1")["message_id"]
             assert smtp.mails == []
             gw.REPEAT_WAIT_SECONDS = 10
@@ -2730,7 +3193,10 @@ def test_one_press_is_one_mail():
         firstly.join(10)
         repeat.join(10)
         gw._ec._smtp_send = real_send
-        assert answers[0][0] == 200 and later == answers, (answers, later)
+        # The request that sent it says "sent"; the one that waited for it
+        # says the same, as a repeat.
+        assert answers[0][0] == 200 and "repeat" not in answers[0][1], answers
+        assert later == [(200, {**answers[0][1], "repeat": True})], (answers, later)
         assert len(smtp.mails) == 1 and answers[0][1]["message_id"] == said["message_id"]
     finally:
         done(w)
@@ -2741,58 +3207,425 @@ def test_one_press_is_one_mail():
         gw, smtp = w.gw, w.smtp
         press = dict(to=["ann@x.org"], subject="New", message="Hello.", request_key="q-1")
         status, queued = w.send(**press)
-        assert status == 202 and w.send(**press) == (202, queued)
+        assert status == 202 and "repeat" not in queued
+        assert w.send(**press) == (202, {**queued, "repeat": True})
         assert len(gw.SENDS.entries()) == 1
         gw._decide_send(queued["request_id"], "approve")
         status, sent = w.send(**press)
         assert status == 200 and sent["message_id"] == queued["message_id"]
-        assert len(smtp.mails) == 1
+        assert sent["repeat"] is True and len(smtp.mails) == 1
         status, again = w.send(to=["ann@x.org"], message="No.", request_key="q-2")
         gw._decide_send(again["request_id"], "reject")
         status, said = w.send(to=["ann@x.org"], message="No.", request_key="q-2")
         assert status == 409 and said["status"] == "rejected" and len(smtp.mails) == 1
+        assert said["repeat"] is True
     finally:
         done(w)
+    print("ok: a request_key makes a repeat of /send answer the first one's outcome, unsent")
 
-    # A send that failed for certain is answered as failed, again — and is
-    # not carried out by the repeat, whatever the server would say now.
+
+def test_a_send_that_failed_for_certain_ends_its_press():
+    """Only an unknown outcome keeps its key. A send that failed with
+    nothing having left the gateway is over: a request under its key is a
+    new attempt — the mail is composed and sent afresh — where one whose
+    mail may have gone out is answered from its entry for as long as the key
+    is remembered, and never sent again."""
     w = world()
     try:
         gw, smtp = w.gw, w.smtp
+        # The server refuses the mail: failed, said as certain, and no repeat.
         smtp.reject_data = "554 5.7.1 content rejected"
         press = dict(to=["ann@x.org"], message="Hm.", request_key="f-1")
         status, said = w.send(**press)
         assert status == 502 and said["error"].startswith("send failed: ")
         assert "554" in said["error"] and "unconfirmed" not in said
+        assert said["sent"] is False and "repeat" not in said
+        # Its caller had the answer: nothing of it is kept, in the chat or
+        # for the key.
+        assert gw.SENDS.entries() == [] and gw.SENDS.by_key("f-1") is None
+        # The same press again, once the server relents: sent — now, for the
+        # first time, and not answered with the old failure.
         smtp.reject_data = None
-        assert w.send(**press) == (status, said) and smtp.mails == [] and smtp.sessions == 1
-        # Its caller had the answer: nothing of it shows in the chat.
-        assert gw.SENDS.listed() == [] and gw.SENDS.entries()[0]["dismissed"] is True
-        # A direct send stopped before anything left is dropped at the next
-        # start, and its key with it: the caller had no answer, and asks again.
-        real_json = gw._atomic_json
-        writes = []
+        status, sent = w.send(**press)
+        assert status == 200 and sent["status"] == "sent" and "repeat" not in sent
+        assert len(smtp.mails) == 1 and smtp.sessions == 2
+        # …and that one is remembered: a repeat of it sends nothing.
+        assert w.send(**press) == (200, {**sent, "repeat": True}) and len(smtp.mails) == 1
 
-        def stop_after_the_entry(path, data):
-            real_json(path, data)
-            writes.append(path)
-            raise _Kill()
-        gw._atomic_json = stop_after_the_entry
+        # The caller had gone before the failure was known: the entry is kept
+        # as a failed send, where the chat finds it — and gives way to the
+        # new attempt made under its key.
+        smtp.drop = "connect"
+        press = dict(to=["ann@x.org"], message="Later.", request_key="f-2")
+        status, said = gw._accept_send(dict(press), HOST, caller_waits=lambda: False)
+        assert status == 502 and said["sent"] is False
+        (failed,) = gw.SENDS.listed()
+        assert failed["status"] == "error" and failed["outcome_unknown"] is False
+        assert failed["request_key"] == "f-2" and "dismissed" not in failed
+        smtp.drop = None
+        sessions = smtp.sessions
+        status, sent = w.send(**press)
+        assert status == 200 and "repeat" not in sent and len(smtp.mails) == 2
+        assert smtp.sessions == sessions + 1
+        assert sent["message_id"] != failed["message_id"], "composed afresh"
+        assert gw.SENDS.get(failed["id"]) is None and gw.SENDS.listed() == []
+        assert gw.SENDS.by_key("f-2")["message_id"] == sent["message_id"]
+        # A key under which nothing was sent names no mail yet: the new
+        # attempt may be another text (the user corrected what was refused).
+        smtp.reject_data = "552 5.3.4 message too big"
+        status, said = gw._accept_send(
+            dict(to=["ann@x.org"], message="Much too long.", request_key="f-3"), HOST,
+            caller_waits=lambda: False)
+        assert status == 502 and len(gw.SENDS.listed()) == 1
+        smtp.reject_data = None
+        status, sent = w.send(to=["ann@x.org"], message="Shorter.", request_key="f-3")
+        assert status == 200 and len(smtp.mails) == 3 and gw.SENDS.listed() == []
+        assert smtp.parsed().get_content().strip() == "Shorter."
+        # A new attempt that is refused as it stands leaves the failed send
+        # where it was: nothing replaced it.
+        smtp.reject_data = "552 5.3.4 message too big"
+        gw._accept_send(dict(to=["ann@x.org"], message="Big.", request_key="f-4"), HOST,
+                        caller_waits=lambda: False)
+        smtp.reject_data = None
+        (kept,) = gw.SENDS.listed()
+        status, said = w.send(to=["not an address"], message="Big.", request_key="f-4")
+        assert status == 400 and [e["id"] for e in gw.SENDS.listed()] == [kept["id"]]
+        assert len(smtp.mails) == 3
+
+        # Two requests of one press at once, after a failure: one new mail.
+        entered, release = threading.Event(), threading.Event()
+        real_send = gw._ec._smtp_send
+
+        def slow(*args, **kwargs):
+            entered.set()
+            release.wait(30)
+            return real_send(*args, **kwargs)
+        gw._ec._smtp_send = slow
+        press = dict(to=["ann@x.org"], message="Big.", request_key="f-4")
+        answers = []
+        firstly = threading.Thread(target=lambda: answers.append(w.send(**press)))
+        firstly.start()
         try:
-            w.send(to=["ann@x.org"], message="Stopped.", request_key="s-1")
+            assert entered.wait(10)
+            assert gw.SENDS.get(kept["id"]) is None, "the failed entry gave way"
+            other = []
+            second = threading.Thread(target=lambda: other.append(w.send(**press)))
+            second.start()
+        finally:
+            release.set()
+        firstly.join(10)
+        second.join(10)
+        gw._ec._smtp_send = real_send
+        assert answers[0][0] == 200 and "repeat" not in answers[0][1]
+        assert other == [(200, {**answers[0][1], "repeat": True})], other
+        assert len(smtp.mails) == 4
+    finally:
+        done(w)
+
+    # A repeat that waited for a send still with the SMTP server, which the
+    # server then refused: the request that made the attempt has the failure
+    # as its answer and clears its entry at once — and the one that waited is
+    # told the same, for certain, from how the flight ended. Never
+    # "unconfirmed" for a mail nothing of which left: that would keep the
+    # press on a key for good.
+    w = world()
+    try:
+        gw, smtp = w.gw, w.smtp
+        gw.REPEAT_WAIT_SECONDS = 10
+        entered, release, waiting = threading.Event(), threading.Event(), threading.Event()
+        real_send, real_wait = gw._ec._smtp_send, gw._Flight.wait
+
+        def slow(*args, **kwargs):
+            entered.set()
+            release.wait(30)
+            return real_send(*args, **kwargs)
+
+        def wait(self, timeout=None):
+            waiting.set()
+            got = real_wait(self, timeout)
+            firstly.join(10)    # by now the first request has cleared its entry
+            return got
+        gw._ec._smtp_send, gw._Flight.wait = slow, wait
+        smtp.reject_data = "554 5.7.1 content rejected"
+        press = dict(to=["ann@x.org"], message="No.", request_key="w-1")
+        answers, later = [], []
+        firstly = threading.Thread(target=lambda: answers.append(w.send(**press)))
+        repeat = threading.Thread(target=lambda: later.append(w.send(**press)))
+        firstly.start()
+        try:
+            assert entered.wait(10)
+            repeat.start()
+            assert waiting.wait(10)
+        finally:
+            release.set()
+        firstly.join(10)
+        repeat.join(10)
+        gw._ec._smtp_send, gw._Flight.wait = real_send, real_wait
+        status, said = answers[0]
+        assert status == 502 and said["sent"] is False and "repeat" not in said, answers
+        assert later == [(502, {**said, "repeat": True})], later
+        assert "unconfirmed" not in later[0][1] and "554" in later[0][1]["error"]
+        assert gw.SENDS.entries() == [] and gw._IN_FLIGHT == {} and smtp.sessions == 1
+        # …and the press after that is the new attempt.
+        smtp.reject_data = None
+        status, sent = w.send(**press)
+        assert status == 200 and "repeat" not in sent and len(smtp.mails) == 1
+    finally:
+        done(w)
+
+    # A mail that may have gone out keeps its key: never a new attempt —
+    # not after a restart, not once it was dismissed, whatever the server
+    # would say now.
+    w = world()
+    try:
+        gw, smtp = w.gw, w.smtp
+        smtp.drop = "dot"       # the whole mail arrived; the line died before the answer
+        press = dict(to=["ann@x.org"], message="Maybe.", request_key="u-1")
+        status, said = w.send(**press)
+        assert status == 502 and said["unconfirmed"] is True and said["outcome_unknown"] is True
+        assert "sent" not in said and "repeat" not in said
+        smtp.drop = None
+        unknown = {**said, "repeat": True}
+        assert w.send(**press) == (502, unknown)
+        w.restart()
+        assert w.send(**press) == (502, unknown)
+        (entry,) = gw.SENDS.listed()
+        dismissed, did = gw.SENDS.dismiss(entry["id"])
+        assert did and dismissed["dismissed"] is True and gw.SENDS.listed() == []
+        # (Dismissed, it is over for the chat — and kept for this answer.)
+        kept = gw.SENDS.get(entry["id"])
+        assert kept["status"] == "error" and kept["dismissed"] is True
+        assert kept["outcome_unknown"] is True
+        assert w.send(**press) == (502, unknown)
+        assert smtp.sessions == 1 and len(smtp.mails) == 1, "handed over once"
+        # An entry that does not say whether its outcome is known is not
+        # taken for unsent either.
+        smtp.reject_data = "554 5.7.1 content rejected"
+        gw._accept_send(dict(to=["ann@x.org"], message="Old.", request_key="u-2"), HOST,
+                        caller_waits=lambda: False)
+        smtp.reject_data = None
+        old = gw.SENDS.by_key("u-2")
+        gw.SENDS.update(old["id"], drop=("outcome_unknown",))
+        status, said = w.send(to=["ann@x.org"], message="Old.", request_key="u-2")
+        assert status == 502 and said["unconfirmed"] is True and said["repeat"] is True
+        assert len(smtp.mails) == 1
+    finally:
+        done(w)
+
+    # A queued send that failed after it was allowed: the new attempt under
+    # its key is queued afresh — the policy decides again — and the failed
+    # entry is gone from the chat.
+    w = world(policy="verify")
+    try:
+        gw, smtp = w.gw, w.smtp
+        press = dict(to=["ann@x.org"], subject="New", message="Hello.", request_key="q-9")
+        _s, queued = w.send(**press)
+        smtp.refuse_login = True
+        gw._decide_send(queued["request_id"], "approve")
+        (failed,) = gw.SENDS.listed()
+        assert failed["id"] == queued["request_id"] and failed["outcome_unknown"] is False
+        smtp.refuse_login = False
+        status, anew = w.send(**press)
+        assert status == 202 and anew["status"] == "pending_approval" and "repeat" not in anew
+        assert anew["request_id"] != queued["request_id"]
+        assert anew["message_id"] != queued["message_id"] and smtp.mails == []
+        assert [(e["id"], e["status"]) for e in gw.SENDS.listed()] == [
+            (anew["request_id"], "pending")]
+        gw._decide_send(anew["request_id"], "approve")
+        assert len(smtp.mails) == 1
+        assert w.send(**press)[1]["repeat"] is True and len(smtp.mails) == 1
+    finally:
+        done(w)
+
+    # A direct send a stop caught before anything was handed over: its
+    # caller was given no answer (and may have told its user "not confirmed
+    # yet"), so it is not dropped — it ends as failed for certain, listed
+    # with its words. A repeat under its key then sends the mail: once.
+    w = world(policy="trust")
+    try:
+        gw, box, mirror, smtp = w.gw, w.box, w.mirror, w.smtp
+        box.put("INBOX", t.msg("a@x.org", day=1))
+        mirror.poll()
+
+        def stopped(*args, **kwargs):
+            raise _Kill()       # while the SMTP session is being opened
+        real_send = gw._ec._smtp_send
+        gw._ec._smtp_send = stopped
+        press = dict(recipient="a@x.org", message="My considered answer.", author="user",
+                     user_approved=True, request_key="s-1",
+                     images=[{"filename": "a.txt", "data": base64.b64encode(b"f").decode()}])
+        try:
+            w.send(**press)
             raise AssertionError("not stopped")
         except _Kill:
             pass
         finally:
-            gw._atomic_json = real_json
-        assert gw.SENDS.by_key("s-1")["status"] == "sending"
+            gw._ec._smtp_send = real_send
+        (before,) = gw.SENDS.listed("a@x.org")
+        assert before["status"] == "sending" and "phase" not in before
         w.restart()
-        assert gw.SENDS.by_key("s-1") is None
-        status, sent = w.send(to=["ann@x.org"], message="Stopped.", request_key="s-1")
-        assert status == 200 and len(smtp.mails) == 1
+        (after,) = gw.SENDS.listed("a@x.org")
+        assert after["id"] == before["id"] and after["status"] == "error", after
+        assert after["error"] == gw.STOPPED_UNSENT and after["outcome_unknown"] is False
+        assert after["message"] == "My considered answer." and "dismissed" not in after
+        assert gw.SENDS.images(after["id"]) == [] and after["attachments"] == ["a.txt"]
+        assert smtp.mails == [] and gw.SENDS.due() == []
+        # Asked after by id, it is what the chat shows: failed, with its reason.
+        assert gw._public(gw.SENDS.get(after["id"]))["error"] == gw.STOPPED_UNSENT
+        # Again and again, a start does nothing more to it.
+        w.restart()
+        assert [e["id"] for e in gw.SENDS.listed("a@x.org")] == [after["id"]]
+        status, sent = w.send(**press)
+        assert status == 200 and "repeat" not in sent and len(smtp.mails) == 1
+        assert gw.SENDS.get(after["id"]) is None and gw.SENDS.listed() == []
+        assert w.send(**press) == (200, {**sent, "repeat": True}) and len(smtp.mails) == 1
+        # One that named no request has nobody to ask after it: dropped.
+        gw._ec._smtp_send = stopped
+        try:
+            w.send(recipient="a@x.org", message="Nameless.", user_approved=True)
+            raise AssertionError("not stopped")
+        except _Kill:
+            pass
+        finally:
+            gw._ec._smtp_send = real_send
+        assert [e["status"] for e in gw.SENDS.listed("a@x.org")] == ["sending"]
+        w.restart()
+        assert gw.SENDS.listed() == [] and len(smtp.mails) == 1
     finally:
         done(w)
-    print("ok: a request_key makes a repeat of /send answer the first one's outcome, unsent")
+    print("ok: a send that failed for certain ends its press; only an unknown outcome "
+          "keeps its key")
+
+
+def test_a_fault_in_a_send_is_answered_from_its_entry():
+    """Something raising where nothing was planned to: the answer says what
+    the entry says, never "failed" for a mail that was handed over."""
+    w = world(save_sent=False)
+    try:
+        gw, smtp = w.gw, w.smtp
+        # After the hand-over, with the server's answer lost: asking Sent
+        # breaks in a way nobody planned for.
+        smtp.drop = "dot"
+
+        def broken(message_id):
+            raise RuntimeError("the index is locked")
+        real = w.mirror.sent_copy
+        w.mirror.sent_copy = broken
+        status, said = w.send(to=["ann@x.org"], request_key="x-1")
+        w.mirror.sent_copy = real
+        assert status == 502 and said["unconfirmed"] is True and "sent" not in said, said
+        (entry,) = gw.SENDS.entries()
+        assert entry["status"] == "sending" and entry["phase"] == "data"
+        assert gw.SENDS.due() == [entry["id"]], "left to the mirror loop"
+        smtp.drop = None
+        status, again = w.send(to=["ann@x.org"], request_key="x-1")
+        assert status == 502 and again["unconfirmed"] is True and again["repeat"] is True
+        assert smtp.sessions == 1 and len(smtp.mails) == 1
+
+        # Before anything was handed over: failed, for certain — and the key
+        # is free for the attempt that follows.
+        real_build = gw._store_sent_parts
+
+        def breaks(*args, **kwargs):
+            raise RuntimeError("no room")
+        real_fail = gw._fail_send
+        calls = []
+
+        def fail_once(entry, said_, **kwargs):
+            calls.append(said_)
+            if len(calls) == 1:
+                raise RuntimeError("could not even say so")
+            return real_fail(entry, said_, **kwargs)
+        gw._store_sent_parts, gw._fail_send = breaks, fail_once
+        status, said = w.send(to=["ann@x.org"], message="Two.", request_key="x-2")
+        gw._store_sent_parts, gw._fail_send = real_build, real_fail
+        assert status == 502 and said["sent"] is False and "unconfirmed" not in said, said
+        assert gw.SENDS.by_key("x-2") is None and len(smtp.mails) == 1
+        status, sent = w.send(to=["ann@x.org"], message="Two.", request_key="x-2")
+        assert status == 200 and len(smtp.mails) == 2
+
+        # A fault while the mail is composed — before any entry stands: not
+        # sent, and said so.
+        real_compose = gw._compose
+
+        def no_compose(*args, **kwargs):
+            raise RuntimeError("the index is gone")
+        gw._compose = no_compose
+        for press in ({"request_key": "x-3"}, {}):
+            status, said = w.send(to=["ann@x.org"], message="Three.", **press)
+            assert status == 502 and said["sent"] is False and "unconfirmed" not in said
+            assert said["error"] == "send failed: the index is gone", said
+        gw._compose = real_compose
+        assert gw.SENDS.by_key("x-3") is None and len(smtp.mails) == 2
+    finally:
+        done(w)
+
+    # And where the request itself raises, anywhere: the HTTP answer is made
+    # from what stands under its key — never "failed" off the fault alone.
+    w = world()
+    try:
+        gw, smtp = w.gw, w.smtp
+        server, base = t.serve(gw)
+
+        def post(payload):
+            request = t.urllib.request.Request(
+                base + "/send", data=json.dumps(payload).encode(), method="POST", headers={
+                    "Content-Type": "application/json", "Authorization": f"Bearer {t.TOKEN}"})
+            try:
+                with t.urllib.request.urlopen(request, timeout=10) as response:
+                    return response.status, json.loads(response.read())
+            except t.urllib.error.HTTPError as exc:
+                return exc.code, json.loads(exc.read())
+        real_answer, real_category = gw._send_answer, gw._send_category
+        faults = []
+
+        def breaks_once(entry, host_header):
+            if not faults:
+                faults.append(entry["id"])
+                raise RuntimeError("no answer could be made")
+            return real_answer(entry, host_header)
+
+        def breaks(entry, host_header):
+            raise RuntimeError("no answer could be made")
+
+        def no_policy():
+            raise RuntimeError("the policy file vanished")
+        try:
+            # After the server took the mail: it is "sent" — the entry says so.
+            gw._send_answer = breaks_once
+            status, said = post({"to": ["ann@x.org"], "message": "One.",
+                                 "request_key": "y-1"})
+            assert faults and status == 200 and said["status"] == "sent", said
+            assert len(smtp.mails) == 1
+            assert said["message_id"] == gw.SENDS.by_key("y-1")["message_id"]
+            # The same without a key, and no way left to say what the entry
+            # says: nobody knows from here — "unconfirmed", never "failed",
+            # and never "nothing was sent".
+            gw._send_answer = breaks
+            for press in ({}, {"request_key": "y-2"}):
+                status, said = post({"to": ["ann@x.org"], "message": "Two.", **press})
+                assert status == 502 and said["unconfirmed"] is True, said
+                assert "sent" not in said and not said["error"].startswith("send failed")
+            assert len(smtp.mails) == 3
+            gw._send_answer = real_answer
+            # Before anything stood under its key: failed, for certain.
+            gw._send_category = no_policy
+            status, said = post({"to": ["ann@x.org"], "message": "Three.",
+                                 "request_key": "y-3"})
+            assert status == 502 and said["sent"] is False and "unconfirmed" not in said
+            assert said["error"] == "send failed: the policy file vanished"
+            assert gw.SENDS.by_key("y-3") is None and len(smtp.mails) == 3
+            # (Without a key there is nothing to look up: not known.)
+            status, said = post({"to": ["ann@x.org"], "message": "Four."})
+            assert status == 502 and said["unconfirmed"] is True and "sent" not in said
+            gw._send_category = real_category
+            assert len(smtp.mails) == 3
+        finally:
+            gw._send_answer, gw._send_category = real_answer, real_category
+            server.shutdown()
+    finally:
+        done(w)
+    print("ok: a fault in a send is answered from what its entry says")
 
 
 def test_a_failed_send_stays_in_its_chat_until_it_is_dismissed():
@@ -2849,15 +3682,33 @@ def test_a_failed_send_stays_in_its_chat_until_it_is_dismissed():
         status, said = gw._accept_send({"to": ["ann@x.org"], "message": "Big."}, HOST,
                                        caller_waits=lambda: True)
         assert status == 502 and gw.SENDS.entries() == []
+        # (Also one that named its request: nothing is kept for a key under
+        # which nothing was sent.)
+        status, said = gw._accept_send({"to": ["ann@x.org"], "message": "Big.",
+                                        "request_key": "big-1"}, HOST,
+                                       caller_waits=lambda: True)
+        assert status == 502 and said["sent"] is False and gw.SENDS.entries() == []
         status, said = gw._accept_send({"to": ["ann@x.org"], "message": "Big."}, HOST,
                                        caller_waits=lambda: False)
         assert status == 502 and said["error"].startswith("send failed: ")
         (kept,) = gw.SENDS.listed()
         assert kept["status"] == "error" and "552" in kept["error"] and kept["direct"] is True
         assert kept["message"] == "Big." and kept["outcome_unknown"] is False
+        # Dismissed, a send that failed for certain is gone, key or no key:
+        # there is nothing left for a reader to take for a failed send.
+        status, said = gw._accept_send({"to": ["ann@x.org"], "message": "Big.",
+                                        "request_key": "big-2"}, HOST,
+                                       caller_waits=lambda: False)
+        keyed = gw.SENDS.by_key("big-2")
+        for entry in (kept, keyed):
+            dismissed, did = gw.SENDS.dismiss(entry["id"])
+            assert did and dismissed["dismissed"] is True
+            assert gw.SENDS.get(entry["id"]) is None
+        assert gw.SENDS.entries() == []
     finally:
         done(w)
-    print("ok: a send that failed is listed with its reason until dismissed, and never resent")
+    print("ok: a send that failed is listed with its reason until dismissed, and never "
+          "released again")
 
 
 def test_failed_sends_over_http_and_a_caller_that_hung_up():
@@ -2910,7 +3761,8 @@ def test_failed_sends_over_http_and_a_caller_that_hung_up():
             status, said = post("/send", {"recipient": "a@x.org", "message": "Direct.",
                                           "user_approved": True, "request_key": "h-1"})
             assert status == 502 and said["error"].startswith("send failed: "), said
-            assert pending() == []
+            assert said["sent"] is False and pending() == []
+            assert gw.SENDS.by_key("h-1") is None
             # …and one whose caller hung up before the server answered keeps
             # it where the chat finds it.
             entered, release = threading.Event(), threading.Event()
@@ -2943,18 +3795,44 @@ def test_failed_sends_over_http_and_a_caller_that_hung_up():
             (kept,) = pending()
             assert kept["status"] == "error" and kept["request_key"] == "h-2", kept
             assert kept["message"] == "Gone." and "554" in kept["error"]
-            # The repeat of that press is told it failed; nothing is sent.
+            assert kept["outcome_unknown"] is False
+            # Asked after by id it is the same failed send, not yet dismissed.
+            status, _h, body = t.call(f"{base}/pending-sends/{kept['id']}", token=token)
+            assert status == 200 and "dismissed" not in json.loads(body)
+            # Nothing left the gateway under that key: the press again is a
+            # new attempt. The mail goes out, and the failed send gives way.
             smtp.reject_data = None
             status, said = post("/send", {"recipient": "a@x.org", "message": "Gone.",
                                           "user_approved": True, "request_key": "h-2"})
-            assert status == 502 and said["error"].startswith("send failed: ")
-            assert smtp.mails == []
-            status, entry = post(f"/pending-sends/{kept['id']}/dismiss", b"")
-            assert status == 200 and pending() == []
-            # (Kept, marked, while its key is remembered: still "failed".)
-            assert post("/send", {"recipient": "a@x.org", "message": "Gone.",
-                                  "user_approved": True, "request_key": "h-2"})[0] == 502
-            assert post(f"/pending-sends/{kept['id']}/dismiss", b"")[0] == 200
+            assert status == 200 and said["status"] == "sent" and "repeat" not in said
+            assert len(smtp.mails) == 1 and pending() == []
+            assert t.call(f"{base}/pending-sends/{kept['id']}", token=token)[0] == 404
+            assert post(f"/pending-sends/{kept['id']}/dismiss", b"")[0] == 404
+            status, again = post("/send", {"recipient": "a@x.org", "message": "Gone.",
+                                           "user_approved": True, "request_key": "h-2"})
+            assert (status, again) == (200, {**said, "repeat": True}) and len(smtp.mails) == 1
+
+            # A mail that may have gone out: dismissed, its entry stays for
+            # as long as its key is remembered — answered by id as over
+            # (``dismissed``), never listed, and never sent by a repeat.
+            smtp.drop = "dot"
+            status, said = post("/send", {"recipient": "a@x.org", "message": "Maybe.",
+                                          "user_approved": True, "request_key": "h-3"})
+            smtp.drop = None
+            assert status == 502 and said["unconfirmed"] is True and "sent" not in said
+            (unknown,) = pending()
+            assert unknown["outcome_unknown"] is True and unknown["id"] == said["request_id"]
+            status, entry = post(f"/pending-sends/{unknown['id']}/dismiss", b"")
+            assert status == 200 and entry["dismissed"] is True and pending() == []
+            status, _h, body = t.call(f"{base}/pending-sends/{unknown['id']}", token=token)
+            over = json.loads(body)
+            assert status == 200 and over["status"] == "error" and over["dismissed"] is True
+            assert over["outcome_unknown"] is True
+            assert post(f"/pending-sends/{unknown['id']}/dismiss", b"")[0] == 200
+            status, again = post("/send", {"recipient": "a@x.org", "message": "Maybe.",
+                                           "user_approved": True, "request_key": "h-3"})
+            assert status == 502 and again["unconfirmed"] is True and again["repeat"] is True
+            assert len(smtp.mails) == 2, "the one that was handed over, and no other"
         finally:
             server.shutdown()
     finally:

@@ -139,7 +139,12 @@ entry moves to the terminal status `retracted` (distinct from the user's
 took it back; e-mail's `email_client.py` deletes the pending draft (the mail gateway's own
 queue, `mail-push.py`, works like a messenger's). A retraction the user has
 already overtaken is not silent: approved (or being sent) exits non-zero with
-"too late", denied exits zero with "nothing was sent". After retracting, say
+"too late", denied exits zero with "nothing was sent". On the mail gateway's
+queue an allowed send that then failed says which kind of failure it was: "too
+late: … the send failed; nothing was sent" where the gateway knows nothing left
+it, and "too late: … it is NOT KNOWN whether it went out. Do not send it again"
+where the mail was handed to the mail server and its answer was never seen
+(`outcome_unknown`) — never "failed", which would invite a second mail. After retracting, say
 so wherever the approval link was relayed — the link now leads to a
 retracted entry, not a message waiting for the user.
 
@@ -159,7 +164,10 @@ that thread as a *Retinue* message:
   failed send marks the thread unread and wakes it; the other notes are a
   record of the user's own decision and badge nothing. A send still running
   after `SEND_DECISION_OUTCOME_TIMEOUT` seconds (default 120) is reported as
-  allowed with a link to its approval page.
+  allowed with a link to its approval page. A mail whose entry ends as `error`
+  with `outcome_unknown: true` is not reported as failed: the note — like the
+  approval page and its status JSON — says that it is not known whether the
+  mail went out, and that it must not be sent again.
 
 The note's agent context names the request (`<gateway>/<id>` and its status),
 so the next turn in the thread knows what became of the message it proposed.
@@ -465,8 +473,9 @@ answers as soon as the SMTP server has taken the mail; the copy in the Sent
 folder is filed afterwards by the mirror loop, so a slow IMAP server or a
 busy mirror never holds the answer. Every `/send` may carry a `request_key`
 (an opaque token of at most 64 characters, minted per press by the caller):
-a repeat with a key the gateway has seen within 24 hours answers what the
-first answered — the same `message_id` — and sends nothing. The web gateway's
+a repeat with a key the gateway has seen within 24 hours answers what became
+of the first — the same `message_id` — and sends nothing, unless the first
+failed for certain (below). The web gateway's
 hop to `/send` waits `MAIL_SEND_TIMEOUT` (120 s by default) and passes the
 browser's `request_key`; when the hop times out, drops after the request was
 written, or the gateway answers `502 {unconfirmed: true}`, the browser gets
@@ -474,15 +483,66 @@ written, or the gateway answers `502 {unconfirmed: true}`, the browser gets
 that reads as "not sent". The chat page keeps the bubble as *Sending — not
 confirmed yet*, does not put the words back into the composer, and reconciles
 the bubble by message id once the mail shows. One `request_key` serves one
-press of Send (a reply or a compose) and is reused if that same press is
-retried.
+press of Send (a reply or a compose) and is reused while the outcome of that
+press is not known. `mail-push.py` mints one per run, asks once more under it
+when no answer came, and prints it with "NOT KNOWN whether this mail was sent"
+when it still does not know — also when the gateway took the request and could
+no longer be reached for the second ask; `--request-key <key>` with the same
+arguments asks about that send again.
+
+**A send that certainly failed ends its press; only an unknown outcome keeps
+its key.** What `POST /send` answers, and what a second request under the same
+`request_key` then does:
+
+| `/send` answers | The entry | A repeat under its `request_key` |
+|---|---|---|
+| `200 {status: "sent", message_id, chat, ts, …}` | `approved`, kept 24 h for the key | `200`, the same answer, `"repeat": true`; sends nothing |
+| `202 {status: "pending_approval", request_id, approval_url, …}` | `pending` | `202`, the same pending send, `"repeat": true` (`status: "sending"` once it was allowed) |
+| `502 {error, unconfirmed: true, request_id, message_id, chat}` | `sending`, handed to the SMTP server, no answer seen yet | the same, `"repeat": true`; sends nothing |
+| `502 {error: "send not confirmed: …", unconfirmed: true, outcome_unknown: true, …}` | `error`, `outcome_unknown: true` | the same, `"repeat": true`, dismissed or not, for 24 h; **never sent again** |
+| `502 {error: "send failed: …", "sent": false}` | `error`, `outcome_unknown: false` — removed at once when the caller was still on the line, else listed as failed | **a new attempt**: the old entry is removed, the mail composed, put to the policy and sent afresh |
+| `409 {error, status: "rejected" \| "retracted"}` | decided, not sent | `409`, `"repeat": true`; sends nothing |
+| `503 {error, "sent": false}` | none: the gateway cannot send, or could not write the send down | a new attempt |
+| `400` / `404` / `409` (no such chat, no address, no reply possible) | none | a new attempt |
+
+(A key names one press of Send: a request under a remembered key that asks for
+*another* mail is answered `409` without `repeat`, and sends nothing.) "For certain" is said only where the gateway knows it: the SMTP server refused
+the mail, or the send ended before the hand-over — the entry's mark of the
+hand-over is on disk before any of the message is on the wire. A direct send
+that a restart caught before that mark, and that named a `request_key`, ends as
+such a failure ("the mail gateway was stopped before this mail was handed to
+the mail server; it was not sent") and is listed in its chat, instead of being
+dropped; everything between the mark and the server's answer is *unknown*, and
+is never sent again by anything. `"repeat": true` says the answer tells of an
+earlier request — **a repeat is not a reply**: the web gateway then only hands
+back the Message or the Pending and clears nothing, marks nothing read, settles
+no attention item and calls no mailbox hook (the rail did all of that when the
+mail went out), and `mail-push.py` prints that it was a repeat. A fault nobody
+planned for is answered from what stands under the request's key, or — with no
+key to look under after an entry was made — as `unconfirmed`; never "failed"
+off the fault alone.
+
+Towards the browser the web gateway answers its certain "nothing was sent" as
+`424 {error, "sent": false, request_key}`; `502` remains "the gateway was never
+reached" and `503` "cannot send / could not queue", each with `"sent": false`
+when nothing was handed over; whatever is open is `202 {unconfirmed: true}`.
+The pages read any answer with `"sent": false`, and any 4xx, as *Not sent:
+<sentence>* — the words stay in the box, the key is dropped, the next press is
+a new one — and a 5xx without `"sent": false` as unknown, keeping the key.
 
 **A send that failed, or was partly refused, does not disappear.** `GET
 /pending-sends` (and `?chat=<key>`) lists entries with status `pending`,
 `sending` and `error`; an `error` entry carries `error`, a sentence, and
 `outcome_unknown`, which says the SMTP hand-over may have happened. `POST
-/pending-sends/<id>/dismiss` removes a failed one. A send is never re-sent from
-an `error` entry. Addresses the SMTP server refused while taking the rest are
+/pending-sends/<id>/dismiss` takes a failed one out of the list: one that
+failed for certain is removed; one of unknown outcome that named a
+`request_key` is kept, unlisted, for the 24 hours its key is remembered, and
+`GET /pending-sends/<id>` answers it as `{status: "error", dismissed: true,
+outcome_unknown: true, …}`. **A dismissed entry is over** — nothing for a chat
+to show — and `outcome_unknown` is read by every reader of an entry: "it is not
+known whether the mail went out; do not send it again" is never worded as
+"failed". A send is never re-sent from
+an `error` entry by itself. Addresses the SMTP server refused while taking the rest are
 on the entry and in the `200` answer as `refused: [addresses]`, and the
 record's recipients are those the server took. In the chat the web gateway
 gives a pending entry `status` (`pending`, `sending` or `failed`), `error`,
