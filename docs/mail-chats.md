@@ -504,7 +504,12 @@ of its own, and the backup brings back the one it had before); a mail to
 oneself whose Sent copy is gone comes back as a mail that came in —
 nothing but its From says the user wrote it; on a server that stamps a
 moved mail with a new arrival time, an archived sent mail comes back as a
-mail that came in too — its From is all that is left to say so; and an
+mail that came in too — its From is all that is left to say so; so does
+an archived mail the gateway sent whose Sent copy the provider filed
+(`SMTP_SAVE_SENT=false`): the record's arrival time is the gateway's clock
+at the send, the copy's the provider's at the filing, and they agree only
+by chance (found under an id the provider gave it, it also comes back under
+that id, not the one the gateway minted); and an
 arrival time has whole seconds, so a look-alike under the id, From the same
 address, delivered in the same second, cannot be told from the record's own
 mail: archived, with the Sent copy gone, it comes back as the user's, and
@@ -653,9 +658,10 @@ of them and 4,000,000 characters, counted once per pass — all four passes for
 A mail that would take more is not trimmed and is recorded as it came,
 `wanting`, as is one of more than 200,000 lines or 5,000,000 characters,
 which is not read at all. Of an HTML part the first 1,000,000 characters of
-markup are parsed, not counting inline `data:` images (but one folded into
-lines where a browser does not read it as a value in quotes, and any after
-a CDATA section, which mail almost never has): beside a plain part a longer
+markup are parsed, not counting inline `data:` images (but one that a
+browser does not read as all in one attribute value — folded into lines, in
+a value in quotes that close — and any after a CDATA section, which mail
+almost never has): beside a plain part a longer
 one is not consulted, and where it is the mail's only text the bubble ends
 where the reading did, on a line `[…]` — *Original* shows all of it.
 Within those bounds the cost is linear in the size of the mail, for hostile
