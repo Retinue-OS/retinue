@@ -754,6 +754,55 @@ def test_written_by_hand_twice(chambers, manifest):
     print("ok test_written_by_hand_twice")
 
 
+def test_a_joined_instruction_past_the_limit(chambers, manifest):
+    """Two instruction literals of a hand edit or a merge that join past
+    INSTRUCTION_MAX: read whole, never trapped. Every write that leaves the
+    instruction — the editors send back the text they showed — succeeds and
+    keeps both literals as written; a write that changes it is held to the
+    limit, and the refusal says how long the one they carry is."""
+    book = contacts.ContactBook(chambers, manifest)
+    first = "Ring me for the house sale. " * 50
+    rec = book.create("work", "Long Brief", [("email", "long@brief.example")], instruction=first)
+    path = chambers / rec["path"]
+    second = "Forward invoices to my accountant. " * 30
+    with path.open("a", encoding="utf-8") as fh:
+        fh.write(f'<{rec["iri"]}> <{contacts.KB}instruction> "{second}" .\n')
+    book._cache.clear()
+    shown = book.get(rec["key"])["instruction"]
+    assert len(shown) > contacts.INSTRUCTION_MAX, len(shown)
+    literals = sorted(line for line in path.read_text(encoding="utf-8").splitlines() if "kb#instruction" in line)
+    # What the Contacts page and the contact card send on any save: the
+    # instruction they showed, unchanged — with \r\n line ends, too.
+    after = book.update(rec["key"], name="Long Brief Renamed", vip=True,
+                        instruction=shown.replace("\n", "\r\n") + "  ")
+    assert (after["name"], after["vip"], after["instruction"]) == ("Long Brief Renamed", True, shown), after
+    assert sorted(line for line in path.read_text(encoding="utf-8").splitlines()
+                  if "kb#instruction" in line) == literals
+    assert book.update(rec["key"], importance=3)["instruction"] == shown
+    # A change is held to the limit, and the refusal states the length now.
+    for changed in (shown + " More.", shown[:-10]):
+        try:
+            book.update(rec["key"], instruction=changed)
+            raise AssertionError("accepted a changed instruction past the cap")
+        except contacts.ContactError as exc:
+            assert f"not {len(changed.strip())}; the one they carry now is {len(shown)}" in str(exc), str(exc)
+    # Copying it to someone else is a change there: refused the same way.
+    other = book.create("work", "Copy Target", [("email", "copy@brief.example")])
+    try:
+        book.update(other["key"], instruction=shown)
+        raise AssertionError("copied an instruction past the cap")
+    except contacts.ContactError as exc:
+        assert f"at most {contacts.INSTRUCTION_MAX} characters, not {len(shown)}" in str(exc), str(exc)
+    # Cut to the limit, it is saved as one literal; taken off, it is gone.
+    cut = book.update(rec["key"], instruction=shown[:contacts.INSTRUCTION_MAX])
+    assert cut["instruction"] == shown[:contacts.INSTRUCTION_MAX].strip(), cut
+    assert sum("kb#instruction" in line for line in path.read_text(encoding="utf-8").splitlines()) == 1
+    assert book.update(rec["key"], instruction=None)["instruction"] is None
+    book.delete(rec["key"])
+    book.delete(other["key"])
+    print("ok test_a_joined_instruction_past_the_limit")
+
+
 def test_cli(chambers, manifest):
     env = dict(os.environ,
                TRIAGE_MESSENGER_DIR=str(chambers.parent / "policy" / "messenger"),
@@ -899,6 +948,7 @@ def main():
         test_attention_and_vip(chambers, manifest)
         test_instruction(chambers, manifest)
         test_written_by_hand_twice(chambers, manifest)
+        test_a_joined_instruction_past_the_limit(chambers, manifest)
         test_cli(chambers, manifest)
         test_commit(tmp)
     print("all contacts checks passed")

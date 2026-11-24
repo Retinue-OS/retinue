@@ -173,7 +173,9 @@ _HEADER = ("# Contact managed by scripts/contacts.py (docs/contacts.md).\n"
            "# Lines it did not write are kept on every rewrite: add your own freely.\n")
 
 # An instruction is a brief, not a document: it rides in every prompt a
-# message of this person's buys, so it is kept to what a brief needs.
+# message of this person's buys, so it is kept to what a brief needs: every
+# write that sets one is held to this. Literals a hand edit or a merge joined
+# past it are read whole and left as they are until the user changes them.
 INSTRUCTION_MAX = 2000
 
 
@@ -666,15 +668,23 @@ def _importance(value) -> float | None:
     return number
 
 
-def _instruction(value) -> str | None:
+def _instruction_text(value) -> str | None:
+    """An instruction as it is compared and kept: trimmed, line ends
+    normalised, None for none."""
+    return None if value is None else (str(value).replace("\r\n", "\n").strip() or None)
+
+
+def _instruction(value, current: str | None = None) -> str | None:
     """A standing instruction as the person keeps it: the user's own words,
-    trimmed, or None for none."""
-    if value is None:
-        return None
-    text = str(value).replace("\r\n", "\n").strip()
-    if len(text) > INSTRUCTION_MAX:
-        raise ContactError(f"an instruction is at most {INSTRUCTION_MAX} characters, not {len(text)}")
-    return text or None
+    trimmed, or None for none — held to INSTRUCTION_MAX. ``current`` is the
+    one the person carries now, which the refusal states: joined from
+    several literals of a hand edit or a merge, it can be longer (read
+    whole, kept as it is by every write that leaves it: ContactBook.update)."""
+    text = _instruction_text(value)
+    if text and len(text) > INSTRUCTION_MAX:
+        now = f"; the one they carry now is {len(current)}" if current else ""
+        raise ContactError(f"an instruction is at most {INSTRUCTION_MAX} characters, not {len(text)}{now}")
+    return text
 
 
 def _modes(values) -> list[str]:
@@ -1004,8 +1014,12 @@ class ContactBook:
                 new["permits"] = _modes(permits)
             if vip is not None:
                 new["vip"] = bool(vip)
-            if instruction is not False:
-                new["instruction"] = _instruction(instruction)
+            if instruction is not False and _instruction_text(instruction) != old.get("instruction"):
+                # The instruction as it stands, sent back with a change to
+                # something else (the editors send what they showed), is
+                # left as it is — also one a hand edit or a merge joined
+                # past the limit: only a change is held to it.
+                new["instruction"] = _instruction(instruction, old.get("instruction"))
             for channel, handle in (normalize_handle(c, h) for c, h in remove):
                 _remove_pair(new, (channel, handle))
             for channel, handle in (normalize_handle(c, h) for c, h in add):

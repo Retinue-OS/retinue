@@ -80,19 +80,19 @@ prompt's:
 * only ids it sent, each once, each with a known kind;
 * ``rule`` puts the memory's own text on the contact (cleaned of invisible
   characters, never cut: a text too long for an instruction stays a memory);
-* ``filing`` puts the fixed filing instruction there only when the memory's
-  own text passes a deterministic check — it names a kind of document and
-  filing it (``FILING_TERMS``, a multilingual table), and asks for nothing
-  else: it is short (``MIGRATE_FILING_MAX_WORDS``) and holds no negation, no
-  exception or condition, no other request and no place to file to
-  (``FILING_EXCEPTIONS``, a table beside it) — and is a ``rule`` otherwise;
+* ``filing`` puts the memory's own text there too, and adds the fixed filing
+  instruction in front of it only when that text passes a deterministic
+  check — it names a kind of document and filing it (``FILING_TERMS``, a
+  multilingual table) — never in its place: a negation, a condition or a
+  second request in the user's words is there, right after the fixed
+  sentence, for the turn to read;
 * ``fact`` and ``unclear`` leave the memory alone.
 
 So the most a steered or wrong answer can do is put a note triage held, in
 that note's own words, on the contact that note's own tags name — what
-``--no-model`` does with every note — or, for a short note that asks for
-nothing but filing its sender's documents, the fixed filing instruction in
-its place. ``--no-model`` skips the turn and carries every rule over
+``--no-model`` does with every note — with, for a note that names filing
+its sender's documents, the fixed filing sentence in front of those words.
+``--no-model`` skips the turn and carries every rule over
 verbatim; nothing then judges whether a text was the user's instruction, so
 read the report.
 
@@ -339,8 +339,13 @@ def _write_json(path: Path, data) -> None:
 # ── The marker ───────────────────────────────────────────────────────────────
 
 class MarkerError(Exception):
-    """The marker file is there and cannot be read: nothing may run on a guess
-    of what an earlier run did."""
+    """The marker file — or the cutoff file, or the snapshot (``file``) — is
+    there and cannot be read: nothing may run on a guess of what an earlier
+    run did."""
+
+    def __init__(self, message: str, file: str = MARKER_NAME):
+        super().__init__(message)
+        self.file = file
 
 
 class PolicyUnreadable(Exception):
@@ -415,9 +420,9 @@ def read_cutoff_file(directory: Path) -> str | None:
     except FileNotFoundError:
         return None
     except (OSError, UnicodeDecodeError) as exc:
-        raise MarkerError(f"{path} is not readable ({exc})")
+        raise MarkerError(f"{path} is not readable ({exc})", CUTOFF_NAME)
     if _parse_iso(text) is None:
-        raise MarkerError(f"{path} does not hold a time ({text[:40]!r})")
+        raise MarkerError(f"{path} does not hold a time ({text[:40]!r})", CUTOFF_NAME)
     return text
 
 
@@ -439,7 +444,7 @@ def _read_snapshot(directory: Path) -> dict | None:
     except FileNotFoundError:
         return None
     except (OSError, ValueError) as exc:
-        raise MarkerError(f"{path} is not readable ({exc})")
+        raise MarkerError(f"{path} is not readable ({exc})", SNAPSHOT_NAME)
     return stored
 
 
@@ -451,7 +456,7 @@ def snapshot_cutoff(directory: Path) -> str | None:
         return None
     cutoff = str(stored.get("cutoff") or "")
     if cutoff and _parse_iso(cutoff) is None:
-        raise MarkerError(f"{directory / SNAPSHOT_NAME}: its cutoff {cutoff!r} is not a time")
+        raise MarkerError(f"{directory / SNAPSHOT_NAME}: its cutoff {cutoff!r} is not a time", SNAPSHOT_NAME)
     return cutoff
 
 
@@ -1496,6 +1501,8 @@ def clean_rule(text) -> str:
 
 # Whether a note is about filing documents is held against its own text, not
 # taken on the model's word: it must name a kind of document and filing it.
+# It decides only whether the fixed filing sentence goes in front of the
+# note's own words (decide) — never whether those words go on.
 # Data, by language — a language is added here, never special-cased in code.
 # A term matches where a word starts (so a plural, or a compound that begins
 # with it, counts) — where it ends in ``$``, only as a whole word — and
@@ -1537,69 +1544,6 @@ FILING_TERMS = {
     },
 }
 
-# Naming filing is not enough for the fixed filing instruction to stand in
-# for a note: the note must ask for nothing else. Held conservatively — a
-# short note (at most MIGRATE_FILING_MAX_WORDS words; in a script written
-# without spaces each character counts as one) in which none of these words
-# appears: a negation ("never archive them"), an exception or a condition
-# ("only", "when it is over 500"), another request ("and ring me"), a place
-# to file to ("under …"; a path, too, is one). Every other note is a rule in
-# its own words, which loses nothing. Data, by language, beside FILING_TERMS:
-# whole words, except in a script written without spaces and for a term that
-# ends in an apostrophe (French "n'").
-MIGRATE_FILING_MAX_WORDS = 30
-FILING_EXCEPTIONS = {
-    "en": ["not", "no", "never", "nothing", "none", "nor", "neither", "without", "don't", "dont",
-           "doesn't", "didn't", "won't", "can't", "shouldn't", "except", "unless", "but", "only",
-           "if", "when", "whenever", "instead", "also", "tell", "ring", "call", "notify", "alert",
-           "remind", "forward", "reply", "answer", "respond", "send", "show", "draft", "ignore",
-           "delete", "flag", "ask", "pay", "check", "under", "into", "folder"],
-    "de": ["nicht", "nie", "niemals", "kein", "keine", "keinen", "keiner", "nichts", "ohne", "außer",
-           "ausser", "sondern", "aber", "nur", "wenn", "falls", "sobald", "statt", "sag", "sage",
-           "melde", "ruf", "rufe", "anrufen", "benachrichtige", "erinnere", "leite", "weiterleiten",
-           "antworte", "schick", "schicke", "sende", "zeig", "zeige", "entwirf", "ignoriere",
-           "lösche", "bezahle", "zahle", "prüfe", "frag", "unter", "ordner"],
-    "fr": ["ne", "n'", "pas", "jamais", "rien", "aucun", "aucune", "sans", "sauf", "sinon", "mais",
-           "seulement", "uniquement", "si", "quand", "lorsque", "dis", "dites", "préviens",
-           "prévenez", "appelle", "appelez", "transfère", "transférez", "réponds", "répondez",
-           "envoie", "envoyez", "montre", "montrez", "ignore", "ignorez", "supprime", "paie", "paye",
-           "sous", "dans", "dossier"],
-    "it": ["non", "mai", "niente", "nessun", "nessuno", "nessuna", "senza", "tranne", "salvo",
-           "eccetto", "ma", "solo", "soltanto", "se", "quando", "invece", "dimmi", "avvisa",
-           "avvisami", "chiama", "chiamami", "inoltra", "rispondi", "invia", "manda", "mostra",
-           "ignora", "elimina", "cancella", "paga", "sotto", "cartella"],
-    "es": ["no", "nunca", "jamás", "nada", "ningún", "ninguna", "ninguno", "sin", "excepto", "salvo",
-           "sino", "pero", "solo", "sólo", "si", "cuando", "avísame", "avisa", "llama", "llámame",
-           "reenvía", "responde", "contesta", "envía", "manda", "muestra", "ignora", "borra",
-           "elimina", "paga", "bajo", "carpeta"],
-    "pt": ["não", "nao", "nunca", "jamais", "nada", "nenhum", "nenhuma", "sem", "exceto", "salvo",
-           "senão", "mas", "só", "somente", "apenas", "se", "quando", "avise", "avisa", "ligue",
-           "encaminhe", "responda", "responde", "envie", "mostre", "ignore", "apague", "pague",
-           "pasta"],
-    "nl": ["niet", "nooit", "geen", "niets", "zonder", "behalve", "tenzij", "maar", "alleen", "als",
-           "wanneer", "vertel", "meld", "bel", "waarschuw", "stuur", "beantwoord", "antwoord",
-           "toon", "negeer", "verwijder", "betaal", "onder", "map"],
-    "sv": ["inte", "ej", "aldrig", "ingen", "inget", "inga", "utan", "utom", "förutom", "men",
-           "bara", "endast", "om", "när", "säg", "meddela", "ring", "vidarebefordra", "svara",
-           "skicka", "visa", "ignorera", "radera", "betala", "under", "mapp"],
-    "da": ["ikke", "aldrig", "ingen", "intet", "uden", "undtagen", "men", "kun", "hvis", "når",
-           "sig", "ring", "videresend", "svar", "send", "vis", "ignorer", "slet", "betal", "under",
-           "mappe"],
-    "pl": ["nie", "nigdy", "żaden", "żadna", "żadne", "nic", "bez", "oprócz", "poza", "ale",
-           "tylko", "jeśli", "jeżeli", "gdy", "kiedy", "powiedz", "powiadom", "zadzwoń", "przekaż",
-           "odpowiedz", "wyślij", "pokaż", "zignoruj", "usuń", "zapłać", "folder", "katalog"],
-    "ru": ["не", "нет", "никогда", "ничего", "никаких", "без", "кроме", "но", "только", "если",
-           "когда", "скажи", "сообщи", "позвони", "перешли", "ответь", "отправь", "покажи",
-           "игнорируй", "удали", "оплати", "папку", "папке"],
-    "ja": ["ない", "ません", "禁止", "以外", "ただし", "だけ", "場合", "なら", "たら", "知らせ", "連絡",
-           "電話", "転送", "返信", "送信", "見せ", "無視", "削除", "支払", "フォルダ"],
-    "zh": ["不", "没", "沒", "别", "別", "勿", "除了", "除非", "但", "只", "如果", "若", "告诉", "告訴",
-           "通知", "电话", "電話", "转发", "轉發", "回复", "回覆", "发送", "發送", "显示", "顯示", "忽略",
-           "删除", "刪除", "付款", "支付", "文件夹", "資料夾"],
-    "ko": ["않", "말고", "말아", "마세요", "없", "못", "제외", "외에", "하지만", "그러나", "경우", "알려",
-           "연락", "전화", "전달", "답장", "보내", "보여", "무시", "삭제", "지불", "폴더"],
-}
-
 
 def _spaceless(term: str) -> bool:
     return any(unicodedata.name(ch, "").startswith(("CJK", "HIRAGANA", "KATAKANA", "HANGUL"))
@@ -1613,14 +1557,14 @@ def _flat_text(text: str) -> str:
     return re.sub("[‘’ʼ]", "'", flat)
 
 
-def _names_any(text: str, terms, *, whole: bool = False) -> bool:
+def _names_any(text: str, terms) -> bool:
     for term in terms:
         term = unicodedata.normalize("NFKC", term).casefold()
         if _spaceless(term):
             if term in text:
                 return True
             continue
-        end = term.endswith("$") or (whole and not term.endswith("'"))
+        end = term.endswith("$")
         term = term.rstrip("$")
         if re.search(r"(?<!\w)" + re.escape(term) + (r"(?!\w)" if end else ""), text):
             return True
@@ -1636,35 +1580,23 @@ def names_filing(text: str) -> bool:
                for group in ("document", "filing"))
 
 
-def _words(text: str) -> int:
-    """How many words a text holds; in a script written without spaces each
-    character counts as one."""
-    return sum(len(run) if _spaceless(run) else 1 for run in re.findall(r"\w+", text))
-
-
-def only_filing(text: str) -> bool:
-    """Whether a memory's own text asks for filing documents and for nothing
-    else, so that the fixed filing instruction loses nothing of it: it names
-    filing (names_filing), is short, and carries no word of FILING_EXCEPTIONS
-    and no path."""
-    flat = _flat_text(text)
-    return (names_filing(flat) and _words(flat) <= MIGRATE_FILING_MAX_WORDS
-            and not re.search(r"[/\\]", flat)
-            and not _names_any(flat, [t for terms in FILING_EXCEPTIONS.values() for t in terms],
-                               whole=True))
-
-
 def decide(kind: str, content: str) -> dict | None:
     """What a memory becomes on its contact, from its kind and its own text —
     never from anything the model wrote: ``{"kind", "instruction"}``, or None
-    when its text is too long to be an instruction (nothing is cut). A
-    ``filing`` the text does not bear out — one that asks for anything but
-    filing documents (only_filing) — is a ``rule``, in the memory's words."""
+    when its text is too long to be an instruction (nothing is cut). The
+    memory's own words always go on. A ``filing`` its text bears out
+    (names_filing) has the fixed filing instruction added in front of them —
+    never in their place, so a negation, a condition or a second request in
+    any language is still there for the turn to read; where the two together
+    would not fit, the words go on alone, as a ``rule``. A ``filing`` the
+    text does not bear out is a ``rule``."""
     text = clean_rule(content)
-    if kind == "filing" and only_filing(text):
-        return {"kind": "filing", "instruction": FILING_INSTRUCTION}
     if not text or len(text) > contacts.INSTRUCTION_MAX:
         return None
+    if kind == "filing" and names_filing(text):
+        briefed = f"{FILING_INSTRUCTION}\n\n{text}"
+        if len(briefed) <= contacts.INSTRUCTION_MAX:
+            return {"kind": "filing", "instruction": briefed}
     return {"kind": "rule", "instruction": text}
 
 
@@ -1711,6 +1643,17 @@ def add_rule(instruction: str | None, rule: str) -> tuple[str, bool] | None:
         return current, False
     joined = f"{current}\n\n{rule}" if current else rule
     return (joined, True) if len(joined) <= contacts.INSTRUCTION_MAX else None
+
+
+def rule_for(current: str | None, entry: dict) -> str:
+    """What a decision adds to an instruction as it stands: a filing memory's
+    own words alone where the fixed filing sentence is there already (a
+    second filing memory for one person, a resumed run), so that it stands
+    once — the words themselves always go on."""
+    decision = entry["decision"]
+    if decision.get("kind") == "filing" and _flat(FILING_INSTRUCTION) in _flat(current):
+        return clean_rule(entry["content"])
+    return decision["instruction"]
 
 
 def _components(entries: list[dict]) -> list[list[dict]]:
@@ -1950,7 +1893,7 @@ def step_memories(run: Run, *, again: bool) -> tuple[bool, bool, str]:
         for key in entry["targets"]:
             if key not in texts:
                 texts[key] = (run.contact(key) or {}).get("instruction")
-            trial[key] = add_rule(texts[key], entry["decision"]["instruction"])
+            trial[key] = add_rule(texts[key], rule_for(texts[key], entry))
         full = [key for key, fit in trial.items() if fit is None]
         if full:
             names = ", ".join(repr(t["name"]) for t in entry["described"] if t["key"] in full)
@@ -1965,13 +1908,22 @@ def step_memories(run: Run, *, again: bool) -> tuple[bool, bool, str]:
         placed.append(entry)
     run.marker.save()
 
-    # Write each contact once, with everything it gains.
+    # Write each contact once, with everything it gains — and journal first
+    # whether an instruction stood before, read from the contact itself: the
+    # report counts as briefed by this migration only a person whose first
+    # instruction it wrote, and a run killed between the write and the
+    # entry's journal must not take what it wrote for what stood before.
+    # The first write's finding stands for every later one.
+    instructed = section.setdefault("instructed", {})
     failed: dict[str, str] = {}
     written: dict[str, dict] = {}
     for key in sorted(changed):
         target = next(t for e in placed for t in e["described"] if t["key"] == key)
+        record = run.contact(key)
+        was = instructed.get(key)
+        instructed[key] = was or {"before": bool(record and record.get("instruction")), "at": _now()}
+        run.marker.save()
         try:
-            record = run.contact(key)
             if record:
                 written[key] = run.update("memories", record, instruction=texts[key])
             elif run.chamber() is None:
@@ -1986,6 +1938,18 @@ def step_memories(run: Run, *, again: bool) -> tuple[bool, bool, str]:
             failed[key] = str(exc)
         except OSError as exc:
             failed[key] = f"could not write the contact: {exc}"
+        if key in failed:
+            # Nothing was written: what stood is as it was.
+            if was is None:
+                instructed.pop(key, None)
+            else:
+                instructed[key] = was
+        elif written.get(key, {}).get("key", key) != key:
+            # A contact this step created is journaled under its own key; a
+            # run killed before this line leaves it under the target's
+            # ``new:`` key, which the report resolves (briefed_people).
+            instructed[written[key]["key"]] = instructed.pop(key)
+        run.marker.save()
     run.finish_writes("memories", "chore(contacts): sender rules move from memory to contacts")
 
     moved: list[dict] = list(resumed)
@@ -2120,42 +2084,78 @@ def _timeout(name: str, default: float) -> str:
     return f"{_seconds(name, default):g}"
 
 
-def briefed_people(run: Run, whitelist: dict, memories: dict) -> tuple[list[dict], list[dict]]:
-    """(briefed, extended). Briefed: everyone this migration gave their first
-    instruction — whose instruction holds nothing but what the migration
-    put there (the generic one, the filing one, the sender rules it moved).
-    Extended: everyone a sender rule was appended to whose instruction also
-    holds words of the user's — they bought a turn per message before, and
-    taking the instruction off would take those words with it. Per person:
-    the key, the name, and the channels beside e-mail an instruction of
-    theirs reaches — an instruction is the person's, on every channel. Read
-    from the contact as it stands, so a run killed between a write and its
-    journal, and an edit the user made since, are counted as they are."""
+def _instructed_by_memories(run: Run, section: dict) -> dict[str, dict]:
+    """The memories step's journal of the contacts it wrote (step_memories),
+    by contact key: a contact it created and was killed before re-keying is
+    found by the address or domain it was created for."""
+    out = {}
+    for key, entry in (section.get("instructed") or {}).items():
+        if key.startswith("new:email:"):
+            holder = run.holder(key[len("new:email:"):])
+            key = holder["key"] if holder else key
+        elif key.startswith("new:domain:"):
+            owners = run.domain_owners(key[len("new:domain:"):].removeprefix("*."))
+            key = owners[0]["key"] if len(owners) == 1 else key
+        out.setdefault(key, entry)
+    return out
+
+
+def briefed_people(run: Run, whitelist: dict, memories: dict,
+                   instructed: dict | None = None) -> tuple[list[dict], list[dict], list[dict]]:
+    """(briefed, edited, extended), from what the journal knows this run did
+    — never from what a contact's text happens to hold.
+
+    Briefed: everyone whose FIRST instruction this migration set — the
+    whitelist step created or instructed them, or the memories step wrote an
+    instruction where none stood (journaled before the write). Edited: those
+    of them whose instruction the user has since added words of their own
+    to, read from the contact as it stands: still briefed by this migration,
+    but taking the instruction off would take those words too. Extended:
+    everyone a sender rule was appended to whose instruction stood before
+    the migration — they bought a turn per message before. A person a rule
+    was journaled for that their instruction already held, or who kept
+    their own instruction in the whitelist step, is none of the three: the
+    migration changed nothing about them. Per person: the key, the name, and
+    the channels beside e-mail an instruction of theirs reaches — an
+    instruction is the person's, on every channel."""
+    instructed = {} if instructed is None else instructed
     keys: dict[str, str] = {}
+    first: set[str] = set()
     placed: dict[str, list[str]] = {}
     for entry in whitelist.values():
         if entry.get("outcome") in ("created", "instructed") and entry.get("contact"):
             for key in entry.get("briefed") or [entry["contact"]]:
                 keys.setdefault(key, entry.get("name") or "?")
+                first.add(key)
     for entry in memories.values():
         if entry.get("state") in ("migrated", "written"):
             for ref in entry.get("contacts") or []:
                 keys.setdefault(ref.get("contact"), ref.get("name") or "?")
-                placed.setdefault(ref.get("contact"), []).append(entry.get("instruction") or "")
-    briefed, extended = [], []
+                text = entry.get("instruction") or ""
+                placed.setdefault(ref.get("contact"), []).append(text)
+                if entry.get("kind") == "filing" and text.startswith(FILING_INSTRUCTION):
+                    # Where the fixed sentence stood already, the words went on alone.
+                    placed[ref.get("contact")].append(text[len(FILING_INSTRUCTION):])
+    first |= {key for key, entry in instructed.items() if not entry.get("before")}
+    briefed, edited, extended = [], [], []
     for key, name in sorted(keys.items(), key=lambda kv: (kv[1].casefold(), kv[0])):
+        if key not in first and key not in instructed:
+            continue   # nothing was written to them
         record = run.contact(key) or {}
         own = _flat(record.get("instruction"))
         if not own:
             continue   # taken off since: it buys nothing
-        for ours in [GENERIC_INSTRUCTION, FILING_INSTRUCTION] + placed.get(key, []):
-            if _flat(ours):
-                own = own.replace(_flat(ours), " ")
         channels = sorted({channel for channel, _handle in record.get("accounts") or []}
                           | ({"sms"} if record.get("all_phones") else set()))
         person = {"contact": key, "name": record.get("name") or name, "channels": channels}
-        (extended if own.strip() else briefed).append(person)
-    return briefed, extended
+        if key not in first:
+            extended.append(person)
+            continue
+        ours = [GENERIC_INSTRUCTION, FILING_INSTRUCTION] + placed.get(key, [])
+        for text in sorted({_flat(t) for t in ours if _flat(t)}, key=len, reverse=True):
+            own = own.replace(text, " ")
+        (edited if own.strip() else briefed).append(person)
+    return briefed, edited, extended
 
 
 def build_report(run: Run) -> dict:
@@ -2212,13 +2212,15 @@ def build_report(run: Run) -> dict:
     }
     report["whitelist"]["contacts"] = {key: people(report["whitelist"][key])
                                        for key in ("created", "instructed", "kept")}
-    briefed, extended = briefed_people(run, whitelist, memories)
+    briefed, edited, extended = briefed_people(
+        run, whitelist, memories, _instructed_by_memories(run, marker.section("memories")))
     beyond = [p for p in briefed if p["channels"]]
     filing = [e for e in report["memories"]["moved"] + report["memories"]["waiting"]
               if e.get("kind") == "filing"]
     mail_wait = _timeout("MAIL_INSTRUCTION_TIMEOUT", 600)
     chat_wait = _timeout("CHAT_INSTRUCTION_TIMEOUT", 60)
-    report["briefed"] = {"contacts": len(briefed), "beyond_mail": beyond, "extended": extended,
+    report["briefed"] = {"contacts": len(briefed) + len(edited), "beyond_mail": beyond,
+                         "edited": edited, "extended": extended,
                          "filing": len({c.get("contact") for e in filing for c in e.get("contacts") or []}),
                          "mail_timeout": mail_wait, "chat_timeout": chat_wait}
     by_hand = []
@@ -2238,9 +2240,9 @@ def build_report(run: Run) -> dict:
                        "and a sender only the mirror would have known may be reported as unknown. "
                        "Rename contacts on the Contacts page; `migrate-triage.py --step memories` "
                        "looks again at what it left.")
-    if briefed:
+    if briefed or edited:
         by_hand.append(
-            f"{len(briefed)} contact(s) carry an instruction from this migration, so a model turn "
+            f"{len(briefed) + len(edited)} contact(s) carry an instruction from this migration, so a model turn "
             f"works each of their mails, and its ring waits for the turn's verdict (up to "
             f"MAIL_INSTRUCTION_TIMEOUT, now {mail_wait} s). An instruction is the person's on "
             "every channel: each of their Signal, WhatsApp, Telegram or SMS messages now buys a "
@@ -2253,6 +2255,17 @@ def build_report(run: Run) -> dict:
                        "was briefed before: "
                        + "; ".join(f"{p['name']} [{p['contact']}] ({', '.join(p['channels'])})"
                                    for p in beyond))
+    if edited:
+        # Briefed by this migration, and the user's own words added since:
+        # --no-instruction would take those words with it.
+        by_hand.append(f"{len(edited)} of them you have edited the instruction of since, so it "
+                       "holds words of yours as well as this migration's: "
+                       + "; ".join(f"{p['name']} [{p['contact']}]"
+                                   + (f" (also {', '.join(p['channels'])})" if p["channels"] else "")
+                                   for p in edited)
+                       + ". Their messages buy a turn because of this migration, on every channel; "
+                       "to change that, edit the instruction on the Contacts page — --no-instruction "
+                       "takes your words with it")
     if extended:
         # Their instruction was the user's before: --no-instruction would
         # take the user's own words with the rule.
@@ -2403,13 +2416,21 @@ def thread_message(report: dict, *, follow_up: bool = False) -> str:
                      f"well ({_listed([_md(p['name']) for p in beyond])}) "
                      "[[chip: Take theirs off | Take the triage migration's instruction off the "
                      "people it briefed who also write on a messenger.]]")
+    edited = briefed.get("edited") or []
+    if edited:
+        lines.append(f"- **Briefed, and edited by you since:** {len(edited)} of them "
+                     f"({_listed([_md(p['name']) for p in edited])}) now carry words of yours as "
+                     "well as the migration's; their messages buy a turn on every channel. To change "
+                     "that, edit the instruction on the Contacts page — taking it off takes your "
+                     "words with it.")
     if briefed.get("extended"):
         lines.append(f"- **Rules added to an instruction of yours:** {len(briefed['extended'])} "
                      "contact(s) already had one, and a sender rule was appended to it; to take a "
                      "rule back off, edit the instruction on the Contacts page — your own words stay.")
     if briefed.get("filing"):
-        lines.append(f"- **Filing senders:** {briefed['filing']} contact(s) now have their documents "
-                     "filed by the Archivist. A filing turn can take minutes: such a mail rings as "
+        lines.append(f"- **Filing senders:** {briefed['filing']} contact(s) carry the filing "
+                     "instruction (the Archivist files their documents), in front of your own words "
+                     "for them. A filing turn can take minutes: such a mail rings as "
                      "a VIP's would when it runs past MAIL_INSTRUCTION_TIMEOUT.")
 
     stubs = [j for j in report["scheduled_jobs"] if j.get("stub")]
@@ -2689,10 +2710,36 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(report, ensure_ascii=False, indent=1) if args.json else render_report(report))
             return 0 if done else EXIT_PENDING
     except MarkerError as exc:
-        log(f"stopped: {exc}. Nothing was changed. Every step is safe to repeat: move the file "
-            f"aside to start afresh — but keep {CUTOFF_NAME} and {SNAPSHOT_NAME} beside it: the "
-            "cutoff they hold is what keeps the sender memories stored since out of the migration.")
+        log(f"stopped: {exc}. Nothing was changed. {unreadable_advice(directory, exc.file)}")
         return 1
+
+
+def unreadable_advice(directory: Path, name: str) -> str:
+    """The way out of a MarkerError, for the file that is actually unreadable:
+    each of the three is recovered differently."""
+    if name == CUTOFF_NAME:
+        known = []
+        for read in (lambda: Marker(directory, dry_run=True).data.get("cutoff"),
+                     lambda: snapshot_cutoff(directory)):
+            try:
+                when = read()
+            except MarkerError:
+                continue
+            if when and _parse_iso(when) is not None:
+                known.append(when)
+        if known:
+            return (f"The marker or the snapshot still holds the cutoff ({min(known, key=_parse_iso)}): "
+                    f"move {CUTOFF_NAME} aside, and the next run writes it back from them.")
+        return (f"Neither the marker nor the snapshot holds the cutoff: restore {CUTOFF_NAME} from a "
+                "backup (one line, the time it held). Moved aside, it would be taken afresh as now, "
+                "and the sender memories stored since the upgrade would be taken for triage's.")
+    if name == SNAPSHOT_NAME:
+        return (f"Restore {SNAPSHOT_NAME} from a backup rather than move it aside: it holds the "
+                "legacy whitelist, which the policy file loses on its next write — moved aside, only "
+                "what the policy files still hold is secured again.")
+    return (f"Every step is safe to repeat: move {MARKER_NAME} aside to start its journal afresh — "
+            f"but keep {CUTOFF_NAME} and {SNAPSHOT_NAME} beside it: the cutoff they hold is what "
+            "keeps the sender memories stored since out of the migration.")
 
 
 if __name__ == "__main__":

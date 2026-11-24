@@ -359,18 +359,27 @@ beforehand.
   is on a contact and whose memory waits to be superseded is not written
   again, so an edit on the contact meanwhile stands.
 - **Exit status** 0: everything asked for is complete; 75: something is
-  pending, and the report says what; 1: the marker (or the cutoff file, or
-  the snapshot) could not be read — nothing was changed. Move the marker
-  aside to start its journal afresh (every step is safe to repeat), but
-  **keep `.migration-cutoff` and `.legacy-email-whitelist.json`**: the cutoff
-  they hold is what keeps the sender memories stored since the upgrade out
-  of the migration, and a marker that is missing adopts it from them. Only a
-  state directory that holds none of the three takes a new cutoff.
+  pending, and the report says what; 1: the marker, the cutoff file or the
+  snapshot could not be read — nothing was changed, and the log line names
+  the file and its way out:
+  - **the marker** (`.migrated-to-contacts.json`): move it aside to start
+    its journal afresh (every step is safe to repeat), but **keep
+    `.migration-cutoff` and `.legacy-email-whitelist.json`**: the cutoff they
+    hold is what keeps the sender memories stored since the upgrade out of
+    the migration, and a marker that is missing adopts it from them;
+  - **the cutoff file** (`.migration-cutoff`): where the marker or the
+    snapshot still holds the cutoff (the log line says so, with the time),
+    move it aside — the next run writes it back from them; where neither
+    does, restore it from a backup (one line, the time it held), since a run
+    with none of the three takes a new cutoff;
+  - **the snapshot** (`.legacy-email-whitelist.json`): restore it from a
+    backup rather than move it aside — it holds the legacy whitelist, which
+    the policy file loses on its next write; moved aside, only what the
+    policy files still hold is secured again.
 - **The model only classifies.** Either way an instruction's text is the
-  memory's own (or, for a filing memory whose short text names a document
-  and filing it and asks for nothing else — no negation, condition, other
-  request or place to file to — the fixed filing instruction); nothing the
-  model writes reaches a contact.
+  memory's own — for a filing memory whose text names a document and filing
+  it, with the fixed filing sentence added in front of those words, never
+  in their place; nothing the model writes reaches a contact.
 - **`--no-model`** carries every sender rule over verbatim. Nothing then
   judges whether a memory's text was the user's instruction or something a
   message said: read the instructions it wrote (the report lists them).
@@ -380,11 +389,15 @@ beforehand.
   message worked by a model turn from then on, its ring waiting up to
   `CHAT_INSTRUCTION_TIMEOUT`; a mail's ring waits up to
   `MAIL_INSTRUCTION_TIMEOUT` (600 s by default; raise it where filing turns
-  run longer). The report names the briefed people who hold messenger
-  handles or a phone. A person who already carried an instruction of the
-  user's is not among them: the report lists them apart, as having a rule
-  appended — take such a rule back off by editing the instruction, never with
-  `--no-instruction`, which takes the user's own words too.
+  run longer). Briefed means the migration set the person's first
+  instruction, as its journal recorded at the write. The report names the
+  briefed people who hold messenger handles or a phone, and lists apart
+  those of them whose instruction the user has edited since (taking it off
+  would take those edits too). A person who already carried an instruction
+  of the user's is not among them: where a rule was appended to it, the
+  report lists them apart again — take such a rule back off by editing the
+  instruction, never with `--no-instruction`, which takes the user's own
+  words too.
 - **What is left for a person:** the scheduled jobs that run `triage-gate.py`
   (to remove) and the prompt jobs that only mention triage (to check — a
   messenger recovery job still belongs), both named in the report; a rule the

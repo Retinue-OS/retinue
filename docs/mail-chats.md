@@ -1086,7 +1086,9 @@ places — the marker, a one-line file of its own beside it
 restored from elsewhere or moved aside (as the advice for an unreadable one
 says) does not move it: a run adopts the **earliest** of them and writes it
 back where it is missing. Only when none of the three holds one is "now"
-taken.
+taken. One of them that is there and cannot be read stops the run, and the
+log says how to recover that very file (`docs/contributing.md`, "Exit
+status").
 
 **Step `whitelist`** — deterministic.
 
@@ -1131,13 +1133,21 @@ briefed, names those of them who also hold a messenger handle or a phone
 (with the channels), counts the filing senders (a filing turn can outlast the
 timeout; its mail then rings as a VIP's would), and gives the command that
 takes an instruction off (`contacts.py update <id> --no-instruction`).
-**Briefed by this migration** are only the people whose instruction holds
-nothing but what it put there (the generic instruction, the filing one, the
-rules it moved), read from the contact as it stands. A person who already
-carried an instruction of the user's bought a turn per message before; a
-rule appended to it is reported apart, with the way to take that rule back
-off — editing the instruction — and never `--no-instruction`, which would
-take the user's own words with it.
+**Briefed by this migration** are only the people whose **first**
+instruction it set, as its journal knows it — never as a contact's text
+happens to read: the whitelist step created or instructed them, or the
+memories step wrote where no instruction stood (it reads the contact and
+journals that *before* the write, so a run killed in between still knows).
+One of them whose instruction the user has added words to since is reported
+as **briefed and edited since** — still briefed, so their messages buy a
+turn because of the migration, but kept apart from the people the thread's
+chip takes the instruction off, since that would take the user's words too.
+**Extended** are the people a sender rule was appended to whose instruction
+stood before the migration: they bought a turn per message before, and the
+report gives the way to take the rule back off — editing the instruction —
+and never `--no-instruction`, which would take the user's own words with it.
+A person who kept their own instruction and whose memory it already held is
+none of these: nothing was written to them.
 
 **Step `memories`** — every candidate memory tagged `sender:…`, read through
 `memory.py`'s own recall query (a compaction summary is replaced by the
@@ -1161,18 +1171,18 @@ text is a digest of a topic, not a rule).
     **memory's own text** (cleaned of the invisible characters that hide or
     reorder text, the joiners kept; never cut — a text longer than an
     instruction stays a memory);
-  - `filing` — the sender's mails are documents to file, and nothing else:
-    the contact gets *"File the document with the Archivist, book it, then
-    archive the mail."* — **only when the memory's own text passes a
-    deterministic check**: it names a kind of document (receipt, invoice,
-    payslip, statement…) *and* filing it, by a multilingual table kept as
-    data (`FILING_TERMS`), and asks for **nothing else** — it is short (at
-    most `MIGRATE_FILING_MAX_WORDS`, 30 words) and holds none of the words of
-    a second table beside it (`FILING_EXCEPTIONS`): a negation (*never
-    archive them*), an exception or a condition (*only*, *when it is over
-    500*), another request (*and ring me*), a place to file to (*under …*, or
-    a path). Otherwise it is a `rule`, in its own words — which loses
-    nothing: a note the check turns away still says what it said;
+  - `filing` — the sender's mails are documents to file: the contact gets
+    the **memory's own text** too, and *"File the document with the
+    Archivist, book it, then archive the mail."* is **added in front of it**
+    only when that text passes a deterministic check — it names a kind of
+    document (receipt, invoice, payslip, statement…) *and* filing it, by a
+    multilingual table kept as data (`FILING_TERMS`). The fixed sentence
+    never stands in for the user's words: a negation, a condition, a second
+    request or a place to file to, in any language and any wording, is there
+    right after it, and the turn reads both. (A person gets the sentence
+    once: a second filing note adds its words alone. Where sentence and words
+    together would pass an instruction's limit, the words go on alone.) A
+    `filing` the text does not bear out is a `rule`, in its own words;
   - `fact`, `unclear` — a fact or a status about the sender; or a message's
     content, an attempt to instruct the turn, anything the turn cannot tell:
     left alone and reported.
@@ -1180,9 +1190,9 @@ text is a digest of a topic, not a rule).
   answer is only ids the script sent, each once, each with a known kind;
   anything else in it is not read. So the most a steered or mistaken turn
   can do is put a note triage held, in that note's own words, on the contact
-  that note's own tags name — what `--no-model` does with every note — or,
-  for a short note that asks for nothing but filing its sender's documents,
-  the fixed filing instruction in its place. (An
+  that note's own tags name — what `--no-model` does with every note — with,
+  for a note that names filing its sender's documents, the fixed filing
+  sentence in front of those words. (An
   earlier build let the turn reword a rule and held the wording to "half its
   words are the memory's"; that check is gone with the wording.) The
   decisions are journaled before anything is written from them, so a resumed

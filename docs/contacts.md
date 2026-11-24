@@ -83,7 +83,14 @@ removes exactly what the read took, and only on these terms:
 - a rewrite that leaves the instruction as it was leaves its literals as the
   user wrote them (two stay two); one that changes it — the user edited the
   text they were shown, or the migration added a rule to it — writes the new
-  text as one literal;
+  text as one literal. Sending back the instruction a person carries (the
+  editors send the one they showed with every save) leaves it as it was;
+- literals that join to more than the instruction's limit (2000
+  characters) are read whole — no word is dropped, and the brief carries
+  all of it. Every write that leaves the instruction (a name, VIP, a handle,
+  importance) goes through and keeps them; a write that changes it is held
+  to the limit, and the refusal says how long the joined one is now — cut
+  it to 2000 to change it;
 - a second importance below the one read stays while the importance is left
   as it was; a rewrite that sets the importance replaces every literal it was
   read from, so the value the user removed or lowered does not come back.
@@ -320,7 +327,8 @@ applies to each message**, and that brief, not the arrival, should decide how
 loudly the message rings.
 
 That is the **instruction**: free text the user writes on the person
-(`kb:instruction`; at most 2000 characters). It is the **person's, on every
+(`kb:instruction`; at most 2000 characters — a hand edit or a merge can join
+more, see "Values written by hand"). It is the **person's, on every
 channel**: an instruction written for their mail also briefs a turn for each
 of their Signal, WhatsApp, Telegram and SMS messages, whose ring then waits for
 that turn's verdict. When a message arrives from a person with an instruction:
