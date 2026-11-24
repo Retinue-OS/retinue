@@ -91,8 +91,10 @@ nothing new.
   wholesale — the send policy (`EMAIL_SEND_POLICY`) and the chat-erase token
   since it sends and erases, and the two ingest tokens of the rails it offers
   mail to: `CHATS_INGEST_TOKEN` (the chats rail, where every arriving mail is
-  offered) and `NEWS_INGEST_TOKEN` (the news rail, where it files the mail of
-  a news sender or list itself). Compose hands
+  offered — without that token it presents its own `MAIL_GATEWAY_TOKEN`
+  there, see "The chats rail is a second way in" below) and
+  `NEWS_INGEST_TOKEN` (the news rail, where it files the mail of a news
+  sender or list itself). Compose hands
   it the credentials whether or not it mirrors; a deployment that wants them
   in one container only gives the service a profile nobody enables
   (`docs/messaging.md`). The mail gateway is the sidecar
@@ -101,7 +103,8 @@ nothing new.
   uses them); until then it adds a second place that holds them rather than
   taking one away. A named account
   mirrored as chats is held by its own mail gateway service as well. The mail
-  gateway reaches no session and has no public route. It mirrors nothing and
+  gateway runs no session itself and has no public route (what it offers the
+  chats rail may start one in the `retinue` service: below). It mirrors nothing and
   serves nothing but its `/health` until `MAIL_GATEWAY_TOKEN` is set — the
   operator's opt-in, so an upgrade that sets nothing mirrors nothing and no
   sidecar on the internal network can read stored mail without the token.
@@ -135,24 +138,63 @@ nothing new.
   as a workflow gate rather than a hard boundary. A hostile message can also
   induce the agent to read across mounted chambers or write to them.
   Reduced-privilege triage is another roadmap item.
-- **A mail's sender is not authenticated.** The mail gateway reads the sender
-  from the `From` header (else `Sender`), and the gate matches that address,
-  or a domain a contact files, against the VIP and instructed senders. Nothing
-  in the mail gateway or the web gateway checks SPF, DKIM, DMARC or an
-  `Authentication-Results` header first, and the mailbox provider's own
-  filtering is the only thing that stands before it. A mail that forges the
-  `From` of a VIP or of an instructed sender therefore gets that sender's
-  treatment: it may ring at once, and a model turn with tools runs on it,
-  briefed by the sender's instruction. The turn reads the mail as data (the
-  mail's text stands in a quoted block, never in a sentence that tells the
-  turn what to do, and the instruction is the user's, not the sender's), but
-  it can act on what the instruction lets it do, and a reply sent by an
-  instructed turn goes out under the mailbox's send policy. An instruction
-  that covers a whole domain is as wide as everyone who can write a `From`
-  at that domain. This is known and not mitigated in code; give an
-  instruction to a sender, and above all to a domain, only where a forged mail
-  from them would do little harm, and keep the mailbox's send policy on
-  `verify` for a mailbox whose instructions send.
+- **A mail's sender is not authenticated.** Who the gate takes a mail for is
+  narrow: a mail has a gate sender only when it carries exactly one `From`
+  header holding exactly one address the mail gateway's own grammar accepts,
+  lower-cased and plain ASCII (so no Unicode folding can turn it into an
+  address the address book holds). The `Sender` header, and the first of
+  several `From` addresses, are shown as who a mail is from and decide
+  nothing. That address, or a domain a contact files, is what the gate
+  matches against the VIP and instructed senders, what the instruction is
+  looked up by and what the attention item is judged as (the person's
+  importance prior and permits); a mail with no gate sender is nobody's — it
+  reaches its chat, buys no turn and rings as nobody's, never as the
+  thread's earlier correspondent. What is not narrow is the `From` itself:
+  nothing in the mail gateway or the web gateway checks SPF, DKIM, DMARC or
+  an `Authentication-Results` header, and the mailbox provider's own
+  filtering is the only thing that stands before a mail (which helps where
+  the forged domain publishes a DMARC policy the provider enforces, and not
+  otherwise). A mail that forges one `From` of a VIP or of an instructed
+  sender therefore still gets that sender's treatment: it may ring at once,
+  in every Focus mode for a VIP, and a model turn with tools runs on it,
+  briefed by the sender's instruction — which can file the documents it
+  carries, archive the thread (moving its mails out of the inbox) and send a
+  reply under the mailbox's send policy, at once under `allow` where the
+  instruction approves that in so many words. One that forges a contact with
+  an importance prior or a permit rings as that contact would. The turn
+  reads the mail as data: everything the mail says of itself — its sender's
+  name, its subject, its id, its text, and the thread's earlier mails in the
+  note that follows — stands escaped inside delimited elements it cannot
+  close, bounded in length, and none of it in a sentence that tells the turn
+  what to do; the instruction is the user's, not the sender's. But the turn
+  can do what the instruction lets it do. An instruction that covers a whole
+  domain is as wide as everyone who can write a `From` at that domain. This
+  is known and not mitigated in code; give an instruction to a sender, and
+  above all to a domain, only where a forged mail from them would do little
+  harm, and keep the mailbox's send policy on `verify` for a mailbox whose
+  instructions send.
+- **The chats rail is a second way in.** `POST /internal/chats/inbound` (and
+  `/merge`, `/removed`) is how the gateways announce messages, and the web
+  gateway trusts what an event says — whose message it is, what the gate
+  decided, the files it hands over. An **e-mail event** is never taken
+  without a token: `CHATS_INGEST_TOKEN` where it is set, else
+  `MAIL_GATEWAY_TOKEN`, compared in constant time, and refused with neither
+  set; `/merge` and `/removed` are authorized the same way. A **messenger
+  event** is open unless `CHATS_INGEST_TOKEN` is set (the gateways' forwards
+  are fire-and-forget, so a fail-closed default would fail silently), so anything that can reach the
+  `retinue` container on the internal network can post one that rings the
+  phone in every Focus mode (an event calling its sender a VIP) or starts a
+  turn briefed by a person's standing instruction, which acts as far as the
+  instruction's words go — a calendar entry or a message it approves in so
+  many words goes out unseen. The web gateway says so at startup. Every
+  `/internal/chats/*` and `/internal/news` call that a browser marks as
+  cross-site (`Sec-Fetch-Site` other than `none` or `same-origin`, else an
+  `Origin` of another site) is refused, so a page the user visits cannot
+  post to the rail through the dashboard's ambient credential; no gateway
+  sends either header. Both tokens are in a session's environment (like
+  every gateway token), so a session a hostile message steers can post an
+  event as well — no more than it can already do with the gateway's send
+  token.
 - **Chambers are not compartmentalized from each other within a session.**
 - **The updater's Docker socket is root-equivalent on the host.** This is
   inherent to what the updater does and is documented in `docker-compose.yml`.
@@ -179,6 +221,10 @@ Some of the security of a Retinue deployment is yours, not ours:
   runs no script from outside, as the egress log viewer does.
 - **Set an explicit send policy per account.** Undeclared accounts fail safe to
   `verify`, but relying on the default is not the same as deciding.
+- **Set `CHATS_INGEST_TOKEN`** on the `retinue` service and on every gateway
+  once a messenger contact is a VIP or carries an instruction: without it,
+  the chats rail takes a messenger event from anything on the internal
+  network ("The chats rail is a second way in").
 - **Keep `UPDATER_TOKEN` and gateway tokens out of any environment you don't
   control.**
 - **Back up the named volumes that are not git** — messaging account keys,

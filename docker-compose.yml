@@ -229,11 +229,16 @@ services:
       # would resurrect every read message as unread and drop staged drafts.
       - CHAT_STATE_DIR=/root/.retinue/chats
       # Optional shared secret for the gateways' chats notify rail
-      # (POST /internal/chats/inbound). Open when unset — the news-rail model;
-      # set it here and on the gateways to lock the endpoint down. Worth a
-      # thought now that the rail also starts companion turns: an open endpoint
-      # can spend a model turn, though still nothing that reaches a
-      # correspondent — only the user's send press does that.
+      # (POST /internal/chats/inbound). Unset, a messenger event is taken
+      # open — the news-rail model — and an e-mail event only with
+      # MAIL_GATEWAY_TOKEN, which the mail gateway presents instead; set it
+      # here and on the gateways to lock the rail down. Worth setting once a
+      # messenger contact is a VIP or carries an instruction: an open rail
+      # lets anything on the internal network ring the phone in every mode
+      # with a "VIP's" message, or start a turn briefed by a person's
+      # instruction, which may act — a calendar entry, a message — as far as
+      # that instruction approves, unseen (SECURITY.md, "The chats rail is a
+      # second way in"). A call a browser marks cross-site is always refused.
       - CHATS_INGEST_TOKEN
       # Required for deleting a chat (POST /chats/<id>/delete): the capability
       # the gateways demand before erasing a chat's messages. Set the same
@@ -714,8 +719,10 @@ services:
       # held/forward path it had before). Own-device echoes are the one
       # fire-and-forget call left: nothing is being handed over. Empty to
       # disable the rail entirely. Open unless CHATS_INGEST_TOKEN is set on both
-      # sides — worth setting now that an unauthenticated caller could spend a
-      # model turn and stage a draft.
+      # sides — worth setting once a contact is a VIP or carries an
+      # instruction: an unauthenticated caller could ring the phone in every
+      # mode or start a turn briefed by that instruction (see the retinue
+      # service's CHATS_INGEST_TOKEN).
       - CHATS_INGEST_URL=http://retinue:8080/internal/chats/inbound
       - CHATS_INGEST_TOKEN
       # Required by POST /chats/delete (a chat's erasure, relayed by the
@@ -819,8 +826,10 @@ services:
       # held/forward path it had before). Own-device echoes are the one
       # fire-and-forget call left: nothing is being handed over. Empty to
       # disable the rail entirely. Open unless CHATS_INGEST_TOKEN is set on both
-      # sides — worth setting now that an unauthenticated caller could spend a
-      # model turn and stage a draft.
+      # sides — worth setting once a contact is a VIP or carries an
+      # instruction: an unauthenticated caller could ring the phone in every
+      # mode or start a turn briefed by that instruction (see the retinue
+      # service's CHATS_INGEST_TOKEN).
       - CHATS_INGEST_URL=http://retinue:8080/internal/chats/inbound
       - CHATS_INGEST_TOKEN
       # Required by POST /chats/delete (a chat's erasure, relayed by the
@@ -925,8 +934,10 @@ services:
       # held/forward path it had before). Own-device echoes are the one
       # fire-and-forget call left: nothing is being handed over. Empty to
       # disable the rail entirely. Open unless CHATS_INGEST_TOKEN is set on both
-      # sides — worth setting now that an unauthenticated caller could spend a
-      # model turn and stage a draft.
+      # sides — worth setting once a contact is a VIP or carries an
+      # instruction: an unauthenticated caller could ring the phone in every
+      # mode or start a turn briefed by that instruction (see the retinue
+      # service's CHATS_INGEST_TOKEN).
       - CHATS_INGEST_URL=http://retinue:8080/internal/chats/inbound
       - CHATS_INGEST_TOKEN
       # Required by POST /chats/delete (a chat's erasure, relayed by the

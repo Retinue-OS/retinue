@@ -69,6 +69,17 @@ DEFAULT_GROUP_IMPORTANCE = 1.0
 # flag, a judgement of the message.
 MAIL_CHANNEL = "email"
 CHANNEL_DEFAULT_IMPORTANCE = {MAIL_CHANNEL: DEFAULT_GROUP_IMPORTANCE}
+# A mail the gate took for nobody's — no From it could read, or more than one
+# (docs/mail-chats.md, "The gate") — is about nobody: the gateway puts this
+# peer on its row, and it has no card, no prior, no permit and a stranger's
+# sphere, whoever the thread was with until then. Its item is filed under
+# MAIL_UNKNOWN_SENDER.
+MAIL_UNKNOWN_SENDER = "Unknown sender"
+MAIL_NOBODY = {"address": "", "name": "", "contact": None, "nobody": True}
+
+
+def _mail_nobody(peer) -> bool:
+    return isinstance(peer, dict) and peer.get("nobody") is True
 
 # The sphere vocabulary the sheet offers. A deployment can extend it in
 # focus.json (``spheres``); the modes' ``admits`` lists use the same words.
@@ -373,6 +384,8 @@ def chat_card(chat: dict, state: dict | None) -> dict:
     if chat.get("group"):
         return {}
     peer = chat.get("peer")
+    if _mail_nobody(peer):
+        return {}
     if (card.get("person") and isinstance(peer, dict) and "contact" in peer
             and peer["contact"] != card["person"]):
         return {}
@@ -390,8 +403,11 @@ def chat_is_unknown(state: dict, chat: dict | None = None) -> bool:
     A mail thread's peer the address book places — the holder of the
     address, or the person whose domain covers it (:func:`mail_peer_person`)
     — is no stranger either, card or not: a domain is filed on nobody's
-    chat, and a group thread keeps no card at all."""
+    chat, and a group thread keeps no card at all. A mail from nobody
+    (:data:`MAIL_NOBODY`) is a stranger's, whatever the rail said."""
     state = state or {}
+    if chat is not None and chat.get("channel") == MAIL_CHANNEL and _mail_nobody(chat.get("peer")):
+        return True
     card = state.get("contact") if chat is None else chat_card(chat, state)
     if (chat is not None and chat.get("channel") == MAIL_CHANNEL
             and mail_peer_person(chat.get("peer"))):
@@ -445,7 +461,9 @@ def chat_sender(chat: dict, state: dict | None) -> str:
     name is whatever its sender typed, and anyone can type the name of
     someone the user gave a high prior or a permit; the address they cannot
     choose. The display name is the item's *title* (:func:`chat_item`), where
-    it only has to read well."""
+    it only has to read well. And never the thread's earlier correspondent
+    for a mail from nobody (:data:`MAIL_NOBODY`): that one is
+    :data:`MAIL_UNKNOWN_SENDER`."""
     if chat.get("channel") != MAIL_CHANNEL:
         return chat.get("name") or chat.get("key") or chat.get("id") or "Chat"
     state = state or {}
@@ -453,6 +471,8 @@ def chat_sender(chat: dict, state: dict | None) -> str:
     if card.get("name"):
         return card["name"]
     for peer in (chat.get("peer"), state.get("peer")):
+        if _mail_nobody(peer):
+            return MAIL_UNKNOWN_SENDER
         if isinstance(peer, dict) and peer.get("address"):
             return mail_peer_person(peer) or peer["address"]
     # No peer on record yet (a chat the rail has not passed by, its state
@@ -746,7 +766,8 @@ def default_emit_path(chambers_dir: Path) -> Path:
 
 __all__ = [
     "AttentionStore", "DEFAULT_CHAT_SPHERE", "DEFAULT_SPHERES", "DEFAULT_DIRECT_IMPORTANCE",
-    "DEFAULT_GROUP_IMPORTANCE", "CHANNEL_DEFAULT_IMPORTANCE", "MAIL_CHANNEL", "zone",
+    "DEFAULT_GROUP_IMPORTANCE", "CHANNEL_DEFAULT_IMPORTANCE", "MAIL_CHANNEL",
+    "MAIL_NOBODY", "MAIL_UNKNOWN_SENDER", "zone",
     "thread_wants_attention", "thread_item", "chat_wants_attention", "chat_card",
     "chat_is_unknown", "chat_screened", "mail_peer_person", "chat_sender", "chat_item",
     "project_item", "fold_projects", "block_for", "subject_iri", "emit", "default_emit_path",
