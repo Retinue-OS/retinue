@@ -36,7 +36,7 @@ ACCOUNT = "me@example.org"
 MAIL_PREDICATES = (ist.P_SUBJECT, ist.P_SENDER_NAME, ist.P_RECIPIENT, ist.P_CC,
                    ist.P_IN_REPLY_TO, ist.P_REFERENCES, ist.P_LIST_ID, ist.P_BODY_PART,
                    ist.P_HTML_PART, ist.P_HEADER_PART, ist.P_CONTENT_ID, ist.P_TRIM,
-                   ist.P_REMOVED_AT)
+                   ist.P_REMOVED_AT, ist.P_ARRIVED_AT)
 
 
 def _png(w, h):
@@ -66,7 +66,9 @@ def _mail(tmp, *, outbound=False, chat="root@x.org", timestamp=1000.0, **over):
               in_reply_to="root@x.org", references=["root@x.org", "mid@x.org"],
               list_id="team.lists.x.org", body_part=refs["body"], html_part=refs["html"],
               header_part=refs["head"], trim="deterministic",
-              content_ids={refs["pic"]: "img1@x.org", "urn:not-an-attachment": "x"})
+              content_ids={refs["pic"]: "img1@x.org", "urn:not-an-attachment": "x"},
+              # The server received it a minute after the Date it carries.
+              arrived_at=timestamp + 60.0)
     kw.update(over)
     if outbound:
         urn, path = ist.write_outbound(tmp, author="device", sender=ACCOUNT, **kw)
@@ -83,6 +85,8 @@ def _assert_mail_fields(fields, refs):
     assert fields["in_reply_to"] == "root@x.org"
     assert fields["references"] == "root@x.org mid@x.org"
     assert fields["list_id"] == "team.lists.x.org"
+    record_time = ist._parse_since(fields.get("sent_at") or fields["received_at"])
+    assert fields["arrived_at"] == ist._iso(record_time + 60.0), fields["arrived_at"]
     assert (fields["body_part"], fields["html_part"], fields["header_part"]) == (
         refs["body"], refs["html"], refs["head"])
     assert fields["trim"] == "deterministic"
@@ -106,6 +110,11 @@ def test_every_field_is_written_and_read_back():
         assert f'<{urn}> <{ist.P_SUBJECT}> "Re: Quarterly numbers — Q3" .' in text
         assert f'<{urn}> <{ist.P_RECIPIENT}> "b@y.org" .' in text
         assert f'<{urn}> <{ist.P_REFERENCES}> "root@x.org mid@x.org" .' in text
+        # Two times: the mail's own (its Date) and when the server received it.
+        assert (f'<{urn}> <{ist.P_RECEIVED_AT}> "{ist._iso(1000.0)}"^^<{ist.XSD_DATETIME}> .'
+                in text)
+        assert (f'<{urn}> <{ist.P_ARRIVED_AT}> "{ist._iso(1060.0)}"^^<{ist.XSD_DATETIME}> .'
+                in text)
         # The parts are IRIs, never attachments: a chat shows attachments as
         # files, and the original is not a file the sender attached.
         assert f'<{urn}> <{ist.P_BODY_PART}> <{refs["body"]}> .' in text
@@ -320,9 +329,9 @@ def test_tombstone():
         assert ist.tombstone_message(path, removed_at=2000.0) is True
         text = path.read_text()
         after = ist._parse(text)
-        # Kept: who, where, when, and the threading ids.
+        # Kept: who, where, when (both times), and the threading ids.
         for key in ("type", "channel", "chat", "account", "sender", "sender_name",
-                    "message_id", "subject_line", "received_at", "in_reply_to",
+                    "message_id", "subject_line", "received_at", "arrived_at", "in_reply_to",
                     "references", "list_id", "subject"):
             assert after[key] == before[key], key
         assert after["delivered"] is True, "nothing is owed for a mail that is gone"
@@ -408,6 +417,122 @@ def test_rekey_then_delete_finds_the_new_key():
         assert ist.rekey_chat(tmp, "late@x.org", "you@example.org", "r@x")["errors"] == 1
         assert ist.rekey_chat(tmp, "", ACCOUNT, "r@x") == {"messages": 0, "errors": 0}
     print("PASS test_rekey_then_delete_finds_the_new_key")
+
+
+def test_a_single_writer_spares_the_ledger_scan():
+    """A tombstone asks every record whether it names one of the blobs, and a
+    merge reads every record to find the chat's: per call, the whole store.
+    A writer that knows the answer says so instead — and the default, which
+    the messenger gateways rely on, is untouched."""
+    with tempfile.TemporaryDirectory() as tmp:
+        urn, path, refs = _mail(tmp)
+        _s, sharer = ist.write_outbound(tmp, channel="email", chat="root@x.org",
+                                        account=ACCOUNT, text="fwd", author="user",
+                                        timestamp=1001.0, attachment_urls=[refs["doc"]])
+        _u, bystander, _r = _mail(tmp, timestamp=1002.0)
+        # A record nobody can read would make the default keep every blob.
+        (ist.messages_dir(tmp) / "0000000000000003-dir.nt").mkdir()
+        read = []
+        real = ist._blob_ids_referenced_elsewhere
+
+        def scan(*args, **kwargs):
+            read.append(args)
+            return real(*args, **kwargs)
+        ist._blob_ids_referenced_elsewhere = scan
+        try:
+            # own_blobs: the caller's word that this record's blobs are its
+            # own. No other record is looked at, and all of them go.
+            assert ist.tombstone_message(path, removed_at=2000.0, own_blobs=True) is True
+            assert read == []
+            for key in refs:
+                assert ist.load_media(tmp, ist.media_id_of(refs[key])) is None, key
+            assert ist._parse(path.read_text())["removed_at"] == ist._iso(2000.0)
+            # The default still asks, and still fails closed.
+            mine = ist._media_refs(ist._parse(bystander.read_text()))
+            assert ist.tombstone_message(bystander) is True
+            assert len(read) == 1
+            assert all(ist.load_media(tmp, ist.media_id_of(ref)) for ref in mine), \
+                "an unreadable record may name any blob: none is unlinked"
+        finally:
+            ist._blob_ids_referenced_elsewhere = real
+        assert ist._parse(sharer.read_text())["attachments"] == [refs["doc"]]
+
+    with tempfile.TemporaryDirectory() as tmp:
+        _u, a1, _r = _mail(tmp, chat="late@x.org", timestamp=1000.0)
+        _u, a2, _r = _mail(tmp, chat="late@x.org", timestamp=1001.0, outbound=True)
+        _u, stray, _r = _mail(tmp, chat="late@x.org", timestamp=1002.0)   # not handed in
+        _u, other, _r = _mail(tmp, chat="else@x.org", timestamp=1003.0)
+        _u, foreign, _r = _mail(tmp, chat="late@x.org", timestamp=1004.0,
+                                account="you@example.org")
+        # A record elsewhere that cannot be judged is not this merge's concern …
+        broken = ist.messages_dir(tmp) / "0000000000000001-broken.nt"
+        broken.write_text(f'garbage\n<urn:x> <{ist.P_CHAT}> "late@x.org" .\n')
+        opened = []
+        real_read = Path.read_text
+
+        def read_text(self, *args, **kwargs):
+            opened.append(self.name)
+            return real_read(self, *args, **kwargs)
+        Path.read_text = read_text
+        try:
+            got = ist.rekey_chat(tmp, "late@x.org", ACCOUNT, "root@x.org",
+                                 paths=[a1, a2, other, foreign,
+                                        ist.messages_dir(tmp) / "gone.nt"])
+        finally:
+            Path.read_text = real_read
+        # Only the files named were read; of those, only this chat's moved.
+        assert got == {"messages": 2, "errors": 0}, got
+        assert set(opened) <= {p.name for p in (a1, a2, other, foreign)} | {"gone.nt"}
+        chats = {p: ist._parse(p.read_text())["chat"] for p in (a1, a2, stray, other, foreign)}
+        assert chats == {a1: "root@x.org", a2: "root@x.org", stray: "late@x.org",
+                         other: "else@x.org", foreign: "late@x.org"}
+        assert ist.rekey_chat(tmp, "late@x.org", ACCOUNT, "root@x.org", paths=[a1, a2]) == {
+            "messages": 0, "errors": 0}, "a repeat finds them moved"
+        # … but one that WAS handed in and cannot be judged is an error,
+        # whatever it names: the caller said it is this chat's.
+        assert ist.rekey_chat(tmp, "late@x.org", ACCOUNT, "root@x.org",
+                              paths=[stray, broken]) == {"messages": 1, "errors": 1}
+        (ist.messages_dir(tmp) / "0000000000000002-quiet.nt").write_text("garbage\n")
+        assert ist.rekey_chat(tmp, "x@x.org", ACCOUNT, "root@x.org", paths=[
+            ist.messages_dir(tmp) / "0000000000000002-quiet.nt"])["errors"] == 1
+        # Without paths: the whole store, as before.
+        assert ist.rekey_chat(tmp, "else@x.org", ACCOUNT, "root@x.org") == {
+            "messages": 1, "errors": 0}
+    print("PASS test_a_single_writer_spares_the_ledger_scan")
+
+
+def test_a_long_literal_is_read_without_a_gigabyte():
+    """One mail's text is one literal on one line. Matched with a pattern
+    that can backtrack, a literal of five megabytes costs a gigabyte on every
+    read of its record — at every start, on every tombstone and re-key."""
+    import tracemalloc
+    with tempfile.TemporaryDirectory() as tmp:
+        text = "".join(f"line {n} with a \"quote\" and a back\\slash\n" for n in range(50_000))
+        assert len(text) > 2_000_000
+        _urn, path = ist.write_message(tmp, channel="email", sender="a@x.org", text=text,
+                                       chat="c@x.org", account=ACCOUNT, message_id="big@x.org",
+                                       timestamp=1000.0)
+        raw = path.read_text(encoding="utf-8")
+        tracemalloc.start()
+        try:
+            fields = ist._parse(raw)
+            _now, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        assert fields["text"] == text
+        # A few copies of the text, not two hundred bytes per character.
+        assert peak < 20 * len(raw), f"{peak / len(raw):.0f} bytes per character"
+        # The same strictness as ever about what a triple is.
+        for bad in ('<urn:a> <urn:p> "unterminated .',
+                    '<urn:a> <urn:p> "a" "b" .',
+                    '<urn:a> <urn:p> "ends in a backslash\\" .',
+                    '<urn:a> <urn:p> "x"^^<urn:t> extra .'):
+            assert ist._TRIPLE_RE.match(bad) is None, bad
+        for good, literal in (('<urn:a> <urn:p> "" .', ""),
+                              ('<urn:a> <urn:p> "a \\"q\\" \\\\ b"^^<urn:t> .', 'a \\"q\\" \\\\ b'),
+                              ('<urn:a> <urn:p> "x"  .  ', "x")):
+            assert ist._TRIPLE_RE.match(good).group(4) == literal, good
+    print("PASS test_a_long_literal_is_read_without_a_gigabyte")
 
 
 def test_delete_chat_unlinks_part_blobs():
@@ -509,6 +634,11 @@ def test_iter_records():
         assert ist.undelivered(tmp) == [] and ist.mark_delivered(bytes_file) is False
         assert ist.update_message(bytes_file, text="x") is None
         assert ist.subject_for(bytes_file) is None and ist.backfill_media_meta(tmp) == 0
+        # One record by its path: the same fields, or None for anything else.
+        assert ist.read_record(p2) == got[1][1] and ist.read_record(str(p1)) == got[0][1]
+        for other in (bytes_file, mdir / "0000000000001500-broken.nt",
+                      mdir / "0000000000001600-dir.nt", mdir / "nope.nt"):
+            assert ist.read_record(other) is None, other
     print("PASS test_iter_records")
 
 
@@ -520,6 +650,8 @@ if __name__ == "__main__":
     test_unsafe_characters_keep_the_record_readable()
     test_tombstone()
     test_rekey_then_delete_finds_the_new_key()
+    test_a_single_writer_spares_the_ledger_scan()
+    test_a_long_literal_is_read_without_a_gigabyte()
     test_delete_chat_unlinks_part_blobs()
     test_the_author_of_an_outbound_record_can_be_corrected()
     test_discard_media()

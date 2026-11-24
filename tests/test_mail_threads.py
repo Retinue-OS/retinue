@@ -164,6 +164,11 @@ def test_base_subject_table():
         ("Re[2]: x", "x"), ("Re(3): x", "x"), ("RE^2: x", "x"), ("Re [4]: x", "x"),
         # French spacing and the full-width colon.
         ("RE : x", "x"), ("Re：x", "x"),
+        # Full-width letters, as an East Asian input method types the prefix;
+        # the rest of the subject keeps its own.
+        ("Ｒｅ： 会議の件", "会議の件"), ("ＲＥ：x", "x"), ("ＦＷＤ：Ｒｅ：x", "x"),
+        ("Ｒｅ［２］： x", "x"), ("Ｒｅ：　ｘｙｚ", "ｘｙｚ"),
+        ("Ｒｅａｌｌｙ", "Ｒｅａｌｌｙ"), ("Ｒｅ 会議", "Ｒｅ 会議"),
         # Stacks of every kind.
         ("RE: AW: Fwd: WG: Re[2]: x", "x"),
         # List tags are part of the name, kept once, in front.
@@ -204,6 +209,15 @@ def test_to_epoch():
     assert e("2026-01-01T00:00:00Z") == e("2026-01-01T01:00:00+01:00")
     assert e("Thu, 01 Jan 2026 01:00:00 +0100") == e("2026-01-01T00:00:00Z")
     assert e(float("nan")) is None and e(True) is None
+    # "Never raises" holds for what a hostile Date header can hold: an offset
+    # of twenty digits (an OverflowError on some Python versions), a year no
+    # clock reaches, a number beyond any float.
+    for hostile in ("Mon, 1 Jan 2024 00:00:00 +99999999999999999999",
+                    "Mon, 1 Jan 2024 00:00:00 -99999999999999999999",
+                    "9" * 400, "0001-01-01T00:00:00+23:59", "9999-12-31T23:59:59-23:59",
+                    "Mon, 31 Dec 9999 23:59:59 -2359", 10 ** 400, "\ud800", "1e999"):
+        got = e(hostile)
+        assert got is None or isinstance(got, float), (hostile, got)
     print("PASS test_to_epoch")
 
 
@@ -477,6 +491,75 @@ def test_resolve_input_hygiene():
     print("PASS test_resolve_input_hygiene")
 
 
+def test_cited_ids_are_bounded():
+    many = " ".join(f"<r{n}@x>" for n in range(5000))
+    cited = mt.cited_ids(many, "<parent@x>", "<m@x>")
+    assert len(cited) == mt.MAX_CITED_IDS
+    # The declared root and the nearest parents; the middle is what goes.
+    assert cited[0] == "r0@x" and cited[-1] == "parent@x" and cited[-2] == "r4999@x"
+    assert cited[1] == f"r{5001 - (mt.MAX_CITED_IDS - 1)}@x"
+    short = " ".join(f"<r{n}@x>" for n in range(mt.MAX_CITED_IDS))
+    assert len(mt.cited_ids(short, "", "")) == mt.MAX_CITED_IDS, "at the bound: all kept"
+    with tempfile.TemporaryDirectory() as tmp, _index(tmp) as ix:
+        # A caller that hands in a raw list is held to the same bound.
+        ix.resolve("<m@x>", [f"<r{n}@x>" for n in range(5000)], T0)
+        assert len(ix.members("r0@x", include_cited=True)) == mt.MAX_CITED_IDS + 1
+        assert ix.chat_of("r4999@x") == "r0@x" and ix.chat_of("r2500@x") is None
+    print("PASS test_cited_ids_are_bounded")
+
+
+def test_one_mail_cannot_weld_many_chats():
+    assert mt.MAX_MERGE_CHATS == 4
+    with tempfile.TemporaryDirectory() as tmp, _index(tmp) as ix:
+        for n in range(8):
+            _feed(ix, f"<t{n}@x>", day=n, subject=f"Thread {n}")
+        # Four chats in one mail is still a thread found again …
+        m = _feed(ix, "<four@x>", "<t0@x> <t1@x> <t2@x> <t3@x>", "<t3@x>", day=20)
+        assert (m.chat, m.merged, m.unmerged) == ("t0@x", ["t1@x", "t2@x", "t3@x"], ())
+        assert len(ix.chats()) == 5
+        # … five is not: nothing is merged, and the mail goes to the chat of
+        # the mail it answers. The other chats keep their ids.
+        before = sorted(ix.chats())
+        w = _feed(ix, "<weld@x>", "<t0@x> <t4@x> <t5@x> <t7@x> <new@x> <t6@x>", "<t6@x>",
+                  day=-5, subject="Mine now")
+        assert w.chat == "t6@x" and w.merged == [] and w.new is False
+        assert w.unmerged == ("t0@x", "t4@x", "t5@x", "t7@x")
+        assert sorted(ix.chats()) == before
+        for n in (4, 5, 6, 7):
+            assert ix.chat_of(f"t{n}@x") == f"t{n}@x"
+            assert ix.subject_of(f"t{n}@x") == (f"Thread {n}" if n != 6 else "Mine now")
+        # An id nobody had seen follows the mail; a known one stays where it was.
+        assert ix.chat_of("new@x") == "t6@x" and ix.chat_of("t0@x") == "t0@x"
+        # A repeat of it changes nothing, and still says what it was refused.
+        again = _feed(ix, "<weld@x>", "<t0@x> <t4@x> <t5@x> <t7@x> <new@x> <t6@x>", "<t6@x>")
+        assert again.chat == "t6@x" and again.repeat and again.merged == []
+        assert sorted(ix.chats()) == before
+        # A mail a reply already placed stays there, however much it cites.
+        _feed(ix, "<reply@x>", "<late@x>", "<late@x>", day=30)
+        late = _feed(ix, "<late@x>", "<t4@x> <t5@x> <t6@x> <t7@x>", "<t7@x>", day=29)
+        assert late.chat == "late@x" and late.merged == [] and len(late.unmerged) == 4
+        snapshot = sorted(ix.chats())
+
+        # A rebuild from the records decides the same: the ledger's keys stand.
+        records = [(f"t{n}@x", [], "t0@x" if n < 4 else f"t{n}@x", T0 + n * DAY, None)
+                   for n in range(8)]
+        records += [("four@x", ["t0@x", "t1@x", "t2@x", "t3@x"], "t0@x", T0 + 20 * DAY, None),
+                    ("weld@x", ["t0@x", "t4@x", "t5@x", "t6@x", "t7@x", "new@x"], "t6@x",
+                     T0 - 5 * DAY, None),
+                    ("reply@x", ["late@x"], "late@x", T0 + 30 * DAY, None),
+                    ("late@x", ["t4@x", "t5@x", "t6@x", "t7@x"], "late@x", T0 + 29 * DAY, None)]
+        assert ix.rebuild(records) == {}
+        assert sorted(ix.chats()) == snapshot
+        assert ix.chat_of("weld@x") == "t6@x" and ix.chat_of("late@x") == "late@x"
+    with tempfile.TemporaryDirectory() as tmp, _index(tmp) as ix:
+        # A subject a caller's decoder left a lone surrogate in is storable.
+        r = ix.resolve("<s@x>", [], T0, "bad \ud800 subject")
+        assert r.chat == "s@x" and ix.subject_of("s@x") == "bad ? subject"
+        # And an id with one is no id.
+        assert mt.normalize_id("<a\udfff@x>") == "" and mt.cited_ids("<a\ud800@x> <b@x>", "") == ["b@x"]
+    print("PASS test_one_mail_cannot_weld_many_chats")
+
+
 # --------------------------------------------------------------------------
 # Rebuild
 # --------------------------------------------------------------------------
@@ -656,6 +739,8 @@ if __name__ == "__main__":
     test_two_accounts_are_independent()
     test_subject_follows_the_earliest_mail()
     test_resolve_input_hygiene()
+    test_cited_ids_are_bounded()
+    test_one_mail_cannot_weld_many_chats()
     test_rebuild_matches_oldest_first()
     test_rebuild_heals_an_interrupted_merge_and_replaces_content()
     test_one_writer_many_readers()

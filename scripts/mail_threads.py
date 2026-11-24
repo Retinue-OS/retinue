@@ -32,6 +32,17 @@ The index maps **every id ever seen or cited** to a chat key, so a parent that
 was only ever cited is found when it finally arrives. Resolving the same mail
 twice changes nothing and reports no merge.
 
+**What one mail may do is bounded**, because every header of it is its
+sender's to write and a merge is for good. A mail cites at most
+:data:`MAX_CITED_IDS` ids (the declared root and the nearest parents; a
+longer ``References`` loses its middle, as RFC 5322 has clients trim it). And
+rule 4 joins at most :data:`MAX_MERGE_CHATS` chats: a mail that cites more
+merges none of them — it joins the chat of its nearest known parent, and
+:attr:`Resolution.unmerged` names the chats it was not allowed to weld.
+"Oldest" is by the ``date`` the caller hands in, so a caller that must not let
+a sender choose the survivor passes a date the sender cannot write (the mail
+gateway: the server's arrival time, not the ``Date`` header).
+
 Schema (``PRAGMA user_version`` 1), kept small on purpose — the ledger is the
 record, this is a lookup table that :meth:`ThreadIndex.rebuild` can recreate:
 
@@ -62,6 +73,18 @@ from typing import Iterable, NamedTuple
 
 SCHEMA_VERSION = 1
 
+# How many ids one mail may cite. A long thread's References runs to a few
+# dozen ids; clients that trim keep the first and the last ones (RFC 5322,
+# 3.6.4), and so does this: the first cited id — the declared root, which keys
+# the chat — and the nearest parents. Without a cap one mail writes as many
+# permanent index rows as its sender cares to type.
+MAX_CITED_IDS = 100
+# How many chats one mail may join into one. Two is the ordinary case (a
+# client cut References short), three or four a long thread cut more than
+# once. Beyond that it is not a thread found again but a header written to
+# weld strangers' conversations together — and a merge cannot be undone.
+MAX_MERGE_CHATS = 4
+
 
 # --------------------------------------------------------------------------
 # Message-ID parsing
@@ -81,7 +104,10 @@ _FOLD = re.compile(r"\r?\n[ \t]*")
 
 
 def _valid(token: str) -> bool:
-    if not token or any(ch in _FORBIDDEN or ch.isspace() for ch in token):
+    # (A lone surrogate — what a lenient decoder leaves of a byte it could not
+    # read — can be neither stored nor sent: a token holding one is no id.)
+    if not token or any(ch in _FORBIDDEN or ch.isspace() or "\ud800" <= ch <= "\udfff"
+                        for ch in token):
         return False
     if "@" in token:
         left, _, right = token.rpartition("@")
@@ -200,12 +226,21 @@ def normalize_id(raw) -> str:
     return ids[0]
 
 
+def _bounded(ids: list[str]) -> list[str]:
+    """At most :data:`MAX_CITED_IDS` of a mail's cited ids: the first (the
+    declared root) and the last ones (the nearest parents), order kept."""
+    if len(ids) <= MAX_CITED_IDS:
+        return ids
+    return ids[:1] + ids[len(ids) - (MAX_CITED_IDS - 1):]
+
+
 def cited_ids(references, in_reply_to, message_id="") -> list[str]:
     """The ids a mail cites: ``References`` in header order, then ``In-Reply-To``.
 
     Duplicates are dropped keeping the first position (``In-Reply-To`` normally
     repeats the last reference), and the mail's own id — when given — is never
     cited, so a client that lists itself cannot make a mail its own parent.
+    At most :data:`MAX_CITED_IDS` come back: the first and the last ones.
     """
     own = normalize_id(message_id) if message_id else ""
     out: list[str] = []
@@ -215,7 +250,7 @@ def cited_ids(references, in_reply_to, message_id="") -> list[str]:
             if token != own and token not in seen:
                 seen.add(token)
                 out.append(token)
-    return out
+    return _bounded(out)
 
 
 # --------------------------------------------------------------------------
@@ -266,6 +301,12 @@ _PREFIX_RE = re.compile(
     re.IGNORECASE,
 )
 _LIST_TAG_RE = re.compile(r"^\[([^\[\]]*)\]")
+# The full-width forms of ASCII ("Ｒｅ：", as an East Asian input method types
+# it) and the ideographic space, folded to ASCII for the prefix match only.
+# One character for one, so a match's length on the folded text is its length
+# on the subject — which a compatibility normalisation would not promise.
+_FULLWIDTH_FOLD = {code: code - 0xFEE0 for code in range(0xFF01, 0xFF5F)}
+_FULLWIDTH_FOLD[0x3000] = 0x20
 
 
 def base_subject(subject) -> str:
@@ -282,7 +323,7 @@ def base_subject(subject) -> str:
     tags: list[str] = []
     seen: set[str] = set()
     while s:
-        m = _PREFIX_RE.match(s)
+        m = _PREFIX_RE.match(s.translate(_FULLWIDTH_FOLD))
         if m:
             s = s[m.end():].lstrip()
             continue
@@ -313,22 +354,30 @@ def to_epoch(value) -> float | None:
     if isinstance(value, bool):
         return None
     if isinstance(value, (int, float)):
-        f = float(value)
+        try:
+            f = float(value)
+        except OverflowError:   # an integer beyond any float
+            return None
         return f if math.isfinite(f) else None
     if isinstance(value, _dt.datetime):
         if value.tzinfo is None:
             value = value.replace(tzinfo=_dt.timezone.utc)
-        return value.timestamp()
+        try:
+            return value.timestamp()
+        except (OverflowError, OSError, ValueError):   # a year no clock reaches
+            return None
     text = str(value).strip()
     if re.fullmatch(r"-?\d+(?:\.\d+)?", text):
         return to_epoch(float(text))
+    # The two parsers raise more than they document on a hostile value (a
+    # zone offset of twenty digits is an OverflowError on some versions).
     try:
         return to_epoch(_dt.datetime.fromisoformat(text.replace("Z", "+00:00")))
-    except ValueError:
+    except (ValueError, OverflowError, TypeError):
         pass
     try:
         return to_epoch(email.utils.parsedate_to_datetime(text))
-    except (TypeError, ValueError, IndexError):
+    except (TypeError, ValueError, IndexError, OverflowError):
         return None
 
 
@@ -343,11 +392,14 @@ class Resolution(NamedTuple):
     into ``chat`` by this call (sorted; the gateway re-keys their records and
     tells the web gateway). ``new`` — this call started the chat. ``repeat`` —
     the mail was already recorded (a re-poll, a re-delivery): nothing changed.
+    ``unmerged`` — the other chats the mail cited when it cited more than
+    :data:`MAX_MERGE_CHATS`: none was merged, and the caller should say so.
     """
     chat: str
     merged: list[str]
     new: bool
     repeat: bool = False
+    unmerged: tuple = ()
 
 
 _SCHEMA = """
@@ -484,6 +536,20 @@ class ThreadIndex:
         def run():
             self._conn.execute("DELETE FROM ids")
             self._conn.execute("DELETE FROM mails")
+            # Every mail is put where the ledger has it before any header is
+            # replayed. A record's date is its sender's claim, and replayed
+            # first into an empty index, a backdated mail would take every
+            # id it cites for its own chat — and the mails those ids name
+            # would then be merged into it one by one, each merge within the
+            # bound. With the mails in place, what a mail cites is counted
+            # against the chats as they stand, as it was when it arrived.
+            for mid, _cited, chat, date, subject in rows:
+                if chat is not None:
+                    self._conn.execute(
+                        "INSERT OR IGNORE INTO ids (id, chat) VALUES (?, ?)", (mid, chat))
+                    self._conn.execute(
+                        "INSERT OR IGNORE INTO mails (id, chat, date, subject) "
+                        "VALUES (?, ?, ?, ?)", (mid, chat, date, self._storable(subject)))
             for mid, cited, chat, date, subject in rows:
                 self._resolve(mid, cited, date, subject, chat)
             moved: dict[str, str] = {}
@@ -581,7 +647,15 @@ class ThreadIndex:
             if token and token not in seen:
                 seen.add(token)
                 out.append(token)
-        return out
+        return _bounded(out)
+
+    @staticmethod
+    def _storable(subject) -> str | None:
+        """A subject as sqlite can hold it. A lone surrogate — a caller's
+        decoder may leave one — would fail the whole statement."""
+        if subject is None:
+            return None
+        return str(subject).encode("utf-8", "replace").decode("utf-8")
 
     def _chat_of(self, mid: str) -> str | None:
         row = self._conn.execute(
@@ -605,10 +679,24 @@ class ThreadIndex:
             known.append(prefer)
 
         merged: list[str] = []
+        unmerged: tuple = ()
         if not known:
             survivor = cited[0] if cited else mid
         elif len(known) == 1:
             survivor = known[0]
+        elif len(known) > MAX_MERGE_CHATS:
+            # More chats than one mail may join: none is merged. The mail
+            # stays where it is on record (a repeat; the ledger's key on a
+            # rebuild), else goes where a reply to it already put it, else to
+            # its nearest known parent.
+            if existing is not None:
+                survivor = existing[0]
+            elif prefer is not None:
+                survivor = prefer
+            else:
+                survivor = self._chat_of(mid) or next(
+                    chat for chat in map(self._chat_of, reversed(cited)) if chat is not None)
+            unmerged = tuple(sorted(c for c in known if c != survivor))
         else:
             def age(chat):
                 first = conn.execute(
@@ -626,18 +714,23 @@ class ThreadIndex:
                 conn.execute("UPDATE mails SET chat = ? WHERE chat = ?", (survivor, chat))
 
         new = not self._chat_exists(survivor)
-        conn.executemany(
+        subject = self._storable(subject)
+        conn.execute(
             "INSERT INTO ids (id, chat) VALUES (?, ?) "
-            "ON CONFLICT (id) DO UPDATE SET chat = excluded.chat",
-            [(token, survivor) for token in [mid, *cited]])
+            "ON CONFLICT (id) DO UPDATE SET chat = excluded.chat", (mid, survivor))
+        # The cited ids follow the mail — unless it was refused a merge: then
+        # an id that belongs to another chat stays that chat's.
+        conn.executemany(
+            "INSERT INTO ids (id, chat) VALUES (?, ?) ON CONFLICT (id) DO "
+            + ("NOTHING" if unmerged else "UPDATE SET chat = excluded.chat"),
+            [(token, survivor) for token in cited])
         if existing is None:
             conn.execute(
                 "INSERT INTO mails (id, chat, date, subject) VALUES (?, ?, ?, ?)",
-                (mid, survivor, date,
-                 None if subject is None else str(subject)))
+                (mid, survivor, date, subject))
         else:
             conn.execute(
                 "UPDATE mails SET chat = ?, date = COALESCE(date, ?), "
                 "subject = COALESCE(subject, ?) WHERE id = ?",
-                (survivor, date, None if subject is None else str(subject), mid))
-        return Resolution(survivor, merged, new, existing is not None)
+                (survivor, date, subject, mid))
+        return Resolution(survivor, merged, new, existing is not None, unmerged)

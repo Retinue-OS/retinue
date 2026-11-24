@@ -184,8 +184,10 @@ P_SENDER_NAME = KB + "senderName"
 P_RECIPIENT = KB + "recipient"
 P_CC = KB + "cc"
 # Threading, as the headers carried it: the parent's id, and the References
-# ids space-separated in header order. Kept on a tombstone too — a thread index
-# rebuilt from the ledger needs every id a mail ever cited.
+# ids space-separated in header order (followed by any further id the
+# In-Reply-To header named beside the parent, so the two together are every
+# id the mail cited). Kept on a tombstone too — a thread index rebuilt from
+# the ledger needs every id a mail ever cited.
 P_IN_REPLY_TO = KB + "inReplyTo"
 P_REFERENCES = KB + "references"
 # The normalised List-Id, what the news gate decides a list mail by.
@@ -206,6 +208,13 @@ P_CONTENT_ID = KB + "contentId"
 P_TRIM = KB + "trim"
 # When the mail was found gone from the mailbox (see tombstone_message).
 P_REMOVED_AT = KB + "removedAt"
+# When the mailbox server received the mail (IMAP's INTERNALDATE). A mail
+# record's own time (kb:receivedAt, kb:sentAt) is the sender's Date header
+# where that is the earlier one, so this is the one time on the record its
+# sender did not write — what a thread index rebuilt from the ledger must go
+# by when it decides which of two chats is the older, and where a mail is
+# looked for again in a folder. Kept on a tombstone, like the other times.
+P_ARRIVED_AT = KB + "arrivedAt"
 # Valid kb:trim values: the deterministic trim settled the text; it did not and
 # a model trim is due on first view; a model trim replaced the text.
 TRIMS = ("deterministic", "wanting", "model")
@@ -373,10 +382,18 @@ def _lit(subject: str, predicate: str, value: str, datatype: str | None = None) 
 
 
 # subject, predicate, then either <iri> or "literal"[^^<datatype>], trailing " ."
-_TRIPLE_RE = re.compile(
-    r'^<([^>]+)>\s+<([^>]+)>\s+'
-    r'(?:<([^>]+)>|"((?:[^"\\]|\\.)*)"(?:\^\^<([^>]+)>)?)\s*\.\s*$'
-)
+#
+# The literal is matched possessively: no part of it can be read a second way,
+# so the engine has nothing to come back to and need not remember each
+# character it passed. Written the plain way, one long literal — a mail's text
+# is one line of its record — costs about two hundred bytes of memory per
+# character on every read of the record: a gigabyte for five megabytes.
+_TRIPLE_SHAPE = (r'^<([^>]+)>\s+<([^>]+)>\s+'
+                 r'(?:<([^>]+)>|"(%s)"(?:\^\^<([^>]+)>)?)\s*\.\s*$')
+try:
+    _TRIPLE_RE = re.compile(_TRIPLE_SHAPE % r'(?:[^"\\]++|\\.)*+')
+except re.error:  # Python before 3.11 has no possessive quantifiers
+    _TRIPLE_RE = re.compile(_TRIPLE_SHAPE % r'(?:[^"\\]|\\.)*')
 
 
 def _media_refs(fields: dict) -> list[str]:
@@ -439,6 +456,8 @@ def _render(fields: dict) -> str:
             lines.append(_iri(subj, pred, fields[key]))
     if fields.get("removed_at"):
         lines.append(_lit(subj, P_REMOVED_AT, fields["removed_at"], XSD_DATETIME))
+    if fields.get("arrived_at"):
+        lines.append(_lit(subj, P_ARRIVED_AT, fields["arrived_at"], XSD_DATETIME))
     if fields.get("chat"):
         lines.append(_lit(subj, P_CHAT, fields["chat"]))
     # Both directions: the chat key alone does not identify a conversation
@@ -501,8 +520,8 @@ def _parse(text: str) -> dict | None:
     The mail fields (see :data:`P_SUBJECT`) read as ``subject_line``,
     ``sender_name``, ``recipients`` and ``cc`` (lists), ``in_reply_to``,
     ``references`` (the space-separated literal as stored), ``list_id``,
-    ``body_part``/``html_part``/``header_part`` (media IRIs), ``trim`` and
-    ``removed_at`` (ISO-8601); an inline part's Content-ID is
+    ``body_part``/``html_part``/``header_part`` (media IRIs), ``trim``,
+    ``removed_at`` and ``arrived_at`` (ISO-8601); an inline part's Content-ID is
     ``attachment_meta[<reference>]["content_id"]``. ``attachment_meta`` is
     keyed by every media IRI the record references, the parts included.
     """
@@ -510,7 +529,7 @@ def _parse(text: str) -> dict | None:
                     "message_id": None, "chat": None, "account": None,
                     "author": None, "sent_at": None, "attachments": [],
                     "media": None, "attachment_meta": {}, "sender": None,
-                    "removed_at": None, "extra": []}
+                    "removed_at": None, "arrived_at": None, "extra": []}
     for key, _pred in _MAIL_LITERALS + _PARTS:
         fields[key] = None
     for key, _pred in _MAIL_LISTS:
@@ -552,6 +571,8 @@ def _parse(text: str) -> dict | None:
             fields[parts[pred]] = value or None
         elif pred == P_REMOVED_AT:
             fields["removed_at"] = value
+        elif pred == P_ARRIVED_AT:
+            fields["arrived_at"] = value
         elif pred == RDF_TYPE:
             fields["type"] = value
         elif pred == P_CHANNEL:
@@ -688,16 +709,18 @@ def _check_trim(trim) -> str | None:
 
 def _mail_fields(*, subject=None, sender_name=None, recipients=None, cc=None,
                  in_reply_to=None, references=None, list_id=None, body_part=None,
-                 html_part=None, header_part=None, trim=None) -> dict:
+                 html_part=None, header_part=None, trim=None, arrived_at=None) -> dict:
     """The mail fields of a new record, normalised (see :data:`P_SUBJECT`).
 
     ``references`` is the References header's ids in header order, as one
     string or as a sequence; either way it is stored as one literal, the ids
     separated by single spaces. Ids, addresses and names are stored as given
-    (trimmed): normalising them — angle brackets, case — is the gateway's."""
+    (trimmed): normalising them — angle brackets, case — is the gateway's.
+    ``arrived_at`` is epoch seconds (see :data:`P_ARRIVED_AT`)."""
     if references is not None and not isinstance(references, str):
         references = " ".join(str(r) for r in references if r)
     return {
+        "arrived_at": None if arrived_at is None else _iso(float(arrived_at)),
         "subject_line": _one(subject),
         "sender_name": _one(sender_name),
         "recipients": _many(recipients),
@@ -752,6 +775,7 @@ def write_message(
     header_part: str | None = None,
     trim: str | None = None,
     content_ids: dict | None = None,
+    arrived_at: float | None = None,
 ) -> tuple[str, Path]:
     """Persist one inbound message as a deterministic N-Triples file.
 
@@ -788,9 +812,12 @@ def write_message(
     ``body_part``/``html_part``/``header_part`` the media references of its
     parts (stored with :func:`store_media` first, like attachments, so their
     blob facts are stated), ``trim`` one of :data:`TRIMS` (anything else is a
-    programming error and raises ``ValueError``), and ``content_ids``
-    ``{attachment reference: Content-ID}`` for its inline parts. Every one
-    defaults to absent, and an absent one writes no triple.
+    programming error and raises ``ValueError``), ``content_ids``
+    ``{attachment reference: Content-ID}`` for its inline parts, and
+    ``arrived_at`` when the mailbox server received the mail (epoch seconds;
+    see :data:`P_ARRIVED_AT` — ``timestamp`` is the mail's time on record,
+    which its sender may have written). Every one defaults to absent, and an
+    absent one writes no triple.
     """
     ts = time.time() if timestamp is None else float(timestamp)
     token = secrets.token_hex(8)
@@ -799,7 +826,7 @@ def write_message(
         **_mail_fields(subject=subject, sender_name=sender_name, recipients=recipients,
                        cc=cc, in_reply_to=in_reply_to, references=references,
                        list_id=list_id, body_part=body_part, html_part=html_part,
-                       header_part=header_part, trim=trim),
+                       header_part=header_part, trim=trim, arrived_at=arrived_at),
         "type": T_INBOUND,
         "subject": urn,
         "channel": channel,
@@ -846,6 +873,7 @@ def write_outbound(
     header_part: str | None = None,
     trim: str | None = None,
     content_ids: dict | None = None,
+    arrived_at: float | None = None,
 ) -> tuple[str, Path]:
     """Persist one successfully sent outbound message as its own N-Triples file.
 
@@ -884,7 +912,7 @@ def write_outbound(
         **_mail_fields(subject=subject, sender_name=sender_name, recipients=recipients,
                        cc=cc, in_reply_to=in_reply_to, references=references,
                        list_id=list_id, body_part=body_part, html_part=html_part,
-                       header_part=header_part, trim=trim),
+                       header_part=header_part, trim=trim, arrived_at=arrived_at),
         "type": T_OUTBOUND,
         "subject": urn,
         "channel": channel,
@@ -1041,8 +1069,10 @@ def safe_file_name(name) -> str | None:
     Base name only (no path), control characters dropped, capped in length
     with the extension kept. None when nothing usable remains. Never used to
     address a file here — blobs are keyed by their own id — only to say what
-    the sender called it."""
-    text = str(name or "").replace("\\", "/").strip()
+    the sender called it. A lone surrogate (a name decoded under a charset
+    its sender chose can hold one) becomes U+FFFD: the name is written to a
+    sidecar and stated in a record, and neither can hold one."""
+    text = _SURROGATE_RE.sub("�", str(name or "")).replace("\\", "/").strip()
     text = re.sub(r"[\x00-\x1f\x7f]", "", text.rsplit("/", 1)[-1]).strip()
     if text in ("", ".", ".."):
         return None
@@ -1466,8 +1496,17 @@ def iter_records(store_dir: str | Path):
             yield path, fields
 
 
+def read_record(path: str | Path) -> dict | None:
+    """One record's fields, as :func:`iter_records` yields them; None when the
+    file is gone, cannot be read or does not parse. Read-only."""
+    try:
+        return _parse(Path(path).read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError):
+        return None
+
+
 def rekey_chat(store_dir: str | Path, chat: str, account: str | None,
-               into: str) -> dict:
+               into: str, *, paths=None) -> dict:
     """Move every record of one chat to another chat key (a thread merge).
 
     The chat is the exact (``kb:chat``, ``kb:account``) pair, as for
@@ -1478,6 +1517,15 @@ def rekey_chat(store_dir: str | Path, chat: str, account: str | None,
     counted in ``errors`` — the caller must not tell anyone the merge is done
     until a repeat comes back clean. Idempotent: a repeat finds nothing left
     under the old key. Returns ``{"messages", "errors"}``.
+
+    Without ``paths`` every record of the store is read, which is the only
+    way to find a chat's records from the ledger alone. A writer that keeps
+    its own index of which record belongs to which chat (the mail gateway
+    does) hands in those record files as ``paths`` and only they are read —
+    a merge then costs the chat's size, not the store's. Each is still checked
+    against the chat and the account before it is touched, and one of them
+    that does not parse is an error whatever it names: the caller said it is
+    this chat's.
     """
     wanted_chat = (chat or "").strip()
     wanted_account = (account or "").strip()
@@ -1486,8 +1534,10 @@ def rekey_chat(store_dir: str | Path, chat: str, account: str | None,
     if not wanted_chat or not into or into == wanted_chat:
         return result
     chat_marker = f'<{P_CHAT}> "{_esc(wanted_chat)}"'
+    named = paths is not None
     try:
-        paths = sorted(messages_dir(store_dir).glob("*.nt"))
+        paths = (sorted({Path(p) for p in paths}) if named
+                 else sorted(messages_dir(store_dir).glob("*.nt")))
     except OSError:
         return result
     for path in paths:
@@ -1500,7 +1550,7 @@ def rekey_chat(store_dir: str | Path, chat: str, account: str | None,
             continue
         fields = _parse(text)
         if not fields:
-            if chat_marker in text:
+            if named or chat_marker in text:
                 result["errors"] += 1
             continue
         if (fields.get("chat") != wanted_chat
@@ -1548,7 +1598,8 @@ def _blob_ids_referenced_elsewhere(store_dir: Path, ids: set[str],
     return named
 
 
-def tombstone_message(path: str | Path, removed_at: str | float | None = None) -> bool:
+def tombstone_message(path: str | Path, removed_at: str | float | None = None, *,
+                      own_blobs: bool = False) -> bool:
     """Strip one record to its identity: the mail is gone from the mailbox.
 
     For a mail deleted, or moved out of the mirrored folders, in a client
@@ -1573,6 +1624,14 @@ def tombstone_message(path: str | Path, removed_at: str | float | None = None) -
     False and a repeat finishes the job. Idempotent: a tombstone is left as it
     is, its first ``removedAt`` kept. Never raises; False only when the record
     cannot be read, parsed or rewritten.
+
+    Finding out whether another record names a blob means reading every
+    record of the store — per call. ``own_blobs=True`` is the caller's word
+    that it need not be asked: every blob this record references was minted
+    for this record alone, so they are unlinked without a look at the rest.
+    Only a store's single writer can say that (the mail gateway stores each
+    mail's parts for that mail's record and never cites a blob twice); the
+    default keeps the check, which is what every other caller relies on.
     """
     try:
         p = Path(path)
@@ -1592,7 +1651,8 @@ def tombstone_message(path: str | Path, removed_at: str | float | None = None) -
         if p.parent.name == MESSAGES_SUBDIR:
             store = p.parent.parent
             ids = set(filter(None, map(media_id_of, _media_refs(fields))))
-            keep = _blob_ids_referenced_elsewhere(store, ids, {p.resolve()})
+            keep = set() if own_blobs else _blob_ids_referenced_elsewhere(
+                store, ids, {p.resolve()})
             for mid in sorted(ids - keep):
                 _unlink_blob(store, mid)
             spool = fields.get("media")

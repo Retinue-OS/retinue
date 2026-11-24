@@ -59,6 +59,8 @@ class MiniImap:
         self.flags_after_body = False
         self.unsolicited = False      # volunteer another mail's flags around a FETCH
         self.literal_names = False    # LIST the folder names as literals
+        self.refuse_examine = {}      # folder → what follows "NO" when it is examined
+        self.refuse_header_fetch = False   # answer NO to a fetch of a header field
         self._held = []
 
     def folder(self, name, attrs="\\HasNoChildren", validity=7):
@@ -126,6 +128,11 @@ class MiniImap:
                 elif verb == "EXAMINE":
                     name = _TOKEN_RE.match(args).group(1)
                     box = self.folders.get(name)
+                    if name in self.refuse_examine:
+                        # The folder is there; the server just will not open it.
+                        selected = None
+                        send(f"{tag} NO {self.refuse_examine[name]}".rstrip())
+                        continue
                     if box is None or "\\Noselect" in box["attrs"]:
                         selected = None
                         send(f"{tag} NO [NONEXISTENT] no such mailbox")
@@ -141,6 +148,9 @@ class MiniImap:
                         found = " ".join(str(u) for u in self._search(selected, rest))
                         send(f"* SEARCH {found}".rstrip(), f"{tag} OK done")
                     elif sub.upper() == "FETCH":
+                        if self.refuse_header_fetch and "HEADER.FIELDS" in rest:
+                            send(f"{tag} NO [SERVERBUG] internal error")
+                            continue
                         send(*self._fetch(selected, rest), f"{tag} OK done")
                     else:
                         send(f"{tag} BAD read-only server")
@@ -390,6 +400,99 @@ def test_listing_fetching_and_finding():
     print("ok: listings, whole and capped fetches, and finding a mail by its Message-ID")
 
 
+def test_a_refusal_is_not_an_answer():
+    with tempfile.TemporaryDirectory() as tmp:
+        gw = t.load(tmp)
+        server = _server()
+        for n in range(1, 4):
+            server.put("INBOX", t.msg(f"m{n}@x.org", day=n), date=t.T0 + n * t.DAY)
+        server.put("Archive", t.msg("arch@x.org", day=1), date=t.T0 + t.DAY)
+        with Wired(gw, server):
+            box = gw.Mailbox(gw.MAIL_CONFIG, timeout=5)
+            assert box.find("Archive", "arch@x.org") == 1
+            # NO to EXAMINE says nothing about the folder unless the server
+            # says NONEXISTENT: it is not "no such folder", "no such mail" or
+            # "expunged" — each of which would have the mirror call mail gone.
+            for said in ("[UNAVAILABLE] Temporary problem, try again later",
+                         "[INUSE] Mailbox is locked", "[SERVERBUG] oops",
+                         "Mailbox is busy"):       # no response code at all
+                server.refuse_examine["Archive"] = said
+                for ask in (lambda: box.list_uids("Archive"),
+                            lambda: box.fetch("Archive", 1),
+                            lambda: box.find("Archive", "arch@x.org")):
+                    try:
+                        answer = ask()
+                        raise AssertionError(f"a refused EXAMINE was read as {answer!r}")
+                    except gw.MailboxError as exc:
+                        assert "would not open 'Archive'" in str(exc), exc
+                        assert said.split("]")[0] in str(exc)
+            # A folder that answered a moment ago is not trusted to be open either.
+            assert box.list_uids("INBOX").uids == {1: None, 2: None, 3: None}
+            del server.refuse_examine["Archive"]
+            assert box.find("Archive", "arch@x.org") == 1
+            # The server's own word for "no such folder" is still an answer.
+            assert box.list_uids("Nope") is None and box.find("Nope", "m1@x.org") is None
+            assert server.connections == 1, "a refusal is not a broken connection"
+
+            # A header the server will not hand over is not "another mail".
+            server.refuse_header_fetch = True
+            try:
+                box.find("INBOX", "m1@x.org")
+                raise AssertionError("a refused FETCH must not read as 'not found'")
+            except gw.MailboxError as exc:
+                assert "refused to read a header" in str(exc)
+            server.refuse_header_fetch = False
+            # More mails whose ids CONTAIN the id than are compared (anyone can
+            # send those): could not tell — never "not there".
+            gw.FIND_CANDIDATES_MAX = 3
+            for n in range(4):
+                server.put("INBOX", t.msg(f"x{n}-m1@x.org", day=5), date=t.T0 + 5 * t.DAY)
+            assert box.find("INBOX", "m1@x.org") is gw.UNSURE
+            assert box.find("INBOX", "x3-m1@x.org") == 7       # among the newest: found
+            assert box.find("INBOX", "m2@x.org") == 2
+            assert box.find("INBOX", "m9@x.org") is None       # the server's answer: none
+    print("ok: a folder, a search or a fetch the server refuses is never read as absence")
+
+
+def test_a_refused_archive_costs_no_archived_mail():
+    with tempfile.TemporaryDirectory() as tmp:
+        gw = t.load(tmp)
+        t._write_policy(gw)
+        events = t.rail(gw)
+        server = _server()
+        with Wired(gw, server):
+            mirror = gw.Mirror(gw.Mailbox(gw.MAIL_CONFIG), clock=lambda: t.NOW)
+            loop: dict = {}
+            gw._loop_step(mirror, loop)
+            uid = server.put("INBOX", t.msg("a@x.org", day=39), date=t.NOW - 5)
+            loop.clear()
+            gw._loop_step(mirror, loop)
+            assert "a@x.org" in t.by_id(gw)
+            # The user archives it; at the next poll the server refuses the archive.
+            mail = server.folders["INBOX"]["mails"].pop(uid)
+            server.put("Archive", mail["raw"], date=mail["date"])
+            server.refuse_examine["Archive"] = "[UNAVAILABLE] Temporary problem"
+            for _ in range(2):
+                loop.clear()
+                gw._loop_step(mirror, loop)
+                snap = gw._health_snapshot()
+                assert snap["connected"] is False and "would not open 'Archive'" in snap["error"]
+            record = t.by_id(gw)["a@x.org"]
+            assert record["removed_at"] is None and record["body_part"]
+            del server.refuse_examine["Archive"]
+            loop.clear()
+            gw._loop_step(mirror, loop)
+            assert gw._health_snapshot()["connected"] is True
+            assert t.by_id(gw)["a@x.org"]["removed_at"] is None
+            assert not any(kind == "removed" for kind, _p in events)
+            # Deleted for real, it is a tombstone as before.
+            server.folders["Archive"]["mails"].clear()
+            loop.clear()
+            gw._loop_step(mirror, loop)
+            assert t.by_id(gw)["a@x.org"]["removed_at"]
+    print("ok: an archive the server refuses for a moment tombstones nothing")
+
+
 def test_the_adapter_cannot_write():
     with tempfile.TemporaryDirectory() as tmp:
         gw = t.load(tmp)
@@ -498,6 +601,7 @@ def test_login_and_reachability_are_reported_for_the_operator():
             box.ensure()
 
             # Through the loop, both are health states.
+            t._write_policy(gw)
             server.password = "another"
             box.close()
             mirror = gw.Mirror(box, clock=lambda: t.NOW)

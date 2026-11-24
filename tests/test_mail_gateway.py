@@ -42,11 +42,13 @@ NOW = T0 + 40 * DAY
 RAIL_URL = "http://rail.invalid/internal/chats/inbound"
 
 _ENV_PREFIXES = ("MAIL_", "EMAIL_", "IMAP_", "SMTP_", "TRIAGE_")
-_ENV_NAMES = ("SENT_FOLDER", "DRAFTS_FOLDER", "INBOUND_STORE_DIR")
+_ENV_NAMES = ("SENT_FOLDER", "DRAFTS_FOLDER", "INBOUND_STORE_DIR", "MESSENGER_BUILTIN_CHANNELS")
+TOKEN = "gateway-token"
 
 
-def load(tmp, *, token="", days=90, configured=True, rail=True, **env):
-    """Import a fresh gateway module whose state lives under ``tmp``."""
+def load(tmp, *, token=TOKEN, days=90, configured=True, rail=True, **env):
+    """Import a fresh gateway module whose state lives under ``tmp``. With a
+    token, as every deployment that mirrors has one (``token=""`` for none)."""
     if str(SCRIPTS_DIR) not in sys.path:
         sys.path.insert(0, str(SCRIPTS_DIR))
     root = Path(tmp)
@@ -130,6 +132,7 @@ class FakeMailbox:
         self.found = []       # (folder, message id) of every find
         self.listed = []      # (folder, since, first_uid, dates) of every listing
         self.fail = None      # raised by the next adapter call, once
+        self.refused = set()  # folders the server will not open (see _check)
 
     # -- what happens to the mailbox ------------------------------------------
 
@@ -165,11 +168,6 @@ class FakeMailbox:
 
     # -- the adapter's surface ------------------------------------------------
 
-    def _check(self):
-        if self.fail is not None:
-            failure, self.fail = self.fail, None
-            raise failure
-
     def ensure(self):
         self._check()
 
@@ -181,8 +179,18 @@ class FakeMailbox:
         return {role: name if name in self.boxes else None
                 for role, name in self.roles.items()}
 
+    def _check(self, folder=None):
+        if self.fail is not None:
+            failure, self.fail = self.fail, None
+            raise failure
+        # A folder the server will not open just now (NO to EXAMINE for a
+        # reason other than "no such folder"): the adapter raises on that.
+        if folder is not None and folder in self.refused:
+            raise self.gw.MailboxError(
+                f"the IMAP server would not open {folder!r}: [UNAVAILABLE] try again later")
+
     def list_uids(self, folder, *, since=None, first_uid=None, dates=False):
-        self._check()
+        self._check(folder)
         self.listed.append((folder, since, first_uid, dates))
         box = self.boxes.get(folder)
         if box is None:
@@ -198,7 +206,7 @@ class FakeMailbox:
         return self.gw.Listing(box["validity"], box["next"], uids)
 
     def fetch(self, folder, uid, limit=None):
-        self._check()
+        self._check(folder)
         self.fetched.append((folder, uid, limit))
         mail = self.boxes.get(folder, {"mails": {}})["mails"].get(uid)
         if mail is None:
@@ -208,7 +216,7 @@ class FakeMailbox:
                                mail["flags"], mail["date"])
 
     def find(self, folder, message_id):
-        self._check()
+        self._check(folder)
         self.found.append((folder, message_id))
         if folder not in self.boxes:
             return None
@@ -526,6 +534,435 @@ def test_a_mail_that_comes_back_replaces_its_tombstone():
     print("ok: a mail moved back into a mirrored folder replaces its tombstone")
 
 
+def test_a_folder_the_server_will_not_open_is_not_an_empty_folder():
+    with tempfile.TemporaryDirectory() as tmp:
+        gw = load(tmp)
+        events = rail(gw)
+        mirror, box = started(gw)
+        uid = box.put("INBOX", msg("a@x.org", day=1))
+        mirror.poll()
+        # Archived in a client — and for a moment the server refuses the
+        # archive (NO to EXAMINE: unavailable, in use, throttled).
+        box.move_mail("INBOX", uid, "Archive")
+        box.refused = {"Archive"}
+        for _ in range(3):
+            try:
+                mirror.poll()
+                raise AssertionError("a refused folder must fail the pass")
+            except gw.MailboxError as exc:
+                assert "would not open" in str(exc)
+        record = by_id(gw)["a@x.org"]
+        assert record["removed_at"] is None and record["body_part"], "nothing is called gone"
+        assert len(events) == 1
+        # New mail was still mirrored meanwhile: INBOX answered.
+        box.put("INBOX", msg("b@x.org", day=2))
+        try:
+            mirror.poll()
+        except gw.MailboxError:
+            pass
+        assert "b@x.org" in by_id(gw)
+        box.refused = set()
+        mirror.poll()
+        assert by_id(gw)["a@x.org"]["removed_at"] is None and ("Archive", "a@x.org") in box.found
+        assert not any(kind == "removed" for kind, _p in events)
+    with tempfile.TemporaryDirectory() as tmp:
+        # The same during a backfill: a mail the server would not hand over is
+        # not "expunged", and the backfill is not done without it.
+        gw = load(tmp)
+        rail(gw)
+        box = FakeMailbox(gw)
+        for n in range(1, 5):
+            box.put("INBOX", msg(f"old{n}@x.org", day=n))
+            box.put("Sent", msg(f"sent{n}@example.org", sender=ME, to="ann@x.org", day=n + 0.5))
+        mirror = gw.Mirror(box, clock=lambda: NOW)
+        assert mirror.poll(backfill_limit=2) is True
+        box.refused = {"INBOX"}
+        try:
+            mirror.poll(sync=False, backfill_limit=50)
+            raise AssertionError("a refused folder must fail the pass")
+        except gw.MailboxError:
+            pass
+        assert mirror.backfill_status()["done"] is False
+        box.refused = set()
+        while mirror.poll():
+            pass
+        assert len(records(gw)) == 8 and mirror.backfill_status()["done"] is True
+    print("ok: a folder the server refuses to open is not read as empty: nothing is "
+          "tombstoned or skipped on it")
+
+
+def test_a_search_that_does_not_settle_it_calls_nothing_gone():
+    with tempfile.TemporaryDirectory() as tmp:
+        gw = load(tmp)
+        events = rail(gw)
+        mirror, box = started(gw)
+        uid = box.put("INBOX", msg("a@x.org", day=1))
+        other = box.put("INBOX", msg("b@x.org", day=2))
+        mirror.poll()
+        box.move_mail("INBOX", uid, "Archive")
+        box.remove("INBOX", other)
+        # The archive's search matched more look-alike ids than are compared.
+        real = box.find
+        box.find = lambda folder, mid: (
+            gw.UNSURE if (folder, mid) == ("Archive", "a@x.org") else real(folder, mid))
+        mirror.poll()
+        mirror.poll()
+        recs = by_id(gw)
+        assert recs["a@x.org"]["removed_at"] is None, "could not tell is not gone"
+        # It holds nothing else up: the mail that IS gone is a tombstone.
+        assert recs["b@x.org"]["removed_at"]
+        assert [p["message_ids"] for kind, p in events if kind == "removed"] == [["b@x.org"]]
+        box.find = real
+        mirror.poll()
+        assert by_id(gw)["a@x.org"]["removed_at"] is None
+        assert mirror.index.one("SELECT role FROM locations WHERE message_id = 'a@x.org'")[
+            "role"] == "archive"
+        # UNSURE cannot be mistaken for a UID or for None.
+        try:
+            bool(gw.UNSURE)
+            raise AssertionError("UNSURE must not be truth-tested")
+        except TypeError:
+            pass
+    print("ok: a search that does not settle where a mail is leaves it as it is")
+
+
+def test_a_mail_without_a_searchable_id_is_found_among_many():
+    with tempfile.TemporaryDirectory() as tmp:
+        gw = load(tmp)
+        events = rail(gw)
+        box = FakeMailbox(gw)
+        # The archive holds many mails of these days that nobody mirrored
+        # (filed by rules; on some servers it is every mail there is).
+        for n in range(150):
+            box.put("Archive", msg(f"filed{n}@x.org", day=38), date=T0 + 38 * DAY)
+        mirror = gw.Mirror(box, clock=lambda: NOW)
+        mirror.poll()
+        uid = box.put("INBOX", msg(None, subject="No message id", day=39))
+        gone = box.put("INBOX", msg(None, subject="Another without", day=38.5))
+        mirror.poll()
+        first, second = sorted(by_id(gw), key=lambda m: by_id(gw)[m]["subject_line"],
+                               reverse=True)
+        assert by_id(gw)[first]["subject_line"] == "No message id"
+        # Archived: its headers are read back newest first, and it is found.
+        box.move_mail("INBOX", uid, "Archive")
+        mirror.poll()
+        assert by_id(gw)[first]["removed_at"] is None
+        assert mirror.index.one("SELECT role FROM locations WHERE message_id = ?",
+                                (first,))["role"] == "archive"
+        # Deleted: it is a tombstone only once every candidate was compared —
+        # which takes more than one pass reads, and until then it is left alone.
+        gw.SCAN_BUDGET = 100
+        box.remove("INBOX", gone)
+        box.fetched.clear()
+        mirror.poll()
+        assert by_id(gw)[second]["removed_at"] is None, "not after the first hundred"
+        assert len(box.fetched) == 100
+        assert all(limit == gw.HEADER_PEEK_BYTES for _f, _u, limit in box.fetched)
+        for _ in range(3):
+            mirror.poll()
+        assert by_id(gw)[second]["removed_at"]
+        assert [p["message_ids"] for kind, p in events if kind == "removed"] == [[second]]
+        # No header is read twice for it.
+        peeks = [(folder, u) for folder, u, _l in box.fetched]
+        assert len(peeks) == len(set(peeks)) == 150, "each candidate is compared once"
+    with tempfile.TemporaryDirectory() as tmp:
+        # One pass reads a bounded number of headers, however many mails ask —
+        # and however many ask, each header is read once for all of them.
+        gw = load(tmp)
+        rail(gw)
+        box = FakeMailbox(gw)
+        for n in range(120):
+            box.put("Archive", msg(f"filed{n}@x.org", day=38), date=T0 + 38 * DAY)
+        mirror = gw.Mirror(box, clock=lambda: NOW)
+        mirror.poll()
+        gw.SCAN_BUDGET = 50
+        uids = [box.put("INBOX", msg(None, subject=f"No id {n}", day=38)) for n in range(4)]
+        mirror.poll()
+        for u in uids:
+            box.remove("INBOX", u)
+        box.fetched.clear()
+        mirror.poll()
+        assert len(box.fetched) == 50
+        assert not any(r["removed_at"] for r in records(gw))
+        for _ in range(3):
+            mirror.poll()
+        assert all(r["removed_at"] for r in records(gw))
+        assert len(box.fetched) == 120, "four mails looked for, each header read once"
+        # What is remembered of the headers read is bounded too. A search
+        # that needs more than may be kept stays undecided — the mail is left
+        # as it is — and reads nothing over and over meanwhile.
+        for n in range(80):
+            box.put("Archive", msg(f"more{n}@x.org", day=38), date=T0 + 38 * DAY)
+        gw.SCAN_CACHE_MAX = 150
+        uid = box.put("INBOX", msg(None, subject="One more", day=38))
+        mirror.poll()
+        box.remove("INBOX", uid)
+        box.fetched.clear()
+        for _ in range(5):
+            mirror.poll()
+        assert len(box.fetched) == 30 and sum(map(len, mirror._peeked.values())) == 150
+        assert [r["subject_line"] for r in records(gw) if not r["removed_at"]] == ["One more"]
+        gw.SCAN_CACHE_MAX = 100_000
+        mirror.poll()
+        assert all(r["removed_at"] for r in records(gw)) and len(box.fetched) == 80
+    with tempfile.TemporaryDirectory() as tmp:
+        # A mail's time on record is its sender's Date where that is earlier
+        # than its arrival, and it is looked for by when it ARRIVED: a mail
+        # with no Message-ID and a Date of years ago, archived, is found.
+        gw = load(tmp)
+        events = rail(gw)
+        box = FakeMailbox(gw)
+        for n in range(30):
+            box.put("Archive", msg(f"filed{n}@x.org", day=38), date=T0 + 38 * DAY)
+        mirror = gw.Mirror(box, clock=lambda: NOW)
+        mirror.poll()
+        uid = box.put("INBOX", msg(None, subject="Backdated", day=-9000), date=NOW)
+        # A server that stamps a copy with the time it was made: this one
+        # arrived days ago and is in the archive as of today.
+        old = box.put("INBOX", msg(None, subject="Stamped anew", day=20), date=T0 + 20 * DAY)
+        mirror.poll()
+        ids = {r["subject_line"]: m for m, r in by_id(gw).items()}
+        assert by_id(gw)[ids["Backdated"]]["received_at"].startswith("2001-")
+        box.move_mail("INBOX", uid, "Archive")
+        box.put("Archive", box.remove("INBOX", old)["raw"], date=NOW)
+        for _ in range(3):
+            mirror.poll()
+        assert not any(r["removed_at"] for r in records(gw)) and not any(
+            kind == "removed" for kind, _p in events)
+        assert {row["role"] for row in mirror.index.rows("SELECT role FROM locations")} == {
+            "archive"}
+        # The index lost: when a mail arrived is in its record, so it is
+        # looked for in the same window as before — not among everything the
+        # folder has held since the year its Date claims.
+        mirror.index.close()
+        mirror.threads.close()
+        shutil.rmtree(gw.MAIL_STATE_DIR)
+        mirror = gw.Mirror(box, clock=lambda: NOW)
+        box.listed.clear()
+        for _ in range(3):
+            mirror.poll()
+        assert not any(r["removed_at"] for r in records(gw))
+        assert mirror.index.one("SELECT COUNT(*) AS n FROM locations WHERE message_id "
+                                "IS NOT NULL")["n"] == 2
+        assert min(since for folder, since, _u, _d in box.listed
+                   if folder == "Archive" and since is not None) > T0
+    with tempfile.TemporaryDirectory() as tmp:
+        # An id some relay folded in the middle is restored for threading —
+        # and the server, which searches the header as it stands, knows no
+        # mail by the restored id. It is not asked; the headers are read.
+        gw = load(tmp)
+        events = rail(gw)
+        mirror, box = started(gw)
+        raw = msg("placeholder@x.org", subject="Folded id", day=39.9).replace(
+            b"<placeholder@x.org>", b"<a-very-long-left-part-of-an-id\r\n .continued@x.org>")
+        uid = box.put("INBOX", raw, date=NOW)
+        mirror.poll()
+        mid = "a-very-long-left-part-of-an-id.continued@x.org"
+        assert list(by_id(gw)) == [mid] and box.find("INBOX", mid) is None
+        box.move_mail("INBOX", uid, "Archive")
+        box.found.clear()
+        mirror.poll()
+        mirror.poll()
+        assert by_id(gw)[mid]["removed_at"] is None and box.found == []
+        assert mirror.index.one("SELECT role FROM locations")["role"] == "archive"
+        assert not any(kind == "removed" for kind, _p in events)
+        # An ordinary id is still asked for, not read for.
+        uid = box.put("INBOX", msg("plain@x.org", day=39.9), date=NOW)
+        mirror.poll()
+        box.move_mail("INBOX", uid, "Archive")
+        fetched = len(box.fetched)
+        mirror.poll()
+        assert ("Archive", "plain@x.org") in box.found and len(box.fetched) == fetched
+    print("ok: a mail the server cannot be searched for is looked for among all the "
+          "candidates, across passes, before it is called gone")
+
+
+def test_an_error_mid_settle_keeps_the_removals_already_made():
+    with tempfile.TemporaryDirectory() as tmp:
+        gw = load(tmp)
+        events = rail(gw)
+        mirror, box = started(gw)
+        uids = [box.put("INBOX", msg(f"m{n}@x.org", subject=f"s{n}", day=1 + n))
+                for n in range(4)]
+        mirror.poll()
+        for uid in uids:
+            box.remove("INBOX", uid)
+        real = box.find
+        calls = {"n": 0}
+
+        def flaky(folder, message_id):
+            calls["n"] += 1
+            if calls["n"] == 8:     # the search for the third mail times out
+                raise gw.MailboxError("the IMAP connection failed: timed out")
+            return real(folder, message_id)
+        box.find = flaky
+        try:
+            mirror.poll()
+            raise AssertionError("the poll must report the failure")
+        except gw.MailboxError:
+            pass
+        # What was found gone before the error is tombstoned AND its event
+        # queued, in the same breath.
+        queued = [json.loads(row["payload"])["message_ids"] for row in mirror.index.rows(
+            "SELECT payload FROM outbox WHERE kind = 'removed' ORDER BY seq")]
+        assert queued == [["m0@x.org"], ["m1@x.org"]], queued
+        assert sorted(m for m, r in by_id(gw).items() if r["removed_at"]) == [
+            "m0@x.org", "m1@x.org"]
+        box.find = real
+        mirror.poll()
+        removed = sorted(p["message_ids"][0] for kind, p in events if kind == "removed")
+        assert removed == ["m0@x.org", "m1@x.org", "m2@x.org", "m3@x.org"]
+        assert all(r["removed_at"] for r in records(gw))
+    print("ok: an IMAP error in the middle of a pass loses no removal already made")
+
+
+def test_a_mail_that_passed_through_inbox_between_polls_is_mirrored():
+    with tempfile.TemporaryDirectory() as tmp:
+        gw = load(tmp)
+        events = rail(gw)
+        mirror, box = started(gw)
+        box.put("INBOX", msg("seen@x.org", day=30))
+        mirror.poll()
+        # Mail a rule files straight into the archive is nobody's, as ever …
+        box.put("Archive", msg("filed@x.org", day=39.9), date=NOW)
+        mirror.poll()
+        mirror.poll()
+        assert list(by_id(gw)) == ["seen@x.org"] and box.fetched[-1][0] == "INBOX"
+        # … but a mail that was in INBOX and is archived before the next poll
+        # (read on the phone within the minute) is the user's mail.
+        uid = box.put("INBOX", msg("quick@x.org", subject="Quick", day=39.9), date=NOW)
+        box.move_mail("INBOX", uid, "Archive")
+        # Their own mail too: sent, and filed away at once by the client.
+        uid = box.put("Sent", msg("own@example.org", sender=ME, to="ann@x.org",
+                                  refs=["quick@x.org"], day=39.95), date=NOW)
+        box.move_mail("Sent", uid, "Archive")
+        # Old mail moved into the archive in the same minute is not new mail.
+        box.put("Archive", msg("ancient@x.org", day=2), date=T0 + 2 * DAY)
+        # Nor is a draft saved just then, where the archive is "all mail".
+        draft = box.put("Archive", msg("draft@example.org", sender=ME, to="ann@x.org",
+                                       day=39.95), date=NOW, flags=("\\Draft",))
+        box.fetched.clear()
+        mirror.poll()
+        recs = by_id(gw)
+        assert sorted(recs) == ["own@example.org", "quick@x.org", "seen@x.org"], sorted(recs)
+        assert mirror.index.one("SELECT skipped FROM locations WHERE role = 'archive' "
+                                "AND uid = ?", (draft,))["skipped"] == "draft"
+        quick, own = recs["quick@x.org"], recs["own@example.org"]
+        assert quick["type"] == gw._ibstore.T_INBOUND and quick["text"]
+        assert own["type"] == gw._ibstore.T_OUTBOUND and own["author"] == "device"
+        assert own["chat"] == "quick@x.org"
+        places = {row["message_id"]: row["role"] for row in mirror.index.rows(
+            "SELECT message_id, role FROM locations WHERE message_id IS NOT NULL")}
+        assert places["quick@x.org"] == "archive" and places["own@example.org"] == "archive"
+        live = [e for e in inbound(events) if e["message_id"] in ("quick@x.org",
+                                                                 "own@example.org")]
+        assert [e["direction"] for e in live] == ["in", "out"]
+        assert not any("backfill" in e for e in live)
+        # The old mail's and the rule-filed mail's headers were at most looked
+        # at (the draft was read whole, once: its flag comes with the mail).
+        whole = [u for folder, u, limit in box.fetched
+                 if folder == "Archive" and limit != gw.HEADER_PEEK_BYTES]
+        assert len(whole) == 3
+        # Followed from there like any mail; and nothing is read twice.
+        fetched = len(box.fetched)
+        mirror.poll()
+        mirror.poll()
+        assert len(box.fetched) == fetched and len(records(gw)) == 3
+        box.remove("Archive", box.uid_of("Archive", "quick@x.org"))
+        mirror.poll()
+        assert by_id(gw)["quick@x.org"]["removed_at"]
+        # A known mail archived in the usual way is found, not read again.
+        uid = box.put("INBOX", msg("slow@x.org", day=39.9), date=NOW)
+        mirror.poll()
+        box.move_mail("INBOX", uid, "Archive")
+        fetched = len(box.fetched)
+        mirror.poll()
+        assert len(box.fetched) == fetched and not by_id(gw)["slow@x.org"]["removed_at"]
+    with tempfile.TemporaryDirectory() as tmp:
+        # The archive refuses just then: the mail is not lost, the next look asks again.
+        gw = load(tmp)
+        rail(gw)
+        mirror, box = started(gw)
+        mirror.poll()
+        uid = box.put("INBOX", msg("quick@x.org", day=39.9), date=NOW)
+        box.move_mail("INBOX", uid, "Archive")
+        box.refused = {"Archive"}
+        try:
+            mirror.poll()
+        except gw.MailboxError:
+            pass
+        assert records(gw) == []
+        box.refused = set()
+        mirror.poll()
+        assert list(by_id(gw)) == ["quick@x.org"]
+        # A From is its sender's to write. A mail that came in under the
+        # user's own address and was filed away within the minute did not
+        # leave Sent: it is not recorded as something the user wrote.
+        uid = box.put("INBOX", msg("spoof@evil.org", sender=ME, to="ann@x.org",
+                                   body="Please wire the money.\n", day=39.9), date=NOW)
+        box.move_mail("INBOX", uid, "Archive")
+        mirror.poll()
+        spoof = by_id(gw)["spoof@evil.org"]
+        assert spoof["type"] == gw._ibstore.T_INBOUND and spoof["author"] is None
+        assert mirror.index.get("archive_due") is None and mirror.index.get("archive_own") is None
+    print("ok: a mail that came and went between two polls is mirrored from the archive")
+
+
+def test_a_received_mail_filed_under_sent_is_not_the_users_own():
+    for order in (("INBOX", "Sent"), ("Sent", "INBOX")):
+        with tempfile.TemporaryDirectory() as tmp:
+            gw = load(tmp)
+            events = rail(gw)
+            mirror, box = started(gw)
+            # Ann's mail, and the copy a client keeps under Sent when the
+            # user redirects it: the same Message-ID, the same From.
+            mail = msg("a@x.org", day=1)
+            for folder in order:
+                box.put(folder, mail)
+                mirror.poll()
+            recs = records(gw)
+            assert len(recs) == 1 and recs[0]["type"] == gw._ibstore.T_INBOUND, order
+            assert recs[0]["sender"] == "ann@x.org" and recs[0]["author"] is None
+            assert inbound(events)[-1]["direction"] == "in"
+            assert mirror.thread("a@x.org")["peer"]["address"] == "ann@x.org"
+            # Both copies are places of the one mail.
+            assert mirror.index.one("SELECT COUNT(*) AS n FROM locations")["n"] == 2
+            mirror.poll()
+            assert len(records(gw)) == 1 and len(inbound(events)) <= 2
+    with tempfile.TemporaryDirectory() as tmp:
+        # Unless someone said who wrote it: an outbound note is the user's word.
+        gw = load(tmp)
+        rail(gw)
+        mirror, box = started(gw)
+        mirror.note_author("n@x.org", "agent")
+        mail = msg("n@x.org", sender="Shared box <team@x.org>", day=1)
+        box.put("Sent", mail)
+        mirror.poll()
+        box.put("INBOX", mail)
+        mirror.poll()
+        assert records(gw)[0]["type"] == gw._ibstore.T_OUTBOUND
+        assert records(gw)[0]["author"] == "agent"
+    with tempfile.TemporaryDirectory() as tmp:
+        # An id is its sender's to choose, and whoever was sent a mail knows
+        # its id: a mail that arrives under the id of one the user sent is
+        # not that mail's INBOX copy, and replaces nothing.
+        gw = load(tmp)
+        events = rail(gw)
+        mirror, box = started(gw)
+        box.put("Sent", msg("s@example.org", sender=ME, to="mallory@evil.org",
+                            body="What I really wrote.\n", day=1))
+        mirror.poll()
+        box.put("INBOX", msg("s@example.org", sender="Mallory <mallory@evil.org>",
+                             body="What I would like you to have written.\n", day=2))
+        mirror.poll()
+        mirror.poll()
+        (record,) = records(gw)
+        assert record["type"] == gw._ibstore.T_OUTBOUND and record["sender"] == ACCOUNT
+        assert record["text"] == "What I really wrote." and len(inbound(events)) == 1
+    print("ok: with copies in INBOX and Sent a mail is the user's own exactly when its "
+          "From is, in either order")
+
+
 def test_a_clients_seen_changes_are_ignored():
     with tempfile.TemporaryDirectory() as tmp:
         gw = load(tmp)
@@ -668,7 +1105,18 @@ def test_no_backfill_mirrors_only_new_mail():
         box.put("INBOX", msg("new@x.org", day=39))
         mirror.poll()
         assert list(by_id(gw)) == ["new@x.org"]
-    print("ok: MAIL_BACKFILL_DAYS=0 mirrors only what arrives from then on")
+        assert mirror.backfill_status() == {"done": True, "pending": 0, "days": 0}
+        mirror.index.close()
+        mirror.threads.close()
+        # The window is fixed at the first run. A later setting does not move
+        # it — and /health does not claim it did.
+        gw = load(tmp, days=365)
+        mirror = gw.Mirror(box, clock=lambda: NOW)
+        mirror.poll()
+        assert list(by_id(gw)) == ["new@x.org"]
+        assert mirror.backfill_status() == {"done": True, "pending": 0, "days": 0}
+    print("ok: MAIL_BACKFILL_DAYS=0 mirrors only what arrives from then on, and /health "
+          "reports the window in force")
 
 
 # --------------------------------------------------------------------------
@@ -870,6 +1318,102 @@ def test_an_index_behind_or_ahead_of_the_ledger_is_reconciled():
     print("ok: an index older or newer than the ledger is made to agree with it at start")
 
 
+def test_a_ledger_older_than_the_index_is_followed_again():
+    with tempfile.TemporaryDirectory() as tmp:
+        gw = load(tmp)
+        events = rail(gw)
+        mirror, box = started(gw)
+        box.put("INBOX", msg("a@x.org", day=1))
+        box.put("INBOX", msg("b@x.org", subject="Re: Quarterly numbers", irt="zz@x.org", day=2))
+        gone = box.put("INBOX", msg("c@x.org", subject="Other", day=3))
+        mirror.poll()
+        backup = Path(tmp) / "ledger-backup"
+        shutil.copytree(Path(tmp) / "inbound", backup)
+        # After the backup: one mail is deleted (a tombstone), two chats merge.
+        box.remove("INBOX", gone)
+        box.put("INBOX", msg("d@x.org", refs=["a@x.org", "zz@x.org"], irt="b@x.org", day=4))
+        mirror.poll()
+        recs = by_id(gw)
+        assert recs["c@x.org"]["removed_at"] and recs["b@x.org"]["chat"] == "a@x.org"
+        mirror.index.close()
+        mirror.threads.close()
+
+        # The ledger volume alone comes back from the backup. The index says
+        # c is removed and b is in a@x.org; the records say neither.
+        shutil.rmtree(Path(tmp) / "inbound")
+        shutil.copytree(backup, Path(tmp) / "inbound")
+        events.clear()
+        mirror = gw.Mirror(box, clock=lambda: NOW)
+        while mirror.poll():
+            pass
+        mirror.poll()
+        recs = by_id(gw)
+        assert sorted(recs) == ["a@x.org", "b@x.org", "c@x.org", "d@x.org"]
+        assert recs["c@x.org"]["removed_at"] and recs["c@x.org"]["body_part"] is None
+        assert {m: r["chat"] for m, r in recs.items() if m != "c@x.org"} == {
+            "a@x.org": "a@x.org", "b@x.org": "a@x.org", "d@x.org": "a@x.org"}
+        kinds = sorted(kind for kind, _p in events)
+        assert kinds == ["inbound", "merge", "removed"], kinds   # d again, quietly
+        assert [e.get("backfill") for e in inbound(events)] == [True]
+        # No blob of the restored, tombstoned-again record is left.
+        named = {gw._ibstore.media_id_of(ref) for r in records(gw)
+                 for ref in gw._ibstore._media_refs(r)}
+        on_disk = {p.name for p in gw._ibstore.media_dir(gw.INBOUND_STORE_DIR).iterdir()
+                   if "." not in p.name}
+        assert on_disk == named
+    print("ok: a ledger restored to an older copy is tombstoned and re-keyed again")
+
+
+def test_tombstones_and_merges_read_only_their_own_records():
+    with tempfile.TemporaryDirectory() as tmp:
+        gw = load(tmp)
+        rail(gw)
+        mirror, box = started(gw)
+        uids = [box.put("INBOX", msg(f"m{n}@x.org", subject=f"s{n}", day=1 + n))
+                for n in range(6)]
+        box.put("INBOX", msg("b@x.org", subject="Re: s0", irt="zz@x.org", day=8))
+        mirror.poll()
+        # From here on, count every read of a ledger record.
+        directory = gw._ibstore.messages_dir(gw.INBOUND_STORE_DIR)
+        reads = []
+        real_read = Path.read_text
+
+        def read_text(self, *args, **kwargs):
+            if self.parent == directory:
+                reads.append(self.name)
+            return real_read(self, *args, **kwargs)
+        scan = gw._ibstore._blob_ids_referenced_elsewhere
+        gw._ibstore._blob_ids_referenced_elsewhere = lambda *a, **kw: (_ for _ in ()).throw(
+            AssertionError("a mail's blobs are its record's own: no scan of the ledger"))
+        Path.read_text = read_text
+        try:
+            for uid in uids[3:]:
+                box.remove("INBOX", uid)
+            mirror.poll()
+            tombstone_reads = list(reads)
+            reads.clear()
+            box.put("INBOX", msg("c@x.org", refs=["m0@x.org", "zz@x.org"], irt="b@x.org", day=9))
+            mirror.poll()
+            merge_reads = list(reads)
+        finally:
+            Path.read_text = real_read
+            gw._ibstore._blob_ids_referenced_elsewhere = scan
+        recs = by_id(gw)
+        assert sorted(m for m, r in recs.items() if r["removed_at"]) == [
+            "m3@x.org", "m4@x.org", "m5@x.org"]
+        assert recs["b@x.org"]["chat"] == "m0@x.org"
+        # Three tombstones read three records; the merge read the one record
+        # of the absorbed chat (twice: to move it, and to see that it moved).
+        assert len(set(tombstone_reads)) == 3, tombstone_reads
+        assert len(set(merge_reads)) == 1, merge_reads
+        media = {p.name for p in gw._ibstore.media_dir(gw.INBOUND_STORE_DIR).iterdir()
+                 if "." not in p.name}
+        named = {gw._ibstore.media_id_of(ref) for r in records(gw)
+                 for ref in gw._ibstore._media_refs(r)}
+        assert media == named, "the tombstones' blobs are gone, nobody else's"
+    print("ok: a tombstone and a merge cost their own records, not a read of the ledger")
+
+
 def test_skipped_mail_is_not_read_again_after_a_uidvalidity_change():
     with tempfile.TemporaryDirectory() as tmp:
         gw = load(tmp)
@@ -935,6 +1479,260 @@ def test_an_interrupted_ingest_is_not_recorded_twice():
         mirror.poll()
         assert sorted(r["message_id"] for r in records(gw)) == ["a@x.org", "b@x.org"]
     print("ok: a failed or interrupted ingest never leaves a second record")
+
+
+class _Kill(BaseException):
+    """The process dies here: no handler runs, nothing is cleaned up."""
+
+
+def _killed_at(n, setup, act, check) -> bool:
+    """Run ``act`` with the process killed right after its n-th write (to
+    either index or to the ledger), restart, let the mirror settle, and
+    ``check(n, gw, events, mirror)``. False when ``act`` has fewer writes."""
+    tmp = tempfile.mkdtemp()
+    try:
+        gw = load(tmp)
+        events = rail(gw)
+        mirror, box = started(gw)
+        setup(mirror, box)
+        count = {"n": 0}
+
+        def arm(owner, name):
+            real = getattr(owner, name)
+
+            def armed(*args, **kwargs):
+                out = real(*args, **kwargs)
+                count["n"] += 1
+                if count["n"] == n:
+                    raise _Kill()
+                return out
+            setattr(owner, name, armed)
+            return real
+        act(box)
+        ledger = ("write_message", "write_outbound", "store_media", "tombstone_message",
+                  "rekey_chat", "update_message")
+        saved = {name: arm(gw._ibstore, name) for name in ledger}
+        for name in ("run", "atomic"):
+            arm(mirror.index, name)
+        arm(mirror.threads, "resolve")
+        try:
+            mirror.poll()
+            killed = False
+        except _Kill:
+            killed = True
+        finally:
+            for name, real in saved.items():
+                setattr(gw._ibstore, name, real)
+        if not killed:
+            return False
+        mirror.index.close()
+        mirror.threads.close()
+        mirror = gw.Mirror(box, clock=lambda: NOW)
+        for _ in range(4):
+            mirror.poll()
+        # Whatever happened: one record per mail, and an index that says what
+        # the ledger says.
+        recs = records(gw)
+        ids = [r["message_id"] for r in recs]
+        assert len(ids) == len(set(ids)), (n, ids)
+        index = {row["message_id"]: (row["chat"], bool(row["removed"])) for row in
+                 mirror.index.rows("SELECT * FROM mails")}
+        assert index == {r["message_id"]: (r["chat"], bool(r["removed_at"])) for r in recs}, n
+        assert mirror.index.one("SELECT COUNT(*) AS n FROM claims")["n"] == 0, n
+        check(n, gw, events, mirror)
+        return True
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _every_kill_point(setup, act, check) -> int:
+    n = 1
+    while _killed_at(n, setup, act, check):
+        n += 1
+    assert n > 5, "the scenario must have writes to be killed after"
+    return n - 1
+
+
+def test_wherever_it_is_killed_one_record_and_the_rail_is_told():
+    told = lambda events, kind: [p for k, p in events if k == kind]   # noqa: E731
+
+    # A new mail, with an attachment.
+    def check_ingest(n, gw, events, mirror):
+        recs = by_id(gw)
+        assert list(recs) == ["a@x.org"] and recs["a@x.org"]["text"], n
+        mine = [e for e in inbound(events) if e["message_id"] == "a@x.org"]
+        assert mine and "backfill" not in mine[0], (n, "a live mail is announced as one")
+        assert len(mine[0]["attachments"]) == 1 and mine[0]["chat_name"] == "Quarterly numbers"
+    points = _every_kill_point(
+        lambda mirror, box: None,
+        lambda box: box.put("INBOX", msg("a@x.org", day=1,
+                                         files=[("f.pdf", "application/pdf", b"%PDF-1")])),
+        check_ingest)
+
+    # Old mail, read by the backfill: announced as old, with its \Seen.
+    def check_backfill(n, gw, events, mirror):
+        mine = [e for e in inbound(events) if e["message_id"] == "old@x.org"]
+        assert mine and mine[0].get("backfill") is True and mine[0].get("seen") is True, n
+
+    def old_mail(mirror, box):
+        box.put("INBOX", msg("old@x.org", day=1), flags=["\\Seen"])
+        mirror.index.run("UPDATE folders SET ceiling = 9, hwm = 9 WHERE role = 'inbox'")
+        mirror.index.set("backfill_done", "0")
+    points += _every_kill_point(old_mail, lambda box: None, check_backfill)
+
+    # A mail that links two chats: the merge reaches the ledger AND the rail.
+    def two_chats(mirror, box):
+        box.put("INBOX", msg("a@x.org", day=1))
+        box.put("INBOX", msg("b@x.org", subject="Re: Quarterly numbers", irt="zz@x.org", day=2))
+        mirror.poll()
+
+    def check_merge(n, gw, events, mirror):
+        assert {r["message_id"]: r["chat"] for r in records(gw)} == {
+            "a@x.org": "a@x.org", "b@x.org": "a@x.org", "c@x.org": "a@x.org"}, n
+        merges = told(events, "merge")
+        assert merges and all(m["from"] == ["zz@x.org"] and m["into"] == "a@x.org"
+                              for m in merges), (n, merges)
+        assert any(e["message_id"] == "c@x.org" for e in inbound(events)), n
+    points += _every_kill_point(
+        two_chats,
+        lambda box: box.put("INBOX", msg("c@x.org", refs=["a@x.org", "zz@x.org"],
+                                         irt="b@x.org", day=3)),
+        check_merge)
+
+    # Two mails deleted in a client: both tombstoned, both announced.
+    def two_mails(mirror, box):
+        box.uids = [box.put("INBOX", msg("a@x.org", day=1)),
+                    box.put("INBOX", msg("b@x.org", subject="Other", day=2))]
+        mirror.poll()
+
+    def check_removed(n, gw, events, mirror):
+        assert all(r["removed_at"] and not r["text"] for r in records(gw)), n
+        gone = {mid for p in told(events, "removed") for mid in p["message_ids"]}
+        assert gone == {"a@x.org", "b@x.org"}, (n, gone)
+        assert all(p["live"] == 0 for p in told(events, "removed")), n
+    points += _every_kill_point(
+        two_mails, lambda box: [box.remove("INBOX", uid) for uid in box.uids], check_removed)
+
+    # The user's own mail, recorded from its INBOX copy, when the Sent copy shows.
+    def inbox_copy(mirror, box):
+        box.put("INBOX", msg("s@example.org", sender=ME, to=ACCOUNT, day=1))
+        mirror.poll()
+
+    def check_own(n, gw, events, mirror):
+        recs = records(gw)
+        assert len(recs) == 1 and recs[0]["type"] == gw._ibstore.T_OUTBOUND, n
+        assert recs[0]["removed_at"] is None and recs[0]["text"], n
+        assert inbound(events)[-1]["direction"] == "out", n
+    points += _every_kill_point(
+        inbox_copy,
+        lambda box: box.put("Sent", msg("s@example.org", sender=ME, to=ACCOUNT, day=1)),
+        check_own)
+    print(f"ok: killed after any of {points} writes, a mail is recorded once and the "
+          f"rail is told of it, of its merge and of its removal")
+
+
+def test_an_index_write_that_fails_after_the_record_stands():
+    import sqlite3
+    for failing in ("UPDATE mails SET record", "INSERT INTO outbox",
+                    "INSERT OR REPLACE INTO locations"):
+        with tempfile.TemporaryDirectory() as tmp:
+            gw = load(tmp)
+            events = rail(gw)
+            mirror, box = started(gw)
+            uid = box.put("INBOX", msg("a@x.org", day=1))
+            real_run, real_atomic = mirror.index.run, mirror.index.atomic
+            state = {"failed": False}
+
+            def full(sql):
+                if sql.startswith(failing) and not state["failed"]:
+                    state["failed"] = True
+                    raise sqlite3.OperationalError("database or disk is full")
+
+            def run(sql, args=()):
+                full(sql)
+                return real_run(sql, args)
+
+            def atomic(statements):
+                for statement in statements:
+                    if statement is not None:
+                        full(statement[0])
+                return real_atomic(statements)
+            mirror.index.run, mirror.index.atomic = run, atomic
+            try:
+                mirror.poll()
+                raise AssertionError("the state volume failing must fail the pass")
+            except sqlite3.OperationalError:
+                pass
+            assert state["failed"], failing
+            # The same process goes on (no restart): the record is matched to
+            # its claim, never written a second time, and the rail hears of it.
+            for _ in range(3):
+                mirror.poll()
+            assert [r["message_id"] for r in records(gw)] == ["a@x.org"], failing
+            assert [e["message_id"] for e in inbound(events)] == ["a@x.org"], failing
+            box.remove("INBOX", uid)
+            mirror.poll()
+            assert [bool(r["removed_at"]) for r in records(gw)] == [True], failing
+    print("ok: a failed index write after the ledger write leaves one record, found "
+          "again without a restart")
+
+
+def test_a_merge_decided_by_a_mail_whose_ingest_fails_is_still_applied():
+    with tempfile.TemporaryDirectory() as tmp:
+        gw = load(tmp)
+        events = rail(gw)
+        mirror, box = started(gw)
+        box.put("INBOX", msg("a@x.org", day=1))
+        box.put("INBOX", msg("b@x.org", subject="Re: Quarterly numbers", irt="zz@x.org", day=2))
+        mirror.poll()
+        box.put("INBOX", msg("c@x.org", refs=["a@x.org", "zz@x.org"], irt="b@x.org", day=3))
+        real = gw._ibstore.write_message
+
+        def full(*args, **kwargs):
+            raise OSError(28, "No space left on device")
+        gw._ibstore.write_message = full
+        try:
+            mirror.poll()
+            raise AssertionError("a full disk must fail the pass")
+        except OSError:
+            pass
+        finally:
+            gw._ibstore.write_message = real
+        # The thread index has merged; the retry is a repeat and reports no
+        # merge — it must have been remembered, or b stays under its old key.
+        assert mirror.threads.chat_of("b@x.org") == "a@x.org"
+        mirror.poll()
+        assert {r["message_id"]: r["chat"] for r in records(gw)} == {
+            "a@x.org": "a@x.org", "b@x.org": "a@x.org", "c@x.org": "a@x.org"}
+        assert [p for kind, p in events if kind == "merge"] == [
+            {"channel": "email", "account": ACCOUNT, "from": ["zz@x.org"], "into": "a@x.org"}]
+        assert mirror._merges_due == set() and mirror.thread("zz@x.org") is None
+    with tempfile.TemporaryDirectory() as tmp:
+        # A merge that cannot be made (a fault in the re-keying itself, here)
+        # stays due and stops nothing: the mail is mirrored, the next pass too.
+        gw = load(tmp)
+        events = rail(gw)
+        mirror, box = started(gw)
+        box.put("INBOX", msg("a@x.org", day=1))
+        box.put("INBOX", msg("b@x.org", subject="Re: Quarterly numbers", irt="zz@x.org", day=2))
+        mirror.poll()
+        box.put("INBOX", msg("c@x.org", refs=["a@x.org", "zz@x.org"], irt="b@x.org", day=3))
+        real = gw._ibstore.rekey_chat
+        gw._ibstore.rekey_chat = lambda *a, **kw: 1 / 0
+        try:
+            mirror.poll()
+            box.put("INBOX", msg("d@x.org", day=4))
+            mirror.poll()
+        finally:
+            gw._ibstore.rekey_chat = real
+        recs = by_id(gw)
+        assert sorted(recs) == ["a@x.org", "b@x.org", "c@x.org", "d@x.org"]
+        assert recs["b@x.org"]["chat"] == "zz@x.org" and mirror._merges_due == {"zz@x.org"}
+        assert not any(kind == "merge" for kind, _p in events)
+        mirror.poll()
+        assert by_id(gw)["b@x.org"]["chat"] == "a@x.org" and mirror._merges_due == set()
+        assert [p["from"] for kind, p in events if kind == "merge"] == [["zz@x.org"]]
+    print("ok: a merge survives the failed ingest of the mail that caused it")
 
 
 def test_a_failing_mailbox_costs_no_mail():
@@ -1015,6 +1813,160 @@ def test_thread_answers():
         assert [t["chat"] for t in mirror.recent_chats(limit=1)] == ["s1@example.org"]
         assert mirror.thread("nope@x.org") is None
     print("ok: a thread answers its name, participants, peer and counts")
+
+
+def test_the_users_other_account_is_not_a_correspondent():
+    with tempfile.TemporaryDirectory() as tmp:
+        # MAIL_OWN_ADDRESSES is every address of the user's that can appear
+        # on this mailbox's mail: aliases, and their other mirrored accounts.
+        gw = load(tmp, MAIL_OWN_ADDRESSES="alias@example.org, Me@Other.example")
+        assert gw.OWN_ADDRESSES == {ACCOUNT, "alias@example.org", "me@other.example"}
+        events = rail(gw)
+        mirror, box = started(gw)
+        # Ann writes to this account, copying the other one …
+        box.put("INBOX", msg("a@x.org", cc="Me Elsewhere <me@other.example>", day=1))
+        mirror.poll()
+        thread = mirror.thread("a@x.org")
+        assert thread["participants"] == [{"address": "ann@x.org", "name": "Ann Example"}]
+        assert thread["group"] is False
+        # … and the user answers from there; the answer lands in this INBOX.
+        box.put("INBOX", msg("r@other.example", sender="Me Elsewhere <me@other.example>",
+                             to="ann@x.org", cc=ACCOUNT, subject="Re: Quarterly numbers",
+                             refs=["a@x.org"], irt="a@x.org", day=2))
+        mirror.poll()
+        thread = mirror.thread("a@x.org")
+        assert thread["messages"] == 2 and thread["group"] is False
+        assert thread["participants"] == [{"address": "ann@x.org", "name": "Ann Example"}]
+        assert thread["peer"] == {"address": "ann@x.org", "name": "Ann Example"}
+        last = inbound(events)[-1]
+        assert last["group"] is False and last["peer"]["address"] == "ann@x.org"
+    print("ok: a thread that reaches two of the user's accounts has the user in it once")
+
+
+def test_one_mail_cannot_weld_many_chats_or_choose_the_survivor():
+    with tempfile.TemporaryDirectory() as tmp:
+        gw = load(tmp)
+        events = rail(gw)
+        mirror, box = started(gw)
+        count = 12
+        for n in range(count):
+            box.put("INBOX", msg(f"t{n}@x.org", sender=f"P{n} <p{n}@x.org>",
+                                 subject=f"Thread {n}", day=10 + n))
+        mirror.poll()
+        assert len(mirror.threads.chats()) == count
+        # A sender who knows the ids cites them all — from a mail dated
+        # before every one of them, with a subject of their choosing.
+        box.put("INBOX", msg("evil0@evil.org", sender="Mallory <m@evil.org>",
+                             subject="URGENT: wire transfer", day=-9000), date=NOW)
+        box.put("INBOX", msg("evil1@evil.org", sender="Mallory <m@evil.org>",
+                             refs=["evil0@evil.org"] + [f"t{n}@x.org" for n in range(count)],
+                             irt=f"t{count - 1}@x.org", subject="x", day=-9000), date=NOW)
+        mirror.poll()
+        # Nothing was merged: every chat is still itself, under its own name.
+        assert len(mirror.threads.chats()) == count + 1
+        assert not any(kind == "merge" for kind, _p in events)
+        for n in range(count - 1):
+            thread = mirror.thread(f"t{n}@x.org")
+            assert thread["messages"] == 1 and thread["name"] == f"Thread {n}"
+        # The mail is in the chat of the mail it answers, and nowhere else.
+        recs = by_id(gw)
+        assert recs["evil1@evil.org"]["chat"] == f"t{count - 1}@x.org"
+        assert recs["evil0@evil.org"]["chat"] == "evil0@evil.org"
+        assert {r["chat"] for m, r in recs.items() if m.startswith("t")} == {
+            f"t{n}@x.org" for n in range(count)}
+
+        # A merge within the bound goes by when the server received the mails,
+        # not by the Date a sender wrote: the backdated mail's chat does not
+        # survive, and its subject does not name the thread.
+        box.put("INBOX", msg("link@evil.org", sender="Mallory <m@evil.org>", subject="x",
+                             refs=["evil0@evil.org", "t0@x.org"], day=-9000), date=NOW)
+        mirror.poll()
+        merge = [p for kind, p in events if kind == "merge"]
+        assert merge == [{"channel": "email", "account": ACCOUNT,
+                          "from": ["evil0@evil.org"], "into": "t0@x.org"}], merge
+        assert mirror.thread("t0@x.org")["name"] == "Thread 0"
+        assert by_id(gw)["evil0@evil.org"]["chat"] == "t0@x.org"
+        # The record still shows the date the mail claims; only threading ignores it.
+        assert by_id(gw)["link@evil.org"]["received_at"] == gw._ibstore._iso(T0 - 9000 * DAY)
+        assert by_id(gw)["link@evil.org"]["arrived_at"] == gw._ibstore._iso(NOW)
+    with tempfile.TemporaryDirectory() as tmp:
+        # Nor after the state volume was lost: the record keeps when the
+        # server received each mail, and the rebuilt index goes by that.
+        gw = load(tmp)
+        events = rail(gw)
+        mirror, box = started(gw)
+        box.put("INBOX", msg("t0@x.org", subject="Lunch on Friday", day=10))
+        gone = box.put("INBOX", msg("t1@x.org", subject="Dinner", day=11))
+        mirror.poll()
+        box.put("INBOX", msg("evil0@evil.org", sender="Mallory <m@evil.org>",
+                             subject="URGENT: wire transfer", day=-9000), date=NOW)
+        mirror.poll()
+        box.remove("INBOX", gone)       # a tombstone keeps its arrival too
+        mirror.poll()
+        assert by_id(gw)["t1@x.org"]["removed_at"]
+        mirror.index.close()
+        mirror.threads.close()
+        shutil.rmtree(Path(tmp) / "data")
+        mirror = gw.Mirror(box, clock=lambda: NOW)
+        assert mirror.threads.earliest("evil0@evil.org") == NOW
+        assert mirror.threads.earliest("t1@x.org") == T0 + 11 * DAY
+        assert mirror.index.one("SELECT arrived FROM mails WHERE message_id = 'evil0@evil.org'")[
+            "arrived"] == NOW
+        mirror.poll()
+        box.put("INBOX", msg("link@evil.org", sender="Mallory <m@evil.org>", subject="x",
+                             refs=["evil0@evil.org", "t0@x.org", "t1@x.org"], day=-9000),
+                date=NOW)
+        while mirror.poll():
+            pass
+        recs = by_id(gw)
+        assert {r["chat"] for r in recs.values()} == {"t0@x.org"}, recs
+        assert mirror.thread("t0@x.org")["name"] == "Lunch on Friday"
+        assert [p["into"] for kind, p in events if kind == "merge"] == ["t0@x.org"]
+    with tempfile.TemporaryDirectory() as tmp:
+        # And a References header of any length cites a bounded number of ids.
+        gw = load(tmp)
+        rail(gw)
+        mirror, box = started(gw)
+        many = [f"r{n}@x.org" for n in range(3000)]
+        box.put("INBOX", msg("long@x.org", refs=many, irt="r2999@x.org", day=1))
+        mirror.poll()
+        record = by_id(gw)["long@x.org"]
+        kept = record["references"].split()
+        assert len(kept) == gw._threads.MAX_CITED_IDS
+        assert kept[0] == "r0@x.org" and kept[-1] == "r2999@x.org" and kept[1] == "r2901@x.org"
+        assert record["chat"] == "r0@x.org" and record["in_reply_to"] == "r2999@x.org"
+        ids = mirror.threads._conn.execute("SELECT COUNT(*) FROM ids").fetchone()[0]
+        assert ids == gw._threads.MAX_CITED_IDS + 1
+    print("ok: one mail joins a few chats at most, cites a bounded number of ids, and "
+          "cannot date itself into owning a thread")
+
+
+def test_every_cited_id_is_on_record_for_a_rebuild():
+    with tempfile.TemporaryDirectory() as tmp:
+        gw = load(tmp)
+        rail(gw)
+        mirror, box = started(gw)
+        # In-Reply-To may name several parents; neither is mirrored yet.
+        box.put("INBOX", msg("b@x.org", subject="Re: Both", day=3,
+                             headers=[("In-Reply-To", "<p1@x.org> <p2@x.org>")]))
+        mirror.poll()
+        record = by_id(gw)["b@x.org"]
+        assert record["chat"] == "p1@x.org" and record["in_reply_to"] == "p1@x.org"
+        assert record["references"] == "p2@x.org"
+        assert mirror.threads.chat_of("p2@x.org") == "p1@x.org"
+        mirror.index.close()
+        mirror.threads.close()
+        # The state volume is lost; the index rebuilt from the record knows
+        # both parents, so the second one still joins the chat when it arrives.
+        shutil.rmtree(Path(tmp) / "data")
+        mirror = gw.Mirror(box, clock=lambda: NOW)
+        assert mirror.threads.chat_of("p2@x.org") == "p1@x.org"
+        box.put("INBOX", msg("p2@x.org", subject="Both", day=2))
+        while mirror.poll():
+            pass
+        assert by_id(gw)["p2@x.org"]["chat"] == "p1@x.org"
+        assert len(mirror.threads.chats()) == 1
+    print("ok: a thread index rebuilt from the records cites what the live one cited")
 
 
 def test_an_outbound_note_names_the_author():
@@ -1150,6 +2102,17 @@ def test_rail_posts_and_their_outcomes():
             server.shutdown()
         gw._chats.CHATS_INGEST_URL = "http://127.0.0.1:9/internal/chats/inbound"
         assert gw._rail_send("inbound", {}) == "down"
+    with tempfile.TemporaryDirectory() as tmp:
+        # Nothing that is not text leaves by the rail, whatever got into an
+        # event: the receiver writes what it is sent into files.
+        gw = load(tmp)
+        events = rail(gw)
+        mirror, _box = started(gw)
+        mirror.index.atomic([gw.Mirror._event(
+            "inbound", {"text": "a\ud800b", "participants": [{"name": "\udfff", "address": "é@x"}]})])
+        mirror.poll()
+        assert events == [("inbound", {"text": "a?b", "participants": [
+            {"name": "?", "address": "é@x"}]})]
     print("ok: the rail's three endpoints, its token, and what each answer means")
 
 
@@ -1163,7 +2126,17 @@ def test_a_long_text_is_capped_on_the_rail_only():
         mirror.poll()
         assert len(events[0][1]["text"]) == 50
         assert len(records(gw)[0]["text"]) > 900
-    print("ok: an event carries a bounded text; the record carries all of it")
+        # The record's text is bounded too, further out: one literal that
+        # every reader of the record parses. The whole text is the body blob.
+        gw.MAX_RECORD_TEXT_CHARS = 2000
+        body = "\n".join(f"Line {n} of a very long report." for n in range(400)) + "\n"
+        box.put("INBOX", msg("long@x.org", body=body, day=2))
+        mirror.poll()
+        record = by_id(gw)["long@x.org"]
+        assert len(record["text"]) <= 2000 + 2 and record["text"].endswith("\n…")
+        assert record["text"].startswith("Line 0 of") and record["trim"] == "wanting"
+        assert blob(gw, record["body_part"]).decode() == body
+    print("ok: an event carries a bounded text, the record a larger bounded one, the blob all")
 
 
 # --------------------------------------------------------------------------
@@ -1196,12 +2169,32 @@ def test_health_states():
         assert snap["configured"] is True and snap["connected"] is False
         assert "EMAIL_PASS" in snap["error"], snap
     with tempfile.TemporaryDirectory() as tmp:
-        gw = load(tmp, MAIL_POLICY_WAIT_SECONDS=0)
+        # A deployment that pinned its built-in channels without e-mail runs
+        # no mirror: the retinue side has no entry for this gateway then.
+        gw = load(tmp, MESSENGER_BUILTIN_CHANNELS="signal, whatsapp,telegram")
+        snap = gw._health_snapshot()
+        assert snap["configured"] is False and snap["account"] is None
+        assert "MESSENGER_BUILTIN_CHANNELS" in snap["error"]
+        assert gw.CONFIGURED is False and gw.MAIL_CONFIG is None
+        assert load(tmp, MESSENGER_BUILTIN_CHANNELS="")._health_snapshot()["configured"] is False
+        for pinned in ("signal,email", " email "):
+            assert load(tmp, MESSENGER_BUILTIN_CHANNELS=pinned).CONFIGURED is True, pinned
+        assert load(tmp).CONFIGURED is True            # unset: every built-in
+        # A named account is enrolled through MESSENGER_GATEWAYS, not the pin.
+        gw = load(tmp, configured=False, MESSENGER_BUILTIN_CHANNELS="signal",
+                  MAIL_ACCOUNT_NAME="work", EMAIL_USER_WORK="w@example.org",
+                  EMAIL_PASS_WORK="x", IMAP_HOST_WORK="imap.example.org",
+                  SMTP_HOST_WORK="smtp.example.org")
+        assert gw.CONFIGURED is True and gw.ACCOUNT == "w@example.org"
+    with tempfile.TemporaryDirectory() as tmp:
+        gw = load(tmp)
+        _write_policy(gw)
         rail(gw)
         snap = gw._health_snapshot()
         assert snap["configured"] is True and snap["connected"] is False
         assert snap["account"] == ACCOUNT and "not been polled" in snap["error"]
         assert snap["backfill"] == {"done": False, "pending": None, "days": 90}
+        assert snap["unmirrored"] == 0
         box = FakeMailbox(gw)
         box.put("INBOX", msg("a@x.org", day=1))
         gw.MIRROR = gw.Mirror(box, clock=lambda: NOW)
@@ -1229,7 +2222,8 @@ def test_health_states():
 
 def test_missing_folders_are_reported():
     with tempfile.TemporaryDirectory() as tmp:
-        gw = load(tmp, MAIL_POLICY_WAIT_SECONDS=0)
+        gw = load(tmp)
+        _write_policy(gw)
         rail(gw)
         # No archive folder: the mirror works, and says what that means.
         box = FakeMailbox(gw, folders=("INBOX", "Sent"))
@@ -1245,7 +2239,8 @@ def test_missing_folders_are_reported():
         gw._loop_step(gw.MIRROR, loop)
         assert records(gw)[0]["removed_at"]
     with tempfile.TemporaryDirectory() as tmp:
-        gw = load(tmp, MAIL_POLICY_WAIT_SECONDS=0)
+        gw = load(tmp)
+        _write_policy(gw)
         rail(gw)
         # No Sent folder: a fault. Nothing may be called gone meanwhile.
         box = FakeMailbox(gw)
@@ -1274,7 +2269,10 @@ def test_missing_folders_are_reported():
 
 def test_the_first_backfill_waits_for_the_policy_file():
     with tempfile.TemporaryDirectory() as tmp:
-        gw = load(tmp, MAIL_POLICY_WAIT_SECONDS=300)
+        # Nothing set: the wait has no end of its own. A backfill read with no
+        # flags makes a chat of every newsletter, and they stay.
+        gw = load(tmp)
+        assert gw.MAIL_POLICY_WAIT_SECONDS == 0
         rail(gw)
         box = FakeMailbox(gw)
         box.put("INBOX", msg("a@x.org", day=1))
@@ -1282,28 +2280,59 @@ def test_the_first_backfill_waits_for_the_policy_file():
         loop: dict = {}
         delay = gw._loop_step(gw.MIRROR, loop)
         snap = gw._health_snapshot()
-        assert snap["connected"] is True and "policy file" in snap["error"]
-        assert records(gw) == [] and delay <= 5.0 and box.fetched == []
-        # The retinue side writes the file (empty: nothing to flag) and the mirror starts.
+        assert snap["connected"] is True and "no e-mail policy file" in snap["error"]
+        assert records(gw) == [] and delay <= 5.0 and box.fetched == [] and box.listed == []
+        # Hours later it still waits — and is a fault by now, which the
+        # gateway monitor reports: nothing is being mirrored.
+        loop["started"] -= 6 * 3600
+        gw._loop_step(gw.MIRROR, loop)
+        snap = gw._health_snapshot()
+        assert snap["connected"] is False and "no e-mail policy file" in snap["error"]
+        assert records(gw) == [] and box.listed == []
+        # A file that cannot be read is no policy either.
         gw.POLICY_PATH.parent.mkdir(parents=True)
+        gw.POLICY_PATH.write_bytes(b"\xff\xfe not text")
+        gw._loop_step(gw.MIRROR, loop)
+        assert records(gw) == [] and "cannot be read" in gw._health_snapshot()["error"]
+        # The retinue side writes the file (empty: nothing to flag) and the mirror starts.
         gw.POLICY_PATH.write_text("")
         gw._loop_step(gw.MIRROR, loop)
+        snap = gw._health_snapshot()
+        assert len(records(gw)) == 1 and snap["error"] is None and snap["connected"] is True
+        assert gw.MIRROR.backfill_done()
+        # Which mail is news is decided when it is first read, backfill or
+        # not: with the file gone again, new mail waits too, and is read —
+        # with the flags — once the file is back.
+        gw.POLICY_PATH.unlink()
+        box.put("INBOX", msg("n@news.org", sender="News <n@news.org>", day=39))
+        loop.clear()
+        gw._loop_step(gw.MIRROR, loop)
+        assert len(records(gw)) == 1 and "no e-mail policy file" in gw._health_snapshot()["error"]
+        _write_policy(gw, news={"n@news.org"})
+        gw._loop_step(gw.MIRROR, loop)
         assert len(records(gw)) == 1 and gw._health_snapshot()["error"] is None
+        assert gw.MIRROR.index.one("SELECT skipped FROM locations WHERE message_id = "
+                                   "'n@news.org'")["skipped"] == "news"
     with tempfile.TemporaryDirectory() as tmp:
+        # The opt-out, for a deployment that keeps no policy file: a positive
+        # MAIL_POLICY_WAIT_SECONDS proceeds, as with no flags, after that long.
         gw = load(tmp, MAIL_POLICY_WAIT_SECONDS=300)
         rail(gw)
         box = FakeMailbox(gw)
         box.put("INBOX", msg("a@x.org", day=1))
         mirror = gw.Mirror(box, clock=lambda: NOW)
-        # It never appears: after the wait the mirror proceeds as with no flags.
-        loop = {"started": 0.0}
+        loop = {}
+        gw._loop_step(mirror, loop)
+        assert records(gw) == []
+        loop["started"] -= 301
         gw._loop_step(mirror, loop)
         assert len(records(gw)) == 1
-        # Once the backfill is done, a missing file holds nothing up.
+        # And goes on so, for as long as it runs.
         box.put("INBOX", msg("b@x.org", day=2))
-        gw._loop_step(mirror, {})
+        loop.pop("synced")
+        gw._loop_step(mirror, loop)
         assert len(records(gw)) == 2
-    print("ok: the first backfill waits for the policy file, but not for ever")
+    print("ok: the mirror waits for the policy file — without end, unless told otherwise")
 
 
 # --------------------------------------------------------------------------
@@ -1407,16 +2436,75 @@ def test_http_api():
             assert json.loads(call(f"{base}/recent-chats", token=token)[2]) == {"recent_chats": []}
         finally:
             server.shutdown()
+    print("ok: the HTTP API is token-gated, serves threads and media, and refuses to write")
+
+
+def test_without_a_token_nothing_is_mirrored_or_served():
     with tempfile.TemporaryDirectory() as tmp:
-        # No token configured: open, like the other gateways on the agents network.
+        # The mailbox credentials are there (a deployment that used
+        # email_client.py has them), the token is not: closed, not open.
+        gw = load(tmp, token="")
+        server, base = serve(gw)
+        try:
+            for path in ("/recent-chats", "/threads/x", "/media/" + "0" * 32, "/pending-sends"):
+                assert call(base + path)[0] == 401, path
+                assert call(base + path, token="anything")[0] == 401, path
+            for path in ("/send", "/outbound-note", "/chats/delete"):
+                assert call(base + path, body=b"{}", token="anything")[0] == 401, path
+            # /health answers, and says what to do. Unconfigured, not
+            # disconnected: the token is the opt-in, and an upgrade that set
+            # nothing must not have the monitor report an outage.
+            status, _h, body = call(f"{base}/health")
+            snap = json.loads(body)
+            assert status == 200 and snap["configured"] is False and snap["connected"] is False
+            assert "MAIL_GATEWAY_TOKEN" in snap["error"] and ".env" in snap["error"]
+            assert snap["account"] is None and snap["status"] == "ok"
+        finally:
+            server.shutdown()
+        # And main() builds no mirror: the mailbox is not even logged in to.
+        built = []
+        gw.Mirror = lambda *a, **kw: built.append(a)
+        gw._serve_http = lambda: None
+        gw.main()
+        assert gw.MIRROR is None and built == []
+        assert not (Path(tmp) / "inbound").exists()
+    with tempfile.TemporaryDirectory() as tmp:
+        # An unconfigured gateway is still just that, token or none.
+        gw = load(tmp, token="", configured=False)
+        snap = gw._health_snapshot()
+        assert snap["configured"] is False and "EMAIL_USER" in snap["error"]
+        # A mailbox half set up and no token: the opt-in was not taken, so it
+        # is the token that is named, not a fault in a mirror nobody asked for.
+        snap = load(tmp, token="", configured=False,
+                    EMAIL_USER="me@example.org")._health_snapshot()
+        assert snap["configured"] is False and "MAIL_GATEWAY_TOKEN" in snap["error"]
+    print("ok: with no MAIL_GATEWAY_TOKEN the gateway neither mirrors nor serves, and says why")
+
+
+def test_a_token_that_is_not_ascii_is_just_a_wrong_token():
+    with tempfile.TemporaryDirectory() as tmp:
         gw = load(tmp)
         server, base = serve(gw)
         try:
-            assert call(f"{base}/recent-chats")[0] == 200
-            assert call(f"{base}/send", body=b"{}")[0] == 501
+            # A byte above 0x7f in the header used to raise in the comparison:
+            # no answer, a traceback per request. It is a wrong token.
+            assert call(f"{base}/recent-chats", token="s\xe9krit")[0] == 401
+            assert call(f"{base}/outbound-note", body=b"{}", token="\xff\xfe")[0] == 401
+            assert call(f"{base}/recent-chats", token=TOKEN)[0] == 200
         finally:
             server.shutdown()
-    print("ok: the HTTP API is token-gated, serves threads and media, and refuses to write")
+    with tempfile.TemporaryDirectory() as tmp:
+        # And a deployment whose own token is not ASCII is served by it: the
+        # peer sends its UTF-8 bytes, which is what is compared.
+        gw = load(tmp, token="sékrit-ł")
+        server, base = serve(gw)
+        try:
+            sent = "sékrit-ł".encode("utf-8").decode("latin-1")
+            assert call(f"{base}/recent-chats", token=sent)[0] == 200
+            assert call(f"{base}/recent-chats", token="s\xe9krit-l")[0] == 401
+        finally:
+            server.shutdown()
+    print("ok: a bearer token with non-ASCII bytes is refused (or accepted) like any other")
 
 
 def main():
