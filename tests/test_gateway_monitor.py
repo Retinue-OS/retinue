@@ -71,8 +71,15 @@ def test_classify_health():
     verdict, reason = gm.classify_health(200, {"configured": True, "connected": False,
                                                "error": "device unlinked"})
     assert verdict == "down" and reason == "device unlinked"
+    # Not working, and the gateway says it is not the link: held by its setup.
+    verdict, reason = gm.classify_health(200, {"configured": True, "connected": False,
+                                               "blocked": "policy", "error": "no policy file"})
+    assert (verdict, reason) == ("blocked", "no policy file")
+    # (A gateway that names nothing, or says null, is simply down.)
+    assert gm.classify_health(200, {"connected": False, "blocked": None})[0] == "down"
     # Healthy link.
     assert gm.classify_health(200, {"configured": True, "connected": True})[0] == "up"
+    assert gm.classify_health(200, {"connected": True, "blocked": "policy"})[0] == "up"
     # A gateway that doesn't report link state (older build) counts as up.
     assert gm.classify_health(200, {"status": "ok"})[0] == "up"
 
@@ -336,6 +343,60 @@ def test_mail_notices_never_talk_about_pairing():
     # The channel is matched as the registry states it, case and all.
     assert gm.outage_message("E-mail", None, channel=" Email ") == \
         gm.outage_message("E-mail", None, channel="email")
+
+
+_IMAP_WORDS = ("mail server", "login", "password", "provider", "lost its connection",
+               "disconnected", "connected again")
+
+
+def test_a_mail_gateway_waiting_for_its_setup_is_not_an_imap_outage():
+    """The mail gateway's mirror does not start without the e-mail policy
+    file, which the retinue side places. While it waits its mailbox is
+    reachable: /health says ``connected: false`` with ``blocked: "policy"``
+    and what to check. The notices must say that — in the gateway's words —
+    and must not send the user to an app password or the provider's status
+    page; the reminders carry the reason too."""
+    reason = ("the mirror is waiting for the e-mail policy: there is no e-mail policy file "
+              "at /inbound/policy/email-policy.nt yet — check the retinue container's "
+              "start log")
+    body = {"status": "ok", "configured": True, "connected": False, "mode": "inbox",
+            "blocked": "policy", "error": reason}
+    verdict, said = gm.classify_health(200, body)
+    assert (verdict, said) == ("blocked", reason)
+    n = FakeNotifier()
+    e = gm.MonitorEngine(n, fail_threshold=2, remind_seconds=3600)
+    e.step("mail-gateway", "E-mail", verdict, said, now=1000, channel="email")
+    assert n.opened == []                       # debounced like any bad check
+    e.step("mail-gateway", "E-mail", verdict, said, now=1060, channel="email")
+    e.step("mail-gateway", "E-mail", verdict, said, now=1060 + 3700, channel="email")
+    e.step("mail-gateway", "E-mail", "up", None, now=1060 + 3800, channel="email")
+    (title, outage), = n.opened
+    assert title == "E-mail gateway waiting for its setup", title
+    texts = [title, outage] + [m for _t, m in n.appended]
+    assert len(texts) == 4, texts
+    for text in texts:
+        for word in _IMAP_WORDS + _PAIRING_WORDS:
+            assert word.lower() not in text.lower(), (word, text)
+    # The notice and the reminder both say what the gateway reports, and
+    # that the chats are missing mail meanwhile.
+    assert reason in outage and reason in texts[2], texts
+    assert "waiting for its setup" in outage and "still waiting for its setup" in texts[2]
+    assert "NOT reaching the chats" in outage and "/gateways)" in outage
+    assert "/gateways)" in texts[2] and texts[3].startswith("The E-mail gateway is running again")
+    assert n.quiet_flags == [False, True]
+    # An outage that turns out to be the mailbox after all is worded as one,
+    # in the same thread.
+    n = FakeNotifier()
+    e = gm.MonitorEngine(n, fail_threshold=1, remind_seconds=10)
+    e.step("mail-gateway", "E-mail", "blocked", reason, now=1000, channel="email")
+    e.step("mail-gateway", "E-mail", "down", "IMAP login failed", now=1100, channel="email")
+    e.step("mail-gateway", "E-mail", "up", None, now=1200, channel="email")
+    assert len(n.opened) == 1 and [t for t, _m in n.appended] == ["thread1", "thread1"]
+    assert "still disconnected" in n.appended[0][1] and "mail server" in n.appended[0][1]
+    assert "connected again" in n.appended[1][1]
+    # A messenger that reported it would be worded as held too, not as unlinked.
+    text = gm.outage_message("Signal", "waiting for X", channel="signal", blocked=True)
+    assert "waiting for its setup" in text and "QR" not in text and "waiting for X" in text
 
 
 def test_messenger_notices_keep_their_wording():

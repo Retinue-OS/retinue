@@ -217,14 +217,18 @@ gateway's name can differ: each entry carries its `channel`, and the web
 gateway reads that before it falls back to reading a slug.
 
 `/health` answers `{configured, connected, mode: "inbox", account, error,
-needs_repair: false, build, backfill: {done, pending, days}, unmirrored}` —
-`backfill.days` is the window fixed at the first run, `unmirrored` the number
-of mails that could not be given even a placeholder. An unconfigured
-gateway (`configured: false`) idles and is not an outage; so does one not
-opted in — no `MAIL_GATEWAY_TOKEN`, or the default account where
+blocked, needs_repair: false, build, backfill: {done, pending, days},
+unmirrored}` — `backfill.days` is the window fixed at the first run,
+`unmirrored` the number of mails that could not be given even a placeholder.
+An unconfigured gateway (`configured: false`) idles and is not an outage; so
+does one not opted in — no `MAIL_GATEWAY_TOKEN`, or the default account where
 `MESSENGER_BUILTIN_CHANNELS` is set without `email` — and `error` says which.
 The mirror starts only once the e-mail policy file is in place, since its
-first backfill decides at ingest which mail is news.
+first backfill decides at ingest which mail is news. While it waits `blocked`
+is `"policy"`: after ten minutes the gateway reports `connected: false` —
+nothing is being mirrored — but as a matter of the deployment's setup, with
+`error` saying where to look, and the connection monitor words it so, not as
+a mailbox that refused the login.
 
 ### The mirror
 
@@ -238,7 +242,11 @@ gateway polls (`MAIL_POLL_SECONDS`, 60) the mirrored folders — **INBOX**,
   a `kb:OutboundMessage`. A mail the gateway sent itself is already on record
   under its `Message-ID` and is not written twice; any other mail in Sent is
   the **own-device echo** (`author: device`) unless an outbound note names its
-  author (see *Writing*).
+  author (see *Writing*). A mail with a copy in both folders is the user's
+  own, whatever address it is `From` — `MAIL_OWN_ADDRESSES` need not list it.
+  The one exception carries its own evidence: a Sent copy that was sent on as
+  it stood (`Resent-` fields: a redirect) under someone else's `From` is
+  still that person's mail.
 - **The archive folder is only followed, never read for new mail**: a mail
   that moves there from INBOX is still that mail. One case is read: a mail
   that passed through INBOX or Sent between two polls — a filter, or a quick
@@ -251,6 +259,10 @@ gateway polls (`MAIL_POLL_SECONDS`, 60) the mirrored folders — **INBOX**,
   `kb:removedAt`. Only an answer counts: a mail is gone once every mirrored
   folder has *said* it does not hold it. A folder the server will not open, a
   refused search, a dropped connection tombstone nothing; the pass is repeated.
+  An archive folder that keeps refusing (a broken mailbox on the server) holds
+  back only that — finding a mail again, calling one gone: INBOX and Sent are
+  still mirrored, new mail and the backfill, and `/health.error` carries the
+  server's words meanwhile.
 - **A client's `\Seen` changes are ignored.**
 - **Backfill**: on first run, INBOX and Sent for `MAIL_BACKFILL_DAYS` (90),
   merged and ingested **oldest first**, so parents arrive before replies.
@@ -287,8 +299,24 @@ always kept.
 **A mail that cannot be read is still there.** One mail's failure never stops
 the folder: a mail the gateway cannot parse or store is mirrored as a
 placeholder that says so (with its sender, its time and its header block,
-unchanged in the mailbox) and is read again at every start; the rare mail
-that cannot even be that is logged and counted on `/health` (`unmirrored`).
+unchanged in the mailbox); the rare mail that cannot even be that is logged
+and counted on `/health` (`unmirrored`). Both are read again at start and
+every hour (less often each time it changes nothing), and a mail that reads
+now takes its placeholder's place.
+
+**But a fault of the mirror is not a mail's.** A corrupt index, a bug every
+mail brings out, memory gone for all of them would otherwise turn the mailbox
+into placeholders one mail at a time, with `/health` still `connected`. What
+the mailbox, a disk or an index file raises ends the pass. For anything else
+a mail is set aside only on evidence that the fault is its own: the reader
+refused it on purpose (one of the bounds above), or the mirror mirrored
+another mail whole since this one first failed, or — for one failure, not the
+next in a row — the mail it tried just before. Without that the mail is *in
+doubt*: not recorded, not marked, the folder's mark stays below it, and it is
+read again at every poll, while the mail behind it is still read (one that is
+mirrored vouches for those before it). As long as mails are in doubt and none
+has been mirrored since, `/health` reports `connected: false` and says how
+many.
 
 A record's time is the earlier of the mail's `Date` and the server's arrival
 time, never the future, so a forged date cannot pin a mail to the head of its

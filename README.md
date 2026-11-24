@@ -602,7 +602,9 @@ that gap:
   force a reconnect, at most once per `WHATSAPP_IQ_RECONNECT_BACKOFF` seconds,
   default 600) — and Telegram from the MTProto connection plus a
   periodic session probe (which catches a session revoked from another device).
-  The mail gateway reports whether its last IMAP login and poll succeeded.
+  The mail gateway reports whether its last IMAP login and poll succeeded —
+  and, when it is not the mailbox that holds it (the mirror waiting for the
+  e-mail policy file), names that in `blocked`.
   An unconfigured channel reports `configured: false` and idles instead of
   crash-looping — the mail gateway too while `MAIL_GATEWAY_TOKEN` is unset or
   `MESSENGER_BUILTIN_CHANNELS` leaves out `email`, its `/health` saying which.
@@ -623,7 +625,9 @@ that gap:
   `MAIL_GATEWAY_BASE_URL` is, which the base compose sets; a deployment that
   pins the set must add `email` to it, in `.env`, to get mail chats) plus any
   `MESSENGER_GATEWAYS` extras. A mail gateway's notices say the mail server
-  refused the login or cannot be reached, never to re-pair a phone.
+  refused the login or cannot be reached, never to re-pair a phone — and
+  where its `/health` says it is held by the deployment's setup (`blocked`),
+  that it is waiting for its setup, with the gateway's own reason.
 - **Re-pairing from the phone.** The dashboard page **`/gateways`** (behind the
   same edge auth as the rest) shows each gateway's live state and, for a
   disconnected one, the pairing QR code — proxied from the gateway's

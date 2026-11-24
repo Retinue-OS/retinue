@@ -18,7 +18,10 @@ complains that their messages go unanswered. This daemon closes that gap:
     The notice links to the /gateways page, where the user sees the gateway's
     status and, for a messenger, the pairing QR code to scan. What the notice
     says follows the gateway's channel (see WORDING): a mailbox has no phone
-    to re-pair.
+    to re-pair. And it follows what the gateway says holds it: one whose link
+    is fine and which waits for the deployment's setup (``blocked`` in its
+    /health — the mail gateway waiting for the e-mail policy file) is
+    reported as that, never as a lost connection.
   * While a gateway stays down it re-reminds in the same thread every
     GATEWAY_MONITOR_REMIND_SECONDS (default 6 h); when the link comes back it
     records the recovery in that thread quietly — no push, no unread badge,
@@ -86,6 +89,9 @@ def classify_health(status: int | None, body: dict | None, error: str | None = N
     verdict is one of:
       "up"           — the gateway reports a working link
       "down"         — reachable but the link is broken (or gateway unreachable)
+      "blocked"      — reachable, and not working for a reason that is not its
+                       link: it waits for something the deployment's setup
+                       owes it, and its ``error`` says what
       "unconfigured" — the channel is deliberately not set up; never notify
     """
     if error is not None:
@@ -97,7 +103,8 @@ def classify_health(status: int | None, body: dict | None, error: str | None = N
     # A gateway that doesn't report link state (older build) counts as up as
     # long as it answers — no false alarms during a rolling upgrade.
     if body.get("connected") is False:
-        return "down", str(body.get("error") or "connection lost")
+        reason = str(body.get("error") or "connection lost")
+        return ("blocked" if body.get("blocked") else "down"), reason
     return "up", None
 
 
@@ -153,28 +160,55 @@ WORDING = {
 }
 
 
+# A blocked gateway (see classify_health) has not lost anything: its link is
+# fine and it waits for the deployment's setup. What is missing is the
+# gateway's to say — its reported problem names it and where to look — so
+# these words blame no login, no server and no phone, and every notice,
+# reminders included, carries the reported problem.
+_BLOCKED_CAUSE = ("Its connection is fine. What it waits for is part of the deployment's "
+                  "setup, not of the account, and the reported problem says what; {link} "
+                  "shows what the gateway reports.")
+
+
 def wording(channel: str | None) -> dict:
     """The words for a gateway serving this registry channel (a messenger's
     when the channel is unknown or not stated)."""
     return WORDING.get((channel or "").strip().lower(), _MESSENGER_WORDING)
 
 
+def outage_title(label: str, blocked: bool = False) -> str:
+    return f"{label} gateway waiting for its setup" if blocked else f"{label} gateway disconnected"
+
+
 def outage_message(label: str, reason: str | None, since: float | None = None,
-                   channel: str | None = None) -> str:
+                   channel: str | None = None, blocked: bool = False) -> str:
     words = wording(channel)
-    lines = [f"The {label} {words['noun']} has lost its connection — {words['lost']}"]
+    if blocked:
+        lines = [f"The {label} {words['noun']} is not running: it is waiting for its "
+                 f"setup — {words['lost']}"]
+    else:
+        lines = [f"The {label} {words['noun']} has lost its connection — {words['lost']}"]
     if reason:
         lines.append(f"Reported problem: {reason}")
-    lines.append(words["cause"].format(link=repair_link()))
+    lines.append((_BLOCKED_CAUSE if blocked else words["cause"]).format(link=repair_link()))
     if since:
         mins = max(1, int((time.time() - since) // 60))
-        lines.insert(1, f"The connection has been down for about {mins} minute(s).")
+        lines.insert(1, f"It has been waiting for about {mins} minute(s)." if blocked
+                     else f"The connection has been down for about {mins} minute(s).")
     return "\n\n".join(lines)
 
 
-def reminder_message(label: str, since: float, channel: str | None = None) -> str:
+def reminder_message(label: str, since: float, channel: str | None = None,
+                     reason: str | None = None, blocked: bool = False) -> str:
     words = wording(channel)
     hours = max(1, int((time.time() - since) // 3600))
+    if blocked:
+        return (
+            f"Reminder: the {label} {words['noun']} is still waiting for its setup "
+            f"(for about {hours} hour(s)). {words['still']} "
+            + (f"Reported problem: {reason}. " if reason else "")
+            + f"{repair_link()} shows what the gateway reports."
+        )
     return (
         f"Reminder: the {label} {words['noun']} is still disconnected "
         f"(for about {hours} hour(s)). {words['still']} "
@@ -182,9 +216,9 @@ def reminder_message(label: str, since: float, channel: str | None = None) -> st
     )
 
 
-def recovery_message(label: str, channel: str | None = None) -> str:
-    return (f"The {label} {wording(channel)['noun']} is connected again. "
-            f"No further action needed.")
+def recovery_message(label: str, channel: str | None = None, blocked: bool = False) -> str:
+    return (f"The {label} {wording(channel)['noun']} is "
+            f"{'running' if blocked else 'connected'} again. No further action needed.")
 
 
 class MonitorEngine:
@@ -193,8 +227,11 @@ class MonitorEngine:
     ``step(slug, label, verdict, reason, now, channel)`` folds one health
     verdict into the persistent state and performs any due notification via
     the injected notifier; ``channel`` (the registry's) picks the wording.
+    A "blocked" gateway runs through the same states as one that is down —
+    debounced, one thread, reminders, a recovery — in its own words.
     State per slug:
       status      "up" | "down"
+      blocked     the last bad check said "blocked", not "down"
       fails       consecutive bad checks while still officially up
       since       when the outage began (first failed check of the streak)
       thread_id   dashboard conversation carrying this incident
@@ -220,27 +257,31 @@ class MonitorEngine:
         if verdict == "up":
             if entry.get("status") == "down":
                 if entry.get("notified") and entry.get("thread_id"):
-                    self.notifier.append(entry["thread_id"], recovery_message(label, channel),
-                                         quiet=True)
+                    self.notifier.append(
+                        entry["thread_id"],
+                        recovery_message(label, channel, blocked=bool(entry.get("blocked"))),
+                        quiet=True)
                 print(f"{LOG} {slug}: recovered", flush=True)
             self.state[slug] = {"status": "up", "fails": 0}
             return
 
-        # verdict == "down"
+        # verdict == "down" or "blocked"
+        blocked = verdict == "blocked"
         entry["fails"] = int(entry.get("fails", 0)) + 1
         entry["reason"] = reason
+        entry["blocked"] = blocked
         if entry.get("status") != "down":
             if entry["fails"] == 1:
                 entry["since"] = now
             if entry["fails"] < self.fail_threshold:
                 return
             entry["status"] = "down"
-            print(f"{LOG} {slug}: DOWN ({reason})", flush=True)
+            print(f"{LOG} {slug}: {'BLOCKED' if blocked else 'DOWN'} ({reason})", flush=True)
 
         if not entry.get("notified"):
             thread_id = self.notifier.open_thread(
-                f"{label} gateway disconnected",
-                outage_message(label, reason, entry.get("since"), channel),
+                outage_title(label, blocked),
+                outage_message(label, reason, entry.get("since"), channel, blocked=blocked),
                 attention=OUTAGE_ATTENTION,
             )
             if thread_id:
@@ -253,7 +294,8 @@ class MonitorEngine:
         if now - float(entry.get("last_notice", 0)) >= self.remind_seconds:
             if entry.get("thread_id") and self.notifier.append(
                     entry["thread_id"], reminder_message(label, entry.get("since", now),
-                                                         channel)):
+                                                         channel, reason=reason,
+                                                         blocked=blocked)):
                 entry["last_notice"] = now
 
 

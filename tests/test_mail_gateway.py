@@ -546,25 +546,29 @@ def test_a_folder_the_server_will_not_open_is_not_an_empty_folder():
         box.move_mail("INBOX", uid, "Archive")
         box.refused = {"Archive"}
         for _ in range(3):
-            try:
-                mirror.poll()
-                raise AssertionError("a refused folder must fail the pass")
-            except gw.MailboxError as exc:
-                assert "would not open" in str(exc)
+            mirror.poll()
+            assert "would not open 'Archive'" in mirror.health_notice()
         record = by_id(gw)["a@x.org"]
         assert record["removed_at"] is None and record["body_part"], "nothing is called gone"
-        assert len(events) == 1
+        assert len(events) == 1 and box.found == []
         # New mail was still mirrored meanwhile: INBOX answered.
         box.put("INBOX", msg("b@x.org", day=2))
-        try:
-            mirror.poll()
-        except gw.MailboxError:
-            pass
+        mirror.poll()
         assert "b@x.org" in by_id(gw)
         box.refused = set()
         mirror.poll()
         assert by_id(gw)["a@x.org"]["removed_at"] is None and ("Archive", "a@x.org") in box.found
         assert not any(kind == "removed" for kind, _p in events)
+        assert mirror.health_notice() is None
+        # INBOX or Sent refused is another matter: without them the pass
+        # has nothing to stand on, and fails.
+        for folder in ("INBOX", "Sent"):
+            box.refused = {folder}
+            try:
+                mirror.poll()
+                raise AssertionError("a refused folder must fail the pass")
+            except gw.MailboxError as exc:
+                assert "would not open" in str(exc)
     with tempfile.TemporaryDirectory() as tmp:
         # The same during a backfill: a mail the server would not hand over is
         # not "expunged", and the backfill is not done without it.
@@ -589,6 +593,61 @@ def test_a_folder_the_server_will_not_open_is_not_an_empty_folder():
         assert len(records(gw)) == 8 and mirror.backfill_status()["done"] is True
     print("ok: a folder the server refuses to open is not read as empty: nothing is "
           "tombstoned or skipped on it")
+
+
+def test_an_archive_that_keeps_refusing_holds_back_only_what_needs_it():
+    """A server can refuse one folder for days (a broken mailbox answering
+    [SERVERBUG], a missing permission). The archive's answer is needed to
+    find a mail again and to call one gone — not to read INBOX and Sent:
+    the ninety days of old mail arrive, /health says what is waiting and
+    why, and nothing is called gone meanwhile."""
+    with tempfile.TemporaryDirectory() as tmp:
+        gw = load(tmp)
+        _write_policy(gw)
+        events = rail(gw)
+        box = FakeMailbox(gw)
+        for n in range(6):
+            box.put("INBOX", msg(f"old{n}@x.org", subject=f"Old {n}", day=30 + n))
+        box.put("Sent", msg("sent@example.org", sender=ME, to="ann@x.org", day=33.5))
+        box.refused = {"Archive"}          # from the first poll on, every time
+        gw.MIRROR = mirror = gw.Mirror(box, clock=lambda: NOW)
+        loop: dict = {}
+        for turn in range(6):
+            if turn == 2:
+                box.put("INBOX", msg("new@x.org", subject="New", day=39.9), date=NOW)
+            loop.pop("synced", None)
+            gw._loop_step(mirror, loop)
+            snap = gw._health_snapshot()
+            # The mirror works; the notice carries the server's own words.
+            assert snap["connected"] is True, snap["error"]
+            assert "would not open 'Archive'" in snap["error"] and "[UNAVAILABLE]" in snap["error"]
+            assert "none is called removed" in snap["error"]
+        assert sorted(by_id(gw)) == ["new@x.org"] + [f"old{n}@x.org" for n in range(6)] + [
+            "sent@example.org"]
+        assert mirror.backfill_status() == {"done": True, "pending": 0, "days": 90}
+        assert [e.get("backfill", False) for e in inbound(events)].count(True) == 7
+        # A mail that leaves INBOX meanwhile — archived, for all anyone can
+        # tell — is not looked for and not called gone …
+        box.move_mail("INBOX", box.uid_of("INBOX", "old3@x.org"), "Archive")
+        gone = box.remove("INBOX", box.uid_of("INBOX", "old4@x.org"))
+        for _ in range(3):
+            loop.pop("synced", None)
+            gw._loop_step(mirror, loop)
+        assert not any(r["removed_at"] for r in records(gw)) and box.found == []
+        assert not any(kind == "removed" for kind, _p in events)
+        # … until the archive answers: then the one is found there, and the
+        # other, which is in no folder, leaves its tombstone.
+        box.refused = set()
+        loop.pop("synced", None)
+        gw._loop_step(mirror, loop)
+        loop.pop("synced", None)
+        gw._loop_step(mirror, loop)
+        recs = by_id(gw)
+        assert recs["old3@x.org"]["removed_at"] is None and recs["old4@x.org"]["removed_at"]
+        assert [p["message_ids"] for kind, p in events if kind == "removed"] == [["old4@x.org"]]
+        assert gw._health_snapshot()["error"] is None and gone["raw"]
+    print("ok: an archive folder that keeps refusing holds back neither new mail nor the "
+          "backfill; nothing is called gone until it answers")
 
 
 def test_a_search_that_does_not_settle_it_calls_nothing_gone():
@@ -908,6 +967,51 @@ def test_a_mail_that_passed_through_inbox_between_polls_is_mirrored():
     print("ok: a mail that came and went between two polls is mirrored from the archive")
 
 
+def test_a_copy_in_sent_is_the_users_own_whatever_address_it_is_from():
+    """MAIL_OWN_ADDRESSES is empty by default and never complete: the user's
+    own mail goes out under a plus-address, a send-as alias, a custom-domain
+    From. Its copy in Sent says it is theirs; the copy that comes back to
+    INBOX (a Cc to oneself, the list's echo) under the same unlisted From
+    takes nothing away."""
+    alias = "Me <me+shop@example.org>"
+    for order in (("Sent", "INBOX"), ("INBOX", "Sent"), ("both",)):
+        with tempfile.TemporaryDirectory() as tmp:
+            gw = load(tmp)
+            assert "me+shop@example.org" not in gw.OWN_ADDRESSES
+            events = rail(gw)
+            mirror, box = started(gw)
+            mail = msg("own1@example.org", sender=alias, to="ann@x.org", cc=ACCOUNT, day=1)
+            for folder in order:
+                for name in (("Sent", "INBOX") if folder == "both" else (folder,)):
+                    box.put(name, mail)
+                mirror.poll()
+            (record,) = records(gw)
+            assert record["type"] == gw._ibstore.T_OUTBOUND, order
+            assert record["author"] == "device" and record["sender"] == "me+shop@example.org"
+            directions = [e["direction"] for e in inbound(events)]
+            # Sent first, the rail hears of it once; INBOX first, it is
+            # corrected once the Sent copy shows — never the other way.
+            assert directions == (["in", "out"] if order[0] == "INBOX" else ["out"]), directions
+            assert mirror.thread("own1@example.org")["peer"]["address"] == "ann@x.org"
+            assert mirror.index.one("SELECT COUNT(*) AS n FROM locations")["n"] == 2
+            mirror.poll()
+            assert len(records(gw)) == 1 and len(inbound(events)) == len(directions)
+    with tempfile.TemporaryDirectory() as tmp:
+        # A mail someone else wrote, filed under Sent by hand, carries nothing
+        # that says it was sent on: Sent's word stands there too, as it did
+        # before anything looked at the From.
+        gw = load(tmp)
+        rail(gw)
+        mirror, box = started(gw)
+        mail = msg("filed@x.org", day=1)
+        box.put("INBOX", mail)
+        mirror.poll()
+        box.put("Sent", mail)
+        mirror.poll()
+        assert records(gw)[0]["type"] == gw._ibstore.T_OUTBOUND
+    print("ok: a copy in Sent is the user's own mail, from a listed address or not")
+
+
 def test_a_received_mail_filed_under_sent_is_not_the_users_own():
     for order in (("INBOX", "Sent"), ("Sent", "INBOX")):
         with tempfile.TemporaryDirectory() as tmp:
@@ -915,10 +1019,13 @@ def test_a_received_mail_filed_under_sent_is_not_the_users_own():
             events = rail(gw)
             mirror, box = started(gw)
             # Ann's mail, and the copy a client keeps under Sent when the
-            # user redirects it: the same Message-ID, the same From.
+            # user redirects it: the same Message-ID, the same From — and
+            # the Resent- fields whoever sends a mail on adds to it.
             mail = msg("a@x.org", day=1)
+            sent_on = msg("a@x.org", day=1, headers=[("Resent-From", ME),
+                                                     ("Resent-To", "bob@y.org")])
             for folder in order:
-                box.put(folder, mail)
+                box.put(folder, sent_on if folder == "Sent" else mail)
                 mirror.poll()
             recs = records(gw)
             assert len(recs) == 1 and recs[0]["type"] == gw._ibstore.T_INBOUND, order
@@ -935,13 +1042,26 @@ def test_a_received_mail_filed_under_sent_is_not_the_users_own():
         rail(gw)
         mirror, box = started(gw)
         mirror.note_author("n@x.org", "agent")
-        mail = msg("n@x.org", sender="Shared box <team@x.org>", day=1)
+        mail = msg("n@x.org", sender="Shared box <team@x.org>", day=1,
+                   headers=[("Resent-From", ME)])
         box.put("Sent", mail)
         mirror.poll()
         box.put("INBOX", mail)
         mirror.poll()
         assert records(gw)[0]["type"] == gw._ibstore.T_OUTBOUND
         assert records(gw)[0]["author"] == "agent"
+    with tempfile.TemporaryDirectory() as tmp:
+        # Or the mail is From the user: sent on, it is still what they wrote.
+        gw = load(tmp)
+        rail(gw)
+        mirror, box = started(gw)
+        mail = msg("mine@example.org", sender=ME, to="ann@x.org", cc=ACCOUNT, day=1,
+                   headers=[("Resent-From", ME), ("Resent-To", "bob@y.org")])
+        box.put("INBOX", mail)
+        mirror.poll()
+        box.put("Sent", mail)
+        mirror.poll()
+        assert records(gw)[0]["type"] == gw._ibstore.T_OUTBOUND
     with tempfile.TemporaryDirectory() as tmp:
         # An id is its sender's to choose, and whoever was sent a mail knows
         # its id: a mail that arrives under the id of one the user sent is
@@ -959,8 +1079,8 @@ def test_a_received_mail_filed_under_sent_is_not_the_users_own():
         (record,) = records(gw)
         assert record["type"] == gw._ibstore.T_OUTBOUND and record["sender"] == ACCOUNT
         assert record["text"] == "What I really wrote." and len(inbound(events)) == 1
-    print("ok: with copies in INBOX and Sent a mail is the user's own exactly when its "
-          "From is, in either order")
+    print("ok: a mail the user sent on is still its author's, in either order; an id alone "
+          "replaces nothing")
 
 
 def test_a_clients_seen_changes_are_ignored():
@@ -2150,6 +2270,7 @@ def test_health_states():
         assert snap["status"] == "ok" and snap["configured"] is False
         assert snap["connected"] is False and snap["account"] is None
         assert "EMAIL_USER" in snap["error"] and snap["needs_repair"] is False
+        assert snap["blocked"] is None
         assert snap["mode"] == "inbox" and snap["read_only"] is True
         json.dumps(snap)
     with tempfile.TemporaryDirectory() as tmp:
@@ -2209,6 +2330,7 @@ def test_health_states():
         assert gw._loop_step(gw.MIRROR, loop) == gw.MAIL_POLL_SECONDS
         snap = gw._health_snapshot()
         assert snap["connected"] is False and "login failed" in snap["error"]
+        assert snap["blocked"] is None
         gw._loop_step(gw.MIRROR, loop)
         assert gw._health_snapshot()["connected"] is True
         # An internal error is a health state too, never a dead loop.
@@ -2281,25 +2403,51 @@ def test_the_first_backfill_waits_for_the_policy_file():
         delay = gw._loop_step(gw.MIRROR, loop)
         snap = gw._health_snapshot()
         assert snap["connected"] is True and "no e-mail policy file" in snap["error"]
+        assert snap["blocked"] == "policy"
         assert records(gw) == [] and delay <= 5.0 and box.fetched == [] and box.listed == []
         # Hours later it still waits — and is a fault by now, which the
-        # gateway monitor reports: nothing is being mirrored.
+        # gateway monitor reports: nothing is being mirrored. But it is the
+        # deployment's setup that is waited for, not the mailbox: /health
+        # names that, and says where to look.
         loop["started"] -= 6 * 3600
         gw._loop_step(gw.MIRROR, loop)
         snap = gw._health_snapshot()
         assert snap["connected"] is False and "no e-mail policy file" in snap["error"]
+        assert snap["blocked"] == "policy" and snap["needs_repair"] is False
+        assert "the mailbox is reachable" in snap["error"]
+        assert "TRIAGE_EMAIL_WHITELIST_PATH" in snap["error"] and "start log" in snap["error"]
         assert records(gw) == [] and box.listed == []
+        # What the connection monitor makes of exactly this answer: a gateway
+        # held by its setup, in the gateway's own words — no IMAP outage.
+        spec = importlib.util.spec_from_file_location("gateway_monitor_for_mail",
+                                                      SCRIPTS_DIR / "gateway-monitor.py")
+        monitor = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(monitor)
+        verdict, reason = monitor.classify_health(200, json.loads(json.dumps(snap)))
+        assert (verdict, reason) == ("blocked", snap["error"])
+        notice = monitor.outage_message("E-mail", reason, channel="email", blocked=True)
+        assert snap["error"] in notice and "mail server" not in notice
+        assert "password" not in notice and "provider" not in notice
         # A file that cannot be read is no policy either.
         gw.POLICY_PATH.parent.mkdir(parents=True)
         gw.POLICY_PATH.write_bytes(b"\xff\xfe not text")
         gw._loop_step(gw.MIRROR, loop)
-        assert records(gw) == [] and "cannot be read" in gw._health_snapshot()["error"]
+        snap = gw._health_snapshot()
+        assert records(gw) == [] and "cannot be read" in snap["error"]
+        assert snap["connected"] is False and snap["blocked"] == "policy"
+        # A mailbox that fails meanwhile is the mailbox's fault, and said so.
+        box.fail = gw.MailboxError("IMAP login failed for me@example.org: bad credentials")
+        gw._loop_step(gw.MIRROR, loop)
+        snap = gw._health_snapshot()
+        assert snap["connected"] is False and snap["blocked"] is None
+        assert "login failed" in snap["error"]
+        assert monitor.classify_health(200, snap)[0] == "down"
         # The retinue side writes the file (empty: nothing to flag) and the mirror starts.
         gw.POLICY_PATH.write_text("")
         gw._loop_step(gw.MIRROR, loop)
         snap = gw._health_snapshot()
         assert len(records(gw)) == 1 and snap["error"] is None and snap["connected"] is True
-        assert gw.MIRROR.backfill_done()
+        assert snap["blocked"] is None and gw.MIRROR.backfill_done()
         # Which mail is news is decided when it is first read, backfill or
         # not: with the file gone again, new mail waits too, and is read —
         # with the flags — once the file is back.

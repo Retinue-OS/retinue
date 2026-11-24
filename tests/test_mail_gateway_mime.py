@@ -463,34 +463,88 @@ def test_the_fields_whose_parameters_are_parsed_are_bounded():
                b"--C\r\nContent-Type: text/plain\r\nContent-Disposition: attachment; "
                b"filename=in.txt\r\n\r\ninner\r\n--C--\r\n--B--\r\n")
         assert len(raw) > 1_200_000
+        # Wherever the parser reads a header block: a nested mail's, and each
+        # block of a delivery report — with any kind of line end, and as the
+        # very first field.
+        nested = (HEAD + b"Message-ID: <n@x.org>\r\nContent-Type: multipart/mixed; boundary=B\r\n"
+                  b"\r\n--B\r\nContent-Type: message/rfc822\r\n\r\n"
+                  b"From: a@x.org\r\nContent-Type: text/plain; charset=utf-8" + junk + b"\r\n"
+                  b"\r\ninner text\r\n"
+                  b"--B\r\nContent-Type: message/delivery-status\r\n\r\n"
+                  b"Reporting-MTA: dns; x.org\r\n\r\n"
+                  b"Content-Disposition: inline" + junk + b"\r\nStatus: 5.0.0\r\n"
+                  b"\r\n--B--\r\n")
+        bare = b"A: b\rContent-Type: text/x; a=\"" + b";" * 9000 + b"\r\tmore\rB: c\r\rbody"
+        first = b"content-disposition: x" + b";" * 9000 + b"\r\nA: b\r\n\r\nbody"
         seen = []
         real = stdlib._parseparam
         stdlib._parseparam = lambda s: (seen.append(len(str(s))), real(s))[1]
         try:
             mail = gw.parse_mail(raw)
             stub = gw.stub_mail(raw, None, "x")
+            inner = gw.parse_mail(nested)
+            for part in gw._parse_bytes(nested).walk():
+                part.get_content_type(), part.get_content_disposition()
+            odd = [gw.parse_mail(bare), gw.parse_mail(first)]
         finally:
             stdlib._parseparam = real
-        assert seen and max(seen) <= gw.MAX_FIELD_BYTES, max(seen)
+        # (The parser puts one ";" before the value it parses.)
+        assert len(seen) > 12 and max(seen) <= gw.MAX_FIELD_BYTES + 1, max(seen)
         # What stood before the cut is read, and the mail is whole.
         assert mail.message_id == stub.message_id == "q@x.org" and mail.subject == "Bounded"
         assert mail.plain == "The text."
         assert [(p.file_name, p.data) for p in mail.parts] == [("a.pdf", b"%PDF"),
                                                               ("in.txt", b"inner")]
-        bounded = gw._bound_fields(raw)
-        assert len(bounded) < 5 * gw.MAX_FIELD_BYTES + 2000
-        # A line end of any kind begins a field, as it does for the parser.
-        bare = b"A: b\rContent-Type: text/x" + b";" * 9000 + b"\r\tmore\rB: c\r\rbody"
-        assert gw._bound_fields(bare).endswith(b";\rB: c\r\rbody")
-        assert len(gw._bound_fields(bare)) < gw.MAX_FIELD_BYTES + 40
-        first = b"content-disposition: x" + b";" * 9000 + b"\r\nA: b\r\n\r\nbody"
-        assert len(gw._bound_fields(first)) == gw.MAX_FIELD_BYTES + len(b"\r\nA: b\r\n\r\nbody")
-        # A mail without such a field is handed on as it is, body and all.
-        plain = t.msg("fine@x.org", body="Content-Type: said the body\n" + "x" * 9000 + "\n",
-                      files=[("a.bin", "application/octet-stream", b"\x00" * 9000)])
-        assert gw._bound_fields(plain) is plain
+        assert [p.content_type for p in inner.parts] == ["message/rfc822",
+                                                         "message/delivery-status"]
+        assert b"inner text" in inner.parts[0].data
+        assert len(inner.parts[0].data) < gw.MAX_FIELD_BYTES + 200
+        assert [p.data for p in odd[0].parts] == [b"body"] and odd[1].plain == "body"
     print("ok: a Content-Type or Content-Disposition field is cut to its bound before "
           "anything parses its parameters")
+
+
+def test_a_line_that_begins_like_a_field_is_cut_only_where_headers_are():
+    """The bound on the two structured fields is the parser's own reading of
+    a header block. A line of a body or of an attachment that begins with
+    ``Content-Type:`` — a pasted HTTP capture, a log, a form dump — is
+    content: every part is kept, byte for byte."""
+    with tempfile.TemporaryDirectory() as tmp:
+        gw = t.load(tmp)
+        indented = "".join(f"    line {n}: indented text that belongs to the body\n"
+                           for n in range(200))
+        body = ("See the capture below.\n\nContent-Type: application/json\n" + indented
+                + "\nContent-Disposition: " + "x" * 6000 + "\nRegards\n")
+        assert len(body) > 3 * gw.MAX_FIELD_BYTES
+        raw = (HEAD + b"Message-ID: <capture@x.org>\r\nSubject: Capture\r\n"
+               b"Content-Type: text/plain; charset=utf-8\r\n\r\n"
+               + body.replace("\n", "\r\n").encode())
+        mail = gw.parse_mail(raw)
+        assert mail.plain == body, (len(mail.plain), len(body))
+        # The same in an attachment that is not base64: a log, with one long
+        # tab-continued line after such a line, and one with bare line ends.
+        log = (b"name: x\r\nContent-Disposition: form-data\r\n" + b"\tvalue " * 2000
+               + b"\r\nend\r\n")
+        bare = b"a\rContent-Type: text/x" + b";" * 9000 + b"\r\tmore\rz"
+        multi = (HEAD + b"Message-ID: <log@x.org>\r\nSubject: Log\r\n"
+                 b"Content-Type: multipart/mixed; boundary=B\r\n\r\n"
+                 b"--B\r\nContent-Type: text/plain\r\n\r\nhi\r\n"
+                 b"--B\r\nContent-Type: text/x-log\r\n"
+                 b"Content-Disposition: attachment; filename=dump.log\r\n\r\n" + log
+                 + b"\r\n--B\r\nContent-Type: application/octet-stream\r\n"
+                 b"Content-Disposition: attachment; filename=bare.bin\r\n\r\n" + bare
+                 + b"\r\n--B--\r\n")
+        parts = {p.file_name: p.data for p in gw.parse_mail(multi).parts}
+        assert parts == {"dump.log": log, "bare.bin": bare}, {k: len(v) for k, v in parts.items()}
+        # And so it is mirrored: the body blob and the stored file are the mail's.
+        record, _mirror, _box = ingest(gw, raw)
+        assert t.blob(gw, record["body_part"]).decode() == body
+    with tempfile.TemporaryDirectory() as tmp:
+        gw = t.load(tmp)
+        record, _mirror, _box = ingest(gw, multi)
+        assert [(name, data) for name, _kind, data, _cid in files(gw, record)] == [
+            ("bare.bin", bare), ("dump.log", log)]
+    print("ok: a line of a body or an attachment that begins like a header field is kept whole")
 
 
 def test_a_charset_the_parser_raises_on_is_still_read():
@@ -580,17 +634,27 @@ def test_what_one_mail_may_ask_for_is_bounded():
         assert record["text"] == "The text."
     with tempfile.TemporaryDirectory() as tmp:
         # Beyond what is worth parsing at all (the parser builds an object
-        # per part before anything can count them): a placeholder.
+        # per part, and they are counted as it does): a placeholder.
         gw = t.load(tmp)
-        gw.MAX_BOUNDARY_LINES = 300
+        gw.MAX_PARSED_PARTS = 300
         raw = (HEAD + b"Message-ID: <flood@x.org>\r\nSubject: Flood\r\n"
                b"Content-Type: multipart/mixed; boundary=B\r\n\r\n"
                + b"--B\r\n\r\nx\r\n" * 301 + b"--B--\r\n")
-        try:
-            gw.parse_mail(raw)
-            raise AssertionError("a mail of boundary lines must not be parsed")
-        except gw.UnreadableMail:
-            pass
+        # The same flood under a boundary a part declares, and as the blocks
+        # of a delivery report (which need no boundary line at all).
+        inner = (HEAD + b"Message-ID: <inner@x.org>\r\n"
+                 b"Content-Type: multipart/mixed; boundary=B\r\n\r\n"
+                 b"--B\r\nContent-Type: multipart/digest; boundary=\"in ner\"\r\n\r\n"
+                 + b"--in ner\r\n\r\nx\r\n" * 301 + b"--in ner--\r\n--B--\r\n")
+        report = (HEAD + b"Message-ID: <dsn@x.org>\r\n"
+                  b"Content-Type: message/delivery-status\r\n\r\n"
+                  + b"Status: 5.0.0\r\n\r\n" * 301)
+        for flood in (raw, inner, report):
+            try:
+                gw.parse_mail(flood)
+                raise AssertionError("a mail of more parts than that must not be parsed")
+            except gw.UnreadableMail:
+                pass
         record, _mirror, _box = ingest(gw, raw)
         assert record["text"] == gw.UNREADABLE_TEXT and record["sender"] == "ann@x.org"
         assert record["message_id"] == "flood@x.org" and record["attachments"] == []
@@ -622,7 +686,37 @@ def test_what_one_mail_may_ask_for_is_bounded():
                b"Content-Type: image/png\r\nContent-ID: <" + b"c" * 5000 + b"@x.org>\r\n\r\n"
                + png(40, 40) + b"\r\n--B--\r\n")
         assert [p.content_id for p in gw.parse_mail(raw).parts] == [None]
-    print("ok: the parts, the boundary lines and the header block of one mail are bounded")
+    print("ok: the parts of one mail, kept and parsed, and its header block are bounded")
+
+
+def test_lines_that_begin_with_dashes_are_not_boundary_lines():
+    """The bound on a mail's parts counts the parts the parser makes of it —
+    the lines of the mail's declared boundaries — and no line that merely
+    begins with ``--``. A dump of sixty thousand SQL comments, a long diff or
+    a log, attached 8bit, is an ordinary mail of two parts."""
+    with tempfile.TemporaryDirectory() as tmp:
+        gw = t.load(tmp)
+        dump = b"".join(b"-- comment %d\r\n--XyZ12\r\n--XyZ123x\r\nSELECT %d;\r\n" % (n, n)
+                        for n in range(30_000))
+        raw = (HEAD + b"Message-ID: <sql@x.org>\r\nSubject: The dump\r\n"
+               b"Content-Type: multipart/mixed; boundary=\"XyZ123\"\r\n\r\n"
+               b"--XyZ123\r\nContent-Type: text/plain\r\n\r\n"
+               b"Here is the dump you asked for.\r\n"
+               b"--XyZ123\r\nContent-Type: application/sql\r\n"
+               b"Content-Transfer-Encoding: 8bit\r\n"
+               b"Content-Disposition: attachment; filename=dump.sql\r\n\r\n" + dump
+               + b"\r\n--XyZ123--\r\n")
+        assert raw.count(b"\n--") > gw.MAX_PARSED_PARTS
+        mail = gw.parse_mail(raw)
+        assert mail.plain == "Here is the dump you asked for."
+        assert [(p.file_name, p.data) for p in mail.parts] == [("dump.sql", dump)]
+        record, mirror, _box = ingest(gw, raw)
+        assert record["text"] == "Here is the dump you asked for." and record["body_part"]
+        assert [(name, data) for name, _kind, data, _cid in files(gw, record)] == [
+            ("dump.sql", dump)]
+        assert mirror.unmirrored() == 0 and mirror._placeholders == set()
+    print("ok: lines of a body or an attachment that begin with \"--\" are not counted as "
+          "boundary lines")
 
 
 def test_rfc2047_names():
@@ -924,10 +1018,18 @@ def test_one_unreadable_mail_does_not_stop_the_folder():
 
         # The next start reads it again — the fault may have been the reader's,
         # and a reader that is fixed must not leave the placeholder standing.
+        # Still unreadable, it stays exactly as it is: nothing is dropped to
+        # try, and the rail hears nothing.
+        before = (Path(gw._ibstore.messages_dir(gw.INBOUND_STORE_DIR)) / "x").parent
+        before = {p.name: p.read_text() for p in before.glob("*.nt")}
+        told = len(events)
         mirror = gw.Mirror(box, clock=lambda: t.NOW)
         mirror.poll()
+        assert box.fetched[-1][:2] == ("INBOX", box.uid_of("INBOX", "bad@x.org"))
         assert t.by_id(gw)["bad@x.org"]["text"] == gw.UNREADABLE_TEXT, "still unreadable"
-        assert len(t.records(gw)) == 3
+        assert len(t.records(gw)) == 3 and len(events) == told
+        assert before == {p.name: p.read_text() for p in Path(
+            gw._ibstore.messages_dir(gw.INBOUND_STORE_DIR)).glob("*.nt")}
         gw.parse_mail = real
         mirror = gw.Mirror(box, clock=lambda: t.NOW)
         while mirror.poll():
@@ -952,21 +1054,27 @@ def test_one_unreadable_mail_does_not_stop_the_folder():
         t._write_policy(gw, news={"dev.lists.x.org", "news@shop.example"})
         t.rail(gw)
         mirror, box = t.started(gw)
+        box.put("INBOX", t.msg("first@x.org", day=1))
         box.put("INBOX", t.msg("l@x.org", sender="Dee <dee@x.org>", subject="poison",
                                list_id="Dev list <dev.lists.x.org>", day=1))
         box.put("INBOX", t.msg("s@shop.example", sender="news@shop.example",
                                subject="poison", day=1))
         box.put("INBOX", t.msg("p@x.org", subject="poison", day=1))
+        box.put("INBOX", t.msg("last@x.org", day=1))
         real = gw.parse_mail
-        gw.parse_mail = lambda raw, internal_date=None: 1 / 0
+        gw.parse_mail = lambda raw, internal_date=None: (
+            1 / 0 if b"poison" in raw else real(raw, internal_date))
         try:
             mirror.poll()
         finally:
             gw.parse_mail = real
-        assert sorted(t.by_id(gw)) == ["p@x.org"]
+        recs = t.by_id(gw)
+        assert sorted(recs) == ["first@x.org", "last@x.org", "p@x.org"]
+        assert recs["p@x.org"]["text"] == gw.UNREADABLE_TEXT
         assert sorted(row["message_id"] for row in mirror.index.rows(
             "SELECT message_id FROM locations WHERE skipped = 'news'")) == [
                 "l@x.org", "s@shop.example"]
+        assert mirror.in_doubt() is None and mirror._folder("inbox")["hwm"] == 5
     print("ok: a mail the reader chokes on is mirrored as a placeholder, and read again "
           "at the next start; the folder goes on")
 
@@ -1054,6 +1162,366 @@ def test_a_mail_whose_record_cannot_be_written_is_a_placeholder_too():
         assert t.by_id(gw)["a@x.org"]["text"] == "The numbers are in."
     print("ok: a mail whose record cannot be written is a placeholder; a full disk is not "
           "the mail's fault")
+
+
+class _Clock:
+    def __init__(self):
+        self.now = t.NOW
+
+    def __call__(self):
+        return self.now
+
+
+def _looped(gw, mirror, loop: dict) -> dict:
+    """One turn of the mirror loop with a look at the folders; what /health
+    says after it."""
+    gw.MIRROR = mirror
+    loop.pop("synced", None)
+    gw._loop_step(mirror, loop)
+    return gw._health_snapshot()
+
+
+def _whole(gw) -> list:
+    return sorted(mid for mid, r in t.by_id(gw).items() if r["text"] != gw.UNREADABLE_TEXT)
+
+
+def test_a_fault_of_the_mirror_is_not_laid_at_the_mails_door():
+    """Failing closed per mail must not absorb a fault of the mirror itself.
+    One that sets aside whatever it fails on turns a corrupt index, a bug
+    every mail brings out, or memory gone for all of them into a mailbox of
+    placeholders with every mark moved on — and /health still "connected"."""
+    import sqlite3
+    with tempfile.TemporaryDirectory() as tmp:
+        # By its type: an index file that is corrupt is nobody's mail.
+        gw = t.load(tmp)
+        t._write_policy(gw)
+        events = t.rail(gw)
+        mirror, box = t.started(gw)
+        loop: dict = {}
+        real = mirror.threads.resolve
+        mirror.threads.resolve = lambda *a, **kw: (_ for _ in ()).throw(
+            sqlite3.DatabaseError("database disk image is malformed"))
+        for n in range(5):
+            box.put("INBOX", t.msg(f"n{n}@x.org", subject=f"s{n}", day=39.9))
+        for _ in range(2):
+            snap = _looped(gw, mirror, loop)
+            assert snap["connected"] is False and "malformed" in snap["error"], snap
+            assert snap["unmirrored"] == 0 and t.records(gw) == []
+            assert mirror._folder("inbox")["hwm"] == 0, "no mark moves past unmirrored mail"
+        # The fault goes away, and no restart is needed: the next poll has it all.
+        mirror.threads.resolve = real
+        snap = _looped(gw, mirror, loop)
+        assert snap["connected"] is True and snap["error"] is None
+        assert _whole(gw) == [f"n{n}@x.org" for n in range(5)]
+        assert not any("backfill" in e for e in t.inbound(events))
+        assert gw._environment(sqlite3.DatabaseError("file is not a database"))
+        assert gw._environment(sqlite3.OperationalError("database is locked"))
+        assert not gw._environment(sqlite3.IntegrityError("NOT NULL constraint failed"))
+        assert not gw._environment(MemoryError()) and not gw._environment(TypeError("x"))
+    for fault in (RuntimeError("a bug every mail brings out"), MemoryError()):
+        with tempfile.TemporaryDirectory() as tmp:
+            # By what it does to other mail: a fault no exception names. A
+            # mirror that has mirrored nothing yet has nothing to show that a
+            # failure is the mail's — none is set aside, none skipped.
+            gw = t.load(tmp)
+            t._write_policy(gw)
+            events = t.rail(gw)
+            mirror, box = t.started(gw)
+            loop = {}
+            real = gw._trim.trim
+            gw._trim.trim = lambda *a, **kw: (_ for _ in ()).throw(fault)
+            try:
+                for n in range(3):
+                    box.put("INBOX", t.msg(f"n{n}@x.org", subject=f"s{n}", day=39.9))
+                for _ in range(2):
+                    snap = _looped(gw, mirror, loop)
+                    assert snap["connected"] is False, snap
+                    assert "3 mail(s) could not be mirrored" in snap["error"]
+                    assert "the mirror itself may be at fault" in snap["error"]
+                    assert t.records(gw) == [] and snap["unmirrored"] == 0
+                    assert mirror._folder("inbox")["hwm"] == 0
+                    assert mirror.index.one("SELECT COUNT(*) AS n FROM locations")["n"] == 0
+            finally:
+                gw._trim.trim = real
+            snap = _looped(gw, mirror, loop)
+            assert snap["connected"] is True and snap["error"] is None
+            assert _whole(gw) == ["n0@x.org", "n1@x.org", "n2@x.org"]
+            assert mirror._folder("inbox")["hwm"] == 3 and len(t.inbound(events)) == 3
+    with tempfile.TemporaryDirectory() as tmp:
+        # The fault begins while the mirror runs. The mail before the first
+        # failure was mirrored whole, which speaks for that one failure and
+        # for no other: the next in a row are left in doubt, behind a mark
+        # that does not move — and when the fault has passed, the one that
+        # was set aside on that word is read again at once.
+        gw = t.load(tmp)
+        t._write_policy(gw)
+        events = t.rail(gw)
+        mirror, box = t.started(gw)
+        loop = {}
+        box.put("INBOX", t.msg("a@x.org", day=39.9))
+        assert _looped(gw, mirror, loop)["connected"] is True
+        real = gw._trim.trim
+        gw._trim.trim = lambda *a, **kw: (_ for _ in ()).throw(MemoryError())
+        try:
+            for mid in ("b@x.org", "c@x.org", "d@x.org"):
+                box.put("INBOX", t.msg(mid, day=39.9))
+            snap = _looped(gw, mirror, loop)
+            assert snap["connected"] is False and "2 mail(s)" in snap["error"], snap
+            recs = t.by_id(gw)
+            assert sorted(recs) == ["a@x.org", "b@x.org"]
+            assert recs["b@x.org"]["text"] == gw.UNREADABLE_TEXT
+            assert mirror._folder("inbox")["hwm"] == 2
+        finally:
+            gw._trim.trim = real
+        snap = _looped(gw, mirror, loop)
+        assert snap["connected"] is True and snap["error"] is None
+        assert _whole(gw) == ["a@x.org", "b@x.org", "c@x.org", "d@x.org"]
+        assert len(t.records(gw)) == 4 and mirror._folder("inbox")["hwm"] == 4
+        assert mirror._placeholders == set()
+    with tempfile.TemporaryDirectory() as tmp:
+        # Not even a placeholder can be written, for any mail: next to
+        # nothing of a mail goes into one, so this is never decided on the
+        # word of the mail before. Nothing is marked unreadable and skipped.
+        gw = t.load(tmp)
+        t._write_policy(gw)
+        t.rail(gw)
+        mirror, box = t.started(gw)
+        loop = {}
+        box.put("INBOX", t.msg("a@x.org", day=39.9))
+        _looped(gw, mirror, loop)
+        real = gw._ibstore.write_message
+        gw._ibstore.write_message = lambda *a, **kw: (_ for _ in ()).throw(
+            TypeError("a writer bug"))
+        try:
+            box.put("INBOX", t.msg("b@x.org", day=39.9))
+            box.put("INBOX", t.msg("c@x.org", day=39.9))
+            snap = _looped(gw, mirror, loop)
+            assert snap["connected"] is False and "2 mail(s)" in snap["error"], snap
+            assert snap["unmirrored"] == 0 and sorted(t.by_id(gw)) == ["a@x.org"]
+            assert mirror._folder("inbox")["hwm"] == 1
+        finally:
+            gw._ibstore.write_message = real
+        assert _looped(gw, mirror, loop)["connected"] is True
+        assert _whole(gw) == ["a@x.org", "b@x.org", "c@x.org"]
+    print("ok: a corrupt index, a bug or memory gone for every mail is the mirror's fault: "
+          "nothing is set aside or skipped on it, and /health says so")
+
+
+def test_mail_in_doubt_holds_back_no_mail_behind_it():
+    """The other side of it: mails that really cannot be read, several in a
+    row, are set aside as soon as a mail behind them is mirrored — which is
+    read all the same, while the mark waits below the ones in doubt."""
+    with tempfile.TemporaryDirectory() as tmp:
+        gw = t.load(tmp)
+        t._write_policy(gw)
+        events = t.rail(gw)
+        mirror, box = t.started(gw)
+        loop: dict = {}
+        real = gw.parse_mail
+        gw.parse_mail = lambda raw, internal_date=None: (
+            1 / 0 if b"poison" in raw else real(raw, internal_date))
+        try:
+            # A lone unreadable mail, and no other yet: the mirror cannot say
+            # whose fault it is, and says that. The mail is read again …
+            box.put("INBOX", t.msg("p1@x.org", subject="poison", day=39.9))
+            for _ in range(2):
+                snap = _looped(gw, mirror, loop)
+                assert snap["connected"] is False and "1 mail(s)" in snap["error"]
+            assert t.records(gw) == [] and len(box.fetched) == 2
+            # … and more of them arrive, and then a mail that can be read.
+            box.put("INBOX", t.msg("p2@x.org", subject="poison", day=39.9))
+            box.put("INBOX", t.msg("p3@x.org", subject="poison", day=39.9))
+            box.put("INBOX", t.msg("good@x.org", day=39.9))
+            snap = _looped(gw, mirror, loop)
+            assert snap["connected"] is True and snap["error"] is None, snap
+            recs = t.by_id(gw)
+            assert sorted(recs) == ["good@x.org", "p1@x.org", "p2@x.org", "p3@x.org"]
+            assert _whole(gw) == ["good@x.org"] and mirror._folder("inbox")["hwm"] == 4
+            assert mirror._doubt == {}
+            # From here on one more unreadable mail is set aside at once, on
+            # the word of the mail before it.
+            box.put("INBOX", t.msg("p4@x.org", subject="poison", day=39.9))
+            assert _looped(gw, mirror, loop)["connected"] is True
+            assert t.by_id(gw)["p4@x.org"]["text"] == gw.UNREADABLE_TEXT
+            # A mail in doubt that is deleted is nobody's fault any more.
+            box.put("INBOX", t.msg("p5@x.org", subject="poison", day=39.9))
+            assert _looped(gw, mirror, loop)["connected"] is False
+            box.remove("INBOX", box.uid_of("INBOX", "p5@x.org"))
+            assert _looped(gw, mirror, loop)["connected"] is True
+            assert "p5@x.org" not in t.by_id(gw) and mirror._doubt == {}
+            # While nothing vouches, only so many are read again per look.
+            for n in range(gw.DOUBT_REREADS + 3):
+                box.put("INBOX", t.msg(f"q{n}@x.org", subject="poison", day=39.9))
+            _looped(gw, mirror, loop)
+            fetched = len(box.fetched)
+            snap = _looped(gw, mirror, loop)
+            assert len(box.fetched) == fetched + gw.DOUBT_REREADS
+            assert f"{gw.DOUBT_REREADS + 3} mail(s)" in snap["error"]
+            box.put("INBOX", t.msg("good2@x.org", day=39.9))
+            assert _looped(gw, mirror, loop)["connected"] is True
+            assert len(t.records(gw)) == 5 + gw.DOUBT_REREADS + 3 + 1
+        finally:
+            gw.parse_mail = real
+        assert len(t.inbound(events)) == len(t.records(gw))
+    with tempfile.TemporaryDirectory() as tmp:
+        # The same in a first backfill: the oldest mails cannot be read, the
+        # ones after them can — the backfill reads on, and is done.
+        gw = t.load(tmp)
+        t.rail(gw)
+        box = t.FakeMailbox(gw)
+        for n in range(3):
+            box.put("INBOX", t.msg(f"p{n}@x.org", subject="poison", day=1 + n))
+        for n in range(4):
+            box.put("INBOX", t.msg(f"g{n}@x.org", day=10 + n))
+        real = gw.parse_mail
+        gw.parse_mail = lambda raw, internal_date=None: (
+            1 / 0 if b"poison" in raw else real(raw, internal_date))
+        try:
+            mirror = gw.Mirror(box, clock=lambda: t.NOW)
+            while mirror.poll(backfill_limit=2):
+                pass
+            assert mirror.backfill_status()["done"] is True and mirror.in_doubt() is None
+            assert _whole(gw) == [f"g{n}@x.org" for n in range(4)] and len(t.records(gw)) == 7
+        finally:
+            gw.parse_mail = real
+    with tempfile.TemporaryDirectory() as tmp:
+        # And a backfill under a mirror that reads nothing stops after a few
+        # mails instead of fetching the whole window to learn it again.
+        gw = t.load(tmp)
+        t.rail(gw)
+        box = t.FakeMailbox(gw)
+        for n in range(40):
+            box.put("INBOX", t.msg(f"o{n}@x.org", day=1 + n / 2))
+        real = gw.parse_mail
+        gw.parse_mail = lambda raw, internal_date=None: 1 / 0
+        try:
+            mirror = gw.Mirror(box, clock=lambda: t.NOW)
+            for _ in range(3):
+                assert mirror.poll(backfill_limit=10) is False
+            assert len(box.fetched) == 3 * gw.DOUBT_REREADS and t.records(gw) == []
+            assert mirror.backfill_status()["done"] is False and "may be at fault" in mirror.in_doubt()
+        finally:
+            gw.parse_mail = real
+        while mirror.poll(backfill_limit=10):
+            pass
+        assert len(_whole(gw)) == 40 and mirror.backfill_status()["done"] is True
+    print("ok: mail that cannot be read is set aside once a mail behind it is mirrored; "
+          "mail in doubt holds none back and is not fetched without end")
+
+
+def test_set_aside_mail_is_read_again_while_the_gateway_runs():
+    """Not only at the next start: what made a mail unreadable may have been
+    a moment the program was in. A placeholder, and a mail that could not
+    even be one, are read again every hour — less often each time it changes
+    nothing — and a mail that reads now takes its placeholder's place."""
+    with tempfile.TemporaryDirectory() as tmp:
+        gw = t.load(tmp)
+        t._write_policy(gw)
+        events = t.rail(gw)
+        clock = _Clock()
+        box = t.FakeMailbox(gw)
+        mirror = gw.Mirror(box, clock=clock)
+        mirror.poll()
+        box.put("INBOX", t.msg("a@x.org", day=39.8))
+        box.put("Sent", t.msg("flaky@example.org", sender=t.ME, to="ann@x.org",
+                              subject="flaky", body="What I wrote.\n", refs=["a@x.org"], day=39.9,
+                              files=[("x.pdf", "application/pdf", b"%PDF")]))
+        box.put("INBOX", t.msg("b@x.org", day=39.9))
+        box.put("INBOX", t.msg("never@x.org", subject="never", day=39.9))
+        box.put("INBOX", t.msg("c@x.org", day=39.9))
+        box.put("INBOX", t.msg("worse@x.org", subject="never", day=39.9))
+        box.put("INBOX", t.msg("d@x.org", day=39.9))
+        real_trim, real_write = gw._trim.trim, gw._ibstore.write_message
+        broken = {"flaky", "never"}
+
+        def trim(plain, html, subject=None, **evidence):
+            if subject in broken:
+                raise RecursionError("this mail, for now")
+            return real_trim(plain, html, subject=subject, **evidence)
+
+        def write(store, **kw):
+            if kw.get("message_id") == "worse@x.org" and "worse" not in fixed:
+                raise TypeError("a writer bug")
+            return real_write(store, **kw)
+        fixed: set = set()
+        gw._trim.trim, gw._ibstore.write_message = trim, write
+        try:
+            mirror.poll()
+            mirror.poll()
+            recs = t.by_id(gw)
+            assert _whole(gw) == ["a@x.org", "b@x.org", "c@x.org", "d@x.org"]
+            assert recs["flaky@example.org"]["type"] == gw._ibstore.T_OUTBOUND
+            assert mirror._placeholders == {"flaky@example.org", "never@x.org"}
+            assert mirror.unmirrored() == 1
+            # Within the hour nothing is read again, however often it polls.
+            fetched, told = len(box.fetched), len(events)
+            clock.now += 1800
+            mirror.poll()
+            assert len(box.fetched) == fetched and len(events) == told
+            # The moment has passed for one of them: after the hour it is
+            # read, and the mail is on record whole — still what the user
+            # sent, in its thread, announced quietly as old mail.
+            broken.discard("flaky")
+            before = Path(gw._ibstore.messages_dir(gw.INBOUND_STORE_DIR))
+            before = {p.name: p.read_text() for p in before.glob("*.nt")
+                      if "never@x.org" in p.read_text()}
+            clock.now += 1800
+            mirror.poll()
+            flaky = t.by_id(gw)["flaky@example.org"]
+            assert flaky["text"] == "What I wrote." and flaky["type"] == gw._ibstore.T_OUTBOUND
+            assert flaky["chat"] == "a@x.org" and len(flaky["attachments"]) == 1
+            assert len(box.fetched) == fetched + 3 and len(t.records(gw)) == 6
+            again = [e for e in t.inbound(events)[told:]]
+            assert [(e["message_id"], e["direction"], e.get("backfill")) for e in again] == [
+                ("flaky@example.org", "out", True)]
+            # The others are as they were: the same record, byte for byte,
+            # the same count, and nothing said to the rail.
+            assert before == {p.name: p.read_text() for p in Path(
+                gw._ibstore.messages_dir(gw.INBOUND_STORE_DIR)).glob("*.nt")
+                if "never@x.org" in p.read_text()}
+            assert mirror._placeholders == {"never@x.org"} and mirror.unmirrored() == 1
+            # Each try fetches the mail whole, so one that changes nothing is
+            # tried less and less often: not after one more hour, but after two.
+            fetched = len(box.fetched)
+            clock.now += 3600
+            mirror.poll()
+            assert len(box.fetched) == fetched
+            fixed.add("worse")
+            clock.now += 3600
+            mirror.poll()
+            assert len(box.fetched) == fetched + 2 and mirror.unmirrored() == 0
+            assert t.by_id(gw)["worse@x.org"]["text"] == gw.UNREADABLE_TEXT
+            assert t.by_id(gw)["never@x.org"]["text"] == gw.UNREADABLE_TEXT
+            assert mirror._placeholders == {"never@x.org", "worse@x.org"}
+            # A placeholder whose mail is in the archive by now is read there
+            # — but not while the archive does not answer: that is no reason
+            # to fail a pass that needs only INBOX and Sent.
+            box.move_mail("INBOX", box.uid_of("INBOX", "never@x.org"), "Archive")
+            box.remove("INBOX", box.uid_of("INBOX", "worse@x.org"))
+            mirror.poll()
+            mirror._retried.clear()
+            box.refused = {"Archive"}
+            fetched = len(box.fetched)
+            clock.now += 3600
+            mirror.poll()
+            assert len(box.fetched) == fetched and "would not open" in mirror.health_notice()
+            box.refused = set()
+            broken.discard("never")
+            clock.now += 3600
+            mirror.poll()
+            assert box.fetched[fetched:] == [("Archive", 1, gw.MAIL_MAX_MAIL_BYTES)]
+            assert t.by_id(gw)["never@x.org"]["text"] == "The numbers are in."
+            assert mirror._placeholders == set() and t.by_id(gw)["worse@x.org"]["removed_at"]
+        finally:
+            gw._trim.trim, gw._ibstore.write_message = real_trim, real_write
+        # Nothing of a replaced placeholder is left in the media store.
+        named = {gw._ibstore.media_id_of(ref) for r in t.records(gw)
+                 for ref in gw._ibstore._media_refs(r)}
+        on_disk = {p.name for p in gw._ibstore.media_dir(gw.INBOUND_STORE_DIR).iterdir()
+                   if "." not in p.name}
+        assert on_disk == named
+    print("ok: set-aside mail is read again every hour while the gateway runs, and a mail "
+          "that reads now replaces its placeholder")
 
 
 # --------------------------------------------------------------------------

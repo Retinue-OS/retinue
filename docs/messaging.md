@@ -449,9 +449,12 @@ installs (`triage_policy.py place-email-policy`), the web gateway does again
 when it starts, and any retinue-side write of the policy moves it first. A
 deployment that pinned `TRIAGE_EMAIL_WHITELIST_PATH` keeps its path and is not
 moved, and must give the gateway the same file under its own mount. The mirror
-does not start until the file is there (`/health.error` says so meanwhile):
-its first backfill decides once, at ingest, which mail is news, so a backfill
-without the flags would make every newsletter of the window a chat for good.
+does not start until the file is there (`/health.error` says so meanwhile,
+with `blocked: "policy"`; after ten minutes also `connected: false`, as a
+matter of the deployment's setup — where to look is in the error — and not of
+the mailbox): its first backfill decides once, at ingest, which mail is news,
+so a backfill without the flags would make every newsletter of the window a
+chat for good.
 By default it waits as long as it takes; a positive
 `MAIL_POLICY_WAIT_SECONDS` makes it give up after that long and go on as with
 no flags. `python3 scripts/triage_policy.py place-email-policy` (or any other
@@ -465,8 +468,11 @@ reached. There is no
 QR code to scan: a mail gateway is fixed in the mailbox settings (host, port,
 user, an app password that was changed or revoked) or by waiting out the
 provider. The connection monitor words its notices for this case
-(`scripts/gateway-monitor.py`, `WORDING`). Unconfigured (`configured: false`)
-is intentional, never an outage.
+(`scripts/gateway-monitor.py`, `WORDING`). One reason is not the mailbox's at
+all: the mirror waiting for the e-mail policy file (`blocked: "policy"` in
+`/health`, above) — the card shows that reason, and the monitor's notice and
+reminders say "waiting for its setup" with it, never "check the login".
+Unconfigured (`configured: false`) is intentional, never an outage.
 
 **A named account** (`EMAIL_USER_ARI`, …) is one more gateway: a service that
 `extends` `mail-gateway` with `MAIL_ACCOUNT_NAME=ARI`, that account's
@@ -511,7 +517,10 @@ disconnected one — the pairing QR code to scan (proxied from the gateway's
 token-gated `GET /qr`). For the mail gateway the notice says what is wrong
 instead — the server refused the login or cannot be reached — and asks for
 no QR scan: there is no phone to re-pair (`gateway-monitor.py` words each
-notice by the registry entry's channel). Recovery is reported in the same thread. So: do **not**
+notice by the registry entry's channel). A gateway whose `/health` names
+what holds it when that is not its link (`blocked` — the mail mirror waiting
+for the e-mail policy file) is reported as waiting for its setup, with the
+gateway's own reason in the notice and in every reminder. Recovery is reported in the same thread. So: do **not**
 build ad-hoc liveness checks for these channels; if a user reports a channel
 seems dead, check `/gateways` (or the gateways' `/health`) first, and treat a
 `SIGNAL_SEND_POLICY`-style unconfigured channel (`configured: false`) as

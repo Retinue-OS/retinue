@@ -472,17 +472,24 @@ def test_a_refused_archive_costs_no_archived_mail():
             mail = server.folders["INBOX"]["mails"].pop(uid)
             server.put("Archive", mail["raw"], date=mail["date"])
             server.refuse_examine["Archive"] = "[UNAVAILABLE] Temporary problem"
-            for _ in range(2):
+            for turn in range(2):
+                # INBOX and Sent answer, so the mirror is at work: new mail
+                # arrives, and /health says what waits for the archive, in
+                # the server's words.
+                server.put("INBOX", t.msg(f"n{turn}@x.org", day=39), date=t.NOW - 5)
                 loop.clear()
                 gw._loop_step(mirror, loop)
                 snap = gw._health_snapshot()
-                assert snap["connected"] is False and "would not open 'Archive'" in snap["error"]
+                assert snap["connected"] is True and f"n{turn}@x.org" in t.by_id(gw)
+                assert "would not open 'Archive'" in snap["error"]
+                assert "[UNAVAILABLE] Temporary problem" in snap["error"]
             record = t.by_id(gw)["a@x.org"]
             assert record["removed_at"] is None and record["body_part"]
             del server.refuse_examine["Archive"]
             loop.clear()
             gw._loop_step(mirror, loop)
-            assert gw._health_snapshot()["connected"] is True
+            snap = gw._health_snapshot()
+            assert snap["connected"] is True and snap["error"] is None
             assert t.by_id(gw)["a@x.org"]["removed_at"] is None
             assert not any(kind == "removed" for kind, _p in events)
             # Deleted for real, it is a tombstone as before.
@@ -490,7 +497,28 @@ def test_a_refused_archive_costs_no_archived_mail():
             loop.clear()
             gw._loop_step(mirror, loop)
             assert t.by_id(gw)["a@x.org"]["removed_at"]
-    print("ok: an archive the server refuses for a moment tombstones nothing")
+    with tempfile.TemporaryDirectory() as tmp:
+        # An archive that refuses from the first poll on, for good (a broken
+        # mailbox on the server): the old mail in INBOX is still read.
+        gw = t.load(tmp)
+        t._write_policy(gw)
+        t.rail(gw)
+        server = _server()
+        for n in range(3):
+            server.put("INBOX", t.msg(f"old{n}@x.org", day=30 + n), date=t.T0 + (30 + n) * t.DAY)
+        server.refuse_examine["Archive"] = "[SERVERBUG] Internal error"
+        with Wired(gw, server):
+            gw.MIRROR = mirror = gw.Mirror(gw.Mailbox(gw.MAIL_CONFIG), clock=lambda: t.NOW)
+            loop = {}
+            for _ in range(3):
+                loop.pop("synced", None)
+                gw._loop_step(mirror, loop)
+            snap = gw._health_snapshot()
+            assert snap["connected"] is True and "[SERVERBUG] Internal error" in snap["error"]
+            assert snap["backfill"]["done"] is True
+            assert sorted(t.by_id(gw)) == ["old0@x.org", "old1@x.org", "old2@x.org"]
+    print("ok: an archive the server refuses tombstones nothing and holds back no mail of "
+          "INBOX or Sent")
 
 
 def test_the_adapter_cannot_write():
