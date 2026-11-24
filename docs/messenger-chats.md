@@ -292,14 +292,17 @@ persistent volume — high-churn disposable data, the news-store precedent):
   the mail may have gone out all the same — until the user dismisses it.
   The gateway's queue is the truth and the copy follows it; it is what the
   chat list counts from and what the chat page shows while the gateway is
-  away. An entry its gateway answers for as dismissed is over and leaves
-  the copy, whatever else it says;
+  away. An entry its gateway answers for as dismissed, or no longer holds
+  (a send that failed for certain is removed when it is dismissed), is
+  over and leaves the copy, whatever else it says;
 - `refused` — whom a mail of the user's did not reach: the recipients the
   mail server refused while it took the mail for the others, by the mail's
   `Message-ID` (a mail chat's only);
 - `unsent` — true for a chat that so far is nothing but a mail of the user's
   own that has not gone out (a queued new mail). Such a chat is forgotten
-  when that send is denied, retracted or dismissed;
+  when that send is denied, retracted, dismissed or gone — a new mail that
+  failed for certain, its chat made by a poll while its SMTP session
+  lasted, included;
 - display metadata (resolved name, group flag) cached from the gateway.
 
 Beside the documents sit two small files of their own. `mailbox/owed.json`
@@ -888,23 +891,32 @@ These rules hold for a mail send that a messenger's does not need
   The gateway's answer is read whole before it is judged: its "it may have
   gone out" carries two `Message-ID`s and is longer than any cut made for
   display.
-- **A send that certainly failed ends its press; only an unknown outcome
-  keeps its key.** A mail that did not go is answered with `"sent": false`
-  and the gateway's sentence — `424` where the gateway took the request and
-  the mail server would not have the mail, `502` where the gateway was
-  never reached, `503` where it cannot send. The page keeps the words,
-  drops the key, and the next press is a new one.
+- **A kept key is dropped only on the mail gateway's own word about that
+  key.** A mail that did not go is answered with `"sent": false`, a
+  sentence, and who said so: `"by": "gateway"` where the mail gateway
+  answered this request itself — `424` where it took the request and the
+  mail server would not have the mail, its `400`/`409`/`413` refusals, its
+  `503` where it cannot send — and `"by": "dashboard"` where the web
+  gateway answered without it: never reached (`502`), no gateway for that
+  mailbox, a request that does not validate. The page keeps the words; it
+  drops the key on the gateway's word only, since a "not sent" of this
+  request says nothing of an earlier one under the same key. A `5xx` is
+  "not sent" only with `"sent": false`; one without it, or a body cut
+  short, is not confirmed.
 - **A repeat is not a reply.** A press answered again from the mail it sent
   earlier (the gateway says `"repeat": true`) is only reconciled: the
-  Message is returned and the chat's copy of the queue brought in line. No
-  draft is cleared, nothing is marked read, no attention item is settled
-  and the mailbox is told nothing — the rail did that when the mail went
-  out, and what arrived since has not been answered.
+  Message is returned and the chat's copy of the queue brought in line.
+  Nothing is marked read, no attention item is settled and the mailbox is
+  told nothing — the rail did that when the mail went out, and what arrived
+  since has not been answered. The shared draft is cleared only where it
+  still holds this press's words (the page put them back when the first
+  answer was lost); a draft written since stays.
 - **Nothing the user queued or sent disappears without a word.** An allowed
   send that then fails stays in its chat as failed, with the gateway's
   reason, until the user dismisses it; recipients the mail server refused
   are named on the sent message. A dismissed entry is over — the gateway
-  may still answer for it by id — and one whose outcome is unknown is never
+  removes one that failed for certain, and answers for one of unknown
+  outcome by id as dismissed — and one whose outcome is unknown is never
   worded as "failed": not in the chat, the list, the companion's note, on
   `/sends`, or in the note to the thread that queued it.
 

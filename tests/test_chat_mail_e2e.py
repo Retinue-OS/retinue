@@ -26,9 +26,14 @@ two processes:
   the same press asked again is answered from the mail that went out, and
   marks nothing read that arrived since — the gateway says "repeat";
 - **a dismissed entry is over** (G): a slow send a page polled in flight,
-  then refused, leaves no failed bubble; and an outcome nobody knows is
-  never worded as "failed" — in the chat, on the approval page, in what it
-  polls, in the note to the thread that queued the send;
+  then refused, leaves no failed bubble — and a new mail no chat at all;
+  and an outcome nobody knows is never worded as "failed" — in the chat,
+  on the approval page, in what it polls, in the note to the thread that
+  queued the send;
+- **a kept key is dropped only on the mail gateway's own word about it**
+  (H): every "not sent" says who said it ("by"), and an answer cut short
+  on the wire is "not confirmed", never "not sent";
+- **a repeat clears the draft it repeats** (I), and only that draft;
 - a delete on a mailbox without a Trash says why, in the gateway's words.
 
 Standalone:
@@ -280,7 +285,8 @@ def test_a_refused_send_ends_its_press(r: Rig):
     # "sent": false, the gateway's own sentence, the key it was made under.
     assert status == 424 and out["sent"] is False and out["request_key"] == key, out
     assert out["error"].startswith("send failed: ") and "535" in out["error"], out
-    assert set(out) == {"error", "sent", "request_key"}
+    # ... by the mail gateway's own word, which ends what the key names too.
+    assert set(out) == {"error", "sent", "by", "request_key"} and out["by"] == "gateway", out
     assert r.smtp.mails == [] or all(b"see you Tuesday" not in m["data"] for m in r.smtp.mails)
     # The words stay, and nothing stands in the chat as sent or as failed.
     assert r.draft("b@x.org") == body["text"]
@@ -508,15 +514,12 @@ def test_a_send_polled_in_flight_then_refused_leaves_no_failed_bubble(r: Rig):
         r.smtp.refuse_login = False
     status, out = answered["out"]
     assert status == 424 and out["sent"] is False and "535" in out["error"], out
-    # The gateway put the entry away: not listed, and by id an error that
-    # was dismissed.
+    # The gateway put the entry away: a send that failed for certain is
+    # removed when it is dismissed — not listed, and by id not found.
     rid = during[0]["request_id"]
     assert r.gateway("GET", "/pending-sends?chat=d%40x.org")[1] == {"pending": []}
     status, kept = r.gateway("GET", f"/pending-sends/{rid}")
-    if status == 200:
-        assert kept["status"] == "error" and kept["dismissed"] is True, kept
-    else:
-        assert status == 404, (status, kept)
+    assert status == 404, (status, kept)
     # The words are in the composer, and nowhere else: no failed bubble on
     # this poll or a later one, none counted in the list.
     assert r.draft("d@x.org") == "Slow one"
@@ -524,6 +527,220 @@ def test_a_send_polled_in_flight_then_refused_leaves_no_failed_bubble(r: Rig):
         assert r.messages("d@x.org")["pending"] == []
     assert r.listed("d@x.org")["pending"] == 0
     assert r.wg._chat_pending(r.wg._CHAT_STATE.get(r.chat("d@x.org"))) == []
+
+
+def _chat_of(r: Rig, subject: str) -> list:
+    """The ids of the chats whose state is named ``subject``."""
+    return [chat_id for chat_id, doc in r.wg._CHAT_STATE.all().items()
+            if doc.get("name") == subject]
+
+
+def test_a_new_mail_polled_in_flight_then_refused_leaves_no_chat(r: Rig):
+    """W1/W4: the Chats page's list poll runs while a new mail's SMTP session
+    lasts and makes its chat (unsent, the send *sending*); the server then
+    refuses the mail. The gateway removes the entry (404 by id) — and the
+    chat, made of nothing but that send, goes with it: no list shows it, so
+    nothing could ever delete it, and its state would keep the subject and
+    every recipient for good."""
+    key = KEY.format(41)
+    answered: dict = {}
+    r.smtp.refuse_login = True
+    try:
+        with _SlowSmtp(r) as smtp:
+            press = threading.Thread(target=lambda: answered.update(out=r.http(
+                "POST", "/chats/compose",
+                {"channel": "email", "to": ["zed@x.org"], "subject": "Secret plan",
+                 "text": "Hello Zed", "request_key": key})))
+            press.start()
+            assert smtp.entered.wait(10)
+            # (GET /chats schedules the sync; run here directly.)
+            r.wg._sync_pending_sends()
+            (chat_id,) = _chat_of(r, "Secret plan")
+            doc = r.wg._CHAT_STATE.get(chat_id)
+            assert doc["unsent"] is True and [p["status"] for p in r.wg._chat_pending(doc)] == [
+                "sending"], doc
+            smtp.release.set()
+            press.join(30)
+    finally:
+        r.smtp.refuse_login = False
+    status, out = answered["out"]
+    assert status == 424 and out["sent"] is False and out["by"] == "gateway", out
+    assert r.entries(key) == [], "removed: a repeat is a new attempt"
+    # Forgotten at once, and nothing brings it back.
+    assert not r.wg._CHAT_STATE.exists(chat_id) and _chat_of(r, "Secret plan") == []
+    for _ in range(3):
+        r.wg._sync_pending_sends()
+    assert chat_id not in mail._chats(r.base) and not r.wg._CHAT_STATE.exists(chat_id)
+
+
+def test_a_failed_new_mail_tried_afresh_leaves_no_first_chat(r: Rig):
+    """W1, its second path: a new mail whose answer the web gateway stopped
+    waiting for, then refused — listed as failed in its chat — and sent by a
+    new attempt under the same key. The new mail has a new Message-ID, so a
+    chat of its own; the first chat's entry is gone (404), and the chat with
+    it."""
+    key = KEY.format(42)
+    new = {"channel": "email", "to": ["yan@x.org"], "subject": "Second go",
+           "text": "Hello Yan", "request_key": key}
+    saved, r.wg.MAIL_SEND_TIMEOUT = r.wg.MAIL_SEND_TIMEOUT, 0.4
+    r.smtp.refuse_login = True
+    try:
+        with _SlowSmtp(r) as smtp:
+            status, out = r.http("POST", "/chats/compose", new)
+            assert status == 202 and out["unconfirmed"] is True, out
+            first = out["id"]
+            smtp.release.set()
+            assert _wait_for(lambda: [e["status"] for e in r.entries(key)] == ["error"])
+    finally:
+        r.wg.MAIL_SEND_TIMEOUT = saved
+        r.smtp.refuse_login = False
+    pending = mail._messages(r.base, first)["pending"]
+    assert [(q["status"], q["outcome_unknown"]) for q in pending] == [("failed", False)], pending
+    status, out = r.http("POST", "/chats/compose", new)
+    assert status == 200 and out["id"] != first, out
+    for _ in range(2):
+        r.wg._sync_pending_sends()
+    assert not r.wg._CHAT_STATE.exists(first) and first not in mail._chats(r.base)
+    assert out["id"] in mail._chats(r.base)
+
+
+# ── Who said "not sent" (decision H) ─────────────────────────────────────────
+
+def test_a_press_again_the_gateway_never_heard_says_so(r: Rig):
+    """A5's server half. The first press under a key went out, its answer was
+    lost; pressed again while the mail gateway cannot be reached, the press
+    is answered "not sent" — of this request, by this side ("by":
+    "dashboard"), which says nothing of the key; asked once the gateway is
+    back, the same key is answered from the mail that went out."""
+    r.arrives("h@x.org", day=1)
+    key = KEY.format(43)
+    body = {"text": "Only once, please.", "request_key": key}
+    status, msg = r.send("h@x.org", body)
+    assert status == 200, msg
+    mails = len(r.smtp.mails)
+    real = r.wg._CHANNEL_GATEWAYS[SLUG]["base_url"]
+    r.wg._CHANNEL_GATEWAYS[SLUG]["base_url"] = "http://127.0.0.1:1"
+    try:
+        status, out = r.send("h@x.org", body)
+        assert status == 502 and out["sent"] is False and out["by"] == "dashboard", out
+        assert "could not be reached" in out["error"] and out["request_key"] == key, out
+        # A new mail asked of a gateway that never said which mailbox it
+        # serves: the same.
+        r.wg._gw_identity.clear()
+        status, out = r.http("POST", "/chats/compose", {
+            "channel": "email", "to": ["x@x.org"], "subject": "s", "text": "t",
+            "request_key": KEY.format(44)})
+        assert status in (409, 502) and out["by"] == "dashboard", out
+    finally:
+        r.wg._CHANNEL_GATEWAYS[SLUG]["base_url"] = real
+        r.wg._gw_identity.clear()
+        r.wg._pending_scan_failed.clear()
+    status, again = r.send("h@x.org", body)
+    assert status == 200 and again["id"] == msg["id"], again
+    assert len(r.smtp.mails) == mails, "the key kept: no second mail"
+
+
+def test_an_answer_cut_short_is_not_confirmed(r: Rig):
+    """W2. The mail gateway's 502 {unconfirmed} — the mail was handed to the
+    SMTP server and its answer never seen — with its last bytes lost on the
+    wire (the process stopped while it wrote its answer). A body that ended
+    before its Content-Length is no answer: "not confirmed", never "not
+    sent" with the cut text as its sentence."""
+    r.arrives("g@x.org", day=1)
+    key = KEY.format(45)
+    handler = r.gw._Handler
+    real = handler._reply
+
+    def cut(self, status, body):
+        if status != 502 or not self.path.startswith("/send"):
+            return real(self, status, body)
+        payload = json.dumps(body).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload[:-40])
+        self.close_connection = True
+    handler._reply = cut
+    r.smtp.drop, r.smtp.takes = "dot", True
+    try:
+        mails = len(r.smtp.mails)
+        status, out = r.send("g@x.org", {"text": "Cut short", "request_key": key})
+    finally:
+        handler._reply = real
+        r.smtp.drop = None
+    assert status == 202 and out["unconfirmed"] is True and "error" not in out, out
+    assert out["request_key"] == key and len(r.smtp.mails) == mails + 1
+    (entry,) = r.entries(key)
+    assert out["message_id"] == entry["message_id"], "asked of the queue, by the key"
+    pending = r.messages("g@x.org")["pending"]
+    assert [(q["status"], q["outcome_unknown"]) for q in pending] == [("failed", True)], pending
+    assert r.http("POST", f"/chats/{mail._quote(r.chat('g@x.org'))}/pending/"
+                          f"{pending[0]['request_id']}/dismiss", {})[0] == 200
+
+
+# ── A repeat clears the draft it repeats (decision I) ────────────────────────
+
+def test_a_repeat_clears_the_draft_it_repeats(r: Rig):
+    """W3. The answer to a press is lost on its way to the browser; the page
+    puts the words back into the box and autosaves them as the shared draft;
+    the user presses Send again — the same words, the same key — and is
+    answered as a repeat. The draft that holds this press's words goes, in
+    each of the three repeat answers; one written since stays."""
+    r.arrives("i@x.org", day=1)
+    words = "Thanks, see you Tuesday."
+    cid = r.chat("i@x.org")
+
+    def autosave(text):
+        # What the page posts a second after the words came back.
+        doc = r.wg._CHAT_STATE.get(cid)
+        status, out = r.http("POST", "/chats/" + mail._quote(cid) + "/draft",
+                             {"text": text, "version": int(doc.get("draft_version") or 0)})
+        assert status == 200, out
+        assert r.draft("i@x.org") == text
+
+    # Sent: answered 200 from the mail that went out.
+    key = KEY.format(46)
+    status, msg = r.send("i@x.org", {"text": words, "request_key": key})
+    assert status == 200 and r.draft("i@x.org") is None, msg
+    autosave(words)
+    mails = len(r.smtp.mails)
+    status, again = r.send("i@x.org", {"text": words, "request_key": key})
+    assert status == 200 and again["id"] == msg["id"] and len(r.smtp.mails) == mails, again
+    assert r.draft("i@x.org") is None, "the sent mail is not left as the draft"
+    # ... and a draft of other words, written since, stays.
+    autosave("Something else")
+    assert r.send("i@x.org", {"text": words, "request_key": key})[0] == 200
+    assert r.draft("i@x.org") == "Something else"
+    r.wg._CHAT_STATE.clear_draft(cid)
+    # Queued: answered 202 {pending} from the send that waits.
+    r.policy("verify")
+    try:
+        key = KEY.format(47)
+        status, out = r.send("i@x.org", {"text": "Queued words", "request_key": key})
+        assert status == 202 and out["pending"]["status"] == "pending", out
+        autosave("Queued words")
+        status, again = r.send("i@x.org", {"text": "Queued words", "request_key": key})
+        assert status == 202 and again["pending"]["request_id"] == out["pending"]["request_id"]
+        assert r.draft("i@x.org") is None, "the queued mail is not left as the draft"
+        r.gateway("POST", f"/pending-sends/{out['pending']['request_id']}/retract")
+    finally:
+        r.policy("trust")
+    # Not confirmed: answered 202 {unconfirmed} from the send nobody knows of.
+    key = KEY.format(48)
+    r.smtp.drop, r.smtp.takes = "dot", True
+    try:
+        status, out = r.send("i@x.org", {"text": "Lost words", "request_key": key})
+    finally:
+        r.smtp.drop = None
+    assert status == 202 and out["unconfirmed"] is True, out
+    autosave("Lost words")
+    status, again = r.send("i@x.org", {"text": "Lost words", "request_key": key})
+    assert status == 202 and again["unconfirmed"] is True, again
+    assert r.draft("i@x.org") is None, "the mail that may be out is not left as the draft"
+    (entry,) = r.entries(key)
+    assert r.http("POST", f"/chats/{mail._quote(cid)}/pending/{entry['id']}/dismiss",
+                  {})[0] == 200
 
 
 def test_an_allowed_mail_whose_answer_was_lost_is_not_worded_as_failed(r: Rig):

@@ -150,8 +150,11 @@ def _gateway_state(account: str) -> dict:
             # certain is tried afresh — both as scripts/mail-gateway.py
             # does. False is a gateway built before it did either: a repeat
             # is answered like a first answer, and a failed key answers
-            # "send failed" for good.
-            "says_repeat": True, "retries_failed": True,
+            # "send failed" for good. And whether a 5xx that nothing was
+            # sent says so in a field of its own ("sent": false): False is
+            # a gateway built before it did, whose 502 "send failed" reads
+            # as its 502 "not confirmed" does.
+            "says_repeat": True, "retries_failed": True, "says_not_sent": True,
             # The states GET /pending-sends lists: what is not over (decision
             # C). ("pending",) is a gateway that lists only what waits.
             # `lists_dismissed`: a gateway whose list still names a failed
@@ -213,15 +216,23 @@ def _listed(gw: dict, chat: str | None = None) -> list:
 
 
 def _dismiss_entry(gw: dict, request_id: str) -> dict:
-    """Sends.dismiss: the entry of a send that named its request stays,
-    marked, for as long as the key is remembered — not listed, and still
-    answered by id; any other is removed."""
+    """Sends.dismiss: the entry of a send of unknown outcome that named its
+    request stays, marked, for as long as the key is remembered — not
+    listed, and still answered by id; any other is removed — one that
+    failed for certain also where it named a key (asked by id: 404)."""
     entry = gw["pending"][request_id]
-    if entry.get("request_key"):
+    # (A gateway built before it tried a failed key afresh kept them all.)
+    if entry.get("request_key") and (entry.get("outcome_unknown") is not False
+                                     or not gw["retries_failed"]):
         entry["dismissed"] = True
     else:
         del gw["pending"][request_id]
     return {**entry, "dismissed": True}
+
+
+def _not_sent(gw: dict) -> dict:
+    """What the gateway adds to a 5xx that nothing was sent."""
+    return {"sent": False} if gw["says_not_sent"] else {}
 
 
 def _deliver(gw: dict, m: dict) -> float:
@@ -301,7 +312,7 @@ def _send_answer(gw: dict, entry: dict, repeat: bool = False) -> tuple[int, dict
         return 502, {"error": f"send not confirmed: {entry['error']}", "unconfirmed": True,
                      "outcome_unknown": True, "request_id": entry["id"], **ids, **said}
     if status == "error":
-        return 502, {"error": f"send failed: {entry['error']}"}
+        return 502, {"error": f"send failed: {entry['error']}", **_not_sent(gw)}
     return 409, {"error": f"this send was {status} before it went out; nothing was sent",
                  "status": status, "request_id": entry["id"], **ids}
 
@@ -314,8 +325,6 @@ def _gw_send(gw: dict, payload: dict, caller_waits=None) -> tuple[int, dict]:
     sends nothing. A key whose send failed for certain — nothing left the
     gateway — is no earlier send: that entry is removed and the mail is
     composed and sent afresh."""
-    if gw["smtp"]:
-        return 503, {"error": gw["smtp"]}
     key = payload.get("request_key")
     press = _press_digest(payload) if key else None
     earlier = _by_key(gw, key) if key else None
@@ -328,6 +337,10 @@ def _gw_send(gw: dict, payload: dict, caller_waits=None) -> tuple[int, dict]:
             return 409, {"error": "this request_key was already used for another mail; "
                                   "nothing was sent — a key names one press of Send"}
         return _send_answer(gw, earlier, repeat=True)
+    # (Said only once nothing stands under the key: never over a mail that
+    # may be out.)
+    if gw["smtp"]:
+        return 503, {"error": gw["smtp"], **_not_sent(gw)}
     return _gw_send_once(gw, payload, press, caller_waits)
 
 
@@ -377,8 +390,8 @@ def _gw_send_once(gw: dict, payload: dict, press: str | None = None,
     if final["status"] == "error" and not final.get("outcome_unknown") \
             and (caller_waits is None or caller_waits()):
         # Failed for certain, and whoever asked has that as the answer: the
-        # send is over. Its entry is dismissed — which keeps it, marked,
-        # when the request named a key.
+        # send is over. Its entry is dismissed — which removes it, also
+        # where the request named a key (a repeat is a new attempt).
         _dismiss_entry(gw, rid)
     return _send_answer(gw, final)
 
@@ -429,7 +442,7 @@ def _mail_gateway(gw: dict):
                 self._json(401, {"error": "unauthorized"})
                 return False
             if gw["down"]:
-                self._json(503, {"error": "mailbox unreachable"})
+                self._json(503, {"error": "mailbox unreachable", **_not_sent(gw)})
                 return False
             return True
 
@@ -466,7 +479,8 @@ def _mail_gateway(gw: dict):
             m = _PENDING_RE.match(path)
             if m and not m.group(2):
                 # By id, every entry the gateway still holds answers — a
-                # dismissed one too ({status: "error", dismissed: true}).
+                # dismissed one of unknown outcome too ({status: "error",
+                # dismissed: true}); a removed one is 404.
                 entry = gw["pending"].get(m.group(1))
                 return self._json(200 if entry else 404,
                                   _public(entry) if entry else {"error": "not found"})
@@ -773,13 +787,15 @@ def test_can_send_states(base, wg):
         # own sentence, not as an outage to retry.
         wg._CHAT_STATE.set_draft(CHAT_A, "hello?", author="user")
         status, out = _send(base, CHAT_A, {"text": "hello?", "request_key": "k-smtp"})
-        # ... and as not sent: the press is over, and its key with it.
-        assert (status, out) == (503, {"error": SMTP_PROBLEM, "sent": False,
+        # ... and as not sent, by the gateway's own word: the press is
+        # over, and its key with it.
+        assert (status, out) == (503, {"error": SMTP_PROBLEM, "sent": False, "by": "gateway",
                                        "request_key": "k-smtp"}), out
         assert wg._CHAT_STATE.get(CHAT_A)["draft"]["text"] == "hello?", "the words stay"
         status, out = _http(base, "POST", "/chats/compose", {
             "channel": "email", "to": [ANN], "subject": "s", "text": "t"})
         assert status == 503 and out["error"] == SMTP_PROBLEM and out["sent"] is False, out
+        assert out["by"] == "gateway", out
         # A reason is one line, whatever a gateway puts into it.
         GW["smtp"] = "no\r\nserver\x00 " + "x" * 400
         wg._gw_identity.clear()
@@ -853,11 +869,15 @@ def test_reply_is_sent(base, wg):
     # `reply` is one of two words, and optional.
     status, out = _send(base, CHAT_B, {"text": "x", "reply": "everyone"})
     assert status == 400 and "reply" in out["error"], out
+    # (A refusal of this side's own, made before the gateway was asked: it
+    # says so — decision H.)
+    assert out["by"] == "dashboard", out
     # A key is a short printable token; one that is not is refused, not
     # passed on. A press without one (a script, an old page) gets one here.
     for bad in ("", "a b", "x" * 65, 7, "k\u00e9y", "line\nbreak"):
         status, out = _send(base, CHAT_B, {"text": "x", "request_key": bad})
         assert status == 400 and "request_key" in out["error"], (bad, out)
+        assert out["by"] == "dashboard", out
     assert len(_posts(GW, "/send")) == 1
     GW["policy"] = "allow"
     status, msg = _send(base, CHAT_B, {"text": "And a salad."})
@@ -866,7 +886,7 @@ def test_reply_is_sent(base, wg):
     assert GW["sent"][-1]["to"] == [BOB] and GW["sent"][-1]["cc"] == [CAT], "the default is all"
     _settle(wg)      # the reply's hook, before the gateway is made to fail below
     status, out = _send(base, CHAT_B, {"text": "   "})
-    assert status == 400 and out["error"] == "empty text"
+    assert (status, out) == (400, {"error": "empty text", "by": "dashboard"}), out
     # What the gateway refuses is passed on as its refusal, in its words —
     # a thread with no mail left to reply to is no outage — and the draft
     # stays in the composer.
@@ -875,7 +895,8 @@ def test_reply_is_sent(base, wg):
         wg._CHAT_STATE.set_draft(CHAT_B, "too late", author="user")
         status, out = _send(base, CHAT_B, {"text": "too late", "request_key": "late"})
         assert (status, out) == (409, {"error": "this thread has no mail left to reply to",
-                                       "sent": False, "request_key": "late"}), out
+                                       "sent": False, "by": "gateway",
+                                       "request_key": "late"}), out
         assert wg._CHAT_STATE.get(CHAT_B)["draft"]["text"] == "too late"
     finally:
         del THREADS[ROOT_B]["dead"]
@@ -886,7 +907,7 @@ def test_reply_is_sent(base, wg):
     try:
         status, out = _send(base, CHAT_B, {"text": "anyone?"})
         assert status == 503 and out["error"] == "mailbox unreachable", out
-        assert out["sent"] is False
+        assert out["sent"] is False and out["by"] == "gateway"
     finally:
         GW["down"] = False
         wg._gw_identity.clear()
@@ -962,6 +983,13 @@ def test_messenger_press_still_releases(base, wg):
     _settle(wg)
     hooks = [p for m, p, _b in SIG["requests"] if m == "POST" and p.startswith("/chats/")]
     assert hooks == ["/chats/read"], "known to have no mailbox"
+    # A messenger's refusals are as they were, byte for byte: "by" is a
+    # mail send's (decision H).
+    assert _send(base, CHAT_S, {"text": "  "}) == (400, {"error": "empty text"})
+    assert _send(base, CHAT_S, {"text": "x", "images": "x"}) == (
+        400, {"error": "'images' must be a list"})
+    assert _send(base, CHAT_S, {"text": "x"}, {"Sec-Fetch-Site": "cross-site"}) == (
+        403, {"error": "cross-site request rejected"})
     print("PASS test_messenger_press_still_releases")
 
 
@@ -1277,14 +1305,20 @@ def test_compose(base, wg):
             ({**good, "account": ""}, "account")):
         status, out = _compose(base, bad)
         assert status == 400 and word in out["error"], (bad, out)
+        # (Each this side's own word, not the gateway's: decision H.)
+        assert out["by"] == "dashboard", (bad, out)
     status, out = _compose(base, {**good, "account": "nobody@example.org"})
     assert status == 409 and "no mail gateway serves" in out["error"], out
+    assert out["by"] == "dashboard", out
     status, out = _compose(base, good, {"Sec-Fetch-Site": "cross-site"})
-    assert status == 403 and out["error"] == "cross-site request rejected"
+    assert (status, out) == (403, {"error": "cross-site request rejected", "by": "dashboard"})
+    status, out = _compose(base, {**good, "images": "x"})
+    assert (status, out) == (400, {"error": "'images' must be a list", "by": "dashboard"}), out
     assert _posts(GW) == [], "nothing of it reached the gateway"
     # What the gateway refuses is the user's to correct: its word, as a 400.
     status, out = _compose(base, {**good, "to": ["not-an-address"]})
     assert status == 400 and out["error"] == "not an address: not-an-address", out
+    assert out["sent"] is False and out["by"] == "gateway", out
     # A gateway that says it cannot take the mail took nothing: an error,
     # in its sentence, and no chat appears.
     GW["down"] = True
@@ -1292,6 +1326,7 @@ def test_compose(base, wg):
         known = set(_chats(base))
         status, out = _compose(base, good)
         assert status == 503 and out["error"] == "mailbox unreachable", out
+        assert out["by"] == "gateway", out
         assert set(_chats(base)) == known
     finally:
         GW["down"] = False
@@ -1826,47 +1861,71 @@ def _dismiss(base, chat_id, rid, headers=None):
 
 def test_mail_send_outcomes(wg):
     """What each ending of the hop to /send proves (_mail_send): "failed"
-    only where nothing left, "unconfirmed" for everything that cannot say."""
+    only where nothing left, "unconfirmed" for everything that cannot say —
+    and of a failure, who said so (decision H)."""
     gw = {"base_url": "http://unused", "token": ""}
     real = wg._gateway_hop
     try:
-        for answer, outcome, status in (
-                ((200, {"status": "sent", "message_id": "m@x"}), "sent", None),
-                ((202, {"status": "pending_approval", "request_id": "r"}), "pending", None),
+        for answer, outcome, status, by in (
+                ((200, {"status": "sent", "message_id": "m@x"}), "sent", None, None),
+                ((202, {"status": "pending_approval", "request_id": "r"}), "pending", None, None),
                 # The gateway's own "handed over, answer not seen" ...
                 ((502, {"error": UNCONFIRMED, "unconfirmed": True, "message_id": "m@x",
-                        "chat": "c@x"}), "unconfirmed", None),
+                        "chat": "c@x"}), "unconfirmed", None, None),
                 # ... and its "nobody will ever know".
                 ((502, {"error": "send failed: " + UNKNOWN_OUTCOME,
-                        "outcome_unknown": True}), "unconfirmed", None),
+                        "outcome_unknown": True}), "unconfirmed", None, None),
+                # (Either of them wins over a "sent": false beside it.)
+                ((502, {"error": UNCONFIRMED, "unconfirmed": True, "sent": False}),
+                 "unconfirmed", None, None),
                 # ... also for a repeat of a queued send the user has
                 # allowed, asked while it is being sent.
                 ((202, {"status": "sending", "request_id": "r", "message_id": "m@x",
-                        "chat": "c@x", "repeat": True}), "unconfirmed", None),
-                # Its own refusals: nothing left. Taken and not sent — the
-                # SMTP server's no, a refusal nobody could act on — is 424;
-                # what the user can read keeps its status.
-                ((502, {"error": "send failed: 535 authentication failed"}), "failed", 424),
-                ((503, {"error": "could not queue the send; retry later"}), "failed", 503),
-                ((400, {"error": "no recipients"}), "failed", 400),
-                ((409, {"error": "no mail left to reply to"}), "failed", 409),
-                ((413, {"error": "too large"}), "failed", 413),
-                ((404, dict(NOT_OURS)), "failed", 424),
-                ((401, {"error": "unauthorized"}), "failed", 424),
+                        "chat": "c@x", "repeat": True}), "unconfirmed", None, None),
+                # Its own refusals: nothing left, by its own word — on a 5xx
+                # only with "sent": false. Taken and not sent — the SMTP
+                # server's no — is 424; what the user can read keeps its
+                # status.
+                ((502, {"error": "send failed: 535 authentication failed", "sent": False}),
+                 "failed", 424, "gateway"),
+                ((503, {"error": "could not queue the send; retry later", "sent": False}),
+                 "failed", 503, "gateway"),
+                ((500, {"error": "send failed: boom", "sent": False}), "failed", 424, "gateway"),
+                ((400, {"error": "no recipients"}), "failed", 400, "gateway"),
+                ((409, {"error": "no mail left to reply to"}), "failed", 409, "gateway"),
+                ((413, {"error": "too large"}), "failed", 413, "gateway"),
+                # A status it answers before it reads a send — or that stands
+                # in front of it: this request was not made, and nothing is
+                # said of the key.
+                ((404, dict(NOT_OURS)), "failed", 502, "dashboard"),
+                ((401, {"error": "unauthorized"}), "failed", 502, "dashboard"),
+                ((429, {}), "failed", 502, "dashboard"),
+                # A 5xx without the word proves nothing (W2): an older
+                # gateway's "send failed", a body that was no JSON, a 503
+                # that does not say it.
+                ((502, {"error": "send failed: 535 authentication failed"}),
+                 "unconfirmed", None, None),
+                ((503, {"error": "could not queue the send; retry later"}),
+                 "unconfirmed", None, None),
+                ((502, {"error": '{"error": "the mail server has not confirmed this mail; it '
+                                 'is not known yet whet'}), "unconfirmed", None, None),
+                ((502, {"error": "send failed", "sent": "false"}), "unconfirmed", None, None),
                 # Answers nobody planned for prove nothing.
-                ((500, {"error": "boom"}), "unconfirmed", None),
-                ((504, {"error": "<html>gateway timeout</html>"}), "unconfirmed", None),
-                ((502, {}), "unconfirmed", None),
-                ((200, {"status": "weird"}), "unconfirmed", None),
-                ((200, ["not", "an", "object"]), "unconfirmed", None)):
+                ((500, {"error": "boom"}), "unconfirmed", None, None),
+                ((504, {"error": "<html>gateway timeout</html>"}), "unconfirmed", None, None),
+                ((502, {}), "unconfirmed", None, None),
+                ((200, {"status": "weird"}), "unconfirmed", None, None),
+                ((200, ["not", "an", "object"]), "unconfirmed", None, None)):
             wg._gateway_hop = lambda *a, _answer=answer, **k: _answer
             got = wg._mail_send(gw, {"message": "x"})
             assert got["outcome"] == outcome, (answer, got)
             if outcome == "failed":
                 assert got["status"] == status and got["error"], (answer, got)
-                assert got["said"] is True, "the gateway itself said so"
+                assert got["by"] == by, (answer, got)
                 assert wg._mail_not_sent(got, "k") == {
-                    "error": got["error"], "sent": False, "request_key": "k"}
+                    "error": got["error"], "sent": False, "by": by, "request_key": "k"}
+                if by == "dashboard":
+                    assert "nothing was sent" in got["error"], got
             else:
                 # The gateway's word that it answered from an earlier send.
                 said = isinstance(answer[1], dict) and answer[1].get("repeat") is True
@@ -1891,7 +1950,7 @@ def test_mail_send_outcomes(wg):
             assert got["outcome"] == outcome, (exc, got)
             if outcome == "failed":
                 assert got["status"] == 502 and "nothing was sent" in got["error"]
-                assert got["said"] is False, "never reached: the gateway said nothing"
+                assert got["by"] == "dashboard", "never reached: the gateway said nothing"
         for flagged in ((200, {"status": "sent", "repeat": True}),
                         (202, {"status": "pending_approval", "repeat": True}),
                         (502, {"error": UNCONFIRMED, "unconfirmed": True, "repeat": True})):
@@ -2158,6 +2217,67 @@ class _Garbage(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
 
+class _Cut(BaseHTTPRequestHandler):
+    """A peer whose error answer ends before its Content-Length: the mail
+    gateway's 502 {unconfirmed}, the process stopped while it wrote it."""
+
+    BODY = json.dumps({"error": UNCONFIRMED, "unconfirmed": True, "request_id": "0" * 32,
+                       "message_id": "179552097446.24218.4651558977627668699@example.org",
+                       "chat": ROOT_A}).encode("utf-8")
+    cut = 40
+
+    def log_message(self, fmt, *args):
+        pass
+
+    def do_POST(self):
+        self.rfile.read(int(self.headers.get("Content-Length", 0) or 0))
+        self.send_response(502)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(self.BODY)))
+        self.end_headers()
+        self.wfile.write(self.BODY[:len(self.BODY) - self.cut])
+        self.close_connection = True
+
+
+def test_an_answer_cut_short_is_no_answer(base, wg):
+    """W2. http.client's read(amount) hands back a body that ended before its
+    Content-Length without raising. Taken as it came, the gateway's "it may
+    have gone out" was no JSON, became {"error": <the cut text>} — and a 502
+    with a sentence read as "not sent". The hop says it is no answer, and
+    the send is not confirmed."""
+    cut = mail._serve(_Cut)
+    gw = {"base_url": f"http://127.0.0.1:{cut.server_address[1]}", "token": ""}
+    try:
+        try:
+            wg._gateway_hop(gw, "/send", {"message": "x"})
+            raise AssertionError("a cut body was taken for an answer")
+        except http.client.IncompleteRead:
+            pass
+        got = wg._mail_send(gw, {"message": "x"})
+        assert got["outcome"] == "unconfirmed", got
+        # The whole body is read as before.
+        _Cut.cut = 0
+        code, parsed = wg._gateway_hop(gw, "/send", {"message": "x"})
+        assert code == 502 and parsed["unconfirmed"] is True and parsed["chat"] == ROOT_A
+        got = wg._mail_send(gw, {"message": "x"})
+        assert got["outcome"] == "unconfirmed" and got["message_id"], got
+        # And through the handler, to the browser: not confirmed, never 424.
+        _Cut.cut = 40
+        real = wg._CHANNEL_GATEWAYS[MAIL_SLUG]
+        wg._CHANNEL_GATEWAYS[MAIL_SLUG] = dict(real, base_url=gw["base_url"])
+        try:
+            status, out = _send(base, CHAT_A, {"text": "Cut short", "request_key": "press-cut"})
+        finally:
+            wg._CHANNEL_GATEWAYS[MAIL_SLUG] = real
+            wg._pending_scan_failed.clear()
+        assert status == 202 and out["unconfirmed"] is True and "error" not in out, out
+    finally:
+        _Cut.cut = 40
+        cut.shutdown()
+    _settle(wg)
+    print("PASS test_an_answer_cut_short_is_no_answer")
+
+
 def test_long_answers_of_the_gateway_are_read_whole(base, wg):
     """A gateway's error answer is fields this side reads, and with two real
     Message-IDs in it the "it may have gone out" answer is longer than 500
@@ -2233,7 +2353,7 @@ def test_a_send_that_certainly_failed_ends_its_press(base, wg):
             sent_before = len(GW["sent"])
             wg._CHAT_STATE.set_draft(CHAT_A, body["text"], author="user")
             status, out = _send(base, CHAT_A, body)
-            assert (status, out) == (424, {"error": refusal, "sent": False,
+            assert (status, out) == (424, {"error": refusal, "sent": False, "by": "gateway",
                                            "request_key": key}), out
             assert wg._CHAT_STATE.get(CHAT_A)["draft"]["text"] == body["text"], "the words stay"
             assert _messages(base, CHAT_A)["pending"] == [] and len(GW["sent"]) == sent_before
@@ -2252,13 +2372,32 @@ def test_a_send_that_certainly_failed_ends_its_press(base, wg):
                 # is still "not sent, and this press is over": the page
                 # drops the key, and the next press, a new one, goes.
                 assert (status, again) == (424, {"error": refusal, "sent": False,
-                                                 "request_key": key}), again
+                                                 "by": "gateway", "request_key": key}), again
                 assert len(GW["sent"]) == sent_before
                 status, again = _send(base, CHAT_A, {**body, "request_key": key + "-next"})
                 assert status == 200 and len(GW["sent"]) == sent_before + 1, again
             assert wg._CHAT_STATE.get(CHAT_A)["draft"] is None
             _settle(wg)
         GW["retries_failed"] = True
+        # A gateway that does not say "sent": false on its 502 (an older
+        # build): that 502 is its "not confirmed" too, and is never told
+        # apart by its wording (W2) — not confirmed, and the key kept, which
+        # is harmless: the same press once the server is back is a new
+        # attempt, and one mail goes.
+        GW["says_not_sent"] = False
+        try:
+            GW["send"] = "refused"
+            sent_before = len(GW["sent"])
+            status, out = _send(base, CHAT_A, {"text": "Older gateway", "request_key": "press-o"})
+            assert status == 202 and out["unconfirmed"] is True and "error" not in out, out
+            assert out["note"] == refusal and len(GW["sent"]) == sent_before, out
+            GW["send"] = "ok"
+            status, again = _send(base, CHAT_A, {"text": "Older gateway",
+                                                 "request_key": "press-o"})
+            assert status == 200 and len(GW["sent"]) == sent_before + 1, again
+        finally:
+            GW["says_not_sent"] = True
+        _settle(wg)
         # A new mail: the same answer, and no chat appears for it.
         new = {"channel": "email", "to": [DORA], "subject": "Hello", "text": "New mail",
                "request_key": "compose-f1"}
@@ -2266,7 +2405,7 @@ def test_a_send_that_certainly_failed_ends_its_press(base, wg):
         known = set(_chats(base))
         sent_before = len(GW["sent"])
         status, out = _compose(base, new)
-        assert (status, out) == (424, {"error": refusal, "sent": False,
+        assert (status, out) == (424, {"error": refusal, "sent": False, "by": "gateway",
                                        "request_key": "compose-f1"}), out
         assert set(_chats(base)) == known and len(GW["sent"]) == sent_before
         GW["send"] = "ok"
@@ -2350,6 +2489,13 @@ def test_a_repeat_is_not_a_reply(base, wg):
             _settle(wg)
             assert stands() == before, (case, stands(), before)
             assert _posts(GW, "/chats/read") == [], (case, _scopes(GW, "/chats/read"))
+            # The same press once more, its words back in the draft: that
+            # draft is the mail that went out, and goes (decision I) — and
+            # still nothing else.
+            wg._CHAT_STATE.set_draft(CHAT_A, "My reply", author="user")
+            status, msg = _send(base, CHAT_A, {"text": "My reply", "request_key": key})
+            assert status == 200 and msg["id"] == sent["message_id"], (case, msg)
+            assert stands() == {**before, "draft": None}, (case, stands(), before)
             wg._CHAT_STATE.clear_draft(CHAT_A)
             assert _mark(base, CHAT_A)[0] == 200
             _settle(wg)
@@ -2368,6 +2514,11 @@ def test_a_repeat_is_not_a_reply(base, wg):
             status, again = _send(base, CHAT_A, {"text": "Out of the box", "request_key": key})
             assert status == 202 and again["message_id"] == out["message_id"], again
             assert wg._CHAT_STATE.get(CHAT_A)["draft"]["text"] == "typed since", says
+            # ... while a draft that holds this press's words — the page put
+            # them back when the answer was lost — goes (decision I).
+            wg._CHAT_STATE.set_draft(CHAT_A, " Out of the box ", author="user")
+            status, again = _send(base, CHAT_A, {"text": "Out of the box", "request_key": key})
+            assert status == 202 and wg._CHAT_STATE.get(CHAT_A)["draft"] is None, says
             assert [q["request_id"] for q in _queued(wg, CHAT_A)] == [rid]
             GW["send"] = "ok"
             _sent_folder_says(GW, rid, True)
@@ -2389,6 +2540,9 @@ def test_a_repeat_is_not_a_reply(base, wg):
             status, again = _send(base, CHAT_A, {"text": "For approval", "request_key": key})
             assert status == 202 and again["pending"] == out["pending"], again
             assert wg._CHAT_STATE.get(CHAT_A)["draft"]["text"] == "typed since", says
+            wg._CHAT_STATE.set_draft(CHAT_A, "For approval", author="user")
+            status, again = _send(base, CHAT_A, {"text": "For approval", "request_key": key})
+            assert status == 202 and wg._CHAT_STATE.get(CHAT_A)["draft"] is None, says
             assert len(_queued(wg, CHAT_A)) == 1
             GW["pending"][out["pending"]["request_id"]]["status"] = "retracted"
             assert _messages(base, CHAT_A)["pending"] == []
@@ -2448,10 +2602,15 @@ def test_a_repeat_is_not_a_reply(base, wg):
 
 
 def test_a_dismissed_entry_is_over(base, wg):
-    """Decision G. The gateway keeps the entry of a keyed send that failed
-    for certain — dismissed: not listed, still answered by id as {status:
-    "error", dismissed: true}. That is an ended send, not a failed bubble."""
+    """Decision G. A send that failed for certain is removed when it is
+    dismissed — by the gateway itself, where its caller has the failure as
+    the answer — and asked by id answers 404 ("gone"); a keyed send of
+    unknown outcome is kept, dismissed: not listed, still answered by id as
+    {status: "error", dismissed: true}. Either is an ended send, not a
+    failed bubble — and a chat made of nothing but it goes with it."""
     GW["policy"] = "trust"
+    gw_url = wg._CHANNEL_GATEWAYS[MAIL_SLUG]["base_url"]
+    gw_auth = {"Authorization": "Bearer mail-secret"}
     try:
         # A reply slow enough for the page's poll to list it as being sent;
         # then the SMTP server refuses it.
@@ -2466,11 +2625,10 @@ def test_a_dismissed_entry_is_over(base, wg):
         poll.join()
         assert [(q["status"], q["text"]) for q in polled[0]] == [
             ("sending", "Big attachment reply")], polled
-        assert status == 424 and out["sent"] is False, out
-        rid, entry = _entry_of(GW, "press-d1")
-        assert (entry["status"], entry["dismissed"]) == ("error", True)
-        assert _http(wg._CHANNEL_GATEWAYS[MAIL_SLUG]["base_url"], "GET", f"/pending-sends/{rid}",
-                     None, {"Authorization": "Bearer mail-secret"})[1]["dismissed"] is True
+        assert status == 424 and out["sent"] is False and out["by"] == "gateway", out
+        rid = polled[0][0]["request_id"]
+        assert [e for e in GW["pending"].values() if e.get("request_key") == "press-d1"] == []
+        assert _http(gw_url, "GET", f"/pending-sends/{rid}", None, gw_auth)[0] == 404
         # The words are back in the composer — and no failed bubble holds
         # them a second time, now or on any later poll, in the page or the list.
         assert wg._CHAT_STATE.get(CHAT_A)["draft"]["text"] == "Big attachment reply"
@@ -2481,13 +2639,27 @@ def test_a_dismissed_entry_is_over(base, wg):
         # A copy written after the fact (a queue answer fetched before the
         # gateway put the entry away, a dismissal that raced a poll) does
         # not stand either: asked after by id, the entry is over.
-        stale = wg._pending_from_entry(MAIL_SLUG, {**_public(entry), "status": "sending",
-                                                   "dismissed": False})
-        wg._CHAT_STATE.add_pending(CHAT_A, dict(stale, noted=time.time() - 60))
+        stale = dict(polled[0][0], noted=time.time() - 60)
+        wg._CHAT_STATE.add_pending(CHAT_A, stale)
         assert len(_queued(wg, CHAT_A)) == 1
         assert _messages(base, CHAT_A)["pending"] == [] and _queued(wg, CHAT_A) == []
         assert wg._pending_ended(MAIL_SLUG, wg._CHANNEL_GATEWAYS[MAIL_SLUG], CHAT_A,
+                                 stale) == (None, "gone")
+        # A send of unknown outcome, dismissed by the user: kept, and over.
+        GW["send"], GW["send_slow"] = "unknown", 0.0
+        status, out = _send(base, CHAT_A, {"text": "Lost one", "request_key": "press-d2"})
+        assert status == 202 and out["unconfirmed"] is True, out
+        rid, entry = _entry_of(GW, "press-d2")
+        assert _dismiss(base, CHAT_A, rid)[0] == 200
+        assert (entry["status"], entry["dismissed"]) == ("error", True)
+        assert _http(gw_url, "GET", f"/pending-sends/{rid}", None, gw_auth)[1]["dismissed"] is True
+        stale = wg._pending_from_entry(MAIL_SLUG, {**_public(entry), "status": "sending",
+                                                   "dismissed": False})
+        wg._CHAT_STATE.add_pending(CHAT_A, dict(stale, noted=time.time() - 60))
+        assert _messages(base, CHAT_A)["pending"] == [] and _queued(wg, CHAT_A) == []
+        assert wg._pending_ended(MAIL_SLUG, wg._CHANNEL_GATEWAYS[MAIL_SLUG], CHAT_A,
                                  stale) == (None, "dismissed")
+        GW["send"], GW["send_slow"] = "refused", 0.6
         # Nor on a list that still names the entry: dismissed is over to
         # every reader of it.
         GW["lists_dismissed"] = True
@@ -2504,21 +2676,38 @@ def test_a_dismissed_entry_is_over(base, wg):
         # A new mail, the same way: the list's sync makes a chat of the send
         # under way — and forgets it with the send, instead of keeping a
         # chat "<subject> — failed" of a mail the compose sheet still holds.
+        # (W1/W4: the gateway removes that send, and a chat made of nothing
+        # but it is forgotten with the answer — no list would show it again,
+        # and its state would keep the subject and the recipients for good.)
         known = set(_chats(base))
         synced: list = []
-        sync = threading.Thread(target=lambda: (
-            time.sleep(0.25), synced.append(wg._sync_pending_sends())))
-        sync.start()
+
+        def sync():
+            time.sleep(0.25)
+            synced.append(wg._sync_pending_sends())
+            synced.extend(cid for cid, doc in wg._CHAT_STATE.all().items()
+                          if doc.get("name") == "Phantom")
+        syncing = threading.Thread(target=sync)
+        syncing.start()
         status, out = _compose(base, {"channel": "email", "to": [DORA], "subject": "Phantom",
                                       "text": "Never sent", "request_key": "compose-d1"})
-        sync.join()
-        assert status == 424 and out["sent"] is False, out
-        rid, entry = _entry_of(GW, "compose-d1")
-        phantom = cs.make_chat_id("email", entry["chat"], ACCOUNT)
-        assert synced == [1] and wg._CHAT_STATE.exists(phantom), "listed while it was sent"
-        wg._sync_pending_sends()
+        syncing.join()
+        assert status == 424 and out["sent"] is False and out["by"] == "gateway", out
+        assert len(synced) == 2 and synced[0] == 1, ("listed while it was sent", synced)
+        phantom = synced[1]
+        assert [e for e in GW["pending"].values() if e.get("request_key") == "compose-d1"] == []
         assert not wg._CHAT_STATE.exists(phantom) and set(_chats(base)) == known
-        assert wg._sync_pending_sends() == 0
+        assert wg._sync_pending_sends() == 0 and not wg._CHAT_STATE.exists(phantom)
+        # ... and one the list's sync is first to find gone (the press was
+        # answered elsewhere, or before this side knew of the chat): the same.
+        wg._CHAT_STATE.note_message(phantom, name="Phantom", unsent=True, gateway=MAIL_SLUG,
+                                    participants=[{"address": DORA, "name": None}])
+        gone = "f" * 32
+        wg._CHAT_STATE.add_pending(phantom, dict(stale, request_id=gone, noted=time.time() - 60,
+                                                 approval_url=f"/sends/{MAIL_SLUG}/{gone}"))
+        assert [p["request_id"] for p in _queued(wg, phantom)] == [gone]
+        wg._sync_pending_sends()
+        assert not wg._CHAT_STATE.exists(phantom)
     finally:
         GW["send"], GW["send_slow"] = "ok", 0.0
     print("PASS test_a_dismissed_entry_is_over")
@@ -2561,7 +2750,12 @@ def test_an_unknown_outcome_is_never_worded_as_failed(base, wg):
                                         "out, so do not send it again unchecked: the mail "
                                         "server was handed this mail"), shown
                 assert "could not deliver" not in shown and 'data-unknown="1"' in page
-                assert '<div class="cross" title="outcome not known">?</div>' in page
+                # ... in a neutral disc: the cross is the mark of a send that
+                # did not go.
+                assert ('<div class="unsure" role="img" aria-label="not confirmed" '
+                        'title="outcome not known">?</div>') in page
+                assert '<div class="cross"' not in page.split('id="st-icon"')[1][:200]
+                assert ".unsure{border:2px solid var(--muted)" in page
                 # What it polls: says so, and gives the page its sentence.
                 assert polled["outcome_unknown"] is True and polled["error"] == UNKNOWN_OUTCOME
                 assert html.unescape(shown) == polled["note"], (shown, polled["note"])
@@ -2693,9 +2887,9 @@ def test_an_allowed_send_that_fails_stays_in_its_chat(base, wg):
     status, out = _dismiss(base, CHAT_A, rid)
     assert status == 200 and out["id"] == CHAT_A and out["dismissed"] == rid, out
     assert [q["request_id"] for q in out["pending"]] == [wid]
-    # (The gateway keeps the entry of a keyed send, marked; it lists it no more.)
+    # (The gateway removes a send that failed for certain; it lists it no more.)
     assert _posts(GW) == [(f"/pending-sends/{rid}/dismiss", {})]
-    assert GW["pending"][rid]["dismissed"] is True and rid not in [e["id"] for e in _listed(GW)]
+    assert rid not in GW["pending"] and rid not in [e["id"] for e in _listed(GW)]
     assert [q["request_id"] for q in _messages(base, CHAT_A)["pending"]] == [wid]
     assert wg._CHAT_STATE.exists(CHAT_A), "a thread of mails is not forgotten with a send"
     # Dismissed twice (a second tab): already gone, and said as done.
@@ -3266,6 +3460,7 @@ def main():
         test_a_reply_that_may_have_gone_out(base, wg)
         test_a_new_mail_that_may_have_gone_out(base, wg)
         test_long_answers_of_the_gateway_are_read_whole(base, wg)
+        test_an_answer_cut_short_is_no_answer(base, wg)
         test_a_send_that_certainly_failed_ends_its_press(base, wg)
         test_a_repeat_is_not_a_reply(base, wg)
         test_a_dismissed_entry_is_over(base, wg)

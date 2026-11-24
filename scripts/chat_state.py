@@ -1748,12 +1748,30 @@ class ChatStateStore:
             self._write(doc)
             return True, doc
 
-    def clear_draft(self, chat_id: str) -> dict:
+    def clear_draft(self, chat_id: str, *, only_text: str | None = None) -> dict:
         """Unconditional clear — the send path, where the draft just went out.
 
         A draft that has just been sent is not something to offer back, so this
-        leaves nothing to undo."""
-        _, doc = self.set_draft(chat_id, "", author="user")
+        leaves nothing to undo.
+
+        With ``only_text``, the clear is made only while the draft still holds
+        exactly those words (compared trimmed) — the repeat of a send, whose
+        words went out with its first request: a draft that still holds them
+        is that mail, put back into the box when its answer was lost, and one
+        written since is left as it is. Guarded by the draft's version, so a
+        save that lands between the look and the clear is never lost."""
+        if only_text is not None:
+            with self._lock:
+                doc = self._read(chat_id)
+                held = ((doc.get("draft") or {}).get("text") or "").strip()
+                version = int(doc.get("draft_version") or 0)
+            if not held or held != only_text.strip():
+                return doc
+            accepted, doc = self.set_draft(chat_id, "", author="user", base_version=version)
+            if not accepted:
+                return doc
+        else:
+            _, doc = self.set_draft(chat_id, "", author="user")
         with self._lock:
             doc = self._read(chat_id)
             if doc.get("cleared"):

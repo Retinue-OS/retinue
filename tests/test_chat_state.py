@@ -195,6 +195,41 @@ def test_undo_clear_is_refused_once_it_is_stale_or_moot():
     print("PASS test_undo_clear_is_refused_once_it_is_stale_or_moot")
 
 
+def test_a_repeat_clears_only_its_own_words():
+    """``clear_draft(only_text=…)``: the repeat of a send clears the draft
+    while it still holds that send's words (the page put them back when the
+    answer was lost), and leaves one written since — decision I."""
+    with tempfile.TemporaryDirectory() as tmp:
+        store = cs.ChatStateStore(tmp)
+        cid = "email:~me@example.org:root@x.org"
+        store.set_draft(cid, " Thanks, see you Tuesday. ", author="user")
+        doc = store.clear_draft(cid, only_text="Thanks, see you Tuesday.")
+        assert doc["draft"] is None and doc["cleared"] is None, doc
+        assert store.undo_clear(cid)[0] is False, "a sent mail is not offered back"
+        # Other words: written since, and kept as they are.
+        store.set_draft(cid, "typed since", author="user")
+        version = store.get(cid)["draft_version"]
+        doc = store.clear_draft(cid, only_text="Thanks, see you Tuesday.")
+        assert doc["draft"]["text"] == "typed since" and doc["draft_version"] == version
+        # Nothing to clear: nothing is written.
+        other = "email:~me@example.org:other@x.org"
+        store.clear_draft(other, only_text="")
+        store.clear_draft(other, only_text="words")
+        assert not store.exists(other)
+        # A save that lands between the look and the clear wins.
+        real = store.set_draft
+
+        def racing(chat_id, text, **kwargs):
+            if kwargs.get("base_version") is not None and not text:
+                real(chat_id, "written meanwhile", author="user")
+            return real(chat_id, text, **kwargs)
+        store.set_draft = racing
+        store.set_draft(cid, "Again", author="user")
+        store.clear_draft(cid, only_text="Again")
+        assert store.get(cid)["draft"]["text"] == "written meanwhile", store.get(cid)
+    print("PASS test_a_repeat_clears_only_its_own_words")
+
+
 def test_agent_staging_never_clobbers_user_text():
     with tempfile.TemporaryDirectory() as tmp:
         store = cs.ChatStateStore(tmp)
@@ -1387,6 +1422,7 @@ if __name__ == "__main__":
     test_draft_version_guard()
     test_undo_clear_restores_the_draft_with_its_author()
     test_undo_clear_is_refused_once_it_is_stale_or_moot()
+    test_a_repeat_clears_only_its_own_words()
     test_agent_staging_never_clobbers_user_text()
     test_last_read_forward_only_and_unread_modes()
     test_mark_read_and_its_guarded_restore()
