@@ -388,16 +388,27 @@ mail the index has there only while its folder's `UIDVALIDITY` is the one it
 was recorded under. (A record whose file is gone when it is to be written
 again is written as the first time, and the index is matched with the
 ledger again.) A record of the user's own that is written again keeps who
-wrote the mail and every id its provider gave it (`kb:sentAs`): the
+wrote the mail, and any record written again — whichever way, one that
+came in included — every id its provider gave the mail (`kb:sentAs`): the
 gateway's own send is on record with its author from the start, and stays
-so when its Sent copy comes back from the Trash. An id its provider gave a
-mail is that mail's in every folder, Sent included: a copy under it — in a
-renumbered Sent, moved out and back, a second copy — is one more place of
-the record under the id the gateway minted, and where that record is a
-tombstone, the record is written again in its own place, under the minted
-id; never a second record under the provider's id. (A stranger's mail under that id is
-what it is under the minted one: one more place, or another mail's beside a
-placeholder.)
+so when its Sent copy comes back from the Trash; a restart knows the same
+ids, and a follow-up cites the one the recipients have. An id its provider
+gave a send names that send only on the send's own evidence — every
+recipient has it, and every answer cites it. A copy under it shown to be
+the send's — in Sent as the gateway's own send is matched there (From the
+account, to the people it went to, dated when it went, naming no other
+send), elsewhere by its header block (the gateway's `X-Retinue-Message-ID`
+naming the send, with the same, or the very header block the record keeps)
+— is that mail in every folder, Sent included: in a renumbered Sent, moved
+out and back, a second copy, it is one more place of the record under the id
+the gateway minted, and where that record is a tombstone, the record is
+written again in its own place, under the minted id; never a second record
+under the provider's id. (A tombstone keeps no addresses: its copy is told
+by the rest.) Any other mail under that id — a stranger's — is a mail of its
+own, recorded under its own id, and no place of the send's: the send's
+tombstone stays the user's until the send's own copy comes back. Met before
+the send's Sent copy, it is that still, and the Sent copy, matched to the
+send, is the send's place beside it.
 
 A mail whose record is gone from the ledger (restored from an older backup,
 a file lost) is known no more: its row and its places go, and what the row
@@ -909,9 +920,11 @@ now, so they are the user's own act like send, compose and delete:
 succeed before the web gateway erases its own state — if any move fails, or a
 mail of the thread cannot be placed, nothing is erased and the answer reports
 `errors > 0`, with the reason as one sentence in `error`. A mail of the thread
-whose record the ledger lost (still looked for, above) is one of them: it is
-looked for under every id it is known by and moved to the Trash with the
-rest, and while a folder cannot say where it is, nothing is erased. The answer is
+whose record the ledger lost (still looked for, above) is one of them — of
+the thread it is in now: a merge takes it along — it is looked for under
+every id it is known by and moved to the Trash with the rest (a copy the
+server keeps flagged `\Deleted` is kept as any other is, below), and while a
+folder cannot say where it is, nothing is erased. The answer is
 `delete_chat`'s shape plus `trashed`; a mail that turns up again later in a
 mirrored folder (restored from the Trash) starts the chat anew.
 

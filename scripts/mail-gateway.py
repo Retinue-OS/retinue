@@ -3479,8 +3479,10 @@ class Mirror:
                   f"announced to the rail: {len(claimed)} mail(s), {len(merged)} merge(s), "
                   f"{sum(map(len, removed.values()))} removal(s)", flush=True)
         # Where the thread index and the records disagree, a merge was begun
-        # and not finished (or the rebuild just found one).
-        for row in self.index.rows("SELECT message_id, chat FROM mails"):
+        # and not finished (or the rebuild just found one) — a lost id's hint
+        # included (_apply_merges).
+        for row in self.index.rows("SELECT message_id, chat FROM mails UNION ALL "
+                                   "SELECT message_id, chat FROM lost WHERE chat IS NOT NULL"):
             chat = self.threads.chat_of(row["message_id"])
             if chat and chat != row["chat"]:
                 self._merges_due.add(row["chat"])
@@ -4726,8 +4728,9 @@ class Mirror:
         # way in the same step: on what was read at its own place, not later
         # for want of one.
         head = _head_of(fetched.raw)
-        # (Under an id its provider gave a mail of the gateway's own, it is
-        # that mail as it is on record — _own_send, _mirror_one.)
+        # (Under an id its provider gave a mail of the gateway's own, it may
+        # be that mail as it is on record: _mirror_one says, on the send's
+        # own evidence — _send_copy, _own_send.)
         renamed = at is not None and at["message_id"] != mail.message_id \
             and mail.message_id not in self._known_as(at["message_id"])
         if renamed and not (at["message_id"] == _bare_id(head)
@@ -4785,24 +4788,28 @@ class Mirror:
         # (A claim is a write under way, never seen here: see _write.)
         known = self.index.one("SELECT * FROM mails WHERE message_id = ? AND record != ''",
                                (mail.message_id,))
-        if known is None:
-            # Under an id a provider gave a mail of the gateway's own
-            # (aliases, from _own_send), in whichever folder — Sent included:
-            # renumbered, or the copy moved out and back — it IS that mail,
-            # as it is on record under the id the gateway minted: live, it is
-            # one more place of that record; a tombstone, the record is
-            # written again in its own place (author and kb:sentAs kept, see
-            # _write) — never a second record under the alias. What else is
-            # known of a mail on record holds as it does under its own id (a
-            # stranger's mail under it is one more place, or "other" beside
-            # a placeholder, by its header block).
+        # Under an id a provider gave a mail of the gateway's own (aliases,
+        # from _own_send) — with no record of its own, or one that came in —
+        # a copy shown to be that send's (_send_copy), in whichever folder,
+        # Sent included (renumbered, the copy moved out and back), IS that
+        # mail, as it is on record under the id the gateway minted: live, it
+        # is one more place of that record; a tombstone, the record is
+        # written again in its own place (author and kb:sentAs kept, see
+        # _write) — never a second record under the alias. Every recipient
+        # has that id, and every answer cites it: any other mail under it is
+        # a mail of its own, under its own id, and no place of the send's.
+        mapped = False
+        if known is None or known["direction"] == "in":
             minted = self.index.one(
                 "SELECT m.* FROM aliases a JOIN mails m ON m.message_id = a.message_id "
                 "WHERE a.alias = ? AND m.record != ''", (mail.message_id,))
-            if minted is not None:
+            if minted is not None and self._send_copy(role, mail, minted):
                 mail, known = dataclasses.replace(mail, message_id=minted["message_id"]), minted
-        # (A copy whose alias is not known yet: _own_send says whether it is one.)
-        if known is None and role == "sent" and self._own_send(uid, mail):
+                outbound = mapped = True
+        # (A copy whose alias is not known yet: _own_send says whether it is
+        # one — also beside a mail under that id that came in first.)
+        if not mapped and role == "sent" and (known is None or known["direction"] == "in") \
+                and self._own_send(uid, mail):
             return
         sent_as = None
         if lost is not None and known is None \
@@ -4920,11 +4927,12 @@ class Mirror:
         self._went_out_after_all(given_up, mail)
 
     def _own_send(self, uid: int, mail: Mail) -> bool:
-        """A copy in Sent under a Message-ID nobody here knows: is it the
-        provider's copy of a mail the gateway itself sent, filed under an
-        id the provider gave it in place of the one the gateway minted? True
-        when it is — it is then one more place of that mail's record, and no
-        mail of its own: one bubble, one chat.
+        """A copy in Sent under a Message-ID nobody here knows — or one a
+        mail that came in has (a recipient's, met first: it stays its own):
+        is it the provider's copy of a mail the gateway itself sent, filed
+        under an id the provider gave it in place of the one the gateway
+        minted? True when it is — it is then one more place of that mail's
+        record, and no mail of its own: one bubble, one chat.
 
         Which send it would be, the copy says itself where the provider kept
         the gateway's header (``submitted_as``); where it kept none, the
@@ -5000,6 +5008,30 @@ class Mirror:
             minted, [alias], row["arrived"] or row["ts"], None).merged)
         self._locate("sent", uid, minted)
         return True
+
+    def _send_copy(self, role: str, mail: Mail, minted) -> bool:
+        """Whether a mail under an id a provider gave a send of the
+        gateway's own (``minted``: its row, live or a tombstone) is that
+        send's copy — on the send's own evidence, never on the id alone,
+        which every recipient has. In Sent, :meth:`_own_send`'s: naming no
+        other send (``submitted_as``), From the account, addressed to
+        exactly the people the record says it went to and dated when it
+        went. Elsewhere, its header block's: the gateway's header naming
+        the send together with that, or the very header block the record
+        keeps (:meth:`_own_copy`). A tombstone keeps no addresses and no
+        header block: its copy is told by the rest."""
+        sent_to = []
+        addressed = mail.unreadable is None and not minted["removed"] \
+            and minted["direction"] == "out"
+        if addressed:
+            fields = _ibstore.read_record(self._record_path(minted["record"])) or {}
+            sent_to = [*(fields.get("recipients") or []), *(fields.get("cc") or []),
+                       *(fields.get("refused") or [])]
+        fits = self._copy_of(mail, sent_to, minted["ts"], addressed=addressed)
+        if role == "sent":
+            return mail.submitted_as in (None, minted["message_id"]) and fits
+        return (mail.submitted_as == minted["message_id"] and fits) \
+            or self._own_copy(minted["message_id"], mail.headers)
 
     def _sent_like(self, mail: Mail) -> str | None:
         """The send of the gateway's own that a copy in Sent is, where
@@ -5218,8 +5250,10 @@ class Mirror:
         time, under a name of its own, with the row standing as it was
         until then — and the index is matched with the ledger again before
         the next pass (_prepare), which also says what is to become of the
-        row should this write fail. ``sent_as``: ids a provider gave an
-        outbound mail, beside those the record it replaces has."""
+        row should this write fail. ``sent_as``: ids a provider gave the
+        mail, beside those the record it replaces has and those `aliases`
+        names for it — kept on every record written again, inbound ones
+        included."""
         now = self._clock()
         ts = min(mail.date, now) if mail.date is not None else now
         # Threaded by when the server received the mail, not by its Date
@@ -5280,24 +5314,30 @@ class Mirror:
                 body_part=refs.get("body_part"), html_part=refs.get("html_part"),
                 header_part=refs["header_part"], trim=state,
                 content_ids=refs["content_ids"], arrived_at=arrived)
+            # Every id a provider gave the mail (kb:sentAs: what its answers
+            # cite), whichever way the record is written again — those it
+            # had, and those `aliases` names for it: a restart builds the
+            # same aliases off the records (_prepare).
+            known_as = list(dict.fromkeys(
+                [*((was or {}).get("sent_as") or []), *self._known_as(mail.message_id)[1:],
+                 *(sent_as or [])])) or None
             if outbound:
                 # Whichever client sent it: the own-device echo, unless
                 # someone said who wrote it. A record written again in the
                 # place of the user's own keeps who that said wrote the mail
                 # (the gateway's own send is on record with its author from
-                # the start, and its note may be pruned by now) and every id
-                # a provider gave it (kb:sentAs: what its answers cite).
+                # the start, and its note may be pruned by now).
                 own = was if was is not None and was.get("type") == _ibstore.T_OUTBOUND \
                     else {}
                 author = self._author_noted(mail) or own.get("author") or "device"
                 _urn, path = _ibstore.write_outbound(
                     INBOUND_STORE_DIR, author=author, sender=mail.sender or None,
-                    replace=old, sent_as=list(dict.fromkeys(
-                        [*(own.get("sent_as") or []), *(sent_as or [])])) or None, **common)
+                    replace=old, sent_as=known_as, **common)
             else:
                 _urn, path = _ibstore.write_message(
                     INBOUND_STORE_DIR, sender=mail.sender,
-                    delivered=_delivered_on_write(direction), replace=old, **common)
+                    delivered=_delivered_on_write(direction), replace=old,
+                    sent_as=known_as, **common)
         except Exception:
             for media_id in stored:
                 _ibstore.discard_media(INBOUND_STORE_DIR, media_id)
@@ -5399,10 +5439,15 @@ class Mirror:
         the web gateway — only once the ledger is clean (rekey_chat fails
         closed), so a merge a full disk interrupts is finished by a later poll.
         The index and the event are one transaction; a stop after the ledger
-        and before it is announced by the next start (_prepare)."""
+        and before it is announced by the next start (_prepare). The ids of
+        `lost` whose hint names a chat merged away follow it in that same
+        transaction: a delete of the chat they are in now looks for them
+        (delete_chat) — also where such an id is all the chat had left."""
         merged: dict = {}
         for old in sorted(self._merges_due):
-            member = self.index.one("SELECT message_id FROM mails WHERE chat = ? LIMIT 1", (old,))
+            member = self.index.one(
+                "SELECT message_id FROM mails WHERE chat = ? UNION ALL "
+                "SELECT message_id FROM lost WHERE chat = ? LIMIT 1", (old, old))
             into = self.threads.chat_of(member["message_id"]) if member else None
             if not into or into == old:
                 self._merges_due.discard(old)
@@ -5429,7 +5474,8 @@ class Mirror:
             merged.setdefault(into, []).append(old)
         for into, absorbed in merged.items():
             self.index.atomic(
-                [("UPDATE mails SET chat = ? WHERE chat = ?", (into, old)) for old in absorbed]
+                [(f"UPDATE {table} SET chat = ? WHERE chat = ?", (into, old))
+                 for old in absorbed for table in ("mails", "lost")]
                 + [self._event("merge", {"channel": CHANNEL, "account": ACCOUNT,
                                          "from": absorbed, "into": into})])
             self._merges_due.difference_update(absorbed)
@@ -5697,11 +5743,17 @@ class Mirror:
                            (source, gen, uid))
         for uid, new in {**result.moved, **result.left}.items():
             message_id, kept = uids[uid], uid in result.left
-            self.index.run(
-                "UPDATE locations SET skipped = 'moved' WHERE role = ? AND gen = ? AND uid = ?"
-                if kept else
-                "DELETE FROM locations WHERE role = ? AND gen = ? AND uid = ?",
-                (source, gen, uid))
+            if not self.index.run(
+                    "UPDATE locations SET skipped = 'moved' WHERE role = ? AND gen = ? AND uid = ?"
+                    if kept else
+                    "DELETE FROM locations WHERE role = ? AND gen = ? AND uid = ?",
+                    (source, gen, uid)) and kept:
+                # A copy that had no place here — a mail of `lost`, which has
+                # no row to place it under (delete_chat) — is kept all the
+                # same: it is that, and no new mail to be read.
+                self.index.run(
+                    "INSERT OR REPLACE INTO locations (role, gen, uid, message_id, skipped) "
+                    "VALUES (?, ?, ?, ?, 'moved')", (source, gen, uid, message_id))
             if target is None:
                 continue
             if new is None and placeable:

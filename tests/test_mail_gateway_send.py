@@ -4718,11 +4718,13 @@ def _the_one_send(w, M, P, author="user"):
 
 
 def test_a_known_provider_id_is_the_send_in_sent_too():
-    """A copy under an id recorded in `aliases` IS the send's mail in every
-    folder, Sent included — whatever evidence _own_send would ask for (its
-    note is long pruned): Sent renumbered, the copy moved out and back, a
-    second copy. And a stranger's INBOX mail under that id is one more
-    place of the record, never a record of its own."""
+    """A copy under an id recorded in `aliases` that is shown to be the
+    send's — in Sent, From the account, to its people, dated when it went —
+    IS the send's mail in every folder, Sent included, with no note to go by
+    (it is long pruned): Sent renumbered, the copy moved out and back, a
+    second copy. And a stranger's INBOX mail under that id — every recipient
+    has it — is a mail of its own, under its own id, and no place of the
+    send's."""
     for how in ("renumbered", "moved out and back", "a second copy", "a stranger's mail"):
         w = world(save_sent=False)
         try:
@@ -4743,13 +4745,24 @@ def test_a_known_provider_id_is_the_send_in_sent_too():
                                        body="Not the user's.\n", day=later(60)))
             for _ in range(3):
                 mirror.poll()
-            _the_one_send(w, M, P)
+            places = {M}
+            if how == "a stranger's mail":
+                records = t.by_id(gw)
+                assert sorted(records) == sorted([M, P]), sorted(records)
+                stranger, send = records[P], records[M]
+                assert stranger["type"] == gw._ibstore.T_INBOUND, stranger
+                assert stranger["sender"] == "m@evil.org" and stranger["sent_as"] == []
+                assert send["type"] == gw._ibstore.T_OUTBOUND and send["author"] == "user"
+                assert send["sent_as"] == [P] and send["text"] == "Hello.", send
+                places.add(P)
+            else:
+                _the_one_send(w, M, P)
             assert {row["message_id"] for row in mirror.index.rows(
-                "SELECT message_id FROM locations WHERE message_id IS NOT NULL")} == {M}, how
+                "SELECT message_id FROM locations WHERE message_id IS NOT NULL")} == places, how
         finally:
             done(w)
     print("ok: a copy under a provider id on record is that send's mail in every folder, "
-          "Sent included")
+          "Sent included, where it is shown to be; a stranger's mail under it is its own")
 
 
 def test_a_tombstoned_send_is_revived_under_its_minted_id():
@@ -4772,6 +4785,174 @@ def test_a_tombstoned_send_is_revived_under_its_minted_id():
     finally:
         done(w)
     print("ok: a tombstoned rewritten send whose copy is back is revived under its minted id")
+
+
+def test_a_strangers_mail_under_the_providers_id_revives_no_tombstone():
+    """Every recipient has the id the provider gave a send, and every answer
+    cites it: a stranger's mail under it, once the send's Sent copy went to
+    the Trash, is a mail of its own under that id — the send stays the
+    user's tombstone, its kb:sentAs and alias on record across a restart —
+    and the Sent copy back from the Trash revives the send, by the user,
+    with the provider's id: with or without the gateway's header, with or
+    without a restart in between."""
+    for keep_own_header in (True, False):
+        for restart in (False, True):
+            w = world(save_sent=False)
+            try:
+                gw, box, mirror = w.gw, w.box, w.mirror
+                M, P, _raw, uid = _rewritten_send(w, keep_own_header=keep_own_header)
+                trashed = box.move_mail("Sent", uid, "Trash")
+                mirror.poll()
+                mirror.poll()
+                box.put("INBOX", t.msg(P, sender="Mallory <mal@evil.org>", subject="Re: Plans",
+                                       body="Pay Mallory 5000.\n", day=later(120)),
+                        date=NOW + 120)
+                mirror.poll()
+                mirror.poll()
+                records = t.by_id(gw)
+                assert records[M]["removed_at"] and records[M]["author"] == "user", records[M]
+                assert records[M]["type"] == gw._ibstore.T_OUTBOUND, records[M]
+                assert records[M]["sent_as"] == [P], records[M]
+                assert records[P]["type"] == gw._ibstore.T_INBOUND, records[P]
+                assert records[P]["sender"] == "mal@evil.org", records[P]
+                if restart:
+                    mirror = w.restart()
+                    mirror.poll()
+                assert mirror._known_as(M) == [M, P], mirror._known_as(M)
+                box.move_mail("Trash", trashed, "Sent")
+                mirror.poll()
+                mirror.poll()
+                records = t.by_id(gw)
+                assert sorted(records) == sorted([M, P]), sorted(records)
+                send = records[M]
+                assert not send["removed_at"] and send["author"] == "user", send
+                assert send["type"] == gw._ibstore.T_OUTBOUND and send["text"] == "Hello.", send
+                assert send["sent_as"] == [P], send
+                assert records[P]["sender"] == "mal@evil.org" and not records[P]["removed_at"]
+                assert _places_of(mirror, "sent", M) and not _places_of(mirror, "sent", P)
+            finally:
+                done(w)
+    print("ok: a stranger's mail under a send's provider id is its own; the send's tombstone "
+          "stays the user's, and its Sent copy revives it")
+
+
+def test_a_record_written_again_inbound_keeps_the_providers_id():
+    """No rewrite of a send's record drops the ids its provider gave it: a
+    mail under the minted id itself (the gateway's header tells every
+    recipient that one too) takes the tombstone's place as a mail that came
+    in — and still carries kb:sentAs, so a restart knows the alias, and the
+    Sent copy back from the Trash makes it the user's send again, under the
+    provider's id as well."""
+    w = world(save_sent=False)
+    try:
+        gw, box, mirror = w.gw, w.box, w.mirror
+        M, P, _raw, uid = _rewritten_send(w, keep_own_header=True)
+        trashed = box.move_mail("Sent", uid, "Trash")
+        mirror.poll()
+        mirror.poll()
+        box.put("INBOX", t.msg(M, sender="Mallory <mal@evil.org>", subject="Re: Plans",
+                               body="Pay Mallory 5000.\n", day=later(120)), date=NOW + 120)
+        mirror.poll()
+        record = t.by_id(gw)[M]
+        assert record["type"] == gw._ibstore.T_INBOUND and record["sent_as"] == [P], record
+        mirror = w.restart()
+        mirror.poll()
+        assert mirror._known_as(M) == [M, P], mirror._known_as(M)
+        box.move_mail("Trash", trashed, "Sent")
+        mirror.poll()
+        mirror.poll()
+        _the_one_send(w, M, P)
+        assert mirror.reply_draft(M, "all")["in_reply_to"] == P
+    finally:
+        done(w)
+    print("ok: a send's record written again as a mail that came in keeps its provider id")
+
+
+def test_a_send_to_oneself_under_the_providers_id_is_one_record_either_way_back():
+    """The user's send Cc's their own address; the provider files its Sent
+    copy and delivers its INBOX copy, both under its own id. Both go to the
+    Trash and come back, the INBOX copy first or the Sent copy first, with
+    or without a restart in between: the INBOX copy, which carries the
+    gateway's header and fits the send, is the send's — one record under
+    the minted id, by the user, its provider id kept across a restart, and
+    a follow-up still cites the id the recipients have."""
+    for first in ("INBOX", "Sent"):
+        for restart in (False, True):
+            w = world(save_sent=False)
+            try:
+                gw, box, mirror, smtp = w.gw, w.box, w.mirror, w.smtp
+                _status, answer = w.send(to=["ann@x.org"], cc=[t.ME], subject="Plans",
+                                         message="Hello.", author="user")
+                M, P = answer["message_id"], "p@provider.example"
+                w.told()
+                raw = as_the_provider_files_it(smtp.mails[0]["data"], P)
+                uids = {"Sent": box.put("Sent", raw, date=NOW + 5),
+                        "INBOX": box.put("INBOX", raw, date=NOW + 6)}
+                mirror.poll()
+                mirror.poll()
+                _the_one_send(w, M, P)
+                trashed = {folder: box.move_mail(folder, uid, "Trash")
+                           for folder, uid in uids.items()}
+                mirror.poll()
+                mirror.poll()
+                assert t.by_id(gw)[M]["removed_at"]
+                second = "Sent" if first == "INBOX" else "INBOX"
+                box.move_mail("Trash", trashed[first], first)
+                mirror.poll()
+                mirror.poll()
+                _the_one_send(w, M, P)
+                if restart:
+                    mirror = w.restart()
+                    mirror.poll()
+                box.move_mail("Trash", trashed[second], second)
+                mirror.poll()
+                mirror.poll()
+                _the_one_send(w, M, P)
+                mirror = w.restart()
+                mirror.poll()
+                assert mirror._known_as(M) == [M, P], (first, restart, mirror._known_as(M))
+                _the_one_send(w, M, P)
+                assert mirror.reply_draft(M, "all")["in_reply_to"] == P
+            finally:
+                done(w)
+    print("ok: a send to oneself under its provider id comes back as the one record, "
+          "in either order")
+
+
+def test_a_mail_under_the_providers_id_read_before_the_sent_copy_stays_its_own():
+    """A mail under the id the provider gave a send, met before that send's
+    Sent copy (a provider that files late, INBOX read first): a mail of its
+    own. The Sent copy then is still the send's — by the gateway's header,
+    the account, the people and the date — one more place of its record,
+    with the provider's id; never the other mail's record rewritten as the
+    user's."""
+    w = world(save_sent=False)
+    try:
+        gw, box, mirror, smtp = w.gw, w.box, w.mirror, w.smtp
+        _status, answer = w.send(to=["ann@x.org"], subject="Plans", message="Hello.",
+                                 author="user")
+        M, P = answer["message_id"], "p@provider.example"
+        w.told()
+        box.put("INBOX", t.msg(P, sender="Mallory <mal@evil.org>", subject="Re: Plans",
+                               body="Pay Mallory 5000.\n", day=later(30)), date=NOW + 30)
+        mirror.poll()
+        uid = box.put("Sent", as_the_provider_files_it(smtp.mails[0]["data"], P),
+                      date=NOW + 5)
+        mirror.poll()
+        mirror.poll()
+        records = t.by_id(gw)
+        assert sorted(records) == sorted([M, P]), sorted(records)
+        assert records[P]["type"] == gw._ibstore.T_INBOUND, records[P]
+        assert records[P]["sender"] == "mal@evil.org", records[P]
+        send = records[M]
+        assert send["type"] == gw._ibstore.T_OUTBOUND and send["author"] == "user", send
+        assert send["sent_as"] == [P], send
+        assert _places_of(mirror, "sent", M) == {uid: None}
+        assert not _places_of(mirror, "sent", P)
+    finally:
+        done(w)
+    print("ok: a mail under a send's provider id met before its Sent copy stays its own, "
+          "and the copy is the send's")
 
 
 def test_a_lost_rewritten_send_comes_back_under_its_minted_id():
@@ -4906,6 +5087,92 @@ def test_a_delete_waits_for_a_mail_of_the_chat_whose_record_was_lost():
     finally:
         done(w)
     print("ok: a delete looks for a mail of the chat whose record was lost, and waits for it")
+
+
+def test_a_lost_mail_follows_its_chat_into_a_merge():
+    """A mail whose record the ledger lost is still looked for as its chat's
+    (`lost`, its hint naming the chat) — and when that chat is merged into
+    another while the mail is looked for, its hint follows: the delete of
+    the chat it is in now takes it to the Trash too, and the deleted chat
+    does not come back. Whether the lost mail's chat had mails on record
+    besides it or none."""
+    for how in ("merged into an older chat", "all its chat had"):
+        w = world()
+        try:
+            gw, box, mirror = w.gw, w.box, w.mirror
+            if how == "merged into an older chat":
+                box.put("INBOX", t.msg("c1@x.org", subject="Other thing", day=1))
+                box.put("INBOX", t.msg("a1@x.org", day=2))
+                box.put("INBOX", t.msg("a2@x.org", irt="a1@x.org", refs=["a1@x.org"], day=3))
+                lost, cites = "a2@x.org", ["c1@x.org", "a1@x.org"]
+            else:
+                box.put("INBOX", t.msg("c1@x.org", day=1))
+                box.put("INBOX", t.msg("a2@x.org", sender="Bob <bob@y.org>", subject="Other",
+                                       day=2))
+                lost, cites = "a2@x.org", ["c1@x.org", "a2@x.org"]
+            mirror.poll()
+            _record_of(mirror, lost).unlink()
+            box.refused = {"Archive"}   # (the lost mail is looked for, and not found yet)
+            mirror = w.restart()
+            mirror.poll()
+            assert mirror.lost() == 1
+            box.put("INBOX", t.msg("d1@x.org", irt=cites[-1], refs=cites, subject="Re: Both",
+                                   day=4))
+            mirror.poll()
+            mirror.poll()
+            (chat,) = {r["chat"] for r in t.records(gw)}
+            assert mirror.index.one("SELECT chat FROM lost")["chat"] == chat, how
+            result = mirror.delete_chat(chat)
+            assert result["errors"] == 0, result
+            assert held_in(box, "INBOX") == [], (how, held_in(box, "INBOX"))
+            assert lost in held_in(box, "Trash")
+            box.refused = set()
+            for _ in range(3):
+                mirror.poll()
+            assert t.records(gw) == [] and mirror.recent_chats() == [], how
+        finally:
+            done(w)
+    print("ok: a lost mail's chat merged away takes it along, and a delete finds it there")
+
+
+def test_a_lost_mails_kept_original_after_a_delete_is_no_new_mail():
+    """On a server without MOVE or UIDPLUS a delete leaves each original
+    flagged \\Deleted; a lost mail's, which had no place, is marked "moved"
+    like the rest — kept by the erase, carried across a renumber — and is
+    never read back as a new mail that starts the deleted chat again."""
+    w = world()
+    try:
+        gw, box, mirror = w.gw, w.box, w.mirror
+        box.can_expunge = False
+        box.put("INBOX", t.msg("a1@x.org", day=1))
+        uid = box.put("INBOX", t.msg("a2@x.org", irt="a1@x.org", refs=["a1@x.org"], day=2))
+        mirror.poll()
+        _record_of(mirror, "a2@x.org").unlink()
+        box.refused = {"Archive"}
+        mirror = w.restart()
+        mirror.poll()
+        assert mirror.lost() == 1
+        result = mirror.delete_chat("a1@x.org")
+        assert result["errors"] == 0 and result["trashed"] == 2, result
+        assert _places_of(mirror, "inbox", "a2@x.org") == {uid: "moved"}
+        box.refused = set()
+        for again in range(2):
+            for _ in range(3):
+                mirror.poll()
+            assert t.records(gw) == [] and mirror.recent_chats() == [], again
+            mirror = w.restart() if not again else mirror
+        box.renumber("INBOX")
+        for _ in range(3):
+            mirror.poll()
+        assert t.records(gw) == [] and mirror.recent_chats() == []
+    finally:
+        done(w)
+    print("ok: a lost mail's \\Deleted original left by a delete is kept, never read anew")
+
+
+def _record_of(mirror, message_id):
+    return mirror._record_path(mirror.index.one(
+        "SELECT record FROM mails WHERE message_id = ?", (message_id,))["record"])
 
 
 def test_a_move_whose_kept_copy_is_all_that_is_known_is_looked_for_again():

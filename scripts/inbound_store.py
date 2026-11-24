@@ -198,7 +198,8 @@ P_REFUSED = KB + "refused"
 # one their answers cite — one triple each (kb:messageId stays the id the
 # gateway minted, which is what the record, the chat and every index are
 # keyed by). Identity, not content: kept on a tombstone, where a thread index
-# rebuilt from the ledger still needs every id a mail was ever known by.
+# rebuilt from the ledger still needs every id a mail was ever known by — and
+# on a record written in its place, inbound-shaped ones included.
 P_SENT_AS = KB + "sentAs"
 # Threading, as the headers carried it: the parent's id, and the References
 # ids space-separated in header order (followed by any further id the
@@ -830,6 +831,7 @@ def write_message(
     arrived_at: float | None = None,
     reply_to: list[str] | None = None,
     replace: str | Path | None = None,
+    sent_as: list[str] | None = None,
 ) -> tuple[str, Path]:
     """Persist one inbound message as a deterministic N-Triples file.
 
@@ -875,7 +877,9 @@ def write_message(
     absent one writes no triple.
 
     ``replace`` is a record of this store that the new one takes the place
-    of (see :func:`_replacing`).
+    of (see :func:`_replacing`). ``sent_as`` as for :func:`write_outbound`:
+    a record written in the place of a mail the gateway sent keeps the ids
+    a provider gave that mail, whichever way it is written.
     """
     ts = time.time() if timestamp is None else float(timestamp)
     token, path = _replacing(store_dir, replace, ts)
@@ -900,6 +904,7 @@ def write_message(
         "attachments": [u for u in (attachment_urls or []) if u],
         "media": media or None,
     }
+    fields["sent_as"] = _many(sent_as)
     fields["attachment_meta"] = _record_blob_meta(store_dir, fields, content_ids)
     _atomic_write(_render(fields), path)
     return urn, path
