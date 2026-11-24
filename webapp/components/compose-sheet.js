@@ -15,19 +15,32 @@
 //   Text      the mail, in lines: Enter breaks one; the button or Ctrl/⌘+Enter
 //             sends
 //
-// Sending is POST /chats/compose `{channel, account, to, cc, subject, text}`.
-// The gateway mints the mail's Message-ID, which becomes the new chat's key,
-// and answers `{id, message}` (sent) or `{id, pending}` (queued under the
-// account's send policy); either way the page goes to the new chat — which
-// may hold only the pending bubble of the mail waiting for approval. A
-// refusal is shown in the sheet, in place, with everything typed still there.
+// Sending is POST /chats/compose `{channel, account, to, cc, subject, text,
+// request_key}`. The gateway mints the mail's Message-ID, which becomes the
+// new chat's key, and answers `{id, message}` (sent) or `{id, pending}`
+// (queued under the account's send policy); either way the page goes to the
+// new chat — which may hold only the pending bubble of the mail waiting for
+// approval. A refusal (4xx) is shown in the sheet, in place, with everything
+// typed still there.
+//
+// One press is one mail. A press mints a `request_key` and holds the Send
+// button until it is answered — closing the sheet and opening it again
+// brings back the same sheet, still sending, never a second Send for the
+// same mail. Where the answer leaves open whether the mail went out (202
+// `{unconfirmed}`, a 5xx, no answer at all) the sheet says exactly that,
+// never "not sent", and the press stays with the mail (also on the device):
+// sent again unchanged it goes out under the same key, which the gateway
+// answers from the first time instead of sending twice.
 //
 // The sheet is a modal dialog: the page behind it is inert while it is open,
 // focus starts in To and stays inside (Tab wraps), Escape closes it (a first
 // Escape only shuts an open suggestion list), and focus goes back to what
 // opened it. Closing is not discarding: what the sheet holds is kept on the
-// device (drafts.js, `compose:<channel>`) and is there when it opens again;
-// Discard empties it, a send that went through drops it.
+// device (drafts.js) and is there when it opens again; Discard empties it, a
+// send that went through drops it. The kept mail belongs to the mailbox it
+// was started from (`compose:<channel>:<mailbox>`): it comes back only into
+// a sheet writing from that mailbox, and never moves to another one unless
+// the user picks that one under From.
 //
 // Everything a field holds is the user's own input, an address book entry or
 // the server's error line: all of it is escaped as text, and none of it ever
@@ -49,6 +62,28 @@ const MAX_RECIPIENTS = 50;
 // RFC 5321's limit on a path.
 const ADDRESS_MAX = 254;
 const FIELDS = ['to', 'cc'];
+const REQUEST_KEY_RE = /^[A-Za-z0-9_-]{16,64}$/;
+
+// An opaque token for one press of Send (see chat-page.js, newRequestKey).
+function newRequestKey() {
+  try {
+    if (globalThis.crypto && typeof globalThis.crypto.randomUUID === 'function') return globalThis.crypto.randomUUID();
+    if (globalThis.crypto && typeof globalThis.crypto.getRandomValues === 'function') {
+      const b = globalThis.crypto.getRandomValues(new Uint8Array(16));
+      return [...b].map((x) => x.toString(16).padStart(2, '0')).join('');
+    }
+  } catch (_e) { /* fall through */ }
+  let out = '';
+  while (out.length < 32) out += Math.floor(Math.random() * 0x100000000).toString(16).padStart(8, '0');
+  return out.slice(0, 32);
+}
+
+// A key is composing text when an input method has it — also the Enter that
+// commits a composition in WebKit, whose keydown arrives after
+// compositionend (isComposing false) and is told only by keyCode 229.
+function composing(e) {
+  return !!e.isComposing || e.keyCode === 229;
+}
 
 // An e-mail address by its shape: something@domain.tld, no spaces, none of
 // the characters that delimit addresses in a header, a domain of dotted
@@ -106,6 +141,11 @@ function invalidText(list) {
     : `These are not e-mail addresses: ${list.map((x) => `“${x}”`).join(', ')}.`;
 }
 
+// The addresses the cap kept out, named: they stay in the field.
+function capText(over) {
+  return `At most ${MAX_RECIPIENTS} recipients here; not added: ${over.join(', ')}.`;
+}
+
 // Open the sheet for one offer of GET /chats/compose (`{channel, label,
 // accounts}`); `restoreFocus` is called when it closes, to put the focus
 // back where the user was (the ＋, which a list refresh may have rebuilt).
@@ -130,8 +170,15 @@ class RetinueComposeSheet extends HTMLElement {
     this._text = '';
     this._account = '';
     this._errors = {};         // field (to | cc | text | form) → its line
-    this._busy = false;
+    this._busy = false;        // a send is on its way; survives close() and open()
+    this._done = false;        // it went through: the page is on its way to the chat
+    // The press whose outcome is not known — on its way, or answered without
+    // a word on whether the mail went out: {key, sig}, `sig` the request it
+    // made. The same request again goes out under the same key.
+    this._press = null;
     this._restored = false;    // the sheet opened on what an earlier one kept
+    this._waiting = '';        // a mailbox not offered now that has a mail kept
+    this._moved = '';          // the mailbox the form was just switched away from
     // The open suggestion list: which field it belongs to, its entries and
     // the one the arrow keys are on (-1: none).
     this._sugg = { field: '', items: [], active: -1 };
@@ -153,11 +200,27 @@ class RetinueComposeSheet extends HTMLElement {
     this._suggTimer = null;
   }
 
-  get _key() { return `compose:${(this._offer && this._offer.channel) || ''}`; }
+  // Where things are kept on the device. One mail per mailbox, under
+  // `compose:<channel>:<mailbox>`; and under `compose:<channel>` which
+  // mailbox was written from last, so the sheet opens on it again.
+  get _indexKey() { return `compose:${(this._offer && this._offer.channel) || ''}`; }
+
+  _slotKey(account) { return `${this._indexKey}:${String(account || '').toLowerCase()}`; }
+
+  get _key() { return this._slotKey(this._account); }
 
   open(offer, restoreFocus = null) {
     if (!this.shadowRoot) this.attachShadow({ mode: 'open' });
     this._wire();
+    this._restoreFocus = restoreFocus;
+    // A send is on its way: this is that sheet, still sending. Never a fresh
+    // form with Send armed again for the same mail — and what it holds is
+    // not replaced by what was kept when it was closed, which is the mail in
+    // flight itself.
+    if (this._busy && this._offer) {
+      this._show();
+      return;
+    }
     const o = offer && typeof offer === 'object' ? offer : {};
     const accounts = Array.isArray(o.accounts) ? o.accounts.filter((a) => typeof a === 'string' && a) : [];
     this._offer = {
@@ -165,34 +228,84 @@ class RetinueComposeSheet extends HTMLElement {
       label: typeof o.label === 'string' && o.label.trim() ? o.label.trim() : 'E-mail',
       accounts,
     };
-    this._restoreFocus = restoreFocus;
-    this._chips = { to: [], cc: [] };
-    this._typed = { to: '', cc: '' };
-    this._subject = '';
-    this._text = '';
     this._errors = {};
-    this._busy = false;
+    this._done = false;
     this._closeSugg(false);
-    // What an earlier sheet kept on this device comes back.
-    const kept = loadDraft(this._key);
-    this._restored = false;
-    if (kept) {
-      for (const f of FIELDS) {
-        this._chips[f] = (Array.isArray(kept[f]) ? kept[f] : [])
-          .filter((r) => r && isAddress(r.address))
-          .map((r) => ({ address: r.address, name: typeof r.name === 'string' ? r.name : '' }));
-        this._typed[f] = kept.typed && typeof kept.typed[f] === 'string' ? kept.typed[f] : '';
-      }
-      this._subject = typeof kept.subject === 'string' ? kept.subject : '';
-      this._text = typeof kept.text === 'string' ? kept.text : '';
-      this._account = typeof kept.account === 'string' ? kept.account : '';
-      this._restored = !this._empty();
-    }
-    if (!accounts.includes(this._account)) this._account = accounts[0] || '';
+    // The mailbox written from last, where it can be written from now.
+    const index = loadDraft(this._indexKey);
+    const last = index && typeof index.account === 'string' ? index.account : '';
+    this._account = accounts.includes(last) ? last : (accounts[0] || '');
+    // What an earlier sheet kept for this mailbox comes back — into this
+    // mailbox only. A mail kept for one that is not offered now stays where
+    // it is and waits for it: it is never taken into another mailbox, where
+    // one press would send it from the wrong address.
+    this._loadKept();
+    this._waiting = last && last !== this._account && !accounts.includes(last) && loadDraft(this._slotKey(last))
+      ? last : '';
+    this._show();
+  }
+
+  _show() {
     this.removeAttribute('hidden');
     this._render();
     this._inert();
     this._focus('[data-input="to"]');
+  }
+
+  // The mail kept for the mailbox the sheet now writes from, into the form
+  // (or an empty form where there is none).
+  _loadKept() {
+    this._chips = { to: [], cc: [] };
+    this._typed = { to: '', cc: '' };
+    this._subject = '';
+    this._text = '';
+    this._press = null;
+    this._restored = false;
+    const kept = loadDraft(this._key);
+    if (!kept) return;
+    for (const f of FIELDS) {
+      this._chips[f] = (Array.isArray(kept[f]) ? kept[f] : [])
+        .filter((r) => r && isAddress(r.address))
+        .map((r) => ({ address: r.address, name: typeof r.name === 'string' ? r.name : '' }));
+      this._typed[f] = kept.typed && typeof kept.typed[f] === 'string' ? kept.typed[f] : '';
+    }
+    this._subject = typeof kept.subject === 'string' ? kept.subject : '';
+    this._text = typeof kept.text === 'string' ? kept.text : '';
+    this._restored = !this._empty();
+    // A press that was never answered stays with its mail.
+    const press = kept.press;
+    if (this._restored && press && typeof press === 'object' && typeof press.key === 'string'
+      && REQUEST_KEY_RE.test(press.key) && typeof press.sig === 'string') {
+      this._press = { key: press.key, sig: press.sig };
+    }
+  }
+
+  // From changed, by the user's own choice. The mail in the form goes with
+  // it — unless the mailbox chosen has a kept mail of its own: then that one
+  // comes back and this one stays kept under the mailbox it was written
+  // from, so neither is lost and neither changes its sender unseen. An empty
+  // form simply opens on what the chosen mailbox holds.
+  _switchAccount(next) {
+    if (!this._offer || this._busy || next === this._account || !this._offer.accounts.includes(next)) return;
+    const from = this._account;
+    const theirs = loadDraft(this._slotKey(next));
+    if (!this._empty() && !theirs) {
+      saveDraft(this._slotKey(from), null);
+      this._account = next;
+      this._saveLocal();
+      return;
+    }
+    const mine = !this._empty();
+    this._saveLocal();
+    this._account = next;
+    this._errors = {};
+    this._closeSugg(false);
+    this._loadKept();
+    saveDraft(this._indexKey, { account: next });
+    this._moved = mine ? from : '';
+    this._render();
+    this._moved = '';
+    this._focus('[data-account]');
   }
 
   // Shut the sheet, keeping what it holds for next time.
@@ -216,10 +329,15 @@ class RetinueComposeSheet extends HTMLElement {
 
   _saveLocal() {
     if (!this._offer) return;
-    saveDraft(this._key, this._empty() ? null : {
+    if (this._empty()) {
+      saveDraft(this._key, null);
+      return;
+    }
+    saveDraft(this._key, {
       to: this._chips.to, cc: this._chips.cc, typed: { ...this._typed },
-      subject: this._subject, text: this._text, account: this._account,
+      subject: this._subject, text: this._text, account: this._account, press: this._press,
     });
+    saveDraft(this._indexKey, { account: this._account });
   }
 
   // The page behind a modal is out of reach: every other child of the body
@@ -258,8 +376,22 @@ class RetinueComposeSheet extends HTMLElement {
     } else if (accounts.length === 1) {
       from = `<p class="from">From <b>${esc(accounts[0])}</b></p>`;
     }
-    const restored = this._restored
-      ? '<p class="note" role="status">The mail you started earlier is back.</p>' : '';
+    // What the sheet opened on, said: a mail in flight, one kept earlier
+    // (and whether a press of it was never answered), one waiting for a
+    // mailbox that is not offered now.
+    let restored = '';
+    if (this._busy) {
+      restored = '<p class="note" role="status">This mail is being sent.</p>';
+    } else if (this._restored) {
+      restored = '<p class="note" role="status">The mail you started earlier is back.' +
+        (this._moved ? ` What you wrote from ${esc(this._moved)} is kept for that mailbox.` : '') +
+        (this._press ? ' It was being sent when this sheet was last open, and it is not confirmed ' +
+          'whether it went out: look in the chat list before you send it again.' : '') + '</p>';
+    }
+    if (this._waiting) {
+      restored += `<p class="note" role="status">A mail you started from ${esc(this._waiting)} is kept. ` +
+        'It comes back when that mailbox can send again.</p>';
+    }
     this.shadowRoot.innerHTML = `<style>${CSS}</style>` +
       `<div class="overlay" data-overlay>` +
       `<form class="sheet" role="dialog" aria-modal="true" aria-labelledby="compose-title" data-form novalidate>` +
@@ -341,8 +473,14 @@ class RetinueComposeSheet extends HTMLElement {
   _paintBusy() {
     const btn = this.shadowRoot && this.shadowRoot.querySelector('[data-send]');
     if (!btn) return;
-    btn.disabled = this._busy;
-    btn.textContent = this._busy ? 'Sending …' : 'Send';
+    btn.disabled = this._busy || this._done;
+    btn.textContent = this._busy ? 'Sending …' : (this._done ? 'Opening the chat …' : 'Send');
+    // While the mail is on its way it is neither emptied nor moved to
+    // another mailbox; closing stays possible.
+    for (const sel of ['[data-account]', '[data-discard]']) {
+      const el = this.shadowRoot.querySelector(sel);
+      if (el) el.disabled = this._busy || this._done;
+    }
   }
 
   _paintSugg() {
@@ -370,35 +508,36 @@ class RetinueComposeSheet extends HTMLElement {
 
   // ── Recipients ─────────────────────────────────────────────────────────────
   // Addresses into field `f`'s chips: valid ones not there yet (an address
-  // in To is not copied to itself in Cc), up to the cap. Returns the tokens
-  // that are no address, as typed.
+  // in To is not copied to itself in Cc), up to the cap. Returns, as typed,
+  // the tokens that are no address (`bad`) and the addresses the cap kept
+  // out (`over`) — neither is dropped: the caller leaves both in the field.
   _addAddresses(f, tokens) {
     const bad = [];
+    const over = [];
     const has = (list, a) => list.some((r) => r.address.toLowerCase() === a.toLowerCase());
     for (const t of tokens) {
       if (!isAddress(t.address)) { bad.push(t.raw); continue; }
       if (has(this._chips[f], t.address) || (f === 'cc' && has(this._chips.to, t.address))) continue;
-      if (this._chips[f].length >= MAX_RECIPIENTS) {
-        this._errors[f] = `At most ${MAX_RECIPIENTS} recipients here.`;
-        break;
-      }
+      if (this._chips[f].length >= MAX_RECIPIENTS) { over.push(t.raw); continue; }
       this._chips[f].push({ address: t.address, name: t.name || '' });
     }
-    return bad;
+    return { bad, over };
   }
 
   // What field `f` holds turned into chips. `all`: the whole of it (Enter,
   // leaving the field, a send); otherwise what a separator has closed, the
-  // token still being typed left in the field. What is no address stays in
-  // the field, with a line saying so.
+  // token still being typed left in the field. What is no address, and what
+  // the cap kept out, stays in the field, with a line naming it; a field
+  // that is clean has no error left.
   _commit(f, all = true) {
     const { tokens, tail } = splitAddresses(this._typed[f]);
     const keep = !all && tail ? tokens.pop() : null;
     if (!tokens.length && !all) return;
-    const bad = this._addAddresses(f, tokens);
-    if (bad.length) this._errors[f] = invalidText(bad);
-    else if (this._errors[f] && !this._errors[f].startsWith('At most')) delete this._errors[f];
-    this._typed[f] = [...bad, ...(keep ? [keep.raw] : [])].join(', ');
+    const { bad, over } = this._addAddresses(f, tokens);
+    const lines = [bad.length ? invalidText(bad) : '', over.length ? capText(over) : ''].filter(Boolean);
+    if (lines.length) this._errors[f] = lines.join(' ');
+    else delete this._errors[f];
+    this._typed[f] = [...bad, ...over, ...(keep ? [keep.raw] : [])].join(', ');
     const input = this.shadowRoot && this.shadowRoot.querySelector(`[data-input="${f}"]`);
     if (input && input.value !== this._typed[f]) input.value = this._typed[f];
     this._paintChips(f);
@@ -409,7 +548,9 @@ class RetinueComposeSheet extends HTMLElement {
   _removeChip(f, i) {
     if (!FIELDS.includes(f) || !(i >= 0 && i < this._chips[f].length)) return;
     this._chips[f].splice(i, 1);
-    if (this._errors[f] && this._errors[f].startsWith('At most')) delete this._errors[f];
+    // There is room again: what the field still holds is taken in with the
+    // next commit, and the cap's line goes now.
+    if (this._errors[f] && this._errors[f].includes('At most')) delete this._errors[f];
     this._paintChips(f);
     this._paintErrors();
     this._saveLocal();
@@ -420,11 +561,12 @@ class RetinueComposeSheet extends HTMLElement {
   _pick(f, i) {
     const s = this._sugg.field === f ? this._sugg.items[i] : null;
     if (!s) return;
-    this._addAddresses(f, [{ raw: s.address, address: s.address, name: s.name }]);
+    const { over } = this._addAddresses(f, [{ raw: s.address, address: s.address, name: s.name }]);
     this._typed[f] = '';
     const input = this.shadowRoot && this.shadowRoot.querySelector(`[data-input="${f}"]`);
     if (input) input.value = '';
-    delete this._errors[f];
+    if (over.length) this._errors[f] = capText(over);
+    else delete this._errors[f];
     this._closeSugg();
     this._paintChips(f);
     this._paintErrors();
@@ -453,9 +595,17 @@ class RetinueComposeSheet extends HTMLElement {
     this._suggTimer = setTimeout(() => this._suggest(f, q), SUGGEST_MS);
   }
 
+  // Which recipient field has the focus, or null.
+  _focusedField() {
+    const a = this.shadowRoot && this.shadowRoot.activeElement;
+    const f = a && a.getAttribute ? a.getAttribute('data-input') : null;
+    return FIELDS.includes(f) ? f : null;
+  }
+
   // The people whose name or address matches `q`, by their e-mail addresses
   // — those not in the field yet. An answer that arrives after the field
-  // moved on (another fragment, a pick, the sheet closed) is dropped.
+  // moved on (another fragment, a pick, the sheet closed) or was left is
+  // dropped: a list under a field nobody is in is one nothing closes.
   async _suggest(f, q) {
     this._suggSeq += 1;
     const seq = this._suggSeq;
@@ -464,6 +614,7 @@ class RetinueComposeSheet extends HTMLElement {
       if (!res.ok) throw new Error(String(res.status));
       const doc = await res.json();
       if (seq !== this._suggSeq || this._typed[f].trim() !== q || this.hasAttribute('hidden')) return;
+      if (this._focusedField() !== f) return;
       const taken = new Set(this._chips[f].map((r) => r.address.toLowerCase()));
       const items = [];
       for (const c of Array.isArray(doc && doc.contacts) ? doc.contacts : []) {
@@ -493,20 +644,20 @@ class RetinueComposeSheet extends HTMLElement {
     root.addEventListener('input', (e) => this._onInput(e));
     root.addEventListener('change', (e) => {
       const t = e.target;
-      if (t && t.hasAttribute && t.hasAttribute('data-account')) {
-        this._account = t.value;
-        this._saveLocal();
-      }
+      if (t && t.hasAttribute && t.hasAttribute('data-account')) this._switchAccount(t.value);
     });
     root.addEventListener('keydown', (e) => this._onKeydown(e));
     root.addEventListener('focusout', (e) => {
       const t = e.target;
       const f = t && t.getAttribute ? t.getAttribute('data-input') : null;
       if (!FIELDS.includes(f)) return;
-      // Leaving a recipient field makes a chip of what it holds — unless the
-      // focus went to its own suggestion list (a press on an option).
+      // Leaving a recipient field makes a chip of what it holds — a press
+      // on one of its suggestions does not leave it (see mousedown below) —
+      // and ends its suggestions: the open list, and a question still on its
+      // way to the address book, whose answer would otherwise open a list
+      // under a field that is no longer in use.
       this._commit(f, true);
-      if (this._sugg.field === f) this._closeSugg();
+      this._closeSugg();
     });
     // A press on an option or a chip's ✕ must not take the focus from the
     // field first (its focusout would commit the fragment being picked).
@@ -529,6 +680,11 @@ class RetinueComposeSheet extends HTMLElement {
       this._typed[f] = t.value;
       // A separator typed or pasted closes the addresses before it.
       if (/[,;\n]/.test(t.value)) this._commit(f, false);
+      // An emptied field has nothing left to be wrong about.
+      else if (!t.value.trim() && this._errors[f]) {
+        delete this._errors[f];
+        this._paintErrors();
+      }
       this._scheduleSuggest(f);
       this._saveLocal();
       return;
@@ -574,11 +730,12 @@ class RetinueComposeSheet extends HTMLElement {
     const f = t && t.getAttribute ? t.getAttribute('data-input') : null;
     if (FIELDS.includes(f)) this._recipKey(e, f);
     else if (t && t.hasAttribute && t.hasAttribute('data-subject') && e.key === 'Enter') {
-      // A subject is one line: Enter goes on to the text, never sends.
+      // A subject is one line: Enter goes on to the text, never sends — and
+      // an input method's Enter only commits what it was composing.
       e.preventDefault();
-      this._focus('[data-text]');
+      if (!composing(e)) this._focus('[data-text]');
     } else if (t && t.hasAttribute && t.hasAttribute('data-text') && e.key === 'Enter'
-      && (e.ctrlKey || e.metaKey) && !e.isComposing) {
+      && (e.ctrlKey || e.metaKey) && !composing(e)) {
       e.preventDefault();
       this._submit();
     }
@@ -606,7 +763,7 @@ class RetinueComposeSheet extends HTMLElement {
       this._paintSugg();
     } else if (e.key === 'Enter') {
       e.preventDefault();
-      if (e.isComposing) return;
+      if (composing(e)) return;
       if (open && this._sugg.active >= 0) this._pick(f, this._sugg.active);
       else if (this._typed[f].trim()) {
         this._commit(f, true);
@@ -616,10 +773,9 @@ class RetinueComposeSheet extends HTMLElement {
       e.preventDefault();
       this._closeSugg();
     } else if (e.key === 'Backspace' && !this._typed[f] && this._chips[f].length) {
+      // As the chip's own ✕ would: the cap's line goes with it.
       e.preventDefault();
-      this._chips[f].pop();
-      this._paintChips(f);
-      this._saveLocal();
+      this._removeChip(f, this._chips[f].length - 1);
     }
   }
 
@@ -643,12 +799,15 @@ class RetinueComposeSheet extends HTMLElement {
   }
 
   _discard() {
+    // Not the mail on its way: its answer would have nothing left to be about.
+    if (this._busy) return;
     this._chips = { to: [], cc: [] };
     this._typed = { to: '', cc: '' };
     this._subject = '';
     this._text = '';
     this._errors = {};
     this._restored = false;
+    this._press = null;
     this._closeSugg(false);
     saveDraft(this._key, null);
     this._render();
@@ -656,22 +815,38 @@ class RetinueComposeSheet extends HTMLElement {
   }
 
   // ── Sending ────────────────────────────────────────────────────────────────
+  // One press, one request, one key. While a request is on its way nothing
+  // starts a second one — not a second press, not closing and opening the
+  // sheet. The answer:
+  //  - 200 / 202 with the new chat's id: sent, queued, or handed over and
+  //    not confirmed yet — the chat is where the mail now lives and says
+  //    which (its message, its pending bubble); the kept mail is dropped;
+  //  - 4xx: the server's refusal, shown with its sentence. Nothing went out;
+  //  - anything else (202 `{unconfirmed}` without a chat, a 5xx, no answer):
+  //    it is not known whether the mail went out, and the sheet says so. The
+  //    press stays with the mail: unchanged, it goes out again under the
+  //    same key.
+  // An answer that is not a success comes to a sheet that was closed
+  // meanwhile by opening it again: a mail that did not verifiably go out is
+  // not left unsaid.
   async _submit() {
-    if (this._busy || !this._offer) return;
-    for (const f of FIELDS) if (this._typed[f].trim()) this._commit(f, true);
+    if (this._busy || this._done || !this._offer) return;
+    for (const f of FIELDS) this._commit(f, true);
     this._closeSugg();
     delete this._errors.form;
     if (!this._chips.to.length && !this._errors.to) this._errors.to = 'Add at least one recipient.';
     if (!this._text.trim()) this._errors.text = 'Write the mail before you send it.';
     else delete this._errors.text;
+    const accounts = this._offer.accounts;
+    if (accounts.length && !accounts.includes(this._account)) {
+      this._errors.form = 'Choose the mailbox this mail leaves from.';
+    }
     const first = ['to', 'cc', 'text'].find((k) => this._errors[k]);
     this._paintErrors();
-    if (first) {
-      this._focus(first === 'text' ? '[data-text]' : `[data-input="${first}"]`);
+    if (first || this._errors.form) {
+      if (first) this._focus(first === 'text' ? '[data-text]' : `[data-input="${first}"]`);
       return;
     }
-    this._busy = true;
-    this._paintBusy();
     const body = {
       channel: this._offer.channel,
       to: this._chips.to.map((r) => r.address),
@@ -680,6 +855,17 @@ class RetinueComposeSheet extends HTMLElement {
       text: this._text,
     };
     if (this._account) body.account = this._account;
+    // The same mail as the press that was never answered is that press
+    // again; anything else is a new one.
+    const sig = JSON.stringify(body);
+    const key = this._press && this._press.sig === sig ? this._press.key : newRequestKey();
+    this._press = { key, sig };
+    body.request_key = key;
+    this._busy = true;
+    this._paintBusy();
+    // Kept with its press before the request leaves: a page left now does
+    // not come back with the same mail and a new key.
+    this._saveLocal();
     let error = '';
     try {
       const res = await fetch(COMPOSE_URL, {
@@ -691,24 +877,42 @@ class RetinueComposeSheet extends HTMLElement {
       try { doc = await res.json(); } catch (_e) { doc = null; }
       const id = doc && typeof doc.id === 'string' ? doc.id : '';
       if ((res.status === 200 || res.status === 202) && id && id.length <= 2048) {
-        // Sent or queued: the new chat is where it now lives — showing the
-        // mail, or its pending bubble with the approval link.
         saveDraft(this._key, null);
+        this._press = null;
+        this._busy = false;
         this._done = true;
+        this._paintBusy();
         this._uninert();
         location.assign(`/chat.html?id=${encodeURIComponent(id)}`);
         return;
       }
       const said = doc && typeof doc.error === 'string' ? doc.error.trim().slice(0, 300) : '';
-      if (res.ok) error = 'The server did not say where the new chat is — look for it in the chat list.';
-      else if (said) error = `Not sent: ${said}`;
-      else if (res.status === 403) error = 'Not sent: the server refused the request.';
-      else error = `Not sent (the server answered ${res.status}). Try again in a moment.`;
+      if (res.status === 202 && doc && doc.unconfirmed === true) {
+        error = 'The mail was handed over, but it is not confirmed yet that it went out. Look for it in the chat list' +
+          (doc.request_key === key
+            ? '; sending it again unchanged asks about this same mail and does not send it twice.'
+            : ' before you send it again.');
+      } else if (res.ok) {
+        error = 'The server did not say where the new chat is — look for it in the chat list.';
+      } else if (res.status >= 400 && res.status < 500) {
+        // Refused: nothing went out, and the next press is a new one.
+        this._press = null;
+        error = said ? `Not sent: ${said}` : `Not sent: the server refused the request${res.status === 403 ? '' : ` (${res.status})`}.`;
+      } else {
+        error = `The server could not confirm this mail (${said || `it answered ${res.status}`}). ` +
+          'If it shows up in the chat list, do not send it again.';
+      }
     } catch (_err) {
-      error = "Couldn't reach the server — check the connection and try again.";
+      error = 'No answer came back, so it is not known whether the mail went out. ' +
+        'If it shows up in the chat list, do not send it again.';
     }
     this._busy = false;
     this._errors.form = error;
+    this._saveLocal();
+    if (this.hasAttribute('hidden')) {
+      this._show();
+      return;
+    }
     this._paintBusy();
     this._paintErrors();
   }

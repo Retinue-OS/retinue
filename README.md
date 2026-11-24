@@ -106,13 +106,15 @@ Defines these core compose services:
   the full mail a tap away (`scripts/mail-gateway.py`;
   [`docs/mail-chats.md`](docs/mail-chats.md)). It writes back: replies and
   new mail leave through it under `EMAIL_SEND_POLICY` (a queued one is shown
-  pending in its chat, with its approval link; agents send with
+  pending in its chat, with its approval link, and a failed one stays there
+  with its reason; the To/Cc line of a reply is the gateway's own answer, and a
+  mail that may have gone out is never reported as not sent; agents send with
   `scripts/mail-push.py`), and Mark as read, Archive and Delete reach the
-  mailbox (Delete moves the thread to the Trash). It gates each arriving mail
-  like a messenger message: nothing is pushed by default, a model turn works
-  the mail only for a sender whose contact carries the VIP flag or an
-  instruction, and a mailing list flagged `news` goes to the feed. There is no
-  e-mail triage beside it.
+  mailbox (Delete moves the thread to the Trash, which it never creates). It
+  gates each arriving mail like a messenger message: nothing is pushed by
+  default, a model turn works the mail only for a sender whose contact carries
+  the VIP flag or an instruction, and a mailing list flagged `news` goes to the
+  feed. There is no e-mail triage beside it.
   Opt-in: it mirrors nothing until `MAIL_GATEWAY_TOKEN` is set, so an upgrade
   that changes nothing in `.env` mirrors nothing; with no mailbox configured
   it idles. See

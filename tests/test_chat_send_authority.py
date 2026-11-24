@@ -324,6 +324,16 @@ def test_another_sites_request_is_refused(base, wg):
             status, body = _http(base, "POST", f"/chats/{_quote(CHAT)}/delete",
                                  None, cross)
             assert status == 403, (site, status, body)
+            # The read mark and the flags are the user's word about their
+            # chat too — and, on a mail chat, reach the real mailbox — and
+            # so is taking a failed send out of it.
+            for path, sent in (("read", {}), ("flags", {"archived": True, "muted": True}),
+                               ("pending/deadbeef/dismiss", {})):
+                status, body = _http(base, "POST", f"/chats/{_quote(CHAT)}/{path}", sent, cross)
+                assert status == 403, (site, path, status, body)
+                assert json.loads(body)["error"] == "cross-site request rejected", body
+            doc = wg._CHAT_STATE.get(CHAT)
+            assert not doc.get("archived") and not doc.get("muted"), doc
         assert GW_SEEN == [], "a gateway was asked to act for another site"
         # The dashboard's own page still sends.
         status, body = _http(base, "POST", f"/chats/{_quote(CHAT)}/send",

@@ -304,6 +304,12 @@ services:
   #     - SMTP_HOST_ARI
   #     - SENT_FOLDER_ARI
   #     - SMTP_SAVE_SENT_ARI
+  #     # Folder names are inherited from .env too; an account whose archive
+  #     # or trash folder is named differently sets its own here (an explicit
+  #     # name wins over the server's SPECIAL-USE marks; a Trash is never
+  #     # created, so without one Delete in a chat is refused):
+  #     # - MAIL_ARCHIVE_FOLDER=Archiv
+  #     # - MAIL_TRASH_FOLDER=Deleted Items
   #   volumes:
   #     - mail-data-ari:/root/.local/share/mail   # its OWN volume
   #     - messenger-email:/inbound

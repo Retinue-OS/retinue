@@ -442,6 +442,21 @@ services:
       - CHAT_SEND_CONFIRM_TIMEOUT
       - CHAT_SEND_MAX_IMAGES
       - CHAT_SEND_TIMEOUT
+      # Mail chats (scripts/web-gateway.py): the hop to the mail gateway's
+      # /send (MAIL_SEND_TIMEOUT, long enough for an SMTP hand-over), the queue
+      # reads (CHAT_PENDING_*), how long a gateway with no mailbox is left
+      # alone (MAILBOX_NONE_SECONDS) and the caps on the original view.
+      - MAIL_SEND_TIMEOUT
+      - CHAT_PENDING_TIMEOUT
+      - CHAT_PENDING_RETRY_SECONDS
+      - CHAT_PENDING_SYNC_SECONDS
+      - MAILBOX_NONE_SECONDS
+      # A mailbox call that failed is owed: kept on disk, tried again on this
+      # timer, and given up after this long.
+      - MAILBOX_RETRY_SECONDS
+      - MAILBOX_OWED_KEEP_SECONDS
+      - MAIL_ORIGINAL_MAX_BYTES
+      - MAIL_ORIGINAL_INLINE_MAX_BYTES
       - GATEWAY_HEALTH_TIMEOUT
       # Gateway auth (scripts/gateway_auth.py) beyond the three above.
       - GATEWAY_BASIC_AUTH_USERS
@@ -463,6 +478,7 @@ services:
       - TELEGRAM_GATEWAY_TIMEOUT
       - SMS_DEFAULT_RECIPIENT
       - SMS_GATEWAY_TIMEOUT
+      - MAIL_GATEWAY_TIMEOUT
       - MESSENGER_GATEWAYS
       - MESSENGER_BUILTIN_CHANNELS
       - GATEWAY_MONITOR_IGNORE

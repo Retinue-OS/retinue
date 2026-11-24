@@ -916,6 +916,7 @@ def test_attention_is_about_the_person(base, wg):
 def test_list_contract(base, wg):
     wg._CHAT_OVERLAY.forget(CHAT_A)
     wg._CHAT_OVERLAY.forget(CHAT_B)
+    wg._mailbox_wait()      # a hook under way asks the store too
     STATE["queries"].clear()
     chats = _chats(base)
     a, b, s = chats[CHAT_A], chats[CHAT_B], chats[CHAT_S]
@@ -968,6 +969,7 @@ def test_list_contract(base, wg):
 
 
 def test_messages_contract(base, wg):
+    wg._mailbox_wait()
     STATE["queries"].clear()
     body = _messages(base, CHAT_A)
     a1, a2, a3 = body["messages"]
@@ -1317,11 +1319,18 @@ def test_companion_note(base, wg):
         # the policy; a queued send is relayed, not sent again. The words of
         # the quick patterns ("the last message", "the composer") are said
         # to mean the thread's mails and its draft.
+        # The command names the thread's own gateway where that is not the
+        # one mail-push.py posts to by default (as here: the registry's is
+        # the mock's), and the note says which policy the mailbox sends
+        # under, with the rule that goes with it — unset, that is `verify`.
+        # (Both in full: tests/test_chat_mail_send.py.)
+        send_url = wg._CHANNEL_GATEWAYS[MAIL_SLUG]["base_url"] + "/send"
         assert ("python3 /workspace/scripts/mail-push.py --chat " + wg.shlex.quote(CHAT_B)
-                + " --reply all --file <that file>") in note
+                + " --url " + send_url + " --reply all --file <that file>") in note
         assert "You send only when the user asks you to, here" in note
-        assert "`--user-approved` only where the user has given their permission" in note
-        assert "approval link" in note and "--retract <id>" in note
+        assert "send policy is `verify`: every send is queued" in note
+        assert "without `--user-approved`" in note
+        assert "approval link" in note and f"mail-push.py --url {send_url} --retract <id>" in note
         assert "they mean this thread's mails and its shared draft" in note
         assert "`email_client.py send` or `reply`" in note
         # The messenger note's "you do not send, under any circumstances"
@@ -1616,7 +1625,9 @@ def test_tombstones_are_not_unread(base, wg):
     assert (wg._CHAT_STATE.get(chat_id)["attention"] or {}).get("state") == "open"
 
     # The list's discipline, measured where it can be: the exclusion rides in
-    # the one unread query — no further query, no second VALUES table.
+    # the one unread query — no further query, no second VALUES table. (A
+    # mailbox hook still under way lists its thread's mails: not the list's.)
+    wg._mailbox_wait()
     STATE["queries"].clear()
     _chats(base)
     counting = [q for q in STATE["queries"] if "VALUES (?chat ?account ?cut)" in q]

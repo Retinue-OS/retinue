@@ -195,6 +195,42 @@ def test_the_retinue_side_enrols_it_and_keeps_its_own_credentials():
     print("PASS test_the_retinue_side_enrols_it_and_keeps_its_own_credentials")
 
 
+# What the retinue-side code reads for the mail channel: the web gateway's
+# hop, queue reads and hook memory, mail-push.py's timeout. The retinue service
+# has no env_file, so a variable it does not name never reaches those
+# processes — a value in .env would do nothing.
+_RETINUE_SIDE_MAIL = {"MAIL_SEND_TIMEOUT", "CHAT_PENDING_TIMEOUT",
+                      "CHAT_PENDING_RETRY_SECONDS", "CHAT_PENDING_SYNC_SECONDS",
+                      "MAILBOX_NONE_SECONDS", "MAIL_GATEWAY_TIMEOUT",
+                      "MAIL_ORIGINAL_MAX_BYTES", "MAIL_ORIGINAL_INLINE_MAX_BYTES"}
+
+
+def test_the_retinue_service_passes_the_mail_tunables_its_code_reads():
+    names = _env_names(_service_block("retinue"))
+    missing = _RETINUE_SIDE_MAIL - names
+    assert not missing, f"retinue does not name {sorted(missing)}"
+    # Whatever else the retinue-side mail code reads is named too: a new
+    # tunable cannot be documented without being wired.
+    pattern = re.compile(
+        r"(?:os\.environ\.get|os\.getenv)\(\s*\"((?:MAIL_|MAILBOX_|CHAT_PENDING_)[A-Z0-9_]*)\"")
+    read = set()
+    for name in ("web-gateway.py", "mail-push.py", "email_client.py"):
+        read |= set(pattern.findall((SCRIPTS_DIR / name).read_text(encoding="utf-8")))
+    unwired = {n for n in read if n not in names}
+    assert not unwired, f"the retinue side reads {sorted(unwired)}, which compose does not pass"
+    # A session may need the push CLI's timeout; the web gateway's own knobs
+    # stay out of sessions (scripts/session_env.py).
+    sys.path.insert(0, str(SCRIPTS_DIR))
+    se = _load("session_env_deploy_under_test", SCRIPTS_DIR / "session_env.py")
+    built = se.build({"PATH": "/usr/bin", "MAIL_GATEWAY_TIMEOUT": "300",
+                      "MAIL_SEND_TIMEOUT": "300", "CHAT_PENDING_SYNC_SECONDS": "5",
+                      "MAILBOX_NONE_SECONDS": "5"})
+    assert built.get("MAIL_GATEWAY_TIMEOUT") == "300", built
+    for daemon_only in ("MAIL_SEND_TIMEOUT", "CHAT_PENDING_SYNC_SECONDS", "MAILBOX_NONE_SECONDS"):
+        assert daemon_only not in built, daemon_only
+    print("PASS test_the_retinue_service_passes_the_mail_tunables_its_code_reads")
+
+
 def test_both_sides_name_the_same_policy_file():
     """The retinue side writes the e-mail policy at its default path under the
     ledger mount; the gateway reads the path compose gives it under its own.
@@ -298,6 +334,7 @@ def main() -> int:
     test_the_entrypoint_places_the_policy_file_before_anything_slow()
     test_the_ledger_volume_is_shared_three_ways()
     test_the_retinue_side_enrols_it_and_keeps_its_own_credentials()
+    test_the_retinue_service_passes_the_mail_tunables_its_code_reads()
     test_both_sides_name_the_same_policy_file()
     test_the_image_carries_every_module_it_imports()
     print("all mail-gateway deployment tests passed")

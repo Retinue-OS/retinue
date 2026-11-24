@@ -60,10 +60,19 @@ one JSON document per chat under ``CHAT_STATE_DIR``:
 - for a mail thread (docs/mail-chats.md) — a chat whose ``name`` is its
   subject — the people in it: ``participants`` and ``peer``. See
   :data:`MAIL_CHANNEL`.
-- ``pending`` — a copy of the sends of this chat that wait in its gateway's
-  queue for the user's approval (:func:`clean_pending`). The gateway's queue
-  is the truth; the copy is what the chat list counts from, and what the chat
-  page shows while the gateway is away.
+- ``pending`` — a copy of the sends of this chat that are not over in its
+  gateway's queue (:func:`clean_pending`): each waiting for the user's
+  approval, being sent, or failed — with the reason — until the user
+  dismisses it. The gateway's queue is the truth; the copy is what the chat
+  list counts from, and what the chat page shows while the gateway is away.
+- ``refused`` — whom a mail of the user's did not reach: the recipients the
+  mail server refused, by the mail's Message-ID (:func:`clean_refused`).
+- ``unsent`` — whether the chat is, so far, nothing but a mail of the user's
+  own that has not gone out (see :meth:`ChatStateStore.note_message`).
+
+Beside the documents, in a directory of its own, sits the queue of calls a
+chat's gateway is still owed (:class:`OwedCalls`) — a read mark or an archive
+that did not reach the mailbox behind the chat.
 
 Beside the documents the store keeps one small index, ``merged/into.json``:
 which chat ids were folded into which chat
@@ -227,6 +236,18 @@ _PENDING_LINE_MAX = 998
 # dashboard's and is not kept.
 _PENDING_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 _PENDING_URL_RE = re.compile(r"^/sends/[A-Za-z0-9._-]{1,128}/[A-Za-z0-9_-]{1,64}$")
+# Where a queued send stands: waiting for the user's decision; allowed (or
+# sent directly) and on its way, its outcome not known yet; or ended without
+# going out for certain — ``error`` then says why, in one bounded line, and
+# ``outcome_unknown`` whether the mail may have gone out all the same.
+PENDING_STATUSES = ("pending", "sending", "failed")
+_PENDING_ERROR_MAX = 500
+# The token one press of Send carries from the browser to the gateway, so a
+# repeat of that press sends nothing twice: opaque, printable, no blanks.
+REQUEST_KEY_RE = re.compile(r"^[\x21-\x7e]{1,64}$")
+# The recipients a mail server refused, per sent mail (``refused``): how many
+# mails' worth a document remembers — the newest.
+REFUSED_MAX = 50
 
 
 def iso_z(ts: float | str | None = None) -> str:
@@ -260,16 +281,23 @@ def _one_line(value, limit: int = _PENDING_LINE_MAX) -> str:
 def clean_pending(value) -> dict | None:
     """One queued send as a chat document keeps it, or None for what is none:
 
-    ``{request_id, approval_url, text, ts, author, to, cc, subject}`` — the
-    contract's Pending — with ``message_id`` where the gateway minted one
-    already, and ``noted``, the instant this side first learned of the entry
-    (:meth:`ChatStateStore.set_pending` reads it).
+    ``{request_id, approval_url, text, ts, author, to, cc, subject, status,
+    error, outcome_unknown, refused}`` — the contract's Pending — with
+    ``message_id`` where the gateway minted one already, ``request_key``
+    where the send carried one, and ``noted``, the instant this side first
+    learned of the entry (:meth:`ChatStateStore.set_pending` reads it).
 
     ``approval_url`` is kept only as the path of an approval page on this
     origin (``/sends/<gateway>/<id>``) for this very request: the page puts
     it into a link, and a link is the one thing here that could lead
     somewhere. Recipients and the subject are one line each; nothing is
-    interpreted."""
+    interpreted.
+
+    ``status`` is one of :data:`PENDING_STATUSES` (anything else reads as
+    waiting). Only a failed entry has an ``error`` — the gateway's sentence,
+    which may repeat what a mail server said, so it is one bounded line —
+    and can be ``outcome_unknown``. ``refused`` are the addresses the mail
+    server would not take, where the entry names any."""
     if not isinstance(value, dict):
         return None
     request_id = value.get("request_id")
@@ -289,6 +317,8 @@ def clean_pending(value) -> dict | None:
         return [a for a in lines if a][:PARTICIPANTS_MAX]
 
     noted = value.get("noted")
+    status = value.get("status") if value.get("status") in PENDING_STATUSES else "pending"
+    failed = status == "failed"
     pending = {
         "request_id": request_id,
         "approval_url": url,
@@ -298,12 +328,19 @@ def clean_pending(value) -> dict | None:
         "to": addresses("to"),
         "cc": addresses("cc"),
         "subject": _one_line(value.get("subject")),
+        "status": status,
+        "error": (_one_line(value.get("error"), _PENDING_ERROR_MAX) or None) if failed else None,
+        "outcome_unknown": failed and value.get("outcome_unknown") is True,
+        "refused": addresses("refused"),
         "noted": (float(noted) if isinstance(noted, (int, float))
                   and not isinstance(noted, bool) else time.time()),
     }
     message_id = _one_line(value.get("message_id"))
     if message_id:
         pending["message_id"] = message_id
+    request_key = value.get("request_key")
+    if isinstance(request_key, str) and REQUEST_KEY_RE.match(request_key):
+        pending["request_key"] = request_key
     return pending
 
 
@@ -324,8 +361,28 @@ def clean_pendings(values, known=None) -> list[dict]:
                 value["ts"] = was.get("ts")
         pending = clean_pending(value)
         if pending is not None:
+            decided = value.get("decided")
+            if isinstance(decided, (int, float)) and not isinstance(decided, bool):
+                pending["decided"] = float(decided)
             out.setdefault(pending["request_id"], pending)
     return sorted(out.values(), key=lambda p: (p["ts"], p["noted"]))[-PENDING_MAX:]
+
+
+def clean_refused(value) -> dict[str, list[str]]:
+    """``{message id: [address]}`` as a chat document keeps it (``refused``):
+    an id one bounded line, each address one that reads as an address
+    (:func:`clean_party`) and nothing else, mails nobody was refused for
+    left out, the newest :data:`REFUSED_MAX` mails."""
+    out: dict[str, list[str]] = {}
+    for message_id, addresses in (value.items() if isinstance(value, dict) else ()):
+        message_id = _one_line(message_id)
+        parties = (clean_party({"address": a})
+                   for a in (addresses if isinstance(addresses, list) else []))
+        kept = list(dict.fromkeys(p["address"] for p in parties if p))[:PARTICIPANTS_MAX]
+        if message_id and kept:
+            out.pop(message_id, None)
+            out[message_id] = kept
+    return dict(list(out.items())[-REFUSED_MAX:])
 
 
 def arrived_since_read(doc: dict | None) -> int:
@@ -353,6 +410,18 @@ def arrived_since_read(doc: dict | None) -> int:
     covered = int(covered)
     landed = int((doc or {}).get("inbound_seq") or 0) - covered
     return max(0, landed - sum(1 for seq in gone_arrivals(doc) if seq > covered))
+
+
+def arrivals_after(doc: dict | None, seq: int | None) -> set[str]:
+    """The message ids of the arrivals the chat counted after place ``seq``
+    in its count (``inbound_recent`` — the newest of them): what landed
+    later than some action whose place is known. None for ``seq`` — a place
+    nobody recorded — names nothing."""
+    if seq is None:
+        return set()
+    return {str(pair[0]) for pair in (doc or {}).get("inbound_recent") or []
+            if isinstance(pair, (list, tuple)) and len(pair) == 2 and pair[0]
+            and isinstance(pair[1], int) and not isinstance(pair[1], bool) and pair[1] > seq}
 
 
 def gone_arrivals(doc: dict | None) -> list[int]:
@@ -583,6 +652,17 @@ class ChatStateStore:
             # user's approval, oldest first (clean_pending). A copy: the
             # gateway's queue is the truth and this follows it (set_pending).
             "pending": [],
+            # The recipients a mail server would not take, per mail of the
+            # user's that went out all the same: ``{message id: [address]}``,
+            # the newest REFUSED_MAX (note_refused). The mail's record names
+            # whom it reached; this is who it did not.
+            "refused": {},
+            # True for a chat that so far is nothing but a mail of the user's
+            # own that has not gone out — queued, or its outcome not known —
+            # (note_message's ``unsent``); False once any mail of it is known.
+            # Such a chat is forgotten when that send is denied, retracted or
+            # dismissed: there was never anything else in it.
+            "unsent": False,
             # First-unread watermark: set when an inbound lands on a fully-read
             # chat, cleared when the user catches up. Its presence is what
             # classifies the next notification as "reply" rather than "new".
@@ -825,7 +905,8 @@ class ChatStateStore:
                      sender: str | None = None,
                      sender_name: str | None = None,
                      unknown_sender: bool | None = None,
-                     participants=None, peer=None) -> dict:
+                     participants=None, peer=None,
+                     unsent: bool | None = None) -> dict:
         """Cache display metadata learned from a message event (the rail).
 
         The ledger persists handles, never names — names are remembered here as
@@ -835,9 +916,16 @@ class ChatStateStore:
         ``participants`` (a list) and ``peer`` are a mail thread's people as
         its gateway states them (see MAIL_CHANNEL); each replaces what was
         kept, cleaned (:func:`clean_parties`). None leaves them as they are,
-        and a ``peer`` that does not read as one is not stored."""
+        and a ``peer`` that does not read as one is not stored.
+
+        ``unsent`` says whether the chat is, so far, only a mail of the
+        user's own that has not gone out (True — a queued new mail), or
+        holds a mail that exists (False — any message event). None leaves
+        it."""
         with self._lock:
             doc = self._read(chat_id)
+            if unsent is not None:
+                doc["unsent"] = bool(unsent)
             if participants is not None:
                 doc["participants"] = clean_parties(participants)
             if peer is not None:
@@ -1061,6 +1149,11 @@ class ChatStateStore:
             if doc.get("pending") or gone.get("pending"):
                 doc["pending"] = clean_pendings(
                     list(doc.get("pending") or []) + list(gone.get("pending") or []))
+            if doc.get("refused") or gone.get("refused"):
+                doc["refused"] = clean_refused({**(gone.get("refused") or {}),
+                                                **(doc.get("refused") or {})})
+            # A whole that holds a mail is no chat of one unsent mail.
+            doc["unsent"] = bool(doc.get("unsent") and gone.get("unsent"))
             mine, theirs = doc.get("attention") or None, gone.get("attention") or None
             if (theirs and theirs.get("state", "open") == "open"
                     and (not mine or mine.get("state", "open") != "open")):
@@ -1158,10 +1251,17 @@ class ChatStateStore:
             held = [p for p in doc.get("pending") or [] if isinstance(p, dict)]
             fresh = clean_pendings(pendings, known=held)
             if since is not None:
+                # Nor does an answer asked before a decision was noted here
+                # (update_pending) take that decision back: the entry stands
+                # as decided until an answer from after it says otherwise.
+                later = {p.get("request_id"): p for p in held
+                         if isinstance(p.get("decided"), (int, float)) and p["decided"] >= since}
                 listed = {p["request_id"] for p in fresh}
-                fresh = clean_pendings(fresh + [
-                    p for p in held if p.get("request_id") not in listed
-                    and isinstance(p.get("noted"), (int, float)) and p["noted"] >= since])
+                fresh = clean_pendings(
+                    [later.get(p["request_id"], p) for p in fresh] + [
+                        p for p in held if p.get("request_id") not in listed
+                        and isinstance(p.get("noted"), (int, float)) and p["noted"] >= since],
+                    known=held)
             if fresh == held or (not exists and not fresh):
                 return doc, False
             doc["pending"] = fresh
@@ -1180,6 +1280,49 @@ class ChatStateStore:
             held = [p for p in doc.get("pending") or []
                     if isinstance(p, dict) and p.get("request_id") != clean["request_id"]]
             doc["pending"] = clean_pendings(held + [clean])
+            self._write(doc)
+            return doc
+
+    def update_pending(self, chat_id: str, request_id: str, **changes) -> tuple[dict, bool]:
+        """Say where one queued send of the copy stands now — ``status``,
+        ``error``, ``outcome_unknown``, ``refused`` — for a decision or an
+        outcome this side learned before the gateway's queue was read again;
+        returns ``(doc, changed)``. The instant is kept on the entry
+        (``decided``), so an answer of the queue asked before it does not
+        undo it (:meth:`set_pending`). Nothing is written for a chat that
+        holds no such entry."""
+        with self._lock:
+            doc = self._read(chat_id)
+            held = [p for p in doc.get("pending") or [] if isinstance(p, dict)]
+            fresh, changed = [], False
+            for p in held:
+                if p.get("request_id") == request_id:
+                    moved = clean_pending({**p, **changes})
+                    if moved is not None and any(
+                            moved.get(k) != p.get(k)
+                            for k in ("status", "error", "outcome_unknown", "refused")):
+                        moved["decided"] = time.time()
+                        p, changed = moved, True
+                fresh.append(p)
+            if not changed:
+                return doc, False
+            doc["pending"] = fresh
+            self._write(doc)
+            return doc, True
+
+    def note_refused(self, chat_id: str, message_id: str | None, addresses) -> dict:
+        """Remember whom a mail of the user's did not reach: the addresses
+        the mail server refused while it took the mail for the others. Kept
+        by the mail's Message-ID, the newest :data:`REFUSED_MAX` mails; a
+        mail without an id, or with nobody refused, notes nothing."""
+        with self._lock:
+            doc = self._read(chat_id)
+            if not isinstance(message_id, str) or not message_id.strip():
+                return doc
+            noted = clean_refused({**(doc.get("refused") or {}), message_id: addresses})
+            if noted == (doc.get("refused") or {}):
+                return doc
+            doc["refused"] = noted
             self._write(doc)
             return doc
 
@@ -1660,6 +1803,132 @@ class ChatStateStore:
             doc["cleared"] = None
             self._write(doc)
             return True, doc
+
+
+# ── Calls owed to a chat's gateway ────────────────────────────────────────────
+
+class OwedCalls:
+    """A small durable queue of calls a chat's gateway is still owed.
+
+    What the user did to a chat, its mailbox is told (the web gateway's
+    "mailbox follows the chat"): best-effort, after the chat's state changed.
+    A call that did not go through is kept here as ``(chat id, action)`` with
+    the instant it was first owed, in one JSON file written atomically — so a
+    restart of the web gateway forgets none of them, and a timer there makes
+    them again. Bounded both ways: the newest ``maxlen`` pairs, and none
+    older than ``keep_seconds`` (a call nobody could make for that long is
+    given up; the chat's state stays the truth).
+
+    A call may carry its ``scope`` — which messages of the chat it is about,
+    as the list of their ids — so that one made late is still about what the
+    user acted on and not about what has arrived since.
+
+    Reads like a set of pairs: ``in``, ``len``, iteration (oldest first)."""
+
+    def __init__(self, path: str | Path, maxlen: int = 500,
+                 keep_seconds: float = 7 * 86400.0):
+        self._path = Path(path)
+        self._maxlen = int(maxlen)
+        self._keep = float(keep_seconds)
+        self._lock = threading.Lock()
+        self._owed: dict[tuple[str, str], float] | None = None
+        self._scopes: dict[tuple[str, str], list[str]] = {}
+
+    def _load(self) -> dict[tuple[str, str], float]:
+        if self._owed is None:
+            owed: dict[tuple[str, str], float] = {}
+            self._scopes = {}
+            try:
+                data = json.loads(self._path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                data = None
+            for row in (data.get("owed") if isinstance(data, dict) else None) or []:
+                if (isinstance(row, list) and len(row) in (3, 4) and isinstance(row[0], str)
+                        and isinstance(row[1], str) and isinstance(row[2], (int, float))
+                        and not isinstance(row[2], bool)):
+                    owed[(row[0], row[1])] = float(row[2])
+                    if len(row) == 4 and isinstance(row[3], list):
+                        self._scopes[(row[0], row[1])] = [x for x in row[3] if isinstance(x, str)]
+            self._owed = owed
+        cutoff = time.time() - self._keep
+        for pair in [p for p, since in self._owed.items() if since < cutoff]:
+            self._owed.pop(pair, None)
+            self._scopes.pop(pair, None)
+        return self._owed
+
+    def _save(self) -> None:
+        rows = [[chat_id, action, since] + ([self._scopes[(chat_id, action)]]
+                                             if (chat_id, action) in self._scopes else [])
+                for (chat_id, action), since in self._owed.items()]
+        try:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self._path.with_suffix(".tmp")
+            tmp.write_text(json.dumps({"owed": rows}, ensure_ascii=False), encoding="utf-8")
+            os.replace(tmp, self._path)
+        except OSError as exc:
+            # Still owed in memory; only a restart would forget it.
+            print(f"[chat-state] owed calls could not be written ({exc})", flush=True)
+
+    def add(self, chat_id: str, action: str, scope: list[str] | None = None) -> bool:
+        """Owe one call; True when it was not owed already (its first
+        instant stands otherwise). A ``scope`` given replaces the one kept:
+        the newest action is what the chat says now."""
+        with self._lock:
+            owed = self._load()
+            pair = (chat_id, action)
+            fresh = pair not in owed
+            if not fresh and (scope is None or self._scopes.get(pair) == scope):
+                return False
+            owed.setdefault(pair, time.time())
+            if scope is not None:
+                self._scopes[pair] = [x for x in scope if isinstance(x, str)]
+            while len(owed) > self._maxlen:
+                self._scopes.pop(next(iter(owed)), None)
+                owed.pop(next(iter(owed)))
+            self._save()
+            return fresh
+
+    def scope(self, chat_id: str, action: str) -> list[str] | None:
+        """The scope an owed call carries, or None where it carries none."""
+        with self._lock:
+            self._load()
+            kept = self._scopes.get((chat_id, action))
+            return list(kept) if kept is not None else None
+
+    def discard(self, chat_id: str, action: str | None = None) -> int:
+        """One call is owed no more — or, without ``action``, none of the
+        chat's; returns how many went."""
+        with self._lock:
+            owed = self._load()
+            doomed = [p for p in owed if p[0] == chat_id and action in (None, p[1])]
+            for pair in doomed:
+                owed.pop(pair, None)
+                self._scopes.pop(pair, None)
+            if doomed:
+                self._save()
+            return len(doomed)
+
+    def clear(self) -> None:
+        with self._lock:
+            if self._load():
+                self._owed, self._scopes = {}, {}
+                self._save()
+
+    def pairs(self) -> list[tuple[str, str]]:
+        """What is owed, oldest first."""
+        with self._lock:
+            return list(self._load())
+
+    def __contains__(self, pair) -> bool:
+        with self._lock:
+            return pair in self._load()
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._load())
+
+    def __iter__(self):
+        return iter(self.pairs())
 
 
 # ── Live overlay ──────────────────────────────────────────────────────────────

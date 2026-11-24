@@ -450,23 +450,53 @@ docstring). Pieces:
   and the grip would be; nothing is loaded into, adopted by or saved from a
   draft there. That is one switch (`_canSend`), followed on every poll.
 - **Writing mail** (`docs/mail-chats.md`, "Writing"). The **composer** of a
-  mail chat says where the reply goes, as the gateway will address it: "To
-  <sender> · Cc <everyone else on the mail>" from the latest live inbound
-  mail (the latest mail's recipients again when it is the user's own, or a
-  queued one's when that is all the thread holds). The user's own addresses
-  are left out by the account and — while the summary's participant list is
-  complete — by not being participants; it is a preview, and the gateway,
-  which knows a Reply-To and the mailbox's aliases, decides. A group thread
-  whose reply to all reaches more than the sender offers **Reply all /
-  Sender only** (two radio buttons under the line, Reply all by default);
-  the choice is the chat's for the next mail and resets with each one sent
-  or queued. The send carries it as `reply` (`"all"` in a 1:1; a messenger
-  send carries none). The box reads "Write your reply …"; **Enter** breaks a
-  line, the send button or **Ctrl/⌘+Enter** sends (an input method's Enter
-  only commits) — as on every chat, which the field's label says on mail.
-  Files are staged as on every chat and go as the mail's attachments. A
-  refused mail (400/409, e.g. no live mail left to reply to) puts the
-  server's reason in the note line and the words back in the box.
+  mail chat says where the reply goes — and that line is the server's word,
+  never the page's. `GET /chats/<id>/reply-preview` answers how the gateway
+  would address a reply right now, for Reply all and for Sender only
+  (`replyPreview` reads it whole or not at all); the page works out nothing
+  of it — no Reply-To, no "the user's own mail is the latest", no alias — and
+  asks on load, after every poll that changed the thread (a mail added,
+  changed, removed or gone, a pending send, the participants) and again at
+  the press. The line reads "To <name> <address> · Cc …": every recipient
+  with its **address**, a name only beside it (the address book's before the
+  mail's own, and none at all where a display name reads as an address
+  itself), and a To that is not where the latest mail came from saying why
+  ("the Reply-To of the mail from …"). It wraps, so no recipient is out of
+  sight; the send button's label names them too. **Reply all / Sender only**
+  (two radio buttons under the line, Reply all by default) is offered
+  exactly when the preview's `choice` is true, and is put on the page and
+  taken off it as that changes. Until the server has answered — or where it
+  has no such answer (an older server: "Recipients unavailable"), cannot be
+  reached, or says no reply is possible (409/400 with its sentence, e.g. a
+  chat that holds only a queued mail) — the line says so, the send button is
+  off, and **no reply is sent**: recipients are never guessed. The box reads
+  "Write your reply …"; **Enter** breaks a line, the send button or
+  **Ctrl/⌘+Enter** sends (an input method's Enter only commits) — as on every
+  chat, which the field's label says on mail. Files are staged as on every
+  chat and go as the mail's attachments.
+- **The press.** The reply mode is the one on screen at the press (read
+  before anything is awaited; the choice resets to Reply all there and comes
+  back with the words if the mail does not go). The recipients are then asked
+  for once more, and the mail is posted only if that answer is there, is not
+  older than the thread on screen, and addresses the reply as the line did;
+  otherwise nothing is posted, the words come back and the line shows what
+  the server now says. The request carries `reply` and a **`request_key`** —
+  one per press — and its answer is read strictly: **200** is the mail;
+  **202** `{pending}` a send that waits for approval; **202**
+  `{unconfirmed, message_id?, request_key}` a mail handed over whose outcome
+  nobody knows yet — its bubble stays, "Sending — not confirmed yet", the
+  words are **never** put back in the box, and it gives way to the mail when
+  that shows (by `message_id`), to the server's pending entry (by
+  `message_id` or `request_key`), or to the answer of **Check again**, which
+  posts the very same body under the same key (offered where the server
+  echoed the key). A **4xx** is the server's refusal: "Not sent: <its
+  sentence>", words back. Anything else — no answer, a 5xx, a 200 that is no
+  document — says nothing about whether the mail went out and is never
+  reported as "not sent": the words come back with the key they went under
+  (kept on the device with them, for twelve hours), so the same words sent
+  again are the same mail to the gateway and not a second one; a press made
+  again whose first mail had gone out says so. Messenger sends are as they
+  were.
 - **Pending sends.** A mail goes under its account's send policy, and a send
   the policy queues answers **202** `{pending}`: the optimistic bubble gives
   way at once to a **pending bubble** at the thread's end — the words, "You
@@ -485,12 +515,23 @@ docstring). Pieces:
   the thread. Pending bubbles are matched by `request_id`, and to the mail a
   released one became by its `message_id` (the Message-ID the gateway minted
   when it queued it) — never by their words, which on mail are long and come
-  back trimmed. An unconfirmed mail send is likewise found by its
-  `message_id`. A page left while a send was on its way does not put a mail
-  that was queued back into the box. A chat in the list whose latest entry
-  is a queued send previews it as "Waiting for approval: …".
+  back trimmed. An entry also says what became of a send that was let go
+  (`status`): **`sending`** ("Sending — not confirmed yet", nothing to
+  approve) and **`failed`**, which stays until the user dismisses it — "Not
+  sent" with the server's reason (`error`, as text), or, with
+  `outcome_unknown`, "Not confirmed — this mail may have gone out" — and two
+  controls: **Copy text back to the composer** (after what the box holds,
+  never over it) and **Dismiss** (`POST
+  /chats/<id>/pending/<request id>/dismiss`; a refusal leaves the bubble
+  with the reason). Recipients the mail server refused (`refused`) are named
+  on the pending bubble and on the sent mail's. A page left while a send was
+  on its way does not put a mail that was queued back into the box. A chat
+  in the list whose latest entry is a queued send previews it as "Waiting
+  for approval: …" (or "Sending:", "Not sent:", "Not confirmed:" where
+  `last.status` says so).
 - **New mail.** The Chats page's **＋** (only where `GET /chats/compose`
-  offers something) opens a short menu — *New e-mail* — and that the
+  offers something; the mailboxes it names are asked for again each time
+  the ＋ is opened) opens a short menu — *New e-mail* — and that the
   **compose sheet** (`components/compose-sheet.js`): a modal dialog (the page
   behind inert, focus in To, Tab kept inside; Escape, ✕ or a press on the
   dimmed page closes it and gives the focus back to the ＋) with From (a choice only when the offer names
@@ -499,14 +540,29 @@ docstring). Pieces:
   field takes the last back), pasted (`"Doe, Jane" <jane@x.org>, b@y.org`
   is two), or picked from the address book's suggestions (`GET
   /contacts?q=`, the matching people's e-mail addresses, a combobox walked
-  with the arrow keys) — Subject and the text. Addresses are checked by
-  shape only; what is not one stays in the field with its error under it.
-  Send (or Ctrl/⌘+Enter in the text) posts `POST /chats/compose` and, on
-  200 or 202, goes to the new chat (`/chat.html?id=<id>`), which may hold
-  only the pending bubble; a refusal shows in the sheet with everything still
-  there. Closing keeps what the sheet holds on the device
-  (`compose:<channel>` in drafts.js) for the next opening; Discard empties
-  it; a send that went through drops it.
+  with the arrow keys; leaving the field ends them, and an answer never
+  opens a list under a field that does not have the focus) — Subject and the
+  text. Addresses are checked by shape only; what is not one stays in the
+  field with its error under it, and so do the addresses past the cap of 50,
+  which the error names. An input method's Enter only commits what it
+  composes (also WebKit's, told by keyCode 229). Send (or Ctrl/⌘+Enter in
+  the text) posts `POST /chats/compose` with a `request_key` and, on 200 or
+  202 with the new chat's id, goes to the new chat (`/chat.html?id=<id>`),
+  which may hold only the pending bubble. **One press is one mail**: while
+  the request is on its way nothing starts a second one — closing the sheet
+  and opening it again brings back the same sheet, still sending — and a
+  send that fails after the sheet was closed opens it again with what
+  happened. A refusal (4xx) shows as "Not sent: …" with everything still
+  there; an answer that leaves open whether the mail went out (202
+  `{unconfirmed}` without a chat, a 5xx, none) says exactly that, and the
+  press stays with the mail, so that sent again unchanged it goes out under
+  the same key. Closing keeps what the sheet holds on the device
+  (`compose:<channel>:<mailbox>` in drafts.js, with the unanswered press)
+  for the next opening **from that mailbox**: a kept mail never comes back
+  into a sheet writing from another one (a mailbox that is not offered at
+  the moment keeps its mail, and the sheet says so), and changes its sender
+  only where the user picks another mailbox under From. Discard empties it;
+  a send that went through drops it.
 
 The API, as the components consume it:
 
@@ -776,20 +832,37 @@ The API, as the components consume it:
   that lets nothing load or run (the chat page's own policy gains
   `frame-src 'self'` for it).
 
-  Writing: `POST /chats/<id>/send` takes `reply: "all" | "sender"` on a mail
-  chat and answers `200` with the Message (sent) or `202 {pending: Pending}`
-  (queued), where `Pending` is `{request_id, approval_url, text, ts, author,
-  agent?, to, cc, subject, message_id?}` (`approval_url` path-only,
-  `/sends/<slug>/<id>`). `GET /chats/<id>/messages` carries top-level
-  `pending: [Pending]` (oldest first; `[]` on other channels, and a document
-  without the field leaves what the page shows), and a `GET /chats` entry
-  `pending: n`, its `last` a queued send's with `pending: true` where that is
-  the latest. `GET /chats/compose` → `{channels: [{channel, label,
-  accounts}]}`, what ＋ offers (a 404 is taken as nothing); `POST
-  /chats/compose` `{channel, account?, to, cc, subject, text}` → `200 {id,
-  message}` or `202 {id, pending}`, an error `{error}` with a 4xx otherwise.
-  Mark as read, Archive and Delete on a mail chat are the same calls as on
-  every chat; the server carries them into the mailbox.
+  Writing: `GET /chats/<id>/reply-preview` → `{all: Addressing, sender:
+  Addressing, choice, subject}`, `Addressing` being `{to: [Party], cc:
+  [Party]}` and `Party` `{address, name, contact}` — exactly what a reply
+  would be addressed to right now in either mode, `name` the display name on
+  record or null, `contact` the address book's **name** for the person who
+  holds the address (a string, or `{name}`; a string that reads as an
+  identifier is not shown as a name), `choice` whether the two modes differ;
+  `409`/`400` `{error}` where no reply is possible, and a `404` is taken as
+  a server that cannot say (the page then sends no reply). `POST
+  /chats/<id>/send` takes `reply: "all" | "sender"` and `request_key` (an
+  opaque token of at most 64 characters, one per press) on a mail chat and
+  answers `200` with the Message (sent; `refused: [addresses]` where the
+  mail server took only some recipients), `202 {pending: Pending}` (queued)
+  or `202 {unconfirmed: true, message_id?, request_key}` (handed over,
+  outcome unknown), where `Pending` is `{request_id, approval_url, text, ts,
+  author, agent?, to, cc, subject, message_id?, request_key?, status?,
+  error?, outcome_unknown?, refused?}` (`approval_url` path-only,
+  `/sends/<slug>/<id>`; `status` `pending` — the default — `sending` or
+  `failed`). `POST /chats/<id>/pending/<request id>/dismiss` takes a failed
+  one off the list. `GET /chats/<id>/messages` carries top-level `pending:
+  [Pending]` (oldest first; `[]` on other channels, and a document without
+  the field leaves what the page shows), every mail Message `reply_to:
+  [addresses]`, and a `GET /chats` entry `pending: n`, its `last` a queued
+  send's with `pending: true` where that is the latest. `GET /chats/compose`
+  → `{channels: [{channel, label, accounts}]}`, what ＋ offers (a 404 is
+  taken as nothing); `POST /chats/compose` `{channel, account?, to, cc,
+  subject, text, request_key}` → `200 {id, message}`, `202 {id, pending}` or
+  `202 {unconfirmed: true, id?, message_id?, request_key}`, an error
+  `{error}` with a 4xx otherwise. Mark as read, Archive and Delete on a mail
+  chat are the same calls as on every chat; the server carries them into the
+  mailbox.
 
 **Reference documents:** `data/chats.json` and `data/chats/<slug>.json` are
 static documents in the API's response shapes — the contract drafts the API
@@ -809,7 +882,9 @@ too (`data/chats/email-quarterly.json`): a group thread with an inline image
 and an attached sheet, a mail sent from another client, an HTML mail whose
 subject is not the thread's, a tombstone and a reply waiting for approval
 (`pending`), with the Original of its HTML mail beside it
-(`email-quarterly.original.json`). Companion messages
+(`email-quarterly.original.json`) and the reply preview the composer's
+recipients line is drawn from (`email-quarterly.reply-preview.json`).
+Companion messages
 themselves are conversation documents, not chat ones, so the corpus holds
 none — the suite mocks `/conversations/<id>` for those.
 

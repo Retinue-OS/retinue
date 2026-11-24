@@ -57,8 +57,9 @@ class MiniImap:
     client: anything that would change a mailbox is answered BAD, and the
     tests of the mirror assert none was ever sent. ``writable`` lets the
     writes through — SELECT, UID STORE, UID COPY, UID MOVE and UID EXPUNGE
-    (the last two where ``capabilities`` names MOVE and UIDPLUS), APPEND and
-    CREATE; a whole-folder EXPUNGE and CLOSE stay BAD in every mode."""
+    (the last two where ``capabilities`` names MOVE and UIDPLUS), APPEND,
+    CREATE and SUBSCRIBE (``subscribed`` holds the names); a whole-folder
+    EXPUNGE and CLOSE stay BAD in every mode."""
 
     def __init__(self):
         self.folders: dict = {}
@@ -80,6 +81,7 @@ class MiniImap:
         self.refuse = {}              # a write's verb ("STORE", "MOVE", …) → what follows "NO"
         self.drop_after = None        # carry this write out, then hang up without an answer
         self.opened = []              # ("SELECT" | "EXAMINE", folder), in order
+        self.subscribed = []          # folder names, as SUBSCRIBE named them
 
     def folder(self, name, attrs="\\HasNoChildren", validity=7):
         self.folders[name] = {"attrs": attrs, "validity": validity, "next": 1, "mails": {}}
@@ -207,6 +209,13 @@ class MiniImap:
                     else:
                         self.folder(name, validity=70 + len(self.folders))
                         send(f"{tag} OK created")
+                elif verb == "SUBSCRIBE" and self.writable:
+                    name = _TOKEN_RE.match(args).group(1)
+                    if "SUBSCRIBE" in self.refuse:
+                        send(f"{tag} NO {self.refuse['SUBSCRIBE']}")
+                    else:
+                        self.subscribed.append(name)
+                        send(f"{tag} OK subscribed")
                 else:
                     send(f"{tag} BAD not here")
         except OSError:
@@ -390,9 +399,11 @@ def _server() -> MiniImap:
 
 def test_folder_roles():
     with tempfile.TemporaryDirectory() as tmp:
-        gw = t.load(tmp, SENT_FOLDER="Sent Items", MAIL_ARCHIVE_FOLDER="Ablage",
-                    MAIL_TRASH_FOLDER="Bin")
-        # The server says which folder is which: its word beats the configured names.
+        # Nothing set for the archive and the Trash: the server says which
+        # folder is which, and its word beats the default names — as it beats
+        # the configured Sent folder.
+        gw = t.load(tmp, SENT_FOLDER="Sent Items")
+        assert not gw.MAIL_ARCHIVE_FOLDER_SET and not gw.MAIL_TRASH_FOLDER_SET
         server = MiniImap()
         server.folder("INBOX")
         server.folder("Sent Items")                              # a client's own, unmarked
@@ -413,7 +424,22 @@ def test_folder_roles():
             # Names sent as literals are read the same.
             server.literal_names = True
             assert box.folders()["trash"] == "Gelöscht"
+        marked = server
+        marked.literal_names = False
 
+    with tempfile.TemporaryDirectory() as tmp:
+        # A name the deployment set IS the folder, whatever the server marks:
+        # the archive it names, and for a Trash name the server does not
+        # have, none — never the marked one in its place.
+        gw = t.load(tmp, SENT_FOLDER="Sent Items", MAIL_ARCHIVE_FOLDER="Ablage",
+                    MAIL_TRASH_FOLDER="Bin")
+        assert gw.MAIL_ARCHIVE_FOLDER_SET and gw.MAIL_TRASH_FOLDER_SET
+        with Wired(gw, marked):
+            box = gw.Mailbox(gw.MAIL_CONFIG)
+            assert box.folders() == {"inbox": "INBOX", "sent": "Gesendete Objekte",
+                                     "archive": "Ablage", "trash": None}
+            marked.folder("bin")
+            assert box.folders()["trash"] == "bin", "matched without case, like every name"
         # No SPECIAL-USE: the configured names, matched exactly, else without case.
         server = MiniImap()
         for name in ("Inbox", "Sent Items", "ablage", "Drafts"):
@@ -421,6 +447,12 @@ def test_folder_roles():
         with Wired(gw, server):
             assert gw.Mailbox(gw.MAIL_CONFIG).folders() == {
                 "inbox": "Inbox", "sent": "Sent Items", "archive": "ablage", "trash": None}
+
+    with tempfile.TemporaryDirectory() as tmp:
+        # Set but empty is not set (compose passes the variables through).
+        gw = t.load(tmp, MAIL_ARCHIVE_FOLDER="  ", MAIL_TRASH_FOLDER="")
+        assert not gw.MAIL_ARCHIVE_FOLDER_SET and not gw.MAIL_TRASH_FOLDER_SET
+        assert (gw.MAIL_ARCHIVE_FOLDER, gw.MAIL_TRASH_FOLDER) == ("Archive", "Trash")
 
     with tempfile.TemporaryDirectory() as tmp:
         gw = t.load(tmp)
@@ -434,6 +466,19 @@ def test_folder_roles():
             "trash": "[Gmail]/Trash"}
         both = gmail + [({"\\archive"}, "Archive")]
         assert resolve(both, "Sent", "Archive", "Trash")["archive"] == "Archive"
+        # A set name wins over both marks — and while no folder has it, the
+        # role has none (the first Archive makes it; a Trash is never made).
+        named = both + [(set(), "Done"), (set(), "Bin")]
+        assert resolve(named, "Sent", "Done", "Bin") == {
+            "inbox": "INBOX", "sent": "[Gmail]/Sent Mail", "archive": "Archive",
+            "trash": "[Gmail]/Trash"}
+        assert resolve(named, "Sent", "Done", "Bin", archive_explicit=True,
+                       trash_explicit=True) == {
+            "inbox": "INBOX", "sent": "[Gmail]/Sent Mail", "archive": "Done", "trash": "Bin"}
+        assert resolve(both, "Sent", "Done", "Bin", archive_explicit=True,
+                       trash_explicit=True) == {
+            "inbox": "INBOX", "sent": "[Gmail]/Sent Mail", "archive": None, "trash": None}
+        assert resolve(both, "Sent", "Done", "Bin", trash_explicit=True)["archive"] == "Archive"
         # A folder that cannot be opened plays no role, whatever it is marked.
         assert resolve([({"\\sent", "\\noselect"}, "Sent")], "Sent", "A", "T")["sent"] is None
         assert resolve([], "Sent", "Archive", "Trash") == {
@@ -444,7 +489,7 @@ def test_folder_roles():
         assert entry(b"(\\Noselect) NIL Plain") == ({"\\noselect"}, "Plain")
         assert entry((b'(\\Trash) "." {5}', b"M&APw-ll")) == ({"\\trash"}, "Müll")
         assert entry(b"garbage") is None and entry(None) is None
-    print("ok: folder roles come from SPECIAL-USE first, then from the configured names")
+    print("ok: a set archive or Trash name is the folder; else SPECIAL-USE, then the default")
 
 
 # --------------------------------------------------------------------------
@@ -821,17 +866,30 @@ def test_append_and_create():
             assert box.folders()["trash"] is None
             box.create("Trash")
             assert box.folders()["trash"] == "Trash"
-            box.create("Trash")         # there already: no failure
+            # Made and subscribed: unsubscribed, a mail client that lists
+            # subscribed folders would not show it, or the mail moved into it.
+            assert server.subscribed == ["Trash"]
+            assert server.commands[-3:-1] == ['CREATE "Trash"', 'SUBSCRIBE "Trash"']
+            box.create("Trash")         # there already: no failure — and subscribed still
+            assert server.subscribed == ["Trash", "Trash"]
             box.create("Ablage/Erledigt ü")
-            assert gw._ec.imap_utf7_encode("Ablage/Erledigt ü") in server.folders
+            wire = gw._ec.imap_utf7_encode("Ablage/Erledigt ü")
+            assert wire in server.folders and server.subscribed[-1] == wire
+            # A server that will not subscribe has still made the folder.
+            server.refuse["SUBSCRIBE"] = "[NOPERM] no subscriptions here"
+            box.create("Unlisted")
+            assert "Unlisted" in server.folders and "Unlisted" not in server.subscribed
+            del server.refuse["SUBSCRIBE"]
             server.refuse["CREATE"] = "[NOPERM] not here"
             try:
                 box.create("Other")
                 raise AssertionError("no error")
             except gw.MailboxError as exc:
                 assert "NOPERM" in str(exc)
+            assert "Other" not in server.subscribed, "nothing is subscribed that was not made"
             assert not _never(server.commands)
-    print("ok: a mail is appended seen, with its UID where the server names it; a folder is made")
+    print("ok: a mail is appended seen, with its UID where the server names it; a folder is "
+          "made and subscribed")
 
 
 def test_a_write_is_made_once_whatever_happens_to_the_connection():
@@ -877,6 +935,7 @@ def test_the_mailbox_follows_the_chat_over_the_adapter():
             gw = t.load(tmp)
             events = t.rail(gw)
             server = _writable(capabilities)
+            server.folder("Deleted Items", "\\HasNoChildren \\Trash")
             with Wired(gw, server):
                 mirror = gw.Mirror(gw.Mailbox(gw.MAIL_CONFIG), clock=lambda: t.NOW)
                 mirror.poll()
@@ -915,9 +974,10 @@ def test_the_mailbox_follows_the_chat_over_the_adapter():
 
                 result = mirror.delete_chat("a@x.org")
                 assert result["errors"] == 0 and result["trashed"] == 3, result
-                # The Trash was made, and holds the thread — the user's own
-                # reply from Sent with it.
-                assert _ids(server, "Trash") == ["a@x.org", "b@x.org", "s@example.org"]
+                # The account's own Trash holds the thread — the user's own
+                # reply from Sent with it — and no folder was made for it.
+                assert _ids(server, "Deleted Items") == ["a@x.org", "b@x.org", "s@example.org"]
+                assert not any(c.startswith("CREATE") for c in server.commands)
                 for _ in range(3):
                     mirror.poll()
                 assert [r["message_id"] for r in t.records(gw)] == ["other@x.org"], capabilities
@@ -929,6 +989,66 @@ def test_the_mailbox_follows_the_chat_over_the_adapter():
                         assert server.opened[at + 1] == ("EXAMINE", name), server.opened[at:at + 2]
                 assert server.opened[-1][0] == "EXAMINE"
     print("ok: read, archive, the Sent copy and delete run over the real adapter")
+
+
+def test_the_archive_and_the_trash_as_configured_over_the_adapter():
+    # A name the deployment set wins over what the server marks: Archive
+    # makes "Done" — subscribed — beside the server's own \Archive, and the
+    # mirror follows "Done". A Trash is never made, set or not.
+    with tempfile.TemporaryDirectory() as tmp:
+        gw = t.load(tmp, MAIL_ARCHIVE_FOLDER="Done", MAIL_TRASH_FOLDER="Bin")
+        t.rail(gw)
+        server = _writable()
+        server.folder("Deleted Items", "\\HasNoChildren \\Trash")
+        with Wired(gw, server):
+            mirror = gw.Mirror(gw.Mailbox(gw.MAIL_CONFIG), clock=lambda: t.NOW)
+            mirror.poll()
+            assert "'Done'" in mirror.health_notice() and "made" in mirror.health_notice()
+            server.put("INBOX", t.msg("a@x.org", day=1), date=t.NOW)
+            server.put("INBOX", t.msg("b@x.org", subject="Re: Quarterly numbers",
+                                      refs=["a@x.org"], irt="a@x.org", day=2), date=t.NOW)
+            mirror.poll()
+            assert mirror.archive("a@x.org") == {"moved": 2, "flagged": 0}
+            assert _ids(server, "Done") == ["a@x.org", "b@x.org"] and _ids(server, "Archive") == []
+            assert server.subscribed == ["Done"]
+            # Deleted at once, as the page does it (Delete is offered on the
+            # archived chat) — before any poll has looked at the new folder.
+            # "Bin" is what was set, and the mailbox has none: the server's
+            # own Trash is not taken instead, none is made, nothing is erased.
+            result = mirror.delete_chat("a@x.org")
+            assert result["errors"] == 2 and result["trashed"] == 0, result
+            assert "MAIL_TRASH_FOLDER" in result["error"] and "'Bin'" in result["error"]
+            assert "Bin" not in server.folders and _ids(server, "Deleted Items") == []
+            assert len(t.records(gw)) == 2 and _ids(server, "Done") == ["a@x.org", "b@x.org"]
+            server.folder("Bin")
+            result = mirror.delete_chat("a@x.org")
+            assert result["errors"] == 0 and result["trashed"] == 2, result
+            assert _ids(server, "Bin") == ["a@x.org", "b@x.org"] and _ids(server, "Done") == []
+            assert t.records(gw) == [] and server.subscribed == ["Done"]
+            for _ in range(2):
+                mirror.poll()
+            assert t.records(gw) == [] and mirror.health_notice() is None
+            assert mirror._folder("archive")["name"] == "Done"
+            assert not _never(server.commands)
+
+    # Nothing set, and nothing the server marks or names "Trash": the delete
+    # fails and says what to set — no CREATE is ever sent for a Trash.
+    with tempfile.TemporaryDirectory() as tmp:
+        gw = t.load(tmp)
+        t.rail(gw)
+        server = _writable()
+        server.folder("Papierkorb")         # the account's trash, unmarked
+        with Wired(gw, server):
+            mirror = gw.Mirror(gw.Mailbox(gw.MAIL_CONFIG), clock=lambda: t.NOW)
+            mirror.poll()
+            server.put("INBOX", t.msg("a@x.org", day=1), date=t.NOW)
+            mirror.poll()
+            result = mirror.delete_chat("a@x.org")
+            assert result["errors"] == 1 and "MAIL_TRASH_FOLDER" in result["error"], result
+            assert "'Trash'" in result["error"]
+            assert not any(c.split()[0] in ("CREATE", "SUBSCRIBE") for c in server.commands)
+            assert _ids(server, "INBOX") == ["a@x.org"] and len(t.records(gw)) == 1
+    print("ok: a set folder name is used and the archive made subscribed; a Trash is never made")
 
 
 # --------------------------------------------------------------------------

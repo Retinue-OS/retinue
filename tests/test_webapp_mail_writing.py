@@ -5,17 +5,26 @@ compose-sheet.js and swipe-rows.js; docs/mail-chats.md, "Writing").
 The elements are driven under Node with a scripted DOM and a scripted fetch,
 and pin:
 
-  * whom a reply reaches (replyRecipients): the latest live inbound mail's
-    sender To and everyone else on it in Cc, the user's own addresses left
-    out by the account and by the participant list while it is complete;
-    Sender only drops the Cc; a thread whose latest mail is the user's own,
-    or that is only a queued mail, goes to that mail's recipients again;
-  * the composer on a mail chat: the To/Cc line, Reply all / Sender only in
-    a group thread whose reply to all reaches more than the sender (and not
-    elsewhere), the placeholder, labels and send label worded for mail;
-    messenger composers as before;
-  * the reply choice in the request body (`reply`, "all" by default and in a
-    1:1, none on a messenger), reset with each sent mail;
+  * whom a reply reaches is the server's word (GET /chats/<id>/reply-preview)
+    and never worked out by the page: the document read whole or not at all
+    (replyPreview), names shown only beside their address and dropped where
+    they read as one (partyName), the address book's name before the mail's;
+    the To/Cc line, the send button's label and the Reply all / Sender only
+    choice drawn from that answer alone — a Reply-To, the user's own mail
+    being the latest, an alias; a To that is not where the latest mail came
+    from says why; asked on load, after every poll that changed the thread
+    (a mail added, changed, removed or gone, a pending send, the people) and
+    not otherwise; an overtaken answer dropped; the pair put on the page and
+    taken off it, not only checked;
+  * no answer, no reply: unanswered, `unavailable` (a server without the
+    endpoint, a document that is not one), away, or the gateway's own "no
+    reply here" (a chat that holds only a queued mail) — the line says so,
+    the button is off, nothing is posted and the words stay;
+  * the press: the mode read at the press and reset there, the recipients
+    asked for once more, and nothing posted unless that answer is there, not
+    older than the thread on screen and the line the user was looking at;
+    `reply` and one `request_key` in the body; messenger composers and sends
+    as before;
   * Enter is a line break, Ctrl+Enter and ⌘+Enter send, an input method's
     Enter does not — on a mail chat and on a messenger chat alike;
   * the pending bubble's whole life: from a 202 at once (the optimistic
@@ -27,20 +36,38 @@ and pin:
     thread), never absorbed by a message with the same words; its accessible
     name and visible state; its text escaped; a page left mid-send does not
     put a queued mail back in the box;
+  * what became of a send that was let go: `sending` and `failed` entries
+    in words, the reason as text, "may have gone out" where nobody knows,
+    the text back into the composer (after what it holds) and Dismiss (one
+    request, a refusal shown, a lagging poll not drawing it again), the
+    recipients the mail server refused named on the bubble and on the mail;
   * the approval link: built by DOM calls, only from a path that is exactly
     /sends/<slug>/<id> — anything else plain text;
-  * an unconfirmed mail send reconciled by its Message-ID, not its words; a
-    refused mail says why;
+  * a mail that may have gone out is never called "not sent": 202
+    `{unconfirmed}` keeps the bubble ("Sending — not confirmed yet") and
+    never restores the words; it gives way to the mail (by Message-ID, never
+    by words) or to the server's pending entry (by Message-ID or
+    request_key); Check again posts the same body under the same key; no
+    answer, a 5xx or a 200 that is no document put the words back with the
+    key they went under, so the same press again is the same mail — also
+    across a reload and a page left mid-send; only a 4xx is "Not sent";
   * ＋ on the Chats page: present only when GET /chats/compose offers
-    something, its menu, the sheet it opens; the delete wording of a mail
+    something, its menu, the sheet it opens, the mailboxes on offer asked
+    for again as it is opened; the delete wording of a mail
     thread (the mails move to the mailbox's Trash) and of a messenger chat;
-    a pending preview in the list;
+    a pending preview in the list, by its state;
   * the compose sheet: address shape and splitting, chips from typing and
-    pasting, invalid input left in place with its error, removal, address
-    book suggestions with the keyboard (stale answers dropped), validation
-    before any request, the request, navigation to the new chat on 200 and
-    on 202, errors in place, Escape and the focus given back, the page
-    behind inert, the unsent mail kept for the next opening;
+    pasting, invalid input left in place with its error, removal, the
+    recipient cap (what it kept out named and left in the field, cleared
+    from the keyboard), address book suggestions with the keyboard (stale
+    answers dropped, none under a field that was left), an input method's
+    Enter (also WebKit's, keyCode 229), validation before any request, the
+    request with its `request_key`, navigation to the new chat on 200 and on
+    202, one press one mail (closing and opening the sheet does not arm Send
+    again; a failure after closing brings the sheet back), errors in place
+    and never "not sent" where the outcome is open, the key kept with the
+    mail, Escape and the focus given back, the page behind inert, the unsent
+    mail kept per mailbox and never moved to another one unseen;
   * the quick-pattern prompts worded for mail.
 
 Standalone like the rest of the suite. Needs `node` on PATH; without it the
@@ -294,7 +321,7 @@ const take = (pred, what) => {
 };
 
 const page = await import('./chat-page.js');
-const { replyRecipients, approvalPath, QUICK_PATTERNS } = page;
+const { replyPreview, partyName, approvalPath, QUICK_PATTERNS } = page;
 const Page = registry.get('retinue-chat-page');
 const List = registry.get('retinue-chats');
 const sheetMod = await import('./compose-sheet.js');
@@ -311,6 +338,9 @@ async function ok(name, fn) { await fn(); passed += 1; console.log('  ok  ' + na
 const ACCT = 'me@example.org';
 const ID = 'email:~me@example.org:root@mail.example.com';
 const MSG_URL = `/chats/${encodeURIComponent(ID)}/messages`;
+const PV_URL = (id = ID) => `/chats/${encodeURIComponent(id)}/reply-preview`;
+const SEND_URL = `/chats/${encodeURIComponent(ID)}/send`;
+const KEY_RE = /^[A-Za-z0-9_-]{16,64}$/;
 const PEOPLE = [{ address: 'ann@example.com', name: 'Ann Example', contact: null },
                 { address: 'bob@builder.example', name: 'Bob Builder', contact: null },
                 { address: 'carla@example.net', name: null, contact: null }];
@@ -323,7 +353,7 @@ const summary = (extra = {}) => ({
 const mail = (id, direction, ts, extra = {}) => ({
   id, chat: ID, direction, ts, text: `text of ${id}`, sender: 'ann@example.com', sender_name: 'Ann Example',
   subject: 'Re: Quarterly numbers', recipients: [ACCT, 'bob@builder.example'], cc: ['carla@example.net'],
-  trim: 'deterministic', removed: false, removed_at: null, attachments: [], ...extra,
+  reply_to: [], trim: 'deterministic', removed: false, removed_at: null, attachments: [], ...extra,
 });
 const BASE = [
   mail('m1', 'in', '2026-11-20T08:00:00Z', { subject: 'Quarterly numbers' }),
@@ -335,6 +365,18 @@ const pend = (rid, extra = {}) => ({
   author: 'user', to: ['ann@example.com'], cc: ['bob@builder.example'], subject: 'Re: Quarterly numbers', ...extra,
 });
 const clone = (x) => JSON.parse(JSON.stringify(x));
+
+// The server's word on whom a reply reaches (GET /chats/<id>/reply-preview),
+// as the gateway would address it for BASE: Ann wrote last, to the user and
+// Bob, copying Carla.
+const ANN = { address: 'ann@example.com', name: 'Ann E.', contact: 'Ann Example' };
+const BOB = { address: 'bob@builder.example', name: 'Bob Builder', contact: null };
+const CARLA = { address: 'carla@example.net', name: null, contact: null };
+const PV = (extra = {}) => ({
+  all: { to: [ANN], cc: [BOB, CARLA] }, sender: { to: [ANN], cc: [] }, choice: true,
+  subject: 'Re: Quarterly numbers', ...extra,
+});
+const SOLO = () => PV({ all: { to: [ANN], cc: [] }, choice: false });
 
 // The chat page with its thread: render() rebuilds the thread from
 // _chatThreadHtml and mounts the approval links, as the real one does.
@@ -359,8 +401,31 @@ function rig(el) {
   el._refreshChatComposer = () => {};
   el._keepLocal = () => {};
 }
-async function open(chat = {}, messages = BASE, pending = []) {
+// One request for the reply preview, answered: a document (200), [document,
+// status], or 'offline'.
+function give(req, preview) {
+  if (preview === 'offline') req.fail();
+  else if (Array.isArray(preview)) req.answer(preview[0], preview[1]);
+  else req.answer(clone(preview));
+}
+function answerPreview(el, preview, what = 'the reply preview') {
+  const req = take((w) => w.url === PV_URL(el._id) && w.method === 'GET', what);
+  give(req, preview);
+  return req;
+}
+// The page asks again and is told `preview`: what it holds from here on.
+async function tell(el, preview) {
+  const p = el._fetchPreview();
+  answerPreview(el, preview);
+  await p;
+  el._pv = preview;
+}
+const asked = (el) => wire.filter((w) => w.url === PV_URL(el._id)).length;
+// `preview`: what the server answers the page's first question with (and,
+// until a test says otherwise, every later one); null leaves it unanswered.
+async function open(chat = {}, messages = BASE, pending = [], preview = PV(), keep = false) {
   wire.length = 0;
+  if (!keep) store.clear();
   document.activeElement = null;
   globalThis.focused = null;
   const el = new Page();
@@ -374,97 +439,308 @@ async function open(chat = {}, messages = BASE, pending = []) {
     .answer({ chat: summary(chat), messages: clone(messages), pending: clone(pending) });
   await loading;
   clearInterval(el._pollTimer);
+  el._pv = preview;
+  const s = summary(chat);
+  if (s.channel === 'email' && s.can_send !== false) {
+    assert.equal(asked(el), 1, 'the page asks where a reply would go as it opens');
+    if (preview !== null) {
+      answerPreview(el, preview);
+      await settle();
+    }
+  } else {
+    assert.equal(asked(el), 0, 'no reply preview where there is no mail composer');
+  }
   return el;
 }
-async function poll(el, messages, pending, chat = {}) {
+// A poll, and — where it changed the thread — the question it makes the page
+// ask again, answered with `preview` (by default as before). → whether the
+// page asked.
+async function poll(el, messages, pending, chat = {}, preview = undefined) {
   const p = el._poll();
   take((w) => w.url === el._msgUrl && w.method === 'GET', 'the poll')
     .answer({ chat: summary(chat), messages: clone(messages), ...(pending === undefined ? {} : { pending: clone(pending) }) });
   await p;
+  const again = asked(el) > 0;
+  if (preview !== undefined) el._pv = preview;
+  if (again && el._pv !== null) {
+    answerPreview(el, el._pv);
+    await settle();
+  }
+  return again;
 }
-async function send(el, text, answer, status = 200) {
+// What the page asks on its own after an answer (the recipients again, the
+// chat's pending sends): answered as before, or dropped.
+async function quiet(el) {
+  await settle();
+  for (const w of wire.filter((x) => x.url === PV_URL(el._id))) {
+    wire.splice(wire.indexOf(w), 1);
+    if (el._pv !== null) give(w, el._pv);
+  }
+  for (const w of wire.filter((x) => x.url === el._msgUrl && x.method === 'GET')) wire.splice(wire.indexOf(w), 1);
+  await settle();
+}
+// A press of Send. On a mail chat the recipients are asked for once more
+// before anything is posted — answered `at` (by default what the page was
+// told last) — then the send leaves and is answered.
+async function send(el, text, answer, status = 200, at = undefined) {
   const p = el._sendChat(text);
   await settle();
+  if (el._chat.channel === 'email') {
+    answerPreview(el, at === undefined ? el._pv : at, 'the preview at the press');
+    await settle();
+  }
   const req = take((w) => w.method === 'POST' && w.url.endsWith('/send'), 'the send');
-  req.answer(answer, status);
+  if (answer === 'offline') req.fail();
+  else req.answer(answer, status);
   await p;
+  await quiet(el);
   return req;
+}
+// A press that must post nothing.
+async function refusedPress(el, text, at = undefined) {
+  const before = wire.filter((w) => w.method === 'POST').length;
+  const p = el._sendChat(text);
+  await settle();
+  if (at !== undefined) {
+    answerPreview(el, at, 'the preview at the press');
+    await settle();
+  }
+  await p;
+  assert.equal(wire.filter((w) => w.method === 'POST').length, before, 'nothing was posted');
+  await quiet(el);
 }
 const link = (el, rid) => {
   const n = el._thread.pnode(rid);
   assert.ok(n, `pending bubble ${rid}`);
   return n._slot;
 };
+const sentMsg = (id, text, extra = {}) => ({ id, chat: ID, direction: 'out', author: 'user', text, sender: ACCT,
+                                            ts: '2026-11-20T11:00:00Z', ...extra });
 
-// ── Whom a reply reaches ─────────────────────────────────────────────────────
-await ok('a reply goes to the latest inbound mail\'s sender, the rest in Cc', async () => {
-  const c = summary();
-  let r = replyRecipients(c, BASE);
-  assert.deepEqual(r.to, [{ address: 'ann@example.com', name: 'Ann Example' }]);
-  assert.deepEqual(r.cc, [{ address: 'bob@builder.example', name: 'Bob Builder' },
-                          { address: 'carla@example.net', name: '' }], 'the account is left out');
-  assert.deepEqual(replyRecipients(c, BASE, 'sender').cc, [], 'Sender only');
-  // An alias of the user's on the mail: not a participant, so not Cc'd while
-  // the participant list is complete …
-  const alias = [mail('a', 'in', 't', { recipients: ['ME-alias@example.org', 'bob@builder.example'], cc: [] })];
-  assert.deepEqual(replyRecipients(c, alias).cc.map((x) => x.address), ['bob@builder.example']);
-  // … and only the account is known to be the user's once it is capped.
-  assert.deepEqual(replyRecipients({ ...c, participants_more: 2 }, alias).cc.map((x) => x.address),
-                   ['ME-alias@example.org', 'bob@builder.example']);
-  // Case and repeats: one entry each; the To is never Cc'd as well.
-  const dup = [mail('d', 'in', 't', { recipients: ['Ann@Example.com', ACCT.toUpperCase(), 'bob@builder.example'], cc: ['BOB@builder.example'] })];
-  r = replyRecipients(c, dup);
-  assert.deepEqual(r.cc.map((x) => x.address), ['bob@builder.example']);
-  // A tombstone is not replied to; the newest live inbound is.
-  const gone = [...BASE, mail('g', 'in', 't', { sender: 'carla@example.net', removed: true })];
-  assert.equal(replyRecipients(c, gone).to[0].address, 'ann@example.com');
-  // The sender's own name where the participants give none.
-  const named = [mail('n', 'in', 't', { sender: 'zed@x.org', sender_name: 'Zed', recipients: [ACCT], cc: [] })];
-  assert.deepEqual(replyRecipients({ ...c, participants: [] }, named).to, [{ address: 'zed@x.org', name: 'Zed' }]);
+// ── Whom a reply reaches: the server says ────────────────────────────────────
+await ok('the page has no addressing of its own', async () => {
+  assert.equal(page.replyRecipients, undefined, 'the client-side derivation is gone');
+  assert.equal(typeof replyPreview, 'function');
 });
 
-await ok('the user\'s own mail last, or only a queued one: its recipients again', async () => {
-  const c = summary();
-  const own = [mail('o', 'out', 't', { sender: ACCT, recipients: ['ann@example.com'], cc: ['carla@example.net'] })];
-  assert.deepEqual(replyRecipients(c, own).to.map((x) => x.address), ['ann@example.com']);
-  assert.deepEqual(replyRecipients(c, own).cc.map((x) => x.address), ['carla@example.net']);
-  assert.deepEqual(replyRecipients(c, own, 'sender').cc, []);
-  assert.deepEqual(replyRecipients(c, []), { to: [], cc: [] }, 'nothing to reply to');
-  const r = replyRecipients(c, [], 'all', [pend('p1', { to: ['ann@example.com'], cc: ['bob@builder.example'] })]);
-  assert.deepEqual([r.to.map((x) => x.name), r.cc.map((x) => x.name)], [['Ann Example'], ['Bob Builder']]);
-  // The page's own optimistic bubble is not a mail of the thread.
-  const local = [...own, { id: 'local-1', direction: 'out', text: 'x', recipients: ['nobody@x.org'] }];
-  assert.equal(replyRecipients(c, local).to[0].address, 'ann@example.com');
+await ok('the reply preview is read whole or not at all', async () => {
+  const p = replyPreview(PV());
+  assert.deepEqual(p.all, { to: [{ address: 'ann@example.com', name: 'Ann Example' }],
+                            cc: [{ address: 'bob@builder.example', name: 'Bob Builder' },
+                                 { address: 'carla@example.net', name: '' }] }, 'the address book\'s name before the mail\'s');
+  assert.deepEqual(p.sender, { to: [{ address: 'ann@example.com', name: 'Ann Example' }], cc: [] });
+  assert.equal(p.choice, true);
+  assert.equal(p.subject, 'Re: Quarterly numbers');
+  // The address book's word as {name}; a person's id is no name.
+  const named = (contact, name = 'Mail Name') => replyPreview(PV({ sender: { to: [{ address: 'a@x.org', name, contact }], cc: [] } })).sender.to[0].name;
+  assert.equal(named({ name: 'Book Name' }), 'Book Name');
+  assert.equal(named('urn:retinue:person:ann-example'), 'Mail Name');
+  assert.equal(named('ann-example'), 'Mail Name');
+  assert.equal(named(null), 'Mail Name');
+  assert.equal(named(7), 'Mail Name');
+  // `choice` only on the server's plain word; a Cc left out is none.
+  assert.equal(replyPreview(PV({ choice: 'yes' })).choice, false);
+  assert.deepEqual(replyPreview(PV({ sender: { to: [ANN] } })).sender.cc, []);
+  // One recipient the page could not show, and nothing is shown at all.
+  for (const bad of [null, 'x', [], {}, PV({ all: null }), PV({ sender: undefined }), PV({ all: { to: 'ann@example.com', cc: [] } }),
+                     PV({ all: { to: [ANN], cc: 'bob' } }), PV({ all: { to: [ANN, { name: 'No Address' }], cc: [] } }),
+                     PV({ all: { to: [ANN], cc: [BOB, 'carla@example.net'] } }), PV({ sender: { to: [{ address: '  ' }], cc: [] } }),
+                     PV({ all: { to: [{ address: `${'a'.repeat(400)}@x.org` }], cc: [] } }),
+                     // An address that would not read on screen as what it is.
+                     PV({ all: { to: [{ address: `ann@example.com${String.fromCharCode(0x202e)}gro.live@` }], cc: [] } }),
+                     PV({ all: { to: [{ address: `ann@exam${String.fromCharCode(0x200b)}ple.com` }], cc: [] } }),
+                     PV({ all: { to: [ANN], cc: [{ address: 'bob@builder.example, eve@evil.example' }] } })]) {
+    assert.equal(replyPreview(bad), null, JSON.stringify(bad).slice(0, 80));
+  }
+  // The same address twice in a row reads the same both times.
+  assert.ok(replyPreview(PV()) && replyPreview(PV()));
+});
+
+await ok('a name is shown only where it cannot be read as an address', async () => {
+  assert.equal(partyName('Ann Example', 'ann@example.com'), 'Ann Example');
+  // A display name a mail supplied that is itself an address, or dresses up
+  // as one, is dropped: the address stands alone.
+  const bidi = String.fromCharCode(0x202e);
+  const fullAt = String.fromCharCode(0xff20);
+  for (const n of ['ceo@company.com', 'Ann <ann@good.org>', `ceo${fullAt}company.com`, 'x@evil.example', 'X@Evil.Example',
+                   '<Ann>', '', '   ', null, 42]) {
+    assert.equal(partyName(n, 'x@evil.example'), '', String(n));
+  }
+  assert.equal(partyName(`Ann${bidi}  Example\n`, 'a@x.org'), 'Ann Example', 'control and direction characters go');
+  assert.equal(partyName('N'.repeat(200), 'a@x.org').length, 60, 'a long name does not push the address away');
+  // In the line: the spoofed name is gone, the real address is what is read.
+  const el = await open({}, BASE, [], PV({ all: { to: [{ address: 'x@evil.example', name: 'ceo@company.com', contact: null }], cc: [] },
+                                           sender: { to: [{ address: 'x@evil.example', name: 'ceo@company.com', contact: null }], cc: [] },
+                                           choice: false }));
+  const h = el._chatComposerHtml();
+  assert.ok(h.includes('To <span class="rcp"><b>x@evil.example</b>'), h);
+  assert.ok(!h.includes('ceo@company.com'), 'the name that reads as another address is nowhere');
 });
 
 // ── The composer ─────────────────────────────────────────────────────────────
-await ok('a mail composer: To/Cc line, Reply all / Sender only, mail wording', async () => {
+const LINE_ALL = '<span aria-hidden="true">&#10148;</span> To <span class="rcp"><b>Ann Example</b> ' +
+  '<span class="addr">&lt;ann@example.com&gt;</span></span> &middot; Cc <span class="rcp"><b>Bob Builder</b> ' +
+  '<span class="addr">&lt;bob@builder.example&gt;</span></span>, <span class="rcp"><b>carla@example.net</b></span></div>';
+const LINE_SENDER = '<span aria-hidden="true">&#10148;</span> To <span class="rcp"><b>Ann Example</b> ' +
+  '<span class="addr">&lt;ann@example.com&gt;</span></span></div>';
+
+await ok('a mail composer: the server\'s To/Cc with every address, the choice, mail wording', async () => {
   const el = await open();
   const h = el._chatComposerHtml();
-  assert.ok(h.includes('<div class="to-line mail" data-to-line'), h);
-  assert.ok(h.includes('To <b>Ann Example</b> &middot; Cc <b>Bob Builder, carla@example.net</b>'), h);
-  assert.ok(h.includes('title="Your reply goes to Ann Example &lt;ann@example.com&gt;, with a copy to Bob Builder &lt;bob@builder.example&gt;, carla@example.net — by e-mail, not to Ara."'), h);
+  assert.ok(h.includes('<div class="to-line mail" data-to-line title="Your reply “Re: Quarterly numbers” goes to ' +
+    'Ann Example &lt;ann@example.com&gt;, with a copy to Bob Builder &lt;bob@builder.example&gt;, carla@example.net ' +
+    '— by e-mail, not to Ara.">' + LINE_ALL), h);
   assert.ok(h.includes('role="radiogroup" aria-label="Who the reply goes to"'));
   assert.ok(h.includes('value="all" data-reply-mode checked> Reply all'), h);
   assert.ok(h.includes('value="sender" data-reply-mode> Sender only'), h);
   assert.ok(h.includes('placeholder="Write your reply …"'));
   assert.ok(h.includes('aria-label="Your reply — Enter starts a new line, Ctrl+Enter or ⌘+Enter sends"'));
   assert.ok(h.includes('enterkeyhint="enter"'));
-  assert.ok(h.includes('aria-label="Send the reply to Ann Example (Ctrl+Enter or ⌘+Enter)"'), h);
+  assert.ok(h.includes('aria-label="Send the reply to Ann Example &lt;ann@example.com&gt;, copy to 2 more (Ctrl+Enter or ⌘+Enter)">'), h);
+  assert.ok(!h.includes('aria-disabled'), 'the send button is live');
   el._setReplyMode('sender');
   const s = el._chatComposerHtml();
-  assert.ok(s.includes('To <b>Ann Example</b></div>'), 'no Cc for the sender only');
+  assert.ok(s.includes(LINE_SENDER), 'the sender\'s side of the answer');
   assert.ok(s.includes('value="sender" data-reply-mode checked'));
-  // A 1:1 thread, and a group thread whose reply to all reaches the sender
-  // alone: no choice to make.
-  const solo = await open({ group: false });
+  assert.ok(s.includes('aria-label="Send the reply to Ann Example &lt;ann@example.com&gt; (Ctrl+Enter or ⌘+Enter)"'), s);
+  // No choice where the server says the two are the same — whatever the
+  // thread looks like to the page (a group, a Cc on the mail).
+  const solo = await open({}, BASE, [], SOLO());
   assert.ok(!solo._chatComposerHtml().includes('data-reply-mode'));
-  const lone = await open({}, [mail('x', 'in', 't', { recipients: [ACCT], cc: [] })]);
-  assert.ok(!lone._chatComposerHtml().includes('data-reply-mode'));
-  assert.ok(lone._chatComposerHtml().includes('To <b>Ann Example</b></div>'));
-  // Nothing left to reply to: the participants, as before.
-  const empty = await open({}, [mail('g', 'in', 't', { removed: true, text: '' })]);
-  assert.ok(empty._chatComposerHtml().includes('To <b>Ann Example, Bob Builder, carla@example.net</b> &middot; E-mail'));
+  assert.ok(solo._chatComposerHtml().includes(LINE_SENDER));
+  // And one in a thread the summary calls a 1:1, when the server says so.
+  const one = await open({ group: false, participants: [PEOPLE[0]] });
+  assert.ok(one._chatComposerHtml().includes('data-reply-mode'));
+});
+
+await ok('the line is the server\'s answer, never the thread\'s arithmetic', async () => {
+  // Ann wrote to the user, Bob and Carla; the user answered Ann alone. The
+  // gateway addresses a follow-up to that mail's recipients again — Ann —
+  // and that is what the line says, with no choice to make.
+  const own = [BASE[0], mail('own', 'out', '2026-11-20T10:00:00Z', { author: 'user', sender: ACCT, recipients: ['ann@example.com'], cc: [] })];
+  let el = await open({}, own, [], SOLO());
+  let h = el._chatComposerHtml();
+  assert.ok(h.includes(LINE_SENDER) && !h.includes('Bob Builder') && !h.includes('data-reply-mode'), h);
+  // Ann wrote to the user alone; the user's own later mail (from a mail
+  // client) added Dave and copied Erin: the next reply reaches them too.
+  const DAVE = { address: 'dave@w.org', name: null, contact: null };
+  const ERIN = { address: 'erin@v.org', name: 'Erin', contact: null };
+  const wide = [mail('a', 'in', '2026-11-20T08:00:00Z', { recipients: [ACCT], cc: [] }),
+                mail('b', 'out', '2026-11-20T09:00:00Z', { author: 'device', sender: ACCT, recipients: ['ann@example.com', 'dave@w.org'], cc: ['erin@v.org'] })];
+  el = await open({ group: false, participants: [PEOPLE[0]] }, wide, [],
+                  PV({ all: { to: [ANN, DAVE], cc: [ERIN] }, sender: { to: [ANN, DAVE], cc: [] } }));
+  h = el._chatComposerHtml();
+  assert.ok(h.includes('<b>dave@w.org</b>') && h.includes('Cc <span class="rcp"><b>Erin</b> <span class="addr">&lt;erin@v.org&gt;</span>'), h);
+  // An alias, a participant list that is capped, an address the page never
+  // heard of: nothing is filtered here — what the server names is shown.
+  el = await open({ participants: [], participants_more: 4 }, BASE, [],
+                  PV({ all: { to: [ANN], cc: [{ address: 'me-alias@example.org', name: null, contact: null }] } }));
+  assert.ok(el._chatComposerHtml().includes('<b>me-alias@example.org</b>'));
+});
+
+await ok('a reply that does not go where the mail came from says so', async () => {
+  // A Reply-To: the line names the address the reply goes to, and why.
+  const LIST = { address: 'all-staff@lists.example', name: 'Ann Example', contact: null };
+  const EVE = { address: 'x@evil.example', name: null, contact: null };
+  const msgs = [mail('r', 'in', '2026-11-20T08:00:00Z', { recipients: [ACCT], cc: [], reply_to: ['All-Staff@lists.example', 'x@evil.example'] })];
+  let el = await open({}, msgs, [], PV({ all: { to: [LIST, EVE], cc: [] }, sender: { to: [LIST, EVE], cc: [] }, choice: false }));
+  let h = el._chatComposerHtml();
+  assert.ok(h.includes('<b>Ann Example</b> <span class="addr">&lt;all-staff@lists.example&gt;</span> ' +
+    '<span class="rcp-why">(the Reply-To of the mail from ann@example.com)</span>'), h);
+  assert.ok(h.includes('<b>x@evil.example</b> <span class="rcp-why">(the Reply-To of the mail from ann@example.com)</span>'), h);
+  assert.ok(h.includes('aria-label="Send the reply to Ann Example &lt;all-staff@lists.example&gt;, x@evil.example (Ctrl'), h);
+  // Not the sender, and no Reply-To the page was told of (an older record):
+  // still said, in plainer words.
+  el = await open({}, [mail('o', 'in', '2026-11-20T08:00:00Z', { reply_to: undefined })], [], PV({ all: { to: [EVE], cc: [] }, sender: { to: [EVE], cc: [] }, choice: false }));
+  h = el._chatComposerHtml();
+  assert.ok(h.includes('<span class="rcp-why">(not the address the latest mail came from, ann@example.com)</span>'), h);
+  // The sender's own address needs no note; nor does a follow-up to the
+  // user's own mail, whose recipients are whom they chose.
+  el = await open();
+  assert.ok(!el._chatComposerHtml().includes('rcp-why'));
+  el = await open({}, [...BASE, mail('mine', 'out', '2026-11-20T10:00:00Z', { author: 'user', sender: ACCT, recipients: ['bob@builder.example'], cc: [] })], [],
+                  PV({ all: { to: [BOB], cc: [] }, sender: { to: [BOB], cc: [] }, choice: false }));
+  assert.ok(!el._chatComposerHtml().includes('rcp-why'));
+  // A hostile sender address is text.
+  el = await open({}, [mail('h', 'in', '2026-11-20T08:00:00Z', { sender: '"><img src=x>@evil.example' })], [], SOLO());
+  h = el._chatComposerHtml();
+  assert.ok(h.includes('&quot;&gt;&lt;img src=x&gt;@evil.example') && !h.includes('<img'), h);
+});
+
+await ok('no answer, no reply: unknown recipients are never guessed', async () => {
+  // Not answered yet: the line says so, the button is off, nothing is sent.
+  let el = await open({}, BASE, [], null);
+  let h = el._chatComposerHtml();
+  assert.ok(h.includes('<div class="to-line mail wait" data-to-line role="status"><span aria-hidden="true">&#10148;</span> ' +
+    'Checking where a reply would go …</div>'), h);
+  assert.ok(h.includes('aria-label="Send the reply — not possible until the recipients are known" aria-disabled="true"'), h);
+  assert.ok(!h.includes('data-reply-mode') && !h.includes('Ann Example'), 'nobody is named');
+  let restored = '';
+  el._restoreComposer = (t) => { restored = t; };
+  wire.length = 0;
+  await refusedPress(el, 'hello');
+  assert.equal(restored, 'hello', 'the words are back');
+  assert.equal(el._notes.at(-1), 'Checking where a reply would go — try again in a moment.');
+  // A server without the endpoint: said, and not asked again on every poll.
+  for (const status of [404, 405, 501]) {
+    el = await open({}, BASE, [], [{ error: 'not found' }, status]);
+    h = el._chatComposerHtml();
+    assert.ok(h.includes('<div class="to-line mail off" data-to-line role="status">'), h);
+    assert.ok(h.includes('Recipients unavailable: this server does not say where a reply would go, so none is sent from here.'), h);
+    assert.ok(h.includes('aria-disabled="true"'));
+    assert.equal(await poll(el, BASE, []), false, 'nothing changed, nothing asked');
+    wire.length = 0;
+    await refusedPress(el, 'x', [{}, status]);
+    assert.ok(el._notes.at(-1).startsWith('Recipients unavailable:'));
+  }
+  // An answer that is not the document counts the same.
+  el = await open({}, BASE, [], { all: { to: [{ name: 'Ann' }], cc: [] }, sender: { to: [], cc: [] } });
+  assert.ok(el._chatComposerHtml().includes('Recipients unavailable: this server does not say'));
+  // The gateway away: said, and asked again with the next poll.
+  for (const down of [[{ error: 'gateway unreachable' }, 502], 'offline']) {
+    el = await open({}, BASE, [], down);
+    assert.ok(el._chatComposerHtml().includes('Recipients unavailable right now: a reply is sent only once the server has said where it goes.'));
+    const p = el._poll();
+    take((w) => w.url === MSG_URL, 'the poll').answer({ chat: summary(), messages: clone(BASE), pending: [] });
+    await p;
+    assert.equal(asked(el), 1, 'asked again though the thread did not move');
+    answerPreview(el, PV());
+    await settle();
+    assert.ok(el._chatComposerHtml().includes(LINE_ALL));
+  }
+});
+
+await ok('a thread the gateway takes no reply in says so instead of offering one', async () => {
+  // A chat that holds only a queued mail: the server's sentence, and no send.
+  const el = await open({}, [], [pend('q1', { to: ['zoe@x.org'], cc: [] })],
+                        [{ error: 'This thread has no mail to reply to yet <its first mail waits for approval>.' }, 409]);
+  assert.deepEqual(el._thread.layout(), ['P:q1'], 'no "No messages." line');
+  const h = el._chatComposerHtml();
+  assert.ok(h.includes('<div class="to-line mail off" data-to-line role="status"><span aria-hidden="true">&#10148;</span> ' +
+    'No reply can be sent from here: This thread has no mail to reply to yet &lt;its first mail waits for approval&gt;.</div>'), h);
+  assert.ok(h.includes('aria-disabled="true"') && !h.includes('zoe@x.org'), 'the queued mail\'s recipients are not offered as a reply\'s');
+  assert.ok(h.includes('<textarea'), 'the words can still be written');
+  let restored = '';
+  el._restoreComposer = (t) => { restored = t; };
+  wire.length = 0;
+  await refusedPress(el, 'a follow-up');
+  assert.equal(restored, 'a follow-up');
+  assert.ok(el._notes.at(-1).startsWith('No reply can be sent from here: This thread has no mail'));
+  // The mail is approved and arrives: the poll asks again and the reply opens.
+  const sent = mail('first@me.example.org', 'out', '2026-11-20T10:05:00Z', { author: 'user', sender: ACCT, recipients: ['zoe@x.org'], cc: [] });
+  const ZOE = { address: 'zoe@x.org', name: null, contact: null };
+  assert.equal(await poll(el, [sent], [], {}, PV({ all: { to: [ZOE], cc: [] }, sender: { to: [ZOE], cc: [] }, choice: false })), true);
+  assert.ok(el._chatComposerHtml().includes('To <span class="rcp"><b>zoe@x.org</b></span></div>'));
+  assert.ok(!el._chatComposerHtml().includes('aria-disabled'));
+  // Rejected instead: the thread is empty again.
+  const gone = await open({}, [], [pend('q1')], [{ error: 'No mail here.' }, 409]);
+  await poll(gone, [], []);
+  assert.deepEqual(gone._thread.layout(), []);
+  const none = await open({}, [], [], [{ error: 'No mail here.' }, 400]);
+  assert.deepEqual(none._thread.layout(), ['EMPTY']);
+  // A 200 that names nobody is the same "no reply".
+  const empty = await open({}, BASE, [], PV({ all: { to: [], cc: [] }, sender: { to: [], cc: [] }, choice: false }));
+  assert.ok(empty._chatComposerHtml().includes('No reply can be sent from here: this thread has no mail to reply to.'));
 });
 
 await ok('a messenger composer is as it was', async () => {
@@ -477,32 +753,229 @@ await ok('a messenger composer is as it was', async () => {
   assert.ok(h.includes('placeholder="Message Mara …" aria-label="Message Mara …" autocomplete="off"'), h);
   assert.ok(h.includes('To <b>Mara</b> &middot; Signal</div>'));
   assert.ok(h.includes('aria-label="Send to Mara"'));
-  for (const no of ['data-reply-mode', 'enterkeyhint', 'Write your reply']) assert.ok(!h.includes(no), no);
-  // And a send carries no reply choice.
+  for (const no of ['data-reply-mode', 'enterkeyhint', 'Write your reply', 'aria-disabled']) assert.ok(!h.includes(no), no);
+  // And a send carries no reply choice, no key, and asks nobody first.
   const req = await send(el, 'yo', { id: 'b', chat: SID, direction: 'out', author: 'user', text: 'yo', ts: '2026-11-20T08:01:00Z' });
   assert.deepEqual(req.body, { text: 'yo' });
+  assert.ok(!wire.some((w) => w.url.includes('reply-preview')));
+  // A failed messenger send reads as before.
+  await send(el, 'again', { error: 'down' }, 502);
+  assert.equal(el._notes.at(-1), "Couldn't send &mdash; check the connection and try again.");
 });
 
-await ok('the reply choice rides the request and resets with each sent mail', async () => {
+// A composer's own nodes, enough for _refreshToLine: the line, the radio
+// pair after it (or none) and the send button, each replaced as the page
+// replaces them.
+function composerDom(el) {
+  const realCreate = document.createElement;
+  const dom = { line: null, pair: null, send: new El('send') };
+  const node = (html) => {
+    const n = { html, changes: [] };
+    n.radios = [...html.matchAll(/value="(all|sender)" data-reply-mode/g)]
+      .map((m) => ({ value: m[1], checked: false, addEventListener: (t, f) => n.changes.push(f) }));
+    n.replaceWith = (x) => { if (dom.line === n) dom.line = x; };
+    n.insertAdjacentElement = (where, x) => { assert.equal(where, 'afterend'); dom.pair = x; };
+    n.remove = () => { if (dom.pair === n) dom.pair = null; };
+    n.contains = () => false;
+    n.querySelectorAll = (s) => (s === '[data-reply-mode]' ? n.radios : []);
+    return n;
+  };
+  dom.line = node(el._toLineHtml());
+  if (el._replyModeHtml()) dom.pair = node(el._replyModeHtml());
+  // Only the composer's own pieces are made here; a bubble redrawn by the
+  // same poll is the thread's.
+  document.createElement = (tag) => {
+    if (tag !== 'template') return realCreate(tag);
+    const real = realCreate('template');
+    return { set innerHTML(h) {
+      if (/^<div class="(to-line|reply-mode)/.test(h)) this.content = { firstElementChild: node(h) };
+      else { real.innerHTML = h; this.content = real.content; }
+    } };
+  };
+  const thread = el._thread;
+  el.shadowRoot = {
+    activeElement: null,
+    querySelector: (s) => {
+      if (s === '[data-to-line]') return dom.line;
+      if (s === '.reply-mode') return dom.pair;
+      if (s === '[data-composer="chat"] .send') return dom.send;
+      if (s === '[data-chat-thread]') return thread;
+      const m = /^\[data-chat-thread\] \[data-mid="(.*)"\]$/.exec(s);
+      return m && thread ? thread.node(m[1]) || null : null;
+    },
+    querySelectorAll: (s) => (s === '[data-reply-mode]' && dom.pair ? dom.pair.radios : []),
+  };
+  dom.done = () => { document.createElement = realCreate; };
+  return dom;
+}
+
+await ok('the line, the choice and the button follow the thread: asked again after every change', async () => {
+  // A 1:1 so far: Ann wrote to the user alone.
+  const first = mail('a1', 'in', '2026-11-20T08:00:00Z', { recipients: [ACCT], cc: [] });
+  const narrow = { group: false, participants: [PEOPLE[0]] };
+  const el = await open(narrow, [first], [], SOLO());
+  const dom = composerDom(el);
+  try {
+    assert.equal(dom.pair, null);
+    // A poll that changes nothing asks nothing.
+    assert.equal(await poll(el, [first], [], narrow), false);
+    // Ann's next mail copies the boss: the people, the line, and now a choice.
+    const BOSS = { address: 'boss@corp.example', name: null, contact: null };
+    const second = mail('a2', 'in', '2026-11-20T09:00:00Z', { recipients: [ACCT], cc: ['boss@corp.example'] });
+    const wider = { group: true, participants: [PEOPLE[0], { address: 'boss@corp.example', name: null, contact: null }] };
+    assert.equal(await poll(el, [first, second], [], wider, PV({ all: { to: [ANN], cc: [BOSS] } })), true, 'a new mail');
+    assert.ok(dom.line.html.includes('Cc <span class="rcp"><b>boss@corp.example</b></span>'), dom.line.html);
+    assert.ok(dom.pair && dom.pair.html.includes('Sender only'), 'the choice appears, not only its checked state');
+    assert.deepEqual(dom.pair.radios.map((r) => r.checked), [true, false]);
+    assert.equal(dom.pair.changes.length, 2, 'and is wired');
+    assert.equal(dom.send.getAttribute('aria-label'), 'Send the reply to Ann Example <ann@example.com>, copy to boss@corp.example (Ctrl+Enter or ⌘+Enter)');
+    assert.deepEqual(el._chat.participants.map((p) => p.address), ['ann@example.com', 'boss@corp.example'], 'the people are the server\'s');
+    assert.equal(el._chat.group, true);
+    // The user picks Sender only: the line follows, the button too.
+    dom.pair.radios[1].checked = true;
+    dom.pair.changes[1]();
+    assert.equal(el._replyMode, 'sender');
+    assert.ok(!dom.line.html.includes('boss@corp.example'));
+    // The mail on screen changes — the rail's overlay had no recipients, the
+    // record has: same id, and the page asks again.
+    const third = mail('a3', 'in', '2026-11-20T10:00:00Z', { recipients: [], cc: [], original: null });
+    assert.equal(await poll(el, [first, second, third], [], wider), true);
+    const record = { ...third, cc: ['carla@example.net'] };
+    assert.equal(await poll(el, [first, second, record], [], wider, PV({ all: { to: [ANN], cc: [CARLA] } })), true, 'a changed mail');
+    assert.equal(el._messages.find((m) => m.id === 'a3').cc[0], 'carla@example.net');
+    el._setReplyMode('all');
+    assert.ok(dom.line.html.includes('carla@example.net'));
+    // The newest mail is removed in a mail client (a tombstone): asked again.
+    assert.equal(await poll(el, [first, second, { ...record, removed: true, text: '' }], [], wider, PV({ all: { to: [ANN], cc: [BOSS] } })), true, 'a removed mail');
+    assert.ok(dom.line.html.includes('boss@corp.example'));
+    // A mail that left the document altogether counts too.
+    assert.equal(await poll(el, [first, second], [], wider), true, 'a mail gone from the document');
+    // A queued send joining or leaving, a send that failed.
+    assert.equal(await poll(el, [first, second], [pend('q1')], wider), true, 'a pending send');
+    assert.equal(await poll(el, [first, second], [pend('q1', { status: 'failed', error: 'no' })], wider), true, 'its state');
+    assert.equal(await poll(el, [first, second], [pend('q1', { status: 'failed', error: 'no' })], wider), false);
+    // The people alone.
+    assert.equal(await poll(el, [first, second], [pend('q1', { status: 'failed', error: 'no' })],
+                            { ...wider, participants: [PEOPLE[0]] }), true, 'the participants');
+    // Nobody left to choose between: the pair goes, a selected Sender only
+    // does not stay behind.
+    el._setReplyMode('sender');
+    assert.equal(await poll(el, [first], [], narrow, SOLO()), true);
+    assert.equal(dom.pair, null, 'the choice is taken off the page');
+    // The gateway goes away: the line says so and the button is off.
+    assert.equal(await poll(el, [first, second], [], wider, [{ error: 'x' }, 502]), true);
+    assert.ok(dom.line.html.includes('Recipients unavailable right now'));
+    assert.equal(dom.send.getAttribute('aria-disabled'), 'true');
+    assert.equal(await poll(el, [first, second], [], wider, PV()), true, 'asked again after a failure');
+    assert.equal(dom.send.getAttribute('aria-disabled'), null);
+  } finally {
+    dom.done();
+  }
+});
+
+await ok('an answer that a later question overtook is dropped', async () => {
   const el = await open();
-  let req = await send(el, 'one', { id: 's1', chat: ID, direction: 'out', author: 'user', text: 'one', ts: '2026-11-20T11:00:00Z' });
-  assert.deepEqual(req.body, { text: 'one', reply: 'all' });
+  const a = el._fetchPreview();
+  const b = el._fetchPreview();
+  const [ra, rb] = wire.filter((w) => w.url === PV_URL());
+  wire.length = 0;
+  rb.answer(SOLO());
+  await b;
+  ra.answer(PV({ all: { to: [BOB], cc: [] } }));
+  await a;
+  assert.equal(el._preview.doc.all.to[0].address, 'ann@example.com', 'the newest question\'s answer stands');
+});
+
+await ok('the reply goes as the line read at the press: mode, recipients, one key', async () => {
+  const el = await open();
+  let req = await send(el, 'one', sentMsg('s1', 'one'));
+  assert.equal(req.url, SEND_URL);
+  assert.deepEqual(Object.keys(req.body).sort(), ['reply', 'request_key', 'text']);
+  assert.equal(req.body.reply, 'all');
+  assert.match(req.body.request_key, KEY_RE);
+  const k1 = req.body.request_key;
+  // The choice on screen at the press goes with the mail and resets there.
   el._setReplyMode('sender');
-  req = await send(el, 'two', { id: 's2', chat: ID, direction: 'out', author: 'user', text: 'two', ts: '2026-11-20T11:01:00Z' });
+  const p = el._sendChat('two');
+  assert.equal(el._replyMode, 'all', 'reset at the press, before any answer');
+  await settle();
+  answerPreview(el, PV(), 'the preview at the press');
+  await settle();
+  req = take((w) => w.method === 'POST', 'the send');
   assert.equal(req.body.reply, 'sender');
-  assert.equal(el._replyMode, 'all', 'reset after the send');
-  // Queued counts as sent for the choice; a failure keeps it.
+  assert.notEqual(req.body.request_key, k1, 'another press, another key');
+  // A choice made for the next mail while this one is on its way survives
+  // this one's answer.
   el._setReplyMode('sender');
+  req.answer(sentMsg('s2', 'two', { ts: '2026-11-20T11:01:00Z' }));
+  await p;
+  await quiet(el);
+  assert.equal(el._replyMode, 'sender');
+  // Queued counts as sent for the choice.
   await send(el, 'three', { pending: pend('q1') }, 202);
   assert.equal(el._replyMode, 'all');
+  // A press that did not get through gets its choice back with its words.
   el._setReplyMode('sender');
-  await send(el, 'four', { error: 'down' }, 502);
+  let restored = '';
+  el._restoreComposer = (t) => { restored = t; };
+  await send(el, 'four', { error: 'no' }, 409);
   assert.equal(el._replyMode, 'sender');
-  // A 1:1 thread says "all": the sender, the only one there is.
-  const solo = await open({ group: false });
-  solo._replyMode = 'sender';
-  req = await send(solo, 'x', { id: 's3', chat: ID, direction: 'out', author: 'user', text: 'x', ts: '2026-11-20T11:02:00Z' });
+  assert.equal(restored, 'four');
+  // No choice on the page: "all" — and both ways are the same mail then.
+  const solo = await open({}, BASE, [], SOLO());
+  req = await send(solo, 'x', sentMsg('s3', 'x'));
   assert.equal(req.body.reply, 'all');
+});
+
+await ok('a press is refused when the recipients are not the ones on screen', async () => {
+  const el = await open();
+  let restored = '';
+  el._restoreComposer = (t) => { restored = t; };
+  // Bob wrote meanwhile (the page was in the background and has not polled):
+  // a "Sender only" reply would now go to Bob. Nothing is posted.
+  el._setReplyMode('sender');
+  await refusedPress(el, 'for Ann only', PV({ all: { to: [BOB], cc: [ANN, CARLA] }, sender: { to: [BOB], cc: [] } }));
+  assert.equal(restored, 'for Ann only');
+  assert.equal(el._replyMode, 'sender', 'the choice is back with the words');
+  assert.ok(el._notes.at(-1).startsWith('Not sent: the thread changed and with it whom a reply reaches.'), el._notes.at(-1));
+  assert.ok(el._chatComposerHtml().includes('To <span class="rcp"><b>Bob Builder</b>'), 'the line now says where it would go');
+  // Only the side that is sent has to match: a change to the other one
+  // does not stop a press.
+  el._pv = PV({ all: { to: [BOB], cc: [ANN, CARLA] }, sender: { to: [BOB], cc: [] } });
+  const req = await send(el, 'for Bob', sentMsg('s1', 'for Bob'), 200, PV({ all: { to: [BOB], cc: [ANN] }, sender: { to: [BOB], cc: [] } }));
+  assert.equal(req.body.reply, 'sender');
+  // Case and order do not make a difference; one address more does.
+  await tell(el, PV());
+  const swapped = PV({ all: { to: [{ ...ANN, address: 'ANN@Example.com' }], cc: [CARLA, BOB] } });
+  await send(el, 'same people', sentMsg('s2', 'same people'), 200, swapped);
+  await tell(el, PV());
+  await refusedPress(el, 'one more', PV({ all: { to: [ANN], cc: [BOB, CARLA, { address: 'dora@w.org', name: null, contact: null }] } }));
+  assert.equal(restored, 'one more');
+  assert.ok(el._chatComposerHtml().includes('dora@w.org'));
+  // The recipients cannot be had at the press: nothing leaves.
+  for (const down of [[{ error: 'gateway unreachable' }, 502], 'offline', [{}, 404], [{ error: 'No mail left.' }, 409]]) {
+    await tell(el, PV());
+    await refusedPress(el, 'not now', down);
+    assert.equal(restored, 'not now');
+    assert.ok(el._notes.at(-1).startsWith('Not sent. '), el._notes.at(-1));
+  }
+  assert.equal(el._notes.at(-1), 'Not sent. No reply can be sent from here: No mail left.');
+  // The thread moves while the recipients are being asked for: the answer is
+  // older than the thread on screen, and the press is refused.
+  await tell(el, PV());
+  const p = el._sendChat('raced');
+  await settle();
+  const at = take((w) => w.url === PV_URL(), 'the preview at the press');
+  const polled = el._poll();
+  take((w) => w.url === MSG_URL, 'the poll').answer({ chat: summary(), pending: [],
+    messages: clone([...BASE, mail('m9', 'in', '2026-11-20T12:00:00Z', { sender: 'bob@builder.example' })]) });
+  await polled;
+  at.answer(PV());
+  await p;
+  assert.equal(wire.filter((w) => w.method === 'POST').length, 0);
+  assert.equal(restored, 'raced');
+  assert.ok(el._notes.at(-1).startsWith('Not sent: the thread changed'));
+  await quiet(el);
 });
 
 await ok('Enter breaks a line; Ctrl+Enter and ⌘+Enter send; an IME\'s Enter does not', async () => {
@@ -533,6 +1006,19 @@ await ok('Enter breaks a line; Ctrl+Enter and ⌘+Enter send; an IME\'s Enter do
     input.value = 'line one\nline two';
     form.fire('submit');
     assert.deepEqual(sent, ['line one\nline two']);
+    assert.equal(input.value, '');
+    // A mail reply whose recipients are not known is not submitted at all:
+    // the words stay in the field.
+    if (!chat.channel) {
+      el._preview = { state: 'error', doc: null, error: '', rev: el._threadRev };
+      input.value = 'stays';
+      wire.length = 0;
+      form.fire('submit');
+      assert.deepEqual(sent, ['line one\nline two'], 'not sent');
+      assert.equal(input.value, 'stays');
+      assert.ok(el._notes.at(-1).startsWith('Recipients unavailable right now'));
+      assert.equal(asked(el), 1, 'and the server is asked again');
+    }
   }
 });
 
@@ -552,6 +1038,7 @@ await ok('a queued send: the pending bubble at once, with its link and a word fo
   assert.ok(n.html.includes('<span class="pend-badge">Waiting for approval</span>'));
   assert.ok(n.html.includes('Friday &lt;b&gt;works&lt;/b&gt; <a href="https://example.org/x" target="_blank" rel="noopener noreferrer">'), n.html);
   assert.ok(!n.html.includes('<a class="pend-link'), 'the link is no markup');
+  assert.ok(!n.html.includes('data-pend-dismiss') && !n.html.includes('data-pend-copy'), 'nothing to dismiss while it waits');
   const a = link(el, 'q1').children[0];
   assert.equal(a.getAttribute('href'), '/sends/mail-gateway/q1');
   assert.equal(a.className, 'pend-link');
@@ -564,6 +1051,8 @@ await ok('a queued send: the pending bubble at once, with its link and a word fo
   // and the chat's own list is asked at once.
   const bare = await open();
   const p = bare._sendChat('hi');
+  await settle();
+  answerPreview(bare, PV(), 'the preview at the press');
   await settle();
   take((w) => w.method === 'POST' && w.url.endsWith('/send'), 'the send').answer({ status: 'pending_approval' }, 202);
   await p;
@@ -583,6 +1072,7 @@ await ok('the bubble lives through polls and reloads, and leaves when it is deci
   await send(el, 'hello', { pending: pend('q1', { text: 'hello' }) }, 202);
   earlyReq.answer({ chat: summary(), messages: clone(BASE), pending: [] });
   await early;
+  await quiet(el);
   assert.deepEqual(el._thread.layout(), ['m1', 'm2', 'm3', 'P:q1'], 'a poll from before it cannot take it down');
   // Listed: the same node.
   const node = el._thread.pnode('q1');
@@ -635,17 +1125,6 @@ await ok('a released send gives way to the mail it became — by Message-ID, nev
   assert.deepEqual(b._thread.layout(), ['m1', 'm2', 'm3', 's2']);
 });
 
-await ok('a new chat that is only a queued mail shows its bubble alone', async () => {
-  const el = await open({}, [], [pend('q1', { to: ['zoe@x.org'], cc: [] })]);
-  assert.deepEqual(el._thread.layout(), ['P:q1'], 'no "No messages." line');
-  assert.ok(el._chatComposerHtml().includes('To <b>zoe@x.org</b>'));
-  // Rejected: the thread is empty again.
-  await poll(el, [], []);
-  assert.deepEqual(el._thread.layout(), []);
-  const none = await open({}, [], []);
-  assert.deepEqual(none._thread.layout(), ['EMPTY']);
-});
-
 await ok('the approval link only for an exact /sends/<slug>/<id> path', async () => {
   const bad = ['https://evil.example/sends/mail-gateway/1', '//evil.example/sends/a/1', '/sends/mail-gateway/1?x=1',
                '/sends/mail-gateway/1#y', '/sends/../admin/1', '/sends/./x/1', '/sends/mail-gateway/..', '/sends/mail-gateway',
@@ -668,6 +1147,130 @@ await ok('a page left mid-send does not put a queued mail back in the box', asyn
   assert.equal(el._sentLike({ text: 'something else', at: s.at }), 0);
 });
 
+// ── What became of a send: being sent, failed, refused recipients ────────────
+await ok('a send that is on its way, or failed, says so and never just disappears', async () => {
+  const sending = pend('q1', { status: 'sending', message_id: 'out-1@me.example.org' });
+  const failed = pend('q2', { status: 'failed', error: 'The mail server refused the sender <me@example.org>: 550 not allowed.' });
+  const unknown = pend('q3', { status: 'failed', outcome_unknown: true, error: 'The connection dropped after the mail was handed over.',
+                               refused: ['bob@builder.example'] });
+  const el = await open({}, BASE, [sending, failed, unknown, pend('q4')]);
+  assert.deepEqual(el._thread.layout(), ['m1', 'm2', 'm3', 'P:q1', 'P:q2', 'P:q3', 'P:q4']);
+  // Being sent: said in words; nothing to approve, nothing to dismiss.
+  let h = el._thread.pnode('q1').html;
+  assert.ok(h.startsWith('<div class="msg out pending sending by-user" data-pending="q1" role="group" ' +
+    'aria-label="Sending — not confirmed yet: your mail to ann@example.com">'), h);
+  assert.ok(h.includes('<small class="who">You &middot; on its way</small>'));
+  assert.ok(h.includes('<span class="pend-badge">Sending — not confirmed yet</span>'));
+  for (const no of ['data-approve-slot', 'data-pend-copy', 'data-pend-dismiss']) assert.ok(!h.includes(no), no);
+  assert.equal(el._thread.pnode('q1')._slot, null, 'no approval link is mounted');
+  // Failed: the reason as text, and the two controls.
+  h = el._thread.pnode('q2').html;
+  assert.ok(h.startsWith('<div class="msg out pending failed by-user" data-pending="q2" role="group" ' +
+    'aria-label="Not sent: your mail to ann@example.com">'), h);
+  assert.ok(h.includes('<small class="who">You &middot; not sent</small>'));
+  assert.ok(h.includes('<span class="pend-badge">Not sent</span><span class="pend-act">' +
+    '<button type="button" class="pend-btn" data-pend-copy>Copy text back to the composer</button>' +
+    '<button type="button" class="pend-btn" data-pend-dismiss title="Take this failed mail off the thread">Dismiss</button></span>'), h);
+  assert.ok(h.includes('<div class="pend-why">The mail server refused the sender &lt;me@example.org&gt;: 550 not allowed.</div>'), h);
+  assert.ok(h.includes('queued q2'), 'the words stay on the page');
+  // Outcome unknown: it may have gone out, and the bubble says exactly that.
+  h = el._thread.pnode('q3').html;
+  assert.ok(h.includes('aria-label="Not confirmed — this mail may have gone out: your mail to ann@example.com"'), h);
+  assert.ok(h.includes('<span class="pend-badge">Not confirmed — this mail may have gone out</span>'));
+  assert.ok(h.includes('<div class="pend-why">The connection dropped after the mail was handed over. ' +
+    'Check with the recipient or the Sent folder before you send it again.</div>'), h);
+  assert.ok(!h.includes('>Not sent<'), 'never called not sent');
+  assert.ok(h.includes('<div class="msg-refused" role="note">Not delivered to bob@builder.example &mdash; the mail server refused this address.</div>'), h);
+  assert.ok(h.includes('data-pend-dismiss'));
+  // A failure without a sentence still says something.
+  assert.ok(el._pendingHtml(pend('x', { status: 'failed' })).includes('<div class="pend-why">The server gave no reason.</div>'));
+  assert.ok(el._pendingHtml(pend('x', { status: 'failed', outcome_unknown: true }))
+    .includes('The mail server did not say whether it took it. Check with the recipient'));
+  // A state the page does not know reads as waiting, with the approval link.
+  assert.ok(el._pendingHtml(pend('x', { status: 'exploded' })).includes('<span class="pend-badge">Waiting for approval</span>'));
+  // A queued send that is let go and fails is redrawn where it is.
+  const node = el._thread.pnode('q4');
+  await poll(el, BASE, [sending, failed, unknown, pend('q4', { status: 'failed', error: 'Rejected by the mail server.' })]);
+  assert.notEqual(el._thread.pnode('q4'), node);
+  assert.ok(el._thread.pnode('q4').html.includes('Rejected by the mail server.'));
+  assert.deepEqual(el._thread.layout().slice(-4), ['P:q1', 'P:q2', 'P:q3', 'P:q4'], 'in its place');
+  // The one being sent goes out: its mail takes its place.
+  await poll(el, [...BASE, mail('out-1@me.example.org', 'out', '2026-11-20T10:01:00Z', { author: 'user', sender: ACCT })],
+             [failed, unknown, pend('q4', { status: 'failed', error: 'Rejected by the mail server.' })]);
+  assert.deepEqual(el._thread.layout(), ['m1', 'm2', 'm3', 'out-1@me.example.org', 'P:q2', 'P:q3', 'P:q4']);
+});
+
+await ok('a failed send: its text back into the composer, and Dismiss', async () => {
+  const failed = pend('q/2 x', { status: 'failed', error: 'no', text: 'the failed words' });
+  const el = await open({}, BASE, [failed, pend('q3')]);
+  // Copy: after what the box holds, never over it; the bubble stays.
+  const into = [];
+  el._restoreComposer = (t) => { into.push(t); el._draft = t; };
+  el._draft = '';
+  el._copyPending('q/2 x');
+  assert.deepEqual(into, ['the failed words']);
+  el._draft = 'already typing  ';
+  el._copyPending('q/2 x');
+  assert.equal(into.at(-1), 'already typing\n\nthe failed words');
+  assert.deepEqual(el._thread.layout().slice(-2), ['P:q/2 x', 'P:q3']);
+  // Neither control acts on a send that only waits.
+  el._copyPending('q3');
+  assert.equal(into.length, 2);
+  wire.length = 0;
+  await el._dismissPending('q3');
+  assert.equal(wire.length, 0);
+  // Dismiss fails: it stays, with the reason; nothing is lost.
+  let p = el._dismissPending('q/2 x');
+  let req = take((w) => w.method === 'POST', 'the dismiss');
+  assert.equal(req.url, `/chats/${encodeURIComponent(ID)}/pending/${encodeURIComponent('q/2 x')}/dismiss`);
+  el._dismissPending('q/2 x');
+  assert.equal(wire.filter((w) => w.method === 'POST').length, 0, 'one press, one request');
+  req.answer({ error: 'cross-origin request <refused>' }, 403);
+  await p;
+  assert.deepEqual(el._thread.layout().slice(-2), ['P:q/2 x', 'P:q3']);
+  assert.equal(el._notes.at(-1), 'Not dismissed: cross-origin request &lt;refused&gt;');
+  p = el._dismissPending('q/2 x');
+  take((w) => w.method === 'POST', 'the dismiss').fail();
+  await p;
+  assert.equal(el._notes.at(-1), "Couldn't dismiss it &mdash; check the connection and try again.");
+  assert.ok(el._thread.pnode('q/2 x'));
+  // Dismissed: it leaves, focus does not fall to the document, and a poll
+  // that left before it does not bring it back.
+  const lagging = el._poll();
+  const lag = take((w) => w.url === MSG_URL, 'a poll from before');
+  document.activeElement = el._thread.pnode('q/2 x');
+  el._thread.pnode('q/2 x').contains = (x) => x === document.activeElement;
+  p = el._dismissPending('q/2 x');
+  take((w) => w.method === 'POST', 'the dismiss').answer({ ok: true });
+  await p;
+  assert.deepEqual(el._thread.layout(), ['m1', 'm2', 'm3', 'P:q3']);
+  assert.equal(globalThis.focused, el._thread);
+  lag.answer({ chat: summary(), messages: clone(BASE), pending: [failed, pend('q3')] });
+  await lagging;
+  await quiet(el);
+  assert.deepEqual(el._thread.layout(), ['m1', 'm2', 'm3', 'P:q3'], 'not drawn again');
+  // One that is gone already (404) is dismissed as well.
+  const b = await open({}, BASE, [failed]);
+  p = b._dismissPending('q/2 x');
+  take((w) => w.method === 'POST', 'the dismiss').answer({}, 404);
+  await p;
+  assert.deepEqual(b._thread.layout(), ['m1', 'm2', 'm3']);
+});
+
+await ok('recipients the mail server refused are named on the mail', async () => {
+  const el = await open();
+  await send(el, 'to both', sentMsg('s1', 'to both', { refused: ['bob@builder.example', '<carla>@example.net'] }));
+  const h = el._thread.node('s1').html;
+  assert.ok(h.includes('<div class="msg-refused" role="note">Not delivered to bob@builder.example, &lt;carla&gt;@example.net ' +
+    '&mdash; the mail server refused these addresses.</div>'), h);
+  assert.ok(el._notes.at(-1).startsWith('Sent &mdash; but the mail server refused bob@builder.example, &lt;carla&gt;@example.net.'));
+  // A mail first seen whole, and one that learns it later: redrawn.
+  await poll(el, [...BASE, sentMsg('s1', 'to both', { refused: ['bob@builder.example'] })], []);
+  assert.ok(el._thread.node('s1').html.includes('refused this address.'));
+  assert.ok(!el._thread.node('m3').html.includes('msg-refused'));
+});
+
+// ── A mail that may have gone out is never called "not sent" ─────────────────
 await ok('an unconfirmed mail send is found by its Message-ID, not its words', async () => {
   const el = await open();
   await send(el, 'my reply\n\n> quoted', { id: 'synth-1', unconfirmed: true, since: '2026-11-20T10:00:00Z',
@@ -681,6 +1284,155 @@ await ok('an unconfirmed mail send is found by its Message-ID, not its words', a
   assert.equal(el._unconfirmed.length, 0);
 });
 
+await ok('202 unconfirmed: the bubble stays, "Sending — not confirmed yet", and the words never come back', async () => {
+  const el = await open();
+  let restored = null;
+  el._restoreComposer = (t) => { restored = t; };
+  el._draftSaved = 'the words';
+  const p = el._sendChat('long\nmail');
+  await settle();
+  answerPreview(el, PV(), 'the preview at the press');
+  await settle();
+  const req = take((w) => w.method === 'POST', 'the send');
+  const key = req.body.request_key;
+  req.answer({ unconfirmed: true, message_id: 'real-2@me.example.org', request_key: key }, 202);
+  await p;
+  assert.equal(restored, null, 'nothing is put back in the box');
+  assert.equal(el._draftSaved, '', 'the shared draft is spent');
+  assert.deepEqual(el._thread.layout(), ['m1', 'm2', 'm3', 'local-1']);
+  const h = el._thread.node('local-1').html;
+  assert.ok(h.startsWith('<div class="msg out by-user unconfirmed" data-mid="local-1" role="group" aria-label="Not confirmed yet: your mail">'), h);
+  assert.ok(h.includes('<span class="pend-badge">Sending &mdash; not confirmed yet</span>'), h);
+  assert.ok(h.includes('data-recheck'), 'the server knows the key: it can be asked again');
+  assert.ok(!el._notes.some((n) => /not sent|couldn't send/i.test(n)), el._notes.join(' | '));
+  assert.ok(el._notes.at(-1).startsWith('Handed over, but not confirmed yet that it went out.'));
+  assert.equal(el._replyMode, 'all');
+  // The page asks the server what it is still sending, at once.
+  assert.ok(wire.some((w) => w.url === MSG_URL && w.method === 'GET'));
+  await quiet(el);
+  // The mail shows: it takes the bubble's place, by its Message-ID.
+  const rec = mail('real-2@me.example.org', 'out', '2026-11-20T10:00:05Z', { text: 'long', author: 'user', sender: ACCT });
+  await poll(el, [...BASE, rec], []);
+  assert.deepEqual(el._thread.layout(), ['m1', 'm2', 'm3', 'real-2@me.example.org'], 'one bubble, not two');
+  assert.equal(el._unconfirmed.length, 0);
+  // Without a Message-ID nothing is matched by words: a mail with the very
+  // same text is another bubble, and the unconfirmed one stays.
+  const b = await open();
+  await send(b, 'same words', { unconfirmed: true, request_key: 'someone-elses-key-0000' }, 202);
+  assert.ok(!b._thread.node('local-1').html.includes('data-recheck'), 'a server that did not echo the key is not asked again');
+  await poll(b, [...BASE, mail('x@y', 'out', '2026-11-20T10:00:05Z', { text: 'same words', author: 'user', sender: ACCT })], []);
+  assert.deepEqual(b._thread.layout(), ['m1', 'm2', 'm3', 'x@y', 'local-1'], 'two bubbles: nothing was matched by words');
+  // The mail was in the thread before the answer came: nothing to keep.
+  const c = await open();
+  const pc = c._sendChat('quick');
+  await settle();
+  answerPreview(c, PV(), 'the preview at the press');
+  await settle();
+  const rc = take((w) => w.method === 'POST', 'the send');
+  await poll(c, [...BASE, mail('real-3@me.example.org', 'out', '2026-11-20T10:00:05Z', { text: 'quick', author: 'user', sender: ACCT })], []);
+  rc.answer({ unconfirmed: true, message_id: 'real-3@me.example.org', request_key: rc.body.request_key }, 202);
+  await pc;
+  assert.deepEqual(c._thread.layout(), ['m1', 'm2', 'm3', 'real-3@me.example.org']);
+  assert.equal(c._unconfirmed.length, 0);
+});
+
+await ok('an unconfirmed mail gives way to what the server says became of it', async () => {
+  // By Message-ID: the gateway lists it as still being sent, then as failed.
+  const el = await open();
+  await send(el, 'hello', { unconfirmed: true, message_id: 'real-4@me.example.org', request_key: 'k' }, 202);
+  assert.deepEqual(el._thread.layout(), ['m1', 'm2', 'm3', 'local-1']);
+  await poll(el, BASE, [pend('g1', { status: 'sending', text: 'hello', message_id: 'real-4@me.example.org' })]);
+  assert.deepEqual(el._thread.layout(), ['m1', 'm2', 'm3', 'P:g1'], 'the server\'s entry, not two bubbles');
+  assert.equal(el._unconfirmed.length, 0);
+  await poll(el, BASE, [pend('g1', { status: 'failed', outcome_unknown: true, error: 'No answer from the mail server.', text: 'hello',
+                                     message_id: 'real-4@me.example.org' })]);
+  assert.ok(el._thread.pnode('g1').html.includes('may have gone out'));
+  // By the request_key, where no Message-ID was known.
+  const b = await open();
+  const p = b._sendChat('hello');
+  await settle();
+  answerPreview(b, PV(), 'the preview at the press');
+  await settle();
+  const req = take((w) => w.method === 'POST', 'the send');
+  req.answer({ unconfirmed: true, request_key: req.body.request_key }, 202);
+  await p;
+  await quiet(b);
+  await poll(b, BASE, [pend('g2', { status: 'failed', error: 'Refused.', text: 'hello', request_key: req.body.request_key })]);
+  assert.deepEqual(b._thread.layout(), ['m1', 'm2', 'm3', 'P:g2']);
+});
+
+await ok('Check again asks about the same press, and never sends a second mail', async () => {
+  const start = async () => {
+    const el = await open();
+    el._into = [];
+    el._restoreComposer = (t) => { el._into.push(t); el._draft = t; };
+    const p = el._sendChat('the mail');
+    await settle();
+    answerPreview(el, PV(), 'the preview at the press');
+    await settle();
+    const req = take((w) => w.method === 'POST', 'the send');
+    req.answer({ unconfirmed: true, request_key: req.body.request_key }, 202);
+    await p;
+    await quiet(el);
+    return { el, first: req };
+  };
+  const again = async (el) => {
+    const p = el._recheck('local-1');
+    await settle();
+    const req = take((w) => w.method === 'POST', 'the question');
+    el._recheck('local-1');
+    assert.equal(wire.filter((w) => w.method === 'POST').length, 0, 'one question at a time');
+    return { p, req };
+  };
+  // Sent: the very same request went out again, and the answer is the mail.
+  let { el, first } = await start();
+  let q = await again(el);
+  assert.equal(q.req.url, SEND_URL);
+  assert.deepEqual(q.req.body, first.body, 'the same body under the same request_key');
+  q.req.answer(sentMsg('real-5@me.example.org', 'the mail'));
+  await q.p;
+  await quiet(el);
+  assert.deepEqual(el._thread.layout(), ['m1', 'm2', 'm3', 'real-5@me.example.org']);
+  assert.equal(el._unconfirmed.length, 0);
+  assert.deepEqual(el._into, []);
+  // It waits for approval after all.
+  ({ el, first } = await start());
+  q = await again(el);
+  q.req.answer({ pending: pend('q1', { text: 'the mail' }) }, 202);
+  await q.p;
+  await quiet(el);
+  assert.deepEqual(el._thread.layout(), ['m1', 'm2', 'm3', 'P:q1']);
+  // The gateway's word is that it did not go: now, and only now, the words
+  // come back — after what the box holds.
+  ({ el, first } = await start());
+  el._draft = 'typed since';
+  q = await again(el);
+  q.req.answer({ error: 'The mail server refused it.' }, 409);
+  await q.p;
+  await quiet(el);
+  assert.deepEqual(el._thread.layout(), ['m1', 'm2', 'm3']);
+  assert.deepEqual(el._into, ['typed since\n\nthe mail']);
+  assert.equal(el._notes.at(-1), 'Not sent: The mail server refused it. The text is back in the box.');
+  // Still unknown — by the server's word, or because it cannot be reached:
+  // the bubble stays and nothing is sent again.
+  ({ el, first } = await start());
+  q = await again(el);
+  q.req.answer({ unconfirmed: true, message_id: 'real-6@me.example.org', request_key: first.body.request_key }, 202);
+  await q.p;
+  assert.equal(el._notes.at(-1), 'Still not confirmed. Nothing was sent a second time.');
+  assert.equal(el._unconfirmed[0].messageId, 'real-6@me.example.org', 'what it learned is kept');
+  q = await again(el);
+  q.req.fail();
+  await q.p;
+  assert.deepEqual(el._thread.layout(), ['m1', 'm2', 'm3', 'local-1']);
+  assert.deepEqual(el._into, []);
+  // The mail arrives on its own: asking again has nothing left to ask about.
+  await poll(el, [...BASE, mail('real-6@me.example.org', 'out', '2026-11-20T10:00:05Z', { author: 'user', sender: ACCT })], []);
+  wire.length = 0;
+  await el._recheck('local-1');
+  assert.equal(wire.length, 0);
+});
+
 await ok('a refused mail says why, and the words come back', async () => {
   const el = await open();
   let restored = '';
@@ -689,8 +1441,150 @@ await ok('a refused mail says why, and the words come back', async () => {
   assert.equal(el._notes.at(-1), 'Not sent: This thread has no mail left to reply to &lt;here&gt;.');
   assert.equal(restored, 'hello');
   assert.deepEqual(el._thread.layout(), ['m1', 'm2', 'm3']);
-  await send(el, 'again', { error: 'gateway down' }, 502);
-  assert.equal(el._notes.at(-1), "Couldn't send &mdash; check the connection and try again.");
+  assert.equal(el._retry, null, 'a refusal is final: the next press is a new one');
+  await send(el, 'bare', {}, 403);
+  assert.equal(el._notes.at(-1), 'Not sent: the server refused it (403).');
+});
+
+await ok('no answer, or a 5xx, is not "not sent" — and the same press again is the same mail', async () => {
+  const el = await open();
+  let restored = '';
+  el._restoreComposer = (t) => { restored = t; el._draft = t; };
+  // The connection drops: the request may have arrived.
+  let req = await send(el, 'did it go?', 'offline');
+  const key = req.body.request_key;
+  assert.equal(restored, 'did it go?');
+  assert.deepEqual(el._thread.layout(), ['m1', 'm2', 'm3']);
+  assert.equal(el._notes.at(-1), 'No answer came back, so it is not known whether this mail went out. ' +
+    'It is back in the box &mdash; if it shows up in the thread, do not send it again.');
+  assert.ok(!el._notes.some((n) => /not sent|couldn't send/i.test(n)), el._notes.join(' | '));
+  // Pressed again as it is: the same request_key, so the gateway answers
+  // from the first time instead of sending a second mail.
+  req = await send(el, 'did it go?', { error: 'gateway unreachable <x>' }, 502);
+  assert.equal(req.body.request_key, key);
+  assert.equal(el._notes.at(-1), 'The server could not confirm this mail (gateway unreachable &lt;x&gt;). ' +
+    'It is back in the box &mdash; if it shows up in the thread, do not send it again.');
+  req = await send(el, 'did it go?', {}, 500);
+  assert.equal(req.body.request_key, key);
+  assert.ok(el._notes.at(-1).startsWith('The server could not confirm this mail (it answered 500).'));
+  // A 200 that is no document is no word on the mail either.
+  req = await send(el, 'did it go?', null, 200);
+  assert.equal(req.body.request_key, key);
+  assert.ok(el._notes.at(-1).startsWith('No answer came back'));
+  // Under another choice it is another mail; so are other words.
+  el._setReplyMode('sender');
+  req = await send(el, 'did it go?', 'offline');
+  assert.notEqual(req.body.request_key, key);
+  const key2 = req.body.request_key;
+  assert.equal(el._replyMode, 'sender', 'the choice came back with the words');
+  req = await send(el, 'did it go? (edited)', 'offline');
+  assert.notEqual(req.body.request_key, key2);
+  // A press refused here, before anything was posted, keeps the key of the
+  // press it repeats.
+  const key3 = req.body.request_key;
+  el._setReplyMode('sender');
+  await refusedPress(el, 'did it go? (edited)', [{ error: 'x' }, 502]);
+  const again = el._fetchPreview();
+  answerPreview(el, PV());
+  await again;
+  req = await send(el, 'did it go? (edited)', sentMsg('s9', 'did it go? (edited)'));
+  assert.equal(req.body.request_key, key3);
+  assert.equal(el._retry, null, 'answered: the key is spent');
+});
+
+await ok('a mail that never left the page is simply not sent', async () => {
+  // An attachment that cannot be read: nothing was posted, so nothing can
+  // have gone out — said plainly, with the words and the file back.
+  const el = await open();
+  const file = { blob: { size: 3 }, content_type: 'application/pdf', name: 'a.pdf', url: 'blob:x' };
+  el._outImages = [file];
+  el._imagePayload = () => Promise.reject(new Error('read'));
+  el._keepImages = () => {};
+  wire.length = 0;
+  await el._sendChat('with a file');
+  assert.equal(wire.filter((w) => w.method === 'POST').length, 0);
+  assert.equal(el._notes.at(-1), 'Not sent: an attachment could not be read.');
+  assert.deepEqual(el._outImages, [file]);
+  assert.equal(el._draft, 'with a file');
+  assert.deepEqual(el._thread.layout(), ['m1', 'm2', 'm3']);
+});
+
+await ok('the key stays with the words across a reload', async () => {
+  // The connection dropped; the page keeps the press with the words.
+  let el = await open();
+  el._keepLocal = Page.prototype._keepLocal;
+  el._restoreComposer = (t) => { el._draft = t; el._keepLocal(); };
+  el._setReplyMode('sender');
+  let req = await send(el, 'kept words', 'offline');
+  const key = req.body.request_key;
+  const kept = JSON.parse(store.get(`retinue-draft:chat:${ID}`)).v;
+  assert.ok(Math.abs(Date.now() - kept.retry.at) < 60000);
+  assert.deepEqual({ ...kept.retry, at: 0 }, { key, text: 'kept words', mode: 'sender', imgs: '[]', at: 0 });
+  // The words reach the server's draft; the press is kept all the same.
+  el._draftSaved = 'kept words';
+  el._keepLocal();
+  assert.equal(JSON.parse(store.get(`retinue-draft:chat:${ID}`)).v.retry.key, key);
+  // Reloaded: the same words, the same choice, the same key.
+  el = await open({ draft: { text: 'kept words', version: 3, author: 'user' } }, BASE, [], PV(), true);
+  assert.equal(el._draft, 'kept words');
+  assert.equal(el._replyMode, 'sender');
+  req = await send(el, 'kept words', sentMsg('s1', 'kept words'));
+  assert.equal(req.body.request_key, key);
+  assert.equal(req.body.reply, 'sender');
+  // A page left while the send was on the wire: the same.
+  el = await open();
+  el._keepLocal = Page.prototype._keepLocal;
+  const p = el._sendChat('left mid-send');
+  await settle();
+  answerPreview(el, PV(), 'the preview at the press');
+  await settle();
+  const flying = take((w) => w.method === 'POST' && w.url === SEND_URL, 'the send');
+  el._leaving();
+  const left = JSON.parse(store.get(`retinue-draft:chat:${ID}`)).v.sending;
+  assert.equal(left.key, flying.body.request_key);
+  assert.equal(left.reply, 'all');
+  el = await open({}, BASE, [], PV(), true);
+  assert.equal(el._draft, 'left mid-send');
+  assert.equal(el._leftSend, true);
+  req = await send(el, 'left mid-send', sentMsg('s2', 'left mid-send'));
+  assert.equal(req.body.request_key, flying.body.request_key, 'sent again, it is the mail that was on the wire');
+  flying.fail();
+  await p;
+  // What is kept is read as data: a key that is no key is not used; nor is
+  // one from long ago — the same words typed then are a mail of their own,
+  // which the gateway must not take for the old one.
+  const keep = (retry) => store.set(`retinue-draft:chat:${ID}`, JSON.stringify({ at: Date.now(), v: { text: 'x', version: 0, retry } }));
+  const good = { key: 'k'.repeat(32), text: 'x', mode: 'all', imgs: '[]', at: Date.now() - 60 * 1000 };
+  keep(good);
+  el = await open({}, BASE, [], PV(), true);
+  assert.deepEqual(el._retry, good);
+  for (const bad of [{ ...good, key: '../../etc' }, { ...good, text: 7 }, { ...good, at: Date.now() - 13 * 3600 * 1000 },
+                     { ...good, at: 'now' }, { ...good, at: Date.now() + 3600 * 1000 }, 'k', null]) {
+    keep(bad);
+    el = await open({}, BASE, [], PV(), true);
+    assert.equal(el._retry, null, JSON.stringify(bad));
+  }
+  keep(good);
+  el = await open({}, BASE, [], PV(), true);
+  el._retry.at = Date.now() - 13 * 3600 * 1000;
+  req = await send(el, 'x', sentMsg('s3', 'x'));
+  assert.notEqual(req.body.request_key, good.key, 'a press from long ago is not repeated');
+});
+
+await ok('a press made again whose first mail had gone out says so, once', async () => {
+  const el = await open();
+  el._restoreComposer = () => {};
+  let req = await send(el, 'did it go?', 'offline');
+  const key = req.body.request_key;
+  // It did: the mail shows in the thread.
+  const first = mail('first@me.example.org', 'out', '2026-11-20T10:00:05Z', { text: 'did it go?', author: 'user', sender: ACCT });
+  await poll(el, [...BASE, first], []);
+  // The words were back in the box, and are sent again all the same: the
+  // gateway knows the press and answers with the mail it already sent.
+  req = await send(el, 'did it go?', first);
+  assert.equal(req.body.request_key, key);
+  assert.deepEqual(el._thread.layout(), ['m1', 'm2', 'm3', 'first@me.example.org'], 'one mail, one bubble');
+  assert.equal(el._notes.at(-1), 'This mail had gone out the first time; it was not sent again.');
 });
 
 await ok('the quick patterns ask about mail on a mail chat', async () => {
@@ -706,11 +1600,11 @@ await ok('the quick patterns ask about mail on a mail chat', async () => {
   }
   // The page asks with the chat's kind.
   const el = await open();
-  let asked = '';
-  el._companionEl = () => ({ ask: (t) => { asked = t; } });
+  let put = '';
+  el._companionEl = () => ({ ask: (t) => { put = t; } });
   el._setPane = () => {};
   el._quickPattern('translate');
-  assert.equal(asked, by('translate').prompt('', true));
+  assert.equal(put, by('translate').prompt('', true));
 });
 
 // ── The Chats page: ＋, Delete, the preview ──────────────────────────────────
@@ -756,12 +1650,38 @@ await ok('＋ is there when the server offers something to start, and opens the 
   let back = 0;
   el.shadowRoot.querySelector = (s) => (s === '[data-new]' ? { focus: () => { back += 1; } } : null);
   el._toggleNew = () => {};
+  store.clear();
   el._startNew(0);
   assert.ok(sheetEl, 'the sheet is on the page');
   assert.deepEqual(sheetEl._offer, { channel: 'email', label: 'E-mail', accounts: [ACCT, 'work@example.com'] });
   assert.equal(sheetEl.hasAttribute('hidden'), false);
   sheetEl.close();
   assert.equal(back, 1, 'focus back on the ＋');
+});
+
+await ok('the mailboxes on offer are asked for again as the ＋ is opened', async () => {
+  // The work mailbox was away when the page loaded.
+  const el = await mountList({ channels: [{ channel: 'email', label: 'E-mail', accounts: [ACCT] }] });
+  const offer = el._compose[0];
+  let p = el._refreshCompose();
+  el._refreshCompose();
+  assert.equal(wire.filter((w) => w.url === '/chats/compose').length, 1, 'one question at a time');
+  take((w) => w.url === '/chats/compose', 'GET /chats/compose')
+    .answer({ channels: [{ channel: 'email', label: 'E-mail', accounts: [ACCT, 'work@example.com'] }] });
+  await p;
+  assert.equal(el._compose[0], offer, 'the offer on the menu is the same entry');
+  assert.deepEqual(offer.accounts, [ACCT, 'work@example.com'], 'with the mailbox that came back');
+  // A failed question changes nothing.
+  for (const status of [502, 404]) {
+    p = el._refreshCompose();
+    take((w) => w.url === '/chats/compose', 'GET /chats/compose').answer({}, status);
+    await p;
+    assert.deepEqual(el._compose[0].accounts, [ACCT, 'work@example.com']);
+  }
+  p = el._refreshCompose();
+  take((w) => w.url === '/chats/compose', 'GET /chats/compose').fail();
+  await p;
+  assert.equal(el._compose.length, 1);
 });
 
 await ok('no ＋ without an offer; a gateway without the endpoint is not asked again', async () => {
@@ -809,9 +1729,13 @@ await ok('Delete on a mail thread says the mails go to the Trash; a messenger ch
   assert.equal(sigBtn.textContent, 'Delete for good?');
 });
 
-await ok('a chat that is only a queued mail previews as waiting', async () => {
-  const c = listChat('k', { last: { ts: 't', direction: 'out', author: 'user', text: 'Hi <Zoe>', pending: true } });
-  assert.equal(previewHtml(c), '<span class="pv-who">You:</span> <span class="pv-pending">Waiting for approval:</span> Hi &lt;Zoe&gt;');
+await ok('a chat that is only a queued mail previews as waiting — or as what became of it', async () => {
+  const last = (extra = {}) => listChat('k', { last: { ts: 't', direction: 'out', author: 'user', text: 'Hi <Zoe>', pending: true, ...extra } });
+  assert.equal(previewHtml(last()), '<span class="pv-who">You:</span> <span class="pv-pending">Waiting for approval:</span> Hi &lt;Zoe&gt;');
+  assert.ok(previewHtml(last({ status: 'sending' })).includes('<span class="pv-pending">Sending:</span>'));
+  assert.ok(previewHtml(last({ status: 'failed' })).includes('<span class="pv-pending">Not sent:</span>'));
+  assert.ok(previewHtml(last({ status: 'failed', outcome_unknown: true })).includes('<span class="pv-pending">Not confirmed:</span>'));
+  assert.ok(previewHtml(last({ status: '<b>' })).includes('Waiting for approval:'));
 });
 
 // ── The compose sheet ────────────────────────────────────────────────────────
@@ -827,16 +1751,26 @@ await ok('addresses by shape, split as a header would be', async () => {
   assert.deepEqual(splitAddresses(' , ;').tokens, []);
 });
 
-function openSheet(offer = { channel: 'email', label: 'E-mail', accounts: [ACCT] }) {
-  store.clear();
+const ONE = { channel: 'email', label: 'E-mail', accounts: [ACCT] };
+const TWO = { channel: 'email', label: 'E-mail', accounts: [ACCT, 'work@example.com'] };
+const SLOT = (account = ACCT) => `retinue-draft:compose:email:${account}`;
+// `keep`: what the device holds stays (the sheet opened again, a reload).
+function openSheet(offer = ONE, keep = false) {
+  if (!keep) store.clear();
   assigned.length = 0;
   wire.length = 0;
   let back = 0;
+  if (sheetEl && !keep) { sheetEl._busy = false; }
   const el = sheetMod.openComposeSheet(offer, () => { back += 1; });
   return { el, root: el.shadowRoot, back: () => back };
 }
 const q = (root, s) => root.querySelector(s);
 const type = (root, f, value) => { const i = q(root, `[data-input="${f}"]`); i.value = value; root.fire('input', i); return i; };
+const write = (root, to = 'ann@example.com,', text = 'Hello') => {
+  type(root, 'to', to);
+  const t = q(root, '[data-text]'); t.value = text; root.fire('input', t);
+};
+const kept = (account = ACCT) => (store.has(SLOT(account)) ? JSON.parse(store.get(SLOT(account))).v : null);
 
 await ok('the sheet: a labelled modal dialog, focus in To, the page behind inert', async () => {
   const { el, root } = openSheet();
@@ -854,7 +1788,7 @@ await ok('the sheet: a labelled modal dialog, focus in To, the page behind inert
   assert.equal(globalThis.focused, q(root, '[data-input="to"]'));
   assert.equal(main.inert, true, 'the page behind is inert');
   // Several mailboxes: a choice.
-  const two = openSheet({ channel: 'email', label: 'E-mail', accounts: [ACCT, 'work@example.com'] });
+  const two = openSheet(TWO);
   assert.ok(two.root.innerHTML.includes('<select id="compose-from" data-account><option value="me@example.org" selected>'));
   two.el.close();
   assert.equal(main.inert, false);
@@ -875,9 +1809,11 @@ await ok('chips from typing and pasting; what is no address stays, with its erro
   assert.deepEqual(el._chips.to.map((r) => r.address), ['ann@example.com', 'bob@builder.example']);
   assert.ok(q(root, '[data-chips="to"]').innerHTML.includes('<span class="chip-txt">Builder, Bob</span>'));
   assert.ok(q(root, '[data-err="to"]').textContent.includes('“<img src=x>@x.org”'), 'shown as text');
+  // An emptied field has nothing left to be wrong about, at once.
   type(root, 'to', '');
-  root.fire('focusout', q(root, '[data-input="to"]'));
   assert.equal(q(root, '[data-err="to"]').hidden, true, 'a clean field clears its error');
+  root.fire('focusout', q(root, '[data-input="to"]'));
+  assert.equal(q(root, '[data-err="to"]').hidden, true);
   // Cc does not copy the To.
   type(root, 'cc', 'ANN@example.com, carla@example.net,');
   assert.deepEqual(el._chips.cc.map((r) => r.address), ['carla@example.net']);
@@ -894,6 +1830,58 @@ await ok('chips from typing and pasting; what is no address stays, with its erro
   // Backspace in an empty field takes the last chip back.
   root.fire('keydown', i, { key: 'Backspace' });
   assert.deepEqual(el._chips.to.map((r) => r.address), ['bob@builder.example']);
+});
+
+await ok('the recipient cap names what it kept out, keeps it in the field, and lets go again', async () => {
+  const { el, root } = openSheet();
+  const many = Array.from({ length: 60 }, (_, n) => `a${n}@x.org`);
+  let i = type(root, 'to', `${many.join(', ')},`);
+  assert.equal(el._chips.to.length, 50);
+  assert.equal(i.value, many.slice(50).join(', '), 'the ten that did not fit are still in the field');
+  assert.equal(q(root, '[data-err="to"]').textContent, `At most 50 recipients here; not added: ${many.slice(50).join(', ')}.`);
+  // With them still there, a send is held back, and says why.
+  write(root, i.value, 'Hello');
+  await el._submit();
+  assert.equal(wire.filter((w) => w.method === 'POST').length, 0);
+  assert.ok(q(root, '[data-err="to"]').textContent.startsWith('At most 50 recipients here; not added: a50@x.org'));
+  // Two chips taken out: two of the waiting ones go in with the next commit.
+  el._removeChip('to', 0);
+  assert.equal(q(root, '[data-err="to"]').hidden, true, 'the cap\'s line goes with the chip');
+  el._removeChip('to', 0);
+  root.fire('focusout', q(root, '[data-input="to"]'));
+  assert.equal(el._chips.to.length, 50);
+  assert.deepEqual(el._chips.to.slice(-2).map((r) => r.address), ['a50@x.org', 'a51@x.org']);
+  assert.equal(q(root, '[data-input="to"]').value, many.slice(52).join(', '));
+  // The rest deleted from the field: nothing stands in the way, from the
+  // keyboard alone.
+  type(root, 'to', '');
+  assert.equal(q(root, '[data-err="to"]').hidden, true);
+  let p = el._submit();
+  let req = take((w) => w.method === 'POST', 'the compose');
+  assert.equal(req.body.to.length, 50);
+  req.answer({ error: 'no' }, 400);
+  await p;
+  // A full field and a pick from the address book: said, and Backspace —
+  // the keyboard's way to take a chip back — clears it.
+  el._sugg = { field: 'to', items: [{ name: 'Zed', address: 'zed@x.org' }], active: 0 };
+  el._pick('to', 0);
+  assert.equal(el._chips.to.length, 50);
+  assert.equal(q(root, '[data-err="to"]').textContent, 'At most 50 recipients here; not added: zed@x.org.');
+  i = q(root, '[data-input="to"]');
+  root.fire('keydown', i, { key: 'Backspace' });
+  assert.equal(el._chips.to.length, 49);
+  assert.equal(q(root, '[data-err="to"]').hidden, true);
+  p = el._submit();
+  req = take((w) => w.method === 'POST', 'the compose');
+  assert.equal(req.body.to.length, 49, 'Send is not blocked by a line nothing could clear');
+  req.answer({ error: 'no' }, 400);
+  await p;
+  // What is no address and what did not fit are both named.
+  const full = openSheet();
+  type(full.root, 'to', `${many.slice(0, 50).join(', ')}, nope, late@x.org,`);
+  assert.equal(q(full.root, '[data-err="to"]').textContent,
+               '“nope” is not an e-mail address. At most 50 recipients here; not added: late@x.org.');
+  assert.equal(q(full.root, '[data-input="to"]').value, 'nope, late@x.org');
 });
 
 await ok('suggestions from the address book, by keyboard; a stale answer is dropped', async () => {
@@ -939,6 +1927,76 @@ await ok('suggestions from the address book, by keyboard; a stale answer is drop
   assert.deepEqual(el._sugg.items, []);
 });
 
+await ok('an address-book answer for a field that was left opens no list', async () => {
+  const BOOK = { contacts: [{ name: 'Ann Example', handles: [{ channel: 'email', handle: 'ann@example.com' }] }] };
+  // Typed "ann", then on to the subject before the answer is back.
+  let { el, root } = openSheet();
+  let i = type(root, 'to', 'ann');
+  let p = el._suggest('to', 'ann');
+  let req = take((w) => w.url.startsWith('/contacts?'), 'the address book');
+  q(root, '[data-subject]').focus();
+  root.fire('focusout', i);
+  assert.equal(i.value, 'ann', 'what is no address stays in the field');
+  assert.equal(q(root, '[data-err="to"]').textContent, '“ann” is not an e-mail address.');
+  req.answer(BOOK);
+  await p;
+  assert.deepEqual(el._sugg, { field: '', items: [], active: -1 }, 'nothing opens under a field nobody is in');
+  assert.equal(q(root, '[data-sugg="to"]').hidden, true);
+  // The same with the question still waiting for its pause: it is not asked.
+  ({ el, root } = openSheet());
+  i = type(root, 'to', 'ann');
+  el._suggTimer = 7;
+  root.fire('focusout', i);
+  assert.equal(el._suggTimer, null);
+  // And however the field was left: an answer only opens a list under the
+  // field that has the focus.
+  ({ el, root } = openSheet());
+  i = type(root, 'to', 'ann');
+  p = el._suggest('to', 'ann');
+  req = take((w) => w.url.startsWith('/contacts?'), 'the address book');
+  q(root, '[data-text]').focus();
+  req.answer(BOOK);
+  await p;
+  assert.deepEqual(el._sugg.items, []);
+  // Escape in the subject then closes the sheet — there is no list in its way.
+  root.fire('keydown', q(root, '[data-subject]'), { key: 'Escape' });
+  assert.equal(el.hasAttribute('hidden'), true);
+});
+
+await ok('an input method\'s Enter only commits what it composes', async () => {
+  const { el, root } = openSheet();
+  // WebKit: the Enter that commits a composition arrives after
+  // compositionend — isComposing false, keyCode 229.
+  for (const ime of [{ isComposing: true }, { isComposing: false, keyCode: 229 }]) {
+    const i = type(root, 'to', '山田');
+    el._sugg = { field: 'to', items: [{ name: '山田', address: 'yamada@x.org' }], active: -1 };
+    let ev = root.fire('keydown', i, { key: 'Enter', ...ime });
+    assert.ok(ev.defaultPrevented, 'never a submit');
+    assert.deepEqual(el._chips.to, [], 'no chip is made of a name being composed');
+    assert.equal(q(root, '[data-err="to"]').hidden, true, 'and no error about it');
+    assert.equal(el._sugg.items.length, 1, 'the list it was typed for stays');
+    // In the subject it does not jump on to the text.
+    const subj = q(root, '[data-subject]');
+    subj.focus();
+    ev = root.fire('keydown', subj, { key: 'Enter', ...ime });
+    assert.ok(ev.defaultPrevented);
+    assert.equal(globalThis.focused, subj);
+    // In the text it does not send.
+    write(root, 'ann@example.com,', 'Hello');
+    root.fire('keydown', q(root, '[data-text]'), { key: 'Enter', ctrlKey: true, ...ime });
+    await settle();
+    assert.equal(wire.filter((w) => w.method === 'POST').length, 0);
+    el._discard();
+  }
+  // A plain Enter still does all three.
+  const i = type(root, 'to', 'zoe@x.org');
+  root.fire('keydown', i, { key: 'Enter', keyCode: 13 });
+  assert.deepEqual(el._chips.to.map((r) => r.address), ['zoe@x.org']);
+  const subj = q(root, '[data-subject]');
+  root.fire('keydown', subj, { key: 'Enter', keyCode: 13 });
+  assert.equal(globalThis.focused, q(root, '[data-text]'));
+});
+
 await ok('nothing is sent until there is a recipient and a text', async () => {
   const { el, root } = openSheet();
   await el._submit();
@@ -952,10 +2010,11 @@ await ok('nothing is sent until there is a recipient and a text', async () => {
   assert.equal(wire.length, 0, 'no request');
 });
 
-await ok('a send: the request, then the new chat — sent or queued', async () => {
+await ok('a send: the request, then the new chat — sent, queued, or handed over', async () => {
   for (const [status, answer] of [[200, { id: 'email:~me@example.org:new1@me.example.org', message: { id: 'new1@me.example.org' } }],
-                                  [202, { id: 'email:~me@example.org:new2@me.example.org', pending: pend('q7') }]]) {
-    const { el, root } = openSheet({ channel: 'email', label: 'E-mail', accounts: [ACCT, 'work@example.com'] });
+                                  [202, { id: 'email:~me@example.org:new2@me.example.org', pending: pend('q7') }],
+                                  [202, { id: 'email:~me@example.org:new3@me.example.org', unconfirmed: true, message_id: 'new3@me.example.org' }]]) {
+    const { el, root } = openSheet(TWO);
     type(root, 'to', 'Ann <ann@example.com>, bob@builder.example');
     type(root, 'cc', 'carla@example.net');
     const subj = q(root, '[data-subject]'); subj.value = 'Numbers'; root.fire('input', subj);
@@ -967,32 +2026,82 @@ await ok('a send: the request, then the new chat — sent or queued', async () =
     await settle();
     const req = take((w) => w.method === 'POST', 'the compose');
     assert.equal(req.url, '/chats/compose');
-    assert.deepEqual(req.body, { channel: 'email', to: ['ann@example.com', 'bob@builder.example'], cc: ['carla@example.net'],
-                                 subject: 'Numbers', text: 'Hi both,\n\nthe numbers.', account: 'work@example.com' });
+    assert.match(req.body.request_key, KEY_RE);
+    assert.deepEqual({ ...req.body, request_key: 0 },
+                     { channel: 'email', to: ['ann@example.com', 'bob@builder.example'], cc: ['carla@example.net'],
+                       subject: 'Numbers', text: 'Hi both,\n\nthe numbers.', account: 'work@example.com', request_key: 0 });
     assert.equal(q(root, '[data-send]').textContent, 'Sending …');
     assert.equal(q(root, '[data-send]').disabled, true);
+    assert.equal(q(root, '[data-discard]').disabled, true);
     el._submit();
     assert.equal(wire.filter((w) => w.method === 'POST').length, 0, 'one press, one request');
     req.answer(answer, status);
     await settle();
     await settle();
     assert.deepEqual(assigned, [`/chat.html?id=${encodeURIComponent(answer.id)}`]);
-    assert.equal(store.get('retinue-draft:compose:email'), undefined, 'the kept mail is dropped');
+    assert.equal(kept('work@example.com'), null, 'the kept mail is dropped');
+    assert.equal(q(root, '[data-send]').disabled, true, 'no second press on the way out');
+    el._submit();
+    assert.equal(wire.filter((w) => w.method === 'POST').length, 0);
   }
 });
 
-await ok('a refusal is shown in place, everything still there', async () => {
+await ok('one press, one mail: closing and opening the sheet does not arm Send again', async () => {
+  const { el, root } = openSheet();
+  write(root, 'ann@example.com,', 'Slow mail');
+  const p = el._submit();
+  const first = take((w) => w.method === 'POST', 'the compose');
+  // Nothing seems to happen: Escape, then ＋ → New e-mail again.
+  root.fire('keydown', q(root, '[data-text]'), { key: 'Escape' });
+  assert.equal(el.hasAttribute('hidden'), true, 'closing stays possible');
+  const again = sheetMod.openComposeSheet(ONE, () => {});
+  assert.equal(again, el);
+  assert.equal(el.hasAttribute('hidden'), false);
+  assert.ok(el.shadowRoot.innerHTML.includes('This mail is being sent.'), 'said');
+  assert.ok(!el.shadowRoot.innerHTML.includes('The mail you started earlier is back.'), 'not offered as a kept draft');
+  assert.deepEqual(el._chips.to.map((r) => r.address), ['ann@example.com']);
+  assert.equal(el._text, 'Slow mail');
+  assert.equal(q(el.shadowRoot, '[data-send]').disabled, true);
+  assert.equal(q(el.shadowRoot, '[data-send]').textContent, 'Sending …');
+  await el._submit();
+  root.fire('keydown', q(el.shadowRoot, '[data-text]'), { key: 'Enter', ctrlKey: true });
+  el._discard();
+  assert.equal(el._text, 'Slow mail', 'the mail on its way is not emptied');
+  assert.equal(wire.filter((w) => w.method === 'POST').length, 0, 'no second request while the first is on its way');
+  first.answer({ id: 'email:~me@example.org:slow@me.example.org', message: {} });
+  await p;
+  assert.deepEqual(assigned, [`/chat.html?id=${encodeURIComponent('email:~me@example.org:slow@me.example.org')}`]);
+  // A send that fails after the sheet was closed is not left unsaid: the
+  // sheet comes back with what happened, and everything still there.
+  const b = openSheet();
+  write(b.root, 'ann@example.com,', 'Slow mail');
+  const pb = b.el._submit();
+  const req = take((w) => w.method === 'POST', 'the compose');
+  b.el.close();
+  req.answer({ error: 'The address does not exist.' }, 400);
+  await pb;
+  assert.equal(b.el.hasAttribute('hidden'), false);
+  assert.equal(q(b.el.shadowRoot, '[data-err="form"]').textContent, 'Not sent: The address does not exist.');
+  assert.equal(q(b.el.shadowRoot, '[data-send]').disabled, false);
+  assert.equal(b.el._text, 'Slow mail');
+  assert.equal(main.inert, true);
+  b.el.close();
+});
+
+await ok('a refusal is shown in place; an answer that leaves it open is never "not sent"', async () => {
   const cases = [
     [{ error: 'The address "x@y.zz" does not parse.' }, 400, 'Not sent: The address "x@y.zz" does not parse.'],
     [{}, 403, 'Not sent: the server refused the request.'],
-    [{}, 503, 'Not sent (the server answered 503). Try again in a moment.'],
+    [{}, 409, 'Not sent: the server refused the request (409).'],
+    [{}, 503, 'The server could not confirm this mail (it answered 503). If it shows up in the chat list, do not send it again.'],
+    [{ error: 'gateway unreachable' }, 502, 'The server could not confirm this mail (gateway unreachable). If it shows up in the chat list, do not send it again.'],
     [{ message: {} }, 200, 'The server did not say where the new chat is — look for it in the chat list.'],
-    [null, 0, "Couldn't reach the server — check the connection and try again."],
+    [{ unconfirmed: true }, 202, 'The mail was handed over, but it is not confirmed yet that it went out. Look for it in the chat list before you send it again.'],
+    [null, 0, 'No answer came back, so it is not known whether the mail went out. If it shows up in the chat list, do not send it again.'],
   ];
   for (const [doc, status, said] of cases) {
     const { el, root } = openSheet();
-    type(root, 'to', 'ann@example.com,');
-    const text = q(root, '[data-text]'); text.value = 'Hello'; root.fire('input', text);
+    write(root);
     const p = el._submit();
     const req = take((w) => w.method === 'POST', 'the compose');
     if (status) req.answer(doc, status); else req.fail();
@@ -1005,7 +2114,63 @@ await ok('a refusal is shown in place, everything still there', async () => {
     assert.deepEqual(el._chips.to.map((r) => r.address), ['ann@example.com']);
     assert.equal(el._text, 'Hello');
     assert.deepEqual(assigned, []);
+    // Only the server's own refusal says "not sent"; only then is the next
+    // press a new one.
+    const open = !(status >= 400 && status < 500);
+    assert.equal(/^Not sent/.test(said), !open, said);
+    const p2 = el._submit();
+    const req2 = take((w) => w.method === 'POST', 'the compose again');
+    assert.equal(req2.body.request_key === req.body.request_key, open, `${status}: the same press again keeps its key`);
+    req2.answer({ error: 'x' }, 400);
+    await p2;
   }
+  // The server echoed the key: it knows this very press, and says so.
+  const { el, root } = openSheet();
+  write(root);
+  let p = el._submit();
+  let req = take((w) => w.method === 'POST', 'the compose');
+  const key = req.body.request_key;
+  req.answer({ unconfirmed: true, request_key: key }, 202);
+  await p;
+  assert.equal(q(root, '[data-err="form"]').textContent, 'The mail was handed over, but it is not confirmed yet that it went out. ' +
+    'Look for it in the chat list; sending it again unchanged asks about this same mail and does not send it twice.');
+  // Unchanged: the same key. Changed: another mail, another key.
+  p = el._submit();
+  req = take((w) => w.method === 'POST', 'the compose');
+  assert.equal(req.body.request_key, key);
+  req.fail();
+  await p;
+  const text = q(root, '[data-text]'); text.value = 'Hello, edited'; root.fire('input', text);
+  p = el._submit();
+  req = take((w) => w.method === 'POST', 'the compose');
+  assert.notEqual(req.body.request_key, key);
+  req.answer({ id: 'email:~me@example.org:n@me.example.org', message: {} });
+  await p;
+});
+
+await ok('a press that was never answered stays with the mail across a reload', async () => {
+  const { el, root } = openSheet();
+  write(root, 'ann@example.com,', 'On the wire');
+  el._submit();
+  const first = take((w) => w.method === 'POST', 'the compose');
+  assert.equal(kept().press.key, first.body.request_key, 'kept with its press before the request left');
+  // The page is reloaded while the request is on its way.
+  el._busy = false;
+  const { el: el2, root: root2 } = openSheet(ONE, true);
+  assert.ok(root2.innerHTML.includes('The mail you started earlier is back. It was being sent when this sheet was last open, ' +
+    'and it is not confirmed whether it went out: look in the chat list before you send it again.'), root2.innerHTML.slice(0, 900));
+  assert.equal(q(root2, '[data-send]').disabled, false);
+  const p = el2._submit();
+  const req = take((w) => w.method === 'POST', 'the compose');
+  assert.equal(req.body.request_key, first.body.request_key, 'sent again unchanged, it is the same mail to the gateway');
+  req.answer({ id: 'email:~me@example.org:w@me.example.org', message: {} });
+  await p;
+  assert.equal(kept(), null);
+  // What is kept is read as data.
+  store.set(SLOT(), JSON.stringify({ at: Date.now(), v: { to: [{ address: 'ann@example.com' }], text: 'x', press: { key: '<script>', sig: 1 } } }));
+  const c = openSheet(ONE, true);
+  assert.equal(c.el._press, null);
+  assert.ok(!c.root.innerHTML.includes('It was being sent'));
 });
 
 await ok('Escape closes, the focus goes back, and the mail waits for the next opening', async () => {
@@ -1022,14 +2187,14 @@ await ok('Escape closes, the focus goes back, and the mail waits for the next op
   assert.equal(main.inert, false);
   // Opened again: what it held, said so.
   let back2 = 0;
-  sheetMod.openComposeSheet({ channel: 'email', label: 'E-mail', accounts: [ACCT] }, () => { back2 += 1; });
+  sheetMod.openComposeSheet(ONE, () => { back2 += 1; });
   assert.deepEqual(el._chips.to.map((r) => r.address), ['ann@example.com']);
   assert.equal(el._subject, 'Later');
-  assert.ok(el.shadowRoot.innerHTML.includes('The mail you started earlier is back.'));
+  assert.ok(el.shadowRoot.innerHTML.includes('The mail you started earlier is back.</p>'));
   assert.ok(el.shadowRoot.innerHTML.includes('value="Later"'));
   // Discard empties it for good.
   el._discard();
-  assert.equal(store.get('retinue-draft:compose:email'), undefined);
+  assert.equal(kept(), null);
   assert.deepEqual(el._chips.to, []);
   // Tab wraps inside the dialog.
   const first = new El('first'); const last = new El('last');
@@ -1040,6 +2205,77 @@ await ok('Escape closes, the focus goes back, and the mail waits for the next op
   el.shadowRoot.activeElement = first;
   el.shadowRoot.fire('keydown', first, { key: 'Tab', shiftKey: true });
   assert.equal(globalThis.focused, last);
+  el.close();
+});
+
+await ok('a kept mail belongs to its mailbox and never changes sender unseen', async () => {
+  const WORK = 'work@example.com';
+  const PRIV = 'me@example.org';
+  const pick = (root, account) => { const a = q(root, '[data-account]'); a.value = account; root.fire('change', a); };
+  // Started from the private mailbox, closed.
+  let { el, root } = openSheet({ ...TWO, accounts: [WORK, PRIV] });
+  assert.equal(el._account, WORK);
+  pick(root, PRIV);
+  write(root, 'ann@example.com,', 'A private matter');
+  el.close();
+  assert.equal(kept(PRIV).text, 'A private matter');
+  assert.equal(kept(WORK), null);
+  // Later the private mailbox cannot send and is not offered: the sheet does
+  // not bring the mail back under the work address — it opens empty, says
+  // where the mail is, and a send from here is another mail.
+  ({ el, root } = openSheet({ ...ONE, accounts: [WORK] }, true));
+  assert.equal(el._account, WORK);
+  assert.deepEqual([el._chips.to, el._text], [[], '']);
+  assert.ok(root.innerHTML.includes('<p class="from">From <b>work@example.com</b></p>'));
+  assert.ok(!root.innerHTML.includes('The mail you started earlier is back.'));
+  assert.ok(root.innerHTML.includes('A mail you started from me@example.org is kept. It comes back when that mailbox can send again.'));
+  write(root, 'bob@builder.example,', 'Work');
+  const p = el._submit();
+  const req = take((w) => w.method === 'POST', 'the compose');
+  assert.equal(req.body.account, WORK);
+  assert.equal(req.body.text, 'Work');
+  req.answer({ error: 'no' }, 400);
+  await p;
+  el.close();
+  assert.equal(kept(PRIV).text, 'A private matter', 'untouched');
+  assert.equal(kept(WORK).text, 'Work');
+  // Both offered again: the sheet opens on the mailbox written from last,
+  // with its own mail; the other mailbox's mail is under that mailbox.
+  ({ el, root } = openSheet({ ...TWO, accounts: [WORK, PRIV] }, true));
+  assert.equal(el._account, WORK);
+  assert.equal(el._text, 'Work');
+  assert.ok(root.innerHTML.includes(`<option value="${WORK}" selected>`));
+  // From changed with both holding a mail: the chosen mailbox's own comes
+  // back, the other stays kept — neither is lost, neither changes sender.
+  pick(root, PRIV);
+  assert.equal(el._account, PRIV);
+  assert.equal(el._text, 'A private matter');
+  assert.ok(el.shadowRoot.innerHTML.includes('The mail you started earlier is back. What you wrote from work@example.com is kept for that mailbox.'));
+  assert.equal(kept(WORK).text, 'Work');
+  // An empty form simply opens on what the chosen mailbox holds …
+  el._discard();
+  assert.equal(kept(PRIV), null);
+  pick(el.shadowRoot, WORK);
+  assert.equal(el._text, 'Work');
+  // … and a mail goes with From only where the user sends it: to a mailbox
+  // that holds none.
+  pick(el.shadowRoot, PRIV);
+  assert.equal(el._text, 'Work', 'the mail moved by the user\'s own choice');
+  assert.equal(kept(WORK), null);
+  assert.equal(kept(PRIV).text, 'Work');
+  assert.equal(kept(PRIV).account, PRIV);
+  const p2 = el._submit();
+  const req2 = take((w) => w.method === 'POST', 'the compose');
+  assert.equal(req2.body.account, PRIV);
+  req2.answer({ id: 'email:~me@example.org:x@me.example.org', message: {} });
+  await p2;
+  // A mailbox that is not on offer is never posted.
+  ({ el, root } = openSheet(ONE));
+  write(root);
+  el._account = 'gone@example.org';
+  await el._submit();
+  assert.equal(wire.filter((w) => w.method === 'POST').length, 0);
+  assert.equal(q(root, '[data-err="form"]').textContent, 'Choose the mailbox this mail leaves from.');
 });
 
 console.log(`${passed} checks passed`);
@@ -1058,6 +2294,16 @@ def static_checks() -> list[str]:
         errors.append("chat-page.js builds the approval link from markup")
     if "createElement('a')" not in code:
         errors.append("chat-page.js no longer builds the approval link with createElement")
+    # Whom a reply reaches is never worked out by the page.
+    if "replyRecipients" in src:
+        errors.append("chat-page.js still derives a reply's recipients (replyRecipients)")
+    if "/reply-preview" not in code:
+        errors.append("chat-page.js no longer asks the server where a reply goes")
+    # The controls of a failed or unconfirmed send are wired where every
+    # bubble's controls are: the thread's delegated click handler.
+    for control in ("[data-pend-copy]", "[data-pend-dismiss]", "[data-recheck]"):
+        if f"at('{control}')" not in code:
+            errors.append(f"the thread's click handler does not know {control}")
     render = re.search(r"\n  render\(\) \{(.*?)\n  \}\n", src, re.S)
     if not render or "this._mountApprovals()" not in render.group(1):
         errors.append("render() no longer mounts the pending bubbles' approval links")

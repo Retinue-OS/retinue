@@ -14,7 +14,9 @@ server, so the flags the companion's note names are known to do what it says:
   * --attach, --user-approved, --thread (and its environment default), --url;
   * a queued send prints its id, how to take it back, and the approval URL
     made absolute; --retract takes it back;
-  * a refusal is the gateway's own sentence, and a failure exit.
+  * a refusal is the gateway's own sentence, and a failure exit;
+  * one run is one mail: every request carries a key, a run that got no
+    answer asks again under it, and one that still does not know says so.
 
     python3 tests/test_mail_push.py
 """
@@ -27,6 +29,7 @@ import os
 import sys
 import tempfile
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -48,6 +51,7 @@ class Stub:
         self.requests = []      # (path, body | None, headers)
         self.answer = (200, {"status": "sent", "message_id": "m1@example.org",
                              "chat": "a@x.org", "ts": 1.0, "attachments": []})
+        self.silent = 0         # leave this many requests unanswered (the caller times out)
         stub = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -59,6 +63,10 @@ class Stub:
                 raw = self.rfile.read(length) if length else b""
                 stub.requests.append((self.path, json.loads(raw) if raw else None,
                                       dict(self.headers)))
+                if stub.silent:
+                    stub.silent -= 1
+                    time.sleep(1.5)
+                    return
                 status, body = stub.answer
                 if self.path.endswith("/retract"):
                     status, body = 200, {"id": RID, "status": "retracted"}
@@ -73,7 +81,13 @@ class Stub:
         self.url = f"http://127.0.0.1:{self.server.server_address[1]}/send"
 
     def body(self, index=-1) -> dict:
-        return self.requests[index][1]
+        """What a request asked to be sent — without the key every run adds
+        (see :meth:`key`)."""
+        return {name: value for name, value in self.requests[index][1].items()
+                if name != "request_key"}
+
+    def key(self, index=-1) -> str:
+        return self.requests[index][1]["request_key"]
 
 
 def push(*argv, env=None, stdin=None):
@@ -269,8 +283,56 @@ def test_what_it_says_of_the_answer():
         stub.server.shutdown()
     code, _out, err = push("--to", "ann@x.org", "x", "--timeout", "2",
                            env={"MAIL_GATEWAY_SEND_URL": "http://127.0.0.1:9/send"})
-    assert code == 1 and "could not reach gateway" in err
+    assert code == 1 and "could not reach gateway" in err and "NOT KNOWN" not in err
     print("ok: a queued send prints its approval link and how to retract it; a refusal fails")
+
+
+def test_one_run_is_one_mail():
+    stub = Stub()
+    env = {"MAIL_GATEWAY_SEND_URL": stub.url}
+    try:
+        # Every request names itself with a key of the run's own.
+        push("--to", "ann@x.org", "x", env=env)
+        push("--to", "ann@x.org", "x", env=env)
+        first, second = stub.key(-2), stub.key(-1)
+        assert first != second and len(first) == 32 and first.isalnum()
+        # No answer (the gateway is busy handing the mail over): asked again,
+        # once, under the same key — which sends nothing a second time — and
+        # the answer to that is the answer.
+        sent = len(stub.requests)
+        stub.silent = 1
+        code, out, err = push("--to", "ann@x.org", "x", "--timeout", "0.5", env=env)
+        assert code == 0 and "mail-push: sent" in out and "asking again" in err, (out, err)
+        assert len(stub.requests) == sent + 2 and stub.key(-2) == stub.key(-1)
+        assert stub.requests[-2][1] == stub.requests[-1][1], "the very same request"
+        # Still none: not "failed" — nobody knows, and it says how to find out.
+        stub.silent = 2
+        code, out, err = push("--to", "ann@x.org", "x", "--timeout", "0.5", env=env)
+        key = stub.key()
+        assert code == 1 and out == "" and "NOT KNOWN whether this mail was sent" in err
+        assert f"--request-key {key}" in err and "Do not send it again" in err
+        time.sleep(1.6)
+        # Asked about later, with the key that run printed.
+        code, out, err = push("--to", "ann@x.org", "x", "--request-key", key, env=env)
+        assert code == 0 and stub.key() == key and "mail-push: sent" in out
+        code, _out, err = push("--to", "ann@x.org", "x", "--request-key", "two words", env=env)
+        assert code == 2 and "--request-key" in err
+        # "Not confirmed" from the gateway is the same kind of answer.
+        stub.answer = (502, {"error": "the mail server has not confirmed this mail",
+                             "unconfirmed": True, "message_id": "m@example.org"})
+        code, out, err = push("--to", "ann@x.org", "x", env=env)
+        assert code == 1 and "NOT KNOWN" in err and f"--request-key {stub.key()}" in err
+        stub.answer = (502, {"error": "send failed: 554 rejected"})
+        code, out, err = push("--to", "ann@x.org", "x", env=env)
+        assert code == 1 and "554" in err and "NOT KNOWN" not in err
+        # A reply that leaves an address of the answered mail out says so.
+        stub.answer = (200, {"status": "sent", "message_id": "m4@example.org", "chat": "a@x.org",
+                             "ts": 1.0, "attachments": [], "skipped": ["p\u00f6st@evil.org"]})
+        code, out, _err = push("--chat", "a@x.org", "x", env=env)
+        assert code == 0 and "not written to" in out and "p\u00f6st@evil.org" in out
+    finally:
+        stub.server.shutdown()
+    print("ok: every run carries a request key; no answer is asked about again, never resent")
 
 
 def test_against_the_gateway_itself():
@@ -324,6 +386,16 @@ def test_against_the_gateway_itself():
                 assert smtp.mails[-1]["rcpt"] == ["dora@w.org"]
                 assert [p.get_filename() for p in smtp.parsed().iter_attachments()] == ["plan.pdf"]
                 assert len(smtp.mails) == 2
+                # The same send asked about again: its outcome, and no mail.
+                key = next(e["request_key"] for e in gw.SENDS.entries()
+                           if e["to"] == ["dora@w.org"])
+                code, out, err = push("--to", "dora@w.org", "--subject", "Plan", "--attach",
+                                      str(pdf), "--user-approved", "Attached.",
+                                      "--request-key", key, env=env)
+                assert code == 0 and "mail-push: sent" in out and len(smtp.mails) == 2, err
+                code, _out, err = push("--to", "dora@w.org", "--subject", "Another",
+                                       "--user-approved", "Else.", "--request-key", key, env=env)
+                assert code == 1 and "409" in err and len(smtp.mails) == 2
             finally:
                 server.shutdown()
     finally:
