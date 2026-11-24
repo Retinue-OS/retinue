@@ -374,8 +374,11 @@ user's own act like a send**: `POST /chats/<id>/read` and
 `POST /chats/<id>/flags` answer 403 to a request another site's page made the
 browser send (a `Sec-Fetch-Site` other than `same-origin` or `none`), on
 every channel and for every body — the undo and a star included. The flags,
-like a send and a delete, are accepted only through the reverse proxy too: an
-agent sets a chat's flags by its own door (`POST /internal/chats/<id>/flags`,
+like a send and a delete, are accepted only through the reverse proxy too —
+refusing a caller inside the container where `EDGE_PROXY_PEERS` names the
+proxy, and without it only a loopback peer and one that is the address the
+caller dialled ([dashboard.md](dashboard.md), "Who is asking"): an agent sets
+a chat's flags by its own door (`POST /internal/chats/<id>/flags`,
 `chat-flags.py`).
 
 ### Unread · Read · Archived

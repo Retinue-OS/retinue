@@ -407,15 +407,19 @@ instruction without VIP and has it ask for a high importance.
   answer then says `a turn is running on this chat; …` — unless it carries
   the proof a dashboard thread's turn is handed (`RETINUE_USER_TURN`). The
   user's own endpoint (`POST /chats/<id>/flags`, which needs no token) is
-  accepted only through the reverse proxy, like a chat's delete and send:
-  the web gateway refuses a caller on loopback or on the container's own
-  address — or, where `EDGE_PROXY_PEERS` names the proxy, any peer it does
-  not name — and only where the proxy itself arrives on loopback (host
-  networking, `EDGE_PROXY_PEERS` including it) can it not tell the
-  dashboard from a caller inside the container. So a mail asking its turn
-  to undo the user's mute on its own thread gets nowhere while the turn
-  runs. That is all it holds: the turn's session holds the backend token
-  every agent session holds, so it can set another chat's flags with the
+  accepted only through the reverse proxy, like a chat's delete and send,
+  where `EDGE_PROXY_PEERS` names the reverse proxy: the web gateway then
+  refuses every peer it does not name, a caller inside the container
+  included. Without that setting it refuses only a loopback peer and a
+  peer that is the very address the caller dialled, so a caller inside the
+  container that comes in from another of the container's addresses, or
+  through a sibling that relays (the egress-audit proxy), is taken for the
+  dashboard; and where the proxy itself arrives on loopback (host
+  networking) it cannot tell the two apart at all. So, on a deployment
+  that sets `EDGE_PROXY_PEERS` to its proxy, a mail asking its turn to
+  undo the user's mute on its own thread gets nowhere while the turn runs.
+  That is all it holds: the turn's session holds the backend token every
+  agent session holds, so it can set another chat's flags with the
   user's meaning, and a process it leaves behind can act once the turn has
   ended; and while a dashboard turn the user started runs, its proof sits
   in that turn's process environment, which another session of the same

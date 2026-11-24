@@ -170,11 +170,15 @@ nothing new.
   flags call on that thread as the turn's — its mute an archive, its unmute,
   unarchive and star nothing — whether or not the call carries the turn's
   token, unless it carries the proof a dashboard thread's turn is handed
-  (the user's word); the user's own flags endpoint, which needs no token, is
-  accepted only through the reverse proxy, like a chat's delete — refusing
-  loopback and the container's own address, or any peer `EDGE_PROXY_PEERS`
-  does not name, and unable to tell the dashboard from a caller inside the
-  container only where that proxy arrives on loopback (host networking).
+  (the user's word); the user's own flags endpoint, which needs no token,
+  refuses a caller inside the container where `EDGE_PROXY_PEERS` names the
+  reverse proxy (any peer it does not name is refused). Without that
+  setting it refuses only a loopback peer and a peer that is the very
+  address the caller dialled, so a caller inside the container that comes
+  in from another of the container's addresses, or through a sibling that
+  relays (the egress-audit proxy), is taken for the dashboard — and where
+  the proxy arrives on loopback (host networking) the two cannot be told
+  apart at all.
   That holds no further. The turn's session holds the backend token every
   agent session holds, so it can set **another** chat's flags — mute it —
   with the user's meaning, and a process it leaves behind can do so on its

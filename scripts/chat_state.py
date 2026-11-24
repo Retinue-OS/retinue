@@ -51,7 +51,9 @@ one JSON document per chat under ``CHAT_STATE_DIR``:
   ``archive_asked``, those of them whose turn asked for the thread's
   archive, which a later turn's archive may then reach
   (:meth:`archive_through`) — until the user brings the thread back
-  (:meth:`set_flags` ``forget_asked``).
+  (:meth:`set_flags` ``forget_asked``), which also counts on
+  ``asked_epoch``: a turn that asked before it asked for nothing
+  (:meth:`note_turn_done` ``epoch``).
 - ``inbound_ahead`` / ``read_ahead`` — the latest stamp an arrival carried
   from a little ahead of this clock, and how far past ``last_read`` the
   newest read reaches by it: a message stamped by a clock running fast lies
@@ -481,6 +483,14 @@ def archive_asked(doc: dict | None, message_id: str | None) -> bool:
             and str(message_id) in ((doc or {}).get("archive_asked") or []))
 
 
+def asked_epoch(doc: dict | None) -> int:
+    """How many times the user has brought the chat back so far
+    (:meth:`ChatStateStore.set_flags` ``forget_asked``): what a turn notes
+    when it asks for the archive, for :meth:`ChatStateStore.note_turn_done`
+    ``epoch``."""
+    return int((doc or {}).get("asked_epoch") or 0)
+
+
 def asked_through(doc: dict | None, cut: int) -> bool:
     """Whether every arrival the chat counted after place ``cut`` was worked
     by a completed turn that asked for the thread's archive
@@ -791,6 +801,12 @@ class ChatStateStore:
             # a turn worked later — an older mail's, left for a turn of its
             # own — may archive the thread over them (archive_through).
             "archive_asked": [],
+            # How many times the user brought the chat back, forgetting
+            # those asks (set_flags ``forget_asked``); a merge adds the two
+            # halves' up. A turn notes it when it asks for the archive, and
+            # its ask counts only while it still stands (note_turn_done
+            # ``epoch``).
+            "asked_epoch": 0,
             # The latest stamp a counted arrival carried from ahead of this
             # clock, no further than READ_SKEW_SECONDS: a sender's clock, or
             # a receiving phone's, running a little fast. The rail takes
@@ -1152,7 +1168,9 @@ class ChatStateStore:
           that a place in it still says read or unread: what either chat's
           read covered first, then what had landed since; so do the
           arrivals either still owed the user (``untold``) and the turns
-          each mail had (``turn_attempts``). Where the mark
+          each mail had (``turn_attempts``), and the user's unarchives add
+          up (``asked_epoch``: the web gateway moves its running turns'
+          note of it along, _rekey_turns). Where the mark
           moved, the undo of the survivor's last *Mark as read* is dropped —
           it names a mark that no longer stands;
         - the **flags**: starred if either was; muted if either was (the user
@@ -1254,7 +1272,7 @@ class ChatStateStore:
 
             doc["read_inbound"] = mine_read + their_read if read_before else None
             doc["last_read"] = mark
-            for key in ("read_seq", "inbound_seq", "attended_seq"):
+            for key in ("read_seq", "inbound_seq", "attended_seq", "asked_epoch"):
                 doc[key] = int(doc.get(key) or 0) + int(gone.get(key) or 0)
             marks = [m for m in (doc.get("unread_since"), gone.get("unread_since")) if m]
             doc["unread_since"] = min(marks) if marks else None
@@ -1793,17 +1811,25 @@ class ChatStateStore:
             return count
 
     def note_turn_done(self, chat_id: str, message_id: str | None, *,
-                       asked: bool = False) -> None:
+                       asked: bool = False, epoch: int | None = None) -> None:
         """A turn for the arrival with this id completed: its next offer —
         made because the answer to this one was lost — is no reason for
         another (:func:`turn_done`). ``asked``: the turn asked for the
         thread's archive (:func:`archive_asked`); a turn that did not takes
-        an earlier turn's ask off the mail."""
+        an earlier turn's ask off the mail.
+
+        ``epoch``: :func:`asked_epoch` as the turn found it when it asked.
+        Where the user has brought the chat back since, the ask is one they
+        have overruled, and is noted as no ask — decided here, in the write
+        that would record it, so an unarchive landing while the turn wraps
+        up is never overtaken by it."""
         if not message_id:
             return
         mid = str(message_id)
         with self._lock:
             doc = self._read(chat_id)
+            if asked and epoch is not None and asked_epoch(doc) != int(epoch):
+                asked = False
             done = [m for m in doc.get("turns_done") or [] if m != mid]
             doc["turns_done"] = (done + [mid])[-INBOUND_RECENT_MAX:]
             ask = [m for m in doc.get("archive_asked") or [] if m != mid]
@@ -1897,13 +1923,16 @@ class ChatStateStore:
         thread back, and what the turns that completed so far asked
         (:func:`archive_asked`) is no archive a later turn may make over
         their mails (:func:`asked_through`) — in the same write, so no turn
-        archives between the two."""
+        archives between the two. And ``asked_epoch`` moves on, so a turn
+        that asked before it notes no ask when it completes
+        (:meth:`note_turn_done` ``epoch``)."""
         with self._lock:
             doc = self._read(chat_id)
             if archived is not None:
                 doc["archived"] = bool(archived)
                 if forget_asked and not archived:
                     doc["archive_asked"] = []
+                    doc["asked_epoch"] = asked_epoch(doc) + 1
             if muted is not None:
                 doc["muted"] = bool(muted)
                 if muted:

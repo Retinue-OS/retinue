@@ -2298,7 +2298,15 @@ def test_the_users_unarchive_forgets_what_turns_asked(base, wg):
     turn had put away, is refused by "newer mail arrived" as before
     decision AR — whether the user unarchived on the dashboard or through
     Ara with the user's meaning. Bringing the chat back is the user's word
-    only: the undo of a turn that did not finish forgets nothing."""
+    only: the undo of a turn that did not finish forgets nothing.
+
+    Decision AZ: an unarchive that lands while the newer mail's turn is
+    wrapping up — its record already off the running registry, its ask
+    not yet written — forgets that ask all the same (the interleaving is
+    forced: the user's call runs at the start of _instructed_settle). And
+    what counts is when the turn asked, not when it started: a turn that
+    asks after the user brought the thread back mid-run ("before-ask") is
+    remembered as asking, and decision AR holds for it."""
     firm = wg._CONTACTS.create("private", "Overrule Firm", [], instruction=FILING,
                                domains=["overrule.example"], permits=["focused"])
     billing = _party("billing@overrule.example", "Billing")
@@ -2310,8 +2318,9 @@ def test_the_users_unarchive_forgets_what_turns_asked(base, wg):
         answers.append(_agent_flags(base, chat, archived=True))
         _verdict(base, chat, 0)(prompt)
 
+    real_settle = wg._instructed_settle
     try:
-        for n, unarchive in enumerate(("dashboard", "ara", None)):
+        for n, unarchive in enumerate(("dashboard", "ara", None, "wrapup", "before-ask")):
             key = f"ov{n}-root@overrule.example"
             chat = _chat_id(key)
             answers.clear()
@@ -2320,15 +2329,44 @@ def test_the_users_unarchive_forgets_what_turns_asked(base, wg):
             _s, old, mid, ts = _arrive(base, key, billing, gate=INSTRUCTED, text="Invoice OLD")
             assert _await_job(base, old["job_url"])["status"] == "error"
             TURN_GATE.update(fail=False, during=during)
+            wrapped: list = []
+            if unarchive == "before-ask":
+                def first_the_user(prompt):
+                    wrapped.append(_http(base, "POST", f"/chats/{_quote(chat)}/flags",
+                                         {"archived": False}))
+                    during(prompt)
+                TURN_GATE.update(during=first_the_user)
+            if unarchive == "wrapup":
+                def settle(chat_id, *args, **kwargs):
+                    # Off _RUNNING_TURNS by now, its ask not yet noted.
+                    if not wrapped:
+                        with wg._chat_turns_lock:
+                            assert not wg._RUNNING_TURNS.get(chat_id)
+                        wrapped.append(_http(base, "POST", f"/chats/{_quote(chat)}/flags",
+                                             {"archived": False}))
+                    return real_settle(chat_id, *args, **kwargs)
+                wg._instructed_settle = settle
             _s, new, newer, _t = _arrive(base, key, billing, gate=INSTRUCTED, text="Invoice NEW")
             assert _await_job(base, new["job_url"])["status"] == "done"
+            wg._instructed_settle = real_settle
+            TURN_GATE.update(during=during)
             assert answers[-1][1]["archived"] is True, answers
-            assert cs.archive_asked(wg._CHAT_STATE.get(chat), newer)
-            # Not the user's word: a turn's undo brings the chat back and
-            # forgets nothing.
-            wg._set_chat_flags(chat, {"archived": False})
-            assert cs.archive_asked(wg._CHAT_STATE.get(chat), newer)
-            wg._set_chat_flags(chat, {"archived": True})
+            if unarchive == "wrapup":
+                (status, out), = wrapped
+                assert status == 200 and out["archived"] is False, out
+                doc = wg._CHAT_STATE.get(chat)
+                assert not doc["archived"] and not cs.archive_asked(doc, newer), doc
+                assert cs.turn_done(doc, newer), doc
+            else:
+                if unarchive == "before-ask":
+                    (status, out), = wrapped
+                    assert status == 200 and cs.asked_epoch(wg._CHAT_STATE.get(chat)) == 1
+                assert cs.archive_asked(wg._CHAT_STATE.get(chat), newer)
+                # Not the user's word: a turn's undo brings the chat back and
+                # forgets nothing.
+                wg._set_chat_flags(chat, {"archived": False})
+                assert cs.archive_asked(wg._CHAT_STATE.get(chat), newer)
+                wg._set_chat_flags(chat, {"archived": True})
             if unarchive == "dashboard":
                 status, out = _http(base, "POST", f"/chats/{_quote(chat)}/flags",
                                     {"archived": False})
@@ -2337,27 +2375,75 @@ def test_the_users_unarchive_forgets_what_turns_asked(base, wg):
                 status, out = _agent_flags(base, chat, archived=False)
                 assert status == 200 and out["archived"] is False, out
             doc = wg._CHAT_STATE.get(chat)
-            assert cs.archive_asked(doc, newer) is (unarchive is None), (unarchive, doc)
+            never = unarchive in (None, "before-ask")
+            assert cs.archive_asked(doc, newer) is never, (unarchive, doc)
             # The mail gateway offers the older mail again; its retry turn
             # asks for the archive.
             status, again = _again(base, key, billing, mid, ts, gate=INSTRUCTED)
             assert status == 202, again
             assert _await_job(base, again["job_url"])["status"] == "done"
             status, last = answers[-1]
-            if unarchive is None:
-                # The thread was never brought back: decision AR holds.
+            if never:
+                # Not brought back after the ask: decision AR holds.
                 assert last["archived"] is True, last
             else:
                 assert last["archived"] is False and last["reason"] == "newer mail arrived", last
                 assert chat in mail._home(base), "the thread the user brought back stays"
             _forget(wg, chat)
     finally:
+        wg._instructed_settle = real_settle
         TURN_GATE.update(fail=False, during=None)
         wg.CHAT_ARRIVAL_RETRY_SECONDS = retry
         wg._CONTACTS.delete(firm["key"])
         PUSHES.clear()
         TURNS.clear()
     print("PASS test_the_users_unarchive_forgets_what_turns_asked")
+
+
+def test_a_running_turns_epoch_follows_a_merge(base, wg):
+    """Decision AZ, through a merge: the halves' asked_epoch add up, and a
+    running turn's note of it takes the other half's (_rekey_turns), so it
+    still says whether the user brought its own half back since it asked
+    — and nothing else does."""
+    a = _chat_id("epoch-a@epoch.example")
+    b = _chat_id("epoch-b@epoch.example")
+    for chat in (a, b):
+        wg._CHAT_STATE.count_arrival(chat, 1000.0, message_id=f"m-{chat[-20:]}")
+    for _ in range(2):
+        wg._set_chat_flags(a, {"archived": False}, user=True)
+    wg._set_chat_flags(b, {"archived": False}, user=True)
+
+    def record(chat):
+        return {"chat": chat, "jobs": set(), "names": {chat}, "token": "",
+                "mids": [], "seqs": [], "instructed": False, "verdict": None,
+                "flags": set(), "asked": False,
+                "epoch": cs.asked_epoch(wg._CHAT_STATE.get(chat))}
+
+    with wg._chat_turns_lock:
+        mine, theirs = record(a), record(b)
+        wg._RUNNING_TURNS[a], wg._RUNNING_TURNS[b] = [mine], [theirs]
+    # The user brings the absorbed half back while its turn runs.
+    wg._set_chat_flags(b, {"archived": False}, user=True)
+    try:
+        doc, gone = wg._CHAT_STATE.merge(b, a)
+        wg._CHAT_STATE.note_merged(b, a)
+        with wg._chat_turns_lock:
+            wg._rekey_turns(b, a, doc, gone)
+            assert wg._RUNNING_TURNS[a] == [mine, theirs]
+        assert cs.asked_epoch(doc) == 4, doc
+        assert mine["epoch"] == cs.asked_epoch(doc), "the survivor's half was not brought back"
+        assert theirs["epoch"] != cs.asked_epoch(doc), "the absorbed half was"
+        wg._CHAT_STATE.note_turn_done(a, "x1", asked=True, epoch=mine["epoch"])
+        wg._CHAT_STATE.note_turn_done(a, "x2", asked=True, epoch=theirs["epoch"])
+        doc = wg._CHAT_STATE.get(a)
+        assert cs.archive_asked(doc, "x1") and not cs.archive_asked(doc, "x2"), doc
+    finally:
+        with wg._chat_turns_lock:
+            wg._RUNNING_TURNS.pop(a, None)
+            wg._RUNNING_TURNS.pop(b, None)
+        _forget(wg, a)
+        _forget(wg, b)
+    print("PASS test_a_running_turns_epoch_follows_a_merge")
 
 
 def test_a_flags_call_is_the_turns_only_with_its_token(base, wg):
@@ -2827,6 +2913,7 @@ def main():
         test_unquoted_mails_get_a_turn_of_their_own(base, wg)
         test_a_chain_of_deferred_turns_archives_its_thread(base, wg)
         test_the_users_unarchive_forgets_what_turns_asked(base, wg)
+        test_a_running_turns_epoch_follows_a_merge(base, wg)
         test_a_flags_call_is_the_turns_only_with_its_token(base, wg)
         test_a_turn_can_only_archive(base, wg)
         test_a_turns_answer_says_what_was_done(base, wg)

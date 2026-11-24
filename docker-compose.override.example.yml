@@ -54,6 +54,12 @@ services:
       # - SMTP_HOST_ARI
       # - MY_CHAMBER_API_KEY
       # - RETINUE_SESSION_ENV_EXTRA=MY_CHAMBER_API_KEY
+      # Recommended: the address Traefik connects from (a fixed one on `web`,
+      # never a range that holds this container's own), for without it the
+      # user-authority endpoints refuse only loopback and the address a caller
+      # dialled, and take a caller inside this container that comes in from
+      # its other network or through egress-audit for the dashboard.
+      # - EDGE_PROXY_PEERS=172.30.0.2
     networks:
       - agents
       - web

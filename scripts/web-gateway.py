@@ -1946,9 +1946,14 @@ AUTH_CONFIG = gateway_auth.config_from_env()
 #
 # What distinguishes the two callers is the TCP peer address, which they cannot
 # choose: Traefik connects from another container's address, while an
-# in-container caller connects either from loopback or, having dialled this
-# container's own address, from the very address this socket is bound to. That
-# is the discriminator; it fails closed on anything it cannot classify.
+# in-container caller connects from loopback or, having dialled this
+# container's own address, usually from the very address this socket is bound
+# to. Without EDGE_PROXY_PEERS that is the whole discriminator, and it is no
+# more: a caller in a container on two networks that dials one of its
+# addresses from the other, or one whose request a sibling relays (the
+# egress-audit proxy), arrives from an address that is neither, and is taken
+# for the proxy. Only EDGE_PROXY_PEERS naming the proxy refuses those. It fails
+# closed on anything it cannot classify.
 #
 # BE CLEAR ABOUT WHAT THIS IS. The web-gateway and the agents share one
 # container, and the channel gateways' tokens are in that container's
@@ -9982,6 +9987,14 @@ _INSTRUCTED_RINGS: dict[str, dict] = {}
 #               that a turn worked after it — for older mail its batch left
 #               for a turn of its own — may archive the thread over them
 #               (ChatStateStore.archive_through);
+#   epoch       for a mail turn that asked, the chat's asked_epoch when it
+#               asked: where the user has brought the thread back since,
+#               the ask is noted as none (ChatStateStore.note_turn_done
+#               ``epoch``) — also where the unarchive lands while the turn
+#               wraps up, off this registry, where _turn_flags_overruled no
+#               longer finds its record. (A merge landing in that window
+#               finds no record to carry the note along either, and the
+#               ask is then noted as none too: the thread stays in view);
 #   flags       {"archived"} where the turn archived the chat itself
 #               (POST /internal/chats/<id>/flags) and the user has not set
 #               the flag since — "file the document, then archive the mail".
@@ -10655,16 +10668,20 @@ def _arrival_job_rung_late(job_url: str, chat_id: str, message_id: str | None) -
                          "result": {"chat": chat_id, "rung_late": True}}
 
 
-def _turns_over(chat_id: str, message_id: str | None, *, asked: bool = False) -> None:
+def _turns_over(chat_id: str, message_id: str | None, *, asked: bool = False,
+                epoch: int | None = None) -> None:
     """A mail's turns are over — one completed, or they gave up
     (ChatStateStore.note_turn_done): its next offer starts none. ``asked``:
     the completed turn asked for the thread's archive, which a later turn's
-    archive may then reach over this mail (_turn_put_away). A write that
-    fails leaves the in-memory handle to say so until a restart."""
+    archive may then reach over this mail (_turn_put_away) — unless the
+    user brought the thread back after ``epoch``, the turn's note of the
+    chat's asked_epoch when it asked. A write that fails leaves the
+    in-memory handle to say so until a restart."""
     if not message_id:
         return
     try:
-        _CHAT_STATE.note_turn_done(_live_chat(chat_id), message_id, asked=asked)
+        _CHAT_STATE.note_turn_done(_live_chat(chat_id), message_id, asked=asked,
+                                   epoch=epoch)
     except OSError as exc:
         print(f"[web-gateway] could not note the turns of {chat_id} {message_id} as over "
               f"({exc})", flush=True)
@@ -10756,8 +10773,18 @@ def _rekey_turns(absorbed: str, survivor: str, doc: dict, gone: dict | None) -> 
             if not theirs.get("running") and mine.get("running"):
                 theirs["running"], theirs["worker"] = True, mine.get("worker")
     moved = _RUNNING_TURNS.pop(absorbed, None) or []
+    # The merge added the halves' asked_epoch up: each turn's note of it
+    # takes the other half's, so it still says whether the user has brought
+    # its own half back since it started.
+    their_epoch = chat_state_mod.asked_epoch(gone)
+    survivor_epoch = chat_state_mod.asked_epoch(doc) - their_epoch
+    for record in _RUNNING_TURNS.get(survivor) or []:
+        if record.get("epoch") is not None:
+            record["epoch"] += their_epoch
     for record in moved:
         record["chat"] = survivor
+        if record.get("epoch") is not None:
+            record["epoch"] += survivor_epoch
     if moved:
         _RUNNING_TURNS.setdefault(survivor, []).extend(moved)
     their_reads = int((gone or {}).get("read_seq") or 0)
@@ -11043,7 +11070,7 @@ def _chat_arrival_worker(chat_id: str, cid: str, worker: object = None) -> None:
                       "mids": [a.get("message_id") for a in arrivals],
                       "seqs": [a.get("seq") for a in arrivals],
                       "instructed": instructed, "verdict": None, "flags": set(),
-                      "asked": False}
+                      "asked": False, "epoch": None}
             _RUNNING_TURNS.setdefault(key, []).append(record)
         prompt = _chat_arrival_prompt(arrivals, key, deferred=deferred, quotes=quotes)
         stored = [f for a in arrivals for f in (a.get("files") or [])]
@@ -11087,7 +11114,8 @@ def _chat_arrival_worker(chat_id: str, cid: str, worker: object = None) -> None:
                 asked = bool(record.get("asked")) and trusted
             for arrival in arrivals:
                 if arrival.get("mail"):
-                    _turns_over(live, arrival.get("message_id"), asked=asked)
+                    _turns_over(live, arrival.get("message_id"), asked=asked,
+                                epoch=record.get("epoch"))
         doc = _CHAT_STATE.get(live) if mail else {}
         for job_id, arrival in zip(jobs, arrivals):
             mid = arrival.get("message_id")
@@ -13346,8 +13374,9 @@ def _set_chat_flags(chat_id: str, flags: dict[str, bool], *, user: bool = False)
     archive the completed turns asked for is forgotten with it
     (ChatStateStore.set_flags ``forget_asked``): only a turn asking after
     the user's last unarchive can put the thread away over a newer mail
-    (_turn_put_away). The undo of a turn that did not finish is no such
-    word."""
+    (_turn_put_away) — also where the turn is wrapping up as this lands
+    (the record's ``epoch``). The undo of a turn that did not finish is no
+    such word."""
     before = _CHAT_STATE.get(chat_id)
     doc = _CHAT_STATE.set_flags(chat_id, **flags,
                                 forget_asked=user and flags.get("archived") is False)
@@ -13518,6 +13547,8 @@ def _turn_put_away(record: dict, live: str) -> tuple[dict, dict]:
     else:
         with _chat_turns_lock:
             record["asked"] = True
+            record["epoch"] = chat_state_mod.asked_epoch(
+                _CHAT_STATE.get(_live_chat(record["chat"])))
         before = _CHAT_STATE.get(live)
         # Where the turn's own mails stand in the count now — by id, since a
         # merge renumbers it; by the place they had when the turn started

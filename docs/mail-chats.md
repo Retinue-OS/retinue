@@ -1162,9 +1162,10 @@ asked. A mail that arrived since and has had no turn, or whose turn did not
 ask, still keeps the thread on the list — and so does one whose turn asked
 but is not trusted with having put it away (it ended without a verdict, or
 the timeout rang the mail first: below), whose ask is not remembered. The
-user bringing the thread back forgets every ask made until then: only a turn
-asking after the user's last unarchive can archive the thread over a newer
-mail.
+user bringing the thread back forgets every ask made until then — also that
+of a turn wrapping up as it lands, whose ask is written only while no
+unarchive has come since the turn asked: only a turn asking after the user's
+last unarchive can archive the thread over a newer mail.
 
 A turn cannot mute: a mute it asks for is taken as that same archive, and the
 answer says so (`a turn cannot mute; archived instead`) — muting stays the
@@ -1187,13 +1188,20 @@ decided by the web gateway, not by the turn's cooperation:
 - any other call — no turn running, a messenger chat — has the user's
   meaning, as before the gate.
 
-The user's own endpoint, `POST /chats/<id>/flags`, needs no token and is no
-way round that rule: like a chat's delete and send it is accepted only
-through the reverse proxy, and refuses a caller on loopback or on the
-container's own address — or, where `EDGE_PROXY_PEERS` names the proxy, any
-peer it does not name. Only where the proxy itself arrives on loopback (host
-networking, `EDGE_PROXY_PEERS` including it) can the web gateway not tell the
-dashboard from a caller inside the container, and such a call is the user's.
+The user's own endpoint, `POST /chats/<id>/flags`, needs no token. Like a
+chat's delete and send it is meant to be reached only through the reverse
+proxy, which the web gateway tells by the TCP peer of the request — and it is
+no way round that rule where `EDGE_PROXY_PEERS` names the reverse proxy: a
+peer it does not name is refused, a caller inside the container included.
+Without that setting the gateway refuses only a loopback peer and a peer that
+is the very address the caller dialled, and takes any other for the
+dashboard: a caller inside the container that comes in from another of the
+container's addresses (the documented deployment puts it on two networks), or
+through a sibling that relays (the egress-audit proxy), sets the flags with
+the user's meaning — a mail's turn too. And where the proxy itself arrives on
+loopback (host networking, `EDGE_PROXY_PEERS` including it) the gateway
+cannot tell the dashboard from a caller inside the container at all. So a
+deployment sets `EDGE_PROXY_PEERS` (`docker-compose.override.example.yml`).
 
 That rule holds for the turn's **own** chat **while the turn runs**, and no
 further. It is a guard against a turn that was talked into something, not a

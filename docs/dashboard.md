@@ -1085,9 +1085,12 @@ for the tabs. (`group` on a chat is the boolean "a group chat", as before.)
   is valid JSON needs no preflight. The dashboard's own fetches are
   same-origin; a caller that sends no such header (a script in the
   container) passes the read mark, as on the other guarded routes. The
-  flags, like a send, are also accepted only through the reverse proxy
-  (`403` from inside the container — an agent has `POST
-  /internal/chats/<id>/flags`, "The gate for mail").
+  flags, like a send, are also accepted only through the reverse proxy:
+  `403` from inside the container where `EDGE_PROXY_PEERS` names the
+  proxy; without it, only from loopback and from the address the caller
+  dialled — a caller coming in from another of the container's addresses,
+  or through a sibling that relays, passes (an agent has `POST
+  /internal/chats/<id>/flags`; "The gate for mail", "Who is asking").
 
 The derivation, the endpoint's request and answer shapes, and what the store
 being away does to the counts are in
@@ -1489,12 +1492,19 @@ adopts). What the web gateway does with the event, by who sent the mail:
   The user's own `POST /chats/<id>/flags`, which needs no token, is no way
   round this order: like a chat's delete and send it is accepted only
   through the reverse proxy (`_request_from_edge`, `403` otherwise, with
-  `chat-flags.py` named as the agent's door), which refuses a caller on
-  loopback or on the container's own address — or, where `EDGE_PROXY_PEERS`
-  names the proxy, any peer it does not name. Only where the proxy itself
-  arrives on loopback (host networking, `EDGE_PROXY_PEERS` including it)
-  can the gateway not tell the dashboard from a caller inside the
-  container, and such a call is the user's.
+  `chat-flags.py` named as the agent's door) — where `EDGE_PROXY_PEERS`
+  names the reverse proxy, which refuses every peer it does not name, a
+  caller inside the container included. Without that setting
+  (`_classify_request_origin`) the gateway refuses only a loopback peer
+  and a peer that is the very address the caller dialled, and takes any
+  other for the dashboard: a caller inside the container that comes in
+  from another of the container's addresses (the documented deployment
+  puts it on two networks), or through a sibling that relays (the
+  egress-audit proxy), has the user's meaning — a mail's turn too. Where
+  the proxy itself arrives on loopback (host networking,
+  `EDGE_PROXY_PEERS` including it) the gateway cannot tell the dashboard
+  from a caller inside the container at all. A deployment sets
+  `EDGE_PROXY_PEERS` (`docker-compose.override.example.yml`).
 
   This holds for the turn's own chat while the turn runs, and no further.
   It is a guard against a turn that was talked into something, not a
@@ -1553,7 +1563,13 @@ adopts). What the web gateway does with the event, by who sent the mail:
   endpoint, or Ara's call with the user's meaning) forgets every ask made
   until then, in the same write (`set_flags` `forget_asked`): only a turn
   asking after the user's last unarchive can archive the thread over a
-  newer mail. The undo of a turn that did not finish forgets nothing.
+  newer mail. That holds for a turn wrapping up as the unarchive lands,
+  its ask not yet written, too: the write moves the chat's `asked_epoch`
+  on, a turn notes it when it asks, and its ask is written only while that
+  note still stands — decided in the write that records the ask
+  (`note_turn_done` `epoch`). (A merge that lands in that same moment
+  makes the ask be noted as none: the thread stays in view.) The undo of a
+  turn that did not finish forgets nothing.
 - **A thread its turn archived rings nothing.** What the turn archived is
   noted as its own. If the turn then ends with a verdict, the ring that
   waited on it is not delivered — whatever importance the verdict gives —

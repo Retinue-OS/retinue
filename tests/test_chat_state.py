@@ -733,6 +733,40 @@ def test_a_turn_archives_over_mail_whose_turn_asked_too():
         print("PASS test_a_turn_archives_over_mail_whose_turn_asked_too")
 
 
+def test_an_ask_from_before_the_users_unarchive_is_none():
+    """Decision AZ: the user's unarchive (set_flags ``forget_asked``) moves
+    the chat's asked_epoch on, and a turn that asked before it — its
+    ``epoch`` the one it found then — notes no ask when it completes,
+    decided in that same write; a turn that asked after it, or one
+    without an epoch, does. Neither an archive nor a turn's undo moves it;
+    a merge adds the halves' up."""
+    with tempfile.TemporaryDirectory() as tmp:
+        store = cs.ChatStateStore(tmp)
+        a = "email:~me@x.example:epoch@x.example"
+        store.count_arrival(a, 1000.0, message_id="m1", owe=True)
+        assert cs.asked_epoch(store.get(a)) == 0
+        started = cs.asked_epoch(store.get(a))
+        store.set_flags(a, archived=True, forget_asked=True)
+        store.set_flags(a, archived=False)
+        assert cs.asked_epoch(store.get(a)) == started, "no word of the user's"
+        store.set_flags(a, archived=False, forget_asked=True)
+        assert cs.asked_epoch(store.get(a)) == started + 1
+        store.note_turn_done(a, "m1", asked=True, epoch=started)
+        doc = store.get(a)
+        assert cs.turn_done(doc, "m1") and not cs.archive_asked(doc, "m1"), doc
+        store.note_turn_done(a, "m1", asked=True, epoch=cs.asked_epoch(doc))
+        assert cs.archive_asked(store.get(a), "m1")
+        store.note_turn_done(a, "m1", asked=True)
+        assert cs.archive_asked(store.get(a), "m1")
+        b = "email:~me@x.example:epoch-b@x.example"
+        store.count_arrival(b, 900.0, message_id="b1", owe=True)
+        store.set_flags(b, archived=False, forget_asked=True)
+        store.set_flags(b, archived=False, forget_asked=True)
+        doc, _gone = store.merge(b, a)
+        assert cs.asked_epoch(doc) == 3 and cs.asked_epoch(cs.ChatStateStore(tmp).get(a)) == 3
+        print("PASS test_an_ask_from_before_the_users_unarchive_is_none")
+
+
 def test_flags_and_note_message():
     with tempfile.TemporaryDirectory() as tmp:
         store = cs.ChatStateStore(tmp)
@@ -1530,6 +1564,7 @@ if __name__ == "__main__":
     test_archive_unless_arrived()
     test_what_an_arrival_owes_is_kept_per_arrival()
     test_a_turn_archives_over_mail_whose_turn_asked_too()
+    test_an_ask_from_before_the_users_unarchive_is_none()
     test_flags_and_note_message()
     test_companion_link()
     test_overlay_merge_dedup_expiry()
