@@ -8,9 +8,10 @@ qlever-life container cannot mount, a module the image does not carry, a
 policy file the two sides look for under different names. What these pin:
 
 - the service names every variable it reads and loads no env_file (it holds a
-  mailbox password; .env holds every other secret too), names no setting or
-  credential it does not read in this phase (the send policy, the erase
-  token, the news rail), runs without a profile, and mounts its ledger and
+  mailbox password; .env holds every other secret too), names the send policy
+  and the erase capability it needs to write (and the approval-link variables
+  a queued send builds its URL from) but no setting or credential it does not
+  read (the news rail's), runs without a profile, and mounts its ledger and
   its state volume;
 - the retinue entrypoint places the e-mail policy file before anything slow,
   since the mirror does not start without it;
@@ -97,25 +98,29 @@ def test_the_service_names_what_it_reads_and_nothing_else():
                 "MAIL_MAX_PART_BYTES", "MAIL_MAX_MAIL_BYTES", "MAIL_TRIM_WANTING_CHARS",
                 "MAIL_DATA_DIR", "MAIL_GATEWAY_HTTP_PORT", "MAIL_GATEWAY_TOKEN",
                 "MAIL_POLICY_WAIT_SECONDS", "MAIL_RECENT_CHATS_MAX", "MAIL_RAIL_TIMEOUT",
+                # Writing: how long its own send waits for the Sent copy.
+                "MAIL_SENT_GRACE_SECONDS",
                 # The default account idles where the channel set leaves out email.
                 "MESSENGER_BUILTIN_CHANNELS"}
     rails = {"CHATS_INGEST_URL", "CHATS_INGEST_TOKEN",
              "INBOUND_STORE_DIR", "TRIAGE_EMAIL_WHITELIST_PATH"}
-    missing = (mailbox | tunables | rails) - names
+    # The send policy it applies, the approval link a queued send returns, and
+    # the capability the user's delete presents.
+    writing = {"EMAIL_SEND_POLICY", "SEND_APPROVAL_BASE_URL", "SEND_APPROVAL_SLUG",
+               "CHAT_ERASE_TOKEN"}
+    missing = (mailbox | tunables | rails | writing) - names
     assert not missing, f"mail-gateway does not name {sorted(missing)}"
     entries = _entries(block)
     for fixed in ("MAIL_GATEWAY_HTTP_PORT=8096", "INBOUND_STORE_DIR=/inbound",
                   "CHATS_INGEST_URL=http://retinue:8080/internal/chats/inbound",
                   "mail-data:/root/.local/share/mail", "messenger-email:/inbound"):
         assert fixed in entries, f"mail-gateway: expected `{fixed}`"
-    # Secrets it has no use for stay out — and so do the ones a later phase
-    # reads: the read-only mirror sends nothing (EMAIL_SEND_POLICY), erases
-    # nothing (CHAT_ERASE_TOKEN, the messengers' /chats/delete capability) and
-    # files no news (e-mail triage still does). The container that parses
-    # mail from strangers holds no credential it has no use for.
+    # Secrets it has no use for stay out — and so does the one a later phase
+    # reads: it files no news yet (e-mail triage still does). The container
+    # that parses mail from strangers holds no credential it has no use for.
     for foreign in ("LITELLM_MASTER_KEY", "OPENROUTER_API_KEY", "CALDAV_PASSWORD",
-                    "SMS_SERVER_PASSWORD", "TELEGRAM_API_HASH", "EMAIL_SEND_POLICY",
-                    "CHAT_ERASE_TOKEN", "NEWS_INGEST_URL", "NEWS_INGEST_TOKEN"):
+                    "SMS_SERVER_PASSWORD", "TELEGRAM_API_HASH",
+                    "NEWS_INGEST_URL", "NEWS_INGEST_TOKEN"):
         assert foreign not in names, foreign
     # Both ways for the gateway's own settings: every MAIL_* it names is one
     # the gateway's code reads (a value-less name the code ignores would be a
@@ -167,6 +172,10 @@ def test_the_retinue_side_enrols_it_and_keeps_its_own_credentials():
     # email_client.py's backend still runs in this container.
     for name in ("EMAIL_USER", "EMAIL_PASS", "IMAP_HOST", "SMTP_HOST"):
         assert name in entries, f"retinue lost {name}; its e-mail backend needs it"
+    # The user's delete presents the erase capability to the gateway, and the
+    # e-mail backend applies the same send policy the gateway does.
+    for name in ("CHAT_ERASE_TOKEN", "EMAIL_SEND_POLICY", "SEND_APPROVAL_BASE_URL"):
+        assert name in entries, f"retinue does not name {name}"
     # The base URL the registry enrols, and the port the gateway listens on.
     sys.path.insert(0, str(SCRIPTS_DIR))
     mg = _load("messenger_gateways_deploy_under_test", SCRIPTS_DIR / "messenger_gateways.py")

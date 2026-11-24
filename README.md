@@ -102,8 +102,12 @@ Defines these core compose services:
 - **`mail-gateway`** — mirrors one mailbox over IMAP into the chat ledger, so
   each mail thread is a chat on the dashboard, trimmed to its new text with
   the full mail a tap away (`scripts/mail-gateway.py`;
-  [`docs/mail-chats.md`](docs/mail-chats.md)). Read-only for now — it changes
-  nothing in the mailbox and sends nothing, and e-mail triage runs beside it.
+  [`docs/mail-chats.md`](docs/mail-chats.md)). It writes back: replies and
+  new mail leave through it under `EMAIL_SEND_POLICY` (a queued one is shown
+  pending in its chat, with its approval link; agents send with
+  `scripts/mail-push.py`), and Mark as read, Archive and Delete reach the
+  mailbox (Delete moves the thread to the Trash). It pushes nothing and starts
+  no model turn for an arriving mail yet, and e-mail triage runs beside it.
   Opt-in: it mirrors nothing until `MAIL_GATEWAY_TOKEN` is set, so an upgrade
   that changes nothing in `.env` mirrors nothing; with no mailbox configured
   it idles. See

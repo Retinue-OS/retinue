@@ -28,6 +28,14 @@ wording for a mailbox, and the e-mail policy file on the ledger volume. The
 mirror is opt-in: it runs once the operator sets `MAIL_GATEWAY_TOKEN`. How to
 run it: *Operator notes* at the end.
 
+Phase 2 ends the read-only mirror and adds to that deployment: the gateway
+names `EMAIL_SEND_POLICY`, `SEND_APPROVAL_BASE_URL` / `SEND_APPROVAL_SLUG`,
+`CHAT_ERASE_TOKEN` and `MAIL_SENT_GRACE_SECONDS` (`MAIL_TRASH_FOLDER` is read
+now), the `retinue` service already carries the send URL, the base URL and the
+erase token, and `scripts/mail-push.py` is the agents' way to send. The gate
+(phase 3) and the model trim (phase 4) are still to come: until then no mail
+pushes or starts a turn.
+
 ## Decisions
 
 The brief left four things open. What was decided, and why:
@@ -209,7 +217,7 @@ are.
 | Channel | `email` |
 | Ledger volume | `messenger-email` → `/inbound` (gateway, RW), `chambers/_generated/messenger/email` (retinue, RW), qlever-life (RO) |
 | State volume | `mail-data` → `/root/.local/share/mail` (thread index, mailbox index, pending sends) |
-| Token | `MAIL_GATEWAY_TOKEN` — required: without it the gateway mirrors and serves nothing; erase capability `CHAT_ERASE_TOKEN` from the phase that builds the delete |
+| Token | `MAIL_GATEWAY_TOKEN` — required: without it the gateway mirrors and serves nothing; the erase capability is `CHAT_ERASE_TOKEN` (`X-Chat-Erase-Token` on `POST /chats/delete`), which no session holds |
 | Registry | a built-in channel: `MAIL_GATEWAY_BASE_URL` enrols it |
 
 The registry (`messenger_gateways.py`) learns that a channel's name and its
@@ -455,43 +463,87 @@ parts are immutable, and the mailbox copy is untouched.
 - **Reply.** The composer sends `POST /chats/<id>/send` as on every chat. For
   a mail chat the body may carry `reply: "all" | "sender"` (default `all` in a
   group, and the only meaning in a 1:1). The gateway builds the mail from its
-  own records: `From` the thread's account, `To`/`Cc` from the latest inbound
-  mail (reply-all: its sender plus everyone on `To`/`Cc` but the account
-  itself), `Subject` `Re: <base subject>`, `In-Reply-To` the latest mail's id,
-  `References` its chain plus that id.
+  own records of the chat, never from the caller: `From` the thread's account
+  (with `EMAIL_FROM_NAME`), `Subject` `Re: <base subject>` (no second `Re:`),
+  `In-Reply-To` the id of the latest live mail of the thread that is not the
+  user's own (else the latest mail), `References` that mail's chain plus its
+  id. Reply-all: `To` is that mail's sender — its `Reply-To` when it had one,
+  which the record now keeps — and `Cc` everyone on its `To`/`Cc` except the
+  account's own addresses and the `To`; *sender only*: the `To` alone. If the
+  latest mail is the user's own, a reply-all goes to its recipients again.
 - **Under the send policy.** The gateway resolves `EMAIL_SEND_POLICY` for its
-  own address. `verify` queues; `trust` sends when the request is the user's
-  own press (or carries `user_approved`); `allow` sends. A queued send answers
-  `202 pending_approval` with `request_id` and `approval_url`, is listed on
-  `/sends` through the gateway's `/pending-sends`, and **shows in the chat as a
-  pending bubble with its approval link** until it is sent, rejected or
-  retracted. The web gateway does not approve a queued mail on the user's
-  behalf.
-- **New mail.** ＋ on the Chats page offers *E-mail*: recipients, subject,
-  text. `POST /chats/compose` hands it to the gateway, which mints the
-  `Message-ID` that becomes the new chat's key.
+  own address. `verify` queues; `trust` sends when the request carries
+  `user_approved` (the web gateway sets it for the user's own press), else
+  queues; `allow` sends. `author: "user"` grants nothing by itself. A queued
+  send answers `202 pending_approval` with `request_id` and `approval_url`
+  (`/sends/<slug>/<id>`), is listed on `/sends` through the gateway's
+  `/pending-sends`, and **shows in the chat as a pending bubble with its
+  approval link** until it is sent, rejected or retracted — whoever queued it:
+  the composer, the companion or `mail-push.py`. The web gateway does not
+  approve a queued mail on the user's behalf (the messengers keep their
+  queue-then-approve behaviour). A `400` answers no recipient, an unknown chat
+  or an address that does not parse; a `409` a chat with no live mail.
+- **What a send writes.** SMTP through `email_client`'s helpers, a Sent copy
+  unless `SMTP_SAVE_SENT=false`, and the outbound record (`kb:OutboundMessage`,
+  the given `author`, the trimmed text the message itself, `kb:bodyPart`) at
+  once, with the rail told, so the bubble does not wait for a poll. The
+  `Message-ID` is minted when the request is accepted — before it is queued —
+  so a new mail's chat key is known at once. The Sent-folder pickup then finds
+  the same `Message-ID` and writes nothing; and a record the gateway wrote for
+  its own send is not "unlocated" until its Sent copy has had
+  `MAIL_SENT_GRACE_SECONDS` (600) to appear — with `SMTP_SAVE_SENT=false` and
+  no copy appearing it stays a live record, the mail having been sent. The
+  gateway never writes policy: `email_client`'s whitelist-on-send is disabled
+  inside it.
+- **New mail.** ＋ on the Chats page offers *E-mail* (what
+  `GET /chats/compose` lists: channels whose gateway takes a new
+  conversation): recipients, Cc, subject, text. `POST /chats/compose` hands it
+  to the gateway's `/send` without a `recipient`, which mints the `Message-ID`
+  that becomes the new chat's key; a new mail that exists only as a queued send
+  is already listed on the Chats page.
 - **Agents** send through the thin `scripts/mail-push.py` (the sibling of
-  `sms-push.py`), under the same policy. `email_client.py send/reply` keeps
-  working as before; a mail it sends is picked up from the Sent folder, and
-  the backend tells the gateway its author (`POST /outbound-note`) so the
-  bubble says *Ara* rather than *mail client*.
+  `sms-push.py`: `--to`/`--cc`/`--subject`, or `--chat`/`--reply-to` with
+  `--reply all|sender`, `--attach`, `--user-approved`, `--thread`,
+  `--retract`), under the same policy. `email_client.py send/reply` keeps
+  working as before and keeps its own queue (an IMAP draft, approved on
+  `/sends` under `/sends/<account>/<id>`); after a successful send, direct or
+  approved, it tells the gateway whose mail it was (`POST /outbound-note`,
+  best-effort, only where `MAIL_GATEWAY_BASE_URL` is set and only for the
+  account the gateway serves), so the bubble says *Ara* rather than *mail
+  client*. Its mail is picked up from the Sent folder.
 - **The companion** works as on any chat: it reads the trimmed thread and the
   attachments, stages drafts (`chat-draft.py`), sends only through
-  `mail-push.py` under the policy, forks; the quick-pattern chips apply.
+  `mail-push.py` under the policy, forks; the quick-pattern chips apply. The
+  draft endpoints work for mail chats, and a mail chat's `can_send` is true
+  unless its gateway is unknown or not connected.
 
 ### The mailbox follows the chat, never the reverse
 
 | In the chat | In the mailbox |
 |---|---|
-| **Mark as read**, or a reply | `\Seen` on the thread's mails |
-| **Archive** | the thread's INBOX mails move to the archive folder; *unarchive does not move them back* |
+| **Mark as read**, or a reply | `\Seen` on every mail of the thread in INBOX or the archive folder |
+| **Archive** | the thread's INBOX mails move to the archive folder (created if absent); *unarchive does not move them back*, and a restore calls nothing |
 | an instructed turn files a document and archives | the same move |
-| **Delete** (two taps, the erase capability, same-origin only) | the thread's mails move to the account's **Trash**, then the mirror is erased — nothing is expunged |
+| **Delete** (two taps, the erase capability, same-origin only) | every mail of the thread, in every mirrored folder, moves to the account's **Trash** (`MAIL_TRASH_FOLDER`), **then** the mirror is erased — nothing is expunged |
 
 The web gateway calls the chat's gateway for each (`POST /chats/read`,
-`POST /chats/archive`, `POST /chats/delete`, all `{chat, account}`). A gateway
-that does not know the first two answers 404 and nothing is owed: the hooks
-are for channels with a mailbox behind them.
+`POST /chats/archive`, `POST /chats/delete`, all `{chat, account}`; the account
+must be the gateway's own, else 404, and an unknown chat answers zero). The
+first two run after the chat state changed, best-effort: a 404 or 501 means the
+channel has no mailbox and is not an error, any other failure is logged and
+retried on the next such action — the chat is the truth, the hook idempotent —
+and the mirror follows an archive by its own index, with no tombstone and no
+rail event. Delete is the exception: it needs `X-Chat-Erase-Token`
+(`CHAT_ERASE_TOKEN`; 503 while unset, 403 on a mismatch), and the gateway must
+succeed before the web gateway erases its own state — if any move fails
+nothing is erased and the answer reports `errors > 0`. The answer is
+`delete_chat`'s shape plus `trashed`; a mail that turns up again later in a
+mirrored folder (restored from the Trash) starts the chat anew.
+
+IMAP writes are `UID STORE` and `UID MOVE`, with `UID COPY` + `\Deleted` +
+`UID EXPUNGE` of exactly those UIDs as the fallback where `UIDPLUS` allows
+(else the `\Deleted` copy is left flagged and reported) — never a whole-folder
+`EXPUNGE`.
 
 ## Unread · Read · Archived, for every channel
 
@@ -602,8 +654,16 @@ accounts. The points an operator meets first:
 - **`MAIL_OWN_ADDRESSES` lists every address of the user's** that may appear
   on the mailbox's mail — aliases and the user's other mirrored accounts —
   one value for every mail gateway.
-- **The credentials are in two containers until phase 2**: the mail
-  gateway's and, as before, the `retinue` container's (`SECURITY.md`).
+- **The credentials are in two containers**: the mail gateway's and, as
+  before, the `retinue` container's, whose `email_client.py` backend and
+  e-mail triage still use them (`SECURITY.md`).
+- **Writing needs the policy and the erase token on the gateway**:
+  `EMAIL_SEND_POLICY` (the same `.env` value `email_client.py` reads; unset,
+  every send queues), `SEND_APPROVAL_BASE_URL` for the approval link and
+  `CHAT_ERASE_TOKEN` (unset, deleting a mail chat is refused). Both are
+  named on the service in compose; `MAIL_TRASH_FOLDER` and
+  `MAIL_SENT_GRACE_SECONDS` tune where Delete moves mail and how long a sent
+  mail's Sent copy is waited for.
 - **The e-mail policy file moves** to
   `chambers/_generated/messenger/email/policy/email-policy.nt`, on the
   gateway's ledger volume; the retinue side moves the old
@@ -620,8 +680,7 @@ accounts. The points an operator meets first:
   monitor does not report the absent container as an outage. Only then does
   the mailbox password stay out of a second container: compose hands it to
   the gateway whether or not it mirrors.
-- **Not in this phase**: sending and the mailbox following the chat (phase 2,
-  which also gives the gateway `EMAIL_SEND_POLICY` and `CHAT_ERASE_TOKEN`),
-  the gate, the gateway's own news filing and the retirement of e-mail triage
-  (phase 3), the model trim (phase 4). Until phase 3 no mail pushes or starts
-  a turn, whatever a contact's prior or VIP flag says.
+- **Not in this phase**: the gate, the gateway's own news filing and the
+  retirement of e-mail triage (phase 3), the model trim (phase 4). Until
+  phase 3 no mail pushes or starts a turn, whatever a contact's prior or VIP
+  flag says.
