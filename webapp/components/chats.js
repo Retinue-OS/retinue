@@ -458,7 +458,10 @@ class RetinueChats extends RetinueCard {
       const doc = await this._postRead(id, Number.isInteger(seen) ? { seen } : {});
       const chat = (this._data && this._data.chats || []).find((c) => c.id === id);
       if (chat) this._adoptRead(chat, doc, 0);
-      shelf.observe(`chat:${id}`, { unread: 0 });
+      // The count the answer left, not a zero taken for granted: a mark
+      // can leave messages unread, and the shelf shows what the row does.
+      const left = chat ? chat.unread : (doc && doc.unread);
+      shelf.observe(`chat:${id}`, { unread: Number(left) || 0 });
       this._changed();
       // Undo needs the mark this replaced; a server that does not say it
       // (one that predates the answer's `previous`) gets no Undo offered.

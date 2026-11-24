@@ -1293,8 +1293,13 @@ class RetinueChatPage extends HTMLElement {
       changed = before !== `${this._unreadCount()}\u0000${c.list_group || ''}`;
       // A chat unread again (a newer arrival) has nothing left to undo: the
       // mark the Undo would restore is not the one that stands any more.
-      if (changed && this._isUnread()) this._clearReadUndo();
+      // Nor has one whose mark moved while it stayed read — a reply from
+      // the phone sets a newer one, and the server would refuse the Undo.
+      const moved = !!this._readUndo && 'last_read' in s
+        && s.last_read !== this._readUndo.marked;
+      if ((changed && this._isUnread()) || moved) this._clearReadUndo();
       if (changed) shelf.observe(this._shelfKey(), { unread: this._unreadCount() });
+      changed = changed || moved;
     }
     const flags = ['archived', 'muted', 'starred'];
     if (flagsFresh && flags.some((f) => f in s && !!s[f] !== !!c[f])) {
