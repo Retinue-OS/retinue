@@ -394,21 +394,31 @@ gateway's own send is on record with its author from the start, and stays
 so when its Sent copy comes back from the Trash; a restart knows the same
 ids, and a follow-up cites the one the recipients have. An id its provider
 gave a send names that send only on the send's own evidence — every
-recipient has it, and every answer cites it. A copy under it shown to be
-the send's — in Sent as the gateway's own send is matched there (From the
-account, to the people it went to, dated when it went, naming no other
-send), elsewhere by its header block (the gateway's `X-Retinue-Message-ID`
-naming the send, with the same, or the very header block the record keeps)
-— is that mail in every folder, Sent included: in a renumbered Sent, moved
-out and back, a second copy, it is one more place of the record under the id
-the gateway minted, and where that record is a tombstone, the record is
-written again in its own place, under the minted id; never a second record
-under the provider's id. (A tombstone keeps no addresses: its copy is told
-by the rest.) Any other mail under that id — a stranger's — is a mail of its
-own, recorded under its own id, and no place of the send's: the send's
-tombstone stays the user's until the send's own copy comes back. Met before
-the send's Sent copy, it is that still, and the Sent copy, matched to the
-send, is the send's place beside it.
+recipient has it, and every answer cites it. In Sent, a copy under it is
+the send's as the gateway's own send is matched there (From the account, to
+the people it went to, dated when it went, naming no other send): in a
+renumbered Sent, moved out and back, a second copy, it is one more place of
+the record under the id the gateway minted, and where that record is a
+tombstone, the record is written again in its own place, under the minted
+id, by the user; never a second record under the provider's id. (A
+tombstone keeps no addresses: its copy is told by the rest.) Outside Sent,
+nothing a recipient holds is evidence that a mail is the user's send — not
+the gateway's `X-Retinue-Message-ID`, not From, To, Cc or Date, alone or
+together: the mail that went out carries them all, and whoever got it can
+write them on a mail of their own. A mail there under the provider's id is
+the send's only by the very header block its live record keeps (the copy
+the record was written from, moved), and then only one more place of it;
+it never revives the send's tombstone, and never rewrites the record. Any
+other mail under that id — a stranger's, a recipient's forgery of the
+send's header block — is a mail of its own that came in, recorded under its
+own id, and no place of the send's: the send stays what it was, a tombstone
+the user's until the send's own Sent copy comes back. Met before the send's
+Sent copy, it is that still, and the Sent copy, matched to the send, is the
+send's place beside it. So on a provider that rewrites ids, the INBOX copy
+of a mail the user sent to themselves (a Cc to their own address) is a mail
+of its own under the provider's id, come in From the user's own address,
+beside the send — the chat shows it once as sent and once as received, as
+any mail client does.
 
 A mail whose record is gone from the ledger (restored from an older backup,
 a file lost) is known no more: its row and its places go, and what the row
@@ -671,6 +681,11 @@ reverse").
   which the record now keeps — and `Cc` everyone on its `To`/`Cc` except the
   account's own addresses and the `To`; *sender only*: the `To` alone. If the
   latest mail is the user's own, a reply-all goes to its recipients again.
+  The user's own is a mail on record as theirs; one that came in `From` an
+  address of theirs (an INBOX copy of their own mail, or anyone's mail
+  claiming that `From`) has no say in the addressing — its `To` and `Cc` are
+  its sender's to write — and where only such mails are left, the reply goes
+  to that address alone.
   An older record does not keep `Reply-To`: its header block says it, and is
   read in the reader process — only where the block has a `Reply-To` line, so
   a reply to a mail that named none waits for nothing, and once for both

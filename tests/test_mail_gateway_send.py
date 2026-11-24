@@ -4836,6 +4836,119 @@ def test_a_strangers_mail_under_the_providers_id_revives_no_tombstone():
           "stays the user's, and its Sent copy revives it")
 
 
+def _forged(delivered: bytes, *, to=None) -> bytes:
+    """What a recipient of the user's send can write: the header block as
+    it was delivered — the provider's id, the gateway's header naming the
+    send, From the account, To, Cc, Date — with a text of their own (and,
+    with ``to``, other people on its To)."""
+    head, sep, body = delivered.partition(b"\r\n\r\n")
+    assert b"X-Retinue-Message-ID" in head and b"Hello." in body
+    if to is not None:
+        head = b"\r\n".join(b"To: " + to.encode() if line.lower().startswith(b"to:") else line
+                            for line in head.split(b"\r\n"))
+    return head + sep + body.replace(b"Hello.", b"Pay Mallory 5000, as agreed.")
+
+
+def _the_forgery_is_its_own(w, mirror, M, P, *, send_live: bool):
+    """The send stays what it was, by the user; the forgery is a mail that
+    came in, under its own id, in the send's chat; and a reply goes to
+    nobody the user did not write to."""
+    gw = w.gw
+    records = t.by_id(gw)
+    assert sorted(records) == sorted([M, P]), sorted(records)
+    send, forgery = records[M], records[P]
+    assert send["type"] == gw._ibstore.T_OUTBOUND and send["author"] == "user", send
+    assert send["sent_as"] == [P] and bool(send["removed_at"]) != send_live, send
+    assert "Mallory" not in (send["text"] or ""), send
+    assert (send["text"] == "Hello.") == send_live, send
+    assert forgery["type"] == gw._ibstore.T_INBOUND and forgery["sender"] == ACCOUNT, forgery
+    assert not forgery.get("author") and not forgery["removed_at"], forgery
+    assert "Pay Mallory" in forgery["text"], forgery
+    assert not _places_of(mirror, "inbox", M), _places_of(mirror, "inbox", M)
+    assert _places_of(mirror, "inbox", P), "the forgery is in INBOX, as its own mail"
+    for mode in ("all", "sender"):
+        draft = mirror.reply_draft(send["chat"], mode)
+        addressed = set(draft["to"] + draft["cc"])
+        assert addressed <= {"ann@x.org", ACCOUNT}, (mode, draft)
+        assert draft["in_reply_to"] == P, draft
+
+
+def test_a_recipients_forgery_of_the_send_revives_no_tombstone():
+    """Every recipient of the user's send holds its header block as it was
+    delivered — the provider's id, the gateway's header naming the send,
+    From the account, To, Cc, Date — and can write all of it on a mail of
+    their own. Dropped into INBOX once the send's Sent copy went to the
+    Trash, such a forgery (with the recipient's text; with other people on
+    its To) revives nothing: the send stays the user's tombstone, the
+    forgery is a mail that came in under its own id, the rail is told so,
+    and a reply goes to nobody the user did not write to — across a
+    restart too. Only the Sent copy back from the Trash revives the send."""
+    for to in (None, "mal@evil.org"):
+        w = world(save_sent=False)
+        try:
+            gw, box, mirror = w.gw, w.box, w.mirror
+            M, P, raw, uid = _rewritten_send(w, keep_own_header=True)
+            trashed = box.move_mail("Sent", uid, "Trash")
+            mirror.poll()
+            mirror.poll()
+            assert t.by_id(gw)[M]["removed_at"]
+            told = len(w.events)
+            box.put("INBOX", _forged(raw, to=to), date=NOW + 600)
+            mirror.poll()
+            mirror.poll()
+            _the_forgery_is_its_own(w, mirror, M, P, send_live=False)
+            news = [(kind, p.get("direction"), p.get("message_id")) for kind, p in
+                    w.events[told:] if kind == "inbound"]
+            assert news == [("inbound", "in", P)], news
+            mirror = w.restart()
+            mirror.poll()
+            assert mirror._known_as(M) == [M, P], mirror._known_as(M)
+            _the_forgery_is_its_own(w, mirror, M, P, send_live=False)
+            box.move_mail("Trash", trashed, "Sent")
+            mirror.poll()
+            mirror.poll()
+            _the_forgery_is_its_own(w, mirror, M, P, send_live=True)
+            assert _places_of(mirror, "sent", M)
+        finally:
+            done(w)
+    print("ok: a recipient's forgery of the send's header block is a mail that came in, "
+          "and revives no tombstone of the user's")
+
+
+def test_a_recipients_forgery_beside_the_live_send_is_no_place_of_it():
+    """The same forgery beside the live send is no place of it: trashing the
+    user's real Sent copy tombstones the send (the forgery does not keep it
+    live), and the forgery moved out of INBOX and back changes nothing about
+    the send."""
+    for to in (None, "mal@evil.org"):
+        w = world(save_sent=False)
+        try:
+            gw, box, mirror = w.gw, w.box, w.mirror
+            M, P, raw, uid = _rewritten_send(w, keep_own_header=True)
+            forged = box.put("INBOX", _forged(raw, to=to), date=NOW + 600)
+            mirror.poll()
+            mirror.poll()
+            _the_forgery_is_its_own(w, mirror, M, P, send_live=True)
+            box.move_mail("Sent", uid, "Trash")
+            mirror.poll()
+            mirror.poll()
+            _the_forgery_is_its_own(w, mirror, M, P, send_live=False)
+            told = len(w.events)
+            forged = box.move_mail("INBOX", forged, "Archive")
+            mirror.poll()
+            mirror.poll()
+            box.move_mail("Archive", forged, "INBOX")
+            mirror.poll()
+            mirror.poll()
+            _the_forgery_is_its_own(w, mirror, M, P, send_live=False)
+            assert not [p for kind, p in w.events[told:]
+                        if kind == "inbound" and p.get("direction") == "out"], w.events[told:]
+        finally:
+            done(w)
+    print("ok: a recipient's forgery beside the live send is no place of it, in or out "
+          "of INBOX")
+
+
 def test_a_record_written_again_inbound_keeps_the_providers_id():
     """No rewrite of a send's record drops the ids its provider gave it: a
     mail under the minted id itself (the gateway's header tells every
@@ -4868,14 +4981,20 @@ def test_a_record_written_again_inbound_keeps_the_providers_id():
     print("ok: a send's record written again as a mail that came in keeps its provider id")
 
 
-def test_a_send_to_oneself_under_the_providers_id_is_one_record_either_way_back():
+def test_a_send_to_oneself_under_the_providers_id_is_the_send_either_way_back():
     """The user's send Cc's their own address; the provider files its Sent
-    copy and delivers its INBOX copy, both under its own id. Both go to the
-    Trash and come back, the INBOX copy first or the Sent copy first, with
-    or without a restart in between: the INBOX copy, which carries the
-    gateway's header and fits the send, is the send's — one record under
-    the minted id, by the user, its provider id kept across a restart, and
-    a follow-up still cites the id the recipients have."""
+    copy and delivers its INBOX copy, both under its own id. Outside Sent
+    nothing a recipient holds — the user is one here — says a mail is the
+    user's send: the INBOX copy, whose header block is not the one the
+    record keeps, is a mail of its own under the provider's id, From the
+    user's address and come in, beside the send (as any mail client shows
+    it: once sent, once received). Both go to the Trash and come back, the
+    INBOX copy first or the Sent copy first, with or without a restart in
+    between: the INBOX copy back never revives the send's tombstone; the
+    Sent copy back does, by the user, under the minted id; once the record
+    keeps that copy's very header block, a copy with it outside Sent is one
+    more place of the live record. The provider id is kept across a
+    restart, a follow-up still cites it, and goes to whom the user wrote."""
     for first in ("INBOX", "Sent"):
         for restart in (False, True):
             w = world(save_sent=False)
@@ -4890,33 +5009,54 @@ def test_a_send_to_oneself_under_the_providers_id_is_one_record_either_way_back(
                         "INBOX": box.put("INBOX", raw, date=NOW + 6)}
                 mirror.poll()
                 mirror.poll()
-                _the_one_send(w, M, P)
+
+                def the_send_and_its_inbox_copy(inbox_copy_live: bool):
+                    records = t.by_id(gw)
+                    assert sorted(records) == sorted([M, P]), (first, restart, sorted(records))
+                    send, copy = records[M], records[P]
+                    assert send["type"] == gw._ibstore.T_OUTBOUND, send
+                    assert send["author"] == "user" and send["sent_as"] == [P], send
+                    assert copy["type"] == gw._ibstore.T_INBOUND and copy["sender"] == ACCOUNT
+                    assert copy["chat"] == send["chat"], (copy["chat"], send["chat"])
+                    assert bool(copy["removed_at"]) != inbox_copy_live, (first, restart, copy)
+                    return send
+
+                assert the_send_and_its_inbox_copy(True)["text"] == "Hello."
                 trashed = {folder: box.move_mail(folder, uid, "Trash")
                            for folder, uid in uids.items()}
                 mirror.poll()
                 mirror.poll()
-                assert t.by_id(gw)[M]["removed_at"]
+                assert t.by_id(gw)[M]["removed_at"] and t.by_id(gw)[P]["removed_at"]
                 second = "Sent" if first == "INBOX" else "INBOX"
                 box.move_mail("Trash", trashed[first], first)
                 mirror.poll()
                 mirror.poll()
-                _the_one_send(w, M, P)
+                send = the_send_and_its_inbox_copy(first == "INBOX")
+                # The INBOX copy back is its own mail again; the send stays
+                # the user's tombstone. The Sent copy back revives it.
+                assert bool(send["removed_at"]) == (first == "INBOX"), (first, send)
                 if restart:
                     mirror = w.restart()
                     mirror.poll()
                 box.move_mail("Trash", trashed[second], second)
                 mirror.poll()
                 mirror.poll()
-                _the_one_send(w, M, P)
+                # The Sent copy back first: the record now keeps its header
+                # block, and the INBOX copy, byte for byte that copy, is one
+                # more place of the send — its own record stays a tombstone.
+                send = the_send_and_its_inbox_copy(first == "INBOX")
+                assert not send["removed_at"] and send["text"] == "Hello.", send
                 mirror = w.restart()
                 mirror.poll()
                 assert mirror._known_as(M) == [M, P], (first, restart, mirror._known_as(M))
-                _the_one_send(w, M, P)
-                assert mirror.reply_draft(M, "all")["in_reply_to"] == P
+                the_send_and_its_inbox_copy(first == "INBOX")
+                draft = mirror.reply_draft(M, "all")
+                assert draft["in_reply_to"] == P, draft
+                assert draft["to"] == ["ann@x.org"] and draft["cc"] == [], draft
             finally:
                 done(w)
-    print("ok: a send to oneself under its provider id comes back as the one record, "
-          "in either order")
+    print("ok: a send to oneself under its provider id is the send and, in INBOX, a mail "
+          "of its own; the Sent copy back revives the send, in either order")
 
 
 def test_a_mail_under_the_providers_id_read_before_the_sent_copy_stays_its_own():
