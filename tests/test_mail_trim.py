@@ -3932,6 +3932,7 @@ def test_model_source_is_the_trims_own_text():
         offered += 1
         assert source is not None, c["name"]
         assert source.lines == result.text.splitlines(), c["name"]
+        assert source.text == result.text, c["name"]
         assert source.digest == _digest(source.lines), c["name"]
         # Deterministic: the same parts, the same lines, the same digest.
         again = mt.model_source(c["plain"], c["html"], c["subject"], **args)
@@ -4062,6 +4063,26 @@ def test_apply_keep_takes_a_choice_and_only_a_choice():
     print("PASS apply_keep: every validity rule, and the text it assembles")
 
 
+def test_a_choice_must_show_something():
+    """A line counts as text only if it shows something: a choice of lines
+    that only look blank — a zero-width space, a word joiner, a BOM, the
+    braille blank, a Hangul or Khmer filler — is no choice, and a source of
+    nothing else is no source. A short message and a lone mark are text."""
+    blanks = ["\u200b", "\u2060", "\ufeff", "\u2800", "\u3164", "\u115f", "\u1160",
+              "\uffa0", "\u180e", "\u200b \u2800\t\u3164", "\u3000", "\u00a0"]
+    for blank in blanks:
+        lines = ["Hi Bob,", "the plan is fine.", blank, "Ann"]
+        assert mt.apply_keep(lines, [[3, 3]]) is None, repr(blank)
+        # Within a kept stretch it is a blank line, as a line of spaces is.
+        assert mt.apply_keep(lines, [[2, 4]]) == "the plan is fine.\n\nAnn", repr(blank)
+        assert mt.apply_keep(lines, [[3, 4]]) == "Ann", repr(blank)
+        assert mt.model_source(blank + "\n" + blank, None) is None, repr(blank)
+    # Short is not blank: "OK" is a whole message, and so is a mark or a sign.
+    for short in ("OK", "Ja", ".", "?", "👍", "５", "\u200bOK"):
+        assert mt.apply_keep(["Hi", short], [[2, 2]]) == short, repr(short)
+    print("PASS apply_keep: a choice of lines that show nothing is no choice")
+
+
 def test_apply_keep_is_cheap_and_invents_nothing():
     import random
     lines = ["line %d" % i for i in range(1, 1501)]
@@ -4159,6 +4180,7 @@ def main():
     test_model_source_splits_where_a_reader_sees_a_line_end()
     test_model_source_never_raises_and_stays_fast()
     test_apply_keep_takes_a_choice_and_only_a_choice()
+    test_a_choice_must_show_something()
     test_apply_keep_is_cheap_and_invents_nothing()
     test_module_is_standalone()
     print("all mail-trim tests passed")

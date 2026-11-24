@@ -240,7 +240,15 @@ def test_what_is_no_choice_settles_the_mail_as_the_rules_left_it():
             # More ranges than a choice may name, a keep of nulls.
             box.put("INBOX", msg("more@x.org", subject="More", body=LONG_BODY, day=7))
             box.put("INBOX", msg("null@x.org", subject="Null", body=LONG_BODY, day=8))
+            box.put("INBOX", msg("gave@x.org", subject="Gave", body=LONG_BODY, day=9))
             mirror.poll()
+            # The web gateway's word that the mail had all its turns and none
+            # of them came to a judgement: settled as any failed answer is.
+            text = t.by_id(gw)["gave@x.org"]["text"]
+            digest = source(base, "gave@x.org")[1]["digest"]
+            assert result(base, "gave@x.org", digest, failed="gave_up") == (
+                200, {"state": "deterministic", "text": text})
+            assert t.by_id(gw)["gave@x.org"]["trim"] == "deterministic"
             for mid, keep in (("more@x.org", [[i, i] for i in range(1, 202)]),
                               ("null@x.org", None)):
                 digest = source(base, mid)[1]["digest"]
@@ -493,7 +501,11 @@ def test_a_record_written_anew_meanwhile_is_stale():
     print("ok: a record written anew from other parts meanwhile refuses the result, 409")
 
 
-def test_a_pass_that_holds_the_lock_makes_it_wait():
+def test_a_pass_that_holds_the_lock_does_not_make_it_wait():
+    """A pass over the mailbox holds the mirror's lock for as long as it
+    takes — minutes on a first sync. A model's judgement is not made to wait
+    it out (it was paid for): its one write takes the record lock, which a
+    writer holds around one record's write and no longer."""
     with tempfile.TemporaryDirectory() as tmp:
         gw, mirror, _box, base, server = rig(tmp)
         try:
@@ -502,29 +514,199 @@ def test_a_pass_that_holds_the_lock_makes_it_wait():
             got = source(base, mid)[1]
             held, release = threading.Event(), threading.Event()
 
-            def hold():
-                with mirror._lock:
+            def hold(lock):
+                with lock:
                     held.set()
                     release.wait(10)
-            worker = threading.Thread(target=hold)
+            worker = threading.Thread(target=hold, args=(mirror._lock,))
             worker.start()
             held.wait(5)
             try:
-                # Reading needs no lock; writing waits for it, and gives up.
                 assert source(base, mid)[1] == got
                 status, answer = result(base, mid, got["digest"], keep=[[1, 1]])
+                assert (status, answer["state"]) == (200, "model"), (status, answer)
+                assert source(base, "huge@x.org")[1]["settled"] == "too_long"
+            finally:
+                release.set()
+                worker.join()
+            assert t.by_id(gw)[mid]["trim"] == "model"
+            assert t.by_id(gw)["huge@x.org"]["trim"] == "deterministic"
+            unchanged_but_reading(gw, mid, before)
+            # A record write in flight is waited for, briefly, then 503 — and
+            # nothing is written.
+            mid = "html@x.org"
+            got = source(base, mid)[1]
+            held.clear()
+            release.clear()
+            worker = threading.Thread(target=hold, args=(mirror._records,))
+            worker.start()
+            held.wait(5)
+            try:
+                status, answer = result(base, mid, got["digest"], keep=[[1, 1]])
                 assert status == 503 and "try again" in answer["error"], answer
-                assert source(base, "huge@x.org")[0] == 503
             finally:
                 release.set()
                 worker.join()
             assert t.by_id(gw)[mid]["trim"] == "wanting"
-            unchanged_but_reading(gw, mid, before)
             assert result(base, mid, got["digest"], keep=[[1, 1]])[0] == 200
-            assert t.by_id(gw)["huge@x.org"]["trim"] == "wanting"
         finally:
             server.shutdown()
-    print("ok: while a pass holds the mirror's lock a result is 503 and writes nothing")
+    print("ok: a pass holding the mirror's lock does not hold up a result; a record write does")
+
+
+def test_a_pass_writes_records_under_the_record_lock():
+    """What lets the trim's write go past a pass: every record write of the
+    pass takes the record lock too, so the trim's check-then-write under it
+    is never interleaved with one (a tombstone, a merge, a record written
+    anew could otherwise be undone by the trim's rewrite)."""
+    with tempfile.TemporaryDirectory() as tmp:
+        gw, mirror, box, base, server = rig(tmp)
+        try:
+            box.put("INBOX", msg("late@x.org", subject="Late", body="Soon.\n", day=9))
+            held, release = threading.Event(), threading.Event()
+
+            def hold():
+                with mirror._records:
+                    held.set()
+                    release.wait(10)
+            holder = threading.Thread(target=hold)
+            holder.start()
+            held.wait(5)
+            passing = threading.Thread(target=mirror.poll)
+            try:
+                passing.start()
+                passing.join(1.0)
+                assert passing.is_alive(), "the pass wrote a record past the record lock"
+                assert "late@x.org" not in t.by_id(gw)
+            finally:
+                release.set()
+                holder.join()
+                passing.join(10)
+            assert "late@x.org" in t.by_id(gw)
+        finally:
+            server.shutdown()
+    print("ok: a pass's record writes wait for the record lock")
+
+
+def raw_mail(mid, subject, head_extra: bytes, body: str) -> bytes:
+    return (b"From: Ann Example <ann@x.org>\r\nTo: me@example.org\r\n"
+            b"Subject: " + subject.encode() + b"\r\nMessage-ID: <" + mid.encode() + b">\r\n"
+            b"Date: Sat, 04 Oct 2025 10:00:00 +0000\r\n" + head_extra
+            + b"\r\n" + body.replace("\n", "\r\n").encode())
+
+
+def test_the_evidence_is_what_the_ingest_read():
+    """The bulk evidence is read again off the stored header block, which
+    was stored with its CRLFs folded to LF. A CR CR LF ended the block for
+    the ingest's parser (List-Unsubscribe after it was body, not a header);
+    read again unfolded, it is a line end and the header block goes on — the
+    source would be cut as bulk mail, without the footer its bubble shows.
+    Folded back, the evidence is the ingest's and the lines are the text."""
+    footer = ("\nYou are receiving this because you subscribed.\n"
+              "Unsubscribe: https://lists.example.org/unsubscribe?u=1\n")
+    with tempfile.TemporaryDirectory() as tmp:
+        gw, mirror, box, base, server = rig(tmp)
+        try:
+            box.put("INBOX", raw_mail(
+                "crcr@x.org", "Digest",
+                b"X-A: b\r\r\nList-Unsubscribe: <https://lists.example.org/u>\r\n",
+                LONG_BODY + footer))
+            mirror.poll()
+            record = t.by_id(gw)["crcr@x.org"]
+            assert record["trim"] == "wanting" and "Unsubscribe:" in record["text"]
+            status, answer = source(base, "crcr@x.org")
+            assert status == 200 and answer["state"] == "wanting", answer
+            assert answer["bulk"] is False, answer
+            assert "\n".join(answer["lines"]) == record["text"]
+            assert any("Unsubscribe:" in line for line in answer["lines"])
+        finally:
+            server.shutdown()
+    print("ok: the bulk evidence read again is the evidence the ingest read")
+
+
+def test_an_unreadable_header_part_is_503():
+    """The header part is a part like the bodies: one that cannot be read
+    says nothing of the mail. Read as "not bulk" instead, a mail bulk by its
+    List-Unsubscribe alone would be offered the footer the rules had cut."""
+    with tempfile.TemporaryDirectory() as tmp:
+        gw, _mirror, _box, base, server = rig(tmp)
+        try:
+            mid = "bulk@x.org"
+            got = source(base, mid)[1]
+            assert got["bulk"] is True
+            media_id = gw._ibstore.media_id_of(t.by_id(gw)[mid]["header_part"])
+            blob_path = gw._ibstore.media_dir(gw.INBOUND_STORE_DIR) / media_id
+            held = blob_path.read_bytes()
+            blob_path.unlink()
+            try:
+                assert source(base, mid) == (503, {"error": "a part of the mail could not be read"})
+                assert result(base, mid, got["digest"], keep=[[1, 1]])[0] == 503
+                assert t.by_id(gw)[mid]["trim"] == "wanting"
+            finally:
+                blob_path.write_bytes(held)
+            assert source(base, mid)[1] == got
+        finally:
+            server.shutdown()
+    print("ok: an unreadable header part is 503 and settles nothing")
+
+
+def set_text(gw, mirror, mid, text) -> None:
+    """The record's kb:text as another version of the rules left it."""
+    path = mirror._record_path(mirror.index.one(
+        "SELECT record FROM mails WHERE message_id = ?", (mid,))["record"])
+    fields = gw._ibstore.read_record(path)
+    fields["text"] = text
+    gw._ibstore._atomic_write(gw._ibstore._render(fields), path)
+
+
+def test_a_source_that_is_not_the_records_text_is_never_handed_out():
+    """The model chooses from what the bubble shows. Where the text rebuilt
+    from the parts is not the record's kb:text — the rules have changed since
+    the mail was read, or its evidence reads otherwise now — the lines could
+    hold what the rules had cut, and a choice of them would bring it back:
+    the mail is settled as it stands, its text unchanged."""
+    with tempfile.TemporaryDirectory() as tmp:
+        gw, mirror, _box, base, server = rig(tmp)
+        try:
+            # As another version of the rules left it: the history it now cuts.
+            mid = "reply@x.org"
+            got = source(base, mid)[1]
+            older = "\n".join(got["lines"]) + "\n\n-----Original Message-----\nFrom: Me"
+            set_text(gw, mirror, mid, older)
+            before = snapshot(gw, mid)
+            # A judgement on the lines handed out before is about no text the
+            # record has: refused, nothing written.
+            assert result(base, mid, got["digest"], keep=[[1, 1]]) == (
+                409, {"error": "stale", "state": "wanting"})
+            assert t.by_id(gw)[mid]["text"] == older
+            assert source(base, mid) == (
+                200, {"state": "deterministic", "settled": "source_differs"})
+            record = t.by_id(gw)[mid]
+            assert record["trim"] == "deterministic" and record["text"] == older
+            unchanged_but_reading(gw, mid, before)
+            assert source(base, mid) == (200, {"state": "deterministic"})
+            # The other way: a record whose text the rules of today would not
+            # cut so far — lines the bubble never had are not offered either.
+            mid = "long@x.org"
+            lines = source(base, mid)[1]["lines"]
+            set_text(gw, mirror, mid, "\n".join(lines[:3]))
+            assert source(base, mid)[1].get("settled") == "source_differs"
+            assert t.by_id(gw)[mid]["text"] == "\n".join(lines[:3])
+            # A record capped at ingest is compared as the ingest capped it.
+            mid = "bulk@x.org"
+            got = source(base, mid)[1]
+            saved = gw.MAX_RECORD_TEXT_CHARS
+            gw.MAX_RECORD_TEXT_CHARS = 300
+            try:
+                set_text(gw, mirror, mid, "\n".join(got["lines"])[:300].rstrip() + "\n…")
+                assert source(base, mid)[1] == got
+                set_text(gw, mirror, mid, "\n".join(got["lines"])[:200].rstrip() + "\n…")
+                assert source(base, mid)[1].get("settled") == "source_differs"
+            finally:
+                gw.MAX_RECORD_TEXT_CHARS = saved
+        finally:
+            server.shutdown()
+    print("ok: a source that is not the record's own text is settled, never handed out")
 
 
 def test_a_failed_write_is_503_and_not_a_settled_mail():

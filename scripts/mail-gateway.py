@@ -2626,6 +2626,12 @@ class Mirror:
         # One pass at a time, and no note corrected while one runs: both
         # rewrite ledger records, and a record has one writer at a time.
         self._lock = threading.RLock()
+        # And one rewrite of a record file at a time, held around that one
+        # write (or one chat's) by every writer of a record here, under the
+        # mirror's lock or not — never the other way round. The model trim's
+        # write holds only this one: it rewrites one record's reading, which
+        # no index row says anything of, and must not wait out a pass.
+        self._records = threading.RLock()
         self._folders: dict = {}
         # What the last look at the folders allows. INBOX and Sent were read:
         # old mail may be read (the backfill needs no other folder). Every
@@ -3109,7 +3115,8 @@ class Mirror:
                 "SELECT record FROM mails WHERE message_id = ? AND direction = 'out' "
                 "AND record != '' AND removed = 0", (message_id,))
             if row is not None:
-                _ibstore.update_message(self._record_path(row["record"]), author=author)
+                with self._records:
+                    _ibstore.update_message(self._record_path(row["record"]), author=author)
 
     # -- the model trim (docs/mail-chats.md, "The model trim") -----------------
     #
@@ -3120,12 +3127,22 @@ class Mirror:
     # Both are built from the record's own parts, which nothing here changes;
     # the text a choice keeps is assembled from this gateway's copy of the
     # lines (mail_trim.apply_keep), so an answer can narrow a bubble and never
-    # add a word to it. Only a judgement settles a mail: a choice (valid or
-    # not), the caller's word that the answer was no choice (``failed``), or a
-    # mail too long to hand over. A model that could not be asked changes
-    # nothing here — the caller just does not call.
+    # add a word to it. And the lines are the bubble's own: a source rebuilt
+    # from the parts that is not the record's text is never handed out. Only
+    # a judgement settles a mail: a choice (valid or not), the caller's word
+    # that the answer was no choice (``failed``), a mail too long to hand over,
+    # or one whose parts no longer give its text. A model that could not be
+    # asked changes nothing here — the caller just does not call.
+    #
+    # Neither half waits for the mirror's lock, which a pass over the mailbox
+    # holds for as long as it takes: the one write is the record's reading,
+    # under the record lock (``_records``), checked there against the record
+    # as it stands.
 
     _TRIM_PARTS = ("body_part", "html_part", "header_part")
+    # What a source was built from and held against: a record that differs
+    # in any of them under the lock is not the one the source is about.
+    _TRIM_BASIS = _TRIM_PARTS + ("text",)
 
     def _trim_target(self, chat: str, message_id: str) -> tuple:
         """``(path, fields)`` of the mail a model-trim call names, read off the
@@ -3169,14 +3186,23 @@ class Mirror:
         so either is there exactly when one was — and whether it calls
         itself bulk, which is the header block's to say again (a List-Id is
         on the record only as normalised, and List-Unsubscribe and
-        Precedence not at all). A header block that will not read again is
-        read as the ingest read none: by the List-Id on record."""
+        Precedence not at all). :class:`TrimRefused` 503 when the header
+        part the record references cannot be read, as for a body part: that
+        says nothing about the mail. A record that references none is read
+        by its List-Id."""
         bulk = bool(fields.get("list_id"))
-        media_id = _ibstore.media_id_of(fields.get("header_part") or "")
-        got = _ibstore.load_media(INBOUND_STORE_DIR, media_id) if media_id else None
-        if got is not None:
+        ref = fields.get("header_part")
+        if ref:
+            media_id = _ibstore.media_id_of(ref)
+            got = _ibstore.load_media(INBOUND_STORE_DIR, media_id) if media_id else None
+            if got is None:
+                raise TrimRefused(503, {"error": "a part of the mail could not be read"})
             try:
-                msg = _parse_bytes(got[0] + b"\n\n")
+                # Stored with every CRLF folded to LF (parse_mail). Folded
+                # back, the parser meets the line ends the ingest's met: a
+                # CR CR LF that ended the block then ends it here too, and
+                # what followed it is no header now either.
+                msg = _parse_bytes(got[0].replace(b"\n", b"\r\n") + b"\r\n\r\n")
                 bulk = _is_bulk(msg, _clean_line(
                     _UNFOLD_RE.sub("", _raw_header(msg, "List-Id")), 998))
             except Exception:  # noqa: BLE001 - the record's own List-Id stands
@@ -3205,9 +3231,43 @@ class Mirror:
         return _trim.model_source(parts[0], parts[1], evidence["subject"],
                                   is_reply=evidence["is_reply"], bulk=evidence["bulk"])
 
+    @staticmethod
+    def _trim_unoffered(fields: dict, source) -> str | None:
+        """Why a record's source is not handed to a model, or None when it is
+        handed over: ``too_long`` when :func:`mail_trim.model_source` gave
+        none (beyond what may be handed over, or nothing that shows), and
+        ``source_differs`` when the text it was split from, capped as the
+        ingest caps it (:meth:`_reading_text`), is not the record's kb:text.
+
+        The second is what keeps the model to what the bubble shows. The
+        parts are immutable, but the evidence is read again (a header block
+        that parses otherwise now) and the rules are the code's of today, not
+        of the day the mail was read: a source that differs could offer
+        lines the rules had cut — history, a footer — and a choice of them
+        would put them back. Such a mail keeps the text it has."""
+        if source is None:
+            return "too_long"
+        text = _scrub(source.text)
+        if len(text) > MAX_RECORD_TEXT_CHARS:
+            text = text[:MAX_RECORD_TEXT_CHARS].rstrip() + "\n…"
+        return None if text == (fields.get("text") or "") else "source_differs"
+
+    @contextlib.contextmanager
+    def _trim_writing(self):
+        """The record lock, for a model trim's write: waited for
+        EXCLUSIVE_SECONDS, :class:`Busy` when not free by then. It is held
+        around one record's write, or one chat's, and never for a pass — so
+        a busy answer is rare, and its caller offers the judgement again."""
+        if not self._records.acquire(timeout=EXCLUSIVE_SECONDS):
+            raise Busy("a record of the mailbox is being rewritten; try again in a moment")
+        try:
+            yield
+        finally:
+            self._records.release()
+
     def _settle_trim(self, path: Path, *, state: str, text: str | None = None) -> dict:
         """Write a trim's outcome onto the record and read it back; the
-        record as it now stands. Under the mirror's lock (the caller's): a
+        record as it now stands. Under the record lock (the caller's): a
         record has one writer at a time. ``update_message`` touches the text
         and the state and nothing else — not a part, not an identity — and
         says nothing of whether it wrote, so the record is read back."""
@@ -3221,29 +3281,32 @@ class Mirror:
     def trim_source(self, chat: str, message_id: str) -> tuple[int, dict]:
         """POST /messages/trim-source: what a model may choose this mail's
         message from — or that there is nothing to do. Read-only, but for a
-        mail too long to hand over, which is settled here and now: asking
-        again would only find it as long."""
+        mail whose source is not handed over (:meth:`_trim_unoffered`), which
+        is settled here and now: asking again would only find it the same."""
         _path, fields = self._trim_target(chat, message_id)
         state = fields.get("trim") or "deterministic"
         if state != "wanting":
             return 200, {"state": state}
         evidence = self._trim_evidence(fields)
         source = self._trim_source_of(fields, evidence)
-        if source is None:
-            with self.exclusive():
+        why = self._trim_unoffered(fields, source)
+        if why is not None:
+            with self._trim_writing():
                 # Looked at again under the lock: settled or gone meanwhile,
                 # or written anew from other parts (then its own source).
-                path, fields = self._trim_target(chat, message_id)
-                state = fields.get("trim") or "deterministic"
+                path, now = self._trim_target(chat, message_id)
+                state = now.get("trim") or "deterministic"
                 if state != "wanting":
                     return 200, {"state": state}
-                evidence = self._trim_evidence(fields)
-                source = self._trim_source_of(fields, evidence)
-                if source is None:
+                if any(now.get(key) != fields.get(key) for key in self._TRIM_BASIS):
+                    fields, evidence = now, self._trim_evidence(now)
+                    source = self._trim_source_of(now, evidence)
+                    why = self._trim_unoffered(now, source)
+                if why is not None:
                     self._settle_trim(path, state="deterministic")
-                    print(f"[mail-gateway] {fields['message_id']!r} is too long for a model "
-                          f"trim; its text stays as the rules trimmed it", flush=True)
-                    return 200, {"state": "deterministic", "settled": "too_long"}
+                    print(f"[mail-gateway] {now['message_id']!r} is not handed to a model "
+                          f"({why}); its text stays as the rules trimmed it", flush=True)
+                    return 200, {"state": "deterministic", "settled": why}
         sender = fields.get("sender") or ""
         return 200, {"state": "wanting", "lines": source.lines, "digest": source.digest,
                      "subject": evidence["subject"], "sender": sender if "@" in sender else "",
@@ -3252,14 +3315,16 @@ class Mirror:
     def trim_result(self, chat: str, message_id: str, digest: str, *,
                     keep=None, failed: str | None = None) -> tuple[int, dict]:
         """POST /messages/trim-result: a model's choice (``keep``), or the
-        caller's word that its answer was none (``failed``), made of the
+        caller's word that there is no choice (``failed``: its answer was
+        none, or the mail had all its turns and gave none), made of the
         source whose digest it names.
 
         Refused (409 ``stale``) unless the mail is still ``wanting`` and its
-        source is still that one — a choice is about the lines it was made
-        from and no others. A valid choice becomes the record's text, capped
-        as every kb:text is, with ``kb:trim "model"``; an invalid one, and
-        ``failed``, settle ``deterministic`` and leave the text as it is.
+        source is still that one, and still its text — a choice is about the
+        lines it was made from and no others. A valid choice becomes the
+        record's text, capped as every kb:text is, with ``kb:trim "model"``;
+        an invalid one, and ``failed``, settle ``deterministic`` and leave
+        the text as it is.
 
         Nothing is told on the rail: a mail's text changing on its record is
         how a better reading has always reached the chat (the life store
@@ -3273,18 +3338,19 @@ class Mirror:
 
         if fields.get("trim") != "wanting":
             return stale(fields.get("trim"))
-        # Built outside the lock — a trim of a long mail takes a moment, and a
-        # pass over the mailbox waits for whoever holds it — and checked
+        # Built outside the lock — a trim of a long mail takes a moment, and
+        # the record lock is held for writes, not for reading — and checked
         # under it: the same parts give the same source.
         source = self._trim_source_of(fields, self._trim_evidence(fields))
-        if source is None or source.digest != digest:
+        if (source is None or source.digest != digest
+                or self._trim_unoffered(fields, source) is not None):
             return stale("wanting")
         text = None if failed is not None else _trim.apply_keep(source.lines, keep)
-        with self.exclusive():
+        with self._trim_writing():
             path, now = self._trim_target(chat, message_id)
             if now.get("trim") != "wanting":
                 return stale(now.get("trim"))
-            if any(now.get(key) != fields.get(key) for key in self._TRIM_PARTS):
+            if any(now.get(key) != fields.get(key) for key in self._TRIM_BASIS):
                 return stale("wanting")
             if text is None:
                 after = self._settle_trim(path, state="deterministic")
@@ -3839,9 +3905,11 @@ class Mirror:
             # A mail still owed keeps its flag (``keep_delivered``): the
             # tombstone is offered to nobody (_owed), but a mail that comes
             # back is owed what it was owed when it went (_mirror_one).
-            if not _ibstore.tombstone_message(self._record_path(row["record"]),
-                                              self._clock(), own_blobs=True,
-                                              keep_delivered=True):
+            with self._records:
+                buried_now = _ibstore.tombstone_message(self._record_path(row["record"]),
+                                                        self._clock(), own_blobs=True,
+                                                        keep_delivered=True)
+            if not buried_now:
                 print(f"[mail-gateway] could not tombstone {row['record']}; "
                       f"will retry", flush=True)
                 continue
@@ -4157,7 +4225,8 @@ class Mirror:
         if not self._copy_of(mail, sent_to, row["ts"]):
             return False
         if alias not in (fields.get("sent_as") or []):
-            _ibstore.update_message(path, sent_as=alias)
+            with self._records:
+                _ibstore.update_message(path, sent_as=alias)
             if alias not in ((_ibstore.read_record(path) or {}).get("sent_as") or []):
                 raise OSError(f"could not note on {row['record']} the id its mail was sent as")
             seen = int(self.index.get("rewritten", 0)) + 1
@@ -4348,8 +4417,9 @@ class Mirror:
         that takes its place is then owed the same."""
         path = self._record_path(row["record"])
         # Unlinks its blobs — the record's own, like every mail's.
-        _ibstore.tombstone_message(path, own_blobs=True)
-        path.unlink(missing_ok=True)
+        with self._records:
+            _ibstore.tombstone_message(path, own_blobs=True)
+            path.unlink(missing_ok=True)
         owed = self.index.one("SELECT 1 FROM offers WHERE message_id = ?",
                               (row["message_id"],)) is not None
         self.index.atomic([
@@ -4508,12 +4578,14 @@ class Mirror:
                 # Whichever client sent it: the own-device echo, unless
                 # someone said who wrote it.
                 author = self._author_noted(mail) or "device"
-                _urn, path = _ibstore.write_outbound(
-                    INBOUND_STORE_DIR, author=author, sender=mail.sender or None, **common)
+                with self._records:
+                    _urn, path = _ibstore.write_outbound(
+                        INBOUND_STORE_DIR, author=author, sender=mail.sender or None, **common)
             else:
-                _urn, path = _ibstore.write_message(
-                    INBOUND_STORE_DIR, sender=mail.sender, gate_sender=mail.gate_sender or None,
-                    delivered=not offer, **common)
+                with self._records:
+                    _urn, path = _ibstore.write_message(
+                        INBOUND_STORE_DIR, sender=mail.sender,
+                        gate_sender=mail.gate_sender or None, delivered=not offer, **common)
         except Exception:
             for media_id in stored:
                 _ibstore.discard_media(INBOUND_STORE_DIR, media_id)
@@ -4616,8 +4688,9 @@ class Mirror:
             records = [self._record_path(row["record"]) for row in self.index.rows(
                 "SELECT record FROM mails WHERE chat = ? AND record != ''", (old,))]
             try:
-                result = _ibstore.rekey_chat(INBOUND_STORE_DIR, old, ACCOUNT, into,
-                                             paths=records)
+                with self._records:
+                    result = _ibstore.rekey_chat(INBOUND_STORE_DIR, old, ACCOUNT, into,
+                                                 paths=records)
             except Exception as exc:  # noqa: BLE001 - one merge, not every pass after it
                 if _environment(exc):
                     raise
@@ -4957,7 +5030,9 @@ class Mirror:
         if accepted and not job_url:
             # Only an explicit acceptance is a handover. The chat has the
             # mail, nothing is owed a model, and that is the delivery.
-            if _ibstore.mark_delivered(self._record_path(row["record"])):
+            with self._records:
+                delivered = _ibstore.mark_delivered(self._record_path(row["record"]))
+            if delivered:
                 self.index.atomic(settle + [
                     ("DELETE FROM offers WHERE message_id = ?", (message_id,))])
                 print(f"[mail-gateway] the chat took {message_id!r} ({reason})", flush=True)
@@ -5033,7 +5108,11 @@ class Mirror:
         with self._lock:
             row = self.index.one(
                 "SELECT record FROM mails WHERE message_id = ? AND record != ''", (message_id,))
-            if row is not None and _ibstore.mark_delivered(self._record_path(row["record"])):
+            if row is None:
+                return
+            with self._records:
+                delivered = _ibstore.mark_delivered(self._record_path(row["record"]))
+            if delivered:
                 self.index.run("DELETE FROM offers WHERE message_id = ?", (message_id,))
                 print(f"[mail-gateway] the turn for {message_id!r} is done: delivered",
                       flush=True)
@@ -5494,7 +5573,8 @@ class Mirror:
                     f"the chat is not deleted until they are found — try again in a minute"))
             if result["errors"]:
                 return result
-            erased = _ibstore.delete_chat(INBOUND_STORE_DIR, chat, ACCOUNT)
+            with self._records:
+                erased = _ibstore.delete_chat(INBOUND_STORE_DIR, chat, ACCOUNT)
             result.update(erased)
             self._forget_chat(chat, whole=not erased["errors"])
             if not erased["errors"]:
@@ -5745,14 +5825,15 @@ class Mirror:
              (message_id, ts + MAIL_SENT_GRACE_SECONDS if MAIL_CONFIG.save_sent else None,
               message_id))])
         try:
-            _urn, path = _ibstore.write_outbound(
-                INBOUND_STORE_DIR, channel=CHANNEL, chat=chat, account=ACCOUNT, text=text,
-                author=entry["author"], message_id=message_id, timestamp=ts,
-                attachment_urls=attachments, sender=ACCOUNT, sender_name=name,
-                subject=subject or None, recipients=to, cc=cc, refused=refused,
-                in_reply_to=cited[-1] if cited else None, references=cited,
-                body_part=refs.get("body_part"), header_part=refs.get("header_part"),
-                trim="deterministic", arrived_at=ts)
+            with self._records:
+                _urn, path = _ibstore.write_outbound(
+                    INBOUND_STORE_DIR, channel=CHANNEL, chat=chat, account=ACCOUNT, text=text,
+                    author=entry["author"], message_id=message_id, timestamp=ts,
+                    attachment_urls=attachments, sender=ACCOUNT, sender_name=name,
+                    subject=subject or None, recipients=to, cc=cc, refused=refused,
+                    in_reply_to=cited[-1] if cited else None, references=cited,
+                    body_part=refs.get("body_part"), header_part=refs.get("header_part"),
+                    trim="deterministic", arrived_at=ts)
         except Exception:
             try:
                 self.index.atomic([
@@ -7868,7 +7949,9 @@ class _Handler(BaseHTTPRequestHandler):
         account, which must be this gateway's own (else 404), and its
         Message-ID. A result is either ``keep`` — any value: whether it is a
         choice is apply_keep's to say, and one that is not settles the mail
-        — or ``failed``, a short reason, never both."""
+        — or ``failed``, a short reason (``unparseable``, ``too_long``,
+        ``gave_up`` for a mail whose turns all ended without a judgement:
+        any reason settles it alike), never both."""
         body = self._read_object()
         if body is None:
             return

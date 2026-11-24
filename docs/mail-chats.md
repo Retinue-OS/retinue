@@ -20,7 +20,7 @@ built: nothing of the design is outstanding.
 | **1 — read-only mirror** | the mail gateway, mail chats rendered, the deterministic trim, the original view | built |
 | **2 — writing** | reply and compose under the send policy; the mailbox follows the chat | built |
 | **3 — the gate** | VIP / instructed turns for mail; triage and the whitelist retire; the migration | built |
-| **4 — the model trim** | one router-tier turn per mail the deterministic trim could not settle | built |
+| **4 — the model trim** | one router-tier judgement per mail the deterministic trim could not settle | built |
 
 Phase 1's deployment is in place: the `mail-gateway` compose service and
 image, its `messenger-email` ledger and `mail-data` state volumes, the
@@ -477,8 +477,9 @@ which of the lines the deterministic trim kept are the author's own message.
 It runs **on first view** — when the bubble first comes into view on the chat
 page, which asks for it — never on ingest, never on backfill and never from
 an agent's read of the thread (the companion and the arrival turn read what
-is on the record). Its result is cached on the record (`kb:text` replaced,
-`kb:trim "model"`), so it runs at most once per mail.
+is on the record). Its result is cached on the record — `kb:text` is replaced,
+by design, and `kb:trim "model"` says so — so a mail gets one judgement, and
+at most `MAIL_MODEL_TRIM_ATTEMPTS` (3) turns that end without one.
 
 **The model chooses lines; it never writes text.** The mail is text from
 outside: the turn has no tools and no session, its prompt hands the mail over
@@ -486,22 +487,35 @@ as escaped data, and the mail is shown as numbered lines. The answer is the
 line ranges to keep, and the bubble's new text is assembled by the mail
 gateway from its own copy of those lines — so nothing a mail says can add a
 word to its own bubble, by construction rather than by a check after the
-fact. The record's parts are never changed.
+fact. And the lines are the bubble's own: a source rebuilt from the parts
+that is not the record's text is never handed out, so a choice can only
+narrow what the bubble shows. The record's original parts are never changed;
+its `kb:text` is, when a choice is made.
+
+**The choice is steerable by the mail.** Every line the model is shown is the
+sender's, and so is any instruction among them: a mail can talk the model
+into keeping a line of its choosing, or dropping one. What bounds that is the
+construction above — only the mail's own lines, never words of its own, can
+show — that the choice is marked (`kb:trim "model"`, the Original panel's
+heading, the companion's note), and that the full mail is one tap away.
 
 **Only a judgement settles a mail.** A choice (valid or not), an answer that
-is no choice at all (not one JSON object of ranges), and a mail too long to
-hand over settle the record — `kb:trim "deterministic"` where no valid
-choice came, the text as the rules left it — so it is not asked again. A
-failure that says nothing about the mail — the model could not be started,
-timed out, sign-in expired, a usage limit, the mail gateway away — changes
-nothing on the record: the mail stays `wanting` and is tried again later. A
-dead model must not settle every mail the user scrolls past.
+is no choice at all (not one JSON object of ranges), a mail too long to hand
+over, and one whose parts no longer give its text settle the record —
+`kb:trim "deterministic"` where no valid choice came, the text as the rules
+left it — so it is not asked again. A failure that says nothing about the
+mail — the model could not be started, timed out, sign-in expired, a usage
+limit, the mail gateway away — changes nothing on the record: the mail stays
+`wanting` and is tried again later. A dead model must not settle every mail
+the user scrolls past. Nor can a mail keep itself `wanting`: after
+`MAIL_MODEL_TRIM_ATTEMPTS` turns without a judgement it is settled as the
+rules left it (`failed: "gave_up"`, below).
 
 #### The two halves (`scripts/mail_trim.py`)
 
 ```python
 def model_source(plain, html, subject=None, *, is_reply=None, bulk=None) -> ModelSource | None
-#   ModelSource(lines: list[str], digest: str)
+#   ModelSource(lines: list[str], digest: str, text: str)
 def apply_keep(lines, keep) -> str | None
 ```
 
@@ -511,21 +525,29 @@ record's cap (`MAX_RECORD_TEXT_CHARS`) is applied: a choice can only narrow
 what the rules kept, never bring back history they cut. Lines end where a
 reader sees a line end (`str.splitlines`: a form feed, U+2028 and their kin
 as well as `"\n"`), so a mail cannot write something that reads as a line of
-ours with a number of its own choosing. It is None when no line has text or
-when there is more than may be handed over — more than
+ours with a number of its own choosing. It is None when no line shows
+anything or when there is more than may be handed over — more than
 `MODEL_SOURCE_MAX_LINES` (1,500) lines or `MODEL_SOURCE_MAX_CHARS` (60,000)
 characters, tested on the text's size before it is split. `digest` is the
 SHA-256 (hex) of the lines joined by `"\n"`, UTF-8: the same parts always
-give the same lines and the same digest.
+give the same lines and the same digest. `text` is the trim's text the lines
+were split from, which the gateway holds against the record's `kb:text`.
+
+A line **shows something** when it has a letter, a number, a punctuation mark
+or a symbol that is not a blank look-alike (the braille blank, the Hangul and
+Khmer fillers, the Mongolian vowel separator); format characters (a
+zero-width space, a word joiner, a BOM) and spaces show nothing. Length is no
+test: "OK" is a whole message, and a lone "." is visible text.
 
 `apply_keep` takes `keep = [[first, last], …]`, 1-based inclusive line
 numbers, and is a choice only if it is a list of at most
 `MODEL_KEEP_MAX_RANGES` (200) pairs of ints (`bool` and `float` are not),
 each `1 <= first <= last <= len(lines)`, strictly ascending and not
 overlapping. The kept lines are joined with one blank line where a gap was
-cut (ranges that touch are one stretch), runs of blank lines collapsed and
-none at either end. None for anything that is no choice, and for a choice
-that keeps no line with text. Both are pure and never raise; `apply_keep` is
+cut (ranges that touch are one stretch), a kept line that shows nothing
+read as a blank one, runs of blank lines collapsed and none at either end.
+None for anything that is no choice, and for a choice that keeps no line
+that shows anything — a bubble that only looks empty is no trim. Both are pure and never raise; `apply_keep` is
 linear in the ranges plus the lines kept and refuses a list longer than 200
 on its length, before one pair is looked at.
 
@@ -548,21 +570,31 @@ after it.
   `kb:references` (the record keeps every id the mail cited, so one is there
   exactly when the mail cited one), and `bulk` read again from the header
   part (`List-Id`, `List-Unsubscribe`, a bulk `Precedence` — the record
-  carries only the normalised `List-Id`). So the lines are the record's own
-  text, uncapped. `200 {"state": "deterministic" | "model"}` for a mail
-  already settled; `200 {"state": "deterministic", "settled": "too_long"}`
-  when `model_source` answers None — the gateway settles the record then and
-  there (text unchanged), since asking again would only find it as long.
-  Otherwise read-only, and without the mirror's lock. A part the record
-  references that cannot be read answers `503` and settles nothing.
+  carries only the normalised `List-Id`; the part was stored with its CRLFs
+  folded to LF, and is folded back to be read, so a block the ingest's
+  parser ended at a CR CR LF ends there again). And it is checked: the text
+  the lines were split from, capped as the ingest caps a record's text, must
+  be the record's `kb:text` — the lines are the record's own text, uncapped.
+  `200 {"state": "deterministic" | "model"}` for a mail already settled;
+  `200 {"state": "deterministic", "settled": "too_long"}` when `model_source`
+  answers None, and `"settled": "source_differs"` when its text is not the
+  record's (the rules have changed since the mail was read, or its evidence
+  reads otherwise now: the lines could hold what the rules had cut, and a
+  choice of them would bring it back) — the gateway settles the record then
+  and there (text unchanged), since asking again would only find it the
+  same. Otherwise read-only, and without a lock. A part the record
+  references that cannot be read — a body part or the header part — answers
+  `503` and settles nothing: it says nothing about the mail.
 - **`POST /messages/trim-result`** with `digest` and exactly one of `keep`
   (any value: whether it is a choice is `apply_keep`'s to say) or `failed`
-  (a short reason, logged, never stored). The gateway rebuilds the source and
+  (a short reason, logged, never stored: `unparseable`, `too_long`, or
+  `gave_up` for a mail whose turns all ended without a judgement — any
+  reason settles the mail alike). The gateway rebuilds the source and
   refuses `409 {"error": "stale", "state"}` when the mail is no longer
-  `wanting` or the digest is not its source's — a choice is about the lines
-  it was made from and no others. Then, under the mirror's lock (`503` when a
-  pass holds it past `EXCLUSIVE_SECONDS`) and with the record read again (a
-  record written anew from other parts meanwhile is stale too): a valid
+  `wanting`, the digest is not its source's or the source is not its text —
+  a choice is about the lines it was made from and no others. Then, under
+  the **record lock**, and with the record read again (one written anew
+  from other parts, or with another text, meanwhile is stale too): a valid
   choice becomes `kb:text`, capped as every `kb:text` is, with `kb:trim
   "model"`; an invalid one, and `failed`, settle `deterministic` with the
   text unchanged. `200 {"state", "text"}` — the record's text as it now
@@ -570,28 +602,44 @@ after it.
   back to confirm (a write that did not happen is `503`, never a `200`); it
   touches nothing but the text and the trim, and nothing on a tombstone.
 
+  The record lock is not the mirror's. A pass over the mailbox holds the
+  mirror's lock for as long as it takes — minutes on a first sync — and a
+  judgement already paid for does not wait that out: every writer of a
+  record (the pass, a send, an erase) holds the record lock around that one
+  write, or one chat's, and no longer, so the trim's check and write are
+  never interleaved with one and wait for one at most. `503` when one holds
+  it past `EXCLUSIVE_SECONDS`; the web gateway offers the judgement again.
+
 Nothing is told on the rail. A mail's text changing on its record is how a
 better reading reaches the chat — the life store indexes the rewrite within
 seconds and the chat page's poll re-renders a message whose `text` or `trim`
 changed — and the one caller, the web gateway, has the new text in the
-answer.
+answer: when a trim settles it forgets that message's live-overlay entry and
+invalidates what the chat list shows, so the preview follows without waiting
+for the store.
 
 #### The turn and the page
 
 The web gateway runs the turn: `POST /chats/<id>/messages/<token>/trim`
 (same-origin, the dashboard's auth, mail chats only; `<token>` is the
-message's `original` segment) answers `200 {state, text}` for a mail settled,
+message's `original` segment) resolves the token as the Original endpoints
+do — tombstone, erasure, chat and account — before it answers anything, from
+its cache of settled mails too: `410` for a mail gone from the mailbox (a
+tombstone, an erased record), `404 {"error": "no such mail in this chat"}`
+for a token that names nothing. Then `200 {state, text}` for a mail settled,
 before or just now; `202 {"state": "queued" | "running"}` while a turn is
 queued or in flight (asking again never queues twice); and `200 {"state":
 "wanting", "retry_after"}` when nothing was started — the feature off, the
-day's budget spent, the queue full, the model in backoff. One worker thread
+day's budget spent (`retry_after` until local midnight), the queue full (a
+short wait), the model in backoff. One worker thread
 runs one turn at a time from a bounded queue (`MAIL_MODEL_TRIM_QUEUE`, 30).
 The model is `MAIL_MODEL_TRIM_MODEL`, else `RETINUE_ROUTER_MODEL`, else the
 transcript cleanup's fallback, spawned with that cleanup's discipline: no
 tools, no session persistence, the allowlisted environment, the sign-in
 refresh, a timeout (`MAIL_MODEL_TRIM_TIMEOUT`, 60 s). `MAIL_MODEL_TRIM`
 (`1`) switches it off with `0`/`false`/`no`; `MAIL_MODEL_TRIM_DAILY_MAX`
-(200) caps the turns of a local day, counted across restarts. The prompt is
+(200) caps the turns of a local day that ran — a spawn that produced no turn
+is not charged — counted across restarts. The prompt is
 fixed instructions, language-agnostic, then the subject, the sender and the
 numbered lines as escaped data in an element they cannot close, within the
 prompt size every turn of the web gateway keeps to; it asks for the ranges of
@@ -599,11 +647,22 @@ the lines that are the author's own message — no quoted history, signature,
 footer, disclaimer, boilerplate, navigation or tracking residue — as one JSON
 object `{"keep": [[first, last], …]}`. An answer parsed as that is a
 judgement and goes to `trim-result` as `keep`; one that does not parse is a
-judgement too and goes as `failed: "unparseable"`. A spawn error, a non-zero
-exit, a timeout, an auth or usage-limit failure and the gateway unreachable
-send nothing: the mail backs off (`MAIL_MODEL_TRIM_RETRY_SECONDS`, 3600, in
-memory), and three such failures in a row pause the feature for ten
-minutes.
+judgement too and goes as `failed: "unparseable"`. A turn that ends without a
+judgement — a spawn error, a non-zero exit, a timeout, an auth or
+usage-limit failure — sends nothing, and the mail waits, longer after each:
+an hour (`MAIL_MODEL_TRIM_RETRY_SECONDS`, 3600), four, twenty-four. After
+`MAIL_MODEL_TRIM_ATTEMPTS` (3) of them the web gateway sends `failed:
+"gave_up"` and the mail is settled as untrimmed. The count is per mail and
+durable — beside the day's budget, in one small state file whose oldest
+entries go — so a restart does not hand a mail its attempts again. A model
+that could not be started at all (sign-in, the binary missing: no turn ran)
+is no attempt of the mail's, but it counts, like every failure without a
+judgement, toward the feature's pause: three in a row rest it for ten
+minutes. A judgement the mail gateway cannot take right now (`503`, a hop
+timeout, the gateway away) is never thrown away: the web gateway keeps it,
+in memory, and offers it again after a short, growing wait — without a new
+turn and without a new charge — until it is taken, refused as stale (`409`,
+`404`, `410`) or about fifteen minutes have passed.
 
 The chat page asks for a `wanting` bubble's trim once it has been at least
 half in view for a moment — not while the list is scrolled through — once per
@@ -613,7 +672,14 @@ settled text arrives through the POST's answer and through the ordinary poll,
 and the reader's place is kept when a bubble above the viewport shrinks. A
 bubble whose `trim` is `model` says so where the user looks for the full
 mail: the Original panel is headed "Shortened by a model — this is the full
-mail." Messenger chats never ask.
+mail." The page switches the feature off for its life only where the server
+has no such endpoint — `405`, `501`, or a `404` whose body is not the
+endpoint's own (the route fallback's `{"error": "not found"}`, or no JSON);
+the endpoint's own `404` and `410` end that one mail and leave the others
+watched. The companion's note marks a model-trimmed mail as well (an
+attribute on its `<mail>` element, and a sentence in the note's head: such a
+mail's text is a model's selection of the mail's own lines, steerable by the
+mail, and the full mail is in its parts). Messenger chats never ask.
 
 ### The original
 
@@ -1386,7 +1452,8 @@ accounts. The points an operator meets first:
   the mailbox password stay out of a second container: compose hands it to
   the gateway whether or not it mirrors.
 - **The model trim needs nothing set.** It is on by default and spends at
-  most `MAIL_MODEL_TRIM_DAILY_MAX` router-tier turns a day, one per mail the
-  rules left `wanting` that the user actually looked at; `MAIL_MODEL_TRIM=0`
+  most `MAIL_MODEL_TRIM_DAILY_MAX` router-tier turns a day, on the mails the
+  rules left `wanting` that the user actually looked at — one judgement a
+  mail, and at most `MAIL_MODEL_TRIM_ATTEMPTS` turns; `MAIL_MODEL_TRIM=0`
   on the `retinue` service switches it off, and every bubble then keeps the
   deterministic text. The mail gateway reads none of its tunables.

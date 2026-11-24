@@ -15,8 +15,8 @@ and the two halves of the model trim, for a mail the rules left ``wanting``
 (see "The model trim's two halves" below):
 
   * :func:`model_source` — the same arguments as :func:`trim`, ``->
-    ModelSource(lines, digest) | None``: trim()'s own text as the numbered
-    lines a model may choose from.
+    ModelSource(lines, digest, text) | None``: trim()'s own text as the
+    numbered lines a model may choose from.
   * :func:`apply_keep` — ``(lines, keep) -> str | None``: the text a model's
     choice of line ranges keeps. The model chooses lines; it never writes.
 
@@ -855,7 +855,7 @@ def _squeeze(lines: list) -> list:
     """One blank line at most between paragraphs, none at either end."""
     out: list = []
     for line in lines:
-        if line.strip():
+        if _visible(line):
             out.append(line)
         elif out and out[-1]:
             out.append("")
@@ -2270,10 +2270,29 @@ MODEL_KEEP_MAX_RANGES = 200
 
 class ModelSource(NamedTuple):
     """What :func:`model_source` answers: the lines a model may choose from,
-    and the digest that binds a choice to exactly these lines."""
+    the digest that binds a choice to exactly these lines, and the text they
+    were split from — trim()'s own, which a caller holds against the text it
+    wrote from that trim, so a model is shown what the bubble shows."""
 
     lines: list
     digest: str
+    text: str
+
+
+# Characters that are letters or symbols to Unicode and still show nothing:
+# the braille blank, the Hangul fillers, the Khmer inherent vowels and the
+# Mongolian vowel separator. With the format characters (Cf: zero-width
+# space, word joiner, BOM, …) and the separators (Z*), which no category
+# test below lets through, they are how a line looks blank and is not.
+_BLANK_LOOKALIKES = frozenset("\u2800\u3164\u115f\u1160\uffa0\u17b4\u17b5\u180e")
+
+
+def _visible(line: str) -> bool:
+    """Whether a line shows anything: a letter, a number, a punctuation mark
+    or a symbol that is not one of the blank look-alikes. Length is no test
+    — "OK" is a whole message — and a lone "." is visible text."""
+    return any(unicodedata.category(ch)[0] in "LNPS" and ch not in _BLANK_LOOKALIKES
+               for ch in line)
 
 
 def _lines_digest(lines: list) -> str:
@@ -2291,7 +2310,8 @@ def model_source(plain: str | None, html: str | None, subject: str | None = None
     only ever narrow what the rules kept: history the rules cut is not shown
     again, and the bubble's cap is the caller's to apply to what is kept.
 
-    None when there is nothing to choose from (no line with text) or more
+    None when there is nothing to choose from (no line that shows anything,
+    see :func:`_visible`) or more
     than may be handed over (MODEL_SOURCE_MAX_LINES, MODEL_SOURCE_MAX_CHARS)
     — tested on the text's size before it is split, so a text of megabytes
     costs no more than trim() did.
@@ -2310,9 +2330,9 @@ def model_source(plain: str | None, html: str | None, subject: str | None = None
         if not isinstance(text, str) or len(text) > MODEL_SOURCE_MAX_CHARS:
             return None
         lines = text.splitlines()
-        if len(lines) > MODEL_SOURCE_MAX_LINES or not any(line.strip() for line in lines):
+        if len(lines) > MODEL_SOURCE_MAX_LINES or not any(map(_visible, lines)):
             return None
-        return ModelSource(lines, _lines_digest(lines))
+        return ModelSource(lines, _lines_digest(lines), text)
     except Exception:       # no source is the safe answer: the trim stands
         return None
 
@@ -2325,12 +2345,15 @@ def apply_keep(lines, keep) -> str | None:
     of ints (``bool`` and ``float`` are not ints here, ``3.0`` is no line
     number), each ``1 <= first <= last <= len(lines)``, strictly ascending
     and not overlapping. Anything else is None — as is a choice that keeps
-    no line with text in it: an empty bubble is never a trim.
+    no line that shows anything (:func:`_visible`: a zero-width space, a
+    braille blank or a Hangul filler is no text): an empty bubble, or one
+    that only looks empty, is never a trim.
 
     The kept lines, joined by ``"\\n"``; where lines between two ranges
     were cut, one blank line stands in for them (two ranges that touch are
-    one stretch of text); runs of blank lines are one, and none opens or
-    ends the text. Every line of the answer is one of ``lines`` or blank.
+    one stretch of text); a kept line that shows nothing is a blank line
+    too; runs of blank lines are one, and none opens or ends the text. Every
+    line of the answer is one of ``lines`` or blank.
 
     Pure, linear in the number of ranges plus the lines kept — the count is
     checked before a single pair is looked at, so a million of them cost
@@ -2368,7 +2391,7 @@ def _kept_text(lines, keep) -> str | None:
     for line in kept:
         if not isinstance(line, str):
             return None
-        if line.strip():
+        if _visible(line):
             out.append(line)
         elif out and out[-1]:
             out.append("")
