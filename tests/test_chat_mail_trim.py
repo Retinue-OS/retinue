@@ -1112,6 +1112,80 @@ def test_the_prompt_fits_and_names_the_lines():
 RIG: Rig | None = None
 
 
+# ── Seams with the mirror's mechanisms (the phase 3 merge) ───────────────────
+
+def test_a_placeholder_is_unread_never_settled(r: Rig):
+    """A placeholder (the mirror's record of a mail it could not read yet)
+    is answered ``unread`` by its gateway: no lines, and nothing settled. The
+    worker takes that as it takes a stale source — nothing cached, nothing
+    forgotten, a wait — so the record written in its place once the mail
+    reads (in its own place, I3) is asked about as the mail's first reading."""
+    mid = r.mail()
+    G["status"]["/messages/trim-source"] = (200, {"state": "unread"})
+    assert r.trim(mid)[0] == 202
+    r.idle()
+    assert not r.claude.calls and not _sent("/messages/trim-result")
+    assert r.wg._mail_trim_settled_get(CHAT, mid) is None
+    assert (CHAT, mid) in r.wg._mail_trim_backoff
+    assert mail._one(r.record(mid), "trim") == "wanting"
+    # A judgement whose record became a placeholder meanwhile: refused as
+    # stale, never taken for a settled mail.
+    r.reset()
+    mid = r.mail()
+    G["status"]["/messages/trim-result"] = (409, {"error": "stale", "state": "unread"})
+    assert r.trim(mid)[0] == 202
+    r.idle()
+    assert len(r.claude.calls) == 1
+    assert r.wg._mail_trim_settled_get(CHAT, mid) is None
+    assert (CHAT, mid) in r.wg._mail_trim_backoff
+
+
+def test_a_settled_entry_does_not_speak_for_a_record_written_anew(r: Rig):
+    """The settled cache covers the seconds until the store has a trim's
+    rewrite. The mirror writes a record again in its own place (another copy
+    read, a placeholder read at last), and a record the store shows with
+    neither the text the trim was asked about nor the one it settled to is
+    that new reading: the entry gives way, and a wanting record is asked
+    about again."""
+    mid = r.mail()
+    assert r.trim(mid)[0] == 202
+    r.idle()
+    assert _settled(r, mid)["state"] == "model"
+    assert r.wg._mail_trim_settled_get(CHAT, mid) == ("model", "\n".join(AUTHOR_LINES))
+    # Written anew by its gateway: another reading, wanting again.
+    ist.update_message(G["sources"][mid]["path"], text="Another reading entirely.",
+                       trim="wanting")
+    shown = next(m for m in mail._messages(r.base, CHAT)["messages"] if m["id"] == mid)
+    assert (shown["trim"], shown["text"]) == ("wanting", "Another reading entirely."), shown
+    assert r.wg._mail_trim_settled_get(CHAT, mid) is None
+    assert r.trim(mid)[0] == 202
+    r.idle()
+    assert len(r.claude.calls) == 2
+
+
+def test_an_offer_made_after_a_first_view_marks_the_quote(r: Rig):
+    """A mail is trimmed by a model on its first view, never on arrival; but
+    an offer made later — the rail was down, a turn failed — is made of the
+    record as it stands, and says ``trim: model``. The arrival turn's quote
+    marks it as the companion's note marks the record, and says what the
+    mark means; a mail offered as the rules trimmed it is quoted plainly."""
+    plain = {"mail": True, "handle": ANN, "sender_name": "Ann", "subject": "Party",
+             "message_id": "q1@x.org", "text": "Hi, the venue moved."}
+    chosen = {**plain, "message_id": "q2@x.org", "trim": "model"}
+    assert "<external_message>" in r.wg._mail_arrival_quote(plain)
+    assert '<external_message trim="model">' in r.wg._mail_arrival_quote(chosen)
+    one = r.wg._chat_arrival_prompt([plain])
+    both = r.wg._chat_arrival_prompt([plain, chosen])
+    assert 'trim=\\"model\\"' not in one and "trim=\"model\"" not in one.split(
+        "</external_message>")[-1]
+    assert both.count('<external_message trim="model">') == 1
+    assert "had its text chosen by a model" in both
+    # The quote decision is the worker's, once: the mark rides on it.
+    quotes, shown = r.wg._mail_arrival_quotes([plain, chosen])
+    assert shown == [True, True] and quotes[1].startswith('  <external_message trim="model">')
+    assert r.wg._mail_arrival_prompt([plain, chosen], quotes=quotes) == both
+
+
 def main() -> int:
     global RIG
     tests = [(name, check) for name, check in globals().items()

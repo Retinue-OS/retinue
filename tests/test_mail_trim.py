@@ -4370,7 +4370,15 @@ def test_model_source_never_raises_and_stays_fast():
                                   and len(source.digest) == 64), repr(plain[:20])
         assert elapsed < 20, (repr(plain[:20]), elapsed)
     started = time.perf_counter()
-    assert mt.model_source(None, "<div>" * 400_000 + "deep" + "</div>" * 400_000) is not None
+    deep = "<div>" * 400_000 + "deep" + "</div>" * 400_000
+    # Read as far as MAX_HTML_CHARS, which "deep" lies beyond: what is left
+    # is the trim's own CUT_MARK line, which is no line to choose — no source.
+    # With a line of the author's before it, that line is the source, and
+    # the mark is kept for the end of whatever is chosen.
+    assert mt.trim(None, deep).text == mt.CUT_MARK
+    assert mt.model_source(None, deep) is None
+    source = mt.model_source(None, "<p>Hello.</p>" + deep)
+    assert source.lines == ["Hello."] and source.ended, source
     assert time.perf_counter() - started < 30
     for plain, html, subject in ((1, 2, 3), (b"bytes", None, None), ([], {}, object())):
         assert mt.model_source(plain, html, subject) is None
@@ -4509,6 +4517,65 @@ def test_apply_keep_is_cheap_and_invents_nothing():
     print("PASS apply_keep: linear, refuses a million pairs at once, invents nothing")
 
 
+# ── The model trim on phase 1's reading (the phase 3 merge) ──────────────────
+
+def test_the_reading_ends_on_a_line_that_is_no_choice():
+    """Phase 1's reading of an HTML part ends, past MAX_HTML_CHARS, on the
+    trim's own line CUT_MARK. The line-choosing half was written beside a
+    reading that never ended early: that line is the trim's word that the
+    rest was not read, never a line of the author's — not handed out, kept
+    at the end of whatever is chosen, and no source where it is all there
+    is. A "[…]" the author wrote is an ordinary line; a plain part beside
+    the HTML one is the source and is not cut."""
+    html = ("<p>Hello Ann,</p><p>the plan is fine.</p>"
+            + "<span></span>" * (mt.MAX_HTML_CHARS // 13 + 10) + "<p>Not read.</p>")
+    trimmed = mt.trim(None, html)
+    assert trimmed.state == "wanting" and trimmed.text.endswith("\n\n" + mt.CUT_MARK)
+    source = mt.model_source(None, html)
+    assert source.ended and mt.CUT_MARK not in source.lines and source.text == trimmed.text
+    assert source.lines[:3] == ["Hello Ann,", "", "the plan is fine."]
+    assert source.digest == _digest(source.lines)
+    assert mt.apply_keep(source.lines, [[1, 3]], ended=source.ended) == (
+        "Hello Ann,\n\nthe plan is fine.\n\n" + mt.CUT_MARK)
+    # The whole of what was read, chosen: the trim's own text again.
+    assert mt.apply_keep(source.lines, [[1, len(source.lines)]], ended=True) == trimmed.text
+    # No choice is still no choice; the mark makes none.
+    assert mt.apply_keep(source.lines, [], ended=True) is None
+    assert mt.apply_keep(["\u200b"], [[1, 1]], ended=True) is None
+    # All that was read is the mark: nothing to choose from.
+    deep = "<div>" * (mt.MAX_HTML_CHARS // 5 + 10) + "late" + "</div>" * 10
+    assert mt.trim(None, deep).text == mt.CUT_MARK and mt.model_source(None, deep) is None
+    # The author's own "[…]" is a line like any other, and a plain part is
+    # read whole.
+    own = mt.model_source("Hi,\n\nmore below\n\n" + mt.CUT_MARK, None)
+    assert not own.ended and own.lines[-1] == mt.CUT_MARK
+    beside = mt.model_source("Hello Ann,\n\nthe plan is fine.\n", html)
+    assert not beside.ended and mt.CUT_MARK not in beside.text
+    print("PASS model trim: where the reading ended is the trim's line, never a choice")
+
+
+def test_one_notion_of_a_line_that_shows_nothing():
+    """The model's choice is judged by _visible; the rules call a line blank
+    when it is whitespace (_squeeze), and html_to_text takes the padding a
+    sender hides (_INVISIBLE) out of the text. One notion, widened for the
+    choice only: whatever the rules or the converter call nothing, the
+    choice calls nothing too — over every line of the corpus as trimmed."""
+    for ch in [chr(c) for c in mt._INVISIBLE] + [" ", "\t", "\u00a0", "\u3000", "\u2028"]:
+        assert not mt._visible(ch * 3), repr(ch)
+        assert not mt._visible(" " + ch + " "), repr(ch)
+    for case in CASES:
+        args = {k: case[k] for k in ("is_reply", "bulk") if k in case}
+        text = mt.trim(case.get("plain"), case.get("html"), case.get("subject"), **args).text
+        for line in text.split("\n"):
+            if not line.strip():
+                assert not mt._visible(line), (case.get("name"), repr(line))
+        if case.get("html"):
+            for line in mt.html_to_text(case["html"]).split("\n"):
+                if not line.translate(mt._INVISIBLE).strip():
+                    assert not mt._visible(line), (case.get("name"), repr(line))
+    print("PASS model trim: one notion of a line that shows nothing, with the rules'")
+
+
 def test_module_is_standalone():
     """Importable in a slim gateway image: stdlib only, no sibling modules."""
     code = ("import sys; before = set(sys.modules); import mail_trim; "
@@ -4576,6 +4643,8 @@ def main():
     test_a_choice_must_show_something()
     test_the_rules_keep_a_line_this_python_cannot_name()
     test_apply_keep_is_cheap_and_invents_nothing()
+    test_the_reading_ends_on_a_line_that_is_no_choice()
+    test_one_notion_of_a_line_that_shows_nothing()
     test_module_is_standalone()
     print("all mail-trim tests passed")
     return 0

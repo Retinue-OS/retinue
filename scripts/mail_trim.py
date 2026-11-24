@@ -2310,6 +2310,15 @@ def trim(plain: str | None, html: str | None, subject: str | None = None, *,
     List-Id, ``Precedence: bulk``). Unsubscribe blocks and list footers are
     cut only then.
     """
+    return _trim(plain, html, subject, is_reply=is_reply, bulk=bulk)[0]
+
+
+def _trim(plain, html, subject=None, *, is_reply=None, bulk=None) -> tuple:
+    """:func:`trim`'s work: ``(TrimResult, ended)``, where ``ended`` says
+    that the text ends on this call's own CUT_MARK line — the HTML part was
+    the source and its reading ended before the part did. Only the model
+    trim's half asks (:func:`model_source`): that line is the trim's word,
+    never the author's, and no line a model may choose."""
     evidence = _Evidence(
         forward=is_forward_subject(subject),
         history=is_reply is True and is_reply_subject(subject),
@@ -2322,7 +2331,7 @@ def trim(plain: str | None, html: str | None, subject: str | None = None, *,
         if _oversize(whole):
             # More than a source may be: no trim, and no line of it is so
             # much as looked at. Asked again, the answer is the same.
-            return TrimResult(whole, "wanting", removed)
+            return TrimResult(whole, "wanting", removed), False
     cut = False
     if has_html:
         html, cut = _markup_read(html)
@@ -2342,6 +2351,7 @@ def trim(plain: str | None, html: str | None, subject: str | None = None, *,
     lines: list | None = []
     untrimmed: list = []
     unsettled = False
+    marked_end = False          # the reading's own CUT_MARK is the last line read
     if has_plain:
         # (Of the part as it came, which is within the bounds: the part
         # itself can be fifty megabytes of marks around a few lines.)
@@ -2359,6 +2369,7 @@ def trim(plain: str | None, html: str | None, subject: str | None = None, *,
         raw = _clean_lines(marked, keep_marks=True)
         if cut:
             raw += ["", CUT_MARK] if raw else [CUT_MARK]
+            marked_end = True
         bare = _unmarked(raw)
         if _oversize(_text_of(bare)):
             # More than a source may be, as above: no trim.
@@ -2407,7 +2418,10 @@ def trim(plain: str | None, html: str | None, subject: str | None = None, *,
     wanting = bool(text) and (
         not has_plain or unsettled or len(text) > WANTING_CHARS
         or _marker_survives(lines))
-    return TrimResult(text, "wanting" if wanting else "deterministic", removed)
+    # (The rules stop at that line — no signature, no footer is looked for
+    # under it — so where it was written, the text still ends on it.)
+    ended = marked_end and text.rsplit("\n", 1)[-1] == CUT_MARK
+    return TrimResult(text, "wanting" if wanting else "deterministic", removed), ended
 
 
 # ── The model trim's two halves ──────────────────────────────────────────────
@@ -2437,11 +2451,17 @@ class ModelSource(NamedTuple):
     """What :func:`model_source` answers: the lines a model may choose from,
     the digest that binds a choice to exactly these lines, and the text they
     were split from — trim()'s own, which a caller holds against the text it
-    wrote from that trim, so a model is shown what the bubble shows."""
+    wrote from that trim, so a model is shown what the bubble shows.
+
+    ``ended``: that text ends on the trim's own CUT_MARK line (the reading
+    of the HTML part ended before the part did). That line is the trim's
+    word, not the author's: it is not among ``lines``, and a choice keeps
+    it at the end, whatever it names (:func:`apply_keep`'s ``ended``)."""
 
     lines: list
     digest: str
     text: str
+    ended: bool = False
 
 
 # Characters that are letters or symbols to Unicode and still show nothing:
@@ -2468,9 +2488,18 @@ def _visible(line: str) -> bool:
     Unicode tables) or private use (Co) — which cannot be known to be blank,
     unless it lies where Unicode reserves the code points drawn as nothing.
     Length is no test — "OK" is a whole message — and a lone "." is visible
-    text. Only a model's choice is judged by it; trim()'s own rules keep any
-    line that is not whitespace."""
+    text.
+
+    One notion of blank with the rules', widened: every line trim() calls
+    blank (whitespace: _squeeze) shows nothing here, and neither does the
+    padding html_to_text takes out of a mail (_INVISIBLE). What only this
+    test calls blank — a line of format characters or look-alikes — trim()'s
+    rules keep as a line, as they always have; it is a model's choice that
+    is judged by it (apply_keep, model_source), since a choice of such lines
+    would show an empty bubble."""
     for ch in line:
+        if ord(ch) in _INVISIBLE:
+            continue
         category = unicodedata.category(ch)
         if category in ("Cn", "Co"):
             if not _reserved_blank(ch):
@@ -2509,20 +2538,32 @@ def model_source(plain: str | None, html: str | None, subject: str | None = None
 
     ``digest`` is the SHA-256 (hex) of the lines joined by ``"\\n"``, UTF-8:
     the same parts always give the same lines and the same digest, which is
-    what lets a choice be checked against the source it was made from."""
+    what lets a choice be checked against the source it was made from.
+
+    Where the reading of an HTML part ended before the part did, trim()'s
+    text ends on a line CUT_MARK — the trim's word that what follows was not
+    read, not the author's. It is no line to choose: ``lines`` leave it out
+    (and the blank above it), ``ended`` says it was there, and a choice
+    keeps it at the end (:func:`apply_keep`), so the bubble still says where
+    the reading ended. A source with nothing but that line is none."""
     try:
-        text = trim(plain, html, subject, is_reply=is_reply, bulk=bulk).text
+        result, ended = _trim(plain, html, subject, is_reply=is_reply, bulk=bulk)
+        text = result.text
         if not isinstance(text, str) or len(text) > MODEL_SOURCE_MAX_CHARS:
             return None
         lines = text.splitlines()
+        if ended:
+            lines = lines[:-1]
+            while lines and not lines[-1].strip():
+                lines.pop()
         if len(lines) > MODEL_SOURCE_MAX_LINES or not any(map(_visible, lines)):
             return None
-        return ModelSource(lines, _lines_digest(lines), text)
+        return ModelSource(lines, _lines_digest(lines), text, ended)
     except Exception:       # no source is the safe answer: the trim stands
         return None
 
 
-def apply_keep(lines, keep) -> str | None:
+def apply_keep(lines, keep, *, ended: bool = False) -> str | None:
     """The text a model's choice keeps of ``lines``, or None.
 
     ``keep`` is ``[[first, last], …]``: 1-based, inclusive line numbers. It
@@ -2538,13 +2579,16 @@ def apply_keep(lines, keep) -> str | None:
     were cut, one blank line stands in for them (two ranges that touch are
     one stretch of text); a kept line that shows nothing is a blank line
     too; runs of blank lines are one, and none opens or ends the text. Every
-    line of the answer is one of ``lines`` or blank.
+    line of the answer is one of ``lines`` or blank — but for ``ended``
+    (:attr:`ModelSource.ended`): the source's text ended on the trim's own
+    CUT_MARK line, and the kept text ends on it too, after a blank line.
 
     Pure, linear in the number of ranges plus the lines kept — the count is
     checked before a single pair is looked at, so a million of them cost
     nothing — and never raises, whatever it is given."""
     try:
-        return _kept_text(lines, keep)
+        text = _kept_text(lines, keep)
+        return text + "\n\n" + CUT_MARK if text is not None and ended is True else text
     except Exception:
         return None
 

@@ -727,6 +727,258 @@ def test_a_failed_write_is_503_and_not_a_settled_mail():
     print("ok: a rewrite that did not happen is 503, never a 200 for an unchanged record")
 
 
+# ── Seams with the mirror's mechanisms (the phase 3 merge) ───────────────────
+#
+# The model trim was written against a mirror that dropped a record and wrote
+# it anew; this one replaces a record in its own place (I3), reads mail in a
+# reader of its own that may give up on it (a placeholder, read again later),
+# and keeps ids and flags beside the reading. Each check below pins the trim
+# on one of those.
+
+def test_a_placeholder_is_never_handed_to_a_model_and_its_reading_is():
+    """A placeholder is our sentence, not the mail: no turn is spent on it,
+    and nothing is settled — a choice of it is refused ``unread``. Once the
+    mail reads, the record written in the placeholder's place is the mail's
+    first reading, and its own lines are handed out."""
+    with tempfile.TemporaryDirectory() as tmp:
+        gw, mirror, box, base, server = rig(tmp)
+        clock = [t.NOW]
+        mirror._clock = lambda: clock[0]
+        real = gw._trim.trim
+
+        def trim(plain, html, subject=None, **evidence):
+            if subject == "poison":
+                raise RecursionError("this mail, for now")
+            return real(plain, html, subject=subject, **evidence)
+        gw._trim.trim = trim
+        try:
+            mid = "placeholder@x.org"
+            box.put("INBOX", msg(mid, subject="poison", body=LONG_BODY, day=7))
+            mirror.poll()
+            record = t.by_id(gw)[mid]
+            assert record["text"] == gw.UNREADABLE_TEXT, record["text"]
+            assert source(base, mid) == (200, {"state": "unread"})
+            assert result(base, mid, "0" * 64, keep=[[1, 1]]) == (
+                409, {"error": "stale", "state": "unread"})
+            assert t.by_id(gw)[mid] == record
+        finally:
+            gw._trim.trim = real
+        try:
+            clock[0] += gw.SET_ASIDE_RETRY_SECONDS
+            mirror.poll()
+            record = t.by_id(gw)[mid]
+            assert record["trim"] == "wanting" and record["text"] != gw.UNREADABLE_TEXT
+            got = source(base, mid)[1]
+            assert got["state"] == "wanting" and "\n".join(got["lines"]) == record["text"]
+            assert result(base, mid, got["digest"], keep=[[1, 1]])[0] == 200
+            assert t.by_id(gw)[mid]["trim"] == "model"
+        finally:
+            server.shutdown()
+    print("ok: a placeholder is unread, never trimmed; its reading is trimmed once it reads")
+
+
+def test_a_judgement_keeps_what_the_mirror_keeps_beside_the_reading():
+    """The judgement's write is the record's in-place rewrite (one rename,
+    as every record write is): it changes the text and the trim, and keeps
+    the gate sender, the ids a provider gave the mail (kb:sentAs) and the
+    flag that the rail is still owed it."""
+    with tempfile.TemporaryDirectory() as tmp:
+        gw, mirror, _box, base, server = rig(tmp)
+        try:
+            mid = "long@x.org"
+            path = mirror._record_path(mirror.index.one(
+                "SELECT record FROM mails WHERE message_id = ?", (mid,))["record"])
+            fields = gw._ibstore.read_record(path)
+            fields.update(sent_as=["provider-id@x.org"], delivered=False)
+            gw._ibstore._atomic_write(gw._ibstore._render(fields), path)
+            before = snapshot(gw, mid)
+            assert before[1]["gate_sender"] and before[1]["sent_as"] == ["provider-id@x.org"]
+            got = source(base, mid)[1]
+            assert result(base, mid, got["digest"], keep=[[1, 1]])[0] == 200
+            unchanged_but_reading(gw, mid, before)
+            after = t.by_id(gw)[mid]
+            assert after["delivered"] is False and after["sent_as"] == ["provider-id@x.org"]
+            # In its own place, in one rename: the same file, nothing left beside it.
+            assert path.is_file() and not [p for p in path.parent.iterdir() if p.suffix == ".tmp"]
+        finally:
+            server.shutdown()
+    print("ok: a judgement's write keeps the gate sender, kb:sentAs and the owed flag")
+
+
+def _own_post(body=LONG_BODY, extra=()):
+    return msg("post@example.org", sender=t.ME, to="list@lists.x.org", cc=ACCOUNT, day=8,
+               subject="Notes for the list", body=body, headers=extra)
+
+
+def test_a_record_written_again_in_its_place_keeps_a_judgement_of_its_own_reading():
+    """The user's post reaches INBOX before its Sent copy: recorded as a mail
+    that came in, and — long — trimmed by a model on its first view. When
+    the Sent copy shows, the mirror writes the record again in its own place
+    as the user's own (I3). The judgement is cached on the record: a copy of
+    the very same bytes is the very same reading, and keeps it (no second
+    turn); the rail is told the text as the record has it, marked. A copy of
+    other bytes is another reading, which the rules trim afresh — wanting
+    again, and asked about on its own first view."""
+    for same in (True, False):
+        with tempfile.TemporaryDirectory() as tmp:
+            gw, mirror, box, base, server = rig(tmp)
+            try:
+                events = t.rail(gw)
+                mid = "post@example.org"
+                box.put("INBOX", _own_post())
+                mirror.poll()
+                record = t.by_id(gw)[mid]
+                assert record["type"] == gw._ibstore.T_INBOUND and record["trim"] == "wanting"
+                got = source(base, mid)[1]
+                status, answer = result(base, mid, got["digest"], keep=[[1, 3]])
+                assert (status, answer["state"]) == (200, "model"), answer
+                judged = answer["text"]
+                events.clear()
+                box.put("Sent", _own_post() if same else _own_post(
+                    extra=[("X-Mailer", "Another client")]))
+                mirror.poll()
+                record = t.by_id(gw)[mid]
+                assert record["type"] == gw._ibstore.T_OUTBOUND, record["type"]
+                told = [p for kind, p in events if kind == "inbound"]
+                assert told and told[-1]["direction"] == "out"
+                if same:
+                    assert (record["trim"], record["text"]) == ("model", judged)
+                    assert told[-1]["text"] == judged and told[-1].get("trim") == "model"
+                    assert source(base, mid) == (200, {"state": "model"})
+                else:
+                    assert record["trim"] == "wanting" and record["text"] != judged
+                    assert "trim" not in told[-1]
+                    again = source(base, mid)[1]
+                    assert "\n".join(again["lines"]) == record["text"]
+            finally:
+                server.shutdown()
+    print("ok: a record written again in its place keeps a judgement of its own reading only")
+
+
+def test_a_record_written_again_in_its_place_waits_for_the_record_lock():
+    """The rewrite of I3 is a record write like any: under the record lock,
+    so a judgement's check and write are never interleaved with it — the
+    record the judgement is held against is the one it is written to."""
+    with tempfile.TemporaryDirectory() as tmp:
+        gw, mirror, box, base, server = rig(tmp)
+        try:
+            mid = "post@example.org"
+            box.put("INBOX", _own_post())
+            mirror.poll()
+            box.put("Sent", _own_post())
+            held, release = threading.Event(), threading.Event()
+
+            def hold():
+                with mirror._records:
+                    held.set()
+                    release.wait(10)
+            holder = threading.Thread(target=hold)
+            holder.start()
+            held.wait(5)
+            passing = threading.Thread(target=mirror.poll)
+            try:
+                passing.start()
+                passing.join(1.0)
+                assert passing.is_alive(), "the record was written again past the record lock"
+                assert t.by_id(gw)[mid]["type"] == gw._ibstore.T_INBOUND
+            finally:
+                release.set()
+                holder.join()
+                passing.join(10)
+            assert t.by_id(gw)[mid]["type"] == gw._ibstore.T_OUTBOUND
+        finally:
+            server.shutdown()
+    print("ok: a record written again in its place waits for the record lock")
+
+
+def test_the_offer_of_a_mail_trimmed_since_says_so():
+    """A mail is trimmed by a model on its first view, never on arrival —
+    but the rail can be down, or a turn fail, until after the user has
+    viewed it. Its offer is made of the record as it stands then, and says
+    ``trim: model``, so the turn that quotes it marks it."""
+    with tempfile.TemporaryDirectory() as tmp:
+        gw, mirror, _box, base, server = rig(tmp)
+        try:
+            mid = "long@x.org"
+            fields = t.by_id(gw)[mid]
+            assert "trim" not in mirror._offer_event(fields["chat"], fields)
+            got = source(base, mid)[1]
+            assert result(base, mid, got["digest"], keep=[[1, 1]])[0] == 200
+            fields = t.by_id(gw)[mid]
+            event = mirror._offer_event(fields["chat"], fields)
+            assert event["trim"] == "model" and event["text"] == fields["text"]
+        finally:
+            server.shutdown()
+    print("ok: the offer of a mail a model trimmed since says so")
+
+
+def test_the_header_block_is_read_as_the_mirror_reads_one():
+    """The bulk evidence is read again off the stored header block — never
+    parsed in the gateway's own threads, but as guarded as the mirror reads
+    every header block (in the reader process, against the clock), and only
+    where the block names a field that can say bulk at all. A reading that
+    did not come back is no answer: 503, nothing settled."""
+    with tempfile.TemporaryDirectory() as tmp:
+        gw, _mirror, _box, base, server = rig(tmp)
+        asked = []
+        real_facts, real_read = gw._bulk_facts, gw.read_bulk_facts
+        gw._bulk_facts = lambda head: asked.append(head) or real_facts(head)
+        try:
+            # No List-Id, List-Unsubscribe or Precedence in the block: the
+            # reader is not asked, and the mail is not bulk.
+            got = source(base, "long@x.org")[1]
+            assert got["bulk"] is False and asked == []
+            # Bulk by List-Unsubscribe alone: read by the reader's function.
+            got = source(base, "bulk@x.org")[1]
+            assert got["bulk"] is True and len(asked) == 1
+            assert b"List-Unsubscribe" in asked[0]
+
+            def not_read(head):
+                raise gw.NotRead("not back in time, twice")
+            gw.read_bulk_facts = not_read
+            status, answer = source(base, "bulk@x.org")
+            assert status == 503 and "header block" in answer["error"], answer
+            assert result(base, "bulk@x.org", got["digest"], keep=[[1, 1]])[0] == 503
+            assert t.by_id(gw)["bulk@x.org"]["trim"] == "wanting"
+        finally:
+            gw._bulk_facts, gw.read_bulk_facts = real_facts, real_read
+            server.shutdown()
+    print("ok: the stored header block is read as guarded as the mirror reads one")
+
+
+def test_where_the_reading_of_a_part_ended_stays_said():
+    """Of an HTML part the trim reads MAX_HTML_CHARS of markup; where that
+    is the mail's only text the bubble ends on the trim's own line "[…]".
+    That line is the trim's word, never a line of the author's to choose:
+    it is not handed out, and the chosen text ends on it again."""
+    with tempfile.TemporaryDirectory() as tmp:
+        gw, mirror, box, base, server = rig(tmp)
+        saved = gw._trim.MAX_HTML_CHARS
+        gw._trim.MAX_HTML_CHARS = 1500
+        try:
+            mid = "cut@x.org"
+            html = ("<p>Hello Ann,</p><p>the plan is fine.</p>"
+                    + "".join(f"<p>Paragraph {i} of the long letter.</p>" for i in range(200)))
+            box.put("INBOX", (b"From: Bob <bob@x.org>\r\nTo: me@example.org\r\n"
+                              b"Subject: Plan\r\nMessage-ID: <cut@x.org>\r\n"
+                              b"Date: Fri, 03 Oct 2025 11:00:00 +0000\r\nMIME-Version: 1.0\r\n"
+                              b"Content-Type: text/html; charset=utf-8\r\n\r\n"
+                              + html.encode() + b"\r\n"))
+            mirror.poll()
+            record = t.by_id(gw)[mid]
+            assert record["trim"] == "wanting" and record["text"].endswith("\n\n[…]")
+            got = source(base, mid)[1]
+            assert got["lines"][:3] == ["Hello Ann,", "", "the plan is fine."], got["lines"][:4]
+            assert "[…]" not in got["lines"] and got["lines"][-1].strip()
+            status, answer = result(base, mid, got["digest"], keep=[[1, 3]])
+            assert (status, answer) == (200, {"state": "model",
+                                              "text": "Hello Ann,\n\nthe plan is fine.\n\n[…]"})
+        finally:
+            gw._trim.MAX_HTML_CHARS = saved
+            server.shutdown()
+    print("ok: where a part's reading ended stays said, and is no line to choose")
+
+
 def main():
     tests = [v for k, v in globals().items() if k.startswith("test_") and callable(v)]
     failures = 0

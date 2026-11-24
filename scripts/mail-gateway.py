@@ -1741,6 +1741,11 @@ def _bare_stub(head: bytes, internal_date: float | None, reason: str) -> Mail:
                 date=internal_date, headers=_head_text(head))
 
 
+# The fields that let a header block call its mail bulk (_is_bulk), as bytes
+# anywhere in the block: where none of them is, the block cannot say so.
+_BULK_FIELDS_RE = re.compile(rb"(?i)list-id|list-unsubscribe|precedence")
+
+
 def _head_facts(head: bytes) -> dict:
     """What the mirror asks of a header block alone, to find a mail again:
     the id the mail is mirrored under, its Message-ID field as it stands,
@@ -1754,6 +1759,15 @@ def _head_facts(head: bytes) -> dict:
         sender = None
     return {"id": _identify(msg, head), "message_id": _raw_header(msg, "Message-ID"),
             "resent": _is_resent(msg), "sender": sender}
+
+
+def _bulk_facts(head: bytes) -> dict:
+    """What the model trim asks of a header block the ledger keeps
+    (Mirror._trim_evidence): whether it declares its mail bulk
+    (:func:`_is_bulk`), as the ingest read it — ``{"bulk": bool}``."""
+    msg = _parse_bytes(head + b"\r\n\r\n")
+    return {"bulk": _is_bulk(msg, _clean_line(
+        _UNFOLD_RE.sub("", _raw_header(msg, "List-Id")), 998))}
 
 
 def _send_facts(head: bytes) -> dict:
@@ -2025,6 +2039,8 @@ def _serve_reader(answer_fd: int) -> None:
                     status, answer = b"F", pickle.dumps(_head_facts(raw))
                 elif kind == b"W":
                     status, answer = b"F", pickle.dumps(_send_facts(raw))
+                elif kind == b"B":
+                    status, answer = b"F", pickle.dumps(_bulk_facts(raw))
                 else:
                     date = None if date != date else date
                     mail = stub_mail(raw, date, "") if kind == b"S" else _reading(raw, date)
@@ -2179,6 +2195,13 @@ class Reader:
     def send_facts(self, head: bytes, seconds: float) -> dict:
         """:func:`_send_facts`, likewise."""
         status, answer = self._ask(b"W", head, seconds, None)
+        if status == b"F":
+            return _unpickled(answer)
+        self._failed(status, answer)
+
+    def bulk_facts(self, head: bytes, seconds: float) -> dict:
+        """:func:`_bulk_facts`, likewise."""
+        status, answer = self._ask(b"B", head, seconds, None)
         if status == b"F":
             return _unpickled(answer)
         self._failed(status, answer)
@@ -2377,6 +2400,18 @@ def read_send_facts(head: bytes) -> dict | None:
     try:
         return _read_guarded(lambda seconds: READER.send_facts(head, seconds),
                              lambda: _send_facts(head))
+    except UnreadableMail:
+        return None
+
+
+def read_bulk_facts(head: bytes) -> dict | None:
+    """:func:`_bulk_facts` for the model trim — a header block read as
+    guarded as a mail (:func:`_read_guarded`), as :func:`read_head` is: None
+    when the block cannot be read, :class:`NotRead` when the reading did not
+    come back."""
+    try:
+        return _read_guarded(lambda seconds: READER.bulk_facts(head, seconds),
+                             lambda: _bulk_facts(head))
     except UnreadableMail:
         return None
 
@@ -4376,7 +4411,18 @@ class Mirror:
         Precedence not at all). :class:`TrimRefused` 503 when the header
         part the record references cannot be read, as for a body part: that
         says nothing about the mail. A record that references none is read
-        by its List-Id."""
+        by its List-Id.
+
+        The block is read as the mirror reads every header block: guarded,
+        in the reader process (:func:`read_bulk_facts`) — never parsed
+        here, where a block the parser does not come back from would hold
+        this thread — and only where it can say bulk at all: a block that
+        names none of the three fields is not (the parser matches a field's
+        name whatever its case, and no name is encoded), so most mails ask
+        the reader nothing and never wait behind the mirror's reading of a
+        mail. A reading that did not come back is no answer (I1): 503,
+        nothing settled; a block the reader cannot read leaves the record's
+        List-Id to say it."""
         bulk = bool(fields.get("list_id"))
         ref = fields.get("header_part")
         if ref:
@@ -4384,16 +4430,21 @@ class Mirror:
             got = _ibstore.load_media(INBOUND_STORE_DIR, media_id) if media_id else None
             if got is None:
                 raise TrimRefused(503, {"error": "a part of the mail could not be read"})
-            try:
-                # Stored with every CRLF folded to LF (parse_mail). Folded
-                # back, the parser meets the line ends the ingest's met: a
-                # CR CR LF that ended the block then ends it here too, and
-                # what followed it is no header now either.
-                msg = _parse_bytes(got[0].replace(b"\n", b"\r\n") + b"\r\n\r\n")
-                bulk = _is_bulk(msg, _clean_line(
-                    _UNFOLD_RE.sub("", _raw_header(msg, "List-Id")), 998))
-            except Exception:  # noqa: BLE001 - the record's own List-Id stands
-                pass
+            # Stored with every CRLF folded to LF (parse_mail). Folded back,
+            # the parser meets the line ends the ingest's met: a CR CR LF
+            # that ended the block then ends it here too, and what followed
+            # it is no header now either.
+            head = got[0].replace(b"\n", b"\r\n")
+            if not _BULK_FIELDS_RE.search(head):
+                bulk = False
+            else:
+                try:
+                    facts = read_bulk_facts(head)
+                except (NotRead, MirrorFault, ReaderDown):
+                    raise TrimRefused(503, {"error": "the mail's header block could not be "
+                                                     "read just now"}) from None
+                if facts is not None and facts.get("bulk") is not None:
+                    bulk = bool(facts["bulk"])
         return {"subject": fields.get("subject_line") or "",
                 "is_reply": bool(fields.get("in_reply_to") or fields.get("references")),
                 "bulk": bulk}
@@ -4439,6 +4490,17 @@ class Mirror:
             text = text[:MAX_RECORD_TEXT_CHARS].rstrip() + "\n…"
         return None if text == (fields.get("text") or "") else "source_differs"
 
+    @staticmethod
+    def _trim_unread(fields: dict) -> bool:
+        """Whether the record is a placeholder (see UNREADABLE_TEXT): a mail
+        not read yet, with nothing of its own to trim. It is never handed to
+        a model — that would spend a turn on our own sentence — and it is
+        not settled either: once it reads, the record written in its place
+        (I3) is the mail's first reading, and a ``wanting`` one gets its
+        first view then. Told by the record as _prepare tells it."""
+        return (fields.get("text") == UNREADABLE_TEXT and not fields.get("body_part")
+                and not fields.get("html_part"))
+
     @contextlib.contextmanager
     def _trim_writing(self):
         """The record lock, for a model trim's write: waited for
@@ -4469,8 +4531,12 @@ class Mirror:
         """POST /messages/trim-source: what a model may choose this mail's
         message from — or that there is nothing to do. Read-only, but for a
         mail whose source is not handed over (:meth:`_trim_unoffered`), which
-        is settled here and now: asking again would only find it the same."""
+        is settled here and now: asking again would only find it the same.
+        ``{"state": "unread"}`` for a placeholder (:meth:`_trim_unread`):
+        nothing to choose from yet, and nothing settled."""
         _path, fields = self._trim_target(chat, message_id)
+        if self._trim_unread(fields):
+            return 200, {"state": "unread"}
         state = fields.get("trim") or "deterministic"
         if state != "wanting":
             return 200, {"state": state}
@@ -4482,6 +4548,8 @@ class Mirror:
                 # Looked at again under the lock: settled or gone meanwhile,
                 # or written anew from other parts (then its own source).
                 path, now = self._trim_target(chat, message_id)
+                if self._trim_unread(now):
+                    return 200, {"state": "unread"}
                 state = now.get("trim") or "deterministic"
                 if state != "wanting":
                     return 200, {"state": state}
@@ -4511,7 +4579,18 @@ class Mirror:
         lines it was made from and no others. A valid choice becomes the
         record's text, capped as every kb:text is, with ``kb:trim "model"``;
         an invalid one, and ``failed``, settle ``deterministic`` and leave
-        the text as it is.
+        the text as it is. A placeholder is refused with ``"state":
+        "unread"`` (:meth:`_trim_unread`): no choice is about it, and it is
+        not settled.
+
+        The mirror writes a record again in its own place (I3) — a copy read
+        under another id, a tombstone's mail come back, a placeholder that
+        reads — and may do so between the offer of a judgement and its
+        write. A record that is not, under the lock, the one the source was
+        built from (other parts, another text, another state) refuses the
+        judgement, as one settled meanwhile does: the choice was made of
+        another record's lines. A record that is now ``wanting`` is asked
+        about again, from its own source; a placeholder is ``unread``.
 
         Nothing is told on the rail: a mail's text changing on its record is
         how a better reading has always reached the chat (the life store
@@ -4520,25 +4599,27 @@ class Mirror:
         new text in this answer."""
         path, fields = self._trim_target(chat, message_id)
 
-        def stale(state):
+        def stale(record):
+            state = "unread" if self._trim_unread(record) else record.get("trim")
             return 409, {"error": "stale", "state": state or "deterministic"}
 
-        if fields.get("trim") != "wanting":
-            return stale(fields.get("trim"))
+        if self._trim_unread(fields) or fields.get("trim") != "wanting":
+            return stale(fields)
         # Built outside the lock — a trim of a long mail takes a moment, and
         # the record lock is held for writes, not for reading — and checked
         # under it: the same parts give the same source.
         source = self._trim_source_of(fields, self._trim_evidence(fields))
         if (source is None or source.digest != digest
                 or self._trim_unoffered(fields, source) is not None):
-            return stale("wanting")
-        text = None if failed is not None else _trim.apply_keep(source.lines, keep)
+            return 409, {"error": "stale", "state": "wanting"}
+        text = None if failed is not None else _trim.apply_keep(
+            source.lines, keep, ended=source.ended)
         with self._trim_writing():
             path, now = self._trim_target(chat, message_id)
-            if now.get("trim") != "wanting":
-                return stale(now.get("trim"))
+            if self._trim_unread(now) or now.get("trim") != "wanting":
+                return stale(now)
             if any(now.get(key) != fields.get(key) for key in self._TRIM_BASIS):
-                return stale("wanting")
+                return 409, {"error": "stale", "state": "wanting"}
             if text is None:
                 after = self._settle_trim(path, state="deterministic")
                 why = (f"no choice ({_clean_line(failed, 120)})" if failed is not None
@@ -6397,12 +6478,21 @@ class Mirror:
                 own = was if was is not None and was.get("type") == _ibstore.T_OUTBOUND \
                     else {}
                 author = self._author_noted(mail) or own.get("author") or "device"
-                with self._records:
+            with self._records:
+                # The record in its place as it stands now, under the lock
+                # every writer of a record holds: a model's judgement written
+                # since `was` was read is seen here, and kept where it is
+                # one about this very reading (_judged_reading).
+                judged = self._judged_reading(old, mail, refs, state) if old is not None \
+                    else None
+                if judged is not None:
+                    text, state = judged
+                    common.update(text=text, trim=state)
+                if outbound:
                     _urn, path = _ibstore.write_outbound(
                         INBOUND_STORE_DIR, author=author, sender=mail.sender or None,
                         replace=old, sent_as=known_as, **common)
-            else:
-                with self._records:
+                else:
                     _urn, path = _ibstore.write_message(
                         INBOUND_STORE_DIR, sender=mail.sender, gate_sender=gate_sender or None,
                         delivered=not offer, replace=old, sent_as=known_as, **common)
@@ -6449,7 +6539,8 @@ class Mirror:
                     sender=mail.sender or None, sender_name=mail.sender_name,
                     gate_sender=gate_sender, text=text,
                     attachments=refs["attachments"], author=author,
-                    subject=mail.subject or None, backfill=backfill, seen=seen))]
+                    subject=mail.subject or None, backfill=backfill, seen=seen,
+                    trim=state))]
             self.index.atomic([
                 ("UPDATE mails SET record = ? WHERE message_id = ?",
                  (path.name, mail.message_id)),
@@ -6469,12 +6560,62 @@ class Mirror:
         else:
             self._placeholders.discard(mail.message_id)
 
+    def _judged_reading(self, old: Path, mail: Mail, refs: dict, state: str):
+        """``(kb:text, "model")`` of the record at ``old`` where a model's
+        judgement stands on it that is one about the reading written in its
+        place; None for anything else. Under the record lock (the caller's).
+
+        A judgement is cached on its record (docs/mail-chats.md, "The model
+        trim"): it is a choice of the lines the rules gave that record, and
+        a record written again in its own place (I3: the INBOX copy whose
+        Sent copy shows, a copy read under a provider's id) is a new reading
+        whose rules may give other lines. It is kept only where they cannot:
+        the new reading is ``wanting`` too, and its trim's inputs are the old
+        record's — the same subject, the same word on whether it answers a
+        mail, and parts of the same bytes (the header block among them, which
+        says whether it is bulk). Then its lines are the very ones the choice
+        was made of, and the mail is not asked about again. Anything else —
+        another copy's bytes, a placeholder, a tombstone, whose judgement
+        went with its text — is the new reading as the rules left it, and a
+        ``wanting`` one gets its own first view. Comparing bytes, not trims:
+        no mail is trimmed or parsed in this process (the reader does that),
+        and none under a lock."""
+        if state != "wanting" or mail.unreadable is not None:
+            return None
+        now = _ibstore.read_record(old)
+        if (now is None or now.get("trim") != "model" or now.get("removed_at")
+                or not now.get("text")):
+            return None
+        if ((now.get("subject_line") or "") != (mail.subject or "").strip()
+                or bool(now.get("in_reply_to") or now.get("references"))
+                != bool(mail.in_reply_to or mail.references)):
+            return None
+        for key in self._TRIM_PARTS:
+            before, after = now.get(key), refs.get(key)
+            if not before and not after:
+                continue
+            ids = [_ibstore.media_id_of(ref or "") for ref in (before, after)]
+            if not all(ids):
+                return None
+            got = [_ibstore.load_media(INBOUND_STORE_DIR, media_id) for media_id in ids]
+            if None in got or got[0][0] != got[1][0]:
+                return None
+        return now["text"], "model"
+
     def _inbound_event(self, *, direction: str, chat: str, message_id: str, ts: float,
                        sender, sender_name, text: str, attachments: list, author,
                        subject, backfill: bool, seen: bool, gate: dict | None = None,
-                       gate_sender: str | None = None) -> dict:
+                       gate_sender: str | None = None, trim: str | None = None) -> dict:
         """What the rail is told of one mirrored mail. ``gate``: the verdict
         on a mail that is offered; every other mail is told as held.
+
+        ``trim``: the record's kb:trim. Where it is ``model`` the event says
+        so (``"trim": "model"``): its text is then a model's choice of the
+        mail's own lines, which the mail can steer, and a turn that quotes it
+        marks it as such (the web gateway's _mail_arrival_quote) — as the
+        companion's note marks the record. A mail is trimmed by a model on
+        its first view, never on arrival; an offer made later (the rail was
+        down, a turn failed) is made of the record as it stands then.
 
         ``sender`` is whom the chat shows the mail as from; ``gate_sender``
         whom the gate took it to be from (:func:`_gate_sender`), "" for
@@ -6490,6 +6631,8 @@ class Mirror:
             "gate": dict(gate or MIRROR_GATE), "subject": subject,
             "participants": thread.get("participants") or [], "peer": thread.get("peer"),
         }
+        if trim == "model":
+            event["trim"] = "model"
         if backfill:
             # Old mail: the rail must not treat it as an arrival, and may
             # start the chat's read mark from what the mailbox says was read.
@@ -6509,7 +6652,8 @@ class Mirror:
             gate_sender=None if outbound else fields.get("gate_sender"),
             text=fields.get("text") or "", attachments=list(fields.get("attachments") or []),
             author=fields.get("author") if outbound else None,
-            subject=fields.get("subject_line") or None, backfill=backfill, seen=seen)
+            subject=fields.get("subject_line") or None, backfill=backfill, seen=seen,
+            trim=fields.get("trim"))
         if outbound and fields.get("refused"):
             event["refused"] = list(fields["refused"])
         return event
@@ -7076,7 +7220,7 @@ class Mirror:
             text=fields.get("text") or "",
             attachments=list(fields.get("attachments") or []), author=None,
             subject=fields.get("subject_line") or None, backfill=False, seen=False,
-            gate=gate))
+            gate=gate, trim=fields.get("trim")))
         # The offer: if the chat takes this mail, that is its delivery.
         event["handover"] = True
         if gate["vip"] or gate["instructed"]:

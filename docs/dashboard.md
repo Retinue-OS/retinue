@@ -1278,7 +1278,13 @@ mail's `trim`; for the seconds until the store has indexed a record the trim
 rewrote, the poll and the chat list's preview show the settled text this
 process holds, so a bubble that took it does not fall back — and the mail's
 arrival entry in the live overlay, which still carries the text from before,
-is forgotten when a model trim settles.
+is forgotten when a model trim settles. What is held names the text the trim
+was asked about: a record the store shows with neither that text nor the
+settled one was written again by its gateway since (in its own place: another
+copy read, a placeholder read at last), and is shown — and asked about — as
+the reading it is. A mail the arrival turn is offered only after it was
+viewed (the rail was down, a turn failed) carries `trim: "model"` on the
+rail, and the turn's quote of it is marked as the companion's note marks it.
 
 *The worker.* One thread runs one turn at a time from a queue of
 `MAIL_MODEL_TRIM_QUEUE` (30) mails, oldest first. A turn is counted against
@@ -1304,7 +1310,11 @@ nothing here and counts against nothing but that mail, which waits
 `MAIL_MODEL_TRIM_RETRY_SECONDS` before it is asked again; so does a mail the
 gateway no longer has (`404`/`410`). A `409` whose `state` is `model` or
 `deterministic` is the mail settled meanwhile, and is taken as a `200` is
-(below). A gateway that could not say what the
+(below). A placeholder — a mail the gateway could not read yet — answers
+`state: "unread"` (from `trim-source`, or in a `409` when the record became
+one meanwhile): nothing to choose from and nothing settled, so it is taken
+as a stale source is, and the record written in its place once the mail
+reads is asked about as the mail's first reading. A gateway that could not say what the
 mail is (away, or a part it could not read just now) costs nothing and that
 mail waits five minutes.
 

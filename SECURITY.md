@@ -233,9 +233,10 @@ nothing new.
   mail's own lines can show — the gateway assembles the text from its own
   copy of them, so no mail adds a word to its own bubble — that the choice
   is marked (the Original is headed "Shortened by a model", and the
-  companion's note marks the mail `trim="model"` and says the mail can steer
-  it), and that the full mail is one tap away: its original parts are never
-  changed. `MAIL_MODEL_TRIM=0` switches the turn off.
+  companion's note — and the quote of an arrival turn offered the mail
+  after it was viewed — marks the mail `trim="model"` and says the mail can
+  steer it), and that the full mail is one tap away: its original parts are
+  never changed. `MAIL_MODEL_TRIM=0` switches the turn off.
 - **Chambers are not compartmentalized from each other within a session.**
 - **The updater's Docker socket is root-equivalent on the host.** This is
   inherent to what the updater does and is documented in `docker-compose.yml`.
