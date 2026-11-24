@@ -2403,7 +2403,6 @@ def test_health_states():
         assert snap["configured"] is True and snap["connected"] is False
         assert snap["account"] == ACCOUNT and "not been polled" in snap["error"]
         assert snap["backfill"] == {"done": False, "pending": None, "days": 90}
-        assert snap["unmirrored"] == 0
         box = FakeMailbox(gw)
         box.put("INBOX", msg("a@x.org", day=1))
         gw.MIRROR = gw.Mirror(box, clock=lambda: NOW)
@@ -2421,11 +2420,14 @@ def test_health_states():
         assert snap["blocked"] is None
         gw._loop_step(gw.MIRROR, loop)
         assert gw._health_snapshot()["connected"] is True
-        # An internal error is a health state too, never a dead loop.
+        # An internal error is a health state too, never a dead loop — and
+        # it is the mirror's own, said so: the mailbox answered, and nobody
+        # is to be sent to check a password over it.
         gw.MIRROR.poll = lambda **kw: 1 / 0
-        gw._loop_step(gw.MIRROR, loop)
+        assert gw._loop_step(gw.MIRROR, loop) == gw.MAIL_POLL_SECONDS
         snap = gw._health_snapshot()
         assert snap["connected"] is False and "internal error" in snap["error"]
+        assert snap["blocked"] == "mirror" and "division by zero" in snap["error"]
         json.dumps(snap)
     print("ok: health reports unconfigured, misconfigured, connected and failed")
 
