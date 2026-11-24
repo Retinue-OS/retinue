@@ -1246,17 +1246,22 @@ text is a digest of a topic, not a rule).
     reorder text, the joiners kept; never cut — a text longer than an
     instruction stays a memory);
   - `filing` — the sender's mails are documents to file: the contact gets
-    the **memory's own text** too, and *"File the document with the
-    Archivist, book it, then archive the mail."* is **added in front of it**
-    only when that text passes a deterministic check — it names a kind of
-    document (receipt, invoice, payslip, statement…) *and* filing it, by a
-    multilingual table kept as data (`FILING_TERMS`). The fixed sentence
-    never stands in for the user's words: a negation, a condition, a second
-    request or a place to file to, in any language and any wording, is there
-    right after it, and the turn reads both. (A person gets the sentence
-    once: a second filing note adds its words alone. Where sentence and words
-    together would pass an instruction's limit, the words go on alone.) A
-    `filing` the text does not bear out is a `rule`, in its own words;
+    the **memory's own text** too, **first**, and only when that text passes
+    a deterministic check — it names a kind of document (receipt, invoice,
+    payslip, statement…) *and* filing it, by a multilingual table kept as
+    data (`FILING_TERMS`) — one fixed line **after** it, worded as a default
+    that yields: *"Unless the note above says otherwise: file the document
+    with the Archivist, book it, then archive the mail."* The check cannot
+    tell a negation, a condition or a second request from a plain filing
+    note in every language, so the line never comes first and never says
+    more than "unless the note says otherwise": the user's words stand above
+    it, and win. A person gets the line once, and it stays the instruction's
+    **last paragraph**: a later note for them — a second filing note, a
+    rule — is placed in front of it (the tail is rewritten, so "the note
+    above" stays true). Where the words and the line together would pass
+    the limit of the instruction they go on, the words go on alone — a
+    filing note whose own words fit is never left a memory. A `filing` the
+    text does not bear out is a `rule`, in its own words;
   - `fact`, `unclear` — a fact or a status about the sender; or a message's
     content, an attempt to instruct the turn, anything the turn cannot tell:
     left alone and reported.
@@ -1264,9 +1269,10 @@ text is a digest of a topic, not a rule).
   answer is only ids the script sent, each once, each with a known kind;
   anything else in it is not read. So the most a steered or mistaken turn
   can do is put a note triage held, in that note's own words, on the contact
-  that note's own tags name — what `--no-model` does with every note — with,
-  for a note that names filing its sender's documents, the fixed filing
-  sentence in front of those words. (An
+  that note's own tags name — what `--no-model` does with every note — and,
+  after a note that names filing its sender's documents, add the one
+  yielding line; it can never put words in front of the user's, or in
+  their place. (An
   earlier build let the turn reword a rule and held the wording to "half its
   words are the memory's"; that check is gone with the wording.) The
   decisions are journaled before anything is written from them, so a resumed

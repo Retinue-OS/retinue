@@ -377,9 +377,11 @@ beforehand.
     the policy file loses on its next write; moved aside, only what the
     policy files still hold is secured again.
 - **The model only classifies.** Either way an instruction's text is the
-  memory's own — for a filing memory whose text names a document and filing
-  it, with the fixed filing sentence added in front of those words, never
-  in their place; nothing the model writes reaches a contact.
+  memory's own, first — for a filing memory whose text names a document and
+  filing it, followed by one fixed line that yields to those words
+  ("Unless the note above says otherwise: file the document …"), kept the
+  instruction's last paragraph; nothing the model writes reaches a contact,
+  and nothing is ever put in front of the user's words or in their place.
 - **`--no-model`** carries every sender rule over verbatim. Nothing then
   judges whether a memory's text was the user's instruction or something a
   message said: read the instructions it wrote (the report lists them).

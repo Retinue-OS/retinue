@@ -80,18 +80,21 @@ prompt's:
 * only ids it sent, each once, each with a known kind;
 * ``rule`` puts the memory's own text on the contact (cleaned of invisible
   characters, never cut: a text too long for an instruction stays a memory);
-* ``filing`` puts the memory's own text there too, and adds the fixed filing
-  instruction in front of it only when that text passes a deterministic
-  check — it names a kind of document and filing it (``FILING_TERMS``, a
-  multilingual table) — never in its place: a negation, a condition or a
-  second request in the user's words is there, right after the fixed
-  sentence, for the turn to read;
+* ``filing`` puts the memory's own text there too, first, and follows it
+  with one fixed line worded as a default that yields to it
+  (``FILING_DEFAULT``, "Unless the note above says otherwise: …") only when
+  that text passes a deterministic check — it names a kind of document and
+  filing it (``FILING_TERMS``, a multilingual table). The line stands once
+  per person and stays the instruction's last paragraph; where words and
+  line together would not fit the instruction they go on, the words go on
+  alone;
 * ``fact`` and ``unclear`` leave the memory alone.
 
 So the most a steered or wrong answer can do is put a note triage held, in
 that note's own words, on the contact that note's own tags name — what
-``--no-model`` does with every note — with, for a note that names filing
-its sender's documents, the fixed filing sentence in front of those words.
+``--no-model`` does with every note — and, after a note that names filing
+its sender's documents, add the one yielding line. It can never put words
+in front of the user's, or in their place.
 ``--no-model`` skips the turn and carries every rule over
 verbatim; nothing then judges whether a text was the user's instruction, so
 read the report.
@@ -180,7 +183,10 @@ import triage_policy  # noqa: E402
 # its text there, so these are constants, not templates.
 GENERIC_INSTRUCTION = ("See whether this belongs to a project and link it; extract the facts worth "
                        "keeping; determine importance and urgency.")
-FILING_INSTRUCTION = "File the document with the Archivist, book it, then archive the mail."
+# The filing default follows the user's own words and yields to them: it is
+# always the last paragraph of an instruction, so "the note above" is true.
+FILING_DEFAULT = ("Unless the note above says otherwise: file the document with the Archivist, "
+                  "book it, then archive the mail.")
 
 KB = "https://w3id.org/retinue/kb#"
 # The whitelist's predicates and the subject suffix of the old VIP projection.
@@ -1501,8 +1507,8 @@ def clean_rule(text) -> str:
 
 # Whether a note is about filing documents is held against its own text, not
 # taken on the model's word: it must name a kind of document and filing it.
-# It decides only whether the fixed filing sentence goes in front of the
-# note's own words (decide) — never whether those words go on.
+# It decides only whether the filing default follows the note's own words
+# (decide, place) — never whether those words go on.
 # Data, by language — a language is added here, never special-cased in code.
 # A term matches where a word starts (so a plural, or a compound that begins
 # with it, counts) — where it ends in ``$``, only as a whole word — and
@@ -1584,20 +1590,15 @@ def decide(kind: str, content: str) -> dict | None:
     """What a memory becomes on its contact, from its kind and its own text —
     never from anything the model wrote: ``{"kind", "instruction"}``, or None
     when its text is too long to be an instruction (nothing is cut). The
-    memory's own words always go on. A ``filing`` its text bears out
-    (names_filing) has the fixed filing instruction added in front of them —
-    never in their place, so a negation, a condition or a second request in
-    any language is still there for the turn to read; where the two together
-    would not fit, the words go on alone, as a ``rule``. A ``filing`` the
-    text does not bear out is a ``rule``."""
+    instruction is always the memory's own words, alone. A ``filing`` its
+    text bears out (names_filing) stays a ``filing``: placing it adds the
+    filing default after the words (place). A ``filing`` the text does not
+    bear out is a ``rule``."""
     text = clean_rule(content)
     if not text or len(text) > contacts.INSTRUCTION_MAX:
         return None
-    if kind == "filing" and names_filing(text):
-        briefed = f"{FILING_INSTRUCTION}\n\n{text}"
-        if len(briefed) <= contacts.INSTRUCTION_MAX:
-            return {"kind": "filing", "instruction": briefed}
-    return {"kind": "rule", "instruction": text}
+    return {"kind": "filing" if kind == "filing" and names_filing(text) else "rule",
+            "instruction": text}
 
 
 def validate_answer(items: list, batch: list[dict]) -> dict[str, dict]:
@@ -1645,15 +1646,30 @@ def add_rule(instruction: str | None, rule: str) -> tuple[str, bool] | None:
     return (joined, True) if len(joined) <= contacts.INSTRUCTION_MAX else None
 
 
-def rule_for(current: str | None, entry: dict) -> str:
-    """What a decision adds to an instruction as it stands: a filing memory's
-    own words alone where the fixed filing sentence is there already (a
-    second filing memory for one person, a resumed run), so that it stands
-    once — the words themselves always go on."""
-    decision = entry["decision"]
-    if decision.get("kind") == "filing" and _flat(FILING_INSTRUCTION) in _flat(current):
-        return clean_rule(entry["content"])
-    return decision["instruction"]
+def place(instruction: str | None, decision: dict) -> tuple[str, bool] | None:
+    """An instruction with a decision placed on it, as add_rule: (text,
+    whether it changed), or None when it would not fit. The memory's own
+    words always go on, after what stands — except the filing default, which
+    stays the last paragraph: where an instruction ends with it, the words
+    of any kind go in front of it (the tail is rewritten). A ``filing`` adds
+    the default after its words where the person has none, and where words
+    and default together would not fit this instruction, the words go on
+    alone. The default stands once: a person whose text holds it elsewhere
+    gets the words alone."""
+    current = str(instruction or "").replace("\r\n", "\n").strip()
+    words = decision["instruction"]
+    if _flat(words) in _flat(current):
+        return current, False
+    if current.endswith(FILING_DEFAULT):
+        joined = add_rule(current[:-len(FILING_DEFAULT)].rstrip(), words)
+        if joined is None:
+            return None
+        return add_rule(joined[0], FILING_DEFAULT)
+    if decision.get("kind") == "filing" and _flat(FILING_DEFAULT) not in _flat(current):
+        defaulted = add_rule(current, f"{words}\n\n{FILING_DEFAULT}")
+        if defaulted is not None:
+            return defaulted
+    return add_rule(current, words)
 
 
 def _components(entries: list[dict]) -> list[list[dict]]:
@@ -1893,7 +1909,7 @@ def step_memories(run: Run, *, again: bool) -> tuple[bool, bool, str]:
         for key in entry["targets"]:
             if key not in texts:
                 texts[key] = (run.contact(key) or {}).get("instruction")
-            trial[key] = add_rule(texts[key], rule_for(texts[key], entry))
+            trial[key] = place(texts[key], entry["decision"])
         full = [key for key, fit in trial.items() if fit is None]
         if full:
             names = ", ".join(repr(t["name"]) for t in entry["described"] if t["key"] in full)
@@ -1913,14 +1929,16 @@ def step_memories(run: Run, *, again: bool) -> tuple[bool, bool, str]:
     # report counts as briefed by this migration only a person whose first
     # instruction it wrote, and a run killed between the write and the
     # entry's journal must not take what it wrote for what stood before.
-    # The first write's finding stands for every later one.
+    # The first write's finding stands for every later one — also one a
+    # killed run left under the ``new:`` key of the contact it created.
     instructed = section.setdefault("instructed", {})
+    earlier = _instructed_by_memories(run, section) if changed else {}
     failed: dict[str, str] = {}
     written: dict[str, dict] = {}
     for key in sorted(changed):
         target = next(t for e in placed for t in e["described"] if t["key"] == key)
         record = run.contact(key)
-        was = instructed.get(key)
+        was = earlier.get(key)
         instructed[key] = was or {"before": bool(record and record.get("instruction")), "at": _now()}
         run.marker.save()
         try:
@@ -1966,6 +1984,10 @@ def step_memories(run: Run, *, again: bool) -> tuple[bool, bool, str]:
             record = written.get(target["key"]) or {}
             names.append({"contact": record.get("key") or target["key"],
                           "name": record.get("name") or target["name"]})
+            if entry["decision"].get("kind") == "filing":
+                # Whether the filing default stands on them, for the report:
+                # where it would not fit, the words went on alone.
+                names[-1]["filing"] = _flat(FILING_DEFAULT) in _flat(texts.get(target["key"]))
         journal[entry["id"]] = {"state": "written", "tags": entry["tags"], "contacts": names,
                                 "by": entry["by"], "at": _now(), **entry["decision"],
                                 **({"said": entry["said"]} if entry.get("said") else {})}
@@ -2087,8 +2109,11 @@ def _timeout(name: str, default: float) -> str:
 def _instructed_by_memories(run: Run, section: dict) -> dict[str, dict]:
     """The memories step's journal of the contacts it wrote (step_memories),
     by contact key: a contact it created and was killed before re-keying is
-    found by the address or domain it was created for."""
-    out = {}
+    found by the address or domain it was created for. One person under
+    several keys is one entry, and "no instruction stood before" wins —
+    whatever the keys' spelling or order: the first write's finding is the
+    one that counts, and only a write where none stood finds that."""
+    out: dict[str, dict] = {}
     for key, entry in (section.get("instructed") or {}).items():
         if key.startswith("new:email:"):
             holder = run.holder(key[len("new:email:"):])
@@ -2096,7 +2121,8 @@ def _instructed_by_memories(run: Run, section: dict) -> dict[str, dict]:
         elif key.startswith("new:domain:"):
             owners = run.domain_owners(key[len("new:domain:"):].removeprefix("*."))
             key = owners[0]["key"] if len(owners) == 1 else key
-        out.setdefault(key, entry)
+        if key not in out or (out[key].get("before") and not entry.get("before")):
+            out[key] = entry
     return out
 
 
@@ -2131,11 +2157,7 @@ def briefed_people(run: Run, whitelist: dict, memories: dict,
         if entry.get("state") in ("migrated", "written"):
             for ref in entry.get("contacts") or []:
                 keys.setdefault(ref.get("contact"), ref.get("name") or "?")
-                text = entry.get("instruction") or ""
-                placed.setdefault(ref.get("contact"), []).append(text)
-                if entry.get("kind") == "filing" and text.startswith(FILING_INSTRUCTION):
-                    # Where the fixed sentence stood already, the words went on alone.
-                    placed[ref.get("contact")].append(text[len(FILING_INSTRUCTION):])
+                placed.setdefault(ref.get("contact"), []).append(entry.get("instruction") or "")
     first |= {key for key, entry in instructed.items() if not entry.get("before")}
     briefed, edited, extended = [], [], []
     for key, name in sorted(keys.items(), key=lambda kv: (kv[1].casefold(), kv[0])):
@@ -2151,7 +2173,7 @@ def briefed_people(run: Run, whitelist: dict, memories: dict,
         if key not in first:
             extended.append(person)
             continue
-        ours = [GENERIC_INSTRUCTION, FILING_INSTRUCTION] + placed.get(key, [])
+        ours = [GENERIC_INSTRUCTION, FILING_DEFAULT] + placed.get(key, [])
         for text in sorted({_flat(t) for t in ours if _flat(t)}, key=len, reverse=True):
             own = own.replace(text, " ")
         (edited if own.strip() else briefed).append(person)
@@ -2221,7 +2243,8 @@ def build_report(run: Run) -> dict:
     chat_wait = _timeout("CHAT_INSTRUCTION_TIMEOUT", 60)
     report["briefed"] = {"contacts": len(briefed) + len(edited), "beyond_mail": beyond,
                          "edited": edited, "extended": extended,
-                         "filing": len({c.get("contact") for e in filing for c in e.get("contacts") or []}),
+                         "filing": len({c.get("contact") for e in filing for c in e.get("contacts") or []
+                                        if c.get("filing", True)}),
                          "mail_timeout": mail_wait, "chat_timeout": chat_wait}
     by_hand = []
     if not report["mail_gateway"]:
@@ -2276,8 +2299,9 @@ def build_report(run: Run) -> dict:
                        + ". To take an appended rule back off, edit the instruction on the Contacts "
                        "page (or `contacts.py update <id> --instruction …`) — not --no-instruction, "
                        "which takes your own words with it")
-    if filing:
-        by_hand.append(f"{report['briefed']['filing']} contact(s) carry the filing instruction. A turn "
+    if report["briefed"]["filing"]:
+        by_hand.append(f"{report['briefed']['filing']} contact(s) carry the filing default after the "
+                       "words of a note that names filing (it yields to those words). A turn "
                        "that files with the Archivist can take minutes; their mail rings as a VIP's "
                        f"would when it runs past MAIL_INSTRUCTION_TIMEOUT (now {mail_wait} s), a "
                        f"message of theirs past CHAT_INSTRUCTION_TIMEOUT (now {chat_wait} s). Raise "
@@ -2428,9 +2452,9 @@ def thread_message(report: dict, *, follow_up: bool = False) -> str:
                      "contact(s) already had one, and a sender rule was appended to it; to take a "
                      "rule back off, edit the instruction on the Contacts page — your own words stay.")
     if briefed.get("filing"):
-        lines.append(f"- **Filing senders:** {briefed['filing']} contact(s) carry the filing "
-                     "instruction (the Archivist files their documents), in front of your own words "
-                     "for them. A filing turn can take minutes: such a mail rings as "
+        lines.append(f"- **Filing senders:** {briefed['filing']} contact(s) carry, after your own "
+                     "words for them, a filing default (the Archivist files their documents) that "
+                     "yields to those words. A filing turn can take minutes: such a mail rings as "
                      "a VIP's would when it runs past MAIL_INSTRUCTION_TIMEOUT.")
 
     stubs = [j for j in report["scheduled_jobs"] if j.get("stub")]

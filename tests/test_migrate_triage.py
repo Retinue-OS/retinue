@@ -605,7 +605,14 @@ def test_names():
 
 # ── The memories step ────────────────────────────────────────────────────────
 
-FILING = "File the document with the Archivist, book it, then archive the mail."
+FILING = ("Unless the note above says otherwise: file the document with the Archivist, "
+          "book it, then archive the mail.")
+
+
+def filed(*words: str) -> str:
+    """An instruction as a filing note leaves it: the user's words first, the
+    yielding default last."""
+    return "\n\n".join(words + (FILING,))
 
 
 def test_memories_every_branch():
@@ -694,16 +701,16 @@ def test_memories_every_branch():
               "Never archive what the landlord sends without asking.")
         check("a sender the mirror knows becomes a contact", people["ACME Payroll"]["emails"],
               ["payroll@acme.example"])
-        # Filing, and a place to file to: the fixed sentence goes in front
-        # of the note's own words, which keep the place.
-        check("a filing note that asks for more keeps its own words",
+        # Filing, and a place to file to: the note's own words come first
+        # and keep the place; the yielding default follows them.
+        check("a filing note that asks for more keeps its own words, first",
               (people["ACME Payroll"]["instruction"], journal[ids["payroll"]]["kind"]),
-              (FILING + "\n\nPayslips from ACME: file them under Finanzen/Lohn.", "filing"))
+              (filed("Payslips from ACME: file them under Finanzen/Lohn."), "filing"))
         check("a domain becomes a contact for the domain", people["bigcorp.example"]["domains"],
               ["bigcorp.example"])
-        check("with the filing instruction, in front of the note's words",
+        check("with the filing default after the note's words",
               people["bigcorp.example"]["instruction"],
-              FILING + "\n\nEverything from bigcorp.example is a statement: file it.")
+              filed("Everything from bigcorp.example is a statement: file it."))
         check("a filing the memory's text does not bear out stays a rule, in its words",
               (people["Bank"]["instruction"], journal[ids["bank"]]["kind"], journal[ids["bank"]]["said"]),
               ("Statements from the bank: tell me when the balance is below 500.", "rule", "filing"))
@@ -801,11 +808,11 @@ def test_memories_address_and_domain_tags():
         # does, so the rule has to be on both.
         check("the rule is on the address's holder, after what they had",
               people["Billing Desk"]["instruction"],
-              mt.GENERIC_INSTRUCTION + "\n\n" + FILING + "\n\nShop mails are receipts: file them.")
-        check("and on the domain's contact, the fixed sentence once, each note's words after it",
+              filed(mt.GENERIC_INSTRUCTION, "Shop mails are receipts: file them."))
+        check("and on the domain's contact, each note's words in turn, the default once and last",
               people["shop.example"]["instruction"],
-              FILING + "\n\nShop mails are receipts: file them.\n\n"
-              "Order confirmations are receipts too, to be filed.")
+              filed("Shop mails are receipts: file them.",
+                    "Order confirmations are receipts too, to be filed."))
         check("an address the domain covers gets no contact of its own", "Shop Orders" in people, False)
         check("two people in all", len(people), 2)
         check("the rule went to both contacts",
@@ -928,6 +935,31 @@ def test_instruction_length_limit():
         check("and all three are superseded now", {fits, spills, both} <= set(links), True)
         check("as is the first run's pointer, by the one that replaces it",
               links[links[fits][0]], links[spills])
+
+    # A filing note on an instruction with room for its words but not for
+    # the filing default too: the words go on alone — the limit is that of
+    # the instruction they are placed on — and the report counts no filing
+    # sender for it. Where there is room, the default follows the words.
+    with world() as w:
+        note = "Invoices: file them."
+        own = "x" * (contacts.INSTRUCTION_MAX - len(note) - 2 - 30)
+        w.book().create("private", "Long", [("email", "long@example.org")], instruction=own)
+        w.book().create("private", "Short", [("email", "short@example.org")], instruction="Own.")
+        tight = w.remember(note, "sender:long@example.org")
+        roomy = w.remember("Receipts: file them.", "sender:short@example.org")
+        w.answers = by_text({"file them": "filing"})
+        rc, report = w.report()
+        journal = w.marker()["memories"]["entries"]
+        check("a filing note whose own words fit is placed, alone",
+              (rc, journal[tight]["state"], journal[tight]["kind"], w.people()["Long"]["instruction"]),
+              (0, "migrated", "filing", own + "\n\n" + note))
+        check("with room, the default follows the words", w.people()["Short"]["instruction"],
+              filed("Own.", "Receipts: file them."))
+        check("the report counts as filing senders only those the default stands on",
+              (report["briefed"]["filing"], [c.get("filing") for c in journal[tight]["contacts"]]), (1, [False]))
+        before = w.people()
+        rc, again = w.report("--step", "memories")
+        check("again: nothing moves", (rc, w.people() == before, again["briefed"]["filing"]), (0, True, 1))
 
 
 # ── The model turn: what is accepted of its answer ───────────────────────────
@@ -1124,10 +1156,10 @@ def test_hostile_memory_text():
         del honest, boss
 
     # A model steered to call every note "filing": every note keeps its own
-    # words. Only one whose own text names a document and filing it gets the
-    # fixed filing sentence, and that IN FRONT of the words, never in their
-    # place — a negation, a condition, a second request in any language is
-    # still there; a boss who rings stays one who rings.
+    # words, FIRST. Only one whose own text names a document and filing it
+    # gets the filing default, and that AFTER the words, worded to yield to
+    # them — a negation, a condition, a second request in any language comes
+    # before it and wins; a boss who rings stays one who rings.
     with world() as w:
         book = w.book()
         book.create("private", "Shop", [("email", "shop@example.org")])
@@ -1146,23 +1178,34 @@ def test_hostile_memory_text():
         w.remember(acme, "sender:billing@acme.example")
         w.remember(stadt, "sender:kasse@stadt.example")
         # Wordings no table of negations or conditions could list in full.
-        stop, ja, over = ("Stop filing their invoices.", "請求書は保存するな。",
-                          "File their invoices over 500 and let me know.")
-        for name, address, text in (("Stopper", "stop@example.org", stop), ("Tanaka", "tanaka@example.jp", ja),
-                                    ("Over", "over@example.org", over)):
-            book.create("private", name, [("email", address)])
-            w.remember(text, "sender:" + address)
+        hostile = {"Stopper": "Stop filing their invoices.", "Tanaka": "請求書は保存するな。",
+                   "Over": "File their invoices over 500 and let me know.",
+                   "Keeper": "Keep their invoices in the inbox; file a copy.",
+                   "Dupont": "Arrête de classer leurs factures.",
+                   "Ivanov": "Квитанции не архивировать, сначала показать мне.",
+                   "Kim": "영수증은 보관하지 마.", "Wang": "停止归档他们的发票。"}
+        for n, (name, text) in enumerate(hostile.items()):
+            book.create("private", name, [("email", f"h{n}@hostile.example")])
+            w.remember(text, f"sender:h{n}@hostile.example")
         w.answers = lambda notes: [{"id": n["id"], "kind": "filing"} for n in notes]
         w.run()
         people = w.people()
-        check("the note about filing receipts files, in its own words too", people["Shop"]["instruction"],
-              FILING + "\n\nShop mail: receipts, file them.")
+        check("the note about filing receipts files, its own words first", people["Shop"]["instruction"],
+              filed("Shop mail: receipts, file them."))
         check("the boss's note is not turned into filing",
               (people["Boss"]["instruction"], w.marker()["memories"]["entries"][boss]["kind"]),
               ("Anything from my boss: ring me at once, never archive, draft a reply.", "rule"))
-        check("a negated or mixed filing note keeps its own words, whatever the model said",
-              [people[n]["instruction"] for n in ("UBS", "ACME", "Stadt", "Stopper", "Tanaka", "Over")],
-              [FILING + "\n\n" + t for t in (ubs, acme, stadt, stop, ja, over)])
+        hostile.update(UBS=ubs, ACME=acme, Stadt=stadt)
+        check("a negated, conditional or mixed filing note, or one with a destination, in any language: "
+              "the note first, the yielding default after it",
+              {name: people[name]["instruction"] for name in hostile},
+              {name: filed(text) for name, text in hostile.items()})
+        # The rule, not only these cases: no instruction opens with anything
+        # but the words of the note it was made from.
+        notes = dict(hostile, Shop="Shop mail: receipts, file them.",
+                     Boss="Anything from my boss: ring me at once, never archive, draft a reply.")
+        check("no instruction opens with an order the note does not hold",
+              [name for name, text in notes.items() if not people[name]["instruction"].startswith(text)], [])
 
 
 def test_add_rule_and_the_filing_check():
@@ -1206,10 +1249,10 @@ def test_add_rule_and_the_filing_check():
     for text in ("Classify their invoices as urgent.", "Their registration statements matter.",
                  "Booking confirmations are not receipts."):
         check(f"names no filing: {text[:40]!r}", mt.names_filing(text), False)
-    # A filing note's own words always go on: the fixed filing sentence is
-    # added in front of them, never in their place, so a negation, a
-    # condition, a second request or a destination — in any language, in any
-    # wording no table lists — is still there for the turn to read.
+    # A filing note's decision is its own words, alone; the filing default is
+    # placed after them (place), so a negation, a condition, a second request
+    # or a destination — in any language, in any wording no table lists —
+    # stands first, and the default yields to it.
     for text in (
             "Receipts: file them.",
             "Stop filing their invoices.",
@@ -1225,24 +1268,45 @@ def test_add_rule_and_the_filing_check():
             "請求書は保存するな。",
             "停止归档他们的发票。",
             "영수증은 보관하지 마."):
-        check(f"decide: filing keeps the words: {text[:40]!r}", mt.decide("filing", text),
-              {"kind": "filing", "instruction": FILING + "\n\n" + text})
-    check("the exceptions table and the word bound are gone: nothing stands in for the words",
-          [hasattr(mt, name) for name in ("FILING_EXCEPTIONS", "MIGRATE_FILING_MAX_WORDS", "only_filing")],
-          [False, False, False])
-    check("decide: a filing note too long to carry the fixed sentence too goes on alone, as a rule",
-          mt.decide("filing", "Receipts: file them. " + "x" * (contacts.INSTRUCTION_MAX - 30)),
-          {"kind": "rule", "instruction": "Receipts: file them. " + "x" * (contacts.INSTRUCTION_MAX - 30)})
+        decision = mt.decide("filing", text)
+        check(f"decide: filing is the words alone: {text[:40]!r}", decision,
+              {"kind": "filing", "instruction": text})
+        check(f"place: the words first, the default after them: {text[:40]!r}",
+              (mt.place(None, decision), mt.place("Her own.", decision)),
+              ((filed(text), True), (filed("Her own.", text), True)))
+    check("the exceptions table, the word bound and the fixed sentence in front are gone",
+          [hasattr(mt, name) for name in ("FILING_EXCEPTIONS", "MIGRATE_FILING_MAX_WORDS", "only_filing",
+                                          "FILING_INSTRUCTION", "rule_for")],
+          [False, False, False, False, False])
     check("decide: filing not borne out is a rule, in its own words",
           mt.decide("filing", "Ring me‮ when it is urgent."),
           {"kind": "rule", "instruction": "Ring me when it is urgent."})
-    # The fixed sentence stands once on a person: a second filing note adds
-    # its words alone.
-    entry = {"content": "Invoices too: file them.", "decision": mt.decide("filing", "Invoices too: file them.")}
-    check("rule_for: the words alone where the fixed sentence is there",
-          mt.rule_for(FILING + "\n\nReceipts: file them.", entry), "Invoices too: file them.")
-    check("rule_for: the fixed sentence and the words where it is not",
-          mt.rule_for("Her own instruction.", entry), FILING + "\n\nInvoices too: file them.")
+    rule = mt.decide("rule", "Ring me for the big ones.")
+    check("place: a rule gets no default", mt.place("Her own.", rule), ("Her own.\n\nRing me for the big ones.", True))
+    # The default stands once on a person, and last: whatever is placed
+    # later goes in front of it, so "the note above" stays true.
+    second = mt.decide("filing", "Invoices too: file them.")
+    check("place: a second filing note goes in front of the default, which stays last",
+          mt.place(filed("Receipts: file them."), second), (filed("Receipts: file them.", "Invoices too: file them."), True))
+    check("place: so does a rule", mt.place(filed("Receipts: file them."), rule),
+          (filed("Receipts: file them.", "Ring me for the big ones."), True))
+    check("place: a default the user moved is not added twice",
+          mt.place(FILING + "\n\nHer own.", second), (FILING + "\n\nHer own.\n\nInvoices too: file them.", True))
+    check("place: words already there change nothing", mt.place(filed("Receipts: file them."), second | {
+        "instruction": "Receipts: file them."}), (filed("Receipts: file them."), False))
+    # The limit is that of the instruction the note is placed on: where the
+    # default does not fit with the words, the words go on alone; where the
+    # default stands last already, moving it costs nothing.
+    note = mt.decide("filing", "Invoices: file them.")
+    room = contacts.INSTRUCTION_MAX - len(note["instruction"]) - 2
+    check("place: words and default too long for this instruction: the words alone",
+          mt.place("x" * room, note), ("x" * room + "\n\nInvoices: file them.", True))
+    check("place: and never cut", mt.place("x" * (room + 1), note), None)
+    long_own = "y" * (room - len(FILING) - 2)
+    check("place: the default kept last where it stood, at the words' own cost",
+          mt.place(filed(long_own), note), (filed(long_own, "Invoices: file them."), True))
+    check("decide: a filing note that fits by itself is a filing",
+          mt.decide("filing", "Receipts: file them. " + "x" * (contacts.INSTRUCTION_MAX - 30))["kind"], "filing")
     check("decide: too long is nothing, never cut",
           mt.decide("rule", "x" * (contacts.INSTRUCTION_MAX + 1)), None)
     check("the old own-words check is gone: nothing a model writes is text any more",
@@ -1420,9 +1484,13 @@ def _busy_world(w):
            w.remember("Shop mail is receipts: file it.", "sender:shop.example", "sender:named@example.org"),
            w.remember("Held is on holiday.", "sender:held@example.org"),
            w.remember("Quiet: answer quietly.", "sender:quiet@example.org"),
-           w.remember("Ring me for anything about the house sale.", "sender:same@example.org")]
+           w.remember("Ring me for anything about the house sale.", "sender:same@example.org"),
+           # A rule after a filing note: it goes in front of the filing
+           # default, which stays last.
+           w.remember("ACME: tell me when one is missing.", "sender:payroll@acme.example")]
     w.answers = by_text({"same day": ("rule", "Answer the same day."), "weekends": ("rule", "Never on weekends."),
-                         "Payslips": "filing", "receipts": "filing", "quietly": "rule", "house sale": "rule"})
+                         "Payslips": "filing", "receipts": "filing", "quietly": "rule", "house sale": "rule",
+                         "missing": "rule"})
     return ids
 
 
@@ -1464,7 +1532,7 @@ def test_killed_between_any_two_writes():
         check("the undisturbed run completes", (rc, want["steps"]),
               (0, {"whitelist": True, "memories": True, "report": True}))
         check("and did what is expected", (want["superseded"], want["pointers"], want["left"]),
-              ([1, 1, 1, 1, 0, 1, 1], 5, ["fact"]))
+              ([1, 1, 1, 1, 0, 1, 1, 1], 5, ["fact"]))
         check("the briefed and the extended: whose first instruction this run wrote, and whose "
               "instruction of before grew — not one whose own words a memory repeated",
               want["briefed"], (5, [], [], ["Mara Keller"]))
@@ -1473,10 +1541,11 @@ def test_killed_between_any_two_writes():
             "Mara Keller": (["mara@example.org"], [],
                             "Her own instruction.\n\nMara: answer the same day.\n\nMara: never on weekends."),
             "Nadia Named": (["named@example.org"], [],
-                            mt.GENERIC_INSTRUCTION + "\n\n" + FILING + "\n\nShop mail is receipts: file it."),
+                            filed(mt.GENERIC_INSTRUCTION, "Shop mail is receipts: file it.")),
             "shop.example": ([], ["shop.example"],
-                             mt.GENERIC_INSTRUCTION + "\n\n" + FILING + "\n\nShop mail is receipts: file it."),
-            "ACME Payroll": (["payroll@acme.example"], [], FILING + "\n\nPayslips from ACME: file them."),
+                             filed(mt.GENERIC_INSTRUCTION, "Shop mail is receipts: file it.")),
+            "ACME Payroll": (["payroll@acme.example"], [],
+                             filed("Payslips from ACME: file them.", "ACME: tell me when one is missing.")),
             "Quiet Person": (["quiet@example.org"], [], "Quiet: answer quietly."),
             "Same Person": (["same@example.org"], [], "Ring me for anything about the house sale.")})
     check("every kind of write is among the kill points", sorted(set(writes)),
@@ -1522,6 +1591,54 @@ def test_killed_between_any_two_writes():
     # Its answer is journaled before the next write, so no kill point lies
     # between the turn and the record of it.
     check("the model is never asked twice", sorted(set(asked)), [1])
+
+    # Killed right after creating a contact, before journaling it under its
+    # own key: the journal holds "nothing stood before" under the target's
+    # ``new:`` key. A later run that appends a rule to the contact finds an
+    # instruction on it — the killed run's — and must not take that for the
+    # user's: the person stays briefed by the migration, also in a report
+    # made after a reload of the marker (which sorts the keys).
+    for domain in (False, True):
+        with world() as w:
+            if domain:
+                tag, name = "sender:corp.example", "corp.example"
+                w.mail("a@corp.example", "Corp")
+            else:
+                tag, name = "sender:new@example.org", "Nina New"
+                w.mail("new@example.org", "Nina New")
+            w.remember("Signal: answer the same day.", tag)
+            w.remember("Signal: never on weekends.", tag)
+            w.answers = by_text({"same day": "rule"})
+
+            def at_create(label):
+                if label == "contact":
+                    raise Kill(label)
+            mt._checkpoint = at_create
+            try:
+                w.run()
+                check(f"killed at the create ({name})", "not killed", "killed")
+            except Kill:
+                pass
+            mt._checkpoint = lambda label: None
+            check(f"the killed run's finding is under the new: key ({name})",
+                  [k.startswith("new:") for k in w.marker()["memories"]["instructed"]], [True])
+            w.run()
+            w.answers = by_text({"same day": "rule", "weekends": "rule"})
+            rc, report = w.report("--step", "memories")
+            check(f"a later run appends a rule to it ({name})",
+                  (rc, w.people()[name]["instruction"]),
+                  (0, "Signal: answer the same day.\n\nSignal: never on weekends."))
+            for run in ("that run", "a report after a reload"):
+                if run != "that run":
+                    rc, report = w.report("--step", "report")
+                briefed = report["briefed"]
+                check(f"{run}: still briefed by the migration, not extended ({name})",
+                      (briefed["contacts"], [p["name"] for p in briefed["extended"]]), (1, []))
+                check(f"{run}: and nobody is said to have carried an instruction of theirs ({name})",
+                      [line for line in report["by_hand"] if "already carried" in line], [])
+            check(f"the contact's own key carries the finding of the first write ({name})",
+                  {k.startswith("new:"): v["before"] for k, v in w.marker()["memories"]["instructed"].items()},
+                  {True: False, False: False})
 
 
 def test_nothing_is_deleted():
@@ -2259,7 +2376,7 @@ def test_the_report_says_what_an_instruction_costs():
         check("the people beyond mail are named, with their keys",
               any(f"Anna Example [{anna['key']}] (signal, sms)" in line for line in report["by_hand"]), True)
         check("the filing senders and their timeout",
-              any("filing instruction" in line and "MAIL_INSTRUCTION_TIMEOUT" in line
+              any("filing default" in line and "MAIL_INSTRUCTION_TIMEOUT" in line
                   for line in report["by_hand"]), True)
         text = mt.thread_message(report)
         check("the thread says it on every channel", "every channel" in text, True)
