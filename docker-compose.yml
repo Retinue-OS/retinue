@@ -454,6 +454,10 @@ services:
       - CHAT_PENDING_RETRY_SECONDS
       - CHAT_PENDING_SYNC_SECONDS
       - MAILBOX_NONE_SECONDS
+      # A mailbox call that failed is owed: kept on disk, tried again on this
+      # timer, and given up after this long.
+      - MAILBOX_RETRY_SECONDS
+      - MAILBOX_OWED_KEEP_SECONDS
       - MAIL_ORIGINAL_MAX_BYTES
       - MAIL_ORIGINAL_INLINE_MAX_BYTES
       - GATEWAY_HEALTH_TIMEOUT

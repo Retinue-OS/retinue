@@ -648,6 +648,8 @@ and a value in `.env` reaches it:
 | `CHAT_PENDING_RETRY_SECONDS` | `15` | the web gateway | how long a gateway that could not answer is left alone, the chat's copy standing in |
 | `CHAT_PENDING_SYNC_SECONDS` | `20` | the web gateway | how often the chat list has every mail gateway's queue read; `0` never does |
 | `MAILBOX_NONE_SECONDS` | `600` | the web gateway | how long a gateway that answered `404`/`501` to a mailbox call (no mailbox) is not asked again |
+| `MAILBOX_RETRY_SECONDS` | `120` | the web gateway | how often a mailbox call that failed (a read, an archive the mailbox still owes) is tried again |
+| `MAILBOX_OWED_KEEP_SECONDS` | `604800` | the web gateway | how long such an owed call is kept and retried before it is given up and logged |
 | `MAIL_ORIGINAL_MAX_BYTES` | 4 MiB | the web gateway | how much of each text part *Original* reads |
 | `MAIL_ORIGINAL_INLINE_MAX_BYTES` | 8 MiB | the web gateway | how many bytes of inline images one *Original* view inlines |
 
