@@ -6713,7 +6713,9 @@ class Mirror:
         for a ``deterministic`` old record that is no placeholder: inputs
         that give a ``wanting`` reading now gave one then, so it was settled
         by a judgement too (an invalid choice, an unparseable answer, a mail
-        given up on). Anything else — another copy's bytes, a placeholder, a
+        given up on) — an inference, nothing on the record says it, and it
+        holds while the rules and MAIL_TRIM_WANTING_CHARS are unchanged: after
+        a change of either such a mail can be left untrimmed. Anything else — another copy's bytes, a placeholder, a
         tombstone, whose judgement went with its text — is the new reading as
         the rules left it, and a ``wanting`` one gets its own first view.
         Comparing bytes, not trims:

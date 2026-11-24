@@ -1249,8 +1249,9 @@ The chat page asks for it once the bubble has been in view:
 `POST /chats/<id>/messages/<token>/trim`, `<token>` being the segment of the
 message's `original`, resolved as the Original resolves it. Same-origin, like
 the user's other acts on a chat (it spends a turn of the day's budget), and,
-like a chat's flags and send, only through the reverse proxy: `403` for a
-caller inside the container (`EDGE_PROXY_PEERS`). It answers
+like a chat's flags and send, only through the reverse proxy: `403` from
+inside the container where `EDGE_PROXY_PEERS` names the proxy — without it
+only from loopback and from the address the caller dialled. It answers
 
 - `200 {state: "model" | "deterministic", text}` — settled: from the record,
   or just now;

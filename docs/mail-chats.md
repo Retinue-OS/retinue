@@ -869,7 +869,10 @@ after it.
   from, and the mail is not asked about twice. A judgement that settled
   the mail `deterministic` (an invalid choice, `failed`) is kept alike, with
   the new reading's own text: inputs that read `wanting` now read `wanting`
-  then, so that `deterministic` was a judgement. Checked under the record
+  then, so that `deterministic` was a judgement — an inference that holds
+  while the trim's rules and `MAIL_TRIM_WANTING_CHARS` are what they were:
+  after a change of either, a mail the old rules had settled by themselves
+  can be left with their text by such a rewrite, untrimmed. Checked under the record
   lock, by comparing bytes — no mail is trimmed or parsed in the mirror's
   process, nor under a lock. Anything else is the new reading as the rules
   trim it, and a `wanting` one gets its own first view: a copy of other
