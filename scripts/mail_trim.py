@@ -2071,8 +2071,9 @@ _CHARREF_END_RE = re.compile(r"[\s;<]")
 def _markup_spans(html: str):
     """``(start, end, markup)`` of each stretch of a part that is no text of
     it, in order: a tag or a style sheet (`markup`), a comment, the text of
-    a script. Then ``(len, len + 1, False)``, for ever. A part is looked at
-    once, and only as far as it is asked for."""
+    a script — up to the first CDATA section. Then ``(len, len + 1,
+    False)``, for ever. A part is looked at once, and only as far as it is
+    asked for."""
     size = len(html)
     at = 0
     while True:
@@ -2093,6 +2094,11 @@ def _markup_spans(html: str):
                 end = html.find(">", start + 2)
                 end = size if end < 0 else end + 1
             yield start, end, False
+            if html.startswith("<![CDATA[", start):
+                # In an <svg> or a <math> a browser ends one at "]]>", not
+                # here, and which this is, is not followed: from here on,
+                # nothing is markup a payload is left out of.
+                break
             at = end
             continue
         name = start + len(match.group()) - 1
@@ -2116,12 +2122,15 @@ def _markup_spans(html: str):
 
 def _folded(payload: str) -> bool:
     """Is a payload with blanks in it base64 folded into lines: each line
-    nothing but base64, every one but the last as long as the first, and
-    not short? Words joined by line breaks are not."""
+    nothing but base64, every one but the first and the last as long as the
+    second, these two no longer, and not short? (The first may share its
+    line with the tag, where a client folded all of the markup.) Words
+    joined by line breaks are not."""
     lines = payload.split()
-    width = len(lines[0]) if lines else 0
-    return (width >= BASE64_LINE_CHARS and len(lines[-1]) <= width
-            and all(len(line) == width for line in lines[:-1])
+    width = len(lines[1] if len(lines) > 2 else lines[0]) if lines else 0
+    return (width >= BASE64_LINE_CHARS
+            and len(lines[0]) <= width and len(lines[-1]) <= width
+            and all(len(line) == width for line in lines[1:-1])
             and all(_BASE64_RE.fullmatch(line) for line in lines))
 
 
@@ -2139,7 +2148,10 @@ def _markup_read(html: str) -> tuple:
     base64 or a URL's characters, no blank but between the lines of folded
     base64, no quote — up to the first character that is none of it: where
     a home-made reading of the markup takes text for a tag, what that
-    costs is a long word of base64, never a sentence or the end of a value.
+    costs is a long run of a URL's characters, never words a blank divides
+    nor the end of a value. (Words joined by "-", "_", "." or "%20" are such
+    a run, so past a CDATA section — the one misreading known: a browser
+    ends one in an <svg> at "]]>" — nothing is left out.)
 
     A longer part is cut at the bound, wherever that falls: the parser is
     handed what was read and not told that it ends there (see _convert), so
@@ -2182,20 +2194,24 @@ def _markup_read(html: str) -> tuple:
         # … and what follows is a payload by its shape, which ends at the
         # first character that is none of one: what began the value must
         # end it there. Whatever else a reading of the markup gets wrong,
-        # what is left out is never a word of a text, nor a quote that ends
-        # one value and lets the next take the mail.
+        # what is left out is never words a blank divides, nor a quote that
+        # ends one value and lets the next take the mail.
         payload = (_DATA_URL_QUOTED_RE if opener else _DATA_URL_BARE_RE).match(html, at)
         if payload is None:
             continue                # no URL: it has no comma where one has
         end = at = payload.end()
         comma = html.index(",", start)
+        blank = "\n" if _BLANKS_RE.search(html, comma, end) else ""
         if (end - start <= DATA_URL_CHARS
                 or not html.startswith(_DATA_URL_CLOSERS[opener], end)
-                or (_BLANKS_RE.search(html, comma, end)
-                    and not _folded(html[comma + 1:end]))):
+                or (blank and not _folded(html[comma + 1:end]))):
             continue
-        kept.append(html[done:start + 5])
-        size += start + 5 - done
+        # (One blank stays for its blanks: where the value began with no
+        # quote a browser took, it ended at the first of them, and the tag
+        # is split where it was — what follows is no text for being joined
+        # to it.)
+        kept.append(html[done:start + 5] + blank)
+        size += start + 5 - done + len(blank)
         done = end
     kept.append(html[done:done + max(0, limit - size) + 1])
     markup = "".join(kept)

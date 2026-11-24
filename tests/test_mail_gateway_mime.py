@@ -4294,6 +4294,31 @@ def _gone_from_under_the_search(box) -> None:
     box.gw.LOST_TRIES = 1
 
 
+def _moved_under_the_last_look(box) -> None:
+    """Ann's mail archived by the user between the server's search and the
+    FETCH, on the last try, which here is the first (LOST_TRIES) — the
+    archive unsure of the id the first time it is asked. It was left
+    unmirrored for good: every match gone since the search, the id left
+    `lost`, and the archive is not read for it. It is looked for once
+    more."""
+    find = box.find
+    asked = {"n": 0}
+
+    def racing(folder, mid):
+        got = find(folder, mid)
+        if mid != "m@x.org" or folder != "Archive":
+            return got
+        asked["n"] += 1
+        if asked["n"] == 1:
+            return box.gw.Matches((), False)
+        uid = box.uid_of("INBOX", mid)
+        if asked["n"] == 2 and uid is not None:
+            box.move_mail("INBOX", uid, "Archive")
+        return got
+    box.find = racing
+    box.gw.LOST_TRIES = 1
+
+
 def _via(raw: bytes, n: int) -> bytes:
     """The copy of a mail a server took in: trace fields of its own."""
     return b"Received: from relay%d.example.org by mx.example.org; x\r\n" % n + raw
@@ -4436,6 +4461,9 @@ _WALKS = {
         lost=True, mail=[_MINE], out=True),
     "lost from the ledger, every match gone on the last try": dict(
         first=[("INBOX", _ANN)], does=_gone_from_under_the_search, lost=True,
+        mail=[_ANN], out=False),
+    "lost from the ledger, archived under the last look": dict(
+        first=[("INBOX", _ANN)], does=_moved_under_the_last_look, lost=True,
         mail=[_ANN], out=False),
     "its record file gone under the running gateway, the mail back from the Trash": dict(
         first=[("INBOX", _ANN)], does=lambda box: box.remove("INBOX", 1),
@@ -4685,7 +4713,8 @@ def test_the_invariants_hold_wherever_the_walk_is_cut():
     before it is read again, then its folder renumbered or rebuilt, behind a
     hostile mail that never reads, a forged From in the archive (and one
     archived, the Sent copy deleted), a mail to oneself, a mail sent from a
-    plus-address, every match gone from under the search on the last try;
+    plus-address, every match gone from under the search on the last try
+    (or archived under it);
     its record file gone while the process runs — with the
     reader late at each header reading in turn (once, and twice running,
     which is "no answer"), the process killed after each write in turn,
