@@ -47,22 +47,28 @@ folders are mirrored — INBOX, Sent and the archive folder:
 bounded: its header block and the fields whose parameters are parsed, the
 codecs it is decoded under (charsets, and nothing else its sender may name),
 the ids it cites, its parts, the text its record carries, the chats it may
-merge, the work its parsing costs. A mail the reader cannot make sense of does
-not stop the folder and does not vanish either: it is mirrored as a
-placeholder that says a mail from this sender, at this time, could not be
-shown (the mailbox still has it), and is read again at start and every hour.
+merge, the work its parsing costs — and the time its reading takes as a
+whole, the bound for what none of the others foresaw: the running gateway
+reads its mail in a process of its own (``Reader``), which is ended when a
+mail outlasts its deadline. A mail the reader cannot make sense of, or not
+in its time, does not stop the folder and does not vanish either: it is
+mirrored as a placeholder that says a mail from this sender, at this time,
+could not be shown (the mailbox still has it), and is read again at start
+and every hour. ``/health`` counts them, and says why.
 
 **Whose fault a failure is, is decided by what failed** (``read_mail``,
 ``Mirror._ingest``). READING a mail — the parse, the walk of its parts, the
 trim — fails on the mail's account when the same reader still reads the
-mirror's own built-in test mail (the canary): that mail is a placeholder at
-once, and the mirror is as healthy as before. WRITING — the ledger, the
-indexes, the blobs — never fails on a mail's account. A reader that cannot
-read the canary either, and any failure in writing, is a fault of the mirror
-itself, and must not be absorbed mail by mail: the pass ends, no mail is set
-aside over it, no mark moves past a mail that has neither a record nor a
-place — so the mail is read again wherever it is by then, also after a
-restart — and ``/health`` reports the mirror, not the mailbox, as at fault.
+mirror's own built-in test mails (the canaries, one for every path a mail
+takes through it), and in their time: that mail is a placeholder at once,
+and the mirror is as healthy as before. WRITING — the ledger, the indexes,
+the blobs — never fails on a mail's account. A reader that cannot read the
+canaries either, or is too slow for them, and any failure in writing, is a
+fault of the mirror itself, and must not be absorbed mail by mail: the pass
+ends, no mail is set aside over it, no mark moves past a mail that has
+neither a record nor a place — so the mail is read again wherever it is by
+then, also after a restart — and ``/health`` reports the mirror, not the
+mailbox, as at fault.
 
 How the poll stays cheap: a **mailbox index** (sqlite, on the state volume)
 maps folder / UID ↔ Message-ID ↔ ledger record. New mail is the UIDs above a
@@ -112,11 +118,18 @@ import email.utils
 import hashlib
 import hmac
 import imaplib
+import io
 import json
 import os
+import pickle
 import re
+import select
+import signal
 import sqlite3
 import ssl
+import struct
+import subprocess
+import sys
 import threading
 import time
 import traceback
@@ -279,6 +292,61 @@ MAX_NESTING = 200
 # largest size fetched, all of it base64, may still nest thirty levels.
 MAX_PARSE_WORK = 50_000_000
 PARSE_LINE_COST = 4
+# The parameters of those two fields. MAX_FIELD_BYTES bounds one field, not
+# the sum over the parts a mail may have: the parser's parameter splitter
+# counts the quotes before every ";" it meets — once more from the start of
+# the field for each on Python 3.12, a step of its own for each on 3.13 — and
+# the reader asks it up to three times a part (file name, charset, boundary).
+# So a field costs its semicolons times its length, with what a step costs
+# at all counted as PARAMETER_STEP_COST characters more, summed as the parser
+# takes the fields off the mail: 6,000 parts with two fields of 4,000
+# semicolons each (49 MB) held the poll for 131 seconds on 3.12. A mail that
+# asks for more than this is a placeholder; the worst still read takes under
+# four seconds on either version. Two hundred attachments under the longest
+# names, or fifty thousand parts that each name a charset, come to a
+# thirtieth of it.
+MAX_PARAMETER_WORK = 1_000_000_000
+PARAMETER_STEP_COST = 256
+# The time reading one mail may take, on the wall clock: the bound for what
+# the bounds above do not know of. Each of them closes one way a mail made
+# the standard library's mail code spend the square of something its sender
+# chose (the parser's boundary tests, its parameter splitter, the re-folding
+# of a nested mail's header, the decoder of encoded words), and each was
+# found only when a mail of some hundred kilobytes had held the mirror's one
+# thread for a minute. The next such path is not known yet, so the reading
+# as a whole has a deadline, kept two ways (read_mail, Reader): the reader's
+# own code looks at the clock wherever it is entered — for every header
+# field and part the parser takes up, every part walked, before the trim —
+# and the reading runs in a process of its own, which is ended when a single
+# call into the library outlasts the deadline (the looks at the clock alone
+# left two of the three paths found last to run their 52 and 139 seconds).
+# Either way the mail is a placeholder ("took too long to read"), as for any
+# other failure of its own.
+#
+# A mail gets MAIL_READ_SECONDS, and READ_SECONDS_PER_MB more for each
+# megabyte fetched. Measured, on Python 3.12 and 3.13 alike: an ordinary
+# mail reads in a millisecond; the trim's own bounds make the heaviest text
+# a second, whatever its size (a megabyte of HTML); an attachment costs
+# 25 ms a megabyte; the worst mail the bounds above let through, six
+# seconds. So the deadline is thirty times what the heaviest honest mail
+# needs and ten thousand times what an ordinary one does — and it must not
+# turn a slow machine into a mailbox of placeholders: after a mail ran out
+# of time the canaries are read against the clock too, with CANARY_SECONDS
+# for their five milliseconds. That is a far smaller multiple of what they
+# need, so on a machine slow enough to time out ordinary mail the canaries
+# time out first, and that is the mirror's fault, not a mail's (read_mail):
+# nothing is set aside. Only the heaviest mail can run out of time while the
+# canaries still read, on a machine thirty times too slow: a placeholder
+# each, read again like every placeholder at start and every hour — and
+# MAIL_READ_SECONDS is the setting for such a machine.
+READ_SECONDS = _env_float("MAIL_READ_SECONDS", 30.0, 1.0)
+READ_SECONDS_PER_MB = 1.0
+CANARY_SECONDS = READ_SECONDS / 10
+# How much longer than its deadline the reader process is waited for before
+# it is ended (it answers for itself when its own code sees the clock), and
+# how long a new one may take to start.
+READER_GRACE_SECONDS = 5.0
+READER_START_SECONDS = 60.0
 # The text a record carries (kb:text) — one literal on one line, read by
 # every reader of the record. The trim leaves a long mail long; the whole of
 # it is in the body blob either way, and "Original" shows it.
@@ -354,6 +422,12 @@ ARRIVAL_SLACK_SECONDS = 3600.0
 # Mail that was set aside (mirrored as a placeholder) is read again at start
 # and then this often (Mirror._retry_set_aside).
 SET_ASIDE_RETRY_SECONDS = 3600.0
+# How long one such round may read (Mirror._retry_set_aside): reading a
+# placeholder again can take as long as its mail may (READ_SECONDS).
+SET_ASIDE_ROUND_SECONDS = 120.0
+# After a fault of the mirror's own the loop waits one poll interval, then
+# twice as long after each further one in a row, up to this (_loop_step).
+MIRROR_FAULT_WAIT_MAX_SECONDS = 3600.0
 
 
 def _policy_path() -> Path:
@@ -432,6 +506,11 @@ def _health_snapshot() -> dict:
         "blocked": state["blocked"] if configured and MAIL_CONFIG is not None else None,
         "read_only": True,
         "backfill": backfill,
+        # Mail mirrored as placeholders: how many stand, how many were made
+        # since this start, and why — each a mail's own fault by the canary
+        # rule, and a run of them is to be seen here whatever the cause.
+        "placeholders": (MIRROR.placeholders() if MIRROR is not None
+                         else {"standing": 0, "made": 0, "why": {}}),
         "last_poll": state["last_poll"],
         "build": _build.build_info(),
     }
@@ -478,18 +557,70 @@ _UNFOLD_RE = re.compile(r"\r?\n(?=[ \t])")
 _HEADER_END_RE = re.compile(rb"\r?\n\r?\n")
 
 
+# Why a mail is a placeholder, in the few words /health counts them under
+# (Mirror.placeholders): one of these, or the name of what the reader raised.
+OVER_A_BOUND = "asks for more than a mail may"
+TOO_SLOW = "took too long to read"
+READER_ENDED = "the reader process ended on it"
+
+
 class UnreadableMail(Exception):
     """A mail the reader can make nothing of, by a fault that is the mail's:
     it asks for more than a mail may (MAX_PARSED_PARTS, MAX_NESTING,
-    MAX_PARSE_WORK), or the reader failed on it and still reads the canary
-    (:func:`read_mail`). It is mirrored as a placeholder."""
+    MAX_PARSE_WORK, MAX_PARAMETER_WORK), or the reader failed on it — an
+    error, or its time ran out — and still reads the canaries
+    (:func:`read_mail`). It is mirrored as a placeholder. ``kind`` is the
+    reason in a few words, for the count on /health."""
+
+    def __init__(self, why: str, kind: str = OVER_A_BOUND):
+        super().__init__(why)
+        self.kind = kind
 
 
 class MirrorFault(Exception):
-    """The mirror itself does not work: its reader fails on the canary too,
-    or a mail could not be written. No mail is set aside over it — the pass
-    ends, and /health reports the mirror as at fault (``blocked: "mirror"``).
-    The message is what /health reports, so it is written for the operator."""
+    """The mirror itself does not work: its reader fails on the canaries
+    too, or is too slow for them, or a mail could not be written. No mail is
+    set aside over it — the pass ends, and /health reports the mirror as at
+    fault (``blocked: "mirror"``). The message is what /health reports, so
+    it is written for the operator."""
+
+
+class TookTooLong(BaseException):
+    """The reading in hand is past its deadline (see READ_SECONDS). Not an
+    ``Exception``: the reader catches those part by part and field by field,
+    and time that is up is up for the whole mail."""
+
+
+# When the reading in hand must be done, on the monotonic clock; None while
+# nothing is being read against the clock. One reading at a time: the mirror
+# has one thread, and the reader process reads one mail.
+_READ_UNTIL: float | None = None
+
+
+class _within:
+    """``with _within(seconds):`` — what runs inside is a reading that must
+    be done in that time. Its own code asks :func:`_tick`."""
+
+    def __init__(self, seconds: float):
+        self.seconds = seconds
+
+    def __enter__(self):
+        global _READ_UNTIL
+        _READ_UNTIL = time.monotonic() + self.seconds
+        return self
+
+    def __exit__(self, *_exc):
+        global _READ_UNTIL
+        _READ_UNTIL = None
+
+
+def _tick() -> None:
+    """Called wherever the reader's own code is entered in the course of one
+    reading; raises :class:`TookTooLong` once the reading is past its
+    deadline. A call into the standard library that does not come back is
+    not interrupted by this — that is what the reader process is for."""
+    if _READ_UNTIL is not None and time.monotonic() > _READ_UNTIL:
+        raise TookTooLong("its reading was not done in time")
 
 
 @dataclass
@@ -584,6 +715,25 @@ def _raw_header(msg, name: str) -> str:
 
 _ENCODED_WORD_RE = re.compile(r"=\?[^?\s]+\?[bBqQ]\?[^?\s]*\?=")
 _BETWEEN_WORDS_RE = re.compile(r"(\?=)[ \t]+(?==\?[^?\s]+\?[bBqQ]\?)")
+# Where the standard decoder takes an encoded word to begin — it is laxer
+# about a word than _ENCODED_WORD_RE: any charset, any text up to "?=".
+_WORD_START_RE = re.compile(r"=\?[^?]*\?[bBqQ]\?")
+
+
+def _words_end(value: str) -> bool:
+    """Whether every encoded word the standard decoder would take up in
+    ``value`` also ends, on the line it begins on.
+
+    From one that does not, its pattern reads on to the end of the line
+    before it gives up, and then begins again at the next: a line of such
+    beginnings costs it the square of their number — 52 seconds for a
+    Subject of 250 kB, and a part's file name goes through the same call."""
+    for line in value.splitlines():
+        if "=?" in line:
+            last_end = line.rfind("?=")
+            if any(word.end() > last_end for word in _WORD_START_RE.finditer(line)):
+                return False
+    return True
 
 
 def _decode_word(match) -> str:
@@ -598,8 +748,13 @@ def _decode_words(value: str) -> str:
     """RFC 2047 encoded words decoded; never raises on a malformed one. The
     words name their own charset, so each is read through _charset and what
     comes back is scrubbed."""
+    _tick()
     try:
-        # As email_client._decode reads a header, but for the codec.
+        # As email_client._decode reads a header, but for the codec — and
+        # only where the standard decoder takes time in proportion: a value
+        # with a word that never ends is read word by word, below.
+        if not _words_end(value):
+            raise ValueError("an encoded word that does not end")
         out = []
         for chunk, charset in email.header.decode_header(value):
             if isinstance(chunk, bytes):
@@ -713,6 +868,7 @@ def _parameter(msg, name: str, header: str = "content-type") -> str:
     not parse. An RFC 2231 value states its own charset; it is collapsed here
     (as ``email.utils.collapse_rfc2231_value`` would, but through _charset),
     which is why ``get_filename`` and ``get_content_charset`` are not used."""
+    _tick()
     try:
         value = msg.get_param(name, None, header)
         if isinstance(value, tuple) and len(value) == 3:
@@ -779,6 +935,7 @@ def _collect(part, mail: Mail, texts: dict, depth: int = 0) -> None:
     message is one part, kept whole: its own bodies are not this mail's.
     A leaf beyond the cap, below the depth any client writes, or that cannot
     be read at all is counted, not kept — and never costs the mail the rest."""
+    _tick()
     if depth > 40:
         _drop_part(mail)
         return
@@ -832,21 +989,46 @@ def _collect_leaf(part, payload, maintype: str, mail: Mail, texts: dict) -> None
 
 
 _STRUCTURED_FIELDS = frozenset({"content-type", "content-disposition"})
+_LINE_END_RE = re.compile(r"\r\n|\r|\n")
 
 
 class _BoundedPolicy(email.policy.Compat32):
     """The lenient legacy policy, with a Content-Type or Content-Disposition
-    field cut to MAX_FIELD_BYTES as the parser takes it off the mail.
+    field cut to MAX_FIELD_BYTES as the parser takes it off the mail, and
+    what the parameters of all those fields cost to parse counted against
+    MAX_PARAMETER_WORK (``spent``: one parse's count, see _parse_bytes).
 
     Cut here and not in the raw bytes: only the parser knows where a header
     field is — the mail's own block, a part's, a nested mail's — and whatever
     it does not read as one is content, to be kept byte for byte."""
 
+    spent = None
+
     def header_source_parse(self, sourcelines):
+        _tick()
         name, value = super().header_source_parse(sourcelines)
-        if len(value) > MAX_FIELD_BYTES and name.lower() in _STRUCTURED_FIELDS:
-            value = value[:MAX_FIELD_BYTES].rstrip("\r\n\t ")
+        if name.lower() in _STRUCTURED_FIELDS:
+            if len(value) > MAX_FIELD_BYTES:
+                value = value[:MAX_FIELD_BYTES].rstrip("\r\n\t ")
+            if self.spent is not None:
+                self.spent[0] += value.count(";") * (len(value) + PARAMETER_STEP_COST)
+                if self.spent[0] > MAX_PARAMETER_WORK:
+                    raise UnreadableMail("the parameters of its Content-Type and "
+                                         "Content-Disposition fields: more work than one "
+                                         "mail may ask for")
         return name, value
+
+    # A nested mail is written back for its part (Message.as_bytes) field by
+    # field as it was read, with the line ends the rest of it is written
+    # with. The legacy policy would wrap every field anew, and its wrapping
+    # takes time with the square of the line breaks a value holds — to it, a
+    # form feed is one: 28 seconds for a nested Subject of 2 MB, 139 for 4.
+    def fold(self, name, value):
+        _tick()
+        return f"{name}: {_LINE_END_RE.sub(self.linesep, str(value))}{self.linesep}"
+
+    def fold_binary(self, name, value):
+        return self.fold(name, value).encode("ascii", "surrogateescape")
 
 
 _BOUNDED = _BoundedPolicy()
@@ -856,9 +1038,9 @@ def _parse_bytes(raw: bytes):
     """Bytes to a message, by the lenient legacy parser — which never raises
     on a malformed header — with what it may be asked to do bounded: the two
     fields whose parameters are parsed (_BoundedPolicy), the number of parts
-    it builds, how deep they nest and the work that nesting costs it
-    (:class:`UnreadableMail` beyond MAX_PARSED_PARTS, MAX_NESTING or
-    MAX_PARSE_WORK)."""
+    it builds, how deep they nest, the work that nesting costs it and the
+    work their parameters do (:class:`UnreadableMail` beyond
+    MAX_PARSED_PARTS, MAX_NESTING, MAX_PARSE_WORK or MAX_PARAMETER_WORK)."""
     made = 0
     # What one level of nesting costs: a test of every line (MAX_PARSE_WORK).
     # The parser ends a line at CR, LF or CRLF.
@@ -874,6 +1056,7 @@ def _parse_bytes(raw: bytes):
         # parser's stack. (The stack is the parser's own business; without
         # it this raises on every mail, the canary included, which is loud.)
         nonlocal made
+        _tick()
         made += 1
         if made > MAX_PARSED_PARTS:
             raise UnreadableMail(f"more than {MAX_PARSED_PARTS} MIME parts")
@@ -886,8 +1069,10 @@ def _parse_bytes(raw: bytes):
         return email.message.Message(policy=policy)
 
     # As email.message_from_bytes does it, but for the parser kept in hand.
-    parser = email.feedparser.BytesFeedParser(policy=_BOUNDED.clone(message_factory=part))
+    parser = email.feedparser.BytesFeedParser(
+        policy=_BOUNDED.clone(message_factory=part, spent=[0]))
     for start in range(0, len(raw), 8192):
+        _tick()
         parser.feed(raw[start:start + 8192])
     return parser.close()
 
@@ -977,11 +1162,13 @@ def parse_mail(raw: bytes, internal_date: float | None = None) -> Mail:
     later than that. What the mail may ask of the reader is bounded before it
     is parsed (the header block, MAX_HEADER_BYTES), as it is parsed (a
     structured field, MAX_FIELD_BYTES; the number of parts, their nesting
-    and the work it costs: MAX_PARSED_PARTS, MAX_NESTING, MAX_PARSE_WORK)
-    and while it is read (MAX_PARTS, the ids, the addresses); a mail that
-    asks for more than can be parsed raises :class:`UnreadableMail` and is
-    the caller's to set aside. Anything else it raises is not yet known to
-    be the mail's fault: the mirror reads through :func:`read_mail`."""
+    and the work it costs: MAX_PARSED_PARTS, MAX_NESTING, MAX_PARSE_WORK,
+    MAX_PARAMETER_WORK) and while it is read (MAX_PARTS, the ids, the
+    addresses) — and by the clock, where the reading has a deadline
+    (:func:`_tick`). A mail that asks for more than can be parsed raises
+    :class:`UnreadableMail` and is the caller's to set aside. Anything else
+    it raises is not yet known to be the mail's fault: the mirror reads
+    through :func:`read_mail`."""
     head, rest = _head_and_rest(raw)
     msg = _parse_bytes(head + rest)
     mail = Mail(message_id=_identify(msg, head), arrived=internal_date)
@@ -1053,16 +1240,38 @@ def stub_mail(raw: bytes, internal_date: float | None, reason: str) -> Mail:
     return mail
 
 
+def _bare_stub(head: bytes, internal_date: float | None, reason: str) -> Mail:
+    """A placeholder for a mail of which not even the header block could be
+    read (see read_stub): nothing of it is parsed. Its id is one of its
+    bytes, and its header block is still what "Original" shows."""
+    return Mail(message_id=f"{hashlib.sha256(head).hexdigest()[:32]}@{_SYNTHETIC_DOMAIN}",
+                unreadable=reason, arrived=internal_date, date=internal_date,
+                headers=head.decode("utf-8", errors="replace").replace("\r\n", "\n"))
+
+
+def _head_facts(head: bytes) -> dict:
+    """What the mirror asks of a header block alone, to find a mail again:
+    the id the mail is mirrored under, its Message-ID field as it stands,
+    and whether it was sent on as it stood (see read_head)."""
+    msg = _parse_bytes(head + b"\r\n\r\n")
+    return {"id": _identify(msg, head), "message_id": _raw_header(msg, "Message-ID"),
+            "resent": _is_resent(msg)}
+
+
 # What a placeholder's bubble says. The mail's sender and time are on the
 # record beside it, and its header block is what "Original" shows.
 UNREADABLE_TEXT = ("This mail could not be shown here: the mail gateway could not read it. "
                    "It is unchanged in the mailbox.")
 
-# The canary: a mail known to be good, with everything in it the reader has
-# a step for — encoded words, a thread, two bodies in two encodings, a
-# quoted reply for the trim, an attachment. When reading a mail fails, the
-# same reading is run on this one, and that decides whose fault it was
-# (read_mail). It is never mirrored.
+# The canaries: mails known to be good, with everything in them the reader
+# has a step for. When reading a mail fails, the same reading is run on
+# these, and that decides whose fault it was (read_mail). Every path a mail
+# can take through the reader is taken by one of them — a fault of the
+# mirror's own on a path no canary takes would be laid at the door of every
+# mail that takes it. They are never mirrored.
+#
+# The first: encoded words, a thread, two bodies in two encodings, a quoted
+# reply for the trim, an attachment.
 CANARY_MAIL = (
     b"From: =?utf-8?q?The_Canary?= <canary@canary.mail.invalid>\r\n"
     b"To: mirror@canary.mail.invalid\r\n"
@@ -1097,22 +1306,373 @@ CANARY_MAIL = (
     b"\r\n"
     b"Y2FuYXJ5\r\n"
     b"--outer--\r\n")
+# The second: HTML and nothing else, so its reading text is the converter's
+# (beside a plain part that reads, the trim never consults the HTML one) —
+# under a charset that is not UTF-8, and a Subject folded after an encoded
+# word in a third.
+CANARY_HTML_MAIL = (
+    b"From: canary@canary.mail.invalid\r\n"
+    b"To: mirror@canary.mail.invalid\r\n"
+    b"Subject: =?iso-8859-1?q?Gr=FC=DFe?= from\r\n"
+    b" the canary\r\n"
+    b"Date: Thu, 01 Jan 2026 12:00:00 +0000\r\n"
+    b"Message-ID: <page@canary.mail.invalid>\r\n"
+    b"MIME-Version: 1.0\r\n"
+    b"Content-Type: text/html; charset=windows-1252\r\n"
+    b"Content-Transfer-Encoding: quoted-printable\r\n"
+    b"\r\n"
+    b"<html><head><style>p { color: red }</style></head><body>\r\n"
+    b"<p>Only <b>HTML</b> here =97 the converter works.</p>\r\n"
+    b"<ul><li>one</li><li>two</li></ul>\r\n"
+    b"</body></html>\r\n")
+# The third: an inline image beside the HTML that shows it, and a nested
+# mail — written back for its part field by field (_BoundedPolicy.fold) —
+# under a file name spelled the RFC 2231 way.
+CANARY_FORWARD_MAIL = (
+    b"From: canary@canary.mail.invalid\r\n"
+    b"To: mirror@canary.mail.invalid\r\n"
+    b"Subject: Fwd: Still singing?\r\n"
+    b"Date: Thu, 01 Jan 2026 12:00:00 +0000\r\n"
+    b"Message-ID: <forward@canary.mail.invalid>\r\n"
+    b"MIME-Version: 1.0\r\n"
+    b"Content-Type: multipart/mixed; boundary=\"mixed\"\r\n"
+    b"\r\n"
+    b"--mixed\r\n"
+    b"Content-Type: multipart/related; boundary=\"related\"\r\n"
+    b"\r\n"
+    b"--related\r\n"
+    b"Content-Type: text/html; charset=utf-8\r\n"
+    b"\r\n"
+    b"<p>The mail below, under our sign <img src=\"cid:sign@canary.mail.invalid\">.</p>\r\n"
+    b"--related\r\n"
+    b"Content-Type: image/png\r\n"
+    b"Content-ID: <sign@canary.mail.invalid>\r\n"
+    b"Content-Disposition: inline\r\n"
+    b"Content-Transfer-Encoding: base64\r\n"
+    b"\r\n"
+    b"iVBORw0KGgoAAAANSUhEUgAAAAgAAAAICAYAAAA=\r\n"
+    b"--related--\r\n"
+    b"--mixed\r\n"
+    b"Content-Type: message/rfc822\r\n"
+    b"Content-Disposition: attachment; filename*=utf-8''fr%C3%BCher.eml\r\n"
+    b"\r\n"
+    b"From: mirror@canary.mail.invalid\r\n"
+    b"Subject: Still\r\n"
+    b"\tsinging?\r\n"
+    b"Message-ID: <question@canary.mail.invalid>\r\n"
+    b"\r\n"
+    b"Still singing?\r\n"
+    b"--mixed--\r\n")
+
+
+def _canary_answer(mail: Mail) -> bool:
+    return (mail.message_id == "answer@canary.mail.invalid" and len(mail.parts) == 1
+            and "the reader works" in (mail.plain or "") and bool(mail.reading[0]))
+
+
+def _canary_page(mail: Mail) -> bool:
+    text = mail.reading[0]
+    return (mail.subject == "Grüße from the canary" and mail.plain is None
+            and "Only HTML here — the converter works." in text
+            and "one" in text and "two" in text and "<" not in text and "color" not in text)
+
+
+def _canary_forward(mail: Mail) -> bool:
+    kinds = [(part.content_type, part.file_name, part.content_id, part.inline_image)
+             for part in mail.parts]
+    return (kinds == [("image/png", None, "sign@canary.mail.invalid", True),
+                      ("message/rfc822", "früher.eml", None, False)]
+            and mail.parts[0].data.startswith(b"\x89PNG")
+            and b"Subject: Still\n\tsinging?\n" in mail.parts[1].data
+            and mail.parts[1].data.endswith(b"\n\nStill singing?")
+            and "The mail below, under our sign" in mail.reading[0])
+
+
+_CANARIES = ((CANARY_MAIL, _canary_answer), (CANARY_HTML_MAIL, _canary_page),
+             (CANARY_FORWARD_MAIL, _canary_forward))
 
 
 def _reading(raw: bytes, internal_date: float | None) -> Mail:
     """All of READING one mail: the parse, the walk of its parts, and the
     trim of its text. Nothing in here writes, and nothing outside it reads."""
     mail = parse_mail(raw, internal_date)
+    _tick()
     mail.reading = Mirror._reading_text(mail)
     return mail
 
 
 def _read_canary() -> None:
-    """Read the canary; raises unless the reader makes of it what it is."""
-    mail = _reading(CANARY_MAIL, None)
-    if (mail.message_id != "answer@canary.mail.invalid" or len(mail.parts) != 1
-            or "the reader works" not in (mail.plain or "") or not mail.reading[0]):
-        raise ValueError("the reader misread the mirror's own test mail")
+    """Read the canaries; raises unless the reader makes of each what it is."""
+    for raw, read_right in _CANARIES:
+        if not read_right(_reading(raw, None)):
+            raise ValueError("the reader misread the mirror's own test mail")
+
+
+# ── The reader process ────────────────────────────────────────────────────────
+# The deadline on reading one mail (READ_SECONDS) is kept by the reader's own
+# looks at the clock wherever it can be — and those cannot end one call into
+# the standard library that does not come back, which is what two of the
+# three slow paths found last were: one regular expression over a Subject,
+# one header written back. Nothing in a thread ends such a call. A process
+# can be ended, so the running gateway reads its mail in one: this same
+# script, started with READER_FLAG, taking mails on its standard input and
+# answering on a pipe of its own (its standard output stays the log's, as
+# whatever a module prints when it is loaded expects). It costs a second interpreter (0.2 s to
+# start) and each mail's bytes across two pipes (nothing to speak of for an
+# ordinary mail; 0.2 s on the second a mail of 41 MB takes to read); it buys
+# a bound nothing a mail holds can get round.
+#
+#   gateway → reader   kind (M: a mail; C: read the canaries; S: a stub of
+#                      this header block; F: the facts of this header
+#                      block), the seconds it may take, a length and an
+#                      arrival time; that many bytes
+#   reader → gateway   H once, when it is ready; then per request a status,
+#                      a length and that many bytes:
+#                        M  the mail as read, or its stub; F its facts
+#                           (pickled, built-in types only)
+#                        K  the canaries read
+#                        U  refused by a bound: (kind, why)
+#                        T  its own look at the clock: out of time
+#                        E  the reader raised: (what, why)
+#
+# The reader is given none of the gateway's secrets: it reads text from
+# outside, and needs nothing but that text.
+
+READER_FLAG = "--reader"
+_REQUEST = struct.Struct("!cdQd")
+_ANSWER = struct.Struct("!cQ")
+_SECRET_NAME_RE = re.compile(r"PASS|TOKEN|SECRET|KEY", re.IGNORECASE)
+
+
+class ReaderDown(OSError):
+    """The reader process cannot be started or does not come up: like a full
+    disk, the mirror's surroundings failing — no mail is at fault, and the
+    pass ends (see _ENVIRONMENT)."""
+
+
+class _ReadFailed(Exception):
+    """What the reader process raised on a mail, by name — or that it ended."""
+
+    def __init__(self, what: str, why: str):
+        super().__init__(f"{what}: {why}" if why else what)
+        self.kind = what
+
+
+def _mail_from(plain: dict) -> Mail:
+    return Mail(**{**plain, "parts": [Part(**part) for part in plain["parts"]]})
+
+
+class _PlainUnpickler(pickle.Unpickler):
+    """Reads what the reader process answers: built-in types and nothing
+    else, whatever became of that process while it read text from outside."""
+
+    def find_class(self, module, name):
+        raise pickle.UnpicklingError(f"the reader's answer names {module}.{name}")
+
+
+def _unpickled(answer: bytes):
+    return _PlainUnpickler(io.BytesIO(answer)).load()
+
+
+def _serve_reader(answer_fd: int) -> None:
+    """The reader process: read each mail the gateway sends, within the time
+    it names, and answer on ``answer_fd``. Ends when the gateway closes the
+    pipe, or is gone."""
+    requests = sys.stdin.buffer
+    answers = os.fdopen(answer_fd, "wb")
+    # (The alarm set below must end this process, whatever it inherited.)
+    signal.signal(signal.SIGALRM, signal.SIG_DFL)
+    try:
+        _read_canary()      # everything the reading imports and compiles, once
+    except Exception:  # noqa: BLE001 - said when the gateway asks for the canaries
+        pass
+    answers.write(_ANSWER.pack(b"H", 0))
+    answers.flush()
+    while True:
+        head = requests.read(_REQUEST.size)
+        if len(head) < _REQUEST.size:
+            return
+        kind, seconds, length, date = _REQUEST.unpack(head)
+        raw = requests.read(length)
+        if len(raw) < length:
+            return
+        # Should the gateway be gone by then, or this process never get back
+        # to its own code: the alarm's default action ends it, in whatever
+        # call it is. (The gateway itself stops waiting sooner.)
+        signal.setitimer(signal.ITIMER_REAL, seconds + 2 * READER_GRACE_SECONDS)
+        try:
+            with _within(seconds):
+                if kind == b"C":
+                    _read_canary()
+                    status, answer = b"K", b""
+                elif kind == b"F":
+                    status, answer = b"F", pickle.dumps(_head_facts(raw))
+                else:
+                    date = None if date != date else date
+                    mail = stub_mail(raw, date, "") if kind == b"S" else _reading(raw, date)
+                    status, answer = b"M", pickle.dumps(
+                        {**vars(mail), "parts": [vars(part) for part in mail.parts]},
+                        protocol=pickle.HIGHEST_PROTOCOL)
+        except UnreadableMail as exc:
+            status, answer = b"U", pickle.dumps((exc.kind, str(exc)))
+        except TookTooLong:
+            status, answer = b"T", b""
+        except Exception as exc:  # noqa: BLE001 - RecursionError and MemoryError are among them
+            traceback.print_exc(limit=-8, file=sys.stderr)
+            status, answer = b"E", pickle.dumps((type(exc).__name__, str(exc)[:300]))
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        answers.write(_ANSWER.pack(status, len(answer)))
+        answers.write(answer)
+        answers.flush()
+        raw = mail = answer = None      # nothing of a mail is held while it waits
+
+
+class Reader:
+    """The gateway's side of the reader process: start it, hand it a mail,
+    wait for the answer no longer than the mail's deadline allows — and end
+    it when it does not answer. A process that was ended, or ended by
+    itself, is replaced when the next reading needs one."""
+
+    def __init__(self, command=None):
+        # (The number of the pipe it answers on is added as the last argument.)
+        self._command = command or [sys.executable, str(Path(__file__).resolve()), READER_FLAG]
+        self._process = None
+        self._answers = None    # the reading end of that pipe
+
+    def close(self) -> None:
+        process, self._process = self._process, None
+        answers, self._answers = self._answers, None
+        if answers is not None:
+            os.close(answers)
+        if process is None:
+            return
+        try:
+            process.kill()
+            process.wait(timeout=READER_GRACE_SECONDS)
+        except Exception:  # noqa: BLE001 - it is being dropped either way
+            pass
+        try:
+            process.stdin.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _start(self) -> None:
+        self.close()
+        try:
+            self._answers, theirs = os.pipe()
+            try:
+                self._process = subprocess.Popen(
+                    [*self._command, str(theirs)], stdin=subprocess.PIPE, bufsize=0,
+                    pass_fds=(theirs,),
+                    env={name: value for name, value in os.environ.items()
+                         if not _SECRET_NAME_RE.search(name)})
+            finally:
+                os.close(theirs)
+            os.set_blocking(self._process.stdin.fileno(), False)
+            status, _length = _ANSWER.unpack(self._receive(
+                _ANSWER.size, time.monotonic() + READER_START_SECONDS))
+        except (OSError, ValueError, struct.error, TookTooLong, _ReadFailed) as exc:
+            self.close()
+            raise ReaderDown("the mail reader process could not be started (" + (
+                "it ended before it was ready" if isinstance(exc, _ReadFailed)
+                else f"{type(exc).__name__}: {exc}") + ")") from exc
+        if status != b"H":
+            self.close()
+            raise ReaderDown("the mail reader process did not come up as one")
+
+    def _send(self, data: bytes, until: float) -> None:
+        fd, view = self._process.stdin.fileno(), memoryview(data)
+        while view:
+            left = until - time.monotonic()
+            if left <= 0:
+                raise TookTooLong("the reader process did not take it in time")
+            if not select.select([], [fd], [], left)[1]:
+                continue
+            try:
+                view = view[os.write(fd, view[:1 << 20]):]
+            except BlockingIOError:
+                continue
+            except OSError as exc:
+                raise _ReadFailed(READER_ENDED, str(exc)) from exc
+
+    def _receive(self, length: int, until: float) -> bytes:
+        fd, got = self._answers, bytearray()
+        while len(got) < length:
+            left = until - time.monotonic()
+            if left <= 0:
+                raise TookTooLong("the reader process did not answer in time")
+            if not select.select([fd], [], [], left)[0]:
+                continue
+            chunk = os.read(fd, min(length - len(got), 1 << 20))
+            if not chunk:
+                raise _ReadFailed(READER_ENDED, "")
+            got += chunk
+        return bytes(got)
+
+    def _ask(self, kind: bytes, raw: bytes, seconds: float, date: float | None):
+        """One request and its answer, ``(status, bytes)``. Raises
+        :class:`TookTooLong` when no answer came in time and the process was
+        ended for it, ``_ReadFailed`` when it ended by itself."""
+        if self._process is None or self._process.poll() is not None:
+            self._start()      # gone while nothing was asked of it: no mail's doing
+        until = time.monotonic() + seconds + READER_GRACE_SECONDS
+        try:
+            self._send(_REQUEST.pack(kind, seconds, len(raw),
+                                     float("nan") if date is None else date), until)
+            self._send(raw, until)
+            status, length = _ANSWER.unpack(self._receive(_ANSWER.size, until))
+            return status, self._receive(length, until)
+        except BaseException:
+            # No telling where in a request the pipes are: this one is done.
+            self.close()
+            raise
+
+    def read(self, raw: bytes, internal_date: float | None, seconds: float) -> Mail:
+        """:func:`_reading`, in the reader process and within ``seconds``."""
+        status, answer = self._ask(b"M", raw, seconds, internal_date)
+        if status == b"M":
+            return _mail_from(_unpickled(answer))
+        self._failed(status, answer)
+
+    def canary(self, seconds: float) -> None:
+        """:func:`_read_canary`, likewise."""
+        status, answer = self._ask(b"C", b"", seconds, None)
+        if status != b"K":
+            self._failed(status, answer)
+
+    def stub(self, head: bytes, internal_date: float | None, seconds: float) -> Mail:
+        """:func:`stub_mail` of a header block, likewise."""
+        status, answer = self._ask(b"S", head, seconds, internal_date)
+        if status == b"M":
+            return _mail_from(_unpickled(answer))
+        self._failed(status, answer)
+
+    def facts(self, head: bytes, seconds: float) -> dict:
+        """:func:`_head_facts`, likewise."""
+        status, answer = self._ask(b"F", head, seconds, None)
+        if status == b"F":
+            return _unpickled(answer)
+        self._failed(status, answer)
+
+    def _failed(self, status: bytes, answer: bytes):
+        if status == b"T":
+            raise TookTooLong("its reading was not done in time")
+        if status in (b"U", b"E"):
+            what, why = _unpickled(answer)
+            raise UnreadableMail(why, what) if status == b"U" else _ReadFailed(what, why)
+        self.close()
+        raise _ReadFailed(READER_ENDED, f"an answer of no known kind ({status!r})")
+
+
+# The reader process of the running gateway (main() makes it). Without one —
+# a Mirror built by hand, as the tests build theirs — a mail is read where
+# the mirror runs, with the reader's own looks at the clock for a deadline.
+READER = None
+
+
+def _read_seconds(size: int) -> float:
+    """How long the reading of a mail of ``size`` bytes may take."""
+    return READ_SECONDS + READ_SECONDS_PER_MB * size / 1_000_000
 
 
 def read_mail(raw: bytes, internal_date: float | None = None) -> Mail:
@@ -1120,27 +1680,96 @@ def read_mail(raw: bytes, internal_date: float | None = None) -> Mail:
     it is. A reader has every way to fail on text from outside: its own
     bounds, the parser's and the codecs' errors, a recursion that does not
     end, memory that does (a mail is some megabytes; what is made of it need
-    not be). No exception says whether the mail brought that out or the
-    reader is broken for every mail, so the reader is asked: the same reading
-    is run on the canary.
+    not be), time that runs out (:func:`_read_seconds`). No exception says
+    whether the mail brought that out or the reader is broken — or the
+    machine too slow — for every mail, so the reader is asked: the same
+    reading is run on the canaries, against the clock too (CANARY_SECONDS).
 
-      * It reads the canary: the reader works, and the failure is this
+      * It reads the canaries: the reader works, and the failure is this
         mail's — :class:`UnreadableMail`, a placeholder at once.
-      * It fails on the canary too: the fault is the mirror's —
-        :class:`MirrorFault`, and no mail is set aside over it."""
+      * It fails on a canary too, or is not done with them in their time:
+        the fault is the mirror's — :class:`MirrorFault`, and no mail is set
+        aside over it.
+
+    With a reader process (READER) both readings run there, and a process
+    that had to be ended over a mail is replaced before the canaries are
+    read; one that cannot be started is nobody's mail (:class:`ReaderDown`)."""
+    seconds = _read_seconds(len(raw))
     try:
-        return _reading(raw, internal_date)
-    except UnreadableMail:
-        raise   # refused on purpose, by a bound: the mail's
+        if READER is not None:
+            return READER.read(raw, internal_date, seconds)
+        with _within(seconds):
+            return _reading(raw, internal_date)
+    except (UnreadableMail, ReaderDown):
+        raise   # refused on purpose, by a bound: the mail's. No reader: nobody's.
+    except TookTooLong as exc:
+        failure, kind = exc, TOO_SLOW
+        why = f"{TOO_SLOW}: {exc} ({seconds:.0f} s for a mail of {_human_size(len(raw))})"
+    except _ReadFailed as exc:
+        failure, kind, why = exc, exc.kind, str(exc)[:300]
     except Exception as exc:  # noqa: BLE001 - RecursionError and MemoryError are among them
-        failure, why = exc, f"{type(exc).__name__}: {exc}"[:300]
+        failure, kind, why = exc, type(exc).__name__, f"{type(exc).__name__}: {exc}"[:300]
     try:
-        _read_canary()
+        if READER is not None:
+            READER.canary(CANARY_SECONDS)
+        else:
+            with _within(CANARY_SECONDS):
+                _read_canary()
+    except ReaderDown:
+        raise
+    except TookTooLong as exc:
+        raise MirrorFault(
+            f"the mail reader is too slow: it did not read the mirror's own test mail in "
+            f"{CANARY_SECONDS:.0f} s ({exc}), after a mail ({why})") from failure
     except Exception as exc:  # noqa: BLE001 - the reader is broken, whatever the mail
+        said = str(exc) if isinstance(exc, _ReadFailed) else f"{type(exc).__name__}: {exc}"
         raise MirrorFault(
             f"the mail reader fails on the mirror's own test mail "
-            f"({type(exc).__name__}: {exc}"[:200] + f") as it did on a mail ({why})") from failure
-    raise UnreadableMail(why) from failure
+            f"({said}"[:200] + f") as it did on a mail ({why})") from failure
+    raise UnreadableMail(why, kind) from failure
+
+
+def read_stub(raw: bytes, internal_date: float | None, reason: str) -> Mail:
+    """:func:`stub_mail` for the mirror: the placeholder of a mail that
+    could not be read. Never raises (but for :class:`ReaderDown`).
+
+    A stub is read off the mail's header block — the block the reading may
+    just have failed on, or run out of time over. So it is read as guarded
+    as the mail was: where the mail is read (the reader process, when there
+    is one), and against the clock; a header block is small, and gets what
+    the canaries get. When that fails as well the mail is still a
+    placeholder: one that nothing was parsed for (:func:`_bare_stub`)."""
+    try:
+        head = _head_and_rest(raw)[0]
+    except Exception:  # noqa: BLE001
+        head = bytes(raw[:MAX_HEADER_BYTES])
+    try:
+        if READER is None:
+            with _within(CANARY_SECONDS):
+                return stub_mail(head, internal_date, reason)
+        mail = READER.stub(head, internal_date, CANARY_SECONDS)
+        mail.unreadable = reason
+        return mail
+    except ReaderDown:
+        raise
+    except (Exception, TookTooLong) as exc:  # noqa: BLE001
+        print(f"[mail-gateway] not even the header block of a mail could be read "
+              f"({type(exc).__name__}: {exc}); its placeholder carries none of it", flush=True)
+        return _bare_stub(head, internal_date, reason)
+
+
+def read_head(head: bytes) -> dict | None:
+    """:func:`_head_facts` for the mirror — a header block read as guarded
+    as a mail (see read_stub); None when it cannot be read, or not in time."""
+    try:
+        if READER is None:
+            with _within(CANARY_SECONDS):
+                return _head_facts(head)
+        return READER.facts(head, CANARY_SECONDS)
+    except ReaderDown:
+        raise
+    except (Exception, TookTooLong):  # noqa: BLE001 - no id can be read off it
+        return None
 
 
 def _human_size(count: int) -> str:
@@ -1600,7 +2229,9 @@ class Mailbox:
 #              has no record of its own ("news"; "draft", in the archive;
 #              "other" for a mail that came under the id of a placeholder
 #              and is not the copy that was made from — Mirror._mirror_one),
-#              so it is not read again.
+#              so it is not read again. "again" is the opposite, a note
+#              with no id: what was known of this UID no longer holds, and
+#              it is to be read anew (Mirror._read_noted).
 #              Rows of an older generation are stale: mails to find again.
 #   mails      one row per mirrored mail: its record file, direction, chat and
 #              the facts a Thread answer needs. An empty `record` is a claim —
@@ -1843,6 +2474,8 @@ class Mirror:
         self._retry_queue: list = []
         self._retry_round = 0
         self._retried: dict = {}      # placeholder → (re-reads that changed nothing, next round)
+        self._retry_spent = 0.0       # seconds of this round's re-reading
+        self._made: dict = {}         # why → placeholders made since this start
         self._prepare()
 
     @staticmethod
@@ -2007,28 +2640,36 @@ class Mirror:
         # it, and the folders are read again so a mail still there is mirrored
         # anew (everything up to the high-water mark becomes the backfill's).
         lost = [mid for mid in rows if mid not in by_id]
+        noted = 0
         for mid in lost:
             self.index.run("DELETE FROM mails WHERE message_id = ?", (mid,))
+            noted += self.index.run(
+                "UPDATE locations SET message_id = NULL, skipped = 'again' "
+                "WHERE message_id = ? AND role = 'archive'", (mid,))
             self.index.run("DELETE FROM locations WHERE message_id = ?", (mid,))
         # Places that say nothing true go the same way: those of a mail
         # whose record was dropped to be written anew and then was not
         # (_mirror_one), and the mark older builds put on a mail they could
         # not write even a placeholder for — no mail is set aside over a
-        # failed write any more (_ingest), so these are read again.
-        stray = self.index.run(
-            "DELETE FROM locations WHERE skipped = 'unreadable' OR (skipped IS NULL "
-            "AND message_id IS NOT NULL "
-            "AND message_id NOT IN (SELECT message_id FROM mails))")
+        # failed write any more (_ingest), so these are read again. In INBOX
+        # and Sent by the backfill; the archive is read by none, and its
+        # mark is long past the UID, so there the place stays (above, too),
+        # as a note to read that UID again (_read_noted).
+        untrue = ("skipped = 'unreadable' OR (skipped IS NULL AND message_id IS NOT NULL "
+                  "AND message_id NOT IN (SELECT message_id FROM mails))")
+        noted += self.index.run("UPDATE locations SET message_id = NULL, skipped = 'again' "
+                                f"WHERE role = 'archive' AND ({untrue})")
+        stray = self.index.run(f"DELETE FROM locations WHERE {untrue}")
         if stray or any(rows[mid]["record"] for mid in lost):
             self.index.run("UPDATE folders SET ceiling = hwm")
             self.index.set("backfill_done", "0")
             self._plan = None
         self.index.run("DELETE FROM claims WHERE message_id NOT IN "
                        "(SELECT message_id FROM mails WHERE record = '')")
-        if unknown or owed or lost or stray:
+        if unknown or owed or lost or stray or noted:
             print(f"[mail-gateway] mailbox index reconciled with the ledger: "
                   f"{len(unknown)} record(s) adopted, {len(lost)} row(s) dropped, "
-                  f"{stray} place(s) of no record cleared; "
+                  f"{stray + noted} place(s) of no record cleared; "
                   f"announced to the rail: {len(claimed)} mail(s), {len(merged)} merge(s), "
                   f"{sum(map(len, removed.values()))} removal(s)", flush=True)
         # Where the thread index and the records disagree, a merge was begun
@@ -2050,23 +2691,43 @@ class Mirror:
         mail — the copy the placeholder was made from, and no other mail
         under its id (_mirror_one). One that still does not read stays
         exactly as it is — nothing is dropped in order to try — and is tried
-        less and less often, since each try fetches it whole."""
+        less and less often, since each try fetches it whole.
+
+        And reads it whole: a mail that is a placeholder because its reading
+        took too long takes that long again, with the mirror's one thread.
+        So a round has SET_ASIDE_ROUND_SECONDS for all its readings, those
+        tried least often first; what it does not get to waits for the next
+        round. However many such mails a mailbox holds, reading them again
+        costs the mirror that share of its time and no more."""
         now = self._clock()
         if not self._retry_queue and now >= self._retry_at:
             self._retry_at = now + SET_ASIDE_RETRY_SECONDS
             aside = sorted(self._placeholders)
             self._retried = {mid: self._retried[mid] for mid in aside if mid in self._retried}
             self._retry_round += 1
-            self._retry_queue = [mid for mid in aside
-                                 if self._retried.get(mid, (0, 0))[1] <= self._retry_round]
+            self._retry_spent = 0.0
+            self._retry_queue = sorted(
+                (mid for mid in aside
+                 if self._retried.get(mid, (0, 0))[1] <= self._retry_round),
+                key=lambda mid: (self._retried.get(mid, (0, 0))[0], mid))
             if self._retry_queue:
                 print(f"[mail-gateway] reading again {len(self._retry_queue)} mail(s) "
                       f"mirrored as placeholders", flush=True)
         done = 0
         while self._retry_queue and (limit is None or done < limit):
+            if self._retry_spent > SET_ASIDE_ROUND_SECONDS:
+                print(f"[mail-gateway] {len(self._retry_queue)} placeholder(s) wait for the "
+                      f"next round: this one has read for {self._retry_spent:.0f} s",
+                      flush=True)
+                self._retry_queue = []
+                break
             # (Taken off the queue only once it is dealt with: a pass that
             # fails reads it again.)
-            self._read_again(self._retry_queue[0], policy)
+            began = time.monotonic()
+            try:
+                self._read_again(self._retry_queue[0], policy)
+            finally:
+                self._retry_spent += time.monotonic() - began
             self._retry_queue.pop(0)
             done += 1
         return bool(self._retry_queue)
@@ -2119,6 +2780,13 @@ class Mirror:
     def health_notice(self) -> str | None:
         """What an operator should know while the mirror works."""
         return self.notice
+
+    def placeholders(self) -> dict:
+        """What /health says of mail mirrored as placeholders: how many are
+        on record now, how many were made since this start, and why — by
+        the few words each reason comes under (UnreadableMail.kind)."""
+        made = dict(self._made)
+        return {"standing": len(self._placeholders), "made": sum(made.values()), "why": made}
 
     def thread(self, chat: str, claimed: str | None = None) -> dict | None:
         """The ``Thread`` answer for one chat key, or None for no such chat.
@@ -2233,8 +2901,10 @@ class Mirror:
                         or self._settle_unlocated(RELOCATE_BATCH))
             if self._read and not more:
                 # Not held back by an archive folder that will not answer:
-                # these read INBOX and Sent, and call nothing gone.
-                more = (self._retry_set_aside(policy, backfill_limit)
+                # these read INBOX and Sent (the archive only when it
+                # answers), and call nothing gone.
+                more = (self._read_noted(policy, backfill_limit)
+                        or self._retry_set_aside(policy, backfill_limit)
                         or self._backfill(policy, backfill_limit))
             if rail_up:
                 self._flush_rail()
@@ -2481,9 +3151,11 @@ class Mirror:
             return None
         try:
             head = _head_and_rest(got.raw)[0]
-            return _identify(_parse_bytes(head + b"\r\n\r\n"), head)
-        except Exception:  # noqa: BLE001 - no id can be read off it: it matches none
+        except Exception:  # noqa: BLE001
             return None
+        # (No id can be read off it: it matches none.)
+        facts = read_head(head)
+        return facts["id"] if facts else None
 
     def _carried_whole(self, message_id: str) -> bool:
         """Whether the mail's own Message-ID header holds its id in one piece.
@@ -2494,11 +3166,8 @@ class Mirror:
         mail it holds. Read off the header block the record keeps; where that
         cannot be read the answer is no, and the mail is looked for the slow
         way, which is right for every mail."""
-        header = self._recorded_header(message_id)
-        try:
-            return header is not None and message_id in _raw_header(header, "Message-ID")
-        except Exception:  # noqa: BLE001
-            return False
+        facts = self._recorded_facts(message_id)
+        return facts is not None and message_id in facts["message_id"]
 
     def _recorded_head(self, message_id: str) -> bytes | None:
         """The header block a mail's record keeps, as it was stored (see
@@ -2511,15 +3180,11 @@ class Mirror:
         got = _ibstore.load_media(INBOUND_STORE_DIR, media_id) if media_id else None
         return got[0] if got is not None else None
 
-    def _recorded_header(self, message_id: str):
-        """The same, parsed; None when it cannot be."""
+    def _recorded_facts(self, message_id: str) -> dict | None:
+        """What that header block says (:func:`read_head`); None when there
+        is none, or it cannot be read."""
         head = self._recorded_head(message_id)
-        if head is None:
-            return None
-        try:
-            return _parse_bytes(head + b"\n\n")
-        except Exception:  # noqa: BLE001
-            return None
+        return read_head(head) if head is not None else None
 
     def _find(self, role: str, message_id: str, ts: float | None,
               arrived: float | None = None):
@@ -2624,15 +3289,19 @@ class Mirror:
         "In none" is what every folder *answered*. A folder that could not
         say (UNSURE) leaves the mail as it is, and one the server would not
         open or search ends the pass (MailboxError) — after the mails already
-        found gone in it have been tombstoned and announced."""
+        found gone in it have been tombstoned and announced.
+
+        A place marked as another mail's ("other", see _mirror_one) is no
+        place of the mail on record: a placeholder whose own copy is gone is
+        in none, whatever else lies in the mailbox under its id."""
         # (When the gateway sends mail itself, a record will exist before its
         # Sent copy is visible; that phase must keep such a mail out of here
         # until the copy has had time to appear.)
         after = self._settle_after or (-1.0, "")
         waiting = self.index.rows(
             "SELECT * FROM mails m WHERE m.removed = 0 AND m.record != '' AND NOT EXISTS "
-            "(SELECT 1 FROM locations l WHERE l.message_id = m.message_id) "
-            "AND (m.ts, m.message_id) > (?, ?) "
+            "(SELECT 1 FROM locations l WHERE l.message_id = m.message_id "
+            "AND l.skipped IS NOT 'other') AND (m.ts, m.message_id) > (?, ?) "
             "ORDER BY m.ts, m.message_id LIMIT ?", (*after, limit + 1))
         gone, failure = [], None
         try:
@@ -2644,7 +3313,10 @@ class Mirror:
                     uid = self._find(role, row["message_id"], row["ts"], row["arrived"])
                     if uid is UNSURE:
                         unsure = True
-                    elif uid is not None:
+                    elif uid is not None and self.index.one(
+                            "SELECT 1 FROM locations l JOIN folders f ON f.role = l.role "
+                            "AND f.gen = l.gen WHERE l.role = ? AND l.uid = ? "
+                            "AND l.skipped = 'other'", (role, uid)) is None:
                         self._locate(role, uid, row["message_id"])
                         break
                 else:
@@ -2667,7 +3339,12 @@ class Mirror:
         announces it as one transaction. A stop in between leaves tombstones
         the index holds for live mail, which the next start announces
         (_prepare) — and a failed transaction leaves them unlocated, so the
-        next pass comes here again."""
+        next pass comes here again.
+
+        What still lies in the mailbox under a buried id — a place marked
+        "other" beside a placeholder — is another mail's no longer: it is
+        noted to be read again (_read_noted), and is then mirrored as the
+        mail it is, in the tombstone's place."""
         buried: dict = {}
         for row in rows:
             # The mail's blobs were stored for its record alone (_store_parts):
@@ -2690,10 +3367,36 @@ class Mirror:
                 # must say what a rebuild from the ledger would.
                 (f"UPDATE mails SET removed = 1, recipients = '[]', cc = '[]' "
                  f"WHERE message_id IN ({marks})", tuple(message_ids)),
+                (f"UPDATE locations SET message_id = NULL, skipped = 'again' "
+                 f"WHERE skipped = 'other' AND message_id IN ({marks})", tuple(message_ids)),
                 self._event("removed", {"channel": CHANNEL, "account": ACCOUNT, "chat": chat,
                                         "message_ids": message_ids, "live": live})])
             print(f"[mail-gateway] {len(message_ids)} mail(s) of chat {chat!r} left the "
                   f"mailbox ({live} still there)", flush=True)
+
+    def _read_noted(self, policy, limit: int | None) -> bool:
+        """Read the UIDs noted for another reading ("again"): what was known
+        of them no longer holds — the record a place stood for could not be
+        written anew (_prepare), the placeholder it lay beside is gone
+        (_bury) — and nothing else would come back to them: the backfill
+        reads INBOX and Sent only, and no folder's mark is moved down. Old
+        mail, quietly. True while some are left for the next pass."""
+        noted = self.index.rows(
+            "SELECT l.role, l.gen, l.uid FROM locations l JOIN folders f ON f.role = l.role "
+            "AND f.gen = l.gen WHERE l.skipped = 'again' ORDER BY l.role, l.uid")
+        done = 0
+        for row in noted:
+            name = self._folders.get(row["role"])
+            if not name or (row["role"] == "archive" and not self._settled):
+                continue   # the archive is not answering: another pass's
+            if limit is not None and done >= limit:
+                return True
+            self._ingest(row["role"], name, row["uid"], policy, backfill=True)
+            # (Still noted: the server no longer holds the mail — see _ingest.)
+            self.index.run("DELETE FROM locations WHERE role = ? AND gen = ? AND uid = ? "
+                           "AND skipped = 'again'", (row["role"], row["gen"], row["uid"]))
+            done += 1
+        return False
 
     # -- backfill --------------------------------------------------------------
 
@@ -2754,16 +3457,17 @@ class Mirror:
 
           * READING the mail — the parse, the walk of its parts, the trim
             (:func:`read_mail`) — fails on the mail's account when the
-            reader still reads the canary. The mail is mirrored as a
-            placeholder (:func:`stub_mail`) at once, and the folder goes on:
+            reader still reads the canaries. The mail is mirrored as a
+            placeholder (:func:`read_stub`) at once, and the folder goes on:
             a mail is its sender's to write, and must stop neither the mails
             behind it nor the backfill.
-          * A reader that cannot read the canary either is the mirror's
-            fault, and so is every failure in WRITING — the ledger, the
-            indexes, the blobs — whatever mail was in hand: next to nothing
-            of a mail decides whether its record can be written, and a
-            mirror that set aside what it could not write would turn a
-            corrupt index or a bug into a mailbox of placeholders, quietly.
+          * A reader that cannot read the canaries either, or not in
+            their time, is the mirror's fault; so is a reader process that
+            cannot be started, and so is every failure in WRITING — the
+            ledger, the indexes, the blobs — whatever mail was in hand: next
+            to nothing of a mail decides whether its record can be written,
+            and a mirror that set aside what it could not write would turn
+            a corrupt index or a bug into a mailbox of placeholders, quietly.
             These end the pass (what the mailbox, a disk or an index file
             raised, as it is; anything else as a :class:`MirrorFault` that
             names the mail). Nothing is recorded, marked or skipped: the
@@ -2773,6 +3477,7 @@ class Mirror:
         if fetched is None:
             return   # the server's answer: expunged between the listing and now
         where = f"{name!r} UID {uid}"
+        why = None
         try:
             mail = read_mail(fetched.raw, fetched.date)
         except UnreadableMail as exc:
@@ -2781,7 +3486,10 @@ class Mirror:
                   f"placeholder: {exc}" + ("\n" + "".join(traceback.format_exception(
                       type(cause), cause, cause.__traceback__, limit=-8)) if cause else ""),
                   flush=True)
-            mail = stub_mail(fetched.raw, fetched.date, str(exc))
+            mail = read_stub(fetched.raw, fetched.date, str(exc))
+            # (Counted for /health only where a placeholder is made of it: a
+            # placeholder read again in vain is the one already on record.)
+            why = None if mail.message_id in self._placeholders else exc.kind
         except MirrorFault as exc:
             raise MirrorFault(f"{exc}: the mail at {where} is not set aside over it — the "
                               f"pass ends there, and nothing is skipped") from exc
@@ -2794,6 +3502,8 @@ class Mirror:
                 f"the mail at {where} could not be written ({type(exc).__name__}: "
                 f"{exc}"[:300] + "): it is not set aside over that — the pass ends "
                 "there, and nothing is skipped") from exc
+        if why is not None and mail.message_id in self._placeholders:
+            self._made[why] = self._made.get(why, 0) + 1
 
     def _mirror_one(self, role: str, uid: int, mail: Mail, fetched: Fetched, policy,
                     backfill: bool) -> None:
@@ -2812,7 +3522,7 @@ class Mirror:
             and self.index.get("archive_own") is not None)
         known = self.index.one("SELECT * FROM mails WHERE message_id = ? AND record != ''",
                                (mail.message_id,))
-        revived = False
+        revived = healed = False
         if known is not None:
             if known["removed"]:
                 # Back from wherever it had gone (out of the Trash, say): the
@@ -2829,8 +3539,8 @@ class Mirror:
             elif role == "inbox" and known["direction"] == "out" and mail.sender \
                     and mail.sender == known["sender"] \
                     and mail.sender not in OWN_ADDRESSES \
-                    and self._sent_on(mail, _is_resent(
-                        self._recorded_header(mail.message_id))):
+                    and self._sent_on(mail, bool(
+                        (self._recorded_facts(mail.message_id) or {}).get("resent"))):
                 # The other way round: recorded from a Sent copy that says
                 # itself it was sent on, and here is its INBOX copy, from
                 # someone else. Somebody's mail the user redirected is still
@@ -2840,20 +3550,29 @@ class Mirror:
                 # the sender's to choose, and whoever was sent a mail knows
                 # its id — replaces nothing.)
                 pass
-            elif mail.unreadable is None and mail.message_id in self._placeholders:
+            elif mail.message_id in self._placeholders:
                 if not self._placeholder_of(mail):
                     # A mail under the id of one on record as a placeholder
-                    # — and not the copy that was made from. Ids are the
-                    # sender's to choose, and whoever was sent a mail knows
-                    # its id: this one replaces nothing either. It is one
-                    # more place, marked so that the placeholder's reading
-                    # again does not come back to it.
+                    # — and not the copy that was made from, whether it
+                    # reads or not (a mail that cannot be read still has its
+                    # header block). Ids are the sender's to choose, and
+                    # whoever was sent a mail knows its id: this one
+                    # replaces nothing either. It is one more place, marked
+                    # so that the placeholder's reading again does not come
+                    # back to it — or stay with it, for good, in place of
+                    # the copy that may read by now.
                     self._locate(role, uid, mail.message_id, "other")
+                    return
+                if mail.unreadable is not None:
+                    # The copy itself, and it still does not read: the
+                    # record it has is the one it keeps.
+                    self._locate(role, uid, mail.message_id)
                     return
                 # On record as a placeholder, and here is the very copy it
                 # was made from, read: the mail takes the placeholder's
                 # place, as what that was recorded as.
                 outbound = known["direction"] == "out"
+                healed = True
             else:
                 self._locate(role, uid, mail.message_id)
                 return
@@ -2874,6 +3593,12 @@ class Mirror:
                 self._reconcile = True
             raise
         self._locate(role, uid, mail.message_id)
+        if healed:
+            # No placeholder any more: what else lies under its id is a
+            # second copy like any mail's — one more place of the mail on
+            # record, not set apart from it.
+            self.index.run("UPDATE locations SET skipped = NULL WHERE message_id = ? "
+                           "AND skipped = 'other'", (mail.message_id,))
 
     def _placeholder_of(self, mail: Mail) -> bool:
         """Whether ``mail`` is the copy its placeholder was made from, read
@@ -3288,6 +4013,7 @@ def _loop_step(mirror: Mirror, loop: dict) -> float:
             loop["synced"] = now
         _set_state(connected=mirror.fault is None, error=mirror.fault,
                    notice=mirror.health_notice(), blocked=None, last_poll=time.time())
+        loop["faults"] = 0
         if more:
             return MAIL_BACKFILL_PAUSE_SECONDS
         return max(1.0, MAIL_POLL_SECONDS - (time.time() - loop.get("synced", now)))
@@ -3301,7 +4027,17 @@ def _loop_step(mirror: Mirror, loop: dict) -> float:
         # and the gateway monitor must not word that as a refused login.
         _set_state(connected=False, blocked="mirror",
                    error=f"the mirror stopped on an internal error: {exc}"[:500])
-        print(f"[mail-gateway] poll failed: {exc}\n{traceback.format_exc()}", flush=True)
+        # Nothing changes between two tries that fail the same way, and each
+        # fetches the mail in hand whole again before it gets to where it
+        # failed (a full disk and one mail of 50 MB: 72 GB a day off a
+        # server that counts). So the wait doubles with every such failure
+        # in a row, up to an hour, and a pass that goes through resets it.
+        loop["faults"] = faults = loop.get("faults", 0) + 1
+        wait = min(max(MIRROR_FAULT_WAIT_MAX_SECONDS, MAIL_POLL_SECONDS),
+                   MAIL_POLL_SECONDS * 2 ** min(faults - 1, 16))
+        print(f"[mail-gateway] poll failed ({faults} time(s) in a row; next try in "
+              f"{wait:.0f} s): {exc}\n{traceback.format_exc()}", flush=True)
+        return float(wait)
     # A whole interval after a failure: a refused login retried every few
     # seconds is how a mailbox gets locked.
     return float(MAIL_POLL_SECONDS)
@@ -3450,7 +4186,7 @@ def _serve_http() -> None:
 
 
 def main() -> None:
-    global MIRROR
+    global MIRROR, READER
     if not CONFIGURED:
         # Stay up with /health reporting configured: false, like the other
         # gateways: an unconfigured channel is a deployment choice, not a fault.
@@ -3464,6 +4200,9 @@ def main() -> None:
     elif MAIL_CONFIG is None:
         print(f"[mail-gateway] the mailbox is not usable: {CONFIG_PROBLEM}", flush=True)
     else:
+        # Started with the first mail it is to read, and again whenever one
+        # had to be ended.
+        READER = Reader()
         MIRROR = Mirror(Mailbox(MAIL_CONFIG))
         print(f"[mail-gateway] mirroring {ACCOUNT} (read-only; backfill "
               f"{MAIL_BACKFILL_DAYS} days)", flush=True)
@@ -3473,4 +4212,7 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    if sys.argv[1:2] == [READER_FLAG]:
+        _serve_reader(int(sys.argv[2]))
+    else:
+        main()

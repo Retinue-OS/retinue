@@ -2344,6 +2344,64 @@ def test_health_states():
     print("ok: health reports unconfigured, misconfigured, connected and failed")
 
 
+def test_a_fault_of_the_mirror_is_tried_again_less_and_less_often():
+    """While a fault of the mirror's own lasts, every turn of the loop
+    fetches the mail in hand whole again before it gets to where it failed,
+    and nothing changes between two turns that fail the same way: a full
+    disk and one mail of 18 MB were 180 MB off the server in ten minutes,
+    and at the fetch limit 72 GB a day. The wait doubles with every such
+    failure in a row, up to an hour; a pass that goes through resets it."""
+    with tempfile.TemporaryDirectory() as tmp:
+        gw = load(tmp)
+        _write_policy(gw)
+        rail(gw)
+        box = FakeMailbox(gw)
+        gw.MIRROR = mirror = gw.Mirror(box, clock=lambda: NOW)
+        loop: dict = {}
+        assert gw._loop_step(mirror, loop) <= gw.MAIL_POLL_SECONDS == 60.0
+        box.put("INBOX", msg("big@x.org", day=39.9))
+        real = gw._ibstore.store_media
+        gw._ibstore.store_media = lambda *a, **kw: (_ for _ in ()).throw(
+            OSError(28, "No space left on device"))
+        try:
+            loop.pop("synced")
+            waits = [gw._loop_step(mirror, loop) for _ in range(9)]
+            assert waits == [60.0, 120.0, 240.0, 480.0, 960.0, 1920.0, 3600.0, 3600.0, 3600.0]
+            assert gw.MIRROR_FAULT_WAIT_MAX_SECONDS == 3600.0
+            # (Each try still fetches the mail once: the saving is the wait.)
+            assert len(box.fetched) == 9 and records(gw) == []
+            snap = gw._health_snapshot()
+            assert snap["connected"] is False and snap["blocked"] == "mirror"
+            assert "No space left" in snap["error"]
+            # A mailbox that does not answer is another matter: it is asked
+            # again after one interval, and is neither such a failure nor a
+            # pass that went through.
+            box.fail = gw.MailboxError("the IMAP connection failed: timed out")
+            assert gw._loop_step(mirror, loop) == gw.MAIL_POLL_SECONDS
+            assert gw._health_snapshot()["blocked"] is None
+            assert gw._loop_step(mirror, loop) == 3600.0
+        finally:
+            gw._ibstore.store_media = real
+        # The disk has room again: the pass goes through, and the next
+        # fault of the mirror starts at one interval.
+        assert gw._loop_step(mirror, loop) <= gw.MAIL_POLL_SECONDS
+        assert gw._health_snapshot()["connected"] is True and len(records(gw)) == 1
+        mirror.poll = lambda **kw: 1 / 0
+        assert [gw._loop_step(mirror, loop) for _ in range(2)] == [60.0, 120.0]
+    with tempfile.TemporaryDirectory() as tmp:
+        # Never less than the poll interval a deployment set, however long.
+        gw = load(tmp, MAIL_POLL_SECONDS=7200)
+        _write_policy(gw)
+        rail(gw)
+        gw.MIRROR = mirror = gw.Mirror(FakeMailbox(gw), clock=lambda: NOW)
+        mirror.poll = lambda **kw: 1 / 0
+        assert [gw._loop_step(mirror, {}) for _ in range(2)] == [7200.0, 7200.0]
+        loop = {}
+        assert [gw._loop_step(mirror, loop) for _ in range(3)] == [7200.0, 7200.0, 7200.0]
+    print("ok: after a fault of its own the mirror waits twice as long each time, up to "
+          "an hour, and a pass that goes through resets the wait")
+
+
 def test_missing_folders_are_reported():
     with tempfile.TemporaryDirectory() as tmp:
         gw = load(tmp)

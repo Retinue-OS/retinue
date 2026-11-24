@@ -94,7 +94,8 @@ def test_the_service_names_what_it_reads_and_nothing_else():
     tunables = {"MAIL_ACCOUNT_NAME", "MAIL_OWN_ADDRESSES", "MAIL_ARCHIVE_FOLDER",
                 "MAIL_TRASH_FOLDER", "MAIL_POLL_SECONDS", "MAIL_BACKFILL_DAYS",
                 "MAIL_BACKFILL_BATCH", "MAIL_BACKFILL_PAUSE_SECONDS", "MAIL_IMAP_TIMEOUT",
-                "MAIL_MAX_PART_BYTES", "MAIL_MAX_MAIL_BYTES", "MAIL_TRIM_WANTING_CHARS",
+                "MAIL_MAX_PART_BYTES", "MAIL_MAX_MAIL_BYTES", "MAIL_READ_SECONDS",
+                "MAIL_TRIM_WANTING_CHARS",
                 "MAIL_DATA_DIR", "MAIL_GATEWAY_HTTP_PORT", "MAIL_GATEWAY_TOKEN",
                 "MAIL_POLICY_WAIT_SECONDS", "MAIL_RECENT_CHATS_MAX", "MAIL_RAIL_TIMEOUT",
                 # The default account idles where the channel set leaves out email.
