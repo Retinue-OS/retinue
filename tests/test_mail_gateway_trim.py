@@ -425,7 +425,8 @@ def test_settled_meanwhile_and_an_unreadable_part():
             # it stays wanting.
             record = t.by_id(gw)["html@x.org"]
             media_id = gw._ibstore.media_id_of(record["html_part"])
-            blob_path = next(gw._ibstore.media_dir(gw.INBOUND_STORE_DIR).glob(media_id + "*"))
+            # The blob itself, not one of its sidecars (.type, .name, .meta).
+            blob_path = gw._ibstore.media_dir(gw.INBOUND_STORE_DIR) / media_id
             held = blob_path.read_bytes()
             blob_path.unlink()
             try:
