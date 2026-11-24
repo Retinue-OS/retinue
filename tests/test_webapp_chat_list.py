@@ -117,6 +117,10 @@ await import('./chats.js');
 const List = registry.get('retinue-chats');
 assert.ok(List, 'the element registered itself');
 const { listGroup, deriveListGroup } = await import('./chats.js');
+// What the list tells the shelf (the minimized chat's count).
+const { shelf } = await import('./shelf-store.js');
+const observed = [];
+shelf.observe = (key, obs) => observed.push([key, obs]);
 
 const chat = (id, extra = {}) => ({
   id, channel: 'signal', account: '+41000', key: id, name: 'N' + id, group: false,
@@ -299,6 +303,16 @@ await ok('swipe right on Unread marks read: POST {seen}, the row moves to Read, 
   await settle();
   assert.deepEqual(rowIds(html(el)), ['u2', 'u3', 'u1'], 'back in Unread');
   assert.ok(html(el).includes('title="3 unread"'), 'with its count');
+});
+
+await ok('the shelf hears the count the read left, not a zero taken for granted', async () => {
+  const el = await mount(payload(LIST, COUNTS));
+  observed.length = 0;
+  el._markRead('u3');
+  take((w) => w.method === 'POST', 'the read')
+    .answer({ id: 'u3', last_read: '2026-11-21T09:00:00Z', previous: null, unread: 1, list_group: 'unread' });
+  await settle();
+  assert.deepEqual(observed.filter(([key]) => key === 'chat:u3').map(([, o]) => o.unread), [1]);
 });
 
 await ok('a read never marked before undoes to no mark at all', async () => {

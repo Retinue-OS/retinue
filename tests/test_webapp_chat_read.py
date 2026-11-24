@@ -459,6 +459,23 @@ await ok('a newer inbound message moves the button under it, and ends an Undo', 
   assert.equal(el._thread.layout().filter((x) => x === 'ROW' || x === 'UNDO').length, 1, 'one row only');
 });
 
+await ok('a mark that moved while the chat stayed read ends the Undo', async () => {
+  const el = await open({ unread: 1, list_group: 'unread' });
+  const p = el._markRead();
+  take((w) => w.method === 'POST', 'the read').answer({ id: ID, last_read: 'L', previous: 'P', unread: 0, list_group: 'read' });
+  await p;
+  // The server's summary still says the mark this page set: the Undo stands.
+  await poll(el, { unread: 0, list_group: 'read', last_read: 'L' }, BASE);
+  assert.ok(el._readUndo, 'the mark is still this page\'s');
+  assert.equal(el._thread.layout().slice(-1)[0], 'UNDO');
+  // A reply from the phone: the chat stays read with the same count, but
+  // the mark is a newer one — the server would answer the Undo 409.
+  const next = [...BASE, msg('m6', 'out', '2026-11-20T10:00:00Z', { author: 'device' })];
+  await poll(el, { unread: 0, list_group: 'read', last_read: '2026-11-20T10:00:00Z' }, next);
+  assert.equal(el._readUndo, null, 'nothing of this page\'s mark is left to undo');
+  assert.ok(!el._thread.layout().includes('UNDO'), 'and no Undo is offered');
+});
+
 await ok('a reply from elsewhere, seen on the next poll, takes the button away', async () => {
   const el = await open({ unread: 1, list_group: 'unread' });
   const next = [...BASE, msg('m6', 'out', '2026-11-20T10:00:00Z', { author: 'device' })];
