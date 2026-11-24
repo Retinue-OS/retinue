@@ -26,6 +26,15 @@ moves nothing back. Archiving also settles the chat's attention item; an
 archive made by an instructed turn means the message that turn works rings
 nothing.
 
+A turn that works an arriving mail archives only what it was given
+(docs/dashboard.md, "The gate for mail"). Where a mail has arrived in the
+thread since the turn's own, the thread is not archived — the turn never saw
+that mail — and only the mails the turn worked leave the inbox; the answer
+says so (``"archived": false, "reason": "newer mail arrived"``) and this
+prints a note: say it in the verdict, and let the verdict's importance
+decide. An archive or mute such a turn made is undone if it ends without a
+verdict, fails or runs past its timeout, and the mail then rings.
+
 `--star` / `--unstar` exist for the same reason they do on a dashboard thread
 (conversation-push.py): the star is the user's, so set or clear it only on
 their word, and never archive a starred chat on your own initiative.
@@ -133,6 +142,11 @@ def main() -> int:
         return 1
 
     print(json.dumps(body, ensure_ascii=False))
+    if body.get("reason") and payload.get("archived") is not False \
+            and not body.get("archived"):
+        print(f"chat-flags: the thread was not archived ({body['reason']}): it stays in "
+              "the user's list with that mail; only the mail this turn worked left the "
+              "inbox. Say so in the verdict.", file=sys.stderr)
     return 0
 
 

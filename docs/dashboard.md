@@ -1360,8 +1360,8 @@ adopts). What the web gateway does with the event, by who sent the mail:
   holder by the address book's name; for a sender known by a domain it is
   the name the mail carried with the organisation's beside it.
 - **The turn** is the messengers' (`_start_chat_arrival_turn`, the verdict
-  endpoint, `CHAT_INSTRUCTION_TIMEOUT`, the failure rule), worded for a mail
-  (`_mail_arrival_prompt`). Everything a mail says of itself — its sender's
+  endpoint, the failure rule), worded for a mail (`_mail_arrival_prompt`),
+  with a timeout of its own (`MAIL_INSTRUCTION_TIMEOUT`, below). Everything a mail says of itself — its sender's
   name and address, its subject, its `Message-ID`, its trimmed text, the
   first `MAIL_ARRIVAL_QUOTE_CHARS` (8000) characters of it — stands in one
   quoted block, escaped, and none of it in a sentence that tells the turn
@@ -1397,34 +1397,70 @@ adopts). What the web gateway does with the event, by who sent the mail:
   queue of owed calls. `scripts/chat-flags.py --chat <id> --archive |
   --unarchive | --mute | --unmute` is its CLI (`--star` / `--unstar` only on
   the user's word, as for a thread). There is no delete: erasing a chat is
-  the user's own act. A merged thread's id answers `410` here as everywhere.
-- **A thread its turn archived rings nothing.** An archive made through the
-  internal endpoint while the chat's instructed turn runs is that turn's. If
-  the turn then ends with a verdict, the ring that waited on it is not
-  delivered — whatever importance the verdict gives — and the chat's status
-  says `quiet`, "the turn archived the chat", with the verdict and its
-  actions. If the turn does not finish (it fails, or sets no verdict) the
-  chat is brought back and the mail rings by the failure rule: a turn that
-  did not finish is not trusted with having put a mail away. The user's own
-  archive during a turn changes nothing about the ring, as on every channel.
-- **The same timeout and failure rule.** A turn that errors, ends without a
-  verdict or runs past `CHAT_INSTRUCTION_TIMEOUT` has the mail rung as a
-  VIP's. Filing a document takes a turn longer than a reply does: a
-  deployment whose instructions file documents raises the timeout, or its
-  filed mail rings when the timeout passes.
+  the user's own act. A merged thread's id answers `410` here as everywhere
+  — unless a running turn answers to it (below).
+- **A turn's archive reaches the mail it was given.** A call made through the
+  internal endpoint while an arrival turn runs for the chat is that turn's
+  (`_turn_flags`). In a mail thread its archive — and its mute, which
+  archives — is made only if no mail has arrived in the chat since the
+  turn's own (`ChatStateStore.archive_through`, one decision under the state
+  lock), and the mailbox hook carries the mails up to the turn's own and no
+  later one. Where one has arrived — a reply-all that landed while the turn
+  filed the invoice — the chat is **not** archived, its new mail stays
+  unread on the list and in the inbox, only the mails the turn worked leave
+  the inbox, and the answer says so: `{"archived": false, "reason": "newer
+  mail arrived"}`. (That hook, if the gateway is away, is not owed for
+  later: an archive is owed only while the chat is archived.)
+- **A thread its turn archived rings nothing.** What the turn archived or
+  muted is noted as its own. If the turn then ends with a verdict, the ring
+  that waited on it is not delivered — whatever importance the verdict
+  gives — and the chat's status says `quiet`, "the turn archived the chat",
+  with the verdict and its actions. If the turn does not finish (it fails,
+  or sets no verdict), or the timeout rings it first, what it put away is
+  undone — un-archived **and** un-muted — before the failure rule rings the
+  mail: a turn that did not finish is not trusted with having put a mail
+  away, and a ring into a chat it muted would be none. What the user set
+  meanwhile is theirs: their archive or mute during a turn takes the flag
+  off the turn's record, stays, and changes nothing about the ring beyond
+  what it does on every channel (a muted chat is quiet).
+- **The same failure rule, a longer timeout.** A turn that errors, ends
+  without a verdict or runs past `MAIL_INSTRUCTION_TIMEOUT` (600 s; the
+  messengers' `CHAT_INSTRUCTION_TIMEOUT` stays 60 s) has the mail rung as a
+  VIP's. A mail is not a chat message: ten minutes is a ring in time, and a
+  turn that files the document a mail carried needs them.
+- **A merge while a turn runs.** The mail gateway may fold the thread into
+  another while its mail's turn works. Every registry the turns keep by
+  chat id — the queue, the running turns, the rings that wait, the handles
+  minted per message — moves to the surviving chat (`_rekey_turns`); the
+  turn, which calls back with the id its prompt named, has its verdict and
+  archive taken for the survivor, and nothing is written under the dead
+  id.
 - **A mail offered again.** The mail gateway has no triage to fall back on:
   a mail the rail did not accept — the turn could not be started, or failed;
   the answer was lost — stays undelivered and is offered again on a later
-  poll. Each mail is taken once, by its `Message-ID`: a repeated offer
-  un-archives nothing, reopens no settled item and rings nothing. It is
+  poll. Each mail is counted once, by its `Message-ID`, and whether the user
+  has been **told** of it is kept per arrival on the chat's state
+  (`untold`): owed in the write that counts it, told once its attention step
+  and push have run to the end — or, for an instructed sender's, once the
+  ring that waited on its turn went out. A repeated offer of a mail that was
+  told un-archives nothing, reopens no settled item and rings nothing; one
+  of a mail that never was — the first request died between the count and
+  the push, or the ring died with the process, whatever later mail of the
+  thread was attended meanwhile — is that first offer, and does what it
+  owed (a death right after the push tells twice rather than never). It is
   answered with the handle of the turn that is running or done; the handle
   of a turn that **failed** is handed back for `CHAT_ARRIVAL_RETRY_SECONDS`
   (900) and then gives way to a turn anew, so the work is done once an
   outage is over without a failing turn being run once a poll. Such a turn
   is told the user already knows of the mail (the failure rule rang it), and
-  its verdict records; a ring waits on it only where the chat's state says
-  nobody was told yet — the arrival was never put through the attention
-  model and no read covers it — which is the case after a restart mid-turn.
+  its verdict records; a ring waits on it only where the mail is still
+  owed and no read covers it — the case after a restart mid-turn. An owed
+  ring whose turn is over (its outcome could not be written) rings at the
+  next offer by the failure rule. A mail gets at most
+  `MAIL_ARRIVAL_TURN_ATTEMPTS` (3) turns: after the last one fails it is
+  accepted as it stands — it rang once, by the failure rule or on arrival —
+  and the companion holds **one** note saying the turns gave up; a failed
+  mail turn posts no apology of its own.
 - **With `CHAT_ARRIVAL_TURNS` off** a mail is accepted all the same, since
   its gateway has nowhere else to take it, and no turn runs: a VIP's mail
   still rings, an instructed sender's is delivered like anyone's. (A

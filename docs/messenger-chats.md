@@ -814,23 +814,30 @@ code, and five things differ because the channel is a mailbox
   instruction asks — send one with `mail-push.py --chat <id>` under the
   mailbox's send policy, add a calendar event under its policy, and
   **archive the thread** with `chat-flags.py`. It ends with the verdict. A
-  thread its turn archived rings nothing; a turn that archived and did not
-  finish has the chat brought back and the mail rung.
+  thread its turn archived rings nothing; a turn that archived (or muted)
+  and did not finish has the chat brought back — un-archived and un-muted —
+  and the mail rung. A turn's archive reaches only the mail it was given: a
+  mail that arrived while it worked keeps the thread in view and in the
+  inbox. A merge of the thread while its turn runs moves the turn with it.
 - **There is no triage fallback.** Step 4's "forwards to triage exactly as
   it always has" does not exist for mail: a mail the rail did not accept
   stays `delivered: false` and the mail gateway offers it again on a later
   poll — the mailbox is the backlog. So the rail takes a mail **once**, by
-  its `Message-ID`: a repeated offer un-archives nothing, reopens no settled
-  item and rings nothing, and the handle of a turn that failed is handed
-  back only for `CHAT_ARRIVAL_RETRY_SECONDS` before the next offer starts
-  the turn anew.
+  its `Message-ID`, and keeps per arrival whether the user was told of it:
+  a repeated offer of a mail they were told of un-archives nothing, reopens
+  no settled item and rings nothing, one of a mail whose first offer never
+  got that far does what it owed. The handle of a turn that failed is
+  handed back only for `CHAT_ARRIVAL_RETRY_SECONDS` before the next offer
+  starts the turn anew, and a mail gets at most `MAIL_ARRIVAL_TURN_ATTEMPTS`
+  turns.
 - **`CHAT_ARRIVAL_TURNS=0` still accepts a mail** — its gateway has nowhere
   else to take it — and runs no turn for it.
-- **The timeout is the same one.** `CHAT_INSTRUCTION_TIMEOUT` bounds how
-  long an instruction can hold a mail's ring, and a turn that files a
-  document with the Archivist runs longer than one that drafts a reply:
-  past the timeout the mail rings as a VIP's, whatever the turn decides
-  afterwards.
+- **The timeout is longer.** `MAIL_INSTRUCTION_TIMEOUT` (600 s) bounds how
+  long an instruction can hold a mail's ring — not the messengers'
+  `CHAT_INSTRUCTION_TIMEOUT` (60 s): a mail is not a chat message, and a
+  turn that files a document with the Archivist runs longer than one that
+  drafts a reply. Past it the mail rings as a VIP's, whatever the turn
+  decides afterwards; the failure rule is otherwise the same.
 
 ## Summaries — unbounded time, bounded context
 

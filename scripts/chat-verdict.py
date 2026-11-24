@@ -34,7 +34,13 @@ verdict has the message rung as a VIP's would be. For a VIP the message rang
 on arrival, and the verdict records.
 
 The verdict is taken only while such a turn is running for the chat (HTTP 409
-otherwise); a second call in the same turn replaces the first.
+otherwise); a second call in the same turn replaces the first. Use the chat
+id the turn's prompt names: should the mail thread have been folded into
+another while the turn worked, the verdict is applied to the chat it is part
+of now, and the answer's `id` names that one.
+
+How long the ring waits for the verdict: a mail's `MAIL_INSTRUCTION_TIMEOUT`
+(600 s by default), any other message's `CHAT_INSTRUCTION_TIMEOUT` (60 s).
 
 This is the retinue-side client for the gateway's token-gated
 ``POST /internal/chats/<id>/verdict`` — the sibling of chat-draft.py and

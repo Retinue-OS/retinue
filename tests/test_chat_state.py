@@ -609,6 +609,49 @@ def test_archive_unless_arrived():
         print("PASS test_archive_unless_arrived")
 
 
+def test_what_an_arrival_owes_is_kept_per_arrival():
+    with tempfile.TemporaryDirectory() as tmp:
+        store = cs.ChatStateStore(tmp)
+        a, b = "email:~me@x.example:a@x.example", "email:~me@x.example:b@x.example"
+        # Owed in the write that counts it; a repeat counts and owes nothing
+        # more; told takes it out, and a second told writes nothing.
+        doc, _had, counted = store.count_arrival(a, 1000.0, message_id="m1", owe=True)
+        assert counted and cs.owes(doc, "m1") and doc["untold"] == ["m1"]
+        doc, _had, counted = store.count_arrival(a, 1000.0, message_id="m1", owe=True)
+        assert not counted and doc["untold"] == ["m1"] and doc["inbound_seq"] == 1
+        # A later arrival attended does not tell an earlier one (no
+        # high-water mark): m1 stays owed while m2 is attended past it.
+        store.count_arrival(a, 1001.0, message_id="m2", owe=True)
+        store.told(a, "m2")
+        doc = store.set_attention(a, {"state": "open"}, attended=2)
+        assert cs.owes(doc, "m1") and not cs.owes(doc, "m2"), doc["untold"]
+        # Without ``owe`` (a messenger) nothing is owed, and told is no write.
+        store.count_arrival("signal:+41790000081", 1000.0, message_id="s1")
+        assert not cs.owes(store.get("signal:+41790000081"), "s1")
+        assert not store.told("signal:+41790000082", "s1")["untold"]
+        assert not store.exists("signal:+41790000082"), "told wrote a document"
+        assert not cs.owes(doc, None) and not cs.owes(doc, "")
+        # The places: by id, or None — never the count as it stands.
+        assert cs.recent_place(doc, "m2") == 2 and cs.recent_place(doc, "nope") is None
+        # Turns per mail, counted on the chat.
+        assert store.note_turn_attempt(a, "m1") == 1
+        assert store.note_turn_attempt(a, "m1") == 2 and store.note_turn_attempt(a, None) == 0
+        assert cs.turn_attempts(store.get(a), "m1") == 2 and cs.turn_attempts(store.get(a), "m2") == 0
+        # A merge carries both: what either half owed, the most turns either
+        # counted.
+        store.count_arrival(b, 900.0, message_id="n1", owe=True)
+        store.note_turn_attempt(b, "m1")
+        doc, gone = store.merge(a, b)
+        assert gone is not None and set(doc["untold"]) == {"m1", "n1"}, doc["untold"]
+        assert cs.turn_attempts(doc, "m1") == 2
+        # A turn's archive: made only while nothing arrived past its cut.
+        doc, done = store.archive_through(b, cut=2)
+        assert not done and not doc["archived"], doc["inbound_seq"]
+        doc, done = store.archive_through(b, cut=doc["inbound_seq"], muted=True)
+        assert done and doc["archived"] and doc["muted"]
+        print("PASS test_what_an_arrival_owes_is_kept_per_arrival")
+
+
 def test_flags_and_note_message():
     with tempfile.TemporaryDirectory() as tmp:
         store = cs.ChatStateStore(tmp)
@@ -1380,6 +1423,7 @@ if __name__ == "__main__":
     test_a_repeated_event_is_one_arrival()
     test_a_read_reaches_a_stamp_from_a_fast_clock()
     test_archive_unless_arrived()
+    test_what_an_arrival_owes_is_kept_per_arrival()
     test_flags_and_note_message()
     test_companion_link()
     test_overlay_merge_dedup_expiry()
