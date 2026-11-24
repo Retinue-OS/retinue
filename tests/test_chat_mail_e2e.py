@@ -123,6 +123,9 @@ class Rig:
         # The rail: the gateway's own events, posted to the web gateway.
         gw._chats.CHATS_INGEST_URL = self.base + "/internal/chats/inbound"
         gw._chats.CHATS_INGEST_TOKEN = "agent-token"
+        # The rail takes a mail event only with a token (docs/mail-chats.md,
+        # "The gate"): the web gateway is given the one the gateway sends.
+        wg.CHATS_INGEST_TOKEN = "agent-token"
         self.rail: list = []
 
         def rail_send(kind, payload):
