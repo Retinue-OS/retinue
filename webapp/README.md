@@ -271,7 +271,9 @@ docstring). Pieces:
   archives — the server's rule — so both land under *Archived*, whose tray
   holds **Star**, **Restore**, **Mute** / **Unmute** (stays archived) and
   **Delete** (`POST /chats/<id>/delete`, armed by a first tap, done by a
-  second). What takes a row out of view offers Undo for a few seconds — Mark
+  second; the armed button reads "Delete for good?", and on a mail thread
+  "Move mails to Trash?" — its mails go to the mailbox's Trash before the
+  chat is erased, and its title says so). What takes a row out of view offers Undo for a few seconds — Mark
   read's puts the previous read mark back (`POST /chats/<id>/read`, below).
   A Mark read is about the row as shown: it names the row's `inbound_seq`,
   and where a message has landed that the list has not fetched yet (it
@@ -440,11 +442,68 @@ docstring). Pieces:
   removal, text, trim, attachments, subject or original changed is
   re-rendered in its place, the rest of the thread, the scroll position and
   an Original that still applies left as they are. And a chat whose summary
-  says `can_send: false` (the read-only mirror) shows `cannot_send_reason` in
-  one line where the composer, its chips, the draft and the grip would be;
-  nothing is loaded into, adopted by or saved from a draft there. That is one
-  switch (`_canSend`), followed on every poll, which the writing phase flips
-  by answering `true`.
+  says `can_send: false` (its gateway unknown or not connected) shows
+  `cannot_send_reason` in one line where the composer, its chips, the draft
+  and the grip would be; nothing is loaded into, adopted by or saved from a
+  draft there. That is one switch (`_canSend`), followed on every poll.
+- **Writing mail** (`docs/mail-chats.md`, "Writing"). The **composer** of a
+  mail chat says where the reply goes, as the gateway will address it: "To
+  <sender> · Cc <everyone else on the mail>" from the latest live inbound
+  mail (the latest mail's recipients again when it is the user's own, or a
+  queued one's when that is all the thread holds). The user's own addresses
+  are left out by the account and — while the summary's participant list is
+  complete — by not being participants; it is a preview, and the gateway,
+  which knows a Reply-To and the mailbox's aliases, decides. A group thread
+  whose reply to all reaches more than the sender offers **Reply all /
+  Sender only** (two radio buttons under the line, Reply all by default);
+  the choice is the chat's for the next mail and resets with each one sent
+  or queued. The send carries it as `reply` (`"all"` in a 1:1; a messenger
+  send carries none). The box reads "Write your reply …"; **Enter** breaks a
+  line, the send button or **Ctrl/⌘+Enter** sends (an input method's Enter
+  only commits) — as on every chat, which the field's label says on mail.
+  Files are staged as on every chat and go as the mail's attachments. A
+  refused mail (400/409, e.g. no live mail left to reply to) puts the
+  server's reason in the note line and the words back in the box.
+- **Pending sends.** A mail goes under its account's send policy, and a send
+  the policy queues answers **202** `{pending}`: the optimistic bubble gives
+  way at once to a **pending bubble** at the thread's end — the words, "You
+  · not sent yet", "Waiting for approval" in words (and in its accessible
+  name; the note line, a live region, says it was queued) and an **Approve
+  or reject** link to its page on `/sends`. The link is built by DOM calls,
+  and only from an `approval_url` that is exactly a path `/sends/<slug>/<id>`
+  (each segment one run of URL-safe characters, not starting with a dot; no
+  query, fragment, host or escape); anything else gets a plain sentence
+  instead. The messages document's `pending` carries every queued send of
+  the chat, whoever queued it (composer, companion, `mail-push.py`), oldest
+  first, and the page follows it on every load and poll: new entries join at
+  the end (messages arriving go in above them), a changed one is redrawn in
+  place, one no longer listed leaves — unless it was queued from here after
+  that poll left — and focus on its link goes to the mail it became, else to
+  the thread. Pending bubbles are matched by `request_id`, and to the mail a
+  released one became by its `message_id` (the Message-ID the gateway minted
+  when it queued it) — never by their words, which on mail are long and come
+  back trimmed. An unconfirmed mail send is likewise found by its
+  `message_id`. A page left while a send was on its way does not put a mail
+  that was queued back into the box. A chat in the list whose latest entry
+  is a queued send previews it as "Waiting for approval: …".
+- **New mail.** The Chats page's **＋** (only where `GET /chats/compose`
+  offers something) opens a short menu — *New e-mail* — and that the
+  **compose sheet** (`components/compose-sheet.js`): a modal dialog (the page
+  behind inert, focus in To, Tab kept inside; Escape, ✕ or a press on the
+  dimmed page closes it and gives the focus back to the ＋) with From (a choice only when the offer names
+  several mailboxes), **To** and **Cc** as removable chips — typed (a comma,
+  a semicolon, Enter or leaving the field makes one; Backspace in an empty
+  field takes the last back), pasted (`"Doe, Jane" <jane@x.org>, b@y.org`
+  is two), or picked from the address book's suggestions (`GET
+  /contacts?q=`, the matching people's e-mail addresses, a combobox walked
+  with the arrow keys) — Subject and the text. Addresses are checked by
+  shape only; what is not one stays in the field with its error under it.
+  Send (or Ctrl/⌘+Enter in the text) posts `POST /chats/compose` and, on
+  200 or 202, goes to the new chat (`/chat.html?id=<id>`), which may hold
+  only the pending bubble; a refusal shows in the sheet with everything still
+  there. Closing keeps what the sheet holds on the device
+  (`compose:<channel>` in drafts.js) for the next opening; Discard empties
+  it; a send that went through drops it.
 
 The API, as the components consume it:
 
@@ -601,7 +660,8 @@ The API, as the components consume it:
   it is an ordinary conversation, named by the summary's `companion` id and
   read through `/conversations`.
 - `POST /chats/<id>/send` `{text?, images?}` — sends through the chat's own
-  gateway and returns the sent `Message`. It does not skip the account's send
+  gateway and returns the sent `Message` (a mail chat's send can come back
+  queued instead: *Mail additions*, "Writing", below). It does not skip the account's send
   policy: under `allow` the gateway sends outright, and otherwise the send is
   **queued and then released** through that gateway's own approve endpoint in
   the same request — the press IS the approval `verify` exists for, but it is
@@ -712,6 +772,21 @@ The API, as the components consume it:
   that lets nothing load or run (the chat page's own policy gains
   `frame-src 'self'` for it).
 
+  Writing: `POST /chats/<id>/send` takes `reply: "all" | "sender"` on a mail
+  chat and answers `200` with the Message (sent) or `202 {pending: Pending}`
+  (queued), where `Pending` is `{request_id, approval_url, text, ts, author,
+  agent?, to, cc, subject, message_id?}` (`approval_url` path-only,
+  `/sends/<slug>/<id>`). `GET /chats/<id>/messages` carries top-level
+  `pending: [Pending]` (oldest first; `[]` on other channels, and a document
+  without the field leaves what the page shows), and a `GET /chats` entry
+  `pending: n`, its `last` a queued send's with `pending: true` where that is
+  the latest. `GET /chats/compose` → `{channels: [{channel, label,
+  accounts}]}`, what ＋ offers (a 404 is taken as nothing); `POST
+  /chats/compose` `{channel, account?, to, cc, subject, text}` → `200 {id,
+  message}` or `202 {id, pending}`, an error `{error}` with a 4xx otherwise.
+  Mark as read, Archive and Delete on a mail chat are the same calls as on
+  every chat; the server carries them into the mailbox.
+
 **Reference documents:** `data/chats.json` and `data/chats/<slug>.json` are
 static documents in the API's response shapes — the contract drafts the API
 was built against, kept as its reference documents and as the Playwright test
@@ -726,10 +801,11 @@ Content-Security-Policy allows no `data:` media on the chat page, since no
 record the gateway serves carries one, so the corpus shows its media only
 where it is served without that policy. It covers both companion states: one chat names an
 existing thread, the rest carry `companion: null`. It holds a mail thread
-too (`data/chats/email-quarterly.json`): a read-only group thread with an
-inline image and an attached sheet, a mail sent from another client, an HTML
-mail whose subject is not the thread's, and a tombstone, with the Original of
-its HTML mail beside it (`email-quarterly.original.json`). Companion messages
+too (`data/chats/email-quarterly.json`): a group thread with an inline image
+and an attached sheet, a mail sent from another client, an HTML mail whose
+subject is not the thread's, a tombstone and a reply waiting for approval
+(`pending`), with the Original of its HTML mail beside it
+(`email-quarterly.original.json`). Companion messages
 themselves are conversation documents, not chat ones, so the corpus holds
 none — the suite mocks `/conversations/<id>` for those.
 

@@ -229,8 +229,11 @@ export class SwipeRows {
   }
 
   // Delete cannot be undone, so the first tap only arms it: the button says
-  // what a second tap will do, and anything else disarms it. True when this
-  // tap is the second one, which the caller then carries out.
+  // what a second tap will do — "Delete for good?", or the row's own words
+  // where its delete does something else as well (`data-confirm`: a mail
+  // thread's mails move to the mailbox's Trash) — and anything else disarms
+  // it. True when this tap is the second one, which the caller then carries
+  // out.
   confirm(id, btn) {
     if (this._confirmId !== id) {
       this._confirmId = id;
@@ -247,7 +250,7 @@ export class SwipeRows {
   _arm(btn) {
     btn.classList.add('confirm');
     if (!btn.dataset.label) btn.dataset.label = btn.textContent;
-    btn.textContent = 'Delete for good?';
+    btn.textContent = (btn.dataset && btn.dataset.confirm) || 'Delete for good?';
   }
 
   _unarm(btn) {

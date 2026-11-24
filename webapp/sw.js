@@ -56,6 +56,7 @@ const SHELL_ASSETS = [
   '/components/project-page.js',
   '/components/chats.js',
   '/components/chat-page.js',
+  '/components/compose-sheet.js',
   '/components/news.js',
   '/components/speech.js',
   '/components/continuous.js',

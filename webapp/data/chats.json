@@ -35,6 +35,7 @@
     "sender_name": "Ann Example",
     "removed": false
    },
+   "pending": 1,
    "draft": null,
    "messages": "/data/chats/email-quarterly.json"
   },

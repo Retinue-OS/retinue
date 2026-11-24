@@ -47,7 +47,9 @@ and pin:
     re-renders;
   * messenger chats render as before;
   * the reference documents (webapp/data/chats*) carry a mail thread that
-    renders: a group thread with an inline image, an HTML mail, a tombstone.
+    renders: a group thread with an inline image, an HTML mail, a tombstone,
+    a composer addressed as the reply would go, and a reply waiting for
+    approval (writing itself: tests/test_webapp_mail_writing.py).
 
 Standalone like the rest of the suite. Needs `node` on PATH; without it the
 test reports a skip and passes (the static checks still run).
@@ -791,7 +793,7 @@ await ok('can_send false: the server\'s reason in place of composer, chips and d
   assert.equal(renders, n + 1);
   assert.ok(el._chatComposerHtml().includes('data-composer="chat"'));
   assert.ok(el._gripHtml().includes('data-grip'));
-  assert.ok(el._chatComposerHtml().includes('placeholder="Reply to Ann Example, Bob Builder …"'));
+  assert.ok(el._chatComposerHtml().includes('placeholder="Write your reply …"'));
 });
 
 await ok('messenger chats are unchanged', async () => {
@@ -1156,7 +1158,16 @@ await ok('the reference documents carry a mail thread that renders', async () =>
   assert.ok(html(3).includes('tomb') && html(3).includes('carla@example.net'));
   for (const i of [0, 1, 2, 4]) assert.ok(html(i).includes('data-orig-toggle'), `Original on ${ids[i]}`);
   assert.ok(!html(3).includes('data-orig-toggle'));
-  assert.ok(el._chatComposerHtml().includes('cannot-send'));
+  // The writing phase: a composer addressed as the reply would go, and the
+  // reply the user queued, waiting for approval at the thread's end.
+  const comp = el._chatComposerHtml();
+  assert.ok(comp.includes('data-composer="chat"') && !comp.includes('cannot-send'), comp);
+  assert.ok(comp.includes('To <b>Ann Example</b> &middot; Cc <b>Bob Builder, carla@example.net</b>'), comp);
+  assert.ok(comp.includes('value="sender"'), 'a group thread offers Sender only');
+  assert.equal(sum.pending, 1, 'the list counts the queued send');
+  assert.deepEqual(el._pending.map((x) => x.p.request_id), [doc.pending[0].request_id]);
+  assert.ok(el._chatThreadHtml().endsWith(el._pendingHtml(doc.pending[0])), 'the pending bubble comes last');
+  assert.equal(doc.pending[0].approval_url, `/sends/mail-gateway/${doc.pending[0].request_id}`);
   // The original's reference document belongs to the HTML mail.
   const bob = doc.messages.find((m) => m.id === orig0.id);
   assert.equal(orig0.html_url, `${bob.original}.html`);
