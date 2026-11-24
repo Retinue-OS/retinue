@@ -885,6 +885,139 @@ def test_a_removal_before_a_merge_goes_first(w: World):
     print("PASS test_a_removal_before_a_merge_goes_first")
 
 
+class _Killed(BaseException):
+    """The process stopping in the middle of a transaction."""
+
+
+def test_a_removal_behind_a_chain_of_merges(w: World):
+    """Decision BB: three chats Z, Y, X (oldest first; X holds a reply).
+    While the web gateway is away, one mail joins X into Y (M1), a later one
+    Y into Z (M2), and the user deletes X's reply: its removal names Z, and
+    waits for no merge but M2. The web gateway fails on every merge of X, so
+    M1 steps aside, M2 is taken and the removal behind it — while the web
+    gateway still holds the mail under X. When M1 is finally taken, it
+    carries the mail into the survivor with its arrival; so the removals of
+    the chats it absorbed are announced again, and the deleted mail is gone
+    from the survivor and counted as gone. The same where the removal is
+    queued between the two merges, and where M2 names X itself; and a stop
+    while the late merge is taken off the outbox loses none of it."""
+    _reset()
+    day = lambda: (time.time() + w.offset - 5 - t.T0) / t.DAY  # noqa: E731
+    for n, (order, mid, kill) in enumerate((("zyx", False, False), ("zyx", True, False),
+                                            ("zxy", False, False), ("zyx", False, True))):
+        p = f"ch{n}"
+        roots = {k: (f"{p}{k}-root@x.org", f"{k.upper()}a <{p}{k}@x.org>") for k in "xyz"}
+        for k in order:
+            w.box.put("INBOX", t.msg(roots[k][0], sender=roots[k][1], subject="S" + k,
+                                     day=day()))
+            w.mirror.poll()
+            w.offset += 10
+        gone = f"{p}x-m@x.org"
+        uid = w.box.put("INBOX", t.msg(gone, sender=roots["x"][1], subject="Re: Sx",
+                                       irt=roots["x"][0], refs=[roots["x"][0]], day=day()))
+        w.mirror.poll()
+        w.offset += 10
+        X, Z = w.rec(gone)["chat"], w.rec(roots["z"][0])["chat"]
+        real = w.wg._merge_chats
+        state = {"heal": False, "killed": False}
+
+        def faulty(channel, account, absorbed, into, X=X, state=state, real=real):
+            if not state["heal"] and (X in absorbed or into == X):
+                raise RuntimeError("a fault on the merge of one chat")
+            return real(channel, account, absorbed, into)
+        w.wg._merge_chats = faulty
+        try:
+            w.stop_wg()
+            for k, mail_id in (("y", f"{p}c1@x.org"), ("z", f"{p}c2@x.org")):
+                cited = [roots["x" if k == "y" else "y"][0], roots[k][0]]
+                w.box.put("INBOX", t.msg(mail_id, sender=roots[k][1], subject="Re: Sx",
+                                         irt=cited[0], refs=cited, day=day()))
+                w.later(10)
+                w.offset += 10
+                if mid and k == "y":
+                    w.box.remove("INBOX", uid)
+                    w.later(10)
+                    w.offset += 10
+            if not mid:
+                w.box.remove("INBOX", uid)
+                w.later(10)
+            assert w.rec(gone).get("removed_at") and w.rec(gone)["chat"] == Z, w.rec(gone)
+            queued = [r["kind"] for r in w.mirror.index.rows(
+                "SELECT kind FROM outbox ORDER BY seq")]
+            assert queued.count("merge") == 2 and "removed" in queued, queued
+            w.start_wg()
+            for _ in range(w.gw.RAIL_HOLD_ATTEMPTS + 3):
+                w.later(4000)
+            left = [dict(r) for r in w.mirror.index.rows("SELECT kind, attempts FROM outbox")]
+            if order == "zyx" and not mid:
+                # M2 and the removal behind it were taken; M1 stepped aside.
+                assert [r["kind"] for r in left] == ["merge"], left
+                assert left[0]["attempts"] >= w.gw.RAIL_HOLD_ATTEMPTS, left
+            state["heal"] = True
+            if kill:
+                # The process stops just after the late merge's row is
+                # deleted — by whatever write deletes it, inside the
+                # transaction it is in. With a restart, nothing the merge
+                # owed is lost.
+                index = w.mirror.index
+                merge = index.one("SELECT seq FROM outbox WHERE kind = 'merge'")["seq"]
+                real_run, real_atomic = index.run, index.atomic
+                deletes = lambda st: (st is not None  # noqa: E731
+                                      and st[0].startswith("DELETE FROM outbox")
+                                      and tuple(st[1]) == (merge,))
+
+                def undo():
+                    index.run, index.atomic = real_run, real_atomic
+
+                def run(sql, args=(), state=state):
+                    if deletes((sql, args)):
+                        undo()
+                        state["killed"] = True
+                        real_run(sql, args)
+                        raise _Killed()
+                    return real_run(sql, args)
+
+                def atomic(statements, state=state):
+                    statements = list(statements)
+                    if not any(deletes(st) for st in statements):
+                        return real_atomic(statements)
+                    undo()
+                    state["killed"] = True
+
+                    def stopped():
+                        for st in statements:
+                            yield st
+                            if deletes(st):
+                                raise _Killed()
+                    return real_atomic(stopped())
+                index.run, index.atomic = run, atomic
+                try:
+                    w.later(4000)
+                except _Killed:
+                    pass
+                undo()
+                assert state["killed"], "the late merge was not taken"
+                w.mirror.index.close()
+                w.mirror.threads.close()
+                w.mirror = w.gw.MIRROR = w.gw.Mirror(
+                    w.box, clock=lambda: time.time() + w.offset)
+            for _ in range(3):
+                w.later(4000)
+            _wait(lambda: w.mirror.index.one("SELECT COUNT(*) AS n FROM outbox")["n"] == 0,
+                  "the outbox empty")
+        finally:
+            w.wg._merge_chats = real
+        for key in {X, Z, w.rec(roots["y"][0])["chat"]} - {Z}:
+            assert w.wg._CHAT_STATE.merged_into(w.chat(key)) == w.chat(Z), key
+        shown = [entry.get("message_id") for entry in w.wg._CHAT_OVERLAY.entries(w.chat(Z))]
+        assert gone not in shown and f"{p}c2@x.org" in shown, (order, mid, kill, shown)
+        doc = w.doc(Z)
+        seq = [s for m, s in doc.get("inbound_recent") or [] if m == gone]
+        assert seq and seq[-1] in mail.cs.gone_arrivals(doc), (order, mid, kill, doc)
+        assert not doc.get("archived"), doc
+    print("PASS test_a_removal_behind_a_chain_of_merges")
+
+
 # ── The two axes ──────────────────────────────────────────────────────────────
 
 def test_news_and_a_vip_in_the_list(w: World):
@@ -984,6 +1117,7 @@ def main():
             test_a_late_told_mail_that_is_gone(w)
             test_a_removal_waits_for_the_merge_of_its_chat(w)
             test_a_removal_before_a_merge_goes_first(w)
+            test_a_removal_behind_a_chain_of_merges(w)
         finally:
             TURN_GATE.update(during=None, fail=False)
             if TURN_GATE.get("hold") is not None:

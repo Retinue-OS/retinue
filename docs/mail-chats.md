@@ -1324,7 +1324,21 @@ listed under Unread and judged by nobody.
   waits with it: its chat's later events go on, so it is marked as
   overtaken and, once the merge is taken, sent as a late event is. A merge
   queued after the removal does not hold it: the removal names its chat as
-  the web gateway still has it, and goes first, in its order. A first
+  the web gateway still has it, and goes first, in its order. The wait
+  covers a merge that names the removal's own chat, not a chain of them: a
+  merge of X into Y that stepped aside, then one of Y into Z, and a removal
+  naming Z goes once the second is taken, while the web gateway still holds
+  the mail under X. So **a merge taken late re-announces what was removed
+  under it**: when a merge that stepped aside is finally taken, the same
+  transaction that takes it off the outbox queues a removal, built as a late
+  one is (the ids still gone, `live` as then), for the chat each chat it
+  absorbed is in now, naming every removed mail of that chat but those a
+  removal still queued names (that one goes after the merge and says it) —
+  the index does not remember which chat a mail was in before a merge, so
+  the chat's other removed mails go along, and a removal of a mail the web
+  gateway already holds as gone changes nothing. It is queued behind
+  everything, so it keeps its chat's order and waits for a merge of its
+  chat still queued. A first
   offer's place names the chat it was queued in as well as the one its mail
   is in now, so a merge meanwhile does not take it out of its old chat's
   hold. This holds for a merge or a removal too: a 408, 429 or 5xx for one

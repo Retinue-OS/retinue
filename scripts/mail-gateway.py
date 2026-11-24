@@ -3186,7 +3186,9 @@ class Mailbox:
 #              aside (an offer's row goes; a told event's holds nothing, and
 #              is sent as the index has its mail then). A removal waits for
 #              every merge queued before it that joins its chat, and is then
-#              marked `overtaken` in its payload. An offer's row names the chat it
+#              marked `overtaken` in its payload; a merge that stepped aside
+#              queues, as it is taken, the removals of the chats it absorbed
+#              (Mirror._removed_under). An offer's row names the chat it
 #              was queued in.
 #   offers     the mails the chats rail still owes an answer for: every
 #              inbound record the ledger holds ``delivered: false`` — the
@@ -6353,7 +6355,10 @@ class Mirror:
         removal names, which goes first, in its order. While it waits its
         chat's later events go on — nothing else waits for a merge that
         stepped aside — so it is marked as out of order (:meth:`_overtaken`),
-        and sent as a late event is."""
+        and sent as a late event is. That wait is for a merge of its own
+        chat, not for a chain of them; so a merge that stepped aside queues,
+        in the transaction that takes it, the removals of the chats it
+        absorbed again (:meth:`_removed_under`)."""
         if not _chats.chats_enabled():
             return True
         if self._clock() < self._rail_wait_until:
@@ -6415,7 +6420,19 @@ class Mirror:
                 if outcome == "down":
                     return False
                 if outcome in ("ok", "drop"):
-                    self.index.run("DELETE FROM outbox WHERE seq = ?", (row["seq"],))
+                    owed = self._removed_under(payload) if (
+                        outcome == "ok" and row["kind"] == "merge"
+                        and row["attempts"] >= RAIL_HOLD_ATTEMPTS) else []
+                    if not owed:
+                        self.index.run("DELETE FROM outbox WHERE seq = ?", (row["seq"],))
+                    else:
+                        # One transaction: a stop must not leave the merge
+                        # taken and the removals it owes unsaid.
+                        self.index.atomic(
+                            [("DELETE FROM outbox WHERE seq = ?", (row["seq"],))] + owed)
+                        print(f"[mail-gateway] a merge of chat(s) {sorted(chats)!r} was taken "
+                              f"late: the removed mails it carried are announced again",
+                              flush=True)
                     merging.pop(row["seq"], None)
                     if outcome == "ok":
                         self._rail_took()
@@ -6447,6 +6464,56 @@ class Mirror:
             return
         text = json.dumps({**payload, OVERTAKEN: True}, ensure_ascii=False)
         self.index.run("UPDATE outbox SET payload = ? WHERE seq = ?", (text, seq))
+
+    def _removed_under(self, merge: dict) -> list:
+        """The removals a merge that stepped aside owes once it is taken
+        (:meth:`_flush_rail`): the statements that queue them, for the
+        transaction that takes the merge off the outbox.
+
+        A removal waits only for the merges queued before it that join its
+        own chat. Behind a chain of them — this one joined X to Y, a later
+        one Y to Z, and the removal names Z, where the index has its mail —
+        it went once the later merge was taken, while in the web gateway the
+        mail was still under X; this merge now carries it into the survivor
+        with its arrival. So every tombstone of the chats it absorbed is
+        removed again: one removal per chat the index has them in now (the
+        chat an absorbed key is in now, by the thread index), built as
+        :meth:`_as_now` builds one — the ids still gone, the chat's ``live``
+        as now — and queued behind everything, in its chat's order. The
+        index does not remember which chat a mail was in before a merge, so
+        that chat's other tombstones go along; a removal of a mail the web
+        gateway holds as gone, or never had, changes nothing. A mail a
+        removal still queued names is left out: that one goes after this
+        merge, and says it."""
+        if not _chats.chats_enabled() or not isinstance(merge, dict):
+            return []
+        chats = set()
+        for key in merge.get("from") or []:
+            if isinstance(key, str):
+                chats.add(self.threads.chat_of(key) or key)
+        queued: set = set()
+        for row in self.index.rows("SELECT payload FROM outbox WHERE kind = 'removed'"):
+            try:
+                ids = json.loads(row["payload"]).get("message_ids")
+            except (ValueError, AttributeError):
+                continue
+            if isinstance(ids, list):
+                queued.update(str(mid) for mid in ids)
+        owed = []
+        for chat in sorted(chats):
+            gone = [row["message_id"] for row in self.index.rows(
+                "SELECT message_id FROM mails WHERE chat = ? AND removed = 1 "
+                "AND record != '' ORDER BY ts, message_id", (chat,))
+                if row["message_id"] not in queued]
+            if not gone:
+                continue
+            live = self.index.one(
+                "SELECT COUNT(*) AS n FROM mails WHERE chat = ? AND removed = 0 "
+                "AND record != ''", (chat,))["n"]
+            owed.append(self._event("removed", {"channel": CHANNEL, "account": ACCOUNT,
+                                                "chat": chat, "message_ids": gone,
+                                                "live": live}))
+        return owed
 
     def _as_now(self, kind: str, payload: dict) -> dict | None:
         """A queued rail event as the index has its mail now, for one that

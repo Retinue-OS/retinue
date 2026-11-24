@@ -473,7 +473,13 @@ stall its thread. Such an event is sent, when it goes, as the mirror has its
 mail then: a removal names only the mails still gone (none: it is dropped), a
 told mail that is gone by then is not told. A removal also waits while a merge
 of its chat queued before it is still queued, and holds nothing back meanwhile
-(one queued after it goes behind it, in order). `/health` counts the events
+(one queued after it goes behind it, in order); and a merge that stepped
+aside queues, in the transaction that takes it, a removal of every removed mail
+of the chat each chat it absorbed is in by then that no queued removal names
+(`live` as then) — behind a chain of merges a removal can go while its mail is
+still under the chat a late merge folds in, and a removal of a mail already gone
+changes nothing.
+`/health` counts the events
 that stepped aside (`waiting.failing`, the oldest failure's time in
 `waiting.failing_since`) and says "N rail event(s) keep failing while others
 are taken" when the rail took an event after the newest of them began to fail,
