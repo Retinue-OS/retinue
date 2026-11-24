@@ -34,10 +34,12 @@ complains that their messages go unanswered. This daemon closes that gap:
     the mail gateway counts the mail it could not read and shows as
     placeholders (``placeholders`` in its /health). One such mail now and then
     is the mail's own doing; a run of them is a reader that broke, and with
-    the gateway "connected" nobody would see it. So when more of them stand
-    than the user was last told of, by UNREAD_STEP or more, a notice says so
-    — a notice, never an outage: its own thread, lower in importance, at most
-    one per reminder interval.
+    the gateway "connected" nobody would see it. It counts as well the mail it
+    had mirrored and lost the records of (``lost``: a ledger restored from an
+    older backup), which it looks for in the mailbox again. So when more of
+    these stand than the user was last told of, by UNREAD_STEP or more, a
+    notice says so — a notice, never an outage: its own thread, lower in
+    importance, at most one per reminder interval.
 
 Gateways that report ``configured: false`` (a channel the deployment simply
 does not use) are skipped, as are slugs listed in GATEWAY_MONITOR_IGNORE.
@@ -82,7 +84,8 @@ FAIL_THRESHOLD = int(os.environ.get("GATEWAY_MONITOR_FAILURES", "") or "2")
 REMIND_SECONDS = float(os.environ.get("GATEWAY_MONITOR_REMIND_SECONDS", "") or str(6 * 3600))
 HEALTH_TIMEOUT = float(os.environ.get("GATEWAY_MONITOR_HEALTH_TIMEOUT", "") or "10")
 # How many more mails than the user was last told of a working mail gateway
-# may be unable to read before a notice says so (see unread_message).
+# may be unable to read (or be looking for again) before a notice says so
+# (see unread_message).
 UNREAD_STEP = 5
 # Comma-separated slugs to exclude from monitoring (e.g. a deliberately
 # unlinked channel the deployment keeps around).
@@ -138,17 +141,20 @@ def classify_health(status: int | None, body: dict | None, error: str | None = N
 def unread_mail(body) -> dict | None:
     """What a gateway's /health says of mail it could not read (the mail
     gateway's ``placeholders``: how many stand, how many it made since it
-    started, and why), or None where it says nothing of the kind."""
+    started, and why) and of mail whose records it lost and looks for again
+    (its ``lost``: how many), or None where it says nothing of the kind."""
     seen = body.get("placeholders") if isinstance(body, dict) else None
     if not isinstance(seen, dict):
         return None
     try:
         counts = {key: max(0, int(seen.get(key) or 0)) for key in ("standing", "made")}
+        lost = max(0, int(body.get("lost") or 0))
     except (TypeError, ValueError):
         return None
     why = seen.get("why") if isinstance(seen.get("why"), dict) else {}
     return {**counts, "why": {str(reason)[:80]: count for reason, count in why.items()
-                              if isinstance(count, int) and not isinstance(count, bool)}}
+                              if isinstance(count, int) and not isinstance(count, bool)},
+            "lost": lost}
 
 
 def repair_url() -> str:
@@ -294,24 +300,37 @@ def unread_title(label: str) -> str:
 
 
 def unread_message(label: str, unread: dict, channel: str | None = None) -> str:
-    """The notice for a gateway that works and cannot read some of its mail.
-    It blames no login, no server and no phone, and reports no outage: mail
-    is flowing. It says how many, why as the gateway counts them, that
-    nothing is lost — and that a run of them is the gateway's to explain."""
-    standing, made = unread["standing"], unread["made"]
-    lines = [
-        f"The {label} {wording(channel)['noun']} is running, but {standing} mail(s) "
-        f"could not be read and stand in their chats as placeholders ({made} made since "
-        f"the gateway started). Nothing is lost: each mail is unchanged in the mailbox, "
-        f"and the gateway reads it again every hour."]
+    """The notice for a gateway that works and cannot read some of its mail,
+    or looks for mail whose records it lost. It blames no login, no server
+    and no phone, and reports no outage: mail is flowing. It says how many,
+    why as the gateway counts them, that nothing is lost — and that a run of
+    them is the gateway's to explain."""
+    standing, made, lost = unread["standing"], unread["made"], unread.get("lost", 0)
+    noun = wording(channel)["noun"]
+    lines = []
+    if standing or not lost:
+        lines.append(
+            f"The {label} {noun} is running, but {standing} mail(s) could not be read "
+            f"and stand in their chats as placeholders ({made} made since the gateway "
+            f"started). Nothing is lost: each mail is unchanged in the mailbox, and the "
+            f"gateway reads it again every hour.")
+    if lost:
+        lines.append(
+            (f"And {lost}" if lines else f"The {label} {noun} is running, but {lost}")
+            + " mail(s) it had mirrored are missing from its records (restored from an "
+            "older backup, or a record file removed). Nothing is lost: it looks for each "
+            "in the mailbox by its Message-ID, and puts it back in its chat once found.")
     why = sorted(unread["why"].items(), key=lambda item: (-item[1], item[0]))
-    if why:
+    if standing and why:
         lines.append("Why, as the gateway counts them: "
                      + "; ".join(f"{reason} ({count})" for reason, count in why[:6]) + ".")
-    lines.append(
-        f"One such mail now and then is that mail's own doing. A run of them means the "
-        f"gateway's reader fails on mail it should read: its log names each mail and "
-        f"what failed. {repair_link()} shows the gateway's status.")
+    if standing or not lost:
+        lines.append(
+            f"One such mail now and then is that mail's own doing. A run of them means "
+            f"the gateway's reader fails on mail it should read: its log names each mail "
+            f"and what failed. {repair_link()} shows the gateway's status.")
+    else:
+        lines.append(f"{repair_link()} shows the gateway's status.")
     return "\n\n".join(lines)
 
 
@@ -358,18 +377,21 @@ class MonitorEngine:
     def _note_unread(self, slug: str, label: str, unread: dict | None, now: float,
                      channel: str | None) -> None:
         """A gateway that is up, and what it says of mail it could not read
-        (``unread_mail``). The user is told when ``unread_step`` or more of
-        them stand beyond those last told of — once, then not again before a
-        reminder interval has passed, however fast they come. Mails that
-        were read since (placeholders heal) count no more, so a later run is
-        news again. Never an outage: the gateway's state stays "up"."""
+        (``unread_mail``) — placeholders, and mail whose records it lost and
+        looks for again, counted together. The user is told when
+        ``unread_step`` or more of them stand beyond those last told of —
+        once, then not again before a reminder interval has passed, however
+        fast they come. Mails that were read since (placeholders heal, lost
+        mail is found) count no more, so a later run is news again. Never an
+        outage: the gateway's state stays "up"."""
         entry = self.state[slug]
-        if not unread or not (unread["standing"] or entry.get("unread")):
+        standing = unread["standing"] + unread.get("lost", 0) if unread else 0
+        if not unread or not (standing or entry.get("unread")):
             return
         seen = entry.setdefault("unread", {})
-        seen["told"] = min(int(seen.get("told", 0)), unread["standing"])
+        seen["told"] = min(int(seen.get("told", 0)), standing)
         last = seen.get("last_notice")
-        if unread["standing"] - seen["told"] < self.unread_step \
+        if standing - seen["told"] < self.unread_step \
                 or (last is not None and now - float(last) < self.remind_seconds):
             return
         text = unread_message(label, unread, channel)
@@ -379,8 +401,9 @@ class MonitorEngine:
             sent = seen["thread_id"] = self.notifier.open_thread(
                 unread_title(label), text, attention=UNREAD_ATTENTION)
         if sent:
-            print(f"{LOG} {slug}: {unread['standing']} mail(s) it cannot read", flush=True)
-            seen.update(told=unread["standing"], last_notice=now)
+            print(f"{LOG} {slug}: {unread['standing']} mail(s) it cannot read, "
+                  f"{unread.get('lost', 0)} it looks for again", flush=True)
+            seen.update(told=standing, last_notice=now)
         # else: backend unreachable — retry on the next tick
 
     def step(self, slug: str, label: str, verdict: str, reason: str | None,

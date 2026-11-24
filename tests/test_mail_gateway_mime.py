@@ -2283,7 +2283,8 @@ def test_the_reader_process_ends_what_no_look_at_the_clock_can():
             # find a mail again — with the canaries' time, and ended alike.
             head = good.split(b"\n\n")[0]
             assert gw.read_head(head) == gw._head_facts(head) == {
-                "id": "good@x.org", "message_id": "<good@x.org>", "resent": False}
+                "id": "good@x.org", "message_id": "<good@x.org>", "resent": False,
+                "sender": "ann@x.org"}
             assert gw.read_stub(good, t.NOW, "why") == gw.stub_mail(good, t.NOW, "why")
             pid = gw.READER._process.pid
             stuck = t.msg("stuck@x.org", body="Worth the wait.\n", day=39.9)
@@ -2937,8 +2938,8 @@ def test_a_mail_in_the_archive_that_lost_its_record_is_read_again():
     is long past the UID: the mail stayed in the mailbox with no record and
     no place, for good. Nothing is dropped to try any more: the placeholder
     stands, in the archive like anywhere, and is read again there. (And
-    where a record is gone from the ledger, its place in the archive is kept
-    as a note to read that UID again.)"""
+    where a record is gone from the ledger, its mail is looked for by its
+    Message-ID, and found in the archive.)"""
     for failure in (OSError(28, "No space left on device"), ValueError("a writer bug")):
         with tempfile.TemporaryDirectory() as tmp:
             gw = t.load(tmp)
@@ -3020,15 +3021,19 @@ def test_a_mail_in_the_archive_that_lost_its_record_is_read_again():
         box.remove("Archive", gone)
         mirror = gw.Mirror(box, clock=lambda: t.NOW)
         # (The mail whose record is gone is known no more: its row goes, and
-        # its place is a note like the others.)
-        assert sorted(_places(mirror)) == [("archive", 1, "again"), ("archive", 2, "again"),
-                                           ("archive", 3, "again")]
+        # its place with it — what the row said is a hint for finding it.)
+        assert sorted(_places(mirror)) == [("archive", 2, "again"), ("archive", 3, "again")]
+        assert _places(mirror, "kept@x.org") == []
         assert mirror.index.rows("SELECT * FROM mails WHERE message_id = 'kept@x.org'") == []
+        assert [tuple(row) for row in mirror.index.rows(
+            "SELECT message_id, sender, direction FROM lost")] == [
+                ("kept@x.org", "ann@x.org", "in")]
         while mirror.poll():
             pass
         assert _whole(gw) == ["kept@x.org", "old@x.org"] and _places(mirror) == []
         assert _places(mirror, "old@x.org") == [("archive", 2, None)]
         assert _places(mirror, "kept@x.org") == [("archive", 1, None)]
+        assert mirror.lost() == 0
     print("ok: a mail in the archive whose record was dropped and not written anew is "
           "read again there, as is one an older build had marked")
 
@@ -3389,8 +3394,10 @@ def test_a_mail_read_again_is_what_it_was():
     direction carried over to whatever mail turned up under its id. Neither
     is needed: a record written again stands until its replacement does, so
     the mail is what it was while that fails, followed and tombstoned like
-    any; and a mail whose record is lost is read as any mail is read where
-    it lies."""
+    any; and a mail whose record is lost is looked for by its Message-ID and
+    read as any mail is read the first time where it lies — the user's own
+    again only where it is From the sender its lost record had, which was
+    the user's."""
     with tempfile.TemporaryDirectory() as tmp:
         # A sent mail that is a placeholder is moved to the archive; at the
         # hour it reads — and the write of its record fails, for a while.
@@ -3458,11 +3465,11 @@ def test_a_mail_read_again_is_what_it_was():
             gw._ibstore.write_outbound = real_write
     with tempfile.TemporaryDirectory() as tmp:
         # The ledger loses its records (restored from a backup, or emptied):
-        # every mail is read again where it lies, as any mail is read the
-        # first time there — the archived sent mail in the archive, by its
-        # From, as the user's; the mail to oneself, whose Sent copy is gone,
-        # from the copy that is left, in INBOX: inbound, as nothing else can
-        # be told of it. And no backfill is started over to find them.
+        # every mail is looked for by its id and read again where it lies,
+        # as any mail is read the first time there — but the archived sent
+        # mail and the mail to oneself, whose Sent copy is gone, are From
+        # the sender their lost records had, which were the user's: the
+        # user's again. And no backfill is started over to find them.
         gw = t.load(tmp)
         t._write_policy(gw)
         events = t.rail(gw)
@@ -3489,13 +3496,12 @@ def test_a_mail_read_again_is_what_it_was():
         assert mirror.index.rows("SELECT * FROM mails") == []
         while mirror.poll():
             pass
-        assert {mid: r["type"] for mid, r in t.by_id(gw).items()} == {
-            **kinds, "self@example.org": gw._ibstore.T_INBOUND}
+        assert {mid: r["type"] for mid, r in t.by_id(gw).items()} == kinds
         assert sorted(box.fetched[fetched:]) == [
             ("Archive", 1, gw.MAIL_MAX_MAIL_BYTES), ("INBOX", 1, gw.MAIL_MAX_MAIL_BYTES),
             ("INBOX", 2, gw.MAIL_MAX_MAIL_BYTES)]
         assert all(p.get("backfill") is True for _k, p in events[told:]) and mirror.backfill_done()
-        assert len(events) == told + 3
+        assert len(events) == told + 3 and mirror.lost() == 0
     print("ok: a mail whose record is written again is what it was while that fails — "
           "followed, and tombstoned, like any — and one whose record is lost is read as "
           "any mail is, from wherever it lies")
@@ -3933,6 +3939,303 @@ def test_a_mail_that_leaves_while_its_record_is_written_again_is_tombstoned():
           "and the rail hears of it")
 
 
+def _lose_records(gw, mirror, *message_ids):
+    """The ledger restored from a backup that lacks these records (all of
+    them, with none named) — the state volume closed for it, as a restore
+    comes with a restart."""
+    for path, fields in list(gw._ibstore.iter_records(gw.INBOUND_STORE_DIR)):
+        if not message_ids or fields["message_id"] in message_ids:
+            path.unlink()
+    mirror.index.close()
+    mirror.threads.close()
+
+
+def _kinds(gw) -> dict:
+    return {mid: ("out" if r["type"] == gw._ibstore.T_OUTBOUND else "in", r["sender"],
+                  r["text"]) for mid, r in t.by_id(gw).items() if not r["removed_at"]}
+
+
+def test_the_mail_of_a_lost_record_is_found_wherever_it_went():
+    """A record lost from the ledger turned its places into notes with no
+    id, read only while their folder kept its UIDs and the mail its place.
+    The mail archived before its note was read, or its folder renumbered or
+    rebuilt meanwhile — the archive not answering for a while, the server's
+    maintenance — and it was never mirrored again: no record, no tombstone,
+    and /health green. What the row said is kept as hints in `lost`, and
+    the mail is looked for by its Message-ID in every folder."""
+    for change in ("renumber", "rebuild"):
+        with tempfile.TemporaryDirectory() as tmp:
+            # Ann's mail is archived; the ledger loses its record; after the
+            # restart the archive will not open for a while, and is
+            # renumbered (rebuilt) meanwhile.
+            gw = t.load(tmp)
+            t._write_policy(gw)
+            t.rail(gw)
+            clock = _Clock()
+            box = t.FakeMailbox(gw)
+            mirror = gw.Mirror(box, clock=clock)
+            loop = {}
+            _looped(gw, mirror, loop)
+            box.put("Archive", t.msg("z@x.org", sender="Zed <z@z.org>", day=39.0))
+            uid = box.put("INBOX", t.msg("a@x.org", body="Ann's words.\n", day=39.9))
+            clock.now += 60
+            _looped(gw, mirror, loop)
+            box.move_mail("INBOX", uid, "Archive")
+            clock.now += 60
+            _looped(gw, mirror, loop)
+            _lose_records(gw, mirror)
+            box.refused.add("Archive")
+            mirror, loop = gw.Mirror(box, clock=clock), {}
+            assert mirror.index.rows("SELECT * FROM locations") == []
+            for _ in range(3):
+                clock.now += 60
+                _looped(gw, mirror, loop)
+            assert t.records(gw) == [] and gw._health_snapshot()["lost"] == 1
+            getattr(box, change)("Archive")
+            box.refused.clear()
+            for _ in range(3):
+                clock.now += 3600
+                _looped(gw, mirror, loop)
+            assert _kinds(gw) == {"a@x.org": ("in", "ann@x.org", "Ann's words.")}, change
+            assert _places(mirror, "a@x.org") == [
+                ("archive", box.uid_of("Archive", "a@x.org"), None)], change
+            snap = gw._health_snapshot()
+            assert snap["lost"] == 0 and snap["connected"] is True, snap
+    with tempfile.TemporaryDirectory() as tmp:
+        # Five mails lose their records; the first cannot be written for a
+        # while (the rest of the work waits, as a fault makes it), and the
+        # user archives another meanwhile.
+        gw = t.load(tmp)
+        t._write_policy(gw)
+        t.rail(gw)
+        clock = _Clock()
+        box = t.FakeMailbox(gw)
+        mirror = gw.Mirror(box, clock=clock)
+        loop = {}
+        _looped(gw, mirror, loop)
+        for i in range(5):
+            box.put("INBOX", t.msg(f"i{i}@x.org", subject=f"i{i}", day=39.1 + i / 100))
+        for _ in range(2):
+            clock.now += 61
+            _looped(gw, mirror, loop)
+        _lose_records(gw, mirror)
+        undo = _failing(gw, "write_message", "i0@x.org", [ValueError("a bug")] * 3)
+        try:
+            mirror, loop = gw.Mirror(box, clock=clock), {}
+            for _ in range(2):
+                clock.now += 61
+                _looped(gw, mirror, loop)
+            box.move_mail("INBOX", box.uid_of("INBOX", "i3@x.org"), "Archive")
+            for _ in range(2):
+                for _ in range(20):
+                    clock.now += 61
+                    snap = _looped(gw, mirror, loop)
+                clock.now += 86400
+        finally:
+            undo()
+        assert sorted(_kinds(gw)) == [f"i{i}@x.org" for i in range(5)]
+        assert _places(mirror, "i3@x.org") == [("archive", 1, None)]
+        assert snap["connected"] is True and snap["lost"] == 0, snap
+    print("ok: the mail of a record lost from the ledger is found by its Message-ID — "
+          "archived, its folder renumbered or rebuilt, behind a fault")
+
+
+def test_a_lost_record_that_cannot_be_told_yet_holds_back_no_other():
+    """The notes of lost records were read in one order, and the first
+    whose header block did not come back ended the reading for good: every
+    other mail lost with it stayed unmirrored, and /health said nothing.
+    A mail that cannot be told now (its header block does not come back —
+    a hostile mail can do that every time) stays in `lost`, is looked for
+    again less and less often, holds back none behind it, and is counted
+    on /health — unless it is the very placeholder it was, under the id of
+    its bytes, which needs no reading."""
+    for facts_too in (False, True):
+        with tempfile.TemporaryDirectory() as tmp:
+            gw = t.load(tmp)
+            t._write_policy(gw)
+            t.rail(gw)
+            clock = _Clock()
+            box = t.FakeMailbox(gw)
+            gw.READER = reader = _CuedReader(gw)
+            undo = _flaky(gw, {"hostile"})
+            try:
+                mirror = gw.Mirror(box, clock=clock)
+                loop = {}
+                _looped(gw, mirror, loop)
+                hostile = t.msg("evil@x.org", sender="Mallory <m@evil.org>", subject="hostile",
+                                day=39.0)
+                reader.slow.add(gw._head_of(hostile))
+                box.put("INBOX", hostile)
+                for i in range(5):
+                    box.put("INBOX", t.msg(f"i{i}@x.org", subject=f"i{i}", day=39.1))
+                arch = box.put("INBOX", t.msg("arch@x.org", subject="arch", day=39.2))
+                for _ in range(2):
+                    clock.now += 61
+                    _looped(gw, mirror, loop)
+                box.move_mail("INBOX", arch, "Archive")
+                clock.now += 61
+                _looped(gw, mirror, loop)
+                bare = gw._bare_id(gw._head_of(hostile))
+                assert mirror._placeholders == {bare} and len(t.records(gw)) == 7
+                _lose_records(gw, mirror)
+                if not facts_too:
+                    # Only a stub of it does not come back; its header block
+                    # is read to find it (the scan needs no stub).
+                    reader.slow.clear()
+                    real = reader.stub
+                    reader.stub = lambda head, date, seconds: (
+                        (_ for _ in ()).throw(gw.TookTooLong("hangs"))
+                        if head == gw._head_of(hostile) else real(head, date, seconds))
+                mirror, loop = gw.Mirror(box, clock=clock), {}
+                # (First in the list, whatever the digest of its bytes.)
+                mirror.index.run("UPDATE lost SET noticed = noticed - 1 WHERE message_id = ?",
+                                 (bare,))
+                assert mirror.lost() == 7
+                for _ in range(2):
+                    for _ in range(10):
+                        clock.now += 61
+                        snap = _looped(gw, mirror, loop)
+                    clock.now += 86400
+                assert sorted(m for m in _kinds(gw) if m != bare) == [
+                    "arch@x.org"] + [f"i{i}@x.org" for i in range(5)], facts_too
+                assert _places(mirror, "arch@x.org") == [("archive", 1, None)]
+                assert snap["connected"] is True and snap["error"] is None, snap
+                if facts_too:
+                    # Not known: still looked for, and said to be.
+                    assert bare not in t.by_id(gw) and snap["lost"] == 1, snap
+                    assert mirror.index.one("SELECT tries FROM lost")["tries"] >= 2
+                else:
+                    assert t.by_id(gw)[bare]["text"] == gw.UNREADABLE_TEXT
+                    assert snap["lost"] == 0 and snap["placeholders"]["standing"] == 1
+            finally:
+                undo()
+                gw.READER = None
+    print("ok: a lost record whose mail cannot be told yet holds back no other, and is "
+          "counted on /health")
+
+
+def test_the_mail_of_a_lost_record_is_the_users_only_by_its_own_from():
+    """A lost record's mail was read with "noted" standing in for evidence:
+    any archived mail From an address of the user's became the user's own
+    (the forged "I hacked your account" mail among them), the notes were
+    read Sent, INBOX, archive — so a look-alike in INBOX took the record of
+    the user's archived sent mail — and the user's own mail from an address
+    MAIL_OWN_ADDRESSES does not list came back inbound. Now the one mail
+    read as the record's is, among those From the sender the lost row
+    named, the one that came first; and it is the user's own where the row
+    said so and it is From that sender — evidence of the mail itself."""
+    cases = {
+        # A forged From in the archive: it came in, and stays inbound.
+        "forged": dict(
+            first=[("INBOX", t.msg("spoof@evil.org", sender=t.ME, to=t.ME,
+                                   subject="I hacked your account",
+                                   body="Pay 1000 USD in bitcoin to 1Evil.\n", day=39.6))],
+            archive=[("INBOX", "spoof@evil.org")],
+            want={"spoof@evil.org": ("in", "me@example.org",
+                                     "Pay 1000 USD in bitcoin to 1Evil.")}),
+        # The user's sent mail archived, Mallory's under its id in INBOX.
+        "look-alike": dict(
+            first=[("Sent", t.msg("own@example.org", sender=t.ME, to="Mallory <m@evil.org>",
+                                  body="My offer: 100.\n", day=39.9))],
+            archive=[("Sent", "own@example.org")],
+            then=[("INBOX", t.msg("own@example.org", sender="Mallory <m@evil.org>",
+                                  subject="Re", body="Mallory: pay to account 666.\n",
+                                  day=39.95))],
+            want={"own@example.org": ("out", "me@example.org", "My offer: 100.")}),
+        # A mail to oneself whose Sent copy was archived.
+        "to oneself": dict(
+            first=[("Sent", t.msg("self@example.org", sender=t.ME, to=t.ME,
+                                  body="Note to self.\n", day=39.5)),
+                   ("INBOX", t.msg("self@example.org", sender=t.ME, to=t.ME,
+                                   body="Note to self.\n", day=39.5))],
+            archive=[("Sent", "self@example.org")],
+            want={"self@example.org": ("out", "me@example.org", "Note to self.")}),
+        # Sent from a plus-address nobody listed, and archived.
+        "plus-address": dict(
+            first=[("Sent", t.msg("plus@example.org", sender="Me <me+shop@example.org>",
+                                  to="Bob <bob@y.org>", body="From the shop address.\n",
+                                  day=39.6))],
+            archive=[("Sent", "plus@example.org")],
+            want={"plus@example.org": ("out", "me+shop@example.org",
+                                       "From the shop address.")}),
+    }
+    for name, case in cases.items():
+        with tempfile.TemporaryDirectory() as tmp:
+            gw = t.load(tmp)
+            t._write_policy(gw)
+            events = t.rail(gw)
+            clock = _Clock()
+            box = t.FakeMailbox(gw)
+            mirror = gw.Mirror(box, clock=clock)
+            loop = {}
+            _looped(gw, mirror, loop)
+            for folder, raw in case["first"]:
+                box.put(folder, raw)
+            for _ in range(2):
+                clock.now += 61
+                _looped(gw, mirror, loop)
+            for folder, mid in case["archive"]:
+                box.move_mail(folder, box.uid_of(folder, mid), "Archive")
+            for folder, raw in case.get("then", ()):
+                box.put(folder, raw)
+            for _ in range(2):
+                clock.now += 61
+                _looped(gw, mirror, loop)
+            assert _kinds(gw) == case["want"], (name, _kinds(gw))
+            _lose_records(gw, mirror)
+            told = len(events)
+            mirror, loop = gw.Mirror(box, clock=clock), {}
+            for _ in range(3):
+                clock.now += 61
+                _looped(gw, mirror, loop)
+            assert _kinds(gw) == case["want"], (name, _kinds(gw))
+            (mid,) = case["want"]
+            direction, sender, _text = case["want"][mid]
+            assert [(p["direction"], p["sender"], p.get("backfill")) for p in
+                    t.inbound(events[told:])] == [(direction, sender, True)], name
+            assert mirror.lost() == 0 and mirror.index.rows(
+                "SELECT * FROM locations WHERE skipped = 'again'") == [], name
+    print("ok: the mail of a lost record is the user's own only where it is From the "
+          "sender that record had — forged, look-alike, to oneself, from a plus-address")
+
+
+def test_a_ledger_that_lost_many_records_is_looked_through_a_batch_a_pass():
+    """A ledger restored from an old backup may lose thousands of records
+    at once. Looking for them costs each pass a bounded share (LOST_BATCH
+    of them, least recently tried first), is the rest of the work, and new
+    mail is mirrored at the poll it arrives by meanwhile."""
+    with tempfile.TemporaryDirectory() as tmp:
+        gw = t.load(tmp)
+        t._write_policy(gw)
+        t.rail(gw)
+        clock = _Clock()
+        box = t.FakeMailbox(gw)
+        mirror = gw.Mirror(box, clock=clock)
+        loop = {}
+        _looped(gw, mirror, loop)
+        many = 2 * gw.LOST_BATCH + 7
+        for i in range(many):
+            box.put("INBOX", t.msg(f"i{i}@x.org", subject=f"i{i}", day=39.0 + i / 10000))
+        clock.now += 61
+        _looped(gw, mirror, loop)
+        assert len(t.records(gw)) == many
+        _lose_records(gw, mirror)
+        mirror, loop = gw.Mirror(box, clock=clock), {}
+        assert mirror.lost() == many
+        searched = []
+        for n in range(3):
+            box.put("INBOX", t.msg(f"new{n}@x.org", body=f"New {n}.\n", day=40))
+            found = len(box.found)
+            clock.now += 61
+            _looped(gw, mirror, loop)
+            assert f"new{n}@x.org" in t.by_id(gw), n
+            searched.append(len({mid for _f, mid in box.found[found:]}))
+        assert searched == [gw.LOST_BATCH, gw.LOST_BATCH, 7], searched
+        assert mirror.lost() == 0 and len(_kinds(gw)) == many + 3
+    print("ok: a ledger that lost many records is looked through a batch a pass, and new "
+          "mail does not wait for it")
+
+
 # --------------------------------------------------------------------------
 # The invariants, walked (see "What the bookkeeping must keep" in the gateway)
 # --------------------------------------------------------------------------
@@ -3951,6 +4254,22 @@ _OTHERS = (t.msg("z@x.org", sender="Zed <z@z.org>", body="Zed.\n", day=39.8),
                  day=39.95))
 
 
+# A mail From the user's own address that came in (the "I hacked your
+# account" kind), a mail to oneself, one sent from a plus-address nobody
+# listed, a look-alike under the id of the user's mail that arrived — by its
+# Date — before it, and a mail whose header block never reads.
+_FORGED = t.msg("forged@x.org", sender=t.ME, to=t.ME, subject="flaky",
+                body="Pay 1000 USD to 1Evil.\n", day=39.9)
+_SELF = t.msg("self@example.org", sender=t.ME, to=t.ME, subject="flaky",
+              body="A note to myself.\n", day=39.9)
+_PLUS = t.msg("plus@example.org", sender="Me <me+shop@example.org>", to="Bob <bob@y.org>",
+              subject="flaky", body="From the shop address.\n", day=39.9)
+_LOOKALIKE = t.msg("mine@example.org", sender="Mallory <m@evil.org>", subject="Re: hello",
+                   body="Mallory's words.\n", day=39.85)
+_HOSTILE = t.msg("evil@x.org", sender="Mallory <m@evil.org>", subject="hostile",
+                 body="Never read.\n", day=39.8)
+
+
 def _via(raw: bytes, n: int) -> bytes:
     """The copy of a mail a server took in: trace fields of its own."""
     return b"Received: from relay%d.example.org by mx.example.org; x\r\n" % n + raw
@@ -3964,7 +4283,9 @@ def _via(raw: bytes, n: int) -> bytes:
 # passed and the mail's record is written again — while that write fails,
 # where the walk has it fail — turn by turn: a client, the server, a
 # restart (_Hands); ``lost`` has the mail's record lost from the ledger
-# (restored from a backup) when the client acts.
+# (restored from a backup) when the client acts — "all": every record, as an
+# old backup loses them. ``hostile`` is a mail in it whose header block never
+# reads, ``new`` has new mail arrive at every turn of ``during``.
 _WALKS = {
     "one mail in one folder": dict(
         first=[("INBOX", _ANN)], mail=[_ANN], out=False),
@@ -4041,6 +4362,42 @@ _WALKS = {
     "deleted meanwhile": dict(
         first=[("INBOX", _ANN)], during={0: lambda h: h.box.remove("INBOX", 1)},
         mail=[_ANN], out=False),
+    # The routes walked from a record lost from the ledger, its mail looked
+    # for by its id (Mirror._read_lost):
+    "lost from the ledger, then archived before it is read again": dict(
+        first=[("INBOX", _ANN)],
+        during={0: lambda h: (h.lose(), h.box.move_mail("INBOX", 1, "Archive"))},
+        new=True, mail=[_ANN], out=False),
+    "lost from the ledger, then the archive renumbered": dict(
+        first=[("Sent", _MINE)], does=lambda box: box.move_mail("Sent", 1, "Archive"),
+        during={0: lambda h: (h.lose(), h.box.renumber("Archive"))},
+        new=True, mail=[_MINE], out=True),
+    "lost from the ledger, then INBOX rebuilt": dict(
+        first=[("INBOX", _OTHERS[0]), ("INBOX", _ANN), ("INBOX", _OTHERS[1])],
+        does=lambda box: box.remove("INBOX", 1),
+        during={0: lambda h: (h.lose(), h.box.rebuild("INBOX"))},
+        new=True, mail=[_ANN], out=False),
+    "lost from the ledger, a hostile mail first in the list": dict(
+        first=[("INBOX", _HOSTILE), ("INBOX", _ANN)], lost="all", hostile=_HOSTILE,
+        during={0: lambda h: None}, new=True, mail=[_ANN], out=False),
+    "lost from the ledger, a forged From in the archive": dict(
+        first=[("INBOX", _FORGED)], does=lambda box: box.move_mail("INBOX", 1, "Archive"),
+        lost=True, mail=[_FORGED], out=False),
+    "lost from the ledger, a look-alike in INBOX, its own mail archived": dict(
+        first=[("Sent", _MINE)], then=[("INBOX", _via(_LOOKALIKE, 9))],
+        does=lambda box: box.move_mail("Sent", 1, "Archive"), lost=True,
+        mail=[_MINE], out=True),
+    "lost from the ledger, a mail to oneself, its Sent copy archived": dict(
+        first=[("Sent", _SELF), ("INBOX", _via(_SELF, 1))],
+        does=lambda box: box.move_mail("Sent", 1, "Archive"), lost=True,
+        mail=[_SELF, _via(_SELF, 1)], out=True),
+    "lost from the ledger, sent from a plus-address and archived": dict(
+        first=[("Sent", _PLUS)], does=lambda box: box.move_mail("Sent", 1, "Archive"),
+        lost=True, mail=[_PLUS], out=True),
+    "its record file gone under the running gateway, the mail back from the Trash": dict(
+        first=[("INBOX", _ANN)], does=lambda box: box.remove("INBOX", 1),
+        during={0: lambda h: h.vanish(), 1: lambda h: h.box.put("INBOX", _ANN)},
+        new=True, mail=[_ANN], out=False),
 }
 _LEDGER_WRITES = ("write_message", "write_outbound", "store_media", "tombstone_message",
                   "rekey_chat", "update_message")
@@ -4048,11 +4405,12 @@ _LEDGER_WRITES = ("write_message", "write_outbound", "store_media", "tombstone_m
 
 class _Hands:
     """What a walk's ``during`` may do: the mailbox, a restart of the
-    process, and the mail's record lost from the ledger (and then a
-    restart, as a ledger restored from a backup comes with one)."""
+    process, the mail's record lost from the ledger (and then a restart, as
+    a ledger restored from a backup comes with one), and its record file
+    gone while the process runs."""
 
-    def __init__(self, box, restart, lose):
-        self.box, self.restart, self.lose = box, restart, lose
+    def __init__(self, box, restart, lose, vanish):
+        self.box, self.restart, self.lose, self.vanish = box, restart, lose, vanish
 
 
 def _walk(name: str, *, late=(), kill=None, fault: int = 0) -> dict:
@@ -4085,11 +4443,19 @@ def _walk(name: str, *, late=(), kill=None, fault: int = 0) -> dict:
             run["mirror"].threads.close()
             run["mirror"], run["loop"] = gw.Mirror(box, clock=clock), {}
 
+        def vanish() -> None:
+            for path, fields in list(gw._ibstore.iter_records(gw.INBOUND_STORE_DIR)):
+                if walk.get("lost") == "all" or fields["message_id"] == ident:
+                    path.unlink()
+
         def lose() -> None:
-            next(path for path, fields in gw._ibstore.iter_records(gw.INBOUND_STORE_DIR)
-                 if fields["message_id"] == ident).unlink()
+            vanish()
             restart()
-        hands = _Hands(box, restart, lose)
+        hands = _Hands(box, restart, lose, vanish)
+        hostile = walk.get("hostile")
+        if hostile is not None:
+            reader.slow.add(gw._head_of(hostile))
+            undo_hostile = _flaky(gw, {"hostile"})
 
         def head_of(raw: bytes) -> str:
             return gw.stub_mail(raw, None, "").headers
@@ -4140,8 +4506,15 @@ def _walk(name: str, *, late=(), kill=None, fault: int = 0) -> dict:
                     head_of(raw) == made_from(under) for raw in held)), \
                     f"{where}: a mail left with no tombstone"
             # Every mail the mailbox holds is on record, whole; nothing is
-            # left half-done in the index.
+            # left half-done in the index. (A mail that never reads, whose
+            # record was lost, is still looked for — and said to be.)
+            lost = {row["message_id"] for row in run["mirror"].index.rows(
+                "SELECT message_id FROM lost")}
+            assert lost == ({gw._bare_id(gw._head_of(hostile))} if hostile else set()), \
+                (where, lost)
             for raw in held:
+                if raw == hostile:
+                    continue
                 mid = gw.parse_mail(raw).message_id
                 assert any(r["message_id"] == mid and not r["removed_at"]
                            and r["text"] != gw.UNREADABLE_TEXT for r in recs), (where, mid)
@@ -4154,6 +4527,7 @@ def _walk(name: str, *, late=(), kill=None, fault: int = 0) -> dict:
                     r["message_id"]: bool(r["removed_at"]) for r in recs}, where
             snap = gw._health_snapshot()
             assert snap["connected"] is True and snap["blocked"] is None, (where, snap)
+            assert snap["lost"] == len(lost), (where, snap)
 
         def turn(n=None) -> None:
             count = {"n": 0}
@@ -4220,7 +4594,7 @@ def _walk(name: str, *, late=(), kill=None, fault: int = 0) -> dict:
             for n in range(4 if fault or "during" in walk else 1):
                 left[0] -= 1
                 walk.get("during", {}).get(n, lambda h: None)(hands)
-                if fault:
+                if fault or walk.get("new"):
                     run["new"].append(f"new{n}@x.org")
                     box.put("INBOX", t.msg(run["new"][-1], body=f"New mail {n}.\n", day=40))
                 turn()
@@ -4233,6 +4607,8 @@ def _walk(name: str, *, late=(), kill=None, fault: int = 0) -> dict:
             check(final=True)
             return {"readings": reader.asked - asked, "writes": run["writes"]}
         finally:
+            if hostile is not None:
+                undo_hostile()
             undo()
     finally:
         for fn, real in saved.items():
@@ -4249,16 +4625,22 @@ def test_the_invariants_hold_wherever_the_walk_is_cut():
     the walks with a fault): another's mail under its id arriving, the
     folder renumbered or rebuilt so an old UID holds another mail, the mail
     archived in the back-off and the process restarted, the mail deleted;
-    and its record lost from the ledger with a look-alike beside it — with
-    the reader late at each header reading in turn (once, and twice
-    running, which is "no answer"), the process killed after each write in
-    turn, both at once, and a write that fails for a while as new mail
-    arrives. At every step: no mail that is in the mailbox is tombstoned, no
-    record holds another mail's content, no mail's direction flips (nothing
-    its correspondent sends is ever the user's own mail), new mail is
-    mirrored at the poll it arrives by; and in the end every mail is on
-    record once, whole, a mail that left is a tombstone, and nothing is
-    left half-done."""
+    its record lost from the ledger with a look-alike beside it (in INBOX,
+    the user's own mail in Sent or the archive), then archived before it is
+    read again, then its folder renumbered or rebuilt, behind a hostile
+    mail that never reads, a forged From in the archive, a mail to oneself,
+    a mail sent from a plus-address; its record file gone while the process
+    runs — with the reader late at each header reading in turn (once, and
+    twice running, which is "no answer"), the process killed after each
+    write in turn, both at once, and a write that fails for a while as new
+    mail arrives. At every step: no mail that is in the mailbox is
+    tombstoned, no record holds another mail's content, no mail's direction
+    flips (nothing its correspondent sends is ever the user's own mail),
+    new mail is mirrored at the poll it arrives by; and in the end every
+    mail is on record once, whole, a mail that left is a tombstone, nothing
+    whose record was lost is lost for good while its mail is in a mirrored
+    folder (only the one that never reads is still looked for, and /health
+    says so), and nothing is left half-done."""
     walks = readings = 0
     for name in _WALKS:
         plain = _walk(name)
@@ -4277,7 +4659,7 @@ def test_the_invariants_hold_wherever_the_walk_is_cut():
         walks += len(cues) + 2 * len(kills) + 2
         assert plain["writes"][0] >= 3 and plain["writes"][1] >= 3, (name, plain)
         readings += plain["readings"]
-    assert walks > 600 and readings > 20, (walks, readings)
+    assert walks > 1200 and readings > 20, (walks, readings)
     print(f"ok: over {walks} walks — every scenario, the reader late on cue, the process "
           f"killed after any write, a write that fails as new mail arrives — no live mail "
           f"is tombstoned, no record holds another mail's content, no direction flips")

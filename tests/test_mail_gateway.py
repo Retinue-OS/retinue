@@ -485,6 +485,88 @@ def test_the_sent_copy_arriving_late_makes_it_the_users_own_mail():
     print("ok: a mail first seen in INBOX becomes the user's own once its Sent copy shows")
 
 
+def test_the_sent_copy_that_shows_as_sent_is_renumbered_still_counts():
+    """The same, with the Sent copy saved in the very poll in which the
+    server renumbers Sent. What arrived since the last look is read at once
+    then — and a mail of it on record was only given its place there, so
+    the user's own post stayed an inbound mail for good. It is read as the
+    folder is followed: the Sent copy makes it the user's."""
+    with tempfile.TemporaryDirectory() as tmp:
+        gw = load(tmp)
+        events = rail(gw)
+        clock = {"now": NOW}
+        box = FakeMailbox(gw)
+        mirror = gw.Mirror(box, clock=lambda: clock["now"])
+        mirror.poll()
+        post = msg("post@example.org", sender=ME, to="list@lists.x.org", cc=ACCOUNT, day=40)
+        box.put("INBOX", post, date=NOW)
+        clock["now"] += 60
+        mirror.poll()
+        assert records(gw)[0]["type"] == gw._ibstore.T_INBOUND
+        box.put("Sent", post, date=NOW + 60)
+        box.renumber("Sent")
+        for _ in range(4):
+            clock["now"] += 3600
+            mirror.poll()
+            while mirror.poll(sync=False):
+                pass
+        (record,) = records(gw)
+        assert record["type"] == gw._ibstore.T_OUTBOUND and record["author"] == "device"
+        assert [e["direction"] for e in inbound(events)] == ["in", "out"]
+        assert sorted((row["role"], row["uid"]) for row in mirror.index.rows(
+            "SELECT role, uid FROM locations WHERE message_id = 'post@example.org'")) == [
+                ("inbox", 1), ("sent", 51)]
+    print("ok: a Sent copy that shows as Sent is renumbered makes the mail the user's own")
+
+
+def test_a_record_whose_file_is_gone_is_written_as_the_first_time():
+    """A record file lost while the gateway runs (deleted by hand, a ledger
+    directory restored under it), and then its mail written again in its
+    place — here the Sent copy of the user's list post, recorded from
+    INBOX, shows. The record to replace was not there, the write raised,
+    and every look at the folders stopped at that mail: no new mail was
+    mirrored until a restart. Nothing stands to be replaced, so the record
+    is written as the first time, and the index is matched with the
+    ledger again."""
+    with tempfile.TemporaryDirectory() as tmp:
+        gw = load(tmp)
+        _write_policy(gw)
+        events = rail(gw)
+        clock = {"now": NOW}
+        box = FakeMailbox(gw)
+        mirror = gw.Mirror(box, clock=lambda: clock["now"])
+        mirror.poll()
+        post = msg("post@example.org", sender=ME, to="list@lists.x.org", cc=ACCOUNT, day=40)
+        box.put("INBOX", post, date=NOW)
+        clock["now"] += 60
+        mirror.poll()
+        (path,) = [p for p, _f in gw._ibstore.iter_records(gw.INBOUND_STORE_DIR)]
+        path.unlink()
+        box.put("Sent", post, date=NOW + 60)
+        loop = {}
+        for n in range(4):
+            clock["now"] += 600
+            box.put("INBOX", msg(f"new{n}@x.org", body=f"New {n}\n", day=40), date=clock["now"])
+            gw.MIRROR = mirror
+            loop.pop("synced", None)
+            gw._loop_step(mirror, loop)
+            snap = gw._health_snapshot()
+            assert snap["connected"] is True and snap["blocked"] is None, snap
+            assert f"new{n}@x.org" in by_id(gw), n
+        recs = by_id(gw)
+        assert recs["post@example.org"]["type"] == gw._ibstore.T_OUTBOUND
+        assert len(records(gw)) == 5 and mirror.lost() == 0
+        assert [e["direction"] for e in inbound(events)
+                if e["message_id"] == "post@example.org"] == ["in", "out"]
+        # The index says what the ledger does.
+        row = mirror.index.one("SELECT * FROM mails WHERE message_id = 'post@example.org'")
+        assert row["record"] == next(p.name for p, f in gw._ibstore.iter_records(
+            gw.INBOUND_STORE_DIR) if f["message_id"] == "post@example.org")
+        assert row["direction"] == "out" and mirror.index.rows("SELECT * FROM claims") == []
+    print("ok: a record whose file is gone is written as the first time, and the folders "
+          "go on")
+
+
 def test_a_move_to_the_archive_leaves_the_record_alone():
     with tempfile.TemporaryDirectory() as tmp:
         gw = load(tmp)

@@ -528,10 +528,11 @@ for the e-mail policy file) is reported as waiting for its setup, and one
 that names itself (`blocked: "mirror"`) as stopped on a fault of its own —
 with the gateway's own reason in the notice and in every reminder. A mail
 gateway that works and still cannot read some of its mail says so in
-`/health` (`placeholders`); when five or more such mails stand beyond those
-the user was last told of, the monitor opens a thread of its own for it — a
-notice of lower importance, at most one per reminder interval, never an
-outage (the mail is in the mailbox, and is read again every hour). An outage
+`/health` (`placeholders`), as does one looking for mail whose records its
+ledger lost (`lost`, counted with them); when five or more such mails stand
+beyond those the user was last told of, the monitor opens a thread of its own
+for it — a notice of lower importance, at most one per reminder interval,
+never an outage (the mail is in the mailbox, and is read again). An outage
 that turns into one of another kind (the gateway that waited for its setup
 now cannot log in) is told in the same thread once as many checks in a row
 have seen it as open an outage (`GATEWAY_MONITOR_FAILURES`), in the new

@@ -501,13 +501,13 @@ def test_mail_the_gateway_cannot_read_is_a_notice_and_no_outage():
     body = health(7, 9, took_too_long_to_read=6, RecursionError=3)
     assert gm.classify_health(200, body) == ("up", None)
     assert gm.unread_mail(body) == {"standing": 7, "made": 9, "why": {
-        "took too long to read": 6, "RecursionError": 3}}
+        "took too long to read": 6, "RecursionError": 3}, "lost": 0}
     # A gateway that says nothing of the kind, or nothing that can be read.
     for other in ({"connected": True}, None, {"placeholders": "many"},
                   {"placeholders": {"standing": "x"}}):
         assert gm.unread_mail(other) is None, other
     assert gm.unread_mail({"placeholders": {"standing": 2}}) == {
-        "standing": 2, "made": 0, "why": {}}
+        "standing": 2, "made": 0, "why": {}, "lost": 0}
 
     n = FakeNotifier()
     e = gm.MonitorEngine(n, fail_threshold=2, remind_seconds=3600, unread_step=5)
@@ -587,6 +587,46 @@ def test_mail_the_gateway_cannot_read_is_a_notice_and_no_outage():
     finally:
         gm.urllib.request.urlopen = real
     assert gm.check_gateway({"base_url": "http://127.0.0.1:9"})[0::2] == ("down", None)
+
+
+def test_mail_whose_records_were_lost_is_counted_with_the_unread():
+    """The mail gateway counts on /health, beside its placeholders, the mail
+    it had mirrored and whose records are gone from its ledger (restored
+    from an older backup): it looks for each in the mailbox again, and until
+    then the mail is in no chat. Nothing read that count. A run of them is
+    told like a run of placeholders — as a notice, in words that report no
+    outage — and counts with them."""
+    def health(standing, lost):
+        return {"status": "ok", "configured": True, "connected": True, "mode": "inbox",
+                "placeholders": {"standing": standing, "made": standing, "why": {}},
+                "lost": lost}
+
+    assert gm.unread_mail(health(0, 7)) == {"standing": 0, "made": 0, "why": {}, "lost": 7}
+    assert gm.unread_mail(dict(health(0, 0), lost="x")) is None
+    n = FakeNotifier()
+    e = gm.MonitorEngine(n, fail_threshold=2, remind_seconds=3600, unread_step=5)
+
+    def check(now, standing, lost):
+        e.step("mail-gateway", "E-mail", "up", None, now=now, channel="email",
+               unread=gm.unread_mail(health(standing, lost)))
+
+    check(1000, 0, 4)
+    assert n.opened == []
+    check(1060, 0, 40)
+    (title, notice), = n.opened
+    assert "40 mail(s) it had mirrored are missing from its records" in notice, notice
+    assert "Message-ID" in notice and "/gateways)" in notice and "placeholders" not in notice
+    for word in _IMAP_WORDS + _PAIRING_WORDS + ("NOT reaching", "not running", "stopped"):
+        assert word.lower() not in (title + notice).lower(), (word, notice)
+    assert e.state["mail-gateway"]["status"] == "up"
+    assert e.state["mail-gateway"]["unread"]["told"] == 40
+    # They are found again; placeholders and lost mail count together.
+    check(1120, 0, 0)
+    check(1120 + 3600, 3, 3)
+    assert len(n.appended) == 1
+    text = n.appended[0][1]
+    assert "3 mail(s) could not be read" in text and "And 3 mail(s) it had mirrored" in text
+    print("ok: mail whose records the gateway lost is counted with the mail it cannot read")
 
 
 def test_messenger_notices_keep_their_wording():

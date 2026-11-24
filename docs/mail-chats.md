@@ -218,7 +218,7 @@ gateway reads that before it falls back to reading a slug.
 
 `/health` answers `{configured, connected, mode: "inbox", account, error,
 blocked, needs_repair: false, build, backfill: {done, pending, days},
-placeholders: {standing, made, why}}` — `backfill.days` is the window fixed
+placeholders: {standing, made, why}, lost}` — `backfill.days` is the window fixed
 at the first run. `blocked` names what holds the mirror when that is not the
 mailbox: `"policy"` (below) or `"mirror"` — it stopped on a fault of its own,
 and `error` says on what. `placeholders` counts the mail that could not be
@@ -227,7 +227,9 @@ start, and `why`, by reason — a mail that cannot be read leaves the mirror
 `connected`, so a run of them shows here, whatever the cause, and the
 connection monitor reads it: when five or more stand beyond those it last
 told the user of, it says so in a thread of its own — a notice, not an
-outage.
+outage. `lost` counts the mails whose record is gone from the ledger and
+that are still looked for in the mailbox (below); the monitor counts them
+with the placeholders.
 An unconfigured gateway (`configured: false`) idles and is not an outage; so
 does one not opted in — no `MAIL_GATEWAY_TOKEN`, or the default account where
 `MESSENGER_BUILTIN_CHANNELS` is set without `email` — and `error` says which.
@@ -330,10 +332,12 @@ with one difference, because of what is decided on them. A header block
 whose reading does not come back is read once more, after the reader has
 shown on the canaries that it works; if it still does not come back, that is
 **no answer**: the mail looked for is left as it is, nothing is remembered,
-and no mail is called gone on it. (A placeholder must be made all the same,
-so the folder can go on: it is made without the block, under an id of the
-block's bytes, by which it is found again with no reading at all, and which
-gives way in one step once the mail reads under its own.)
+and no mail is called gone on it. (Where the folders are followed, or old
+mail read, a placeholder must be made all the same, so the folder can go
+on: it is made without the block, under an id of the block's bytes, by which
+it is found again with no reading at all, and which gives way in one step
+once the mail reads under its own. The mail of a lost record — below — has
+no folder to keep going: its id is simply looked for again later.)
 
 **A mail that cannot be read is still there.** One mail's failure never stops
 the folder, or the backfill: a mail the gateway cannot read is mirrored as a
@@ -365,12 +369,33 @@ process be stopped, the old record stands as it was, and its mail is followed
 like any (and tombstoned like any, if it leaves). A placeholder gives way only
 to the mail its record keeps the header block of; a UID is taken to be the
 mail the index has there only while its folder's `UIDVALIDITY` is the one it
-was recorded under. And a mail whose record is gone from the ledger (restored
-from a backup, a file lost) is known no more: it is read again where it lies,
-as any mail is read the first time — what a Sent copy holds is the user's,
-what is in the archive is the user's when it is from one of the user's own
-addresses — and nothing that was known of the record is carried over to
-whatever mail is found under its id.
+was recorded under. (A record whose file is gone when it is to be written
+again is written as the first time, and the index is matched with the
+ledger again.)
+
+A mail whose record is gone from the ledger (restored from an older backup,
+a file lost) is known no more: its row and its places go, and what the row
+said — the id, the sender, the direction, the chat, when the mail arrived —
+is kept as hints for finding the mail, never as knowledge of it (the
+`lost` list; nothing in it is a record, a place or a claim). The rest of
+the work looks for each such id by its `Message-ID` in Sent, INBOX and the
+archive — every mail under it in every folder, so a move or a renumbered
+folder makes no difference — at most `LOST_BATCH` ids a pass, the one
+tried least recently first, before the backfill and never in the way of
+new mail. Of what is found, the one mail From the sender the row named that
+the server received first (Sent first on a tie; the first of all if none is
+From that sender) is read as any mail is read the first time where it lies
+— what a Sent copy holds is the user's, what is in the archive the user's
+when it is from one of the user's own addresses and left Sent unseen — with
+one difference: From that very sender, where the row said the mail was the
+user's, it is the user's again, whatever address that is. That is evidence
+about the mail itself; a forged From in the archive stays a mail that came
+in, and a look-alike under the id stays a second copy. The others found are
+read as further copies of any mail are. Found in no folder, with every
+folder sure of it, the id is dropped (there is no record to tombstone).
+Where that cannot be told yet — a folder that would not answer, a header
+block that did not come back — the id stays, is looked for again less and
+less often, and holds back none behind it; `/health` counts it.
 
 The bookkeeping behind this keeps four rules, written out above `class
 Mirror` in the gateway: an answer that was not obtained is never an answer; a
