@@ -159,12 +159,15 @@ class FakeMailbox:
         box["mails"] = {uid + offset: mail for uid, mail in box["mails"].items()}
         box["next"] += offset
 
+    def uids_of(self, folder, message_id) -> tuple:
+        """Every UID in ``folder`` under this Message-ID, newest first."""
+        return tuple(
+            uid for uid, mail in sorted(self.boxes[folder]["mails"].items(), reverse=True)
+            if (email.message_from_bytes(mail["raw"]).get("Message-ID") or ""
+                ).strip().strip("<>") == message_id)
+
     def uid_of(self, folder, message_id) -> int | None:
-        for uid, mail in sorted(self.boxes[folder]["mails"].items(), reverse=True):
-            header = email.message_from_bytes(mail["raw"]).get("Message-ID") or ""
-            if header.strip().strip("<>") == message_id:
-                return uid
-        return None
+        return next(iter(self.uids_of(folder, message_id)), None)
 
     # -- the adapter's surface ------------------------------------------------
 
@@ -219,8 +222,8 @@ class FakeMailbox:
         self._check(folder)
         self.found.append((folder, message_id))
         if folder not in self.boxes:
-            return None
-        return self.uid_of(folder, message_id)
+            return self.gw.Matches((), True)
+        return self.gw.Matches(self.uids_of(folder, message_id), True)
 
 
 def records(gw) -> list:
@@ -663,7 +666,8 @@ def test_a_search_that_does_not_settle_it_calls_nothing_gone():
         # The archive's search matched more look-alike ids than are compared.
         real = box.find
         box.find = lambda folder, mid: (
-            gw.UNSURE if (folder, mid) == ("Archive", "a@x.org") else real(folder, mid))
+            gw.Matches((), False) if (folder, mid) == ("Archive", "a@x.org")
+            else real(folder, mid))
         mirror.poll()
         mirror.poll()
         recs = by_id(gw)
@@ -817,7 +821,7 @@ def test_a_mail_without_a_searchable_id_is_found_among_many():
         uid = box.put("INBOX", raw, date=NOW)
         mirror.poll()
         mid = "a-very-long-left-part-of-an-id.continued@x.org"
-        assert list(by_id(gw)) == [mid] and box.find("INBOX", mid) is None
+        assert list(by_id(gw)) == [mid] and box.find("INBOX", mid).uids == ()
         box.move_mail("INBOX", uid, "Archive")
         box.found.clear()
         mirror.poll()
@@ -2336,6 +2340,7 @@ def test_health_states():
         # it is the mirror's own, said so: the mailbox answered, and nobody
         # is to be sent to check a password over it.
         gw.MIRROR.poll = lambda **kw: 1 / 0
+        loop.pop("synced")      # (at the next look at the folders)
         assert gw._loop_step(gw.MIRROR, loop) == gw.MAIL_POLL_SECONDS
         snap = gw._health_snapshot()
         assert snap["connected"] is False and "internal error" in snap["error"]
@@ -2387,6 +2392,7 @@ def test_a_fault_of_the_mirror_is_tried_again_less_and_less_often():
         assert gw._loop_step(mirror, loop) <= gw.MAIL_POLL_SECONDS
         assert gw._health_snapshot()["connected"] is True and len(records(gw)) == 1
         mirror.poll = lambda **kw: 1 / 0
+        loop.pop("synced")
         assert [gw._loop_step(mirror, loop) for _ in range(2)] == [60.0, 120.0]
     with tempfile.TemporaryDirectory() as tmp:
         # Never less than the poll interval a deployment set, however long.
@@ -2400,6 +2406,96 @@ def test_a_fault_of_the_mirror_is_tried_again_less_and_less_often():
         assert [gw._loop_step(mirror, loop) for _ in range(3)] == [7200.0, 7200.0, 7200.0]
     print("ok: after a fault of its own the mirror waits twice as long each time, up to "
           "an hour, and a pass that goes through resets the wait")
+
+
+def test_a_fault_in_old_work_keeps_no_new_mail_waiting():
+    """(I4) The doubling wait after a fault of the mirror's own was the whole
+    loop's: one old mail the backfill could not write — a fault that lasts
+    until a fix — and new mail was mirrored an hour late, for as long. A
+    fault delays only the work that failed. Following the folders comes
+    first and by itself, every poll interval; the rest is what is tried
+    again less and less often."""
+    with tempfile.TemporaryDirectory() as tmp:
+        gw = load(tmp)
+        _write_policy(gw)
+        rail(gw)
+        box = FakeMailbox(gw)
+        old = box.put("INBOX", msg("old@x.org", body="What the writer chokes on.\n", day=20))
+        gw.MIRROR = mirror = gw.Mirror(box, clock=lambda: NOW)
+        loop: dict = {}
+        real = gw._ibstore.store_media
+
+        def store(directory, data, *args, **kwargs):
+            if b"the writer chokes on" in data:
+                raise ValueError("a bug in the writer")
+            return real(directory, data, *args, **kwargs)
+        gw._ibstore.store_media = store
+
+        def turn(n: int) -> float:
+            """One poll interval later: a new mail has come."""
+            if n:
+                box.put("INBOX", msg(f"new{n}@x.org", body=f"New mail {n}.\n", day=40))
+            loop.pop("synced", None)
+            return gw._loop_step(mirror, loop)
+        try:
+            for n in range(17):
+                assert turn(n) <= gw.MAIL_POLL_SECONDS, "new mail waits for no fault but its own"
+                assert n == 0 or f"new{n}@x.org" in by_id(gw), n
+                # Mail is mirrored, and still the mirror is at fault: /health
+                # says so, and which part of its work it is.
+                snap = gw._health_snapshot()
+                assert snap["connected"] is False and snap["blocked"] == "mirror", snap
+                assert "a bug in the writer" in snap["error"] and "'INBOX' UID 1" in snap["error"]
+                assert "new mail is still mirrored" in snap["error"] and snap["last_poll"]
+            # What failed was tried again after one interval, then two, four,
+            # eight: each try fetches that mail whole.
+            tries = [i for i, fetch in enumerate(box.fetched) if fetch[:2] == ("INBOX", old)]
+            assert len(tries) == 5 and len(box.fetched) == 5 + 16, box.fetched
+            assert sorted(by_id(gw)) == sorted(f"new{n}@x.org" for n in range(1, 17))
+            # Between two looks at the folders it is not tried either.
+            assert gw._loop_step(mirror, loop) <= gw.MAIL_POLL_SECONDS
+            assert len(box.fetched) == 5 + 16
+        finally:
+            gw._ibstore.store_media = real
+        # The writer works again: at its next try the old mail is on record
+        # — as old mail — and the mirror is healthy.
+        for n in range(17, 33):
+            turn(n)
+            if "old@x.org" in by_id(gw):
+                break
+        assert n == 31, n     # sixteen intervals after the last try
+        snap = gw._health_snapshot()
+        assert snap["connected"] is True and snap["blocked"] is None and snap["error"] is None
+        assert mirror.backfill_done() and len(records(gw)) == n + 1
+        # And the next such fault starts at one interval again.
+        assert loop["rest_faults"] == 0
+    with tempfile.TemporaryDirectory() as tmp:
+        # A fault in following the folders is another matter: the mail in
+        # hand is new mail, none behind it can be mirrored before it, and
+        # the loop as a whole waits (see the test above). The rest is not
+        # run on a look at the folders that failed.
+        gw = load(tmp)
+        _write_policy(gw)
+        rail(gw)
+        box = FakeMailbox(gw)
+        gw.MIRROR = mirror = gw.Mirror(box, clock=lambda: NOW)
+        loop = {}
+        gw._loop_step(mirror, loop)
+        passes = []
+        real_poll = mirror.poll
+
+        def poll(**kwargs):
+            passes.append(kwargs)
+            if kwargs.get("sync"):
+                raise ValueError("a bug in following the folders")
+            return real_poll(**kwargs)
+        mirror.poll = poll
+        loop.pop("synced")
+        assert [gw._loop_step(mirror, loop) for _ in range(3)] == [60.0, 120.0, 240.0]
+        assert passes == [{"sync": True, "work": False}] * 3
+        assert "new mail is still mirrored" not in gw._health_snapshot()["error"]
+    print("ok: a fault in the work an earlier look left to do delays that work alone; "
+          "new mail is mirrored at every poll meanwhile")
 
 
 def test_missing_folders_are_reported():

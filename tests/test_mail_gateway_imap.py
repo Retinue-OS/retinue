@@ -359,7 +359,7 @@ def test_listing_fetching_and_finding():
             assert box.list_uids("Sent").uids == {} and box.list_uids("Sent").uidnext == 1
             # No such folder is an answer, not an error.
             assert box.list_uids("Nope") is None and box.fetch("Nope", 1) is None
-            assert box.find("Nope", "m1@x.org") is None
+            assert box.find("Nope", "m1@x.org") == gw.Matches((), True)
 
             raw = server.folders["INBOX"]["mails"][3]["raw"]
             got = box.fetch("INBOX", 3)
@@ -383,13 +383,16 @@ def test_listing_fetching_and_finding():
             # By Message-ID: the header search matches substrings, the adapter does not.
             server.put("INBOX", t.msg("xm1@x.org", day=6))
             server.put("INBOX", t.msg("m1@x.org.example", day=6))
-            assert box.find("INBOX", "m1@x.org") == 1
-            assert box.find("INBOX", "xm1@x.org") == 6
-            assert box.find("INBOX", "m9@x.org") is None and box.find("Sent", "m1@x.org") is None
-            copy = server.put("INBOX", t.msg("m1@x.org", day=7))     # the same mail again
-            assert box.find("INBOX", "m1@x.org") == copy
+            assert box.find("INBOX", "m1@x.org") == gw.Matches((1,), True)
+            assert box.find("INBOX", "xm1@x.org").uids == (6,)
+            assert box.find("INBOX", "m9@x.org") == box.find("Sent", "m1@x.org") == gw.Matches(
+                (), True)
+            # The same mail again — or another under its id, which is its
+            # sender's to choose: every one of them, newest first.
+            copy = server.put("INBOX", t.msg("m1@x.org", day=7))
+            assert box.find("INBOX", "m1@x.org") == gw.Matches((copy, 1), True)
             server.put("INBOX", t.msg(None, subject="no id", day=8))
-            assert box.find("INBOX", "") is None
+            assert box.find("INBOX", "") == gw.Matches((), True)
 
             # One connection served all of it; folders are opened read-only and
             # bodies only ever peeked at.
@@ -409,7 +412,7 @@ def test_a_refusal_is_not_an_answer():
         server.put("Archive", t.msg("arch@x.org", day=1), date=t.T0 + t.DAY)
         with Wired(gw, server):
             box = gw.Mailbox(gw.MAIL_CONFIG, timeout=5)
-            assert box.find("Archive", "arch@x.org") == 1
+            assert box.find("Archive", "arch@x.org").uids == (1,)
             # NO to EXAMINE says nothing about the folder unless the server
             # says NONEXISTENT: it is not "no such folder", "no such mail" or
             # "expunged" — each of which would have the mirror call mail gone.
@@ -429,9 +432,9 @@ def test_a_refusal_is_not_an_answer():
             # A folder that answered a moment ago is not trusted to be open either.
             assert box.list_uids("INBOX").uids == {1: None, 2: None, 3: None}
             del server.refuse_examine["Archive"]
-            assert box.find("Archive", "arch@x.org") == 1
+            assert box.find("Archive", "arch@x.org").uids == (1,)
             # The server's own word for "no such folder" is still an answer.
-            assert box.list_uids("Nope") is None and box.find("Nope", "m1@x.org") is None
+            assert box.list_uids("Nope") is None and box.find("Nope", "m1@x.org").uids == ()
             assert server.connections == 1, "a refusal is not a broken connection"
 
             # A header the server will not hand over is not "another mail".
@@ -447,10 +450,15 @@ def test_a_refusal_is_not_an_answer():
             gw.FIND_CANDIDATES_MAX = 3
             for n in range(4):
                 server.put("INBOX", t.msg(f"x{n}-m1@x.org", day=5), date=t.T0 + 5 * t.DAY)
-            assert box.find("INBOX", "m1@x.org") is gw.UNSURE
-            assert box.find("INBOX", "x3-m1@x.org") == 7       # among the newest: found
-            assert box.find("INBOX", "m2@x.org") == 2
-            assert box.find("INBOX", "m9@x.org") is None       # the server's answer: none
+            assert box.find("INBOX", "m1@x.org") == gw.Matches((), False)
+            # Among the newest: found — and not known to be the only one.
+            assert box.find("INBOX", "x3-m1@x.org") == gw.Matches((7,), True)
+            gw.FIND_CANDIDATES_MAX = 2
+            assert box.find("INBOX", "x3-m1@x.org") == gw.Matches((7,), True)
+            assert box.find("INBOX", "org") == gw.Matches((), False)
+            gw.FIND_CANDIDATES_MAX = 3
+            assert box.find("INBOX", "m2@x.org") == gw.Matches((2,), True)
+            assert box.find("INBOX", "m9@x.org") == gw.Matches((), True)   # the server's answer
     print("ok: a folder, a search or a fetch the server refuses is never read as absence")
 
 
@@ -577,7 +585,7 @@ def test_a_dropped_connection_is_reopened_once():
             assert box.list_uids("INBOX").uids == {1: None}
             box.close()
             box.close()
-            assert box.find("INBOX", "a@x.org") == 1
+            assert box.find("INBOX", "a@x.org").uids == (1,)
     print("ok: a dropped connection is reopened and the command retried, once")
 
 

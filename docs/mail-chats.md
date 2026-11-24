@@ -224,7 +224,10 @@ mailbox: `"policy"` (below) or `"mirror"` — it stopped on a fault of its own,
 and `error` says on what. `placeholders` counts the mail that could not be
 read (below): how many placeholders stand, how many were `made` since this
 start, and `why`, by reason — a mail that cannot be read leaves the mirror
-`connected`, so a run of them shows here, whatever the cause.
+`connected`, so a run of them shows here, whatever the cause, and the
+connection monitor reads it: when five or more stand beyond those it last
+told the user of, it says so in a thread of its own — a notice, not an
+outage.
 An unconfigured gateway (`configured: false`) idles and is not an outage; so
 does one not opted in — no `MAIL_GATEWAY_TOKEN`, or the default account where
 `MESSENGER_BUILTIN_CHANNELS` is set without `email` — and `error` says which.
@@ -319,8 +322,18 @@ process of its own** (the same script, started with `--reader`, given none of
 the gateway's secrets): the reader looks at the clock wherever its own code
 runs, and where a single call into the library does not come back, the
 process is ended and replaced. Either way the mail is a placeholder — it took
-too long to read. The header block a placeholder is made from, and the one a
-mail is found again by, are read the same way.
+too long to read. (The slowest mail the bounds let through is one of
+thousands of parts under encoded file names, at about a second a megabyte:
+that is what the second per megabyte is for.) The header block a placeholder
+is made from, and the one a mail is found again by, are read the same way —
+with one difference, because of what is decided on them. A header block
+whose reading does not come back is read once more, after the reader has
+shown on the canaries that it works; if it still does not come back, that is
+**no answer**: the mail looked for is left as it is, nothing is remembered,
+and no mail is called gone on it. (A placeholder must be made all the same,
+so the folder can go on: it is made without the block, under an id of the
+block's bytes, by which it is found again with no reading at all, and which
+gives way in one step once the mail reads under its own.)
 
 **A mail that cannot be read is still there.** One mail's failure never stops
 the folder, or the backfill: a mail the gateway cannot read is mirrored as a
@@ -339,7 +352,16 @@ again from it, and is not kept by it — when the placeholder's own copy has
 left the mailbox the placeholder leaves a tombstone like any mail, and what
 still lies there under its id is then mirrored as the mail it is. Once the
 placeholder has given way to its mail, the other is one more place of the
-mail on record, as a second copy of any mail is.
+mail on record, as a second copy of any mail is. Which is which is read off
+the mails, every time they are looked for: a folder may hold several mails
+under one id, all of them are looked at, and the placeholder's own copy may
+be the older one — after a move to the archive, or a folder renumbered.
+
+The bookkeeping behind this keeps four rules, written out above `class
+Mirror` in the gateway: an answer that was not obtained is never an answer; a
+record is replaced or buried only on evidence about its own mail; what is
+known of a mail — its direction above all — stays with it until its record
+stands again; and a fault delays only the work that failed.
 
 **Whose fault a failure is, is decided by what failed.** *Reading* a mail —
 the parse, the walk of its parts, the trim — fails on the mail's account when
@@ -359,13 +381,19 @@ mail at a time with `/health` still `connected`: the pass ends there. No mail
 is set aside or marked over it, and no folder's mark moves past a mail that
 has neither a record nor a place — so the next pass reads it again, after a
 restart too, and if it has left for the archive by then it is read there, as a
-mail that came and went. (So is a mail in the archive whose record was dropped
-to be written anew and then could not be: its place is kept as a note to read
-it again.) `/health` reports `connected: false` with `blocked: "mirror"`
+mail that came and went. A mail whose record was dropped to be written anew
+and then could not be — or whose record is gone from the ledger — keeps its
+row and its places meanwhile: it is followed like any mail, in whichever
+folder it lies, and read again from there as what it was, outbound mail as
+outbound. `/health` reports `connected: false` with `blocked: "mirror"`
 meanwhile, and `error` says on what — naming the mail, where the pass stopped
-at one. While the fault lasts the pass is tried again after one poll interval,
-then twice as long each time, up to an hour: every try fetches the mail in
-hand whole again.
+at one. A fault delays only the work it was in. Following the folders — new
+mail, vanished mail — is done first and by itself, every poll interval; when
+that is what fails, it is tried again after one interval, then twice as long
+each time, up to an hour (every try fetches the mail in hand whole again).
+When the rest fails — finding mail again, reading mail again, the backfill —
+it is the rest that waits so, and new mail goes on being mirrored: `error`
+says that too.
 
 A record's time is the earlier of the mail's `Date` and the server's arrival
 time, never the future, so a forged date cannot pin a mail to the head of its
