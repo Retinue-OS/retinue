@@ -23,8 +23,8 @@
   "starred": false,
   "companion": null,
   "instructed": null,
-  "can_send": false,
-  "cannot_send_reason": "Mail is mirrored read-only for now: reply from your mail client.",
+  "can_send": true,
+  "pending": 1,
   "last": {
    "ts": "2026-08-27T08:58:00+02:00",
    "direction": "in",
@@ -121,6 +121,19 @@
    "removed_at": null,
    "ts": "2026-08-27T08:58:00+02:00",
    "original": "/chats/email%3A~me%40example.org%3ACAJx8kQ2v7Lr3n%40mail.example.com/messages/9e8d7c6b5a4f3e2d1c0b9a8f7e6d5c4b/original"
+  }
+ ],
+ "pending": [
+  {
+   "request_id": "7c1e0b6a9d2f4e3c8b5a6d7e8f901234",
+   "approval_url": "/sends/mail-gateway/7c1e0b6a9d2f4e3c8b5a6d7e8f901234",
+   "message_id": "20260827091500.7C1E@me.example.org",
+   "text": "Friday works. I'll freeze the table then and send the final numbers round.\n\nThanks both!",
+   "ts": "2026-08-27T09:15:00+02:00",
+   "author": "user",
+   "to": ["ann@example.com"],
+   "cc": ["bob@builder.example", "carla@example.net"],
+   "subject": "Re: Quarterly numbers"
   }
  ]
 }
