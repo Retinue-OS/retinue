@@ -990,7 +990,9 @@ document of its own under a policy stricter than the dashboard's
 (`sandbox allow-popups allow-popups-to-escape-sandbox; default-src 'none';
 img-src data:; style-src 'unsafe-inline'`), sanitised first (no script, no
 event handlers, no forms, no frames, no remote loads) with `cid:` images
-inlined as `data:` URLs and links opening in a new tab. Remote images never
+inlined as `data:` URLs and links opening in a new tab (in the Android app,
+whose WebView opens no windows, in the phone's browser by a tap-only
+navigation of the top frame: docs/dashboard.md). Remote images never
 load, so a tracking pixel never fires. The chat page's own policy gains
 `frame-src 'self'` for that one frame.
 

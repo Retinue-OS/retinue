@@ -434,7 +434,10 @@ docstring). Pieces:
   whose message names an `original` offers a control that expands the whole
   mail in the bubble — From, To, Cc, Date and Subject, the full header block
   behind an *All headers* disclosure, then the HTML part in a sandboxed frame
-  (`<iframe sandbox="allow-popups allow-popups-to-escape-sandbox">`, built by
+  (`<iframe sandbox="allow-popups allow-popups-to-escape-sandbox">`, plus
+  `allow-top-navigation-by-user-activation` inside the Android app, whose
+  WebView opens no new windows — a tapped link there goes to the phone's
+  browser, docs/dashboard.md; built by
   DOM calls, sized by an estimate from the text within a cap, resizable, with
   its own scroll) or the full plain text when there is no HTML part, then
   every attachment; a second tap gives the trimmed text back. It is fetched

@@ -620,6 +620,19 @@ await ok('a tap expands the whole mail in place; a second collapses it; a third 
   const f = slot.children[0];
   assert.equal(f.getAttribute('sandbox'), 'allow-popups allow-popups-to-escape-sandbox');
   assert.equal(f.getAttribute('src'), `${orig('tm3')}.html`);
+  // In the Android app (no new windows there), a tap on a link may navigate
+  // the top frame, which the app hands to the phone's browser.
+  el._toggleOriginal('m3');
+  window.RetinueShell = { platform: 'android', version: 6 };
+  try {
+    el._toggleOriginal('m3');
+    await settle();
+    const sf = el._thread.node('m3')._slot.children[0];
+    assert.equal(sf.getAttribute('sandbox'),
+      'allow-popups allow-popups-to-escape-sandbox allow-top-navigation-by-user-activation');
+  } finally {
+    delete window.RetinueShell;
+  }
   assert.equal(f.getAttribute('title'), 'The original mail: Re: Quarterly numbers (revised)');
   assert.equal(f.getAttribute('referrerpolicy'), 'no-referrer');
   assert.equal(f.className, 'orig-html');

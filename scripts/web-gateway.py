@@ -8502,6 +8502,20 @@ MAIL_ORIGINAL_INLINE_MAX_BYTES = int(
 # says of the dashboard's pages: this document is not one of them.
 MAIL_ORIGINAL_CSP = ("sandbox allow-popups allow-popups-to-escape-sandbox; "
                      "default-src 'none'; img-src data:; style-src 'unsafe-inline'")
+# The same for the Android app (its user agent carries "RetinueShell/"): its
+# WebView opens no new windows, so a link meant for a new tab went nowhere.
+# There a link navigates the top frame instead — and only on the user's own
+# tap — which the app hands to the phone's browser for any address off the
+# dashboard's origin, the dashboard staying where it was.
+MAIL_ORIGINAL_CSP_SHELL = (
+    "sandbox allow-popups allow-popups-to-escape-sandbox "
+    "allow-top-navigation-by-user-activation; "
+    "default-src 'none'; img-src data:; style-src 'unsafe-inline'")
+
+
+def _is_shell_agent(user_agent: str | None) -> bool:
+    """Whether a request comes from the Android app's WebView."""
+    return "RetinueShell/" in (user_agent or "")
 # The image types a mail's inline (`cid:`) picture is embedded as: the raster
 # types the dashboard shows in place anywhere. The type goes into the `data:`
 # URL from this list, never from what the sender wrote.
@@ -13986,7 +14000,7 @@ def _mail_cid_images(chat_id: str, record: dict, markup: str) -> dict:
     return images
 
 
-def _mail_original_html(chat_id: str, token: str) -> bytes | None:
+def _mail_original_html(chat_id: str, token: str, shell: bool = False) -> bytes | None:
     """The GET …/original.html body: a mail's HTML part as a document that is
     safe to show — mail_trim.sanitize_html's output, served unchanged — or
     None where there is none (not this chat's mail, a tombstone, a mail with
@@ -14007,7 +14021,8 @@ def _mail_original_html(chat_id: str, token: str) -> bytes | None:
         return None
     markup = _mail_text(blob)
     return mail_trim.sanitize_html(
-        markup, _mail_cid_images(chat_id, record, markup)).encode("utf-8")
+        markup, _mail_cid_images(chat_id, record, markup),
+        link_target="_top" if shell else "_blank").encode("utf-8")
 
 
 # ── The model trim ────────────────────────────────────────────────────────────
@@ -18073,8 +18088,9 @@ class Handler(BaseHTTPRequestHandler):
         chat_id = self._chat_id_or_404(raw_id)
         if chat_id is None:
             return
+        shell = _is_shell_agent(self.headers.get("User-Agent"))
         try:
-            body = (_mail_original_html(chat_id, token) if as_html
+            body = (_mail_original_html(chat_id, token, shell) if as_html
                     else _mail_original(chat_id, token))
         except Exception as exc:  # the store, or the gateway holding the parts
             self._send_json(502, {"error": "the mail could not be read",
@@ -18091,7 +18107,10 @@ class Handler(BaseHTTPRequestHandler):
         # Not a page of the dashboard: its own policy below, and not the
         # dashboard's as well (end_headers adds that to what is marked a page).
         self._csp_page = False
-        self.send_header("Content-Security-Policy", MAIL_ORIGINAL_CSP)
+        self.send_header("Content-Security-Policy",
+                         MAIL_ORIGINAL_CSP_SHELL if shell else MAIL_ORIGINAL_CSP)
+        # The document differs by viewer: never one served to the other.
+        self.send_header("Vary", "User-Agent")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("X-Frame-Options", "SAMEORIGIN")
         self.send_header("Referrer-Policy", "no-referrer")

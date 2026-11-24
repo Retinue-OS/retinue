@@ -184,7 +184,16 @@ lines that each hold without the others:
   them in `report` mode;
 - the page frames it with the `sandbox` attribute as well
   (`allow-popups allow-popups-to-escape-sandbox`), so the same holds where a
-  client ignores the header.
+  client ignores the header;
+- **in the Android app** (a request whose user agent carries
+  `RetinueShell/`) the shell's WebView opens no new windows, so a link meant
+  for a new tab would go nowhere. There the sanitiser targets links at the
+  top frame (`target="_top"`) and both the header and the frame's attribute
+  add one token, `allow-top-navigation-by-user-activation`: a link the user
+  taps navigates the top frame, which the app hands to the phone's browser
+  for any address off the dashboard's origin, the dashboard staying where it
+  was. Nothing navigates without the tap, and no script runs either way. The
+  answer carries `Vary: User-Agent`.
 
 A source list cannot name that one path family — a chat id is part of it —
 so the directive is `'self'`, and what the frame holds is the page's doing:

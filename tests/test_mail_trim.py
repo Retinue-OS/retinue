@@ -3717,6 +3717,19 @@ def test_sanitize_links():
     body = _clean("<a href='https://example.com/\"onmouseover=\"x'>x</a>")
     assert body == '<a href="https://example.com/&quot;onmouseover=&quot;x"%s>x</a>' % forced, body
     assert _clean('<a xlink:href="https://example.com">x</a>') == "<a>x</a>"
+    # For a viewer that opens no new windows (the Android app), the top
+    # frame instead — still without an opener or a referrer, and the mail's
+    # own target never survives; nothing but the two targets is accepted.
+    top = mt.sanitize_html('<a href="https://example.com" target="_self">x</a>',
+                           link_target="_top")
+    assert '<a href="https://example.com" target="_top" rel="noopener noreferrer">x</a>' in top, top
+    assert "_self" not in top and "_blank" not in top
+    try:
+        mt.sanitize_html("<p>x</p>", link_target="_parent")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("a target other than _blank or _top was accepted")
     print("PASS sanitize: http(s) and mailto links, new tab, no opener")
 
 

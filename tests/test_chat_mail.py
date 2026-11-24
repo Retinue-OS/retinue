@@ -470,9 +470,9 @@ def _http(base, method, path, body=None, headers=None):
             return exc.code, {"raw": raw}
 
 
-def _raw(base, path):
+def _raw(base, path, headers=None):
     """GET that hands back the headers and the bytes as they came."""
-    req = urllib.request.Request(base + path)
+    req = urllib.request.Request(base + path, headers=headers or {})
     try:
         with urllib.request.urlopen(req, timeout=10) as resp:
             return resp.status, resp.headers, resp.read()
@@ -1218,6 +1218,23 @@ def test_original_html(base, wg):
     link = re.search(r'<a\b[^>]*href="https://example\.org/report"[^>]*>', page)
     assert link and 'target="_blank"' in link.group(0) and "noopener" in link.group(0), page
     assert len(re.findall(r"<a\b", low)) == 1 or "javascript" not in low
+    _s, plain_headers, _d = _raw(base, a1["original"] + ".html")
+    assert plain_headers.get("Vary") == "User-Agent"
+    # In the Android app, whose WebView opens no new windows, a link goes to
+    # the top frame instead — on the user's tap only, which the app hands to
+    # the phone's browser — and the policy lets exactly that through.
+    shell_ua = {"User-Agent": "Mozilla/5.0 (Linux; Android 15) Chrome/140 Mobile RetinueShell/6 (Android)"}
+    status, sh, shell_page = _raw(base, a1["original"] + ".html", shell_ua)
+    assert status == 200
+    assert sh.get_all("Content-Security-Policy") == [wg.MAIL_ORIGINAL_CSP_SHELL]
+    assert "allow-top-navigation-by-user-activation" in wg.MAIL_ORIGINAL_CSP_SHELL
+    assert "allow-top-navigation-by-user-activation" not in SANDBOX_CSP
+    assert "allow-scripts" not in wg.MAIL_ORIGINAL_CSP_SHELL
+    shell_link = re.search(r'<a\b[^>]*href="https://example\.org/report"[^>]*>',
+                           shell_page.decode("utf-8"))
+    assert shell_link and 'target="_top"' in shell_link.group(0), shell_page
+    assert "noopener" in shell_link.group(0) and "noreferrer" in shell_link.group(0)
+    assert 'target="_blank"' not in shell_page.decode("utf-8")
 
     # Nothing is embedded from outside the message: a content id that is
     # another mail's, a type that is no raster image, a picture past the cap.

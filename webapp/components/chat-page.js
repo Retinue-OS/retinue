@@ -237,8 +237,14 @@ const ORIGINAL_PATH_RE =
   /^\/chats\/([^/?#]+)\/messages\/((?:[A-Za-z0-9._~-]|%[0-9A-Fa-f]{2})+)\/original$/;
 // The frame's sandbox: links open in a new tab (the sanitiser targets them
 // there) and leave the sandbox behind; the mail's document never runs a
-// script and never shares this origin.
+// script and never shares this origin. In the Android app, whose WebView
+// opens no new windows, the server targets them at the top frame instead,
+// on the user's tap only, and the app hands an address off the dashboard to
+// the phone's browser.
 const FRAME_SANDBOX = 'allow-popups allow-popups-to-escape-sandbox';
+const FRAME_SANDBOX_SHELL = `${FRAME_SANDBOX} allow-top-navigation-by-user-activation`;
+const frameSandbox = () =>
+  (typeof window !== 'undefined' && window.RetinueShell ? FRAME_SANDBOX_SHELL : FRAME_SANDBOX);
 // The frame cannot be measured from here (a sandboxed document of its own
 // origin), so its height is estimated from the mail's plain text — between
 // these bounds, the CSS cap on small screens, and the user's own drag (the
@@ -1921,7 +1927,7 @@ class RetinueChatPage extends HTMLElement {
       ? ownOriginalHtml(entry.doc, original) : '';
     if (!url) return;
     const frame = document.createElement('iframe');
-    frame.setAttribute('sandbox', FRAME_SANDBOX);
+    frame.setAttribute('sandbox', frameSandbox());
     frame.setAttribute('referrerpolicy', 'no-referrer');
     const subject = entry.doc.headers && typeof entry.doc.headers.subject === 'string'
       ? entry.doc.headers.subject.trim() : '';
