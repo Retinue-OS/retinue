@@ -1292,11 +1292,13 @@ the ranges, assembles the bubble from its own copy of the lines and writes the
 record (`kb:trim "model"`, or `"deterministic"` with the text unchanged); it
 tells the rail nothing — open pages see the change through their poll, and
 this process has the new text in the answer. The record's original parts are
-never touched; `kb:text` is replaced by design. A `409` (the source is not what
-the turn was shown any more, or the mail was settled meanwhile) settles
+never touched; `kb:text` is replaced by design. A `409` whose `state` is still
+`wanting` (the source is not what the turn was shown any more) settles
 nothing here and counts against nothing but that mail, which waits
 `MAIL_MODEL_TRIM_RETRY_SECONDS` before it is asked again; so does a mail the
-gateway no longer has (`404`/`410`). A gateway that could not say what the
+gateway no longer has (`404`/`410`). A `409` whose `state` is `model` or
+`deterministic` is the mail settled meanwhile, and is taken as a `200` is
+(below). A gateway that could not say what the
 mail is (away, or a part it could not read just now) costs nothing and that
 mail waits five minutes.
 

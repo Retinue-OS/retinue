@@ -4069,7 +4069,9 @@ def test_a_choice_must_show_something():
     braille blank, a Hangul or Khmer filler — is no choice, and a source of
     nothing else is no source. A short message and a lone mark are text."""
     blanks = ["\u200b", "\u2060", "\ufeff", "\u2800", "\u3164", "\u115f", "\u1160",
-              "\uffa0", "\u180e", "\u200b \u2800\t\u3164", "\u3000", "\u00a0"]
+              "\uffa0", "\u180e", "\u200b \u2800\t\u3164", "\u3000", "\u00a0",
+              # Unassigned, and reserved by Unicode as drawn as nothing.
+              "\u2065", "\ufff0", "\U000e0080", "\u200b\u2065"]
     for blank in blanks:
         lines = ["Hi Bob,", "the plan is fine.", blank, "Ann"]
         assert mt.apply_keep(lines, [[3, 3]]) is None, repr(blank)

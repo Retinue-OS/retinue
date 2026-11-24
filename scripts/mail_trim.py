@@ -2287,18 +2287,30 @@ class ModelSource(NamedTuple):
 _BLANK_LOOKALIKES = frozenset("\u2800\u3164\u115f\u1160\uffa0\u17b4\u17b5\u180e")
 
 
+def _reserved_blank(ch: str) -> bool:
+    """An unassigned code point Unicode already reserves as one that is
+    drawn as nothing (Default_Ignorable_Code_Point): whatever is assigned
+    there one day, a renderer shows no glyph for it."""
+    code = ord(ch)
+    return (0x2060 <= code <= 0x206F or 0xFFF0 <= code <= 0xFFF8
+            or 0xE0000 <= code <= 0xE0FFF)
+
+
 def _visible(line: str) -> bool:
     """Whether a line shows anything: a letter, a number, a punctuation mark
     or a symbol that is not one of the blank look-alikes, or a code point
     this Python cannot name — unassigned (Cn: an emoji newer than its
-    Unicode tables) or private use (Co) — which cannot be known to be blank.
+    Unicode tables) or private use (Co) — which cannot be known to be blank,
+    unless it lies where Unicode reserves the code points drawn as nothing.
     Length is no test — "OK" is a whole message — and a lone "." is visible
     text. Only a model's choice is judged by it; trim()'s own rules keep any
     line that is not whitespace."""
     for ch in line:
         category = unicodedata.category(ch)
-        if category in ("Cn", "Co") or (category[0] in "LNPS"
-                                         and ch not in _BLANK_LOOKALIKES):
+        if category in ("Cn", "Co"):
+            if not _reserved_blank(ch):
+                return True
+        elif category[0] in "LNPS" and ch not in _BLANK_LOOKALIKES:
             return True
     return False
 

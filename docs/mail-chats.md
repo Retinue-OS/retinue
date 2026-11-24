@@ -102,7 +102,7 @@ Further decisions the build had to take:
 - **The bubble text is derived, the original is immutable.** `kb:text` holds
   the trimmed reading text; the mail's own parts — headers, plain body, HTML
   body, attachments — are stored once as blobs and never rewritten. A better
-  trim replaces `kb:text` and nothing else.
+  trim replaces `kb:text`, sets `kb:trim`, and changes nothing else.
 
 ## A thread is a chat
 
@@ -537,7 +537,8 @@ A line **shows something** when it has a letter, a number, a punctuation mark
 or a symbol that is not a blank look-alike (the braille blank, the Hangul and
 Khmer fillers, the Mongolian vowel separator), or a code point the running
 Python cannot name — unassigned to its Unicode tables (an emoji newer than
-they are) or private use — which cannot be known to be blank; format
+they are) or private use — which cannot be known to be blank, save where
+Unicode reserves the code points that are drawn as nothing; format
 characters (a zero-width space, a word joiner, a BOM) and spaces show
 nothing. Length is no test: "OK" is a whole message, and a lone "." is
 visible text. This judges a model's choice only: trim()'s own rules keep
