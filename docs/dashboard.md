@@ -1381,11 +1381,15 @@ adopts). What the web gateway does with the event, by who sent the mail:
   who, then the subject and the text — and names the holder by the address
   book's name; for a sender known by a domain it is the name the mail
   carried with the organisation's beside it. A mail with no gate sender is
-  **nobody's**, everywhere its item is shown or judged: its block says so
-  (`nobody`), so the item rebuilt for the home list, the sweep or a
+  **nobody's**, everywhere its item is shown or judged. One helper decides
+  whom a mail chat's item is about from its newest mail's gate sender
+  (`_mail_item_peer`), for the arrival the model judges and for the mail
+  that only reopens a settled thread (`_attention_relist_chat`: one the
+  gate holds, history the mirror catches up on) alike, and its block says
+  so (`nobody`), so the item rebuilt for the home list, the sweep or a
   correction is "Unknown sender" with no card, prior or permit — never the
   thread's peer on record, who is whoever last wrote with an address — until
-  a mail with a sender judges it afresh. A gate sender is lower-cased in its
+  a mail with a sender is the newest. A gate sender is lower-cased in its
   ASCII letters only, and is nobody's where one of its characters maps to an
   ASCII one, one for one, under NFKC or case folding (KELVIN SIGN, a
   fullwidth letter); an internationalized address's own letters (ß, ı, ü)
@@ -1402,8 +1406,11 @@ adopts). What the web gateway does with the event, by who sent the mail:
   first `MAIL_ARRIVAL_QUOTE_CHARS` (8000) characters of it — stands in one
   quoted block, escaped — at most `MAIL_ARRIVAL_BATCH_BYTES` (48 KiB) for
   all the mails of one turn, header lines included: a batch that would not
-  fit quotes the newest mails, says how many older ones it leaves out, and
-  the turn's archive reaches only the ones quoted — and none of it in a
+  fit is worked in turns. The turn takes the newest mails that fit and is
+  told how many older ones wait; those stay on the chat's queue, untouched
+  by anything that turn's outcome settles (its archive, its verdict, the
+  rings, "told", the turns being over), and get a turn of their own next —
+  a turn is for the mails it was shown, and only for those — and none of it in a
   sentence that tells the turn
   what to do: those name the person by the address book's name alone, and
   the sender's address stands in the one command that needs it (the memory
@@ -1443,28 +1450,47 @@ adopts). What the web gateway does with the event, by who sent the mail:
   the user's word, as for a thread). There is no delete: erasing a chat is
   the user's own act. A merged thread's id answers `410` here as everywhere
   — unless a running turn answers to it (below).
-- **A turn cannot mute.** A call made through the internal endpoint while an
-  arrival turn runs for the chat is that turn's (`_turn_flags`), and a mute
-  keeps every later message of the chat out of view and unrung, a VIP's
-  included — the user's to decide, never a turn's that one message started.
-  So `{muted: true}` from a running turn is taken as the archive it also is
-  (the same archive as `{archived: true}`, below), and the answer says so:
-  `{"muted": false, "reason": "a turn cannot mute; archived instead"}`
-  beside the archive's own outcome (a reason of the archive's follows after
-  a `;`). The chat's next message brings it back, as after any archive.
-  Muting stays the user's: their own flags endpoint, and an agent acting on
-  their word outside an arrival turn.
+- **Who is asking.** A call is an arrival turn's only when it proves it:
+  the web gateway hands each arrival turn's session a token of its own
+  (`RETINUE_ARRIVAL_TURN`, one of the turn's unguessable job ids, set per
+  spawn by `scripts/session_env.py` and never inherited),
+  `scripts/chat-flags.py` sends it as `X-Arrival-Turn`, and the endpoint
+  takes the call for that turn's (`_turn_by_token`) only while the turn
+  runs on the chat named — on it, or on the chat a merge folded it into. A
+  token that names no turn running there (a turn asking about another chat,
+  one whose turn is over) is refused, `403`, and changes nothing. A call
+  without a token is Ara acting on the user's word from another session —
+  the user's own dashboard thread, say — and has the user's meaning, the
+  mute included, whether or not a turn runs on the chat. This holds for a
+  messenger chat's turns as for a mail thread's.
+- **A turn can only archive its own mails.** A mute keeps every later
+  message of the chat out of view and unrung, a VIP's included — the user's
+  to decide, never a turn's that one message started — and so are taking a
+  mute off, bringing an archived chat back, and the star. So `{muted: true}`
+  from a turn is taken as the archive it also is (the same archive as
+  `{archived: true}`, below); `{muted: false}`, `{archived: false}` and
+  `starred` change nothing. The answer says what was refused and then what
+  was done, worded from the outcome: `{"muted": false, "reason": "a turn
+  cannot mute; archived instead"}` where the archive was made, `"a turn
+  cannot mute; newer mail arrived"` (and `"archived": false`) where it was
+  not, `"a turn cannot unmute or unarchive"` for a turn asked to undo the
+  user's mute — and `chat-flags.py` prints what the answer says, no more.
+  The chat's next message brings an archived chat back, as after any
+  archive.
 - **A turn's archive reaches the mail it was given.** In a mail thread a
   turn's archive is made only if no mail has arrived in the chat since the
   turn's own (`ChatStateStore.archive_through`, one decision under the state
-  lock), and the mailbox hook carries exactly the `Message-ID`s the turn
-  worked, named at that decision — never a mail the mirror has stored but
-  the rail has not counted yet. Where one has arrived — a reply-all that
-  landed while the turn filed the invoice — the chat is **not** archived,
-  its new mail stays unread on the list and in the inbox, only the mails the
-  turn worked leave the inbox, and the answer says so: `{"archived": false,
-  "reason": "newer mail arrived"}`. (That hook, if the gateway is away, is
-  not owed for later: an archive is owed only while the chat is archived.)
+  lock) and none waits on the chat's queue for a turn of its own (an older
+  one its batch could not quote, another person's under another brief), and
+  the mailbox hook carries exactly the `Message-ID`s the turn worked, named
+  at that decision — never a mail the mirror has stored but the rail has not
+  counted yet. Where one has arrived — a reply-all that landed while the
+  turn filed the invoice — or waits, the chat is **not** archived, that mail
+  stays unread on the list and in the inbox, only the mails the turn worked
+  leave the inbox, and the answer says so: `{"archived": false, "reason":
+  "newer mail arrived"}` (or `"an earlier mail of the thread waits for a
+  turn of its own"`). (That hook, if the gateway is away, is not owed for
+  later: an archive is owed only while the chat is archived.)
 - **A thread its turn archived rings nothing.** What the turn archived is
   noted as its own. If the turn then ends with a verdict, the ring that
   waited on it is not delivered — whatever importance the verdict gives —

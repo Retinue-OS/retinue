@@ -358,6 +358,50 @@ def test_a_mail_from_nobody_is_nobodys(base, wg):
     print("PASS test_a_mail_from_nobody_is_nobodys")
 
 
+def test_a_reopened_item_from_nobody_is_nobodys(base, wg):
+    """Decision AG: every path that builds a mail chat's item decides its
+    peer by the newest mail's gate sender. A thread the user settled is
+    reopened by a mail nothing judges — one of a group the gate holds, or
+    history the mirror catches up on — and a mail the gate took for nobody
+    reopens it as nobody's, not as the thread's earlier correspondent's
+    (their name, card and prior); the next one with a sender as theirs."""
+    rolf = _person(wg, "Rolf Sweep", "rolf@rs.example", importance=4.5, permits=["focused"])
+    key = "sweep-root@rs.example"
+    chat = _chat_id(key)
+    rp = _party("rolf@rs.example", "Rolf")
+    _arrive(base, key, rp, text="The offer.")
+    PUSHES.clear()
+
+    def read():
+        status, out = _http(base, "POST", f"/chats/{gate._quote(chat)}/read",
+                            {"seq": wg._CHAT_STATE.get(chat).get("inbound_seq")})
+        assert status == 200, out
+        assert _block(wg, chat)["state"] == "done"
+
+    for how, extra in (("held", dict(gate=gate.QUIETED)),
+                       ("backfilled", dict(backfill=True, seen=False))):
+        read()
+        status, body, _m, _t = _arrive(base, key, rp, text="wire the money today",
+                                       sender=None, sender_name="Rolf Sweep", gate_sender="",
+                                       **extra)
+        assert status == 200 and body["pushed"] is False, (how, body)
+        block = _block(wg, chat)
+        assert block["state"] == "open" and block.get("nobody") is True, (how, block)
+        item = _item(wg, chat)
+        assert (item["sender"], item["title"]) == ("Unknown sender",) * 2, (how, item)
+        assert item["importance"] == 1.0 and item["contact"] is None, (how, item)
+        # And with a sender again: theirs, the marker gone.
+        read()
+        _arrive(base, key, rp, text="the real Rolf", **extra)
+        block = _block(wg, chat)
+        assert block["state"] == "open" and "nobody" not in block, (how, block)
+        assert _item(wg, chat)["sender"] == "Rolf Sweep", how
+    assert not PUSHES, PUSHES
+    wg._CONTACTS.delete(rolf["key"])
+    _forget(wg, chat)
+    print("PASS test_a_reopened_item_from_nobody_is_nobodys")
+
+
 def test_another_senders_judgement_is_not_inherited(base, wg):
     rolf = _person(wg, "Rolf Inherit", "rolf@ri.example", importance=4.5, permits=["focused"])
     kim = _person(wg, "Kim Plain", "kim@ri.example")
@@ -636,17 +680,22 @@ def test_a_batch_never_cuts_the_brief(base, wg):
         assert shown[-1] and len(quoted) == sum(shown), n
         if not all(shown):
             assert shown == sorted(shown), "an older mail was quoted over a newer one"
-            assert f"The {n - len(quoted)} oldest of these mails are not quoted" in prompt, n
+            left = n - len(quoted)
+            assert (f"{left} older mails of this thread have arrived as well and are not "
+                    "quoted here") in prompt, n
+            assert "They get a turn of their own next" in prompt, n
             assert "NEWEST-0 " not in prompt
-    # The turn's archive reaches the mails it was shown, not the ones it was
-    # only told of.
+    # Decision AF: a turn is for the mails it is shown. The ones a batch could
+    # not quote are no mails of its: they wait on the queue for a turn of
+    # their own, the turn's archive leaves the thread in view while they wait
+    # (and the mailbox moves only the turn's own), and they are worked next.
     office = _person(wg, "Fit Office", "office@fitb.example", instruction=gate.FILING)
     key2 = "fit-batch@fitb.example"
     chat2 = _chat_id(key2)
     op = _party("office@fitb.example", "Office")
     hold = threading.Event()
     TURN_GATE.update(hold=hold)
-    mids = []
+    mids, jobs, answers = [], [], []
     try:
         status, body, mid, _t = _arrive(base, key2, op, gate=INSTRUCTED, text="first")
         mids.append(mid)
@@ -656,25 +705,41 @@ def test_a_batch_never_cuts_the_brief(base, wg):
                 base, key2, op, gate=INSTRUCTED, text=f"batch-{i} " + "x" * 3000,
                 subject='"' * 300, sender_name='"' * 200, mid=("&" * 380) + f"{i}@fitb.example")
             mids.append(mid)
+            jobs.append(body["job_url"])
         TURNS.clear()
 
         def archives(prompt):
-            gate._agent_flags(base, chat2, archived=True)
+            answers.append(gate._agent_flags(base, chat2, archived=True)[1])
             gate._verdict(base, chat2, 0)(prompt)
 
         TURN_GATE["during"] = archives
     finally:
         hold.set()
         TURN_GATE.update(hold=None)
-    gate._await_job(base, body["job_url"])
+    for job in jobs:
+        assert gate._await_job(base, job)["status"] == "done"
     TURN_GATE["during"] = None
     wg._mailbox_wait()
-    (batch,) = [t for t in TURNS if "batch-11 " in t["prompt"]]
-    assert "oldest of these mails are not quoted" in batch["prompt"], batch["prompt"][:2000]
-    (hook,) = [b for b in gate._hooks("/chats/archive") if b["chat"] == key2]
+    batch = TURNS[0]
+    assert "batch-11 " in batch["prompt"]
+    assert "older mails of this thread have arrived as well" in batch["prompt"]
     shown = [m for m in mids[1:] if html.escape(m) in batch["prompt"]]
     assert 0 < len(shown) < len(mids) - 1 and mids[-1] in shown, len(shown)
-    assert sorted(hook["message_ids"]) == sorted(shown), (hook, shown)
+    hooks = [b for b in gate._hooks("/chats/archive") if b["chat"] == key2]
+    # The first turn's archive: the thread stays in view while older mail
+    # waits for its turn, and the mailbox moves exactly the mails it was shown.
+    assert answers[0]["archived"] is False, answers
+    assert answers[0]["reason"] == "an earlier mail of the thread waits for a turn of its own"
+    assert sorted(hooks[0]["message_ids"]) == sorted(shown), (hooks[0], shown)
+    # The others got turns of their own, oldest last, and each mail was
+    # quoted by exactly one turn and moved by exactly that turn's archive.
+    assert len(TURNS) >= 2 and len(hooks) == len(TURNS), (len(TURNS), len(hooks))
+    moved = [m for h in hooks for m in h["message_ids"]]
+    assert sorted(moved) == sorted(mids[1:]), "a mail was moved twice, or never"
+    for turn, hook in zip(TURNS, hooks):
+        quoted = [m for m in mids[1:] if html.escape(m) in turn["prompt"]]
+        assert sorted(quoted) == sorted(hook["message_ids"]), (quoted, hook)
+    assert wg._CHAT_STATE.get(chat2)["archived"] is False
     for record in (acme, office):
         wg._CONTACTS.delete(record["key"])
     _forget(wg, chat, chat2)
@@ -715,6 +780,7 @@ def main():
         test_a_channel_is_only_a_channel(base, wg)
         test_the_rail_always_answers(base, wg)
         test_a_mail_from_nobody_is_nobodys(base, wg)
+        test_a_reopened_item_from_nobody_is_nobodys(base, wg)
         test_another_senders_judgement_is_not_inherited(base, wg)
         test_the_rollback_pushes_no_mail(base, wg)
         test_a_hostile_mail_cannot_speak_for_the_user(base, wg)

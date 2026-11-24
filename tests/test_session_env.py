@@ -282,6 +282,25 @@ def test_per_spawn_stamps_are_never_inherited():
           "never inherited — not even through the escape hatch")
 
 
+def test_the_arrival_turn_token_is_set_per_spawn_only():
+    """RETINUE_ARRIVAL_TURN tells the web gateway that a chat-flags call is
+    the arrival turn's it was minted for: only the spawn of that turn carries
+    it, and never one that inherits it — a session holding a stale token, or
+    one the operator's escape hatch let through, would be taken for a turn
+    (or a turn's call for Ara's on the user's word)."""
+    src = _source(RETINUE_ARRIVAL_TURN="stale-turn")
+    assert "RETINUE_ARRIVAL_TURN" not in se.build(src)
+    for extra in ("RETINUE_ARRIVAL_TURN", "RETINUE_*"):
+        hatch = {**src, "RETINUE_SESSION_ENV_EXTRA": extra}
+        assert "RETINUE_ARRIVAL_TURN" not in se.build(hatch), extra
+        assert not se.allowed("RETINUE_ARRIVAL_TURN", hatch), extra
+    assert se.build(src, arrival_turn="0f" * 16)["RETINUE_ARRIVAL_TURN"] == "0f" * 16
+    # None and "" are "not an arrival turn".
+    for none in (None, ""):
+        assert "RETINUE_ARRIVAL_TURN" not in se.build(src, arrival_turn=none)
+    print("ok: the arrival-turn token is set per spawn, never inherited")
+
+
 def test_email_goes_through_the_gateway_backend():
     # The spawner holds the token: the session is pointed at the backend, and
     # a stale inherited URL does not survive.
@@ -374,6 +393,7 @@ def main():
     test_excluded_names_are_prefix_matches()
     test_gateway_client_suffixes_cover_deployment_added_gateways()
     test_per_spawn_stamps_are_never_inherited()
+    test_the_arrival_turn_token_is_set_per_spawn_only()
     test_email_goes_through_the_gateway_backend()
     test_escape_hatch_admits_what_a_deployment_names()
     test_default_source_is_the_process_environment()

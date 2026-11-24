@@ -18,7 +18,7 @@ Two callers have a reason to. A turn worked by a sender's standing instruction
 it to file — "File the document with the Archivist, book it, then archive the
 mail." — and names that in its verdict (`chat-verdict.py --action "archived
 the mail"`). And Ara archives or mutes a chat when the user asks her to —
-outside an arrival turn: muting is the user's alone.
+from any session but an arrival turn's: muting is the user's alone.
 
 For a mail thread the mailbox follows the chat, exactly as when the user
 archives it themselves (docs/mail-chats.md, "The mailbox follows the chat"):
@@ -27,22 +27,29 @@ moves nothing back. Archiving also settles the chat's attention item; an
 archive made by an instructed turn means the message that turn works rings
 nothing.
 
-A turn that works an arriving mail archives only what it was given
-(docs/dashboard.md, "The gate for mail"). Where a mail has arrived in the
-thread since the turn's own, the thread is not archived — the turn never saw
-that mail — and only the mails the turn worked leave the inbox; the answer
-says so (``"archived": false, "reason": "newer mail arrived"``) and this
-prints a note: say it in the verdict, and let the verdict's importance
-decide. An archive such a turn made is undone if it ends without a verdict
-or fails — in a mail thread also once it runs past its timeout — and the
-message then rings.
+A turn a chat arrival started is told so by its environment:
+RETINUE_ARRIVAL_TURN holds its token, and this sends it along
+(``X-Arrival-Turn``). The gateway takes the call for that turn's only while
+the turn runs on the chat named; a call with a token for any other chat is
+refused. Without a token — Ara on the user's word, in any other session —
+the call has the user's meaning.
 
-A turn cannot mute. A mute keeps every later message of the chat out of
-view and unrung, a VIP's included, and that is the user's to decide. So
-``--mute`` from a running arrival turn is taken as the archive it also is,
-and the answer says so (``"muted": false, "reason": "a turn cannot mute;
-archived instead"``, beside what the archive itself answered); this prints
-a note. The next message brings the chat back, as after any archive.
+A turn can only archive its own mails (docs/dashboard.md, "The gate for
+mail"). A mute keeps every later message of the chat out of view and
+unrung, a VIP's included, and that — like taking a mute off, bringing an
+archived chat back, and the star — is the user's to decide. So ``--mute``
+from a turn is taken as the archive it also is; ``--unmute``,
+``--unarchive``, ``--star`` and ``--unstar`` change nothing; and the answer
+says what it refused and what it did (``"reason": "a turn cannot mute;
+archived instead"``). In a mail thread the archive is made only if no other
+mail has arrived in the thread since the turn's own, and none waits for a
+turn of its own — the turn never saw that mail — and otherwise only the
+mails the turn worked leave the inbox (``"archived": false, "reason":
+"newer mail arrived"``): say it in the verdict, and let the verdict's
+importance decide. An archive such a turn made is undone if it ends without
+a verdict or fails — in a mail thread also once it runs past its timeout —
+and the message then rings. This prints what the answer says, and nothing
+it does not.
 
 `--star` / `--unstar` exist for the same reason they do on a dashboard thread
 (conversation-push.py): the star is the user's, so set or clear it only on
@@ -61,6 +68,8 @@ chat-verdict.py.
 Configuration (environment):
     CHAT_DRAFT_BACKEND_URL      default http://localhost:${WEB_GATEWAY_PORT}/internal/chats
     CONVERSATION_BACKEND_TOKEN  shared secret gating the endpoint (set by the entrypoint)
+    RETINUE_ARRIVAL_TURN        the arrival turn's token (set by the web gateway for
+                                that turn's session only)
 """
 import argparse
 import json
@@ -75,6 +84,7 @@ DEFAULT_URL = os.environ.get(
     "CHAT_DRAFT_BACKEND_URL", f"http://localhost:{_PORT}/internal/chats"
 )
 TOKEN = os.environ.get("CONVERSATION_BACKEND_TOKEN", "").strip()
+ARRIVAL_TURN = os.environ.get("RETINUE_ARRIVAL_TURN", "").strip()
 DEFAULT_TIMEOUT = float(os.environ.get("CONVERSATION_BACKEND_TIMEOUT", "30"))
 
 
@@ -90,14 +100,17 @@ def main() -> int:
                          help="out of the list until it speaks again; a mail "
                               "thread's mails move out of the inbox")
     archive.add_argument("--unarchive", dest="archived", action="store_const", const=False,
-                         help="back into the list (the mailbox is not touched)")
+                         help="back into the list (the mailbox is not touched) — only on "
+                              "the user's word; from an arrival turn it changes nothing")
     mute = parser.add_mutually_exclusive_group()
     mute.add_argument("--mute", dest="muted", action="store_const", const=True,
                       help="archive it, and let no new message bring it back — only on "
                            "the user's word; from a running arrival turn it is an "
                            "archive")
     mute.add_argument("--unmute", dest="muted", action="store_const", const=False,
-                      help="let the next message bring it back (it stays archived until then)")
+                      help="let the next message bring it back (it stays archived until "
+                           "then) — only on the user's word; from an arrival turn it "
+                           "changes nothing")
     star = parser.add_mutually_exclusive_group()
     star.add_argument("--star", dest="starred", action="store_const", const=True,
                       help="first in its list — only on the user's word")
@@ -126,13 +139,16 @@ def main() -> int:
 
     base = (args.url or DEFAULT_URL).rstrip("/")
     url = f"{base}/{urllib.parse.quote(args.chat, safe='')}/flags"
+    headers = {
+        "Content-Type": "application/json",
+        "X-Conversation-Backend-Token": TOKEN,
+    }
+    if ARRIVAL_TURN:
+        headers["X-Arrival-Turn"] = ARRIVAL_TURN
     req = urllib.request.Request(
         url,
         data=json.dumps(payload).encode("utf-8"),
-        headers={
-            "Content-Type": "application/json",
-            "X-Conversation-Backend-Token": TOKEN,
-        },
+        headers=headers,
         method="POST",
     )
     try:
@@ -153,16 +169,18 @@ def main() -> int:
         return 1
 
     print(json.dumps(body, ensure_ascii=False))
-    if payload.get("muted") is True and body.get("muted") is False \
-            and str(body.get("reason") or "").startswith("a turn cannot mute"):
-        print("chat-flags: a turn cannot mute; the chat was archived instead, and its "
-              "next message brings it back. Muting is the user's to decide.",
+    # What the answer says was not done, and where the chat stands — no
+    # more: the archive a turn asked for may have been refused.
+    if body.get("reason"):
+        print(f"chat-flags: not everything asked was done: {body['reason']}.",
               file=sys.stderr)
-    if body.get("reason") and payload.get("archived") is not False \
-            and not body.get("archived"):
-        print(f"chat-flags: the thread was not archived ({body['reason']}): it stays in "
-              "the user's list with that mail; only the mail this turn worked left the "
-              "inbox. Say so in the verdict.", file=sys.stderr)
+        asked_away = payload.get("archived") is True or payload.get("muted") is True
+        if asked_away and body.get("archived") is True and body.get("muted") is False:
+            print("chat-flags: the chat is archived, not muted: its next message brings "
+                  "it back.", file=sys.stderr)
+        elif asked_away and body.get("archived") is False:
+            print("chat-flags: the chat was not archived: it stays in the user's list. "
+                  "Say so in the verdict.", file=sys.stderr)
     return 0
 
 

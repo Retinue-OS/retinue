@@ -739,8 +739,12 @@ section.)
    rung afterwards; opening the chat is neither (*Unread · Read · Archived*).
    The timeout only rings: what the turn did by then stands — a chat it
    archived (`chat-flags.py --archive`, which the instruction asked for)
-   stays archived, also once its verdict comes. A turn cannot mute: a mute
-   it asks for is taken as an archive, and the answer says so
+   stays archived, also once its verdict comes. A turn can only archive: a
+   mute it asks for is taken as an archive, its unmute, unarchive and star
+   change nothing, and the answer says so. A flags call is the turn's only
+   when it carries the token the turn's session was handed
+   (`RETINUE_ARRIVAL_TURN`, which `chat-flags.py` sends); one without it is
+   Ara on the user's word and mutes, also while a turn runs
    (docs/dashboard.md, "The gate for mail").
 
    As built, five things are worth naming:
@@ -826,14 +830,17 @@ code, and five things differ because the channel is a mailbox
   instruction asks — send one with `mail-push.py --chat <id>` under the
   mailbox's send policy, add a calendar event under its policy, and
   **archive the thread** with `chat-flags.py`. It ends with the verdict. A
-  turn cannot mute (a mute it asks for is an archive). A thread its turn
+  turn can only archive (a mute it asks for is an archive; an unmute, an
+  unarchive or a star changes nothing). A thread its turn
   archived rings nothing; a turn that archived and did not finish — it
   failed, set no verdict, or, for a mail unlike a messenger message, ran
   past the timeout — has the chat brought back and the mail rung. A turn's
   archive reaches only the mail it was given: a mail that arrived while it
-  worked keeps the thread in view and in the inbox, and the mailbox hears
-  of the turn's own mails by `Message-ID`. A merge of the thread while its
-  turn runs moves the turn with it.
+  worked, or waits for a turn of its own, keeps the thread in view and in
+  the inbox, and the mailbox hears of the turn's own mails by `Message-ID`.
+  A batch too big to quote whole is worked in turns: the oldest of it wait
+  for a turn of their own, and nothing the first turn settles is about
+  them. A merge of the thread while its turn runs moves the turn with it.
 - **There is no triage fallback.** Step 4's "forwards to triage exactly as
   it always has" does not exist for mail: a mail the rail did not accept
   stays `delivered: false` and the mail gateway offers it again on a later

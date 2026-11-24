@@ -82,15 +82,25 @@ TURNS: list = []
 TURN_GATE: dict = {"during": None, "hold": None, "fail": False}
 
 
+# The token the running turn's session was handed (RETINUE_ARRIVAL_TURN),
+# per thread: the scripts `during` runs get it in their environment, as the
+# session's own commands would (World.script).
+_TURN = threading.local()
+
+
 def _stub_send_message(prompt, display_question=None, session_key=None, **_kw):
     """The model turn: records its prompt, runs what the test has it do."""
-    TURNS.append({"prompt": prompt, "session": session_key})
-    during = TURN_GATE.get("during")
-    if during is not None:
-        during(prompt)
-    hold = TURN_GATE.get("hold")
-    if hold is not None:
-        hold.wait(30)
+    TURNS.append({"prompt": prompt, "session": session_key, "token": _kw.get("arrival_turn")})
+    _TURN.token = _kw.get("arrival_turn")
+    try:
+        during = TURN_GATE.get("during")
+        if during is not None:
+            during(prompt)
+        hold = TURN_GATE.get("hold")
+        if hold is not None:
+            hold.wait(30)
+    finally:
+        _TURN.token = None
     if TURN_GATE.get("fail"):
         return {"error": "upstream is down"}
     return {"response": "Read it; nothing to add.", "model_name": "stub-model", "cost_usd": 0.0}
@@ -239,9 +249,14 @@ class World:
         return _set
 
     def script(self, name, *args) -> tuple[int, str]:
-        """One of the scripts a turn is told to run, as it would run it."""
+        """One of the scripts a turn is told to run, as it would run it: in
+        the turn's environment, its token included, when run from the turn
+        (`during`); without one — Ara in another session — elsewhere."""
         env = dict(os.environ, CHAT_DRAFT_BACKEND_URL=self.base + "/internal/chats",
                    CONVERSATION_BACKEND_TOKEN="agent-token")
+        env.pop("RETINUE_ARRIVAL_TURN", None)
+        if getattr(_TURN, "token", None):
+            env["RETINUE_ARRIVAL_TURN"] = _TURN.token
         proc = subprocess.run([sys.executable, str(SCRIPTS / name), *args], env=env,
                               capture_output=True, text=True, timeout=30)
         return proc.returncode, proc.stdout + proc.stderr

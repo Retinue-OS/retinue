@@ -395,18 +395,26 @@ instruction without VIP and has it ask for a high importance.
   Read · Archived* in docs/messenger-chats.md.
 - **A turn cannot silence the mail it was given.** An instructed mail turn
   may archive its thread (`scripts/chat-flags.py`) where the instruction
-  asks. It cannot mute it: a mute asked by a running arrival turn is taken as
-  an archive of the turn's own mail (the answer says `a turn cannot mute;
-  archived instead`). Muting stays the user's — their own flags, or an agent
-  acting on their word outside an arrival turn. The archive a mail turn sets
+  asks — and that is all a turn may do with a chat's flags. It cannot mute
+  it: a mute asked by a running arrival turn is taken as an archive of the
+  turn's own mail (the answer says `a turn cannot mute; archived instead`,
+  or why the archive was not made either). Nor can it take a mute off,
+  bring an archived thread back or star it: those change nothing, and the
+  answer says so (`a turn cannot unmute or unarchive`) — a mail asking its
+  turn to undo the user's mute gets nowhere. A call is the turn's only when
+  it carries the token its session was handed (`RETINUE_ARRIVAL_TURN`,
+  sent by `chat-flags.py`). Muting stays the user's — their own flags, or
+  Ara acting on their word from any other session, whose call carries no
+  token and mutes even while a turn runs. The archive a mail turn sets
   is recorded as the turn's own: a turn that ends with a verdict keeps it, and
   the mail rings nothing; a turn that fails, ends without a verdict or times
   out has it undone — the thread un-archived — before the failure ring. That
   undo is for mail only: a messenger turn's archive stands as it always did
   (docs/messenger-chats.md). And a turn's archive covers only what the turn
-  was started for: if another mail arrived in the thread after the turn's
-  own, the thread is not archived (the answer says `newer mail arrived`), and
-  the mailbox is touched only for the mail the turn worked.
+  was started for and shown: if another mail arrived in the thread after the
+  turn's own, or waits for a turn of its own, the thread is not archived
+  (the answer says `newer mail arrived`), and the mailbox is touched only
+  for the mail the turn worked.
 - **No sending on a messenger.** A reply is only ever staged in the chat's
   draft; the user's send press is the only way a chat reply leaves in their
   name. That is how the chat surface works for every agent
