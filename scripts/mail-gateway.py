@@ -9056,8 +9056,10 @@ def _press_digest(payload: dict) -> str:
             ("recipient", "reply_to", "reply", "to", "cc", "subject", "account")]
     said.append(payload.get("message") if payload.get("message") is not None
                 else payload.get("text"))
+    # The attachments themselves, not their number: the same words with
+    # another file are another mail.
     images = payload.get("images")
-    said.append(len(images) if isinstance(images, list) else 0)
+    said.append(images if isinstance(images, list) else [])
     return hashlib.sha256(json.dumps(said, sort_keys=True, default=str)
                           .encode("utf-8", "replace")).hexdigest()
 

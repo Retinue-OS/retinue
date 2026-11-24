@@ -149,15 +149,23 @@ function composing(e) {
   return !!e.isComposing || e.keyCode === 229;
 }
 
-// An e-mail address by its shape: something@domain.tld, no spaces, none of
-// the characters that delimit addresses in a header, a domain of dotted
-// labels whose last is two characters or more. Letters of any script are
-// letters (an internationalised address is an address); whether the mailbox
-// exists is the server's and the recipient's business.
-const ADDRESS_RE = /^[^\s@<>()[\]\\,;:"]+@(?:[^\s@<>()[\]\\,;:".]+\.)+[^\s@<>()[\]\\,;:".]{2,}$/u;
+// An e-mail address by its shape, as the mail gateway takes one to send to
+// (its _SEND_ADDRESS_RE): dotted atoms, "@", a domain of dotted labels —
+// letters, digits, inner hyphens — whose last is two characters or more.
+// ASCII only: the gateway's submission asks for no SMTPUTF8, so an address
+// with other letters would be taken here and refused at Send (a domain in
+// another script is written in its xn-- form). Whether the mailbox exists
+// is the server's and the recipient's business.
+const ADDRESS_ATOM = "[A-Za-z0-9!#$%&'*+/=?^_`{|}~-]+";
+const ADDRESS_LABEL = '[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?';
+const ADDRESS_LAST = '[A-Za-z0-9][A-Za-z0-9-]{0,61}[A-Za-z0-9]';
+const ADDRESS_RE = new RegExp(
+  `^(${ADDRESS_ATOM}(?:\\.${ADDRESS_ATOM})*)@(?:${ADDRESS_LABEL}\\.)+${ADDRESS_LAST}$`);
 
 export function isAddress(s) {
-  return typeof s === 'string' && s.length <= ADDRESS_MAX && ADDRESS_RE.test(s);
+  if (typeof s !== 'string' || s.length > ADDRESS_MAX || s.includes('=?')) return false;
+  const m = ADDRESS_RE.exec(s);
+  return !!m && m[1].length <= 64;
 }
 
 // What the user typed or pasted into a recipient field, split into the

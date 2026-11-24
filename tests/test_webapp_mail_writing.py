@@ -2734,7 +2734,13 @@ await ok('a chat that is only a queued mail previews as waiting — or as what b
 
 // ── The compose sheet ────────────────────────────────────────────────────────
 await ok('addresses by shape, split as a header would be', async () => {
-  for (const a of ['ann@example.com', 'a.b+tag@sub.example.co', 'jörg@exämple.de', 'x@y.museum']) assert.ok(isAddress(a), a);
+  for (const a of ['ann@example.com', 'a.b+tag@sub.example.co', 'x@y.museum', "o'neil@x.org",
+                   'x@xn--exmple-cua.de']) assert.ok(isAddress(a), a);
+  // What the mail gateway would refuse at Send is not taken here either: an
+  // address with letters outside ASCII (no SMTPUTF8), an encoded word, a
+  // local part over 64 characters.
+  for (const a of ['jörg@example.de', 'joerg@exämple.de', '=?utf-8?q?x?=@x.org',
+                   `${'a'.repeat(65)}@x.org`, 'a..b@x.org', '.a@x.org', 'a@-x.org']) assert.ok(!isAddress(a), a);
   for (const a of ['ann', 'ann@', '@x.org', 'ann@x', 'a b@x.org', 'a@x.o', 'a@@x.org', 'a<b>@x.org', 'a,b@x.org',
                    'a@x..org', `${'a'.repeat(250)}@x.org`, null, 3]) assert.ok(!isAddress(a), String(a));
   const r = splitAddresses('"Doe, Jane" <jane@x.org>, b@y.org; Bob <bob@builder.example>\nlast');

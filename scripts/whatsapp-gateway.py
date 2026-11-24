@@ -519,6 +519,7 @@ _conn: dict = {
     "iq_error": None,
     "iq_fails": 0,        # consecutive failed probes
     "iq_checked": None,
+    "iq_teardowns": 0,    # wedge teardowns since the last successful probe
     # Outcome of the last outbound delivery's recipient resolution (issue
     # #120). Kept separate from the probe state: the probe usyncs our OWN JID,
     # which can succeed while an arbitrary recipient's device-list lookup times
@@ -537,6 +538,13 @@ WHATSAPP_IQ_PROBE_SECONDS = float(os.environ.get("WHATSAPP_IQ_PROBE_SECONDS", ""
 WHATSAPP_IQ_PROBE_FAILURES = int(os.environ.get("WHATSAPP_IQ_PROBE_FAILURES", "") or "2")
 # Minimum seconds between automatic reconnect attempts while IQ stays wedged.
 WHATSAPP_IQ_RECONNECT_BACKOFF = float(os.environ.get("WHATSAPP_IQ_RECONNECT_BACKOFF", "") or "600")
+# Teardowns that may pass without a successful probe before the gateway gives
+# up on in-process recovery and exits, so the container restart policy starts
+# a fresh process (0 disables). A teardown can be a no-op: once whatsmeow's own
+# autoreconnect has given up (e.g. after a dial or DNS failure), disconnect()
+# on the already-dead socket fires no event and connect() never returns, so the
+# outer loop in main() never reconnects — only a process restart recovers.
+WHATSAPP_IQ_EXIT_AFTER = int(os.environ.get("WHATSAPP_IQ_EXIT_AFTER", "") or "2")
 # Outbound usync/device-list failures (issue #120): how many extra attempts a
 # send gets after the candidate JIDs are exhausted, and the pause before each.
 WHATSAPP_SEND_USYNC_RETRIES = int(os.environ.get("WHATSAPP_SEND_USYNC_RETRIES", "") or "1")
@@ -590,6 +598,7 @@ def _note_iq_result(ok: bool, error: str | None = None) -> bool:
             _conn["iq_ok"] = True
             _conn["iq_error"] = None
             _conn["iq_fails"] = 0
+            _conn["iq_teardowns"] = 0
             return False
         _conn["iq_fails"] = int(_conn.get("iq_fails", 0)) + 1
         _conn["iq_error"] = (error or "info query failed")[:500]
@@ -1535,6 +1544,10 @@ class _IQProbeUnsupported(RuntimeError):
 
 _IQ_RECONNECT_LOCK = threading.Lock()
 _last_iq_reconnect = 0.0
+# os._exit, not sys.exit: this runs on the probe thread, and the bridge's
+# blocking connect() on the main thread must not keep the process alive.
+# Module-level so tests can substitute it.
+_exit_process = os._exit
 # The (method, style) call shape that completed a probe, discovered on the
 # first successful round and cached so later failures are never re-classified
 # as API-shape issues.
@@ -1616,6 +1629,19 @@ def _maybe_iq_reconnect() -> None:
         _last_iq_reconnect = now
     client = _wa_client
     if client is None:
+        return
+    with _CONN_LOCK:
+        teardowns = int(_conn.get("iq_teardowns", 0))
+        if not (WHATSAPP_IQ_EXIT_AFTER > 0 and teardowns >= WHATSAPP_IQ_EXIT_AFTER):
+            _conn["iq_teardowns"] = teardowns + 1
+    if WHATSAPP_IQ_EXIT_AFTER > 0 and teardowns >= WHATSAPP_IQ_EXIT_AFTER:
+        # Earlier teardowns did not bring a single probe back, so the client is
+        # stuck past what an in-process reconnect can fix (see
+        # WHATSAPP_IQ_EXIT_AFTER). Exit non-zero; Compose restarts the container
+        # and the fresh process reconnects from the stored session.
+        print(f"[whatsapp-gateway] info queries still wedged after {teardowns} teardown(s) — "
+              "exiting so the container restarts with a fresh connection", flush=True)
+        _exit_process(1)
         return
     print("[whatsapp-gateway] info queries are wedged — tearing the connection down to force a reconnect", flush=True)
     try:
