@@ -92,17 +92,33 @@
 // one switch, _canSend.
 //
 // Writing a mail (docs/mail-chats.md, "Writing"): the composer names where
-// the reply goes — "To … · Cc …", as the gateway will address it
-// (replyRecipients) — with a Reply all / Sender only choice in a group
-// thread, sent as `reply`; Enter breaks a line, the button or Ctrl/⌘+Enter
-// sends. The send is under the account's send policy: an answer 202
+// the reply goes — "To … · Cc …", every recipient with its address — and
+// that line is the server's word, never the page's: GET
+// /chats/<id>/reply-preview answers how the gateway would address a reply
+// right now, for Reply all and for Sender only (replyPreview). The page
+// derives nothing of it; it asks on load, after every poll that changed the
+// thread, and again at the press, and a reply is not sent unless the answer
+// then is the line the user was looking at. Without an answer (an older
+// server, the gateway away) the line says the recipients are unavailable and
+// no reply leaves from here. The Reply all / Sender only choice is there
+// exactly when the server says the two differ, and goes as `reply`; Enter
+// breaks a line, the button or Ctrl/⌘+Enter sends. Every press carries its
+// own `request_key`, kept with the words when the outcome is not known, so
+// the same press made again is the same mail to the gateway and not a second
+// one. The send is under the account's send policy: an answer 202
 // `{pending}` is a send that waits for the user's approval on /sends, and it
 // shows as a **pending bubble** at the thread's end — the words, "Waiting
 // for approval", and a link to its approval page built by DOM calls from a
 // path that is exactly /sends/<slug>/<id> (approvalPath) — on every load and
 // poll from the messages document's `pending`, until the server stops
-// listing it. Pending bubbles are matched by their request id, and to the
-// mail a released one became by its Message-ID — never by text.
+// listing it. A pending entry also says when it is being sent (`sending`)
+// and when it failed (`failed`: with the reason, whether the mail may have
+// gone out all the same, and two controls — the text back into the composer,
+// and Dismiss). An answer 202 `{unconfirmed}` is a mail handed over whose
+// outcome nobody knows yet: its bubble stays, "Sending — not confirmed yet",
+// and the words are never put back in the box. Pending bubbles are matched
+// by their request id, and to the mail a released one became by its
+// Message-ID — never by text.
 
 import { esc, webLink, WIDE_FRAME, deepActiveElement, onPressOutside, softKeyboard, visibleHeight } from './base.js';
 import { deviceGet, deviceSet } from './device-store.js';
@@ -276,7 +292,7 @@ function subjectDiffers(subject, name) {
 function msgSig(m) {
   return JSON.stringify([!!m.removed, m.removed_at || null, m.text || '', m.trim || null,
     Array.isArray(m.attachments) ? m.attachments : [], m.subject || null, m.original || null,
-    m.sender_name || null, m.author || null, m.agent || null]);
+    m.sender_name || null, m.author || null, m.agent || null, m.refused || null]);
 }
 
 // Epoch milliseconds of a message's timestamp, or NaN — which compares as
@@ -314,7 +330,16 @@ function pendingList(doc) {
 // What of a pending entry, when it changes on the server, changes its bubble.
 function pendSig(p) {
   return JSON.stringify([p.text || '', p.ts || null, p.author || null, p.agent || null,
-    p.approval_url || null, p.subject || null, p.to || null, p.cc || null]);
+    p.approval_url || null, p.subject || null, p.to || null, p.cc || null,
+    p.status || null, p.error || null, p.outcome_unknown === true, p.refused || null]);
+}
+
+// What a queued send is doing (the entry's `status`): waiting for approval
+// (the default, and what an entry without the field is), being sent, or
+// failed. Anything else is read as waiting — never as a state the page would
+// have to invent a meaning for.
+function pendStatus(p) {
+  return p && (p.status === 'sending' || p.status === 'failed') ? p.status : 'pending';
 }
 
 // An address as the page compares them: trimmed, lowercased; '' for none.
@@ -327,70 +352,127 @@ function addrList(v) {
   return typeof v === 'string' && v.trim() ? [v] : [];
 }
 
-// Whom a reply in a mail thread reaches, as the composer shows it before it
-// goes: `mode` 'all' (the default) or 'sender'. It mirrors how the mail
-// gateway builds the reply from its own records (docs/mail-chats.md,
-// "Writing") — the latest live mail that is not the user's own, its sender
-// To and everyone else on its To/Cc in Cc; a thread whose latest live mail is
-// the user's own goes to that mail's recipients again — so the line says
-// where the press sends. It is a preview: the gateway decides, from records
-// the page does not see (a Reply-To, the user's aliases on the mailbox).
-// The user's own addresses are left out by the two facts the summary gives:
-// the account, and — while the server's participant list is complete — any
-// address it does not name, since it names every address on the thread but
-// the user's own. Names come from the participants (the address book's or
-// the mail's), the sender's from its mail, else the address.
-// → {to: [{address, name}], cc: [...]}, both empty when there is nothing
-// left to reply to.
-export function replyRecipients(chat, messages, mode = 'all', pending = []) {
-  const c = chat || {};
-  const names = new Map();
-  for (const p of Array.isArray(c.participants) ? c.participants : []) {
-    const a = p && typeof p === 'object' ? addrKey(p.address) : '';
-    if (a && !names.has(a)) names.set(a, String(p.name || '').trim());
-  }
-  const complete = names.size > 0 && !(Number(c.participants_more) > 0);
-  const account = addrKey(c.account);
-  // The participant rule only for what an inbound mail carried: the
-  // recipients of the user's own mail (or queued one) are whom they chose.
-  const own = (a, strict) => !a || a === account || (strict && complete && !names.has(a));
-  const live = (messages || []).filter((m) => m && !m.removed && !String(m.id || '').startsWith('local-'));
-  let base = null;
-  for (let i = live.length - 1; i >= 0 && !base; i -= 1) if (live[i].direction !== 'out') base = live[i];
-  let to;
-  let cc;
-  const named = {};
-  if (base) {
-    const from = addrKey(base.sender);
-    to = [base.sender];
-    cc = [...addrList(base.recipients), ...addrList(base.cc)];
-    if (from && typeof base.sender_name === 'string') named[from] = base.sender_name.trim();
-  } else {
-    // The user's own mail is the latest — or the thread is only a queued
-    // send so far: its recipients again.
-    const last = live[live.length - 1]
-      || (pending.length ? { recipients: pending[pending.length - 1].to, cc: pending[pending.length - 1].cc } : null);
-    if (!last) return { to: [], cc: [] };
-    to = addrList(last.recipients);
-    cc = addrList(last.cc);
-  }
-  const seen = new Set();
-  const pick = (list, keep) => list.map((a) => ({ raw: String(a).trim(), key: addrKey(a) }))
-    .filter(({ key }) => {
-      if (!key || seen.has(key) || !keep(key)) return false;
-      seen.add(key);
-      return true;
-    })
-    .map(({ raw, key }) => ({ address: raw, name: names.get(key) || named[key] || '' }));
-  // An inbound mail's sender is To whatever the participant list says — a
-  // mail to oneself aside, which leaves nobody to write to.
-  const toList = pick(to, (a) => (base ? a !== account : !own(a, false)));
-  const ccList = mode === 'sender' ? [] : pick(cc, (a) => !own(a, !!base));
-  return { to: toList, cc: ccList };
+// ── Whom a reply reaches: the server's word ─────────────────────────────────
+// The page does not work out a reply's recipients. The mail gateway addresses
+// a reply from its own records — a Reply-To, the user's aliases, a mail the
+// page has not been told of yet — and GET /chats/<id>/reply-preview answers
+// exactly what it would address right now:
+//   {all: {to, cc}, sender: {to, cc}, choice, subject}
+// each recipient `{address, name, contact}` — the address, the display name
+// on record (text a mail supplied) and, where the address is a person's, the
+// address book's word on them. replyPreview reads that document into what
+// the composer draws, or null when it is not one: a recipient the page could
+// not show is a reason to show none and send nothing, never to show the rest.
+
+// A name beside an address. It is shown only where it cannot be taken for an
+// address or hide one: a name that itself holds an at sign (in any width) or
+// an angle bracket is dropped — "ceo@company.com" as the display name of
+// x@evil.example reads as an address the mail does not go to — as is one
+// that only repeats the address. Control and direction characters go, and a
+// long name is cut, so the address after it stays in sight.
+const NAME_JUNK_RE = /[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u2028-\u202e\u2060-\u2069\ufeff]/g;
+const NAME_ADDRESSY_RE = /[@\uff20\ufe6b<>\uff1c\uff1e\u2039\u203a\u27e8\u27e9\u3008\u3009]/;
+const NAME_MAX = 60;
+const CONTACT_ID_RE = /^[a-z0-9._~:/#%+-]*$/;
+const ADDRESS_SHOWN_MAX = 320;
+
+export function partyName(name, address) {
+  const n = (typeof name === 'string' ? name : '').replace(NAME_JUNK_RE, ' ').replace(/\s+/g, ' ').trim();
+  if (!n || NAME_ADDRESSY_RE.test(n) || n.toLowerCase() === String(address || '').toLowerCase()) return '';
+  return n.length > NAME_MAX ? `${n.slice(0, NAME_MAX - 1)}…` : n;
 }
 
-function recipientNames(list) {
-  return list.map((r) => r.name || r.address).join(', ');
+function previewParty(x) {
+  if (!x || typeof x !== 'object') return null;
+  const address = typeof x.address === 'string' ? x.address.trim() : '';
+  // An address is shown exactly as the gateway will use it, or not at all:
+  // one that holds a space or a control or direction character cannot be
+  // read off the screen as what it is.
+  if (!address || address.length > ADDRESS_SHOWN_MAX || /\s/.test(address) || address.search(NAME_JUNK_RE) >= 0) return null;
+  // The address book's name where the address is a person's, else the name
+  // the mail carried. `contact` is that name — as a string, or `{name}` —
+  // and a string that reads as an identifier (a person's id, as a chat's
+  // participants carry it) is no name and is not shown as one.
+  let book = x.contact && typeof x.contact === 'object' ? x.contact.name : x.contact;
+  if (typeof book !== 'string' || CONTACT_ID_RE.test(book.trim())) book = '';
+  return { address, name: partyName(book, address) || partyName(x.name, address) };
+}
+
+function previewSide(v) {
+  if (!v || typeof v !== 'object' || !Array.isArray(v.to)) return null;
+  if (v.cc !== undefined && v.cc !== null && !Array.isArray(v.cc)) return null;
+  const to = v.to.map(previewParty);
+  const cc = (v.cc || []).map(previewParty);
+  return to.includes(null) || cc.includes(null) ? null : { to, cc };
+}
+
+export function replyPreview(doc) {
+  if (!doc || typeof doc !== 'object') return null;
+  const all = previewSide(doc.all);
+  const sender = previewSide(doc.sender);
+  if (!all || !sender) return null;
+  return { all, sender, choice: doc.choice === true,
+           subject: typeof doc.subject === 'string' ? doc.subject.replace(NAME_JUNK_RE, ' ').trim().slice(0, 200) : '' };
+}
+
+// One addressing as the page compares two of them: the addresses, case
+// folded, To apart from Cc, in no particular order.
+function sideSig(side) {
+  const keys = (list) => list.map((r) => addrKey(r.address)).sort();
+  return side ? JSON.stringify([keys(side.to), keys(side.cc)]) : '';
+}
+
+// "Name <address>", or the address alone: never a name without its address.
+function partyText(r) {
+  return r.name ? `${r.name} <${r.address}>` : r.address;
+}
+
+// A mail send's idempotency key (`request_key`): an opaque token the page
+// mints per press of Send, at most 64 characters. The gateway answers a key
+// it has seen with what it answered the first time and sends nothing, so the
+// same press made again — after a dropped connection, a page left mid-send —
+// is the same mail, not a second one.
+const REQUEST_KEY_RE = /^[A-Za-z0-9_-]{16,64}$/;
+
+export function newRequestKey() {
+  try {
+    if (globalThis.crypto && typeof globalThis.crypto.randomUUID === 'function') return globalThis.crypto.randomUUID();
+    if (globalThis.crypto && typeof globalThis.crypto.getRandomValues === 'function') {
+      const b = globalThis.crypto.getRandomValues(new Uint8Array(16));
+      return [...b].map((x) => x.toString(16).padStart(2, '0')).join('');
+    }
+  } catch (_e) { /* fall through */ }
+  let out = '';
+  while (out.length < 32) out += Math.floor(Math.random() * 0x100000000).toString(16).padStart(8, '0');
+  return out.slice(0, 32);
+}
+
+// The staged attachments of a press, as far as telling one press from
+// another needs them.
+function imgSig(images) {
+  return JSON.stringify((images || []).map((im) => [im.content_type || '', im.blob ? im.blob.size : 0, im.name || '']));
+}
+
+// A press whose outcome was never learned, as it is kept with the words it
+// sent ({key, text, mode, imgs, at}), or null for anything that is not one
+// — or is one no longer: the gateway knows a key for a day, a retry is made
+// within hours (the same evening, for a page left mid-send), and the same
+// words typed later than that are a new mail of their own.
+const RETRY_MS = 12 * 60 * 60 * 1000;
+
+function keptRetry(r) {
+  if (!r || typeof r !== 'object' || typeof r.key !== 'string' || !REQUEST_KEY_RE.test(r.key)) return null;
+  if (typeof r.text !== 'string' || !Number.isFinite(r.at)) return null;
+  const age = Date.now() - r.at;
+  if (age > RETRY_MS || age < -60 * 1000) return null;
+  return { key: r.key, text: r.text, mode: r.mode === 'sender' ? 'sender' : 'all',
+           imgs: typeof r.imgs === 'string' ? r.imgs : '[]', at: r.at };
+}
+
+// The sentence an error answer carries, as text, cut to a line or two.
+function saidError(doc) {
+  return doc && typeof doc === 'object' && typeof doc.error === 'string'
+    ? doc.error.replace(NAME_JUNK_RE, ' ').trim().slice(0, 300) : '';
 }
 
 // Splitter persistence, per device — same pattern as layout.js (STORE_KEY).
@@ -420,6 +502,9 @@ const ICON_SHRINK = '<svg class="i-shrink" viewBox="0 0 24 24" width="16" height
   'stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
   '<path d="M4 14h6v6M20 10h-6V4M14 10l7-7M3 21l7-7"/></svg>';
 const NOTE_MS = 2600;
+// A note the user has to have read: a mail that was not sent, or may have
+// been — why, and what became of the words.
+const LONG_NOTE_MS = 12000;
 // The conversations cadence: how often the open chat re-fetches its messages.
 const POLL_MS = 4000;
 // While Ara's turn runs the companion is polled tighter, so her answer lands
@@ -585,10 +670,30 @@ class RetinueChatPage extends HTMLElement {
     // a poll that left before it was queued cannot take it down (_adoptPending).
     this._pending = [];
     this._pendSeq = 0;
-    // Whom a mail reply reaches in a group thread: 'all' (the default) or
-    // 'sender'. The choice is the chat's for the next mail and resets with
-    // each one sent.
+    // Which of the two ways to address a mail reply stands: 'all' (the
+    // default) or 'sender'. The choice is the chat's for the next mail and
+    // resets with each press of Send.
     this._replyMode = 'all';
+    // Whom a mail reply reaches, as the server last said (_fetchPreview):
+    // `state` is 'idle' (not asked yet), 'ok' (`doc`, a replyPreview), 'none'
+    // (no reply is possible, `error` the server's sentence), 'unavailable'
+    // (the server has no such answer) or 'error' (it could not be asked);
+    // `rev` is the _threadRev the answer is as new as.
+    this._preview = { state: 'idle', doc: null, error: '', rev: 0 };
+    this._previewSeq = 0;      // the latest request; an older answer is dropped
+    this._previewBusy = 0;     // requests on their way
+    this._previewAsked = 0;    // the _threadRev the latest request left at
+    // What a reply depends on, as one number: bumped whenever the thread on
+    // screen changes in a way that can change whom it reaches (_noteThread).
+    this._threadRev = 0;
+    this._threadSig = '';
+    // A mail press whose outcome was never learned ({key, text, mode, imgs,
+    // at}): the same words sent again within hours go out under the same
+    // request_key.
+    this._retry = null;
+    // Failed sends the user dismissed here, by request id: a poll that left
+    // before the dismissal must not draw them again.
+    this._dismissed = new Set();
     this._undoing = false;     // a clear is being restored; hold draft saves
     this._undo = null;         // {text, byAra} a cleared draft, still recoverable
     this._undoTimer = null;
@@ -873,6 +978,7 @@ class RetinueChatPage extends HTMLElement {
       // The sends still waiting for approval, whoever queued them: shown at
       // the thread's end on every load, so a reload does not lose them.
       this._pending = (pendingList(doc) || []).map((p) => ({ p, seq: 0 }));
+      this._noteThread(doc);
       // Pin the waterline to where the chat stood when it was opened —
       // messages sent from here are appended below it, and neither a
       // re-render nor a Mark as read moves it (messenger convention: it stays
@@ -904,6 +1010,9 @@ class RetinueChatPage extends HTMLElement {
           this._adoptDictations();
         } catch (_e) { unsaved = false; }
       }
+      // A press that was never answered comes back with its words, and with
+      // the choice it was made under.
+      if (this._retry && this._retry.mode === 'sender' && this._retry.text === this._draft) this._replyMode = 'sender';
       this._state = 'ok';
       try { document.title = `${TITLE_BRAND} — ${this._chat.name}`; } catch (_e) { /* ignore */ }
       const restore = this._shelfRestore;
@@ -921,6 +1030,8 @@ class RetinueChatPage extends HTMLElement {
       shelf.observe(this._shelfKey(), {
         unread: this._unreadCount(), title: this._chat.name || '', avatar: this._avatar(),
       });
+      // Where a reply would go: asked once the thread is on screen.
+      this._ensurePreview();
       // Keep the mirror fresh on the conversations cadence.
       this._startPolling();
     } catch (err) {
@@ -1060,8 +1171,11 @@ class RetinueChatPage extends HTMLElement {
       // at the end, approved, rejected and retracted ones leave.
       const pend = pendingList(doc);
       if (pend) this._adoptPending(pend, pendSeq, stick);
-      // A new mail changes whom a reply reaches.
-      if (added && isMail(this._chat)) this._refreshToLine();
+      // Whom a reply reaches moves with the thread — a mail added, changed
+      // or gone, a queued send, the people on it — and the page does not
+      // work that out: it notes that the thread moved, and asks the server
+      // again below (_ensurePreview).
+      this._noteThread(doc);
       // The chat as the server now sees it — read by a reply from the
       // phone, unread again by an arrival, archived elsewhere — and the
       // Mark as read button where that puts it.
@@ -1112,10 +1226,145 @@ class RetinueChatPage extends HTMLElement {
       // in place; a send since then retires it (_instructedFresh).
       if (doc.chat) this._chat.instructed = doc.chat.instructed || null;
       this._refreshInstructed();
+      this._ensurePreview();
     } catch (_err) {
       // Offline or store blip: keep the last rendered state; the next poll
       // reconciles.
     }
+  }
+
+  // ── Whom a reply reaches: asked, never derived ─────────────────────────────
+  // What of a messages document can change whom a mail reply reaches, held
+  // as one string: every mail with who sent it, to whom, and whether it is
+  // still there; the queued sends; the people on the thread. When it differs
+  // from the last document's, the thread on screen is a newer one than the
+  // recipients line was drawn for: _threadRev moves on, and the line is
+  // asked for again (_ensurePreview). A mail that left the document counts
+  // like one that joined it. The page's own optimistic bubbles are not in
+  // any document and move nothing.
+  _noteThread(doc) {
+    if (!isMail(this._chat)) return;
+    const c = (doc && doc.chat) || {};
+    const msgs = Array.isArray(doc && doc.messages) ? doc.messages : [];
+    const pend = pendingList(doc);
+    const sig = JSON.stringify([
+      msgs.map((m) => (m ? [m.id, !!m.removed, m.direction || '', m.sender || '', m.recipients || null,
+                            m.cc || null, m.reply_to || null] : null)),
+      pend ? pend.map((p) => [p.request_id, pendStatus(p), p.message_id || null]) : null,
+      Array.isArray(c.participants) ? c.participants.map((p) => (p && p.address) || null) : null,
+      Number(c.participants_more) || 0, !!c.group,
+    ]);
+    if (sig === this._threadSig) return;
+    this._threadSig = sig;
+    this._bumpThread();
+  }
+
+  // The thread on screen changed under the recipients line. The line may
+  // still be right — the server says, in a moment — but what it notes about
+  // the latest mail (_replyToNotes) is drawn again now.
+  _bumpThread() {
+    this._threadRev += 1;
+    if (this._state === 'ok') this._refreshToLine();
+  }
+
+  // Ask where a reply would go whenever the answer on the page is older than
+  // the thread on it, was never given, or could not be had a moment ago — one
+  // request per state of the thread unless it failed. An answer that the
+  // server has none to give (`unavailable`) is not asked for again until the
+  // thread moves or the user presses Send.
+  _ensurePreview() {
+    if (this._state !== 'ok' || !isMail(this._chat) || !this._canSend()) return;
+    const p = this._preview;
+    const due = p.state === 'idle' || p.state === 'error' || p.rev !== this._threadRev;
+    if (!due || (this._previewBusy && this._previewAsked === this._threadRev)) return;
+    this._fetchPreview();
+  }
+
+  // GET /chats/<id>/reply-preview: how the gateway would address a reply in
+  // this thread right now, for both ways of replying. → the answer as the
+  // page keeps it ({state, doc, error, rev}); it goes onto the page unless a
+  // later request has left meanwhile. 409 and 400 are the gateway's own "no
+  // reply here" (a thread with no mail left to answer, one that holds only a
+  // queued mail), with its sentence; a server without the endpoint, or an
+  // answer that is not the document, is `unavailable` — the page then shows
+  // no recipients and sends no reply, rather than guess.
+  async _fetchPreview() {
+    this._previewSeq += 1;
+    const seq = this._previewSeq;
+    const rev = this._threadRev;
+    this._previewAsked = rev;
+    this._previewBusy += 1;
+    let next;
+    try {
+      const res = await fetch(`/chats/${encodeURIComponent(this._id)}/reply-preview`, { cache: 'no-store' });
+      let doc = null;
+      try { doc = await res.json(); } catch (_e) { doc = null; }
+      if (res.ok) {
+        const p = replyPreview(doc);
+        if (!p) next = { state: 'unavailable', doc: null, error: '' };
+        else if (!p.all.to.length || !p.sender.to.length) next = { state: 'none', doc: null, error: '' };
+        else next = { state: 'ok', doc: p, error: '' };
+      } else if (res.status === 409 || res.status === 400) {
+        next = { state: 'none', doc: null, error: saidError(doc) };
+      } else if (res.status === 404 || res.status === 405 || res.status === 501) {
+        next = { state: 'unavailable', doc: null, error: '' };
+      } else {
+        next = { state: 'error', doc: null, error: '' };
+      }
+    } catch (_e) {
+      next = { state: 'error', doc: null, error: '' };
+    } finally {
+      this._previewBusy -= 1;
+    }
+    next.rev = rev;
+    if (seq === this._previewSeq) {
+      const before = JSON.stringify([this._preview.state, this._preview.error, this._preview.doc]);
+      this._preview = next;
+      if (before !== JSON.stringify([next.state, next.error, next.doc]) && this._state === 'ok') this._refreshToLine();
+    }
+    return next;
+  }
+
+  // Why a reply cannot be pressed right now, or '' when it can: only once
+  // the server has said where it would go.
+  _replyBlock() {
+    if (!isMail(this._chat)) return '';
+    const p = this._preview;
+    if (p.state === 'ok') return '';
+    if (p.state === 'none') {
+      return `No reply can be sent from here: ${p.error || 'this thread has no mail to reply to.'}`;
+    }
+    if (p.state === 'unavailable') {
+      return 'Recipients unavailable: this server does not say where a reply would go, so none is sent from here.';
+    }
+    if (p.state === 'error') {
+      return 'Recipients unavailable right now: a reply is sent only once the server has said where it goes.';
+    }
+    return 'Checking where a reply would go — try again in a moment.';
+  }
+
+  // Why a recipient in To is not the address the mail on screen came from —
+  // said beside it, so a reply that goes somewhere else than the name above
+  // the mail never does so quietly. The addressing is the server's; this
+  // only compares it with the latest mail the page shows: an address that
+  // mail named as its Reply-To says so, any other says that it is not the
+  // sender's. Nothing is noted when the latest mail is the user's own (a
+  // follow-up goes to its recipients again). → Map(recipient → note).
+  _replyToNotes(to) {
+    const notes = new Map();
+    const live = this._messages.filter((m) => m && !m.removed && !String(m.id || '').startsWith('local-'));
+    const last = live[live.length - 1];
+    const from = last && last.direction !== 'out' ? addrKey(last.sender) : '';
+    if (!from) return notes;
+    const sender = last.sender.replace(NAME_JUNK_RE, '').trim().slice(0, ADDRESS_SHOWN_MAX);
+    const replyTo = new Set(addrList(last.reply_to).map(addrKey));
+    for (const r of to) {
+      const a = addrKey(r.address);
+      if (a === from) continue;
+      notes.set(r, replyTo.has(a) ? `the Reply-To of the mail from ${sender}`
+        : `not the address the latest mail came from, ${sender}`);
+    }
+    return notes;
   }
 
   // One arriving message against the sends whose identity we never learned.
@@ -1136,15 +1385,19 @@ class RetinueChatPage extends HTMLElement {
   // A mail is the exception: its Message-ID is minted when the send is
   // accepted, so a send that names one is that mail and nothing else — a
   // record's text is the trimmed text of a long, multi-line body, and words
-  // are no way to find it.
+  // are no way to find it. A mail the server answered `{unconfirmed}` for
+  // (`mail`, _unconfirmedMail) is never found by words at all: without a
+  // Message-ID it stays until its own request is asked about again
+  // (_recheck) or the server lists it among the chat's pending sends.
   _reconcileUnconfirmed(m) {
     if (!this._unconfirmed.length || !m || m.direction !== 'out') return false;
     const text = m.text || '';
-    const i = this._unconfirmed.findIndex((u) => (u.messageId
-      ? u.messageId === m.id
+    const i = this._unconfirmed.findIndex((u) => (u.messageId || u.mail
+      ? !!u.messageId && u.messageId === m.id
       : u.text === text && (!u.since || !tsAfter(u.since, m.ts))));
     if (i < 0) return false;
     const [pending] = this._unconfirmed.splice(i, 1);
+    this._revoke(pending.images);
     const idx = this._messages.findIndex((x) => x && x.id === pending.id);
     if (idx >= 0) this._messages[idx] = m;
     // Found by walking rather than by selector: a synthesised id carries the
@@ -1177,7 +1430,15 @@ class RetinueChatPage extends HTMLElement {
     const i = this._messages.findIndex((x) => x && x.id === m.id);
     if (i < 0) return false;
     const old = this._messages[i];
-    if (msgSig(old) === msgSig(m)) return false;
+    if (msgSig(old) === msgSig(m)) {
+      // The bubble is the same. What is read off the mail beside the
+      // recipients line — who sent it, its Reply-To (_replyToNotes) — is
+      // kept current all the same: the rail's overlay of a mail has neither
+      // yet, the record that follows has.
+      const facts = (x) => JSON.stringify([x.sender || '', x.recipients || null, x.cc || null, x.reply_to || null]);
+      if (facts(old) !== facts(m)) this._messages[i] = m;
+      return false;
+    }
     this._messages[i] = m;
     const original = m.removed ? '' : ownOriginal(m.original, this._id);
     if (!original) {
@@ -1460,6 +1721,15 @@ class RetinueChatPage extends HTMLElement {
       for (const f of flags) if (f in s) c[f] = !!s[f];
       this._refreshFlagsUi();
     }
+    // The people on the thread: a mail that arrives can add some, and turn a
+    // 1:1 into a group (the bubbles then name their senders). The header's
+    // line follows in place.
+    const people = ['participants', 'participants_more', 'group', 'peer'].filter((k) => k in s);
+    const same = (a, b) => JSON.stringify(a === undefined ? null : a) === JSON.stringify(b === undefined ? null : b);
+    if (isMail(c) && people.some((k) => !same(s[k], c[k]))) {
+      for (const k of people) c[k] = s[k];
+      this._refreshHeadPeople();
+    }
     // Whether the chat can be written to, and why not: a flip changes what
     // the pane holds below the thread (the grip goes with the composer), so
     // the page is rendered anew; a new reason only replaces its line.
@@ -1472,6 +1742,15 @@ class RetinueChatPage extends HTMLElement {
       else if (!could && why !== c.cannot_send_reason) this._refreshChatComposer();
     }
     return changed;
+  }
+
+  // A mail thread's participants line in the header, redrawn where it is.
+  _refreshHeadPeople() {
+    const el = this.shadowRoot && this.shadowRoot.querySelector('.chat-head .head-sub:not(.head-acct)');
+    const people = participantsText(this._chat);
+    if (!el || !people) return;
+    el.textContent = people;
+    el.setAttribute('title', people);
   }
 
   _isUnread() { return this._unreadCount() > 0; }
@@ -1638,12 +1917,15 @@ class RetinueChatPage extends HTMLElement {
 
   // The composer's words while the server does not have them yet (a save is
   // debounced, or failed offline), with the draft version they were written
-  // over. Nothing unsaved, nothing kept.
+  // over. Nothing unsaved, nothing kept — but for a mail press whose outcome
+  // was never learned (`_retry`): its request_key stays with its words, so a
+  // reload does not turn the same press into a second mail.
   _keepLocal(sending) {
     if (!this._id) return;
     const unsaved = this._draft !== this._draftSaved;
-    saveDraft(this._localKey(), unsaved || sending
-      ? { text: this._draft, version: this._draftVersion, byAra: this._draftByAra, sending: sending || null }
+    const retry = keptRetry(this._retry);
+    saveDraft(this._localKey(), unsaved || sending || retry
+      ? { text: this._draft, version: this._draftVersion, byAra: this._draftByAra, sending: sending || null, retry }
       : null);
   }
 
@@ -1661,17 +1943,26 @@ class RetinueChatPage extends HTMLElement {
     let text = kept.text;
     let force = false;
     const s = kept.sending && typeof kept.sending === 'object' ? kept.sending : null;
+    // A mail press that was never answered, with the key it went out under:
+    // sent again as it is, it is the same mail to the gateway (_pressKey).
+    this._retry = keptRetry(kept.retry);
     if (s && !this._sentSince(s)) {
-      text = [String(s.text || '').trim(), text.trim()].filter(Boolean).join(' ');
+      const more = text.trim();
+      text = [String(s.text || '').trim(), more].filter(Boolean).join(' ');
       force = true;
       this._leftSend = true;
+      // The send the page was left on is such a press — unless words typed
+      // after it joined it in the box: that would be another mail.
+      if (!more) {
+        this._retry = keptRetry({ key: s.key, text, mode: s.reply, imgs: s.imgs, at: Date.parse(s.at || '') }) || this._retry;
+      }
     } else if (s) {
       this._sentImages = Number(s.images) || 0;
     }
     const server = this._draftSaved;
     const same = (kept.version || 0) === (this._draftVersion || 0);
     if (text === server || !(force || same || (!server && text.trim()))) {
-      saveDraft(this._localKey(), null);
+      this._keepLocal();
       return false;
     }
     this._draft = text;
@@ -1769,7 +2060,8 @@ class RetinueChatPage extends HTMLElement {
     if (!this._canSend()) return;
     if (this._recState === 'recording' && !this._recAborted) this._handOffRecording();
     const out = this._sendingNow;
-    this._keepLocal(out ? { text: out.text, at: out.at, images: out.images.length, seen: out.seen } : null);
+    this._keepLocal(out ? { text: out.text, at: out.at, images: out.images.length, seen: out.seen,
+                            key: out.key || null, reply: out.reply || null, imgs: imgSig(out.images) } : null);
     if (this._draft !== this._draftSaved && !this._undoing && this._id) {
       try {
         fetch(`/chats/${encodeURIComponent(this._id)}/draft`, {
@@ -2449,30 +2741,79 @@ class RetinueChatPage extends HTMLElement {
   // its place at the thread's end, across polls and reloads (the server's
   // `pending`), until the server stops listing it: then it goes, and a mail
   // that was sent arrives as a message in its own right.
+  //
+  // The entry also says what became of a send that was let go (`status`):
+  // `sending` — handed to the mail server, its answer not in yet — and
+  // `failed`, which stays on the page until the user dismisses it: with the
+  // server's reason (`error`, text), with the plain statement that the mail
+  // may have gone out all the same where nobody knows (`outcome_unknown`),
+  // and with two controls, the text back into the composer and Dismiss.
+  // Recipients the mail server refused (`refused`) are named. Nothing the
+  // user queued or sent leaves the thread without a word.
   _pendingHtml(p) {
     const author = p.author === 'agent' ? 'agent' : 'user';
     const who = author === 'agent' ? (typeof p.agent === 'string' && p.agent.trim() ? p.agent.trim() : 'Ara') : 'You';
     const to = addrList(p.to);
     const toText = to.length ? to.join(', ') : '';
     const mail = isMail(this._chat);
+    const what = mail ? 'mail' : 'message';
     const subject = mail && typeof p.subject === 'string' && subjectDiffers(p.subject, this._chat.name)
       ? `<div class="msg-subj">${esc(p.subject.trim())}</div>` : '';
-    const label = `Waiting for approval: ${who === 'You' ? 'your' : `${who}'s`} ${mail ? 'mail' : 'message'}` +
-      (toText ? ` to ${toText}` : '');
+    const status = pendStatus(p);
+    const unknown = status === 'failed' && p.outcome_unknown === true;
+    // The state in words: the badge, the line beside the author, and the
+    // start of the accessible name.
+    let badge = 'Waiting for approval';
+    let head = 'not sent yet';
+    if (status === 'sending') {
+      badge = 'Sending — not confirmed yet';
+      head = 'on its way';
+    } else if (unknown) {
+      badge = `Not confirmed — this ${what} may have gone out`;
+      head = 'not confirmed';
+    } else if (status === 'failed') {
+      badge = 'Not sent';
+      head = 'not sent';
+    }
+    const label = `${badge}: ${who === 'You' ? 'your' : `${who}'s`} ${what}` + (toText ? ` to ${toText}` : '');
     const text = p.text ? `<span class="txt">${linkify(p.text)}</span>` : '';
-    return `<div class="msg out pending by-${author}" data-pending="${esc(p.request_id)}" ` +
-      `role="group" aria-label="${esc(label)}">` +
-      `<div class="msg-head"><small class="who">${esc(who)} &middot; not sent yet</small></div>` +
+    let more = '';
+    if (status === 'failed') {
+      const why = typeof p.error === 'string' ? p.error.replace(NAME_JUNK_RE, ' ').trim().slice(0, 500) : '';
+      more += `<div class="pend-why">` + (why ? esc(why) : (unknown
+        ? 'The mail server did not say whether it took it.' : 'The server gave no reason.')) +
+        (unknown ? ' Check with the recipient or the Sent folder before you send it again.' : '') + `</div>`;
+    }
+    more += this._refusedHtml(p.refused);
+    const act = status === 'pending' ? `<span class="pend-act" data-approve-slot></span>`
+      : (status === 'failed'
+        ? `<span class="pend-act"><button type="button" class="pend-btn" data-pend-copy>Copy text back to the composer</button>` +
+          `<button type="button" class="pend-btn" data-pend-dismiss ` +
+          `title="Take this failed ${what} off the thread">Dismiss</button></span>`
+        : '');
+    return `<div class="msg out pending${status === 'pending' ? '' : ` ${status}`} by-${author}" ` +
+      `data-pending="${esc(p.request_id)}" role="group" aria-label="${esc(label)}">` +
+      `<div class="msg-head"><small class="who">${esc(who)} &middot; ${head}</small></div>` +
       `<div class="bubble">${subject}${text}` +
-      `<div class="pend-state"><span class="pend-badge">Waiting for approval</span>` +
-      `<span class="pend-act" data-approve-slot></span></div>` +
+      `<div class="pend-state"><span class="pend-badge">${esc(badge)}</span>${act}</div>${more}` +
       `<span class="stamp">${esc(fmtTime(p.ts))}</span></div></div>`;
+  }
+
+  // The recipients the mail server refused, by address: the rest got the
+  // mail, these did not. On a pending bubble and on the mail it became.
+  _refusedHtml(refused) {
+    const list = addrList(refused).map((a) => a.replace(NAME_JUNK_RE, '').trim().slice(0, ADDRESS_SHOWN_MAX)).filter(Boolean);
+    if (!list.length) return '';
+    return `<div class="msg-refused" role="note">Not delivered to ${esc(list.join(', '))} &mdash; the mail server ` +
+      `refused ${list.length === 1 ? 'this address' : 'these addresses'}.</div>`;
   }
 
   // The approval link of one pending bubble, element by element: only from a
   // path approvalPath accepts, and with nothing of the entry's in it but that
   // path. Anything else says where the send is approved, as text.
   _mountApproval(node, p) {
+    // Only a send that still waits has anything to approve.
+    if (pendStatus(p) !== 'pending') return;
     const slot = node && node.querySelector ? node.querySelector('[data-approve-slot]') : null;
     if (!slot) return;
     const path = approvalPath(p.approval_url);
@@ -2559,6 +2900,13 @@ class RetinueChatPage extends HTMLElement {
     const plan = [];
     for (const p of list) {
       if (p.message_id && sent.has(p.message_id)) continue;
+      // One the user dismissed here, listed by a poll that left before that.
+      if (this._dismissed.has(p.request_id)) continue;
+      // A mail this page handed over without learning its outcome is the
+      // server's to report from here on: its own bubble gives way.
+      const mine = this._unconfirmed.find((u) => u.mail
+        && ((u.messageId && u.messageId === p.message_id) || (u.key && u.key === p.request_key)));
+      if (mine) this._dropUnconfirmed(mine);
       const cur = this._pending.find((x) => x.p.request_id === p.request_id);
       if (!cur) {
         plan.push({ x: { p, seq: 0 }, how: 'add' });
@@ -2594,13 +2942,58 @@ class RetinueChatPage extends HTMLElement {
         this._mountApproval(fresh, s.x.p);
         if (had) {
           // The same control again where there is one, else the bubble.
-          const link = fresh.querySelector('.pend-link');
+          const link = fresh.querySelector('.pend-link') || fresh.querySelector('.pend-btn');
           const to = link || fresh;
           if (!link && !fresh.hasAttribute('tabindex')) fresh.setAttribute('tabindex', '-1');
           to.focus({ preventScroll: true });
         }
       }
     });
+  }
+
+  // "Copy text back to the composer" on a failed send: its words into the
+  // box — after what the box already holds, never over it — for the user to
+  // send again when they choose. The bubble stays until it is dismissed.
+  _copyPending(rid) {
+    const x = this._pending.find((y) => y.p.request_id === rid);
+    if (!x || pendStatus(x.p) !== 'failed' || !this._canSend()) return;
+    this._intoComposer(typeof x.p.text === 'string' ? x.p.text : '');
+    const input = this.shadowRoot.querySelector('[data-composer="chat"] textarea');
+    if (input) { try { input.focus(); } catch (_e) { /* ignore */ } }
+    this._showNote('The text is back in the box. The failed one stays above until you dismiss it.', 'chat', LONG_NOTE_MS);
+  }
+
+  // Dismiss on a failed send: POST /chats/<id>/pending/<request id>/dismiss
+  // takes it off the gateway's list, and then off the thread. A refusal
+  // leaves it where it is, with the server's sentence.
+  async _dismissPending(rid) {
+    const x = this._pending.find((y) => y.p.request_id === rid);
+    if (!x || pendStatus(x.p) !== 'failed' || x.dismissing) return;
+    x.dismissing = true;
+    try {
+      const res = await fetch(`/chats/${encodeURIComponent(this._id)}/pending/${encodeURIComponent(rid)}/dismiss`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: '{}',
+      });
+      // Gone already (404) is dismissed as well.
+      if (!res.ok && res.status !== 404) {
+        let doc = null;
+        try { doc = await res.json(); } catch (_e) { doc = null; }
+        const err = new Error(String(res.status));
+        err.why = saidError(doc);
+        throw err;
+      }
+      this._dismissed.add(rid);
+      if (this._pending.includes(x)) this._dropPending(x);
+      this._bumpThread();
+      this._ensurePreview();
+    } catch (err) {
+      this._showNote(err && err.why ? `Not dismissed: ${esc(err.why)}`
+        : "Couldn't dismiss it &mdash; check the connection and try again.", 'chat', LONG_NOTE_MS);
+    } finally {
+      x.dismissing = false;
+    }
   }
 
   // One bubble. Outbound carries its author — the user, Ara, or the user's
@@ -2617,7 +3010,10 @@ class RetinueChatPage extends HTMLElement {
     if (m.removed) return this._tombHtml(m, out, author);
     const original = ownOriginal(m.original, this._id);
     const open = !!original && this._origOpen.has(m.id);
-    const cls = (out ? `msg out by-${author}` : 'msg in') + (open ? ' orig-open' : '');
+    // A mail of this page's own that the server took without saying it went
+    // out (_unconfirmedMail): the bubble says so, in words.
+    const unsure = out && m.unconfirmed === true && String(m.id || '').startsWith('local-');
+    const cls = (out ? `msg out by-${author}` : 'msg in') + (open ? ' orig-open' : '') + (unsure ? ' unconfirmed' : '');
     let head = '';
     if (out) {
       head = `<div class="msg-head"><small class="who">${this._authorTag(m, author)}</small></div>`;
@@ -2645,8 +3041,16 @@ class RetinueChatPage extends HTMLElement {
         `aria-expanded="${open}" title="${open ? 'Back to the mail as a message' : 'The whole mail as it was sent'}">` +
         `${open ? 'Hide original' : 'Original'}</button></div>`
       : '';
-    return `<div class="${cls}" data-mid="${esc(m.id)}">${head}<div class="bubble">${subject}${body}` +
-      `${toggle}<span class="stamp">${esc(fmtTime(m.ts))}</span></div></div>`;
+    const state = unsure
+      ? `<div class="pend-state"><span class="pend-badge">Sending &mdash; not confirmed yet</span>` +
+        (m.recheck ? `<span class="pend-act"><button type="button" class="pend-btn" data-recheck ` +
+          `title="Ask the server what became of this mail — it is not sent a second time">Check again</button></span>` : '') +
+        `</div>`
+      : '';
+    const refused = out ? this._refusedHtml(m.refused) : '';
+    const group = unsure ? ` role="group" aria-label="Not confirmed yet: your ${mail ? 'mail' : 'message'}"` : '';
+    return `<div class="${cls}" data-mid="${esc(m.id)}"${group}>${head}<div class="bubble">${subject}${body}` +
+      `${state}${refused}${toggle}<span class="stamp">${esc(fmtTime(m.ts))}</span></div></div>`;
   }
 
   _authorTag(m, author) {
@@ -3049,19 +3453,10 @@ class RetinueChatPage extends HTMLElement {
       `</div>`;
   }
 
-  // A mail reply's recipients as the gateway will build them, for the
-  // composer's line and the Reply all / Sender only choice.
-  _mailRecipients(mode = this._replyMode) {
-    const pend = this._pending.map((x) => x.p);
-    return replyRecipients(this._chat, this._messages, mode, pend);
-  }
-
-  // Whether this mail thread offers the choice: a group thread whose reply
-  // to all reaches more people than one to the sender — where the two are
-  // the same there is nothing to choose.
+  // Whether this mail thread offers the choice: exactly when the server says
+  // a reply to all and one to the sender are addressed differently.
   _offersReplyMode() {
-    if (!isMail(this._chat) || !this._chat.group) return false;
-    return this._mailRecipients('all').cc.length > 0;
+    return isMail(this._chat) && this._preview.state === 'ok' && this._preview.doc.choice;
   }
 
   // Reply all / Sender only, as a pair of radio buttons: a choice of two that
@@ -3073,8 +3468,8 @@ class RetinueChatPage extends HTMLElement {
       `<input type="radio" name="reply-mode" value="${value}" data-reply-mode` +
       `${this._replyMode === value ? ' checked' : ''}> ${label}</label>`;
     return `<div class="reply-mode" role="radiogroup" aria-label="Who the reply goes to">` +
-      opt('all', 'Reply all', 'The sender, and everyone else the mail went to in Cc') +
-      opt('sender', 'Sender only', 'Only the sender of the mail you answer') +
+      opt('all', 'Reply all', 'Everyone a reply to all reaches — the line above names them') +
+      opt('sender', 'Sender only', 'Only whom a reply to the sender reaches — the line above names them') +
       `</div>`;
   }
 
@@ -3085,34 +3480,76 @@ class RetinueChatPage extends HTMLElement {
     this._refreshToLine();
   }
 
-  // The To/Cc line and the send button's label redrawn in place — after a
-  // reply-mode change, a new mail (whom a reply reaches moves with it), or a
-  // send that reset the choice; the radio pair follows the state too.
-  _refreshToLine() {
-    const root = this.shadowRoot;
-    const line = root && root.querySelector('[data-to-line]');
-    if (line) {
-      const tpl = document.createElement('template');
-      tpl.innerHTML = this._toLineHtml();
-      const next = tpl.content.firstElementChild;
-      if (next) line.replaceWith(next);
-    }
-    if (root) {
-      root.querySelectorAll('[data-reply-mode]').forEach((el) => { el.checked = el.value === this._replyMode; });
-      const send = root.querySelector('[data-composer="chat"] .send');
-      if (send) {
-        const label = this._sendLabel();
-        send.setAttribute('title', label);
-        send.setAttribute('aria-label', label);
-      }
-    }
+  _wireReplyMode(scope) {
+    if (!scope || !scope.querySelectorAll) return;
+    scope.querySelectorAll('[data-reply-mode]').forEach((el) =>
+      el.addEventListener('change', () => { if (el.checked) this._setReplyMode(el.value); }));
   }
 
-  // What the chat composer's send button says it does.
+  // The To/Cc line, the Reply all / Sender only pair and the send button
+  // redrawn in place — after the server's word on the recipients changed, a
+  // reply-mode change, the thread moving under the line, or a press that
+  // reset the choice. The pair is put on the page and taken off it as the
+  // choice comes and goes, not only checked: a mail that copies someone in
+  // must bring it, and one that leaves nobody to choose between must not
+  // leave a selected "Sender only" standing.
+  _refreshToLine() {
+    const root = this.shadowRoot;
+    if (!root || !root.querySelector) return;
+    // The line wraps, so its height moves with the recipients; a reader at
+    // the newest message stays there.
+    const stick = this._atBottom();
+    const fromHtml = (html) => {
+      const tpl = document.createElement('template');
+      tpl.innerHTML = html;
+      return tpl.content.firstElementChild;
+    };
+    let line = root.querySelector('[data-to-line]');
+    if (line) {
+      const next = fromHtml(this._toLineHtml());
+      if (next) {
+        line.replaceWith(next);
+        line = next;
+      }
+    }
+    const pair = root.querySelector('.reply-mode');
+    const html = this._replyModeHtml();
+    if (pair && !html) {
+      // Focus on a radio that goes does not fall to the document.
+      const had = pair.contains && pair.contains(deepActiveElement());
+      pair.remove();
+      const send = had && root.querySelector('[data-composer="chat"] .send');
+      if (send) send.focus();
+    } else if (!pair && html && line) {
+      const next = fromHtml(html);
+      if (next) {
+        line.insertAdjacentElement('afterend', next);
+        this._wireReplyMode(next);
+      }
+    }
+    root.querySelectorAll('[data-reply-mode]').forEach((el) => { el.checked = el.value === this._replyMode; });
+    const send = root.querySelector('[data-composer="chat"] .send');
+    if (send) {
+      const label = this._sendLabel();
+      send.setAttribute('title', label);
+      send.setAttribute('aria-label', label);
+      if (this._replyBlock()) send.setAttribute('aria-disabled', 'true');
+      else send.removeAttribute('aria-disabled');
+    }
+    if (stick) this._scrollThread('[data-chat-thread]');
+  }
+
+  // What the chat composer's send button says it does. On a mail: whom the
+  // reply goes to, by the server's word and with the addresses — the first
+  // few; the line above the field names every one.
   _sendLabel() {
     if (isMail(this._chat)) {
-      const to = this._mailRecipients().to;
-      return `Send the reply${to.length ? ` to ${recipientNames(to)}` : ''} (Ctrl+Enter or ⌘+Enter)`;
+      if (this._preview.state !== 'ok') return 'Send the reply — not possible until the recipients are known';
+      const side = this._preview.doc[this._replyMode];
+      const to = side.to.slice(0, 3).map(partyText).join(', ') +
+        (side.to.length > 3 ? ` and ${side.to.length - 3} more` : '');
+      const cc = side.cc.length ? `, copy to ${side.cc.length === 1 ? partyText(side.cc[0]) : `${side.cc.length} more`}` : '';
+      return `Send the reply to ${to}${cc} (Ctrl+Enter or ⌘+Enter)`;
     }
     return this._recipient() ? `Send to ${this._recipient()}` : 'Send';
   }
@@ -3123,36 +3560,48 @@ class RetinueChatPage extends HTMLElement {
   // standing "To <name> · <channel>" line above it, the recipient in its
   // placeholder and send label, and the outbound colour on the field and the
   // send button, where the companion composer keeps Ara's accent blue.
-  // A mail thread is named by its subject, not by whom a reply reaches: the
-  // recipient there is its participants.
+  // On a messenger that is the chat's name. A mail thread is named by its
+  // subject, and whom a reply reaches there is the server's to say
+  // (_toLineHtml, _sendLabel) — never this.
   _recipient() {
     const c = this._chat;
-    if (!c) return '';
-    return (isMail(c) && participantsText(c)) || c.name || '';
+    return (c && !isMail(c) && c.name) || '';
   }
 
   //
-  // A mail reply's line says where this reply goes, as the gateway will
-  // address it (replyRecipients): "To <sender> · Cc <the others>", following
-  // the Reply all / Sender only choice. A thread with nothing left to reply
-  // to names its participants, as before.
+  // A mail reply's line says where this reply goes, in the server's words
+  // (_fetchPreview): "To <name> <address> · Cc …" for the choice that stands
+  // — every recipient with its address, a name never without it, and a To
+  // that is not where the latest mail came from saying so (_replyToNotes).
+  // It wraps rather than cuts, so no recipient is out of sight. Until the
+  // server has said, or where it says no reply is possible, the line says
+  // that instead, and nothing is sent (_replyBlock).
   _toLineHtml() {
     if (isMail(this._chat)) {
-      const { to, cc } = this._mailRecipients();
-      if (to.length) {
-        const all = (list) => list.map((r) => (r.name ? `${r.name} <${r.address}>` : r.address)).join(', ');
-        const title = `Your reply goes to ${all(to)}${cc.length ? `, with a copy to ${all(cc)}` : ''}` +
-          ' — by e-mail, not to Ara.';
-        return `<div class="to-line mail" data-to-line title="${esc(title)}">` +
-          `<span aria-hidden="true">&#10148;</span> To <b>${esc(recipientNames(to))}</b>` +
-          (cc.length ? ` &middot; Cc <b>${esc(recipientNames(cc))}</b>` : '') + `</div>`;
+      const p = this._preview;
+      if (p.state !== 'ok') {
+        const wait = p.state === 'idle';
+        return `<div class="to-line mail ${wait ? 'wait' : 'off'}" data-to-line role="status">` +
+          `<span aria-hidden="true">&#10148;</span> ` +
+          `${esc(wait ? 'Checking where a reply would go …' : this._replyBlock())}</div>`;
       }
+      const side = p.doc[this._replyMode];
+      const notes = this._replyToNotes(side.to);
+      const one = (r) => `<span class="rcp">` +
+        (r.name ? `<b>${esc(r.name)}</b> <span class="addr">&lt;${esc(r.address)}&gt;</span>` : `<b>${esc(r.address)}</b>`) +
+        (notes.has(r) ? ` <span class="rcp-why">(${esc(notes.get(r))})</span>` : '') + `</span>`;
+      const list = (l) => l.map(one).join(', ');
+      const title = `Your reply${p.doc.subject ? ` “${p.doc.subject}”` : ''} goes to ${side.to.map(partyText).join(', ')}` +
+        `${side.cc.length ? `, with a copy to ${side.cc.map(partyText).join(', ')}` : ''} — by e-mail, not to Ara.`;
+      return `<div class="to-line mail" data-to-line title="${esc(title)}">` +
+        `<span aria-hidden="true">&#10148;</span> To ${list(side.to)}` +
+        (side.cc.length ? ` &middot; Cc ${list(side.cc)}` : '') + `</div>`;
     }
     const name = this._recipient();
     if (!name) return '';
     const ch = this._chat.channel;
     const via = esc((CHANNELS[ch] || { label: ch || '' }).label);
-    const who = this._chat.group && !isMail(this._chat) ? `everyone in ${esc(name)}` : esc(name);
+    const who = this._chat.group ? `everyone in ${esc(name)}` : esc(name);
     return `<div class="to-line" data-to-line title="What you send here goes to ${who}${via ? ` on ${via}` : ''}, not to Ara.">` +
       `<span aria-hidden="true">&#10148;</span> To <b>${who}</b>${via ? ` &middot; ${via}` : ''}</div>`;
   }
@@ -3283,8 +3732,12 @@ class RetinueChatPage extends HTMLElement {
         `title="Record a voice message" aria-label="Record a voice message">&#127908;</button>`
       : '';
     const sendLabel = isChat ? this._sendLabel() : 'Send';
+    // A mail reply whose recipients the server has not named cannot be
+    // pressed (_replyBlock): the button says so, and stays reachable, so its
+    // label can be read.
+    const off = isChat && this._replyBlock() ? ' aria-disabled="true"' : '';
     const sendBtn = `<button type="submit" class="send" title="${esc(sendLabel)}" ` +
-      `aria-label="${esc(sendLabel)}">&#10148;</button>`;
+      `aria-label="${esc(sendLabel)}"${off}>&#10148;</button>`;
     // The clear ✕ lives INSIDE the field, docked to its top-right corner: on
     // the send side, as the design asks, but within the field's own boundary,
     // so it reads — and taps — as part of the text box, visually and
@@ -3389,6 +3842,16 @@ class RetinueChatPage extends HTMLElement {
           this._markRead();
         } else if (at('[data-mark-read-undo]')) {
           this._undoMarkRead();
+        } else if (at('[data-pend-copy]') || at('[data-pend-dismiss]')) {
+          // The entry a control belongs to is its bubble's request id, read
+          // as an attribute, like a message's.
+          const node = at('[data-pending]');
+          const rid = node ? node.getAttribute('data-pending') : null;
+          if (rid !== null && at('[data-pend-copy]')) this._copyPending(rid);
+          else if (rid !== null) this._dismissPending(rid);
+        } else if (at('[data-recheck]')) {
+          const id = mid();
+          if (id !== null) this._recheck(id);
         } else if (at('[data-orig-toggle]')) {
           const id = mid();
           if (id !== null) this._toggleOriginal(id);
@@ -3479,8 +3942,7 @@ class RetinueChatPage extends HTMLElement {
     // while a recording or dictation job holds the row.
     root.querySelectorAll('[data-rmimg]').forEach((el) =>
       el.addEventListener('click', () => this._removeImage(Number(el.getAttribute('data-rmimg')))));
-    root.querySelectorAll('[data-reply-mode]').forEach((el) =>
-      el.addEventListener('change', () => { if (el.checked) this._setReplyMode(el.value); }));
+    this._wireReplyMode(root);
     this._wireComposer('chat');
   }
 
@@ -3699,6 +4161,14 @@ class RetinueChatPage extends HTMLElement {
       // A chat message needs text or at least one staged image; a companion
       // turn is text-only.
       if (!text.trim() && !(isChat && this._outImages.length)) return;
+      // A mail reply whose recipients are not known is not sent, and the
+      // words stay where they are.
+      const blocked = isChat ? this._replyBlock() : '';
+      if (blocked) {
+        this._showNote(esc(blocked), 'chat', LONG_NOTE_MS);
+        this._fetchPreview();
+        return;
+      }
       if (isChat) {
         this._draft = '';
         this._setDraftByAra(false);
@@ -4122,16 +4592,59 @@ class RetinueChatPage extends HTMLElement {
   // will confirm — then is reconciled with the Message the server returns
   // (POST /chats/<id>/send — the gateway records author `user`; on a
   // messenger no policy category queues it: the user's send press IS the
-  // approval `verify` exists for). A mail goes under its account's policy and
-  // may come back queued, 202 `{pending}`: then the bubble gives way to a
-  // pending one (_queued). On failure the bubble comes back down and the
-  // words AND the staged images return to the composer for retry.
+  // approval `verify` exists for). On failure the bubble comes back down and
+  // the words AND the staged images return to the composer for retry.
+  //
+  // A mail is sent in the user's name to whoever the gateway addresses, and
+  // may leave before any answer is back, so its press is held to more:
+  //
+  //  - Whom it reaches. The reply mode is the one on screen at the press,
+  //    read before anything is awaited, and the choice resets there. The
+  //    recipients are asked for once more (_fetchPreview) and the mail is
+  //    posted only if that answer is there, is not older than the thread on
+  //    screen, and addresses the reply as the line did at the press;
+  //    otherwise nothing is posted, the words come back, and the line shows
+  //    what the server now says.
+  //  - One press, one mail. The request carries a `request_key` (_pressKey).
+  //  - Its answer. 200 is the mail; 202 `{pending}` a send that waits for
+  //    approval (_queued); 202 `{unconfirmed}` a mail handed over whose
+  //    outcome nobody knows yet — the bubble stays and says so, the words do
+  //    not come back (_unconfirmedMail). A 4xx is the server's refusal, with
+  //    its sentence: nothing went out. Anything else — no answer at all, a
+  //    5xx, an answer that is no document — says nothing about whether the
+  //    mail went out, and is never reported as "not sent": the words come
+  //    back with the key they went under, and the note says to look in the
+  //    thread before sending them again.
   async _sendChat(text) {
+    const mail = isMail(this._chat);
+    let mode = 'all';
+    let shown = '';
+    if (mail) {
+      const blocked = this._replyBlock();
+      if (blocked) {
+        // The caller emptied the field for the send; nothing else was taken.
+        this._restoreComposer(text);
+        this._showNote(esc(blocked), 'chat', LONG_NOTE_MS);
+        this._fetchPreview();
+        return;
+      }
+      mode = this._replyMode;
+      shown = sideSig(this._preview.doc[mode]);
+      // The next mail starts from Reply all again — from the press, not from
+      // the answer, which may land after a choice made for the mail after
+      // this one.
+      if (mode !== 'all') {
+        this._replyMode = 'all';
+        this._refreshToLine();
+      }
+    }
     if (this._draftTimer) clearTimeout(this._draftTimer);
     this._draftTimer = null;
     const images = this._outImages;
     this._outImages = [];
     this._imgError = '';
+    const press = mail ? this._pressKey(text, mode, images) : { key: '', again: false, at: 0 };
+    const key = press.key;
     // Words alone go out as a keepalive request, which the browser finishes
     // even if the page is left now (offline it fails like any other, so the
     // next visit still looks for the message in the chat). Images make the
@@ -4139,7 +4652,7 @@ class RetinueChatPage extends HTMLElement {
     // is answered (see _keepImages): a page left meanwhile finds them, and
     // the words, on the next visit (_leaving, _restoreLocal).
     const keepalive = !images.length && text.length * 3 <= KEEPALIVE_BYTES;
-    const sending = { text, at: new Date().toISOString(), keepalive, images };
+    const sending = { text, at: new Date().toISOString(), keepalive, images, key, reply: mail ? mode : '' };
     sending.seen = this._sentLike(sending);
     this._sendingNow = sending;
     if (images.length) {
@@ -4168,51 +4681,161 @@ class RetinueChatPage extends HTMLElement {
     }
     this._messages.push(local);
     this._appendChatMessage(local);
-    const findLocal = () => this.shadowRoot.querySelector(
-      `[data-chat-thread] [data-mid="${local.id}"]`);
-    const node = findLocal();
+    const node = this._localNode(local);
     if (node) node.classList.add('sending');
-    const mail = isMail(this._chat);
+    // Whether the request left the page: until then nothing can have been
+    // sent, whatever goes wrong.
+    let posted = false;
     try {
       const body = {};
       if (!images.length || text.trim()) body.text = text;
       if (images.length) {
         body.images = await Promise.all(images.map((im) => this._imagePayload(im)));
       }
-      // A mail reply says whom it is for: the choice in a group thread, and
-      // in a 1:1 "all" — the sender, the only one there is.
-      if (mail) body.reply = this._offersReplyMode() ? this._replyMode : 'all';
+      if (mail) {
+        // The recipients once more, now: the mail goes only to whom the
+        // line named when send was pressed.
+        const now = await this._fetchPreview();
+        const side = now.state === 'ok' ? now.doc[mode] : null;
+        if (!side || now.rev !== this._threadRev || sideSig(side) !== shown) {
+          const err = new Error('recipients');
+          err.note = side
+            ? 'Not sent: the thread changed and with it whom a reply reaches. Check the line above the field, then send again.'
+            : `Not sent. ${this._replyBlock() || 'The recipients could not be confirmed.'}`;
+          throw err;
+        }
+        body.reply = mode;
+        body.request_key = key;
+      }
+      const bodyJson = JSON.stringify(body);
+      posted = true;
       const res = await fetch(`/chats/${encodeURIComponent(this._id)}/send`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
+        body: bodyJson,
         keepalive,
       });
       if (!res.ok) {
-        // A mail the gateway refused says why (no live mail left to reply
-        // to, an address it cannot parse): the reason goes into the note.
-        let why = '';
-        if (mail && res.status >= 400 && res.status < 500) {
-          try {
-            const doc = await res.json();
-            why = doc && typeof doc.error === 'string' ? doc.error.trim().slice(0, 300) : '';
-          } catch (_e) { why = ''; }
-        }
         const err = new Error(String(res.status));
-        err.why = why;
+        if (mail) {
+          let doc = null;
+          try { doc = await res.json(); } catch (_e) { doc = null; }
+          err.why = saidError(doc);
+          // The server's own refusal: it took nothing. Anything else leaves
+          // open whether the mail went out.
+          err.refused = res.status >= 400 && res.status < 500;
+          err.status = res.status;
+        }
         throw err;
       }
       const msg = await res.json();
-      // The next mail starts from Reply all again.
-      if (mail) this._replyMode = 'all';
+      if (!msg || typeof msg !== 'object') throw new Error('answer');
       if (res.status === 202) {
-        this._queued(local, msg && msg.pending, images);
+        if (mail && msg.unconfirmed === true && !msg.pending) {
+          this._unconfirmedMail(local, msg, { key, bodyJson, images });
+        } else {
+          this._queued(local, msg.pending, images);
+        }
         return;
       }
-      // Reconcile: the server's message replaces the optimistic bubble
-      // wholesale — same renderer, so nothing moves except the media sources,
-      // now the proxied URLs (the reserved boxes match by construction), and
-      // the poll's de-dup knows the message.
+      this._sent(local, msg, images, mail, press.again);
+    } catch (err) {
+      // No mail the server may have taken is called "not sent" here: only
+      // one that never left the page, or that the server refused.
+      const open = mail && posted && !(err && err.refused);
+      // Take the bubble down, give words and images back to the composer.
+      // The preview object URLs were never revoked, so the staged images
+      // are intact for the retry.
+      this._takeDown(local);
+      if (mail) {
+        // The choice the press was made under goes back with the words —
+        // unless another was made since.
+        if (mode !== 'all' && this._replyMode === 'all') this._replyMode = mode;
+        // And so does the key, while it is not known what became of the
+        // press (or nothing was posted under it at all): the same words
+        // sent again are then the same mail.
+        this._retry = open || !posted ? { key, text, mode, imgs: imgSig(images), at: press.at } : null;
+        this._refreshToLine();
+      }
+      if (images.length) {
+        this._outImages = images.concat(this._outImages);
+        this._draft = text;
+        this._keepLocal();
+        this._refreshChatComposer();
+      } else {
+        this._restoreComposer(text);
+      }
+      if (!mail) {
+        this._showNote("Couldn't send &mdash; check the connection and try again.");
+      } else if (!posted) {
+        this._showNote(esc((err && err.note) || 'Not sent: an attachment could not be read.'), 'chat', LONG_NOTE_MS);
+      } else if (!open) {
+        this._showNote(`Not sent: ${esc(err.why || `the server refused it (${err.status}).`)}`, 'chat', LONG_NOTE_MS);
+        // A refusal may be about the thread (no mail left to reply to).
+        this._fetchPreview();
+      } else {
+        const how = err && err.status
+          ? `The server could not confirm this mail${err.why ? ` (${esc(err.why)})` : ` (it answered ${err.status})`}.`
+          : 'No answer came back, so it is not known whether this mail went out.';
+        this._showNote(`${how} It is back in the box &mdash; if it shows up in the thread, do not send it again.`,
+          'chat', LONG_NOTE_MS);
+      }
+    } finally {
+      if (this._sendingNow === sending) this._sendingNow = null;
+      if (images.length) this._keepImages();
+    }
+  }
+
+  // The request_key of a mail press. A press whose outcome was never learned
+  // left its key with its words (`_retry`): the same words, under the same
+  // choice and with the same attachments, sent again within hours (keptRetry),
+  // are that press made again and go out under its key — the gateway then
+  // answers what it answered the first time and sends nothing twice.
+  // Anything else is a new mail and a new key. → {key, again, at}: `again`
+  // when the key is that of an earlier press, `at` when that press was made.
+  _pressKey(text, mode, images) {
+    const r = keptRetry(this._retry);
+    this._retry = null;
+    if (r && r.text === text && r.mode === mode && r.imgs === imgSig(images)) return { key: r.key, again: true, at: r.at };
+    return { key: newRequestKey(), again: false, at: Date.now() };
+  }
+
+  _revoke(images) {
+    (images || []).forEach((im) => { try { URL.revokeObjectURL(im.url); } catch (_e) { /* ignore */ } });
+  }
+
+  // The bubble of one of this page's own optimistic messages. By selector:
+  // its id is the page's own making ("local-<n>"), not text from outside.
+  _localNode(local) {
+    return this.shadowRoot.querySelector(`[data-chat-thread] [data-mid="${local.id}"]`);
+  }
+
+  // The page's own bubble `local` off the thread, with a day separator that
+  // was there for it alone (the sends waiting for approval stay after it).
+  _takeDown(local) {
+    const idx = this._messages.indexOf(local);
+    if (idx >= 0) this._messages.splice(idx, 1);
+    const node = this._localNode(local);
+    if (!node) return;
+    const sep = node.previousElementSibling;
+    node.remove();
+    const after = sep && sep.nextElementSibling;
+    if (sep && sep.classList && sep.classList.contains('day-sep')
+      && (!after || after.hasAttribute('data-pending'))) sep.remove();
+  }
+
+  // The server's Message for a send from here: it replaces the optimistic
+  // bubble wholesale — same renderer, so nothing moves except the media
+  // sources, now the proxied URLs (the reserved boxes match by
+  // construction), and the poll's de-dup knows the message.
+  _sent(local, msg, images, mail, again = false) {
+    if (msg.id && this._seen.has(msg.id)) {
+      // The mail is in the thread already, and the optimistic bubble only
+      // leaves: a poll was quicker than the answer — or this was a press
+      // made again, and the gateway answers that the first one went out.
+      this._takeDown(local);
+      if (again) this._showNote('This mail had gone out the first time; it was not sent again.', 'chat', LONG_NOTE_MS);
+    } else {
       const idx = this._messages.indexOf(local);
       if (idx >= 0) this._messages[idx] = msg;
       // An unconfirmed send has no identity to remember: its id is synthesised
@@ -4226,51 +4849,33 @@ class RetinueChatPage extends HTMLElement {
       } else {
         this._seen.add(msg.id);
       }
-      const cur = findLocal();
+      const cur = this._localNode(local);
       if (cur) this._replaceBubble(cur, msg);
-      images.forEach((im) => { try { URL.revokeObjectURL(im.url); } catch (_e) { /* ignore */ } });
-      // The server cleared the shared draft and read the chat with this send
-      // — a reply reads it, the server's rule, so nothing is posted for it
-      // here; mirror both (the next draft save re-anchors its version
-      // through the guard's one-shot retry). A poll that left before the
-      // send would still say unread: the epoch makes it stand aside.
-      this._draftSaved = '';
-      this._keepLocal();
-      this._readEpoch += 1;
-      this._clearReadUndo();
-      if (this._chat) {
-        this._adoptRead(null, { unread: 0, listGroup: this._chat.archived ? 'archived' : 'read' });
+    }
+    this._revoke(images);
+    // The server cleared the shared draft and read the chat with this send
+    // — a reply reads it, the server's rule, so nothing is posted for it
+    // here; mirror both (the next draft save re-anchors its version
+    // through the guard's one-shot retry). A poll that left before the
+    // send would still say unread: the epoch makes it stand aside.
+    this._draftSaved = '';
+    this._keepLocal();
+    this._readEpoch += 1;
+    this._clearReadUndo();
+    if (this._chat) {
+      this._adoptRead(null, { unread: 0, listGroup: this._chat.archived ? 'archived' : 'read' });
+    }
+    this._placeMarkRead();
+    if (mail) {
+      // The user's own mail is the thread's latest now: whom the next reply
+      // reaches is asked again.
+      this._bumpThread();
+      this._ensurePreview();
+      // A mail that went, but not to everyone: said in the live region too.
+      const refused = addrList(msg.refused);
+      if (refused.length) {
+        this._showNote(`Sent &mdash; but the mail server refused ${esc(refused.join(', '))}.`, 'chat', LONG_NOTE_MS);
       }
-      this._placeMarkRead();
-      if (mail) this._refreshToLine();
-    } catch (err) {
-      // Not sent: take the bubble down, give words and images back to the
-      // composer. The preview object URLs were never revoked, so the staged
-      // images are intact for the retry.
-      const idx = this._messages.indexOf(local);
-      if (idx >= 0) this._messages.splice(idx, 1);
-      const cur = findLocal();
-      if (cur) {
-        const sep = cur.previousElementSibling;
-        cur.remove();
-        // A day separator introduced just for this bubble goes with it (the
-        // sends waiting for approval stay after it).
-        const after = sep && sep.nextElementSibling;
-        if (sep && sep.classList.contains('day-sep') && (!after || after.hasAttribute('data-pending'))) sep.remove();
-      }
-      if (images.length) {
-        this._outImages = images.concat(this._outImages);
-        this._draft = text;
-        this._keepLocal();
-        this._refreshChatComposer();
-      } else {
-        this._restoreComposer(text);
-      }
-      this._showNote(err && err.why ? `Not sent: ${esc(err.why)}`
-        : "Couldn't send &mdash; check the connection and try again.");
-    } finally {
-      if (this._sendingNow === sending) this._sendingNow = null;
-      if (images.length) this._keepImages();
     }
   }
 
@@ -4284,26 +4889,110 @@ class RetinueChatPage extends HTMLElement {
   // The chat is not taken as read here — nothing has gone out yet; the poll
   // brings the server's word on that.
   _queued(local, pending, images) {
-    const idx = this._messages.indexOf(local);
-    if (idx >= 0) this._messages.splice(idx, 1);
-    const node = this._bubbleNode(local.id);
-    if (node) {
-      const sep = node.previousElementSibling;
-      node.remove();
-      if (sep && sep.classList && sep.classList.contains('day-sep')
-        && (!sep.nextElementSibling || sep.nextElementSibling.hasAttribute('data-pending'))) sep.remove();
-    }
-    images.forEach((im) => { try { URL.revokeObjectURL(im.url); } catch (_e) { /* ignore */ } });
+    this._takeDown(local);
+    this._revoke(images);
     this._draftSaved = '';
     this._keepLocal();
     // An answer that names no entry still means queued: the chat's own list
     // of pending sends, fetched now, has it.
     if (pending && typeof pending === 'object') this._addPending(pending, true);
     else this._poll();
-    if (isMail(this._chat)) this._refreshToLine();
+    if (isMail(this._chat)) {
+      this._bumpThread();
+      this._ensurePreview();
+    }
     // Said in the note line too, which is a live region: the bubble alone
     // would appear without a word to someone who cannot see it.
     this._showNote('Queued &mdash; it waits for your approval before it goes out.');
+  }
+
+  // A mail the server took without learning what became of it (202
+  // `{unconfirmed, message_id?, request_key}`: the mail server's answer was
+  // lost, or the gateway did not answer in time). It may have gone out, so
+  // nothing here says it did not: the bubble stays, reading "Sending — not
+  // confirmed yet", and the words are spent like any sent mail's — never
+  // back in the box, where one press would send them a second time. It ends
+  // in one of three ways: the mail shows in the thread and takes the
+  // bubble's place (by its Message-ID, _reconcileUnconfirmed); the server
+  // lists it among the chat's pending sends — being sent, or failed with its
+  // reason — and that bubble takes over (_adoptPending); or the user asks
+  // again (_recheck), which a server that echoed the key answers from what
+  // it knows of this very press.
+  _unconfirmedMail(local, doc, { key, bodyJson, images }) {
+    const messageId = typeof doc.message_id === 'string' ? doc.message_id.slice(0, 998) : '';
+    this._draftSaved = '';
+    this._keepLocal();
+    if (messageId && this._seen.has(messageId)) {
+      // It is in the thread already: confirmed after all.
+      this._takeDown(local);
+      this._revoke(images);
+      return;
+    }
+    const echoed = doc.request_key === key;
+    local.unconfirmed = true;
+    local.recheck = echoed;
+    this._unconfirmed.push({ id: local.id, mail: true, text: local.text, since: '', messageId, key,
+                             body: echoed ? bodyJson : null, images });
+    const node = this._localNode(local);
+    if (node) this._replaceBubble(node, local);
+    this._showNote('Handed over, but not confirmed yet that it went out. There is nothing to send again.',
+      'chat', LONG_NOTE_MS);
+    // The server's own list of what it is still sending, now.
+    this._poll();
+  }
+
+  // The bubble of an unconfirmed mail leaves because something truer takes
+  // its place (the mail itself, the server's pending entry).
+  _dropUnconfirmed(u) {
+    this._unconfirmed = this._unconfirmed.filter((x) => x !== u);
+    const local = this._messages.find((m) => m && m.id === u.id);
+    if (local) this._takeDown(local);
+    this._revoke(u.images);
+  }
+
+  // "Check again" on an unconfirmed mail: the very same request once more,
+  // under the same request_key — which the gateway answers with what became
+  // of the first and never with a second mail. Offered only where the
+  // server echoed the key (it knows of keys at all).
+  async _recheck(id) {
+    const u = this._unconfirmed.find((x) => x.id === id && x.mail);
+    if (!u || !u.body || u.busy) return;
+    u.busy = true;
+    let res = null;
+    let doc = null;
+    try {
+      res = await fetch(`/chats/${encodeURIComponent(this._id)}/send`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: u.body,
+      });
+      try { doc = await res.json(); } catch (_e) { doc = null; }
+    } catch (_e) {
+      res = null;
+    }
+    u.busy = false;
+    const local = this._messages.find((m) => m && m.id === u.id);
+    // Settled meanwhile (the mail came in, the server listed it).
+    if (!this._unconfirmed.includes(u) || !local) return;
+    const answer = doc && typeof doc === 'object' ? doc : null;
+    if (res && res.status === 200 && answer && !answer.unconfirmed) {
+      this._unconfirmed = this._unconfirmed.filter((x) => x !== u);
+      this._sent(local, answer, u.images, true);
+    } else if (res && res.status === 202 && answer && answer.pending && typeof answer.pending === 'object') {
+      this._unconfirmed = this._unconfirmed.filter((x) => x !== u);
+      this._queued(local, answer.pending, u.images);
+    } else if (res && res.status >= 400 && res.status < 500) {
+      // The gateway's word on this press: it did not go, and why.
+      this._dropUnconfirmed(u);
+      this._intoComposer(u.text);
+      this._showNote(`Not sent: ${esc(saidError(answer) || `the server refused it (${res.status}).`)} `
+        + 'The text is back in the box.', 'chat', LONG_NOTE_MS);
+      this._fetchPreview();
+    } else {
+      if (answer && typeof answer.message_id === 'string' && !u.messageId) u.messageId = answer.message_id.slice(0, 998);
+      if (u.messageId && this._seen.has(u.messageId)) this._dropUnconfirmed(u);
+      else this._showNote('Still not confirmed. Nothing was sent a second time.', 'chat', LONG_NOTE_MS);
+    }
   }
 
   _restoreComposer(text) {
@@ -4314,6 +5003,13 @@ class RetinueChatPage extends HTMLElement {
     if (!input) return;
     input.value = text;
     input.dispatchEvent(new Event('input'));
+  }
+
+  // Words into the composer without costing it what it holds: after the
+  // text that is there, on a line of their own.
+  _intoComposer(text) {
+    const cur = this._draft || '';
+    this._restoreComposer(cur.trim() ? `${cur.replace(/\s+$/, '')}\n\n${text}` : text);
   }
 
   // One mirrored message onto the end of the thread. The companion pane has no
@@ -4343,7 +5039,7 @@ class RetinueChatPage extends HTMLElement {
 
   // A transient line above the chat composer. The companion reports its own
   // failures inside the element.
-  _showNote(html, target = 'chat') {
+  _showNote(html, target = 'chat', ms = NOTE_MS) {
     const note = this.shadowRoot.querySelector('[data-note]');
     if (!note) return;
     const thread = '[data-chat-thread]';
@@ -4356,7 +5052,7 @@ class RetinueChatPage extends HTMLElement {
     this._noteTimers[target] = setTimeout(() => {
       note.hidden = true;
       this._scrollThread(thread);
-    }, NOTE_MS);
+    }, ms);
   }
 
   // A chip is a companion turn with a canned prompt over the current draft:
@@ -4575,6 +5271,28 @@ const CSS = `
   .pend-act { color: var(--muted, #8b93a3); }
   .pend-link { font-weight: 600; }
   .pend-link:focus-visible { outline: 2px solid var(--fg, #e7ebf2); outline-offset: 2px; }
+  /* A send that failed, or whose outcome nobody knows: its reason in words,
+     its two controls, and the same outline — in the warning colour where
+     the mail did not go. */
+  .msg.pending.failed .bubble { border-color: #e0716b; }
+  .msg.pending.failed .pend-badge { color: #f0a39e; }
+  .pend-why { margin-top: 4px; font-size: .74rem; color: var(--muted, #8b93a3); overflow-wrap: anywhere; }
+  .pend-act { display: inline-flex; flex-wrap: wrap; gap: 4px 8px; }
+  .pend-btn { font: inherit; font-size: .74rem; font-weight: 600; cursor: pointer; padding: 2px 10px;
+              border-radius: 999px; background: transparent; color: var(--fg, #e7ebf2);
+              border: 1px solid var(--line, rgba(231, 235, 242, .3)); }
+  .pend-btn:hover { border-color: var(--accent, #6ea8fe); }
+  .pend-btn:focus-visible { outline: 2px solid var(--fg, #e7ebf2); outline-offset: 2px; }
+  /* A mail handed over whose outcome is not known yet: the page's own
+     bubble, kept, and marked in words (.pend-state inside it). */
+  .msg.unconfirmed .bubble { opacity: .85; outline: 1px dashed var(--outbound, #f0b45e); outline-offset: 2px; }
+  /* On a filled bubble the state and its control take the bubble's own ink. */
+  .msg.out:not(.pending) .pend-badge { color: inherit; }
+  .msg.out:not(.pending) .pend-btn { color: inherit; border-color: currentColor; }
+  .msg.out:not(.pending) .pend-btn:focus-visible { outline-color: currentColor; }
+  /* Recipients the mail server refused. */
+  .msg-refused { margin-top: 4px; font-size: .74rem; font-weight: 600; overflow-wrap: anywhere; }
+  .msg.pending .msg-refused { color: #f0a39e; }
 
   /* ── Mail: its own subject, the Original, the tombstone ──────────────────── */
   .msg-subj { font-size: .74rem; font-weight: 650; opacity: .8; margin-bottom: 3px;
@@ -4740,6 +5458,15 @@ const CSS = `
              color: var(--outbound, #f0b45e); font-size: .74rem; overflow: hidden;
              white-space: nowrap; text-overflow: ellipsis; }
   .to-line b { font-weight: 650; overflow: hidden; text-overflow: ellipsis; }
+  /* A mail reply's recipients: every one with its address, so the line
+     wraps instead of cutting, and scrolls where there are very many. */
+  .to-line.mail { white-space: normal; overflow: auto; max-height: 6.2em; overflow-wrap: anywhere;
+                  line-height: 1.45; }
+  .to-line.mail b { overflow: visible; }
+  .to-line .addr { opacity: .85; }
+  .to-line .rcp-why { color: var(--fg, #e7ebf2); font-style: italic; }
+  .to-line.wait, .to-line.off { color: var(--muted, #8b93a3); }
+  .to-line.off { color: #f0a39e; }
   /* Reply all / Sender only, under the To/Cc line of a group mail thread. */
   .reply-mode { display: flex; flex-wrap: wrap; gap: 4px 14px; margin: -2px 4px 6px;
                 font-size: .74rem; color: var(--muted, #8b93a3); }
@@ -4796,6 +5523,8 @@ const CSS = `
           cursor: pointer; padding: 0 0 0 2px; background: var(--accent, #6ea8fe);
           color: #0b0d12; -webkit-tap-highlight-color: transparent; }
   .send:active { filter: brightness(1.12); }
+  /* A mail reply that cannot be pressed yet (its recipients are not known). */
+  .send[aria-disabled="true"] { opacity: .45; cursor: not-allowed; }
   /* The inline clear: docked in the field's top-right corner, shown only
      while there is text (see _composerRowHtml for the placement rationale);
      the .has-text padding keeps text from wrapping under it. */

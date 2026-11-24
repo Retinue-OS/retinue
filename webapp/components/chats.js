@@ -191,6 +191,19 @@ export function participantsText(chat) {
 // subject and says nothing else about who wrote. An image message shows a
 // camera mark before any caption; a mail removed in a mail client says so in
 // place of the text it no longer has.
+// What ＋ can start, from GET /chats/compose: `{channel, label, accounts}` per
+// channel whose gateway takes a new conversation.
+function composeOffers(doc) {
+  return (Array.isArray(doc && doc.channels) ? doc.channels : [])
+    .filter((c) => c && typeof c.channel === 'string' && c.channel)
+    .map((c) => ({
+      channel: c.channel,
+      label: typeof c.label === 'string' && c.label.trim() ? c.label.trim()
+        : (CHANNELS[c.channel] || { label: c.channel }).label,
+      accounts: Array.isArray(c.accounts) ? c.accounts.filter((a) => typeof a === 'string' && a) : [],
+    }));
+}
+
 export function previewHtml(chat) {
   const last = chat.last || {};
   const mail = isMail(chat);
@@ -204,8 +217,13 @@ export function previewHtml(chat) {
   const lead = who ? `<span class="pv-who">${esc(who)}:</span> ` : '';
   if (last.removed) return `${lead}<span class="pv-removed">Removed in a mail client</span>`;
   // A send that waits for approval (a new mail that exists only as one, so
-  // far) says so before its words: it has not gone out.
-  if (last.pending) return `${lead}<span class="pv-pending">Waiting for approval:</span> ${esc(last.text || '')}`;
+  // far) says so before its words: it has not gone out. Where the server
+  // says what became of one that was let go (`status`), that is said instead.
+  if (last.pending) {
+    const state = last.status === 'failed' ? (last.outcome_unknown === true ? 'Not confirmed:' : 'Not sent:')
+      : (last.status === 'sending' ? 'Sending:' : 'Waiting for approval:');
+    return `${lead}<span class="pv-pending">${state}</span> ${esc(last.text || '')}`;
+  }
   const img = last.kind === 'image' ? '<span class="pv-img" aria-label="Image">&#128247;</span> ' : '';
   const text = last.text || (last.kind === 'image' ? 'Photo' : '');
   return lead + img + esc(text);
@@ -357,18 +375,34 @@ class RetinueChats extends RetinueCard {
         return;
       }
       if (!res.ok) throw new Error(String(res.status));
-      const doc = await res.json();
-      this._compose = (Array.isArray(doc && doc.channels) ? doc.channels : [])
-        .filter((c) => c && typeof c.channel === 'string' && c.channel)
-        .map((c) => ({
-          channel: c.channel,
-          label: typeof c.label === 'string' && c.label.trim() ? c.label.trim()
-            : (CHANNELS[c.channel] || { label: c.channel }).label,
-          accounts: Array.isArray(c.accounts) ? c.accounts.filter((a) => typeof a === 'string' && a) : [],
-        }));
+      this._compose = composeOffers(await res.json());
       if (this._compose.length && this._data) this.renderState({ state: 'ok', data: this._data });
     } catch (_err) {
       // No ＋ for now; the next refresh asks again.
+    } finally {
+      this._composeBusy = false;
+    }
+  }
+
+  // The mailboxes an offer names are the ones that can send at the moment it
+  // was asked for. As the ＋ is opened they are asked for again, so a mailbox
+  // that was away when the page loaded and has come back can be written from
+  // — a mail the compose sheet kept for it waits for exactly that. Only the
+  // mailboxes of the offers on the menu are taken, in place: the menu under
+  // the user's finger keeps its entries.
+  async _refreshCompose() {
+    if (this._composeBusy || !Array.isArray(this._compose) || !this._compose.length) return;
+    this._composeBusy = true;
+    try {
+      const res = await fetch(COMPOSE_URL, { cache: 'no-store' });
+      if (!res.ok) return;
+      const fresh = composeOffers(await res.json());
+      for (const offer of this._compose) {
+        const now = fresh.find((f) => f.channel === offer.channel);
+        if (now) offer.accounts = now.accounts;
+      }
+    } catch (_err) {
+      // What the page was told before stands.
     } finally {
       this._composeBusy = false;
     }
@@ -397,7 +431,10 @@ class RetinueChats extends RetinueCard {
     if (this._newAway) { this._newAway(); this._newAway = null; }
     const btn = root.querySelector('[data-new]');
     if (!btn) { this._newOpen = false; return; }
-    btn.addEventListener('click', () => this._toggleNew());
+    btn.addEventListener('click', () => {
+      this._toggleNew();
+      if (this._newOpen) this._refreshCompose();
+    });
     root.querySelectorAll('[data-new-offer]').forEach((el) =>
       el.addEventListener('click', () => this._startNew(Number(el.getAttribute('data-new-offer')))));
     if (this._newOpen) this._toggleNew(true);
