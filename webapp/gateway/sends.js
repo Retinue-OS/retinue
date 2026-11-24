@@ -188,8 +188,9 @@
   }
   // The mark of an outcome nobody knows: a question mark in a neutral disc,
   // shaped like the check and the cross. Built by DOM calls and styled
-  // through its style object — the page's stylesheet knows only those two,
-  // and its Content-Security-Policy takes no style from markup.
+  // through its style object — a page rendered before the stylesheet learned
+  // the mark has no rule for it, and its Content-Security-Policy takes no
+  // style from markup.
   function unsureMark() {
     var d = document.createElement('div');
     d.className = 'unsure';
