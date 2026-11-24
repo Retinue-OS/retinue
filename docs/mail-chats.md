@@ -225,9 +225,10 @@ gateway's name can differ: each entry carries its `channel`, and the web
 gateway reads that before it falls back to reading a slug.
 
 `/health` answers `{configured, connected, mode: "inbox", account, error,
-blocked, needs_repair: false, build, backfill: {done, pending, days},
-unmirrored}` — `backfill.days` is the window fixed at the first run,
-`unmirrored` the number of mails that could not be given even a placeholder.
+blocked, needs_repair: false, build, backfill: {done, pending, days}}` —
+`backfill.days` is the window fixed at the first run. `blocked` names what
+holds the mirror when that is not the mailbox: `"policy"` (below) or
+`"mirror"` — it stopped on a fault of its own, and `error` says on what.
 An unconfigured gateway (`configured: false`) idles and is not an outage; so
 does one not opted in — no `MAIL_GATEWAY_TOKEN`, or the default account where
 `MESSENGER_BUILTIN_CHANNELS` is set without `email` — and `error` says which.
@@ -302,29 +303,38 @@ rest. `kb:text` holds at most 256,000 characters (cut with a mark, trim state
 `wanting`; the whole text stays in the body part). Header fields, address
 lists and ids have their own caps, and a mail is decoded only under real
 character sets — never under a codec the sender names. The text of a mail is
-always kept.
+always kept. The work of parsing is bounded too, not only what is built: the
+parser tests every line against the boundary of every multipart around it, so
+a mail may nest 200 levels at most and ask for no more than 50 million such
+tests (lines × levels; under six seconds on Python 3.12, three on 3.13) —
+beyond either it is not parsed to the end.
 
 **A mail that cannot be read is still there.** One mail's failure never stops
-the folder: a mail the gateway cannot parse or store is mirrored as a
+the folder, or the backfill: a mail the gateway cannot read is mirrored as a
 placeholder that says so (with its sender, its time and its header block,
-unchanged in the mailbox); the rare mail that cannot even be that is logged
-and counted on `/health` (`unmirrored`). Both are read again at start and
-every hour (less often each time it changes nothing), and a mail that reads
-now takes its placeholder's place.
+unchanged in the mailbox), at once. It is read again at start and every hour
+(less often each time it changes nothing), and takes its placeholder's place
+when it reads — that mail, and no other: the placeholder's record keeps the
+header block of the copy it was made from, and only a mail with that very
+header block replaces it, wherever it lies by then. A mail that merely
+arrives under a placeholder's `Message-ID` is one more place of the mail on
+record, as a second copy of any mail is; ids are their sender's to choose.
 
-**But a fault of the mirror is not a mail's.** A corrupt index, a bug every
-mail brings out, memory gone for all of them would otherwise turn the mailbox
-into placeholders one mail at a time, with `/health` still `connected`. What
-the mailbox, a disk or an index file raises ends the pass. For anything else
-a mail is set aside only on evidence that the fault is its own: the reader
-refused it on purpose (one of the bounds above), or the mirror mirrored
-another mail whole since this one first failed, or — for one failure, not the
-next in a row — the mail it tried just before. Without that the mail is *in
-doubt*: not recorded, not marked, the folder's mark stays below it, and it is
-read again at every poll, while the mail behind it is still read (one that is
-mirrored vouches for those before it). As long as mails are in doubt and none
-has been mirrored since, `/health` reports `connected: false` and says how
-many.
+**Whose fault a failure is, is decided by what failed.** *Reading* a mail —
+the parse, the walk of its parts, the trim — fails on the mail's account when
+the same reader still reads a known-good mail the gateway carries with it
+(the canary): whatever was raised, one of the bounds above or a recursion or
+memory error among them, the mail is a placeholder and the mirror as healthy
+as it was. *Writing* — the ledger, the indexes, the blobs — never fails on a
+mail's account. A reader that cannot read the canary either, and any failure
+in writing, is a fault of the mirror itself, which must not turn the mailbox
+into placeholders one mail at a time with `/health` still `connected`: the
+pass ends there. No mail is set aside or marked over it, and no folder's mark
+moves past a mail that has neither a record nor a place — so the next pass
+reads it again, after a restart too, and if it has left for the archive by
+then it is read there, as a mail that came and went. `/health` reports
+`connected: false` with `blocked: "mirror"` meanwhile, and `error` says on
+what — naming the mail, where the pass stopped at one.
 
 A record's time is the earlier of the mail's `Date` and the server's arrival
 time, never the future, so a forged date cannot pin a mail to the head of its

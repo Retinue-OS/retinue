@@ -602,7 +602,11 @@ provider. The connection monitor words its notices for this case
 (`scripts/gateway-monitor.py`, `WORDING`). One reason is not the mailbox's at
 all: the mirror waiting for the e-mail policy file (`blocked: "policy"` in
 `/health`, above) — the card shows that reason, and the monitor's notice and
-reminders say "waiting for its setup" with it, never "check the login".
+reminders say "waiting for its setup" with it, never "check the login". Nor
+is a mirror that stopped on a fault of its own (`blocked: "mirror"` — it
+cannot read or write mail: a corrupt index, a full disk, a bug): the notice
+says "stopped on a fault of its own", with the gateway's reason, and the
+gateway's log has the rest.
 Unconfigured (`configured: false`) is intentional, never an outage.
 
 **A named account** (`EMAIL_USER_ARI`, …) is one more gateway: a service that
@@ -650,8 +654,14 @@ instead — the server refused the login or cannot be reached — and asks for
 no QR scan: there is no phone to re-pair (`gateway-monitor.py` words each
 notice by the registry entry's channel). A gateway whose `/health` names
 what holds it when that is not its link (`blocked` — the mail mirror waiting
-for the e-mail policy file) is reported as waiting for its setup, with the
-gateway's own reason in the notice and in every reminder. Recovery is reported in the same thread. So: do **not**
+for the e-mail policy file) is reported as waiting for its setup, and one
+that names itself (`blocked: "mirror"`) as stopped on a fault of its own —
+with the gateway's own reason in the notice and in every reminder. An outage
+that turns into one of another kind (the gateway that waited for its setup
+now cannot log in) is told in the same thread once as many checks in a row
+have seen it as open an outage (`GATEWAY_MONITOR_FAILURES`), in the new
+kind's words and with its reason, not at the next reminder. Recovery is
+reported in the same thread. So: do **not**
 build ad-hoc liveness checks for these channels; if a user reports a channel
 seems dead, check `/gateways` (or the gateways' `/health`) first, and treat a
 `SIGNAL_SEND_POLICY`-style unconfigured channel (`configured: false`) as
