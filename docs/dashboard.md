@@ -1056,6 +1056,10 @@ for the tabs. (`group` on a chat is the boolean "a group chat", as before.)
   (`POST /chats/<id>/read {restore, marked}`) puts the read mark back only if
   nothing has moved it since — a reply sent in between stands — and reopens
   the item only if that mark is what settled it.
+- A mark, a reply and an archive are passed on to the chat's gateway, where a
+  channel with a mailbox behind it follows (the thread's mails seen, or moved
+  out of the inbox); the undo and an un-archive are not. See "Writing mail",
+  *The mailbox follows the chat*.
 
 The derivation, the endpoint's request and answer shapes, and what the store
 being away does to the counts are in
@@ -1067,8 +1071,11 @@ A mail thread is a chat like any other — the same list, page, state document
 and companion ([mail-chats.md](mail-chats.md) is the design; this is what the
 web gateway serves of it). The channel is `email`, the chat key the thread
 root's `Message-ID`, the account the mailbox address:
-`email:~<account>:<message-id>`. In its first phase the mirror is
-**read-only**: nothing is written to the mailbox and nothing is sent.
+`email:~<account>:<message-id>`. The mirror reads the mailbox, and since the
+writing phase the chat writes to it: replies and new mail leave from here
+under the e-mail send policy, and the mailbox follows what the user does to
+the chat ("Writing mail" below). What is still to come is the gate: no mail
+pushes or starts a turn yet, and e-mail triage runs beside the mirror.
 
 **Routing.** The mail gateway's service is `mail-gateway` and its channel
 `email`, which no reading of the slug says, so a registry entry may state its
@@ -1180,13 +1187,17 @@ document of its own: see "The frame on the chat page" under "The
 Content-Security-Policy". Each text part is read up to
 `MAIL_ORIGINAL_MAX_BYTES` (4 MiB).
 
-**Read-only.** The chat summary of a mail chat says `can_send: false` with
-`cannot_send_reason`, and `POST /chats/<id>/send`, `/draft`, `/draft/undo`,
-`/delete` and the agents' `/internal/chats/<id>/draft` answer `409` with that
-sentence and `read_only: true`. One constant in the gateway
-(`MAIL_READ_ONLY_REASON`) is all of it; the writing phase removes it. What is
-state alone works: *Mark as read*, the flags, the contact card, the
-companion.
+**`can_send`.** A mail chat's summary says whether it can be written to:
+`can_send: true`, or `false` with `cannot_send_reason`, one sentence saying
+which it is — no mail gateway is set up for the thread's mailbox, the mail
+gateway is not answering, or it is not connected to its mailbox. It is read
+from what the gateway last reported on `/health` (cached like its identity;
+a gateway that said "not connected" is asked again within seconds), so the
+list costs no request per chat. It is advice for the page: the send itself
+asks the gateway and answers what it says. No other channel's chat carries
+the field. The shared draft works for a mail chat as for any — the user's
+(`/draft`, `/draft/undo`) and an agent's (`/internal/chats/<id>/draft`,
+`chat-draft.py`).
 
 **The rail.** `POST /internal/chats/inbound` takes five more fields for a
 mail (`scripts/chat_ingest.py`): `subject` (this mail's own), `participants`
@@ -1235,14 +1246,148 @@ is then about the chat that one is part of now.
 **The companion.** A mail thread's note names the thread by its id where it
 gives instructions and carries the subject and the participants as data, in
 a block beside the mails — a subject is the first thing a stranger writes.
-It says the texts are the trimmed ones, lists attachments by type under the
-rule in "Attachments", and while the mirror is read-only ends in what the
-companion can do — read, discuss, open an ordinary conversation for a matter
-of its own — in place of the draft and send paragraphs. It names no send
-tool.
+It says the texts are the trimmed ones and lists attachments by type under
+the rule in "Attachments". Then the draft, as in every chat's note: what the
+shared draft holds, that the `secretary` writes the words, and the
+`chat-draft.py` command that stages them. Where a messenger chat's note ends
+in "you do not send, under any circumstances", a mail thread's says how a
+mail leaves it: by the user's press on the draft, or — only when the user
+asks for it there — through `scripts/mail-push.py --chat <id> --reply
+all|sender --file <path>`, under the mailbox's send policy, with
+`--user-approved` only on the user's word for that text, the approval link
+of a queued send relayed, and no other tool (not `email_client.py send` or
+`reply`, not a messenger's push script). It says that the quick patterns'
+words — the last message, the draft, the composer — mean the thread's mails
+and its shared draft, and how many sends of the thread already wait for
+approval, so a turn does not queue one twice.
 
 `tests/test_chat_mail.py` covers all of the above against real ledger
 records.
+
+### Writing mail
+
+[mail-chats.md](mail-chats.md), "Writing", is the contract; this is the web
+gateway's side of it. `tests/test_chat_mail_send.py` covers it against a mock
+mail gateway.
+
+**A reply** is `POST /chats/<id>/send`, as on every chat, with one more
+field: `reply`, `"all"` or `"sender"` (optional; the gateway's default is
+all). The gateway is handed `{recipient: <chat key>, reply, message, author:
+"user", user_approved: true}` and builds the mail from its own records of
+the thread — this side names no recipient and no subject.
+
+**The send press is not the approval here.** On the messengers a send the
+policy queues is released by the web gateway in the same request: the press
+*is* the approval `verify` exists for. On e-mail it is not
+(mail-chats.md, Decisions). The press is passed on as `user_approved`, which
+is what `trust` asks for; under `verify` the mail is queued even though the
+user typed it, and the web gateway leaves it queued — it never calls
+`approve` for a mail. So the endpoint has two answers:
+
+- **sent** → `200` and the Message, as on every chat: the overlay has it,
+  the draft is cleared, the chat is read, its attention item settled;
+- **queued** → `202 {"pending": Pending}`. The draft is cleared — the words
+  are in the queue — and nothing else moves: no reply has been made, so the
+  chat is not read and its attention item stands.
+
+```json
+Pending = {"request_id": "…", "approval_url": "/sends/mail-gateway/<id>",
+           "text": "…", "ts": "…", "author": "user" | "agent",
+           "to": ["a@x.org"], "cc": [], "subject": "Re: …",
+           "message_id": "<the Message-ID the mail will go out under>"}
+```
+
+`approval_url` is the path of this dashboard's own approval page, built here
+from the gateway's registry slug and the request id. What a gateway states
+as its approval URL (absolute, where `SEND_APPROVAL_BASE_URL` is set) is
+never passed on, and the chat state keeps a queued send only with a link of
+exactly that form (`chat_state.clean_pending`).
+
+**Pending sends in the chat.** `GET /chats/<id>/messages` carries top-level
+`pending`: every queued send of that chat, whoever queued it — the composer,
+the companion, an agent with `mail-push.py` — oldest first; `[]` on every
+other channel. A chat's entry in `GET /chats` carries the count as `pending`.
+The gateway's queue is the truth (`GET <gateway>/pending-sends?chat=<key>`);
+the chat's state keeps a copy for the list and for when the gateway is away,
+and the copy follows the queue from three sides:
+
+- the chat page's poll asks the gateway about its chat and brings the copy in
+  line (a gateway that could not answer is left alone for
+  `CHAT_PENDING_RETRY_SECONDS`, 15, and the copy stands in);
+- the chat list has every mail gateway's whole queue read in the background,
+  at most every `CHAT_PENDING_SYNC_SECONDS` (20) — so a send queued past the
+  dashboard shows in the list without its chat being opened;
+- a decision on `/sends` takes the entry out at once, and so does the rail's
+  word that the mail went out (an outbound event under the queued send's
+  `Message-ID`).
+
+A send whose mail is among the page's messages is never also listed as
+pending, whatever a queue that lags says.
+
+**A new mail that is only queued is listed.** The `Message-ID` that keys a
+new thread is minted when the send is accepted, so a queued new mail has its
+chat id before any mail exists. Such a chat is in no ledger; its state — the
+copy of the queued send — lists it: `last` is that send
+(`{direction: "out", text, author, pending: true}`), `list_group` is
+`"read"`, its name is the subject and its participants are who the mail is
+to. Allowed, it is a chat of messages; denied or retracted, it is no longer
+listed.
+
+**On `/sends`.** The mail gateway is a registry gateway, so its queue is on
+`/sends` with every other: listed by the mail's subject and its recipients,
+and the approval card shows *From* (the mailbox), *To*, *Cc*, *Subject*, the
+category, the names of attached files and the text — the recipients in full,
+since a reply's are built from the thread and nobody typed them. A queue
+entry is addressed by the gateway's registry slug whatever it says its own
+account is. A decision there is in the chat on its next poll: the entry
+leaves `pending`, and a mail that was allowed appears as a message. The note
+a decision leaves in the dashboard thread that queued the send names such a
+mail by the addresses it goes to and nothing else — that note is replayed to
+Ara's sessions as her own words, and a reply's subject and its recipients'
+display names are a stranger's.
+
+**A new mail.** `GET /chats/compose` answers what the ＋ of the Chats page
+can offer: `{"channels": [{"channel": "email", "label": "E-mail",
+"accounts": ["me@example.org"]}]}` — a channel for each whose gateway takes a
+new conversation (today e-mail), with the mailboxes whose gateway is up; no
+such gateway, no entry. `POST /chats/compose`
+`{channel: "email", account?, to: [...], cc?: [...], subject, text}` hands
+the mail to that mailbox's gateway (`account` is needed only where several
+are mirrored) under the same policy as a reply, and answers
+`200 {id, message}` or `202 {id, pending}` with the new chat's id. It is the
+user's own act and gated like a send: same-origin only, and only through the
+reverse proxy. Recipients are passed on as the strings that were typed — the
+gateway parses them and its `400` for one that is no address is passed back
+— each one line; the subject is collapsed to one line before it leaves.
+
+**The mailbox follows the chat.** After the chat's state has changed, its
+gateway is told, each call `{chat, account}`:
+
+| In the chat | Call |
+|---|---|
+| *Mark as read* that leaves nothing unread; a reply, from here or from anywhere the rail sees | `POST <gateway>/chats/read` |
+| `archived: true` (muting archives) | `POST <gateway>/chats/archive` |
+| the undo of a mark, un-archive, a star | nothing |
+
+The hooks are generic: the call goes to the chat's own gateway on every
+channel, and a gateway that answers `404` or `501` has no mailbox — no error,
+and it is not asked again for `MAILBOX_NONE_SECONDS` (600). They never block
+and never fail the user's action: the call runs on a thread of its own after
+the state is written. The chat's state is the truth; a call that failed is
+logged and owed, and made again when the next hook call to that gateway goes
+through — unless it no longer says what the chat says (the user un-archived,
+undid the mark, or new mail has landed since: both calls are about the whole
+thread). Owed calls are in memory only. A *Mark as read* that leaves mail
+unread (a `{ts}` mark a newer mail outran) calls nothing, for the same
+reason.
+
+**Delete** is no hook. `POST /chats/<id>/delete` asks the thread's own
+gateway — the one that serves its mailbox, and no other mail gateway — with
+the erase capability (`CHAT_ERASE_TOKEN`), and that gateway moves the
+thread's mails to the Trash before it erases its mirror. Only when it
+answers that all of it is done (`errors: 0`) does the web gateway erase its
+own state, the copy of the queued sends and the companion; otherwise the
+answer is `502` and the chat is as it was. The report carries `trashed`.
 
 ## Archived, muted, starred, deleted
 

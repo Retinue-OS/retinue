@@ -49,6 +49,8 @@ SCRIPTS_DIR = REPO_ROOT / "scripts"
 
 CHAT = "signal:+41794456312"
 GW_SEEN: list = []
+# What the gateway was asked besides a send: (path, body).
+GW_OTHER: list = []
 
 
 class _MockGateway(BaseHTTPRequestHandler):
@@ -76,6 +78,13 @@ class _MockGateway(BaseHTTPRequestHandler):
     def do_POST(self):
         length = int(self.headers.get("Content-Length", 0))
         payload = json.loads(self.rfile.read(length).decode("utf-8"))
+        if self.path.rstrip("/") != "/send":
+            # As every messenger gateway answers a route it does not have —
+            # the mailbox hooks among them (POST /chats/read after a reply):
+            # a messenger has no mailbox, and says so.
+            GW_OTHER.append((self.path, payload))
+            self._json(404, {"error": "not found"})
+            return
         GW_SEEN.append(payload)
         self._json(200, {"status": "sent", "message_id": "1", "ts": 1756000000.0})
 
@@ -280,6 +289,13 @@ def test_dashboard_send_still_works(base, wg):
     # carries nothing that asks the gateway to skip its policy.
     assert sent["author"] == "user", sent
     assert "edge_verified" not in sent and "user_approved" not in sent, sent
+    # A reply is passed on to the chat's gateway as "read" (the mailbox
+    # hook, generic by contract). A messenger gateway has no such route:
+    # its 404 is no error, the send stands, and it is not asked again for a
+    # while.
+    wg._mailbox_wait()
+    assert GW_OTHER == [("/chats/read", {"chat": "+41794456312", "account": ""})], GW_OTHER
+    assert not wg._mailbox_owed, "a gateway without a mailbox is owed nothing"
     print("PASS test_dashboard_send_still_works")
 
 
@@ -313,9 +329,20 @@ def test_another_sites_request_is_refused(base, wg):
         status, body = _http(base, "POST", f"/chats/{_quote(CHAT)}/send",
                              {"text": "geht raus"}, {"Sec-Fetch-Site": "same-origin"})
         assert status == 200, (status, body)
+        # Starting a conversation is the user's own act too.
+        compose = {"channel": "email", "to": ["a@x.org"], "subject": "s", "text": "t"}
+        status, body = _http(base, "POST", "/chats/compose", compose,
+                             {"Sec-Fetch-Site": "cross-site"})
+        assert status == 403 and json.loads(body)["error"] == "cross-site request rejected", body
     finally:
         wg._EDGE_PEER_NETS = saved
+    # ... and, like a send, only through the reverse proxy.
+    status, body = _http(base, "POST", "/chats/compose", compose)
+    assert status == 403 and "reverse proxy" in json.loads(body)["error"], (status, body)
     assert len(GW_SEEN) == 1, GW_SEEN
+    # The second reply's hook found the gateway known to have no mailbox.
+    wg._mailbox_wait()
+    assert len(GW_OTHER) == 1, GW_OTHER
     print("PASS test_another_sites_request_is_refused")
 
 

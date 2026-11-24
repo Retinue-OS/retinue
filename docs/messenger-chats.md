@@ -286,6 +286,10 @@ persistent volume — high-churn disposable data, the news-store precedent):
 - `summary`, `summary_watermark` — the rolling summary and the timestamp up to
   which it has folded both rails;
 - `companion` — the companion thread's conversation id, once created;
+- `pending` — a copy of the sends of this chat that wait in its gateway's
+  queue for approval (a mail chat's only; see *Trust model*, "E-mail"). The
+  gateway's queue is the truth and the copy follows it; it is what the chat
+  list counts from and what the chat page shows while the gateway is away;
 - display metadata (resolved name, group flag) cached from the gateway.
 
 Beside the documents sits one small index, `merged/into.json`: which chat ids
@@ -320,6 +324,26 @@ that agent sessions do not inherit (unlike the `*_GATEWAY_TOKEN`s they send
 with). Without it configured, deletion is refused. The
 dashboard's Archived tab is where the action lives (swipe left → Delete, two
 taps).
+
+A **mail thread** is deleted by the same call, which means more to its
+gateway ([mail-chats.md](mail-chats.md), "The mailbox follows the chat"):
+the thread's mails are moved to the mailbox's Trash — nothing is expunged —
+and only then is the mirror erased, the thread's queued sends with it; a
+move that failed is reported like a file that could not be erased, and
+nothing is. Only the gateway that serves the thread's mailbox is asked: a
+mail ledger, its mailbox and its queue are per account. The order is the
+same on both sides — the web-gateway erases its state, its copy of the
+queued sends and the companion only after that gateway has answered that all
+of it is done.
+
+**The mailbox follows the chat** in two more ways, which are not erasures and
+need no capability: a read mark or a reply is passed on to the chat's gateway
+as `POST /chats/read`, an archive as `POST /chats/archive`, each
+`{chat, account}`. Generic by contract — the call goes to the chat's own
+gateway on every channel, and one with no mailbox behind it answers 404 (the
+messenger gateways do) and is owed nothing. Best-effort, after the state
+change and never part of it; the undo of a mark and an un-archive call
+nothing. The mechanics are in [dashboard.md](dashboard.md), "Writing mail".
 
 ### Unread · Read · Archived
 
@@ -802,6 +826,21 @@ the chat surface maps onto them rather than around them:
   user-send path, origins recorded on every outbound message) and adds no new
   bypass.
 
+**E-mail** is the one channel where the first point does not hold
+([mail-chats.md](mail-chats.md), Decisions): a send from the composer goes
+through `EMAIL_SEND_POLICY` like anyone's. The press is passed to the mail
+gateway as `user_approved`, so under `trust` and `allow` it sends; under
+`verify` the mail is queued although the user typed it, and the web-gateway
+does not release it — `_chat_send_via_gateway` approves a queued send for
+the messengers only. The send answers `202` with the pending send, the chat
+shows it as a pending bubble with its approval link, and `/sends` is where
+it is allowed, with recipients, subject and text on one card. So for mail
+the draft area does not replace `/sends`; the two meet in the chat, which
+lists every queued send of its thread whoever queued it. The companion of a
+mail thread stages drafts like any companion and, unlike a messenger chat's,
+has a send path that is the thread's own: `scripts/mail-push.py`, under the
+same policy, when the user asks for it there.
+
 ## What this replaces, what it keeps
 
 **Replaced:** per-message dashboard conversations for messenger traffic; the
@@ -816,9 +855,10 @@ the conversation concept, dashboard, and push machinery for everything that is
 not a messenger chat; e-mail triage in full (pull channel, own flow — it can
 adopt this pattern later, but nothing here depends on it). *It since has:*
 [mail-chats.md](mail-chats.md) mirrors the mailbox into this same ledger and
-shows a mail thread as a chat. Its first phase is a read-only mirror beside
-which e-mail triage keeps running untouched; a later one retires triage for
-mail.
+shows a mail thread as a chat. Replies and new mail leave from the chat
+surface under the e-mail send policy, and the mailbox follows the chat
+(read, archive, delete). E-mail triage keeps running beside the mirror until
+the phase that gives mail the gate retires it.
 
 **Converges with:** issue #130 — the message-id plumbing is shared, and the
 chat page is the missing answer to where reactions and quoted replies surface.
@@ -869,7 +909,9 @@ serving logic, `webapp/`, `scripts/`). Phases 1–4 have shipped.
 4. **Pending sends in the mirror.** A `verify`-queued push-CLI send targeting a
    chat is invisible on the chat page until approved; showing it as a
    pending bubble (approvable in place) would fold `/sends` into the chat for
-   those too. Deferred to phase 6.
+   those too. Deferred to phase 6. *Built for e-mail:* a mail chat lists its
+   queued sends (`pending` on `GET /chats/<id>/messages`), each with the link
+   to its approval page; the messengers' chats do not yet.
 5. **SMS.** Resolved: `sms-gateway` (opt-in, `sms` compose profile) writes
    the same store shape, so SMS chats appear here with no serving-code change —
    as this design predicted. See `docs/messaging.md`, "SMS".
