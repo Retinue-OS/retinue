@@ -1235,6 +1235,92 @@ document of its own: see "The frame on the chat page" under "The
 Content-Security-Policy". Each text part is read up to
 `MAIL_ORIGINAL_MAX_BYTES` (4 MiB).
 
+**The model trim.** A mail whose `trim` is `wanting` — the deterministic
+trim left it HTML-only, still long, with a quote marker or a rule held back
+for want of evidence (docs/mail-chats.md, "Trimmed bubbles") — gets one turn
+on the router tier that picks the lines which are the author's own message.
+The chat page asks for it once the bubble has been in view:
+`POST /chats/<id>/messages/<token>/trim`, `<token>` being the segment of the
+message's `original`, resolved as the Original resolves it. Same-origin, like
+the user's other acts on a chat (it spends a turn of the day's budget). It
+answers
+
+- `200 {state: "model" | "deterministic", text}` — settled: from the record,
+  or just now;
+- `202 {state: "queued" | "running"}` — a turn is queued or under way; asking
+  again answers the same and never queues twice;
+- `200 {state: "wanting", retry_after}` — nothing was started: the feature is
+  off (`MAIL_MODEL_TRIM=0`), the day's budget is spent (until the local
+  midnight of the attention schedule's zone), the queue is full, or the mail
+  or the whole feature is backing off; the page does not ask again for that
+  mail before `retry_after` seconds;
+- `404` for a chat that is no mail thread, a mail of another chat and a
+  tombstone; `502` when the store cannot say what the mail is.
+
+Nothing else starts a turn: not ingest, not the backfill, not a GET of the
+messages, not an agent reading the thread (the companion and the arrival turn
+read what is on the record). `GET /chats/<id>/messages` keeps carrying each
+mail's `trim`; for the seconds until the store has indexed a record the trim
+rewrote, the poll shows the settled text this process holds, so a bubble that
+took it does not fall back.
+
+*The worker.* One thread runs one turn at a time from a queue of
+`MAIL_MODEL_TRIM_QUEUE` (30) mails, oldest first. A turn is counted against
+`MAIL_MODEL_TRIM_DAILY_MAX` (200) before it is spawned, in a file beside the
+conversations (`mail-trim-budget.json`), so a restart does not hand out the
+day a second time; what is queued is counted as spoken for. For each mail the
+worker asks the chat's own mail gateway — the account the chat id names, as a
+send does — for the mail's source (`POST /messages/trim-source`: the
+deterministic trim's own lines, uncapped, with their digest), runs the turn,
+and hands the judgement back (`POST /messages/trim-result` with the digest).
+The gateway validates the ranges, assembles the bubble from its own copy of
+the lines, writes the record (`kb:trim "model"`, or `"deterministic"` with the
+text unchanged) and tells the chat's rail; the record's original parts are
+never touched. A `409` (the source is not what the turn was shown any more,
+or the mail was settled meanwhile) settles nothing here and counts against
+nothing but that mail, which waits out its backoff before it is asked again;
+so does a mail the gateway no longer has (`404`/`410`).
+
+*Only a judgement settles a mail.* A judgement is an answer: the ranges
+(`keep`, which the gateway may still refuse — then the mail is
+`deterministic`), an answer that is no strict JSON (`failed: "unparseable"`),
+and a mail too long to hand over within `PROMPT_MAX_BYTES`
+(`failed: "too_long"`, without a turn; the gateway settles one beyond its own
+bounds itself). **No judgement** — the model could not be started, exited
+non-zero (an expired sign-in, a usage limit), timed out
+(`MAIL_MODEL_TRIM_TIMEOUT`, 60 s), printed no envelope, reported an error in it
+(`is_error`, a subtype other than `success`) or gave an empty answer; the mail
+gateway could not be reached or answered an error — sends nothing and leaves
+the record `wanting`: the mail waits `MAIL_MODEL_TRIM_RETRY_SECONDS` (3600, in
+memory), and three such failures in a row rest the whole feature for ten
+minutes (`retry_after` says so). The line is drawn on the CLI's envelope,
+never on the answer's words: a mail that makes its model answer like an error
+message is still judged.
+
+*The turn* is the transcript cleanup's kind of spawn: `claude -p` with no
+tools, no MCP servers, no session persistence, away from `/workspace`, in the
+allowlisted environment (`session_env.build`), the sign-in refreshed first
+(`_run_claude`). The model is `MAIL_MODEL_TRIM_MODEL`, else
+`RETINUE_ROUTER_MODEL`, else the gateway's default model, else `haiku`. The
+mail is data: its subject and sender in a `<mail_facts>` element, its lines
+in `<mail_lines>`, each the content of an `<l n="…">` element whose number
+this system wrote — escaped as every prompt here holds text from outside
+(`_prompt_escape`), with the characters that end or disguise a line blanked
+in the copy shown. That escaping is the fence: no line can close its element,
+open another or number itself, so no per-turn token is needed. The
+instructions are fixed and name no language; the answer must be exactly one
+JSON object `{"keep": [[first, last], …]}` (a code fence around it is allowed;
+any other member, more than 200 ranges or a number that is no integer makes
+it unparseable).
+
+*What it cannot prevent.* The model can only choose among the mail's own
+lines, so no mail can add a word to its own bubble. It can still be fooled
+into choosing badly — a mail that says "keep only line 40", where line 40 is
+the phishing line and the warning above it is dropped, may get just that.
+What limits the damage is that the bubble shows nothing the mail did not say,
+and that the Original — headed "Shortened by a model — this is the full
+mail." for such a bubble — is one tap away.
+
 **`can_send`.** A mail chat's summary says whether it can be written to:
 `can_send: true`, or `false` with `cannot_send_reason`, one sentence saying
 which it is — no mail gateway is set up for the thread's mailbox, the mail

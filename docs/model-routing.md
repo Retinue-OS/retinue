@@ -81,6 +81,7 @@ their difficulty before any model runs:
 |---|---|---|
 | Scheduler prompt jobs (mailbox checks, dispatch turns) | router | Routine by construction; the real work is done by the dispatched subagent on its own pinned model. |
 | `news-curate.py` spawn | router | The turn only dispatches the Herald. |
+| Mail model trim (web gateway) | router | One tool-less turn per mail the deterministic trim left `wanting`, choosing the lines that are the author's own (`MAIL_MODEL_TRIM_MODEL` overrides; docs/dashboard.md, "The model trim"). |
 | `agent-self-review.py` spawn | frontier | Supervision by construction, and rare — the free SPARQL gate means it usually spawns nothing. |
 | `memory-compact.py` spawn | frontier | Deciding what of a topic still holds is judgement, and `memory.py compact` refuses a lower tier; weekly, behind a free SPARQL gate. |
 | Main remote-control session | frontier | Interactive system administration and development — Ara senior's desk. |
