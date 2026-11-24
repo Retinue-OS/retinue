@@ -17,11 +17,19 @@ scripted fetch, a fake IntersectionObserver and a fake clock, and pins:
     page life; an answer `wanting` names when it may be asked again
     (`retry_after`, clamped; a default where it names none), no answer (a
     5xx, offline) a minute;
+  * not under one of the page's full-screen layers (the lightbox, the
+    attention sheet, a modal), and the dwell starts again when the page
+    comes back — hidden and shown, from the back-forward cache, or thawed
+    from a freeze in which no timer ran;
   * the answers: 200 settled replaces the text in place, held over a poll
     that read the record before the settle; 202 shows "Tidying up…" (the
     page's own words, never the server's) until a poll shows the record
-    settled, or for two minutes at most; an older server (404/405) switches
-    the feature off quietly for the page's life; 410 follows a merge;
+    settled, or for two minutes at most — put into the bubble's own node
+    and taken out of it, never a bubble drawn anew, and nothing at all
+    while its Original is open; an older server (405, 501, a 404 that is
+    not the endpoint's) switches the feature off quietly for the page's
+    life, while the endpoint's own 404 or 410 ends that one mail; 410
+    follows a merge;
   * the observer lets go of a bubble that left the DOM or was re-rendered,
     of every bubble on a chat switch and when the element goes, and an
     answer that comes back after a switch touches nothing;
@@ -49,7 +57,9 @@ import assert from 'node:assert/strict';
 
 // ── A fake clock ─────────────────────────────────────────────────────────────
 // Every timeout the page sets waits for advance(); the poll's interval is
-// cleared by open(). Date.now() is the clock's.
+// cleared by open(). Date.now() is the clock's; `clock += ms` alone is a page
+// frozen that long (no timer runs), and a timer overdue then runs at the
+// time it is run, not at the time it was due.
 const realSetTimeout = globalThis.setTimeout;
 let clock = Date.parse('2026-11-24T10:00:00Z');
 Date.now = () => clock;
@@ -72,7 +82,7 @@ async function advance(ms) {
     const t = timers[0];
     if (!t || t.at > end) break;
     timers.shift();
-    clock = t.at;
+    clock = Math.max(clock, t.at);
     t.fn();
     await settle();
   }
@@ -134,6 +144,7 @@ class Node {
     this.height = heightOf(html);
     this._slot = null;
     this._toggle = null;
+    this.edits = 0;
   }
   getAttribute(n) { return n === 'data-mid' ? this.mid : null; }
   hasAttribute() { return false; }
@@ -142,7 +153,25 @@ class Node {
   focus() { document.activeElement = this; }
   get isConnected() { return !!this.thread && this.thread.nodes.includes(this); }
   getBoundingClientRect() { return this.thread.rectOf(this); }
+  // The bubble's own HTML changed in place (an element put in or taken out).
+  edit(html) { this.html = html; this.height = heightOf(html); this.edits += 1; }
   querySelector(sel) {
+    // The status line, and what it goes in before: the bubble's own children.
+    if (sel === '.trim-state') {
+      const at = this.html.indexOf(TIDY);
+      return at < 0 ? null : { remove: () => this.edit(this.html.slice(0, at) + this.html.slice(at + TIDY.length)) };
+    }
+    if (sel === '.pend-state, .msg-refused, .orig-bar') {
+      const at = Math.min(...['pend-state', 'msg-refused', 'orig-bar']
+        .map((c) => this.html.indexOf(`<div class="${c}"`)).filter((i) => i >= 0));
+      if (!Number.isFinite(at)) return null;
+      return {
+        insertAdjacentHTML: (where, h) => {
+          assert.equal(where, 'beforebegin');
+          this.edit(this.html.slice(0, at) + h + this.html.slice(at));
+        },
+      };
+    }
     if (sel === '[data-orig-frame]') {
       return this.html.includes('data-orig-frame') ? (this._slot = this._slot || new Slot()) : null;
     }
@@ -206,10 +235,21 @@ class FakeElement {
   querySelectorAll() { return []; }
   get isConnected() { return true; }
 }
+// What the page listens for on the document and the window, so a test can say
+// the page was hidden, shown, or shown again from the back-forward cache.
+const heard = { document: [], window: [] };
+const listen = (where) => ({
+  addEventListener(type, fn) { heard[where].push({ type, fn }); },
+  removeEventListener(type, fn) { heard[where] = heard[where].filter((l) => !(l.type === type && l.fn === fn)); },
+});
+const emit = (where, type, ev = {}) => {
+  for (const l of [...heard[where]]) if (l.type === type) l.fn({ type, ...ev });
+};
 globalThis.HTMLElement = FakeElement;
 globalThis.customElements = { define: (n, c) => registry.set(n, c), get: (n) => registry.get(n) };
+const layers = new Set();
 globalThis.document = {
-  addEventListener() {}, removeEventListener() {},
+  ...listen('document'),
   createElement: (tag) => {
     if (tag === 'iframe') return new Frame();
     if (tag === 'template') {
@@ -222,7 +262,12 @@ globalThis.document = {
     }
     return new FakeElement();
   },
-  querySelector() { return null; }, getElementById() { return null; },
+  // A full-screen layer of the document's (the attention sheet) is up
+  // while `layers` holds its selector.
+  querySelector(sel) {
+    return [...layers].some((l) => String(sel).split(',').map((x) => x.trim()).includes(l)) ? {} : null;
+  },
+  getElementById() { return null; },
   hidden: false, visibilityState: 'visible', body: { appendChild() {} },
   documentElement: { dataset: {} }, title: 'Retinue — Chat', activeElement: null,
 };
@@ -231,8 +276,8 @@ globalThis.innerHeight = 800;
 const replaced = [];
 globalThis.location = { hash: '', pathname: '/chat.html', search: '', href: 'http://dash/chat.html',
                         origin: 'http://dash', replace: (u) => replaced.push(String(u)) };
-globalThis.addEventListener = () => {};
-globalThis.removeEventListener = () => {};
+globalThis.addEventListener = listen('window').addEventListener;
+globalThis.removeEventListener = listen('window').removeEventListener;
 globalThis.dispatchEvent = () => true;
 globalThis.history = { length: 1, pushState() {}, replaceState() {}, back() {} };
 globalThis.matchMedia = () => ({ matches: false, addEventListener() {}, removeEventListener() {}, addListener() {}, removeListener() {} });
@@ -269,6 +314,8 @@ globalThis.fetch = (url, init = {}) => {
   log.push(req);
   return new Promise((resolve, reject) => {
     req.answer = (doc, status = 200) => resolve({ ok: status < 400, status, json: async () => doc });
+    // An answer with no JSON body (a proxy's page, an empty 404).
+    req.answerRaw = (status) => resolve({ ok: status < 400, status, json: async () => { throw new SyntaxError('no JSON'); } });
     req.fail = () => reject(new TypeError('offline'));
     wire.push(req);
   });
@@ -343,6 +390,9 @@ async function open(chat = {}, messages = BASE) {
   timers.length = 0;
   observers.length = 0;
   replaced.length = 0;
+  heard.document = [];
+  heard.window = [];
+  layers.clear();
   renders = 0;
   document.hidden = false;
   document.activeElement = null;
@@ -374,6 +424,11 @@ async function ask(el, mid = 'w1', url = trimOf(`t${mid}`)) {
   return take((w) => w.method === 'POST' && w.url === url, `the trim request of ${mid}`);
 }
 const TIDY = '<div class="trim-state" role="status">Tidying up&#8230;</div>';
+// A mail's Original as the endpoint answers it.
+const DOC = (tok) => ({
+  id: 'x', headers: { from: 'Ann <ann@example.com>', subject: 'Quarterly numbers' }, header_block: 'From: Ann',
+  text: 'Full text', html_url: `${orig(tok)}.html`, attachments: [],
+});
 
 // ── What is watched ──────────────────────────────────────────────────────────
 await ok('only wanting mails with this chat\'s own Original are watched', async () => {
@@ -490,6 +545,70 @@ await ok('on a phone, the companion\'s pane shown: the chat is not seen', async 
   assert.equal(trims().length, 1);
 });
 
+await ok('under the lightbox, the attention sheet or a modal of the page\'s own: not seen', async () => {
+  for (const how of ['lightbox', 'sheet', 'modal']) {
+    const el = await open();
+    const query = el.shadowRoot.querySelector;
+    const cover = (on) => {
+      if (how === 'lightbox') el._lightbox = on ? { url: '/img', alt: 'Image' } : null;
+      else if (how === 'sheet') { if (on) layers.add('retinue-attention-sheet:not([hidden])'); else layers.clear(); }
+      else el.shadowRoot.querySelector = on ? (q) => (q === '[aria-modal="true"]' ? {} : query(q)) : query;
+    };
+    cover(true);
+    fire(el, 'w1');
+    await advance(5000);
+    assert.equal(trims().length, 0, `${how}: a bubble under it is not seen`);
+    cover(false);
+    await advance(500);
+    assert.equal(trims().length, 0, `${how}: the dwell counts from when it went`);
+    await advance(400);
+    assert.equal(trims().length, 1, how);
+  }
+});
+
+await ok('a page frozen in the background: the dwell starts again on its return', async () => {
+  const el = await open();
+  fire(el, 'w1');
+  await advance(400);
+  clock += 60000;                          // frozen: not one timer ran
+  await advance(1);
+  assert.equal(trims().length, 0, 'the overdue look is no look at all');
+  await advance(500);
+  assert.equal(trims().length, 0);
+  await advance(100);
+  assert.equal(trims().length, 1, 'seen for the dwell after the return');
+});
+
+await ok('hidden and shown again, or shown from the back-forward cache: the dwell starts again', async () => {
+  for (const how of ['visibilitychange', 'pageshow']) {
+    const el = await open();
+    fire(el, 'w1');
+    await advance(400);
+    if (how === 'pageshow') {
+      emit('window', 'pageshow', { persisted: true });
+    } else {
+      document.hidden = true;
+      emit('document', 'visibilitychange');
+      document.hidden = false;
+      emit('document', 'visibilitychange');
+    }
+    await advance(400);
+    assert.equal(trims().length, 0, `${how}: the time before it does not count`);
+    await advance(200);
+    assert.equal(trims().length, 1, how);
+  }
+  // A fresh load's pageshow is no return; and the listeners go with the watch.
+  const el = await open();
+  fire(el, 'w1');
+  await advance(400);
+  emit('window', 'pageshow', { persisted: false });
+  await advance(200);
+  assert.equal(trims().length, 1);
+  el._trimRelease();
+  assert.equal(heard.window.filter((l) => l.type === 'pageshow').length, 0, 'no pageshow listener left');
+  assert.equal(el._trimOnShow, null);
+});
+
 // ── The answers ──────────────────────────────────────────────────────────────
 await ok('200 settled: the text in place, escaped, held over a poll that read the record first', async () => {
   const el = await open();
@@ -564,6 +683,72 @@ await ok('202: the status line goes after two minutes without a settle, and no s
   assert.equal(trims().length, 1);
 });
 
+await ok('202: the status line goes into the bubble\'s own node, and out of it; the focus stays', async () => {
+  const el = await open();
+  const req = await ask(el);
+  const node = el._thread.node('w1');
+  const toggle = node.querySelector('[data-orig-toggle]');
+  toggle.focus();
+  req.answer({ state: 'queued' }, 202);
+  await settle();
+  assert.equal(el._thread.node('w1'), node, 'not drawn anew');
+  assert.ok(node.html.includes(TIDY));
+  assert.ok(node.html.indexOf(TIDY) < node.html.indexOf('class="orig-bar"'), 'above the Original control');
+  assert.equal(node.edits, 1);
+  assert.equal(document.activeElement, toggle);
+  await advance(120000);
+  assert.equal(el._thread.node('w1'), node);
+  assert.ok(!node.html.includes('trim-state'));
+  assert.equal(node.edits, 2);
+  assert.equal(document.activeElement, toggle);
+  // The chat gone: a line it showed is taken out the same way.
+  const el2 = await open();
+  const r2 = await ask(el2);
+  r2.answer({ state: 'running' }, 202);
+  await settle();
+  const n2 = el2._thread.node('w1');
+  el2._stopPolling();
+  assert.equal(el2._thread.node('w1'), n2);
+  assert.ok(!n2.html.includes('trim-state'));
+});
+
+await ok('202 while the Original is open: nothing at all is done to the bubble or its frame', async () => {
+  for (const close of ['before the cap', 'after the cap']) {
+    const el = await open();
+    el._toggleOriginal('w1');
+    take((w) => w.method === 'GET' && w.url === orig('tw1'), 'the original').answer(DOC('tw1'));
+    await settle();
+    await settle();
+    const node = el._thread.node('w1');
+    assert.ok(node.html.includes('orig-open'));
+    const frame = node._slot.children[0];
+    const html = node.html;
+    const req = await ask(el);
+    req.answer({ state: 'queued' }, 202);
+    await settle();
+    assert.equal(el._thread.node('w1'), node, `${close}: not drawn anew`);
+    assert.equal(node.html, html, close);
+    assert.equal(node.edits, 0, close);
+    assert.equal(node._slot.children.length, 1, `${close}: no second frame`);
+    assert.equal(node._slot.children[0], frame, `${close}: the frame is the one the user scrolled`);
+    if (close === 'after the cap') {
+      await advance(120000);
+      assert.equal(el._thread.node('w1'), node, 'the cap does nothing either');
+      assert.equal(node.edits, 0);
+      el._toggleOriginal('w1');
+      assert.ok(!bubble(el, 'w1').includes('trim-state'), 'closed after the cap: no line');
+    } else {
+      await advance(1000);
+      el._toggleOriginal('w1');
+      assert.ok(bubble(el, 'w1').includes(TIDY), 'closed while the turn is on its way: the line');
+      const closed = el._thread.node('w1');
+      await advance(120000);
+      assert.equal(el._thread.node('w1'), closed);
+      assert.ok(!closed.html.includes('trim-state'), 'and it goes at the cap, in place');
+    }
+  }
+});
+
 await ok('202 after a poll already brought the settled record: no status line', async () => {
   const el = await open();
   const req = await ask(el);
@@ -633,11 +818,12 @@ await ok('no answer (5xx, offline): asked again after a minute', async () => {
   }
 });
 
-await ok('an older server (404/405): off for the page\'s life, quietly', async () => {
-  for (const status of [404, 405]) {
+await ok('an older server (no such endpoint): off for the page\'s life, quietly', async () => {
+  for (const [status, body] of [[404, { error: 'not found' }], [404, null], [404, {}], [405, { error: 'not found' }],
+                                [501, null]]) {
     const el = await open();
     const req = await ask(el);
-    req.answer({ error: 'not found' }, status);
+    if (body) req.answer(body, status); else req.answerRaw(status);
     await settle();
     assert.equal(watched().length, 0, `${status}: nothing is watched`);
     assert.ok(observers.every((o) => !o.live), `${status}: the observer is let go`);
@@ -649,6 +835,26 @@ await ok('an older server (404/405): off for the page\'s life, quietly', async (
     assert.equal(watched().length, 0);
     await advance(10 * 60 * 1000);
     assert.equal(trims().length, 1);
+  }
+});
+
+await ok('the endpoint\'s own 404 or 410 ends that one mail; the others stay watched', async () => {
+  for (const [status, error] of [[404, 'no such mail in this chat'], [410, 'this mail is gone from the mailbox']]) {
+    const el = await open();
+    const req = await ask(el);
+    req.answer({ error }, status);
+    await settle();
+    await settle();
+    assert.equal(el._trimOff, false, `${status}: the feature stays on`);
+    assert.deepEqual(replaced, [], `${status}: the page stays`);
+    assert.equal(el._pollDone, false, `${status}: the chat is not over`);
+    assert.deepEqual(watchedMids(), ['w2', 'w4'], `${status}: the others are watched`);
+    const r2 = await ask(el, 'w2');
+    r2.answer({ state: 'queued' }, 202);
+    await settle();
+    assert.ok(bubble(el, 'w2').includes(TIDY), status);
+    await advance(10 * 60 * 1000);
+    assert.deepEqual(trims().map((r) => r.url), [trimOf('tw1'), trimOf('tw2')], `${status}: w1 not asked again`);
   }
 });
 
@@ -788,10 +994,6 @@ await ok('a reader at the bottom stays at the bottom', async () => {
 });
 
 // ── The Original ─────────────────────────────────────────────────────────────
-const DOC = (tok) => ({
-  id: 'x', headers: { from: 'Ann <ann@example.com>', subject: 'Quarterly numbers' }, header_block: 'From: Ann',
-  text: 'Full text', html_url: `${orig(tok)}.html`, attachments: [],
-});
 const NOTE = '<p class="orig-note">Shortened by a model &mdash; this is the full mail.</p>';
 await ok('an open Original survives the text changing under it, and says a model shortened it', async () => {
   const el = await open();
