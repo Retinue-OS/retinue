@@ -2172,8 +2172,46 @@ def test_a_removal_waits_for_the_merge_of_its_chat():
         assert ("inbound", "s@example.org") in _rail_kinds(events), events
         assert [p["chat"] for k, p in events if k == "removed"] == [
             t.by_id(gw)["x@y.org"]["chat"]], events
+    with tempfile.TemporaryDirectory() as tmp:
+        # Decision AV: a removal queued BEFORE a merge of its chat does not
+        # wait for it — it names its chat as the web gateway still has it,
+        # and goes in its order however long the merge fails.
+        gw = t.load(tmp)
+        state = {"down": False}
+        events = t.rail(gw, lambda kind, payload: "down" if state["down"] else (
+            "unanswered" if kind == "merge" else "ok"), alive=True)
+        mirror, box, clock = begin(gw)
+        box.put("INBOX", msg("root@x.org", sender="ann@x.org", subject="Plans", day=36))
+        mirror.poll()
+        uid_m = box.put("INBOX", msg("m@x.org", sender="ann@x.org", subject="Re: Plans",
+                                     irt="root@x.org", refs=["root@x.org"], day=37))
+        mirror.poll()
+        box.put("INBOX", msg("o@x.org", sender="bob@x.org", subject="Other",
+                             irt="lost@x.org", refs=["lost@x.org"], day=37))
+        mirror.poll()
+        chat = t.by_id(gw)["m@x.org"]["chat"]
+        assert chat != t.by_id(gw)["o@x.org"]["chat"]
+        state["down"] = True
+        box.remove("INBOX", uid_m)
+        mirror.poll()
+        box.put("INBOX", msg("c@x.org", sender="ann@x.org", subject="Re: Plans",
+                             irt="root@x.org", refs=["root@x.org", "lost@x.org"], day=38))
+        mirror.poll()
+        kinds = [r["kind"] for r in mirror.index.rows("SELECT kind FROM outbox ORDER BY seq")]
+        assert kinds.index("removed") < kinds.index("merge"), kinds
+        state["down"] = False
+        clock[0] += 3600
+        heard = len(events)
+        for _ in range(gw.RAIL_HOLD_ATTEMPTS + 1):
+            _until_due(mirror, clock)
+        removed = [p for k, p in events[heard:] if k == "removed"]
+        assert len(removed) == 1 and removed[0]["chat"] == chat \
+            and removed[0]["message_ids"] == ["m@x.org"], events[heard:]
+        assert not mirror.index.one("SELECT seq FROM outbox WHERE kind = 'removed'")
+        assert mirror.index.one("SELECT attempts FROM outbox WHERE kind = 'merge'")[
+            "attempts"] >= gw.RAIL_HOLD_ATTEMPTS
     print("ok: a removal waits for a merge of its chat that stepped aside — nothing else "
-          "does — and is then sent as its mails are, also over a stop")
+          "does, and only one queued before it — and is then sent as its mails are, also over a stop")
 
 
 def test_a_quiet_outage_does_not_blame_one_mail():
@@ -2221,6 +2259,108 @@ def test_a_quiet_outage_does_not_blame_one_mail():
         assert "while others are taken" in mirror.health_notice()
     print("ok: /health says others are taken only when the rail took one since the oldest "
           "failing event first failed")
+
+
+def test_the_notice_is_worded_from_the_newest_failing_event():
+    with tempfile.TemporaryDirectory() as tmp:
+        # A poison mail has stepped aside for a day while other mail is
+        # taken; then the web gateway fails on everything, on a quiet
+        # mailbox. The rail took something after the poison first failed,
+        # but nothing after the newest failing event began to fail: the
+        # notice is about the rail, not about one mail.
+        gw = t.load(tmp)
+        state = {"outage": False}
+
+        def outcome(kind, payload):
+            if state["outage"] or payload.get("message_id") == "poison@x.org":
+                return "unanswered"
+            return "ok"
+        t.rail(gw, outcome, alive=True)
+        mirror, box, clock = begin(gw)
+        box.put("INBOX", msg("poison@x.org", sender="pp@corp.example", subject="P", day=39))
+        k = 0
+        for step in range(24 * 12):
+            if step % 72 == 10:
+                box.put("INBOX", msg(f"ok{k}@x.org", sender=f"q{k}@corp.example", day=39))
+                k += 1
+            mirror.poll()
+            clock[0] += 300
+        assert mirror.health_notice().startswith(
+            "1 rail event(s) keep failing while others are taken"), mirror.health_notice()
+        state["outage"] = True
+        said = []
+        for step in range(24 * 12):
+            if step % 72 == 0:
+                box.put("INBOX", msg(f"m{k}@x.org", sender=f"p{k}@corp.example", day=39))
+                k += 1
+            mirror.poll()
+            notice = mirror.health_notice() or ""
+            if mirror.waiting()["failing"] > 1 and not mirror._rail_refusing:
+                said.append(notice)
+            clock[0] += 300
+        assert said, "the outage's events never stepped aside"
+        assert all("has taken nothing since the newest of them began to fail" in n
+                   for n in said), sorted(set(n[:80] for n in said))
+        # A restart keeps it so; a mail taken again makes it about the mails.
+        mirror = again(gw, box, clock)
+        assert "has taken nothing since the newest" in mirror.health_notice()
+        state["outage"] = False
+        box.put("INBOX", msg("fresh@x.org", day=39))
+        mirror.poll()
+        assert t.by_id(gw)["fresh@x.org"]["delivered"]
+        assert "while others are taken" in mirror.health_notice(), mirror.health_notice()
+    print("ok: /health says others are taken only when one was taken after the newest "
+          "failing event began to fail")
+
+
+def test_an_index_without_a_take_says_nothing_of_one():
+    with tempfile.TemporaryDirectory() as tmp:
+        # An index from before the gateway kept when the rail last took a
+        # mail: a poison mail has stepped aside while others were taken.
+        # Until the first take, /health says neither that others are taken
+        # nor that nothing is.
+        gw = t.load(tmp)
+        state = {"answer": None}
+
+        def outcome(kind, payload):
+            if state["answer"]:
+                return state["answer"]
+            return "unanswered" if payload.get("message_id") == "poison@x.org" else "ok"
+        t.rail(gw, outcome, alive=True)
+        mirror, box, clock = begin(gw)
+        box.put("INBOX", msg("poison@x.org", sender="pp@corp.example", subject="P", day=39))
+        for step in range(60):
+            if step % 10 == 5:
+                box.put("INBOX", msg(f"ok{step}@x.org", sender=f"q{step}@corp.example", day=39))
+            mirror.poll()
+            clock[0] += 300
+        assert "while others are taken" in mirror.health_notice()
+        mirror.index.run("DELETE FROM meta WHERE key = 'rail_took'")
+        mirror = again(gw, box, clock)
+        for _ in range(12):
+            mirror.poll()
+            notice = mirror.health_notice()
+            assert notice.startswith("1 rail event(s) keep failing — the oldest for "), notice
+            assert "taken" not in notice, notice
+            clock[0] += 300
+        # A whole pass that takes nothing says so, as ever.
+        state["answer"] = "unanswered"
+        for n in range(gw.RAIL_DOWN_NOTICE):
+            box.put("INBOX", msg(f"d{n}@x.org", sender=f"d{n}@corp.example", day=39))
+        mirror.poll()
+        assert mirror.health_notice().startswith(
+            "the web gateway's chats rail answers but takes no mail"), mirror.health_notice()
+        # The first take is recorded: the notice is worded from it again.
+        state["answer"] = None
+        box.put("INBOX", msg("fresh@x.org", day=39))
+        clock[0] += 300
+        mirror.poll()
+        assert t.by_id(gw)["fresh@x.org"]["delivered"]
+        assert mirror.index.get("rail_took") is not None
+        mirror = again(gw, box, clock)
+        assert "while others are taken" in mirror.health_notice(), mirror.health_notice()
+    print("ok: with no take ever recorded, /health is worded neutrally until the first take "
+          "or a pass that takes nothing")
 
 
 def test_an_older_index_is_upgraded_column_by_column():

@@ -1029,12 +1029,14 @@ listed under Unread and judged by nobody.
   its chat) is not told at all; one that is there is told as its record
   says then, under the chat it is in then. A young held event keeps what
   it was queued with, since the hold keeps its chat's order. **A removal
-  waits for the merge of its chat**: while a merge that joins its chat (on
-  either side) is still queued, whatever that merge's attempts, a removal
-  is not sent — in the web gateway the mail may still be under the chat the
+  waits for the merge of its chat**: while a merge queued before it that
+  joins its chat (on either side) is still queued, whatever that merge's
+  attempts, a removal is not sent — in the web gateway the mail may still be under the chat the
   merge folds away, with the arrival it brings along — and nothing else
   waits with it: its chat's later events go on, so it is marked as
-  overtaken and, once the merge is taken, sent as a late event is. A first
+  overtaken and, once the merge is taken, sent as a late event is. A merge
+  queued after the removal does not hold it: the removal names its chat as
+  the web gateway still has it, and goes first, in its order. A first
   offer's place names the chat it was queued in as well as the one its mail
   is in now, so a merge meanwhile does not take it out of its old chat's
   hold. This holds for a merge or a removal too: a 408, 429 or 5xx for one
@@ -1099,13 +1101,17 @@ listed under Unread and judged by nobody.
   rail events (offers among them) the web gateway failed on three times or
   more, and `waiting.failing_since` says when the oldest first failed. The
   notice for them is worded from whether the rail has taken any event since
-  then (the gateway keeps when it last took one, across a restart): if it
-  has, "N rail event(s) keep failing while others are taken — the oldest for
-  …" is about those mails; if it has not — a quiet mailbox or a short outage
-  can fail on every call without a pass of three — it says "N rail event(s)
-  keep failing and the rail has taken nothing since the oldest of them first
-  failed, … ago", which points at the web gateway, not at one mail (the log
-  names them either way). When a
+  the **newest** of them began to fail (the gateway keeps when it last took
+  one, across a restart): if it has, "N rail event(s) keep failing while
+  others are taken — the oldest for …" is about those mails; if it has not —
+  a quiet mailbox or a short outage can fail on every call without a pass of
+  three, and an older failure (a mail that always fails) says nothing of
+  that — it says "N rail event(s) keep failing and the rail has taken
+  nothing since the newest of them began to fail, … ago", which points at
+  the web gateway, not at one mail (the log names them either way). An
+  index from before the gateway kept its last take knows neither: it says
+  "N rail event(s) keep failing — the oldest for …" until the first take
+  (or a pass that takes nothing, which has its notice above). When a
   mail is taken again, what waited over the fault — each wait grown up to an
   hour meanwhile — is offered and told again at once.
 

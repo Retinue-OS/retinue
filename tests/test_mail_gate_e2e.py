@@ -826,6 +826,65 @@ def test_a_removal_waits_for_the_merge_of_its_chat(w: World):
     print("PASS test_a_removal_waits_for_the_merge_of_its_chat")
 
 
+def test_a_removal_before_a_merge_goes_first(w: World):
+    """Decision AV: a removal waits only for a merge queued before it. The
+    web gateway is away for a moment: the user deletes a mail of one chat,
+    and then a mail joins that chat with another — the removal is queued
+    first. The web gateway comes back and fails on the merge every time;
+    the removal names the chat as the web gateway still has it, so it goes
+    in its order, and the deleted mail is gone from the chat."""
+    _reset()
+    day = lambda: (time.time() + w.offset - 5 - t.T0) / t.DAY  # noqa: E731
+    w.box.put("INBOX", t.msg("rb-root@x.org", sender="Fay <fay@x.org>", subject="Trip",
+                             day=day()))
+    w.mirror.poll()
+    w.offset += 10
+    uid = w.box.put("INBOX", t.msg("rb-m@x.org", sender="Fay <fay@x.org>", subject="Re: Trip",
+                                   irt="rb-root@x.org", refs=["rb-root@x.org"], day=day()))
+    w.mirror.poll()
+    w.offset += 10
+    w.box.put("INBOX", t.msg("rb-o@x.org", sender="Gus <gus@x.org>", subject="Other",
+                             irt="rb-lost@x.org", refs=["rb-lost@x.org"], day=day()))
+    w.mirror.poll()
+    root, lost = w.rec("rb-m@x.org")["chat"], w.rec("rb-o@x.org")["chat"]
+    assert root != lost
+    state, undo = _failing(w, "_handle_chats_merge")
+    try:
+        w.stop_wg()
+        w.box.remove("INBOX", uid)
+        w.later(10)
+        w.offset += 10
+        w.box.put("INBOX", t.msg("rb-c@x.org", sender="Fay <fay@x.org>", subject="Re: Trip",
+                                 irt="rb-root@x.org", refs=["rb-root@x.org", "rb-lost@x.org"],
+                                 day=day()))
+        w.later(10)
+        queued = [r["kind"] for r in w.mirror.index.rows("SELECT kind FROM outbox ORDER BY seq")]
+        assert queued.index("removed") < queued.index("merge"), queued
+        w.start_wg()
+        for _ in range(w.gw.RAIL_HOLD_ATTEMPTS + 2):
+            w.later(4000)
+        _wait(lambda: not w.mirror.index.one(
+            "SELECT seq FROM outbox WHERE kind = 'removed'"), "the removal taken")
+        row = w.mirror.index.one("SELECT attempts FROM outbox WHERE kind = 'merge'")
+        assert row and row["attempts"] >= w.gw.RAIL_HOLD_ATTEMPTS, row
+        doc = w.doc(root)
+        shown = [entry.get("message_id") for entry in w.wg._CHAT_OVERLAY.entries(w.chat(root))]
+        assert "rb-m@x.org" not in shown, shown
+        seq = [s for mid, s in doc.get("inbound_recent") or [] if mid == "rb-m@x.org"]
+        assert seq and seq[-1] in mail.cs.gone_arrivals(doc), doc
+        # Healed, the merge goes too, and the deleted mail stays gone.
+        state["heal"] = True
+        w.later(4000)
+        w.later(4000)
+        _wait(lambda: w.mirror.index.one("SELECT COUNT(*) AS n FROM outbox")["n"] == 0,
+              "the outbox empty")
+    finally:
+        undo()
+    shown = [entry.get("message_id") for entry in w.wg._CHAT_OVERLAY.entries(w.chat(root))]
+    assert "rb-m@x.org" not in shown and "rb-o@x.org" in shown, shown
+    print("PASS test_a_removal_before_a_merge_goes_first")
+
+
 # ── The two axes ──────────────────────────────────────────────────────────────
 
 def test_news_and_a_vip_in_the_list(w: World):
@@ -924,6 +983,7 @@ def main():
             test_a_late_removal_of_a_mail_that_came_back(w)
             test_a_late_told_mail_that_is_gone(w)
             test_a_removal_waits_for_the_merge_of_its_chat(w)
+            test_a_removal_before_a_merge_goes_first(w)
         finally:
             TURN_GATE.update(during=None, fail=False)
             if TURN_GATE.get("hold") is not None:

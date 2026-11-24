@@ -2339,8 +2339,8 @@ class Mailbox:
 #              later rows wait — for RAIL_HOLD_ATTEMPTS tries, then it steps
 #              aside (an offer's row goes; a told event's holds nothing, and
 #              is sent as the index has its mail then). A removal waits for
-#              every merge queued that joins its chat, and is then marked
-#              `overtaken` in its payload. An offer's row names the chat it
+#              every merge queued before it that joins its chat, and is then
+#              marked `overtaken` in its payload. An offer's row names the chat it
 #              was queued in.
 #   offers     the mails the chats rail still owes an answer for: every
 #              inbound record the ledger holds ``delivered: false`` — the
@@ -2426,6 +2426,12 @@ class MailboxIndex:
             version = self._conn.execute("PRAGMA user_version").fetchone()[0]
             if version == 0:
                 self._conn.execute(f"PRAGMA user_version = {INDEX_SCHEMA_VERSION}")
+                if self._conn.execute("SELECT 1 FROM mails LIMIT 1").fetchone() is None:
+                    # A new index: the rail has taken nothing since it began
+                    # (Mirror._rail_took). One from before the key has none —
+                    # what it took is not known (Mirror.health_notice).
+                    self._conn.execute("INSERT OR IGNORE INTO meta (key, value) "
+                                       "VALUES ('rail_took', '0')")
             elif version != INDEX_SCHEMA_VERSION:
                 raise RuntimeError(f"mailbox index {path}: schema {version}, "
                                    f"expected {INDEX_SCHEMA_VERSION}")
@@ -3098,13 +3104,18 @@ class Mirror:
             "SELECT COUNT(*) AS n, MIN(COALESCE(m.arrived, m.ts)) AS since FROM offers o "
             "LEFT JOIN mails m ON m.message_id = o.message_id")
         news = self.index.one("SELECT COUNT(*) AS n FROM news WHERE state != 'done'")
-        failing = self.index.one(
-            "SELECT COUNT(*) AS n, MIN(failed) AS since FROM ("
+        failing = self._failing()
+        return {"rail": rail["n"], "since": rail["since"], "news": news["n"],
+                "failing": failing["n"], "failing_since": failing["since"]}
+
+    def _failing(self):
+        """The rail events that stepped aside: how many (``n``), and when the
+        oldest (``since``) and the newest (``newest``) of them first failed."""
+        return self.index.one(
+            "SELECT COUNT(*) AS n, MIN(failed) AS since, MAX(failed) AS newest FROM ("
             "SELECT failed FROM outbox WHERE attempts >= ? "
             "UNION ALL SELECT failed FROM offers WHERE queued = 0 AND attempts >= ? "
             "AND failed IS NOT NULL)", (RAIL_HOLD_ATTEMPTS, RAIL_HOLD_ATTEMPTS))
-        return {"rail": rail["n"], "since": rail["since"], "news": news["n"],
-                "failing": failing["n"], "failing_since": failing["since"]}
 
     def health_notice(self) -> str | None:
         """What an operator should know while the mirror works."""
@@ -3124,25 +3135,33 @@ class Mirror:
                     f"every offer and event of a pass — {owed} mail(s) wait to be taken by "
                     f"their chats, {told} other event(s) to be heard; each is tried again "
                     f"on its own clock, and all of them once one is taken")
-        waiting = self.waiting()
-        if waiting["failing"]:
-            since = waiting["failing_since"]
+        failing = self._failing()
+        if failing["n"]:
+            since, newest = failing["since"], failing["newest"]
             age = (f" — the oldest for {_span(self._clock() - since)}"
                    if since is not None else "")
             try:
                 took = float(self.index.get("rail_took"))
             except (TypeError, ValueError):
                 took = None
-            if took is None or (since is not None and took < since):
-                # Nothing was taken since the oldest began to fail: that says
+            if took is None or newest is None:
+                # No take was ever recorded (an index from before the key), or
+                # no first failure (one from before that column): whether
+                # others were taken since is not known — until the first take,
+                # or a pass that takes nothing (the notice above).
+                return (f"{failing['n']} rail event(s) keep failing{age}: the web "
+                        f"gateway fails on each of them, which is tried again on its own "
+                        f"clock (the mail gateway's log names them)")
+            if took < newest:
+                # Nothing was taken since the newest began to fail: that says
                 # nothing of one mail — the rail may take none at all (a pass
                 # with too few calls to tell does not get to the notice above).
-                ago = f", {_span(self._clock() - since)} ago" if since is not None else ""
-                return (f"{waiting['failing']} rail event(s) keep failing and the rail has "
-                        f"taken nothing since the oldest of them first failed{ago}: look at "
-                        f"the web gateway, not at one mail; each is tried again on its own "
-                        f"clock (the mail gateway's log names them)")
-            return (f"{waiting['failing']} rail event(s) keep failing while others are "
+                return (f"{failing['n']} rail event(s) keep failing and the rail has "
+                        f"taken nothing since the newest of them began to fail, "
+                        f"{_span(self._clock() - newest)} ago: look at the web gateway, not "
+                        f"at one mail; each is tried again on its own clock (the mail "
+                        f"gateway's log names them)")
+            return (f"{failing['n']} rail event(s) keep failing while others are "
                     f"taken{age}: the web gateway fails on each of them, which is tried "
                     f"again on its own clock and holds back nothing (the mail gateway's log "
                     f"names them)")
@@ -4627,12 +4646,14 @@ class Mirror:
         mail since may have gone ahead of it — so it is not sent as it was
         queued but as the index has its mail now (:meth:`_as_now`); a young
         held event keeps its payload — the hold keeps its chat's order. And
-        a removal waits for every merge still queued that joins its chat,
-        whatever that merge's attempts: in the web gateway its mail may
-        still be under the other chat, which the merge folds in with its
-        arrivals. While it waits its chat's later events go on — nothing
-        else waits for a merge that stepped aside — so it is marked as out
-        of order (:meth:`_overtaken`), and sent as a late event is."""
+        a removal waits for every merge queued before it that joins its
+        chat, whatever that merge's attempts: in the web gateway its mail
+        may still be under the other chat, which the merge folds in with its
+        arrivals; one queued after it cannot have moved the mail the
+        removal names, which goes first, in its order. While it waits its
+        chat's later events go on — nothing else waits for a merge that
+        stepped aside — so it is marked as out of order (:meth:`_overtaken`),
+        and sent as a late event is."""
         if not _chats.chats_enabled():
             return True
         if self._clock() < self._rail_wait_until:
@@ -4640,7 +4661,7 @@ class Mirror:
         self._flags = None
         now = self._clock()
         held: set = set()     # chats with an event that waits: their later ones wait too
-        merging: dict = {}    # each merge still queued → the chats it joins
+        merging: dict = {}    # each merge still queued (by seq) → the chats it joins
         for row in self.index.rows("SELECT seq, payload FROM outbox WHERE kind = 'merge'"):
             try:
                 merging[row["seq"]] = self._event_chats("merge", json.loads(row["payload"]))
@@ -4664,7 +4685,8 @@ class Mirror:
                     held |= chats   # behind an event of its chat: in order
                     continue
                 if row["kind"] == "removed" and any(
-                        chats & joined for joined in merging.values()):
+                        seq < row["seq"] and chats & joined
+                        for seq, joined in merging.items()):
                     # It waits for the merge, and holds nothing back: marked
                     # first, so whatever of its chat goes ahead of it now, it
                     # is sent as the index has its mails then.
@@ -4878,9 +4900,10 @@ class Mirror:
         """The rail took a mail. If it had failed on every one of a pass,
         what waited over that is due again at once — each such mail's own
         wait grew while the fault lasted, up to an hour — and /health stops
-        saying it takes none. When it took one is kept, for /health: an
-        event that keeps failing while others are taken is about itself,
-        one while nothing is taken about the rail (:meth:`health_notice`)."""
+        saying it takes none. When it took one is kept, for /health: events
+        that keep failing while others are taken — one was taken after the
+        newest of them began to fail — are about themselves; otherwise the
+        notice is about the rail (:meth:`health_notice`)."""
         self.index.set("rail_took", self._clock())
         if not self._rail_refusing:
             return
