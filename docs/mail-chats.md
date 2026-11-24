@@ -44,7 +44,8 @@ rail, and the gateway files news mail itself. E-mail triage, its whitelist,
 the omnibus, the status store and the already-answered check are retired;
 what triage knew lives on contacts (*The migration*). The gateway gains the
 news rail (`NEWS_INGEST_URL`, `NEWS_INGEST_TOKEN`) and `MAIL_NEWS_FOLDER`,
-`MAIL_NEWS_EXCERPT_CHARS`, `MAIL_RAIL_FILE_BYTES` and `MAIL_RAIL_JOB_TIMEOUT`.
+`MAIL_NEWS_EXCERPT_CHARS`, `MAIL_RAIL_FILE_BYTES`, `MAIL_RAIL_JOB_TIMEOUT` and
+`MAIL_UNREAD_OFFER_WAIT`.
 Phase 4 adds the model trim (*The model trim*, below): two endpoints on the
 mail gateway (`POST /messages/trim-source`, `/messages/trim-result`), which
 reads nothing new, and the turn the web gateway runs on a bubble's first
@@ -313,7 +314,10 @@ SPECIAL-USE marks) — and keeps a small index of where each mail lives
   merged and ingested **oldest first**, so parents arrive before replies.
   Backfilled mail is told to the rail as `backfill: true`: it pushes
   nothing, starts no turn, and carries `seen` so the read mark can start from
-  the mailbox. It is never gated: written `delivered: true`, with no
+  the mailbox — the `\Seen` the mirror first saw it with, and only that: a
+  record written again in its place (a placeholder that reads) is told what
+  was told of it then (an arrival: unread), never the mailbox's `\Seen` of
+  the moment. It is never gated: written `delivered: true`, with no
   handover offered, and not filed to the news feed.
 
 Nothing is reduced to text. Every MIME part is kept:
@@ -469,10 +473,12 @@ not have it). A match whose header block does not come back counts as From
 nobody and comes last; it holds up nothing where the first is known to be
 the record's — a Sent copy, or one From the row's sender received when the
 row said (in the archive, for a row that said the mail was the user's).
-That one mail is read as old mail — told to the rail, never offered: it was
-heard of before — and as any mail is read the first time where it lies —
-what a Sent copy holds is the user's, what is in the archive the user's when
-it is from one of the user's own addresses and left Sent unseen — with one
+That one mail is read as old mail — told to the rail, not offered: the
+chat had taken it, unless the rail still owed it an answer when its record
+went, and then it is offered once more (*The gate*, "As built") — and as
+any mail is read the first time where it lies — what a Sent copy holds is
+the user's, what is in the archive the user's when it is from one of the
+user's own addresses and left Sent unseen — with one
 difference: in the archive, From that very sender and received when the row
 said, where the row said the mail was the user's, it is the user's again,
 whatever address that is — and found under an id its provider gave a send of
@@ -552,9 +558,12 @@ at one. A fault delays only the work it was in. Following the folders — new
 mail, vanished mail — is done first and by itself, every poll interval; when
 that is what fails, it is tried again after one interval, then twice as long
 each time, up to an hour (every try fetches the mail in hand whole again).
-When the rest fails — finding mail again, reading mail again, the backfill —
-it is the rest that waits so, and new mail goes on being mirrored: `error`
-says that too.
+When the rest fails — finding mail again, reading mail again, the backfill,
+filing news — it is the rest that waits so, and new mail goes on being
+mirrored: `error` says that too. Filing news (*The gate*, "News") comes last
+in the rest and runs whatever became of the steps before it: one mail read
+again that fails at every pass keeps the feed waiting only as long as the
+rest's own wait, never for good.
 
 A record's time is the earlier of the mail's `Date` and the server's arrival
 time, never the future, so a forged date cannot pin a mail to the head of its
@@ -571,7 +580,7 @@ channels:
 |---|---|
 | `kb:subject` | the mail's own subject, decoded |
 | `kb:senderName` | the display name on `From` |
-| `kb:gateSender` | inbound: the address the gate takes the mail to be from (*The gate*, "Who the sender is") — absent when it has none, a header block cut at its bound included, and on a placeholder (*The gate*, "As built") |
+| `kb:gateSender` | inbound: the address the gate takes the mail to be from (*The gate*, "Who the sender is") — absent when it has none, a header block cut at its bound included, and on a placeholder but one whose block names a VIP or an instructed sender (*The gate*, "As built") |
 | `kb:recipient` (multi) | `To` addresses |
 | `kb:cc` (multi) | `Cc` addresses |
 | `kb:inReplyTo` | the parent's id |
@@ -1295,9 +1304,11 @@ leftover no longer flagged `\Deleted` is its place again). And a move is
 noted before the server is asked, so a stop between the server's move and
 the index following it is put right at the next start: the source UID gone
 or flagged `\Deleted` is no place any more, and the copy in the archive is
-found. And where a mail is looked for in
-a folder — after a move whose new UID the server did not name, or by a
-delete — every mail there under its id is looked at, as the mirror looks:
+found. So is the move of a filed news mail (*The gate*, "News"): its copy
+kept flagged `\Deleted` is not copied out a second time. And where a mail
+is looked for in a folder — after a move whose new UID the server did not
+name, or by a delete — every mail there under its id is looked at, as the
+mirror looks:
 the mail of a placeholder is only the copy its record keeps the header block
 of, and another mail under the same id is neither moved nor flagged; once
 the placeholder is erased with its chat, that other mail is mirrored as the
@@ -1528,15 +1539,32 @@ listed under Unread and judged by nobody.
   more: offered, with its gate sender, if the chat had not taken the
   placeholder yet; told once, as old mail, if it had — never offered twice.
   **A placeholder is from nobody** (no `kb:gateSender`, `gate_sender` empty on
-  the rail, whatever its header block names): it reaches its chat and buys no
-  turn — a turn would work a mail it cannot read, and its done would deliver
-  the mail. So a VIP's mail that arrived unreadable is worked once it reads
-  only if its placeholder was still owed then. **The mail of a lost record**
-  (one the ledger lost, found again by its `Message-ID`) is told as old mail,
-  never offered: it was heard of before. A copy of the user's own send under
-  the id its provider gave it is that send, told under the id the gateway
-  minted; a stranger's mail under that id is a mail of its own, offered like
-  any that arrives.
+  the rail): it reaches its chat at once and buys no turn — a turn would work
+  a mail it cannot read, and its done would deliver the mail. **Unless its
+  header block names a VIP or an instructed sender**: where the block was
+  not cut and the gate calls its gate sender either, the mail must not lose
+  its ring or its turn to a reader that failed on it. Its placeholder keeps
+  that `kb:gateSender` and is written owed, its offer due once
+  `MAIL_UNREAD_OFFER_WAIT` (600 seconds) is over and no sooner — the index's
+  offers row is the wait, and survives a restart — and it is read again
+  once half that wait is over rather than with the next hourly round. Read
+  by then, the record written in its place is still owed and is offered
+  once, under its real gate sender: one ring, one turn, on the real text.
+  Not read by then, the placeholder is offered under the gate sender its
+  block names: the VIP's ring, or the instructed turn and the ring of a turn
+  that has no verdict, goes out for a mail that says it could not be shown;
+  its reading later is only told. Never two rings for one mail, and such a
+  mail reaches its chat up to that wait late. Every other placeholder — of
+  nobody, of anyone else, of a block cut at its bound — is offered from
+  nobody at once. **The mail of a lost record** (one the ledger lost, found
+  again by its `Message-ID`) is told as old mail, not offered: the chat had
+  taken it — unless the rail still owed it an answer when the record went
+  (the index's `offers` row stood for it, kept as `owed` among the lost
+  ids' hints): then it is owed still, and offered once more (a repeat is
+  safe: the web gateway takes one once, by its message id). A copy of the
+  user's own send under the id its provider gave it is that send, told
+  under the id the gateway minted; a stranger's mail under that id is a mail
+  of its own, offered like any that arrives.
 - **The verdict** is asked when the offer is made, not when the mail arrived,
   so a mail that waited is judged by the policy as it stands: `gate =
   {"forward": not (quieted or ignored), "vip", "instructed", "reason"}`. The
@@ -1659,13 +1687,18 @@ listed under Unread and judged by nobody.
   empty: left in the INBOX) through the adapter's write half, and the mirror
   follows its own move. Only a mail that is in no chat is moved — a news mail
   that joined a chat is filed, shown there, and left to the chat. **A VIP's
-  or an instructed sender's mail in a news group** is such a mail: filed,
-  and also written, offered and worked in its chat like any of theirs, and
-  never moved. A feed that refuses leaves the mail untouched and is asked
-  again; the move never comes before the filing. A news mail the reader could
-  not read is neither filed nor a chat; it is read again with the
-  placeholders (hourly, less often each time it still fails) and filed once
-  it reads. Backfilled news mail is neither filed nor moved. With
+  or an instructed sender's mail in a news group** is such a mail: filed —
+  once it reads, where it arrived unreadable — and also written, offered and
+  worked in its chat like any of theirs, and never moved. A feed that
+  refuses leaves the mail untouched and is asked again; the move never comes
+  before the filing. A news mail the reader could
+  not read is not filed before it reads: one that would be in no chat is no
+  chat either, and one that joins its chat (a VIP's, an instructed sender's,
+  or in a mirrored thread) is a placeholder of its chat meanwhile (*As
+  built*, above). Either is read again with the placeholders (hourly, less
+  often each time it still fails) and filed once it reads — the one in its
+  chat left in the INBOX. A placeholder that came as old mail is not filed
+  when it reads. Backfilled news mail is neither filed nor moved. With
   `NEWS_INGEST_URL` emptied there is no feed to take the mail, so the `news`
   flag does nothing: such mail is **mirrored as a chat** like any other,
   filed nowhere and moved nowhere. `MAIL_NEWS_FOLDER` and
@@ -1856,9 +1889,14 @@ text is a digest of a topic, not a rule).
     — by its opening: a line beginning *"Unless the note above says
     otherwise:"*, however the user edited the rest of it and wherever they
     moved it, at the start of any line (no blank line needed before it; a
-    lone CR ends a line too) — there, a paragraph of the user's own that
-    begins with those words is taken for the line too. Where several lines
-    qualify, the exact one wins, then the last. On anyone else a paragraph of the user's own that
+    lone CR ends a line too) — there, a line of the user's own that begins
+    with those words, also inside a paragraph, is taken for the line too: a
+    later note goes in front of that line and enters its "note above". Where
+    several lines qualify, the exact one wins, then the last. Only the
+    journal knows on whom the line was placed: a marker moved aside forgets
+    it (as does a stop between a filing note's write and its journal entry),
+    and where the user has edited the line since, a later filing note then
+    adds the line a second time. On anyone else a paragraph of the user's own that
     happens to begin with those words is their text: a note goes after it,
     and a filing note adds the real line. A later note for a person who has
     the line — a second filing note, a rule — goes in front of it, in its

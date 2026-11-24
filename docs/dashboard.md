@@ -1720,7 +1720,10 @@ adopts). What the web gateway does with the event, by who sent the mail:
   on, a turn notes it when it asks, and its ask is written only while that
   note still stands — decided in the write that records the ask
   (`note_turn_done` `epoch`). (A merge that lands in that same moment
-  makes the ask be noted as none: the thread stays in view.) The undo of a
+  finds no record to carry the note along: the ask is then dropped where
+  the merged chat's epoch differs from the one the turn noted — where the
+  other half was ever brought back by the user — and kept where neither
+  was.) The undo of a
   turn that did not finish forgets nothing.
 - **A thread its turn archived rings nothing.** What the turn archived is
   noted as its own. If the turn then ends with a verdict, the ring that

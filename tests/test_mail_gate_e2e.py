@@ -36,6 +36,11 @@ job a turn runs under is polled by the mail gateway's real job_delivery
 - a news-flagged list's mail goes to the feed and makes no chat; a VIP's
   mail in that list gets its chat and its turn, is still filed, and stays in
   the INBOX;
+- a mail that arrives unreadable: a VIP's or an instructed sender's waits
+  for its reading (MAIL_UNREAD_OFFER_WAIT) — read in time, one ring and one
+  turn on its real text; not, one ring and one turn for the placeholder, and
+  its reading told — a stranger's is offered from nobody at once, and the
+  reading of a placeholder the chat counted unread does not read the chat;
 - a mail the web gateway answers 5xx for, for ever — one that arrived, and
   the user's own sent mail — then a VIP's reply in the same thread: the
   failing mail steps aside after RAIL_HOLD_ATTEMPTS tries, the reply is
@@ -1046,6 +1051,159 @@ def test_news_and_a_vip_in_the_list(w: World):
     print("PASS test_news_and_a_vip_in_the_list")
 
 
+def _broken_trim(w: World, subjects: set):
+    """Mails of these subjects do not read (until the set is emptied):
+    each is mirrored as a placeholder. Returns the real trim."""
+    real = w.gw._trim.trim
+
+    def trim(plain, html, subject=None, **evidence):
+        if subject in subjects:
+            raise RecursionError("this mail, for now")
+        return real(plain, html, subject=subject, **evidence)
+    w.gw._trim.trim = trim
+    return real
+
+
+def test_a_placeholders_reading_does_not_read_its_chat(w: World):
+    _reset()
+    broken = {"Unread at first"}
+    real = _broken_trim(w, broken)
+    try:
+        w.arrives("seen1@x.org", sender="Ann <ann@x.org>", subject="Unread at first")
+        assert w.rec("seen1@x.org")["text"] == w.gw.UNREADABLE_TEXT
+        doc = w.doc("seen1@x.org")
+        assert (doc.get("inbound_seq"), doc.get("read_seq") or 0) == (1, 0), doc
+        # Read in a mail client meanwhile: the mailbox has it \Seen.
+        mail = w.box.boxes["INBOX"]["mails"][w.box.uid_of("INBOX", "seen1@x.org")]
+        mail["flags"] = frozenset(set(mail["flags"]) | {"\\Seen"})
+        broken.clear()
+        w.later(w.gw.SET_ASIDE_RETRY_SECONDS + 10)
+        _wait(lambda: w.rec("seen1@x.org")["text"] != w.gw.UNREADABLE_TEXT, "the reading")
+    finally:
+        w.gw._trim.trim = real
+    # The chat still counts it unread: the mailbox follows the chat.
+    doc = w.doc("seen1@x.org")
+    assert (doc.get("inbound_seq"), doc.get("read_seq") or 0) == (1, 0), doc
+    assert not doc.get("last_read"), doc
+    assert not PUSHES and not TURNS
+    print("PASS test_a_placeholders_reading_does_not_read_its_chat")
+
+
+def _rounds(w: World, n=3) -> None:
+    """The placeholders' rounds of reading again, ``n`` of them (one read
+    in vain waits a round longer for its next)."""
+    for _ in range(n):
+        w.later(w.gw.SET_ASIDE_RETRY_SECONDS + 10)
+
+
+def test_an_unreadable_vips_mail_waits_for_its_reading(w: World):
+    # It reads within the bound: offered as the mail it is — one ring, one
+    # turn, on its real text.
+    _reset()
+    broken = {"Budget, unread"}
+    real = _broken_trim(w, broken)
+    try:
+        w.arrives("unr1@corp.example", sender="Boss <boss@corp.example>",
+                  subject="Budget, unread", body="The real budget is 42.\n")
+        assert w.rec("unr1@corp.example")["text"] == w.gw.UNREADABLE_TEXT
+        assert w.owed("unr1@corp.example") and not w.delivered("unr1@corp.example")
+        assert not PUSHES and not TURNS and not w.exists("unr1@corp.example")
+        broken.clear()
+        w.later(w.gw.MAIL_UNREAD_OFFER_WAIT / 2 + 1)
+        _wait(lambda: w.delivered("unr1@corp.example"), "the VIP's mail delivered")
+    finally:
+        w.gw._trim.trim = real
+    assert len(PUSHES) == 1 and PUSHES[0][0][0] == "The Boss", PUSHES
+    assert len(TURNS) == 1 and "The real budget is 42." in TURNS[0]["prompt"]
+    # It does not: at the bound the placeholder is offered under the gate
+    # sender its header block names — the ring and the turn go out for a
+    # mail that says it could not be shown — and its reading later is told,
+    # with no second ring and no second turn.
+    _reset()
+    broken = {"Budget, late"}
+    real = _broken_trim(w, broken)
+    try:
+        w.arrives("unr2@corp.example", sender="Boss <boss@corp.example>",
+                  subject="Budget, late", body="The late budget is 43.\n")
+        assert not PUSHES and not TURNS
+        w.later(w.gw.MAIL_UNREAD_OFFER_WAIT + 1)
+        _wait(lambda: w.delivered("unr2@corp.example"), "the placeholder delivered")
+        assert len(PUSHES) == 1 and len(TURNS) == 1, (PUSHES, TURNS)
+        assert "The late budget is 43." not in TURNS[0]["prompt"]
+        assert w.rec("unr2@corp.example")["text"] == w.gw.UNREADABLE_TEXT
+        broken.clear()
+        _rounds(w)
+        _wait(lambda: w.rec("unr2@corp.example")["text"] == "The late budget is 43.",
+              "the reading")
+    finally:
+        w.gw._trim.trim = real
+    time.sleep(0.3)
+    assert len(PUSHES) == 1 and len(TURNS) == 1, (PUSHES, TURNS)
+    assert w.delivered("unr2@corp.example") and not w.owed("unr2@corp.example")
+    print("PASS test_an_unreadable_vips_mail_waits_for_its_reading")
+
+
+def test_an_unreadable_instructed_mail_waits_for_its_reading(w: World):
+    # Read in time: the instructed turn runs once, on the real text.
+    _reset()
+    TURN_GATE["during"] = w.verdict("unr3@firm.example", 0)
+    broken = {"Invoice, unread"}
+    real = _broken_trim(w, broken)
+    try:
+        w.arrives("unr3@firm.example", sender="Clerk <clerk@firm.example>",
+                  subject="Invoice, unread", body="Invoice number 7.\n")
+        assert not TURNS and w.owed("unr3@firm.example")
+        broken.clear()
+        w.later(w.gw.MAIL_UNREAD_OFFER_WAIT / 2 + 1)
+        _wait(lambda: w.delivered("unr3@firm.example"), "the instructed mail delivered")
+    finally:
+        w.gw._trim.trim = real
+    assert len(TURNS) == 1 and "Invoice number 7." in TURNS[0]["prompt"]
+    assert not PUSHES, PUSHES
+    # Not read by the bound: the turn runs once, on the placeholder — and,
+    # giving no verdict on a mail it cannot read, rings once. The reading
+    # later is told: no second turn, no second ring.
+    _reset()
+    broken = {"Invoice, late"}
+    real = _broken_trim(w, broken)
+    try:
+        w.arrives("unr4@firm.example", sender="Clerk <clerk@firm.example>",
+                  subject="Invoice, late", body="Invoice number 8.\n")
+        w.later(w.gw.MAIL_UNREAD_OFFER_WAIT + 1)
+        _wait(lambda: w.delivered("unr4@firm.example"), "the placeholder delivered")
+        _wait(lambda: len(PUSHES) == 1, "the instructed turn's ring")
+        assert len(TURNS) == 1 and "Invoice number 8." not in TURNS[0]["prompt"]
+        broken.clear()
+        _rounds(w)
+        _wait(lambda: w.rec("unr4@firm.example")["text"] == "Invoice number 8.", "the reading")
+    finally:
+        w.gw._trim.trim = real
+    time.sleep(0.3)
+    assert len(TURNS) == 1 and len(PUSHES) == 1, (TURNS, PUSHES)
+    print("PASS test_an_unreadable_instructed_mail_waits_for_its_reading")
+
+
+def test_an_unreadable_strangers_mail(w: World):
+    # As ever: from nobody, offered at once and taken plainly — listed, no
+    # ring, no turn — and its reading told.
+    _reset()
+    broken = {"Hello, unread"}
+    real = _broken_trim(w, broken)
+    try:
+        w.arrives("unr5@x.org", sender="Ann <ann@x.org>", subject="Hello, unread",
+                  body="Hello there.\n")
+        assert w.delivered("unr5@x.org") and not w.owed("unr5@x.org")
+        assert w.listed("unr5@x.org") and not w.rec("unr5@x.org").get("gate_sender")
+        broken.clear()
+        _rounds(w, 1)
+        _wait(lambda: w.rec("unr5@x.org")["text"] == "Hello there.", "the reading")
+    finally:
+        w.gw._trim.trim = real
+    time.sleep(0.3)
+    assert not PUSHES and not TURNS, (PUSHES, TURNS)
+    print("PASS test_an_unreadable_strangers_mail")
+
+
 def test_a_turns_mute_is_an_archive(w: World):
     """Decision S across the seam: a turn that runs `chat-flags.py --mute`
     archives — the mailbox moves the turn's own mail, the answer says the
@@ -1112,6 +1270,10 @@ def main():
             test_a_newer_mail_keeps_the_chat(w)
             test_news_and_a_vip_in_the_list(w)
             test_a_turns_mute_is_an_archive(w)
+            test_a_placeholders_reading_does_not_read_its_chat(w)
+            test_an_unreadable_vips_mail_waits_for_its_reading(w)
+            test_an_unreadable_instructed_mail_waits_for_its_reading(w)
+            test_an_unreadable_strangers_mail(w)
             test_a_vips_reply_behind_a_mail_the_rail_always_fails_on(w)
             test_a_late_removal_of_a_mail_that_came_back(w)
             test_a_late_told_mail_that_is_gone(w)
