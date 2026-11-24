@@ -2032,11 +2032,49 @@ def _is_stub(plain: str, marked: str) -> bool:
     return says > 1000 and says > STUB_RATIO * said
 
 
+# Where markup stands in a part, as a browser reads it: a tag (its values in
+# quotes may hold a ">"), a comment and its like, and the text of the
+# elements in which nothing but their own end tag is a tag — a script, a
+# <textarea>, … — of which a style sheet's is markup all the same.
+_TAG_OPEN_RE = re.compile(r"<(?:/?[A-Za-z]|!|\?|/(?!>))")
+# A tag's name, then its attributes — each with a value or none: in quotes,
+# or up to a blank or a ">" — and the blanks between them (HTML's own).
+_TAG_NAME_RE = re.compile(r"[^\t\n\f\r />]*")
+_COMMENT_END_RE = re.compile(r"--!?>")
+_TAG_ATTRIBUTES_RE = re.compile(
+    r"(?:[{b}/]+|[^{b}/>][^{b}/>=]*"
+    r"""(?:[{b}]*=[{b}]*(?:"[^"]*"?|'[^']*'?|[^{b}>]*))?)*""".format(
+        b=r"\t\n\f\r "))
+# … one of them at a time, a value in quotes (its quotes with it) in group 1,
+# one without in group 2.
+_TAG_ATTRIBUTE_RE = re.compile(
+    r"[{b}/]+|[^{b}/>][^{b}/>=]*"
+    r"""(?:[{b}]*=[{b}]*(?:("[^"]*"?|'[^']*'?)|([^{b}>]*)))?""".format(
+        b=r"\t\n\f\r "))
+_RAW_TEXT_ENDS = {tag: re.compile(r"</%s[\t\n\f\r />]" % tag, re.I) for tag in (
+    "style", "script", "xmp", "iframe", "noembed", "noframes", "textarea",
+    "title")}
 # A ``data:`` URL where markup holds one — an attribute's value, a url() of
-# a style — and what ends it there when no quote does.
+# a style — and its payload, by its shape: a media type and parameters, a
+# comma, then the characters of base64 and of a URL. No quote, no "<", ">"
+# or "&", no blank — but between the lines of folded base64 (_folded), in
+# quotes — and what began it ends it: its quote, or what ends a value.
 _DATA_URL_RE = re.compile(r"data:", re.I)
-_DATA_URL_END_RE = re.compile(r"[\s\"'<>()&]")
-_DATA_URL_OPENERS = ("&quot;", "&#34;", "&#39;", "&apos;")
+_DATA_URL_PAYLOAD = r"A-Za-z0-9._~%!$*+,;=:@/?\-"
+_DATA_URL_BARE_RE = re.compile(
+    r"[A-Za-z0-9.+/;=_-]{0,127},[%s]*" % _DATA_URL_PAYLOAD)
+_DATA_URL_QUOTED_RE = re.compile(
+    r"[A-Za-z0-9.+/;=_-]{0,127},[%s\t\n\f\r ]*" % _DATA_URL_PAYLOAD)
+_DATA_URL_CLOSERS = {
+    "\"": ("\"",), "'": ("'",),
+    "&quot;": ("&quot;", "&#34;"), "&#34;": ("&quot;", "&#34;"),
+    "&#39;": ("&#39;", "&apos;"), "&apos;": ("&#39;", "&apos;"),
+    "": ("\t", "\n", "\f", "\r", " ", ">", ")")}
+_BLANKS_RE = re.compile(r"[\t\n\f\r ]+")
+_BASE64_RE = re.compile(r"[A-Za-z0-9+/=]+")
+#: Of base64 folded into lines, every line but the last has this many
+#: characters at least, and all of them the same (MIME's have 76).
+BASE64_LINE_CHARS = 40
 #: A ``data:`` URL longer than this is an image, a font: never text of the
 #: mail, and not counted as markup that is read (MAX_HTML_CHARS).
 DATA_URL_CHARS = 4096
@@ -2044,6 +2082,104 @@ DATA_URL_CHARS = 4096
 # but the word is not searched to its end for an image.
 _MAX_DATA_URLS = 20_000
 _CHARREF_END_RE = re.compile(r"[\s;<]")
+
+
+def _markup_spans(html: str):
+    """``(start, end, markup)`` of each stretch of a part that is no text of
+    it, in order: a tag or a style sheet (`markup`: True, or "style" for the
+    sheet), a comment, the text of a script — up to the first CDATA
+    section. Then ``(len, len + 1, False)``, for ever. A part is looked at
+    once, and only as far as it is asked for."""
+    size = len(html)
+    at = 0
+    while True:
+        match = _TAG_OPEN_RE.search(html, at)
+        if match is None:
+            break
+        start = match.start()
+        if not match.group()[-1].isalpha():
+            # A comment ends at "-->" ("<!-->" is one) or at "--!>" (not
+            # "<!--!>"), what else begins with "<!", "<?" or "</" and no
+            # name at the first ">".
+            if html.startswith("<!--", start):
+                ended = _COMMENT_END_RE.search(html, start + 2)
+                if ended and ended.start() < start + 4 and ended.group() == "--!>":
+                    ended = _COMMENT_END_RE.search(html, start + 4)
+                end = ended.end() if ended else size
+            else:
+                end = html.find(">", start + 2)
+                end = size if end < 0 else end + 1
+            yield start, end, False
+            if html.startswith("<![CDATA[", start):
+                # In an <svg> or a <math> a browser ends one at "]]>", not
+                # here, and which this is, is not followed: from here on,
+                # nothing is markup a payload is left out of.
+                break
+            at = end
+            continue
+        name = start + len(match.group()) - 1
+        named = _TAG_NAME_RE.match(html, name).end()
+        end = _TAG_ATTRIBUTES_RE.match(html, named).end()
+        end = min(size, end + 1)        # past its ">", if it has one
+        yield start, end, True
+        at = end
+        tag = html[name:named].lower()
+        if match.group()[1] == "/":
+            continue
+        if tag == "plaintext":
+            break                       # the rest is text
+        if tag in _RAW_TEXT_ENDS:
+            close = _RAW_TEXT_ENDS[tag].search(html, end)
+            at = close.start() if close else size
+            yield end, at, "style" if tag == "style" else False
+    while True:
+        yield size, size + 1, False
+
+
+def _folded(payload: str) -> bool:
+    """Is a payload with blanks in it base64 folded into lines: each line
+    nothing but base64, every one but the first and the last as long as the
+    second, these two no longer, and not short? (The first may share its
+    line with the tag, where a client folded all of the markup.) Words
+    joined by line breaks are not."""
+    lines = payload.split()
+    width = len(lines[1] if len(lines) > 2 else lines[0]) if lines else 0
+    return (width >= BASE64_LINE_CHARS
+            and len(lines[0]) <= width and len(lines[-1]) <= width
+            and all(len(line) == width for line in lines[1:-1])
+            and all(_BASE64_RE.fullmatch(line) for line in lines))
+
+
+class _TagWalk:
+    """A browser's reading of one tag's attributes — the tokenizer's
+    attribute states, an attribute at a time — walked once: asked of
+    stretches of the tag in order, it goes on from where it stopped."""
+
+    def __init__(self, html: str, start: int, end: int):
+        self.html, self.start, self.end = html, start, end
+        name = _TAG_OPEN_RE.match(html, start).end() - 1
+        self.at = _TAG_NAME_RE.match(html, name).end()
+        self.attribute = None       # the first that does not end before
+
+    def holds(self, start: int, end: int, quoted: bool) -> bool:
+        """Is html[start:end] inside one attribute value: one in quotes —
+        opened by a quote (an entity opens none) before it and closed by
+        that quote after its end — or, unless `quoted` is asked, one without
+        quotes, which a blank would end? (Not where a browser begins an attribute's
+        NAME with it: there its own "/" and "=" divide it.)"""
+        while self.attribute is None or self.attribute.end() <= start:
+            attribute = _TAG_ATTRIBUTE_RE.match(self.html, self.at, self.end)
+            if attribute is None:
+                return False            # the tag's ">", or its end
+            self.attribute, self.at = attribute, attribute.end()
+        opened, closed = self.attribute.span(1)
+        if opened < 0 and not quoted:
+            opened, closed = self.attribute.span(2)
+            return 0 <= opened <= start and end <= closed
+        # (A quote nothing closes takes the rest of the mail in a browser,
+        # and not in every reader of markup: what stands in one counts.)
+        return (opened < start and end < closed
+                and self.html[closed - 1] == self.html[opened])
 
 
 def _markup_read(html: str) -> tuple:
@@ -2054,8 +2190,21 @@ def _markup_read(html: str) -> tuple:
     say where the text is. An image a client wrote into the part itself is
     neither, and a megabyte of it would use up the bound before the first
     word (or after the second, and take the rest of the mail with it): the
-    payload of a long ``data:`` URL is left out, not counted, and the tag
-    that held it stays.
+    payload of a long ``data:`` URL in a tag or a style sheet is left out,
+    not counted, and the tag that held it stays. Text shaped like one is
+    text, and counts. And what is left out is a payload by its shape —
+    base64 or a URL's characters, no blank but between the lines of folded
+    base64, no quote — up to the first character that is none of it: where
+    a home-made reading of the markup takes text for a tag, what that
+    costs is a long run of a URL's characters, never words a blank divides
+    nor the end of a value. (Words joined by "-", "_", "." or "%20" are such
+    a run, so past a CDATA section — the one misreading known: a browser
+    ends one in an <svg> at "]]>" — nothing is left out.) Folded base64 is
+    left out only where a browser's own reading of the tag puts all of it
+    in one value in quotes, which nothing but its quote ends: what stands
+    in for it cannot change where the tag is split. Anywhere else a browser
+    ended the value at the first blank, and what follows is attributes or
+    text as it reads them — so the run is no folded value, and counts.
 
     A longer part is cut at the bound, wherever that falls: the parser is
     handed what was read and not told that it ends there (see _convert), so
@@ -2069,46 +2218,62 @@ def _markup_read(html: str) -> tuple:
         return html, False
     kept: list = []
     size = done = at = 0
-    bare_end = 0            # where the unquoted value last looked at ends
+    spans = _markup_spans(html)
+    span = (0, 0, False)    # the first that does not end before a candidate
+    walk = None             # of the tag the last one stood in
     for _ in range(_MAX_DATA_URLS):
-        # (Looked for from where the last payload ended: one that was left
-        # out is not searched for more of them.)
+        # (Looked for from where the last payload, or what looked like one,
+        # ended: what stands in one is not searched for more of them.)
         match = _DATA_URL_RE.search(html, at)
         if match is None:
             break
         start, at = match.span()
         if size + start - done >= limit:
             break                   # the bound falls before this one
-        # In an attribute or a url(): right after "=" or "(", a quote or not.
-        before = html[max(done, start - 10):start]
-        quote = ""
-        if before[-1:] in ("\"", "'"):
-            quote, before = before[-1], before[:-1]
-        else:
-            for opener in _DATA_URL_OPENERS:
-                if before.endswith(opener):
-                    before = before[:-len(opener)]
-                    break
-        if (not before.rstrip().endswith(("=", "("))
-                or html.find(",", start, start + 128) < 0):
-            continue                # no URL: it has no comma where one has
-        end = html.find(quote, start) if quote else -1
-        if end < 0:
-            # (One search per value, not per "data:" that stands in it.)
-            if start >= bare_end:
-                ended = _DATA_URL_END_RE.search(html, start)
-                bare_end = ended.start() if ended else len(html)
-            end = bare_end
-        # A payload, and not a sentence someone began with the word: neither
-        # a blank nor a tag stands anywhere in it.
-        if (end - start <= DATA_URL_CHARS
-                or html.find(" ", start, end) >= 0
-                or html.find("<", start, end) >= 0
-                or html.find(">", start, end) >= 0):
+        # It stands in a tag or a style sheet — asked first, so that one in
+        # text costs no more than that. Text shaped like one is shown by a
+        # browser, line breaks and all: it is text here too …
+        while span[1] <= start:
+            span = next(spans)
+        if not (span[2] and span[0] < start):
             continue
-        kept.append(html[done:at])
-        size += at - done
-        done = at = end
+        # … in an attribute or a url(): right after "=" or "(", in quotes
+        # or not …
+        before = html[max(done, start - 10):start]
+        opener = before[-1:] if before[-1:] in ("\"", "'") else next(
+            (opener for opener in _DATA_URL_CLOSERS
+             if opener and before.endswith(opener)), "")
+        if not before[:len(before) - len(opener)].rstrip().endswith(("=", "(")):
+            continue
+        # … and what follows is a payload by its shape, which ends at the
+        # first character that is none of one: what began the value must
+        # end it there. Whatever else a reading of the markup gets wrong,
+        # what is left out is never words a blank divides, nor a quote that
+        # ends one value and lets the next take the mail.
+        payload = (_DATA_URL_QUOTED_RE if opener else _DATA_URL_BARE_RE).match(html, at)
+        if payload is None:
+            continue                # no URL: it has no comma where one has
+        end = at = payload.end()
+        comma = html.index(",", start)
+        blank = "\n" if _BLANKS_RE.search(html, comma, end) else ""
+        if (end - start <= DATA_URL_CHARS
+                or not html.startswith(_DATA_URL_CLOSERS[opener], end)
+                or (blank and not _folded(html[comma + 1:end]))):
+            continue
+        # In a tag, it is all in one value as a browser reads the tag —
+        # folded, a value in quotes — or a browser read no such value (it
+        # began an attribute's name there, say), and it counts. (In a style
+        # sheet nothing but its end tag ends anything. A tag is walked once,
+        # on from where the last candidate in it was.)
+        if span[2] is True:
+            if walk is None or walk.start != span[0]:
+                walk = _TagWalk(html, span[0], span[1])
+            if not walk.holds(start, end, bool(blank)):
+                continue
+        # (One blank stays for its blanks: in quotes it splits nothing.)
+        kept.append(html[done:start + 5] + blank)
+        size += start + 5 - done + len(blank)
+        done = end
     kept.append(html[done:done + max(0, limit - size) + 1])
     markup = "".join(kept)
     if len(markup) <= limit:
@@ -2463,13 +2628,16 @@ _P_BARRIERS = (_CLOSES_P - {"p"}) | _TABLE_TAGS
 # What a second <a> does not end with the link it stands in, as a browser
 # reads the two. An element of HTML's "special" category (a block, a list, a
 # table and its parts, …) is moved out from under the first link and stays
-# open, and a formatting element (the sanitiser's _CARRIED_TAGS) is opened
-# again: one of either kind that hides what is in it goes on hiding it.
+# open, and a formatting element (_REOPENED_TAGS: the sanitiser's
+# _CARRIED_TAGS, and <nobr>) is opened again: one of either kind that hides
+# what is in it goes on hiding it.
+_REOPENED_TAGS = frozenset((
+    "a", "b", "big", "code", "em", "font", "i", "nobr", "s", "small",
+    "strike", "strong", "tt", "u"))
 _LASTING_TAGS = (
-    _PARAGRAPH_TAGS | _BREAK_TAGS | _CLOSES_P | _TABLE_TAGS | frozenset((
-        "button", "dir", "hgroup", "listing", "marquee", "menu", "search",
-        "a", "b", "big", "code", "em", "font", "i", "nobr", "s", "small",
-        "strike", "strong", "tt", "u"))) - frozenset(("legend", "option"))
+    _PARAGRAPH_TAGS | _BREAK_TAGS | _CLOSES_P | _TABLE_TAGS | _REOPENED_TAGS
+    | frozenset(("button", "dir", "hgroup", "listing", "marquee", "menu",
+                 "search"))) - frozenset(("legend", "option"))
 # And inside these an <a> is no link at all to a browser: text of a script,
 # a tag that a <select> drops, an element of another kind in an <svg>. (Not
 # so in the muted elements whose content is ordinary markup that merely is
@@ -2739,11 +2907,14 @@ class _TextConverter(HTMLParser):
         # that mutes, and those inside it that would — and which of them a
         # second <a> does not end (_LASTING_TAGS); where the outermost is in
         # which an <a> is none (_OPAQUE_TAGS; -1: nowhere); and where the
-        # links are that a second <a> has ended all the same (_end_link).
+        # links are that a second <a> has ended all the same, with what a
+        # browser took off its stack with them (_end_link), and for how long:
+        # the element that kept on hiding, and where its part of those begins.
         self._veils: list = []
         self._lasting: list = []
         self._opaque = -1
         self._stale: list = []
+        self._keepers: list = []
         self._inert = 0         # depth inside muted or hidden elements
         self._overflow = None   # [tag, depth] of a muted element past _MAX_DEPTH
         self._pre = 0
@@ -2782,6 +2953,14 @@ class _TextConverter(HTMLParser):
                     self._opaque = -1
             if self._stale and self._stale[-1] == here:
                 self._stale.pop()
+            while self._keepers and self._keepers[-1][0] >= here:
+                # A formatting element the browser opened again in this one
+                # is open after it as well: its end tag ends it.
+                first = self._keepers.pop()[1]
+                self._stale[first:] = [
+                    at for at in self._stale[first:]
+                    if self._stack[at].tag == "a"
+                    or self._stack[at].tag not in _REOPENED_TAGS]
             self._close(element)
 
     def _last(self, tags) -> int:
@@ -2840,8 +3019,7 @@ class _TextConverter(HTMLParser):
                 # no link to a browser: such a tag ends nothing, takes no
                 # text and has no part in what is shown.
                 if (found is None or self._veils[0] < found
-                        or self._opaque > found
-                        or (self._stale and self._stale[-1] == found)):
+                        or self._opaque > found or self._gone(found)):
                     return
                 # Nor if an element in the link hides that the browser
                 # keeps (_LASTING_TAGS: a mobile duplicate in a <div>, a
@@ -2865,18 +3043,35 @@ class _TextConverter(HTMLParser):
         on, the first element in the link that the browser keeps — whatever
         hid around that one has ended with the link, so the hiding is over
         when that element is.
+
+        What stands between the two a browser has taken off its stack with
+        the link — all of it but a block and its like, which it moves and
+        keeps open (a formatting element it opens again, inside the one that
+        hides): an end tag of theirs is a stray one, as the link's own </a>
+        is, and does not end the hiding. Once that element has closed, the
+        end tag of a formatting element is a real one again — the browser's
+        copy of it is open — and ends it, and what was opened in it since.
         """
         element = self._stack[index]
         if element.kind == "link":
             self._close(element)
             element.kind = "inline"
-        self._stale.append(index)
         keeper = self._lasting[bisect_right(self._lasting, index)]
+        self._keepers.append((keeper, len(self._stale)))
+        self._stale.extend(
+            at for at in range(index, keeper)
+            if self._stack[at].tag in _REOPENED_TAGS
+            or self._stack[at].tag not in _LASTING_TAGS)
         if self._veils[0] != keeper:
             self._stack[self._veils[0]].kind = "inert"
             self._stack[keeper].kind = "mute"
             del self._veils[:bisect_left(self._veils, keeper)]
             del self._lasting[:bisect_left(self._lasting, keeper)]
+
+    def _gone(self, index: int) -> bool:
+        """Is the element at `index` off a browser's stack (_end_link)?"""
+        at = bisect_left(self._stale, index)
+        return at < len(self._stale) and self._stale[at] == index
 
     # ── parser callbacks ──
 
@@ -3049,8 +3244,8 @@ class _TextConverter(HTMLParser):
         # A stray </div> inside a cell must not close the table around it.
         if tag not in _TABLE_TAGS and self._walls and self._walls[-1] > index:
             return
-        if self._stale and self._stale[-1] == index:
-            return                  # a link that has ended: a stray </a>
+        if self._gone(index):
+            return                  # ended with a link: a stray end tag
         self._pop_to(index)
 
     def _close(self, element: _Element) -> None:

@@ -736,6 +736,68 @@ def test_the_gate_sender_and_a_tombstone_that_keeps_what_was_owed():
     print("PASS test_the_gate_sender_and_a_tombstone_that_keeps_what_was_owed")
 
 
+def test_a_record_is_written_again_in_its_own_place():
+    """``replace``: a mail's record written anew takes the old one's place —
+    its file and its token — in one rename, as either direction; the blobs
+    stay the caller's. A write that fails leaves the old record as it was,
+    and nothing but a record of this store can be replaced."""
+    with tempfile.TemporaryDirectory() as tmp:
+        urn, path, refs = _mail(tmp)
+        others = sorted(ist.messages_dir(tmp).iterdir())
+        before = path.read_bytes()
+        token = urn.rsplit(":", 1)[1]
+        # The same mail as the user's own, read anew: one file still.
+        again, same = ist.write_outbound(tmp, channel="email", chat="root@x.org",
+                                         account=ACCOUNT, text="read at last",
+                                         message_id="m1000@x.org", timestamp=1000.0,
+                                         author="device", sender=ACCOUNT, replace=path)
+        assert same == path and sorted(ist.messages_dir(tmp).iterdir()) == others
+        assert again == f"urn:retinue:outbound:email:{token}"
+        fields = ist.read_record(path)
+        assert fields["type"] == ist.T_OUTBOUND and fields["text"] == "read at last"
+        assert fields["subject"] == again and fields["body_part"] is None
+        # The blobs the old record named are still there: the caller's.
+        assert ist.load_media(tmp, ist.media_id_of(refs["body"])) is not None
+        # Back to inbound, in the same place, and from a tombstone too.
+        ist.tombstone_message(path)
+        urn2, same = ist.write_message(tmp, channel="email", sender="a@x.org",
+                                       text="back", message_id="m1000@x.org",
+                                       chat="root@x.org", account=ACCOUNT, timestamp=1000.0,
+                                       replace=str(path))
+        assert same == path and urn2 == f"urn:retinue:inbound:email:{token}"
+        fields = ist.read_record(path)
+        assert fields["text"] == "back" and not fields["removed_at"]
+        # A write that fails leaves the record as it stood.
+        mid = path.read_bytes()
+        real = ist._render
+        ist._render = lambda fields: (_ for _ in ()).throw(OSError(28, "No space left"))
+        try:
+            ist.write_message(tmp, channel="email", sender="a@x.org", text="x",
+                              replace=path)
+            raise AssertionError("the write fails")
+        except OSError:
+            pass
+        finally:
+            ist._render = real
+        assert path.read_bytes() == mid and path.read_bytes() != before
+        # Only a record of this store.
+        outside = Path(tmp) / "elsewhere.nt"
+        outside.write_text("x")
+        for wrong in (outside, ist.messages_dir(tmp) / "0000000000001000-0123456789abcdef.nt",
+                      ist.messages_dir(tmp) / "notes.nt"):
+            try:
+                ist.write_message(tmp, channel="email", sender="a@x.org", text="x",
+                                  replace=wrong)
+                raise AssertionError(f"replaced {wrong}")
+            except ValueError:
+                pass
+        assert sorted(ist.messages_dir(tmp).iterdir()) == others
+        # Without it, a record is a file of its own as ever.
+        _urn, new = ist.write_message(tmp, channel="signal", sender="+41", text="hi")
+        assert new != path and len(list(ist.messages_dir(tmp).iterdir())) == 2
+    print("PASS test_a_record_is_written_again_in_its_own_place")
+
+
 if __name__ == "__main__":
     test_every_field_is_written_and_read_back()
     test_every_field_survives_every_rewrite()
@@ -752,4 +814,5 @@ if __name__ == "__main__":
     test_discard_media()
     test_iter_records()
     test_the_gate_sender_and_a_tombstone_that_keeps_what_was_owed()
+    test_a_record_is_written_again_in_its_own_place()
     print("all inbound_store mail tests passed")

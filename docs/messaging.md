@@ -422,10 +422,13 @@ arrives in INBOX:
    `gate_sender` on the rail): the one address of a mail with exactly one
    `From` header holding exactly one address — the only form the provider's
    DMARC check of the `From` domain is sure to have looked at — lowercased by
-   its ASCII letters, and none where a character of it folds into ASCII. A
-   mail with none (no `From`, a group, two addresses, two `From` headers) is
-   from nobody: it reaches its chat and buys no turn. The `Sender` header is
-   for display only (`docs/mail-chats.md`, "Who the sender is").
+   its ASCII letters, and none where a character of it stands in for an
+   ASCII one on its own (a Kelvin sign, a long s, a fullwidth letter; `ß`,
+   `ı` and `İ` are letters like any other). A mail with none (no `From`, a
+   group, two addresses, two `From` headers, a header block cut at its
+   256 KiB bound or fetched short of its end) is from nobody: it reaches its
+   chat and buys no turn. The `Sender` header is for display only
+   (`docs/mail-chats.md`, "Who the sender is").
 3. **Offer the chats rail** the mail, with the verdict (`gate: {forward, vip,
    instructed, reason}`) and `handover: true`. The web gateway decides what the
    arrival does: **a mail pushes nothing by default; a contact can say
@@ -458,9 +461,36 @@ poll, the oldest first — a mail whose turn is still at work is passed over
 and takes none of them. While the web gateway does not answer at all (the
 connection refused, a `401`/`403`/`404`, or no answer and none to a `GET`
 either) nothing is tried for 30 seconds, doubling up to 15 minutes. An answer
-about **one** mail — a `408`, `429` or `5xx` for it, or no answer for it while
-the rail answers otherwise — backs off that mail alone: one mail never holds
-back another. A record that cannot be read at that moment is offered again
+about **one** event — a `408`, `429` or `5xx` for it, or no answer for it while
+the rail answers otherwise — backs off that event alone, offer or not (the
+user's own mail, a held or backfilled one, a merge, a removal): it keeps its
+place, only its own chat's later events wait behind it, and every other chat's
+go on — one mail never holds back another. And not for long: after three of
+its own attempts (`RAIL_HOLD_ATTEMPTS`) the event steps aside — an offer is
+then retried among the re-offers, a told event on its own clock — and its
+chat's later events go on, so a mail the web gateway always fails on cannot
+stall its thread. Such an event is sent, when it goes, as the mirror has its
+mail then: a removal names only the mails still gone (none: it is dropped), a
+told mail that is gone by then is not told. A removal also waits while a merge
+of its chat queued before it is still queued, and holds nothing back meanwhile
+(one queued after it goes behind it, in order); and a merge that stepped
+aside queues, in the transaction that takes it, a removal of every removed mail
+of the chat each chat it absorbed is in by then that no queued removal names
+(`live` as then) — behind a chain of merges a removal can go while its mail is
+still under the chat a late merge folds in, and a removal of a mail already gone
+changes nothing.
+`/health` counts the events
+that stepped aside (`waiting.failing`, the oldest failure's time in
+`waiting.failing_since`) and says "N rail event(s) keep failing while others
+are taken" when the rail took an event after the newest of them began to fail,
+and that it "has taken nothing since" that time when it took none; an index
+from before the gateway kept its last take says neither ("N rail event(s) keep
+failing — the oldest for …") until the first take. A merge or removal that gets a `404` (an
+older web gateway without the endpoint) waits without holding anything
+back. Three calls in a row with no answer in time end the
+pass as a rail that does not answer would, so a web gateway too slow for every
+event costs a pass three `MAIL_RAIL_TIMEOUT`s. A record that cannot be read at
+that moment is offered again
 later, and a mailbox that does not answer holds back only new mail: what has
 arrived is offered all the same. The web gateway takes a repeated offer once,
 by its message id. Mail from a sender who is neither VIP nor instructed is
@@ -507,7 +537,10 @@ mirrored mails the chats rail has not taken yet, since when the oldest of them
 has been in the mailbox, and how many news mails wait for the feed or for
 their move. While the web gateway has not answered three times running and
 mail waits, `error` carries a notice saying so (the gateway stays
-`connected`: the mailbox is fine).
+`connected`: the mailbox is fine) — and while it answers and takes no mail:
+once every offer and event of a pass (three at least) failed there, the notice
+says "the chats rail answers but takes no mail" until a mail is taken, and
+what waited over it is then offered again at once.
 
 ### Sending
 
@@ -844,6 +877,7 @@ gate", above).
 | `MAIL_IMAP_TIMEOUT` | `60` | IMAP socket timeout, seconds |
 | `MAIL_MAX_PART_BYTES` | 25 MiB | an attachment larger than this is not stored |
 | `MAIL_MAX_MAIL_BYTES` | 50 MiB | a larger mail keeps its text parts and no attachments |
+| `MAIL_READ_SECONDS` | `30` | how long reading one mail may take, plus a second for each megabyte of it, before the mail is mirrored as a placeholder (`docs/mail-chats.md`, *The mirror*); raise it on a very slow machine |
 | `MAIL_TRIM_WANTING_CHARS` | `2500` | the trim's "still long" threshold (`scripts/mail_trim.py`) |
 | `MAIL_POLICY_WAIT_SECONDS` | *(unset: no limit)* | a positive number: how long the mirror waits for the e-mail policy file before it starts as with no flags |
 | `MAIL_RECENT_CHATS_MAX` | `200` | how many chats `/recent-chats` answers at most |
@@ -993,7 +1027,13 @@ notice by the registry entry's channel). A gateway whose `/health` names
 what holds it when that is not its link (`blocked` — the mail mirror waiting
 for the e-mail policy file) is reported as waiting for its setup, and one
 that names itself (`blocked: "mirror"`) as stopped on a fault of its own —
-with the gateway's own reason in the notice and in every reminder. An outage
+with the gateway's own reason in the notice and in every reminder. A mail
+gateway that works and still cannot read some of its mail says so in
+`/health` (`placeholders`), as does one looking for mail whose records its
+ledger lost (`lost`, counted with them); when five or more such mails stand
+beyond those the user was last told of, the monitor opens a thread of its own
+for it — a notice of lower importance, at most one per reminder interval,
+never an outage (the mail is in the mailbox, and is read again). An outage
 that turns into one of another kind (the gateway that waited for its setup
 now cannot log in) is told in the same thread once as many checks in a row
 have seen it as open an outage (`GATEWAY_MONITOR_FAILURES`), in the new

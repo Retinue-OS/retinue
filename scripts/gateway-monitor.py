@@ -30,6 +30,16 @@ complains that their messages go unanswered. This daemon closes that gap:
     another kind — the gateway that waited for its setup now cannot log in —
     is a second fault, and is told in that thread when it is seen (debounced
     like the first), not at the next reminder.
+  * A gateway that works may still say that it cannot do part of its work:
+    the mail gateway counts the mail it could not read and shows as
+    placeholders (``placeholders`` in its /health). One such mail now and then
+    is the mail's own doing; a run of them is a reader that broke, and with
+    the gateway "connected" nobody would see it. It counts as well the mail it
+    had mirrored and lost the records of (``lost``: a ledger restored from an
+    older backup), which it looks for in the mailbox again. So when more of
+    these stand than the user was last told of, by UNREAD_STEP or more, a
+    notice says so — a notice, never an outage: its own thread, lower in
+    importance, at most one per reminder interval.
 
 Gateways that report ``configured: false`` (a channel the deployment simply
 does not use) are skipped, as are slugs listed in GATEWAY_MONITOR_IGNORE.
@@ -62,6 +72,9 @@ LOG = "[gateway-monitor]"
 # next digest in the others — a dead channel is serious, not critical: nothing
 # is lost, messages queue at the channel until it is back.
 OUTAGE_ATTENTION = {"importance": 5, "sphere": "system", "kind": "system alert", "lead": "60m"}
+# Mail a working gateway cannot read is worth knowing and nothing to be woken
+# for: every mail is still in the mailbox, and each is read again by itself.
+UNREAD_ATTENTION = {"importance": 3, "sphere": "system", "kind": "system notice"}
 
 
 INTERVAL = float(os.environ.get("GATEWAY_MONITOR_INTERVAL", "") or "60")
@@ -70,6 +83,10 @@ FAIL_THRESHOLD = int(os.environ.get("GATEWAY_MONITOR_FAILURES", "") or "2")
 # While a gateway stays down, re-remind in the incident thread this often.
 REMIND_SECONDS = float(os.environ.get("GATEWAY_MONITOR_REMIND_SECONDS", "") or str(6 * 3600))
 HEALTH_TIMEOUT = float(os.environ.get("GATEWAY_MONITOR_HEALTH_TIMEOUT", "") or "10")
+# How many more mails than the user was last told of a working mail gateway
+# may be unable to read (or be looking for again) before a notice says so
+# (see unread_message).
+UNREAD_STEP = 5
 # Comma-separated slugs to exclude from monitoring (e.g. a deliberately
 # unlinked channel the deployment keeps around).
 IGNORE = {s.strip() for s in os.environ.get("GATEWAY_MONITOR_IGNORE", "").split(",") if s.strip()}
@@ -119,6 +136,25 @@ def classify_health(status: int | None, body: dict | None, error: str | None = N
         held = body.get("blocked")
         return ("faulty" if held in _OWN_FAULTS else "blocked" if held else "down"), reason
     return "up", None
+
+
+def unread_mail(body) -> dict | None:
+    """What a gateway's /health says of mail it could not read (the mail
+    gateway's ``placeholders``: how many stand, how many it made since it
+    started, and why) and of mail whose records it lost and looks for again
+    (its ``lost``: how many), or None where it says nothing of the kind."""
+    seen = body.get("placeholders") if isinstance(body, dict) else None
+    if not isinstance(seen, dict):
+        return None
+    try:
+        counts = {key: max(0, int(seen.get(key) or 0)) for key in ("standing", "made")}
+        lost = max(0, int(body.get("lost") or 0))
+    except (TypeError, ValueError):
+        return None
+    why = seen.get("why") if isinstance(seen.get("why"), dict) else {}
+    return {**counts, "why": {str(reason)[:80]: count for reason, count in why.items()
+                              if isinstance(count, int) and not isinstance(count, bool)},
+            "lost": lost}
 
 
 def repair_url() -> str:
@@ -259,6 +295,45 @@ def recovery_message(label: str, channel: str | None = None, blocked=False) -> s
             f"{'running' if _held(blocked) else 'connected'} again. No further action needed.")
 
 
+def unread_title(label: str) -> str:
+    return f"{label} gateway cannot read some mail"
+
+
+def unread_message(label: str, unread: dict, channel: str | None = None) -> str:
+    """The notice for a gateway that works and cannot read some of its mail,
+    or looks for mail whose records it lost. It blames no login, no server
+    and no phone, and reports no outage: mail is flowing. It says how many,
+    why as the gateway counts them, that nothing is lost — and that a run of
+    them is the gateway's to explain."""
+    standing, made, lost = unread["standing"], unread["made"], unread.get("lost", 0)
+    noun = wording(channel)["noun"]
+    lines = []
+    if standing or not lost:
+        lines.append(
+            f"The {label} {noun} is running, but {standing} mail(s) could not be read "
+            f"and stand in their chats as placeholders ({made} made since the gateway "
+            f"started). Nothing is lost: each mail is unchanged in the mailbox, and the "
+            f"gateway reads it again every hour.")
+    if lost:
+        lines.append(
+            (f"And {lost}" if lines else f"The {label} {noun} is running, but {lost}")
+            + " mail(s) it had mirrored are missing from its records (restored from an "
+            "older backup, or a record file removed). Nothing is lost: it looks for each "
+            "in the mailbox by its Message-ID, and puts it back in its chat once found.")
+    why = sorted(unread["why"].items(), key=lambda item: (-item[1], item[0]))
+    if standing and why:
+        lines.append("Why, as the gateway counts them: "
+                     + "; ".join(f"{reason} ({count})" for reason, count in why[:6]) + ".")
+    if standing or not lost:
+        lines.append(
+            f"One such mail now and then is that mail's own doing. A run of them means "
+            f"the gateway's reader fails on mail it should read: its log names each mail "
+            f"and what failed. {repair_link()} shows the gateway's status.")
+    else:
+        lines.append(f"{repair_link()} shows the gateway's status.")
+    return "\n\n".join(lines)
+
+
 class MonitorEngine:
     """Per-gateway outage state machine, separated from I/O for testability.
 
@@ -285,17 +360,55 @@ class MonitorEngine:
       turning     another verdict the checks say now, ``turned`` of them in a
                   row, since ``turn_since`` — not told yet
       last_notice timestamp of the last message posted for this outage
+      unread      what the user was told of mail the gateway cannot read (see
+                  ``_note_unread``): ``told`` such mails, at ``last_notice``,
+                  in ``thread_id``. Kept across outages: it is no part of one.
     """
 
     def __init__(self, notifier, state: dict | None = None,
-                 fail_threshold: int = FAIL_THRESHOLD, remind_seconds: float = REMIND_SECONDS):
+                 fail_threshold: int = FAIL_THRESHOLD, remind_seconds: float = REMIND_SECONDS,
+                 unread_step: int = UNREAD_STEP):
         self.notifier = notifier
         self.state = state if state is not None else {}
         self.fail_threshold = fail_threshold
         self.remind_seconds = remind_seconds
+        self.unread_step = unread_step
+
+    def _note_unread(self, slug: str, label: str, unread: dict | None, now: float,
+                     channel: str | None) -> None:
+        """A gateway that is up, and what it says of mail it could not read
+        (``unread_mail``) — placeholders, and mail whose records it lost and
+        looks for again, counted together. The user is told when
+        ``unread_step`` or more of them stand beyond those last told of —
+        once, then not again before a reminder interval has passed, however
+        fast they come. Mails that were read since (placeholders heal, lost
+        mail is found) count no more, so a later run is news again. Never an
+        outage: the gateway's state stays "up"."""
+        entry = self.state[slug]
+        standing = unread["standing"] + unread.get("lost", 0) if unread else 0
+        if not unread or not (standing or entry.get("unread")):
+            return
+        seen = entry.setdefault("unread", {})
+        seen["told"] = min(int(seen.get("told", 0)), standing)
+        last = seen.get("last_notice")
+        if standing - seen["told"] < self.unread_step \
+                or (last is not None and now - float(last) < self.remind_seconds):
+            return
+        text = unread_message(label, unread, channel)
+        if seen.get("thread_id"):
+            sent = self.notifier.append(seen["thread_id"], text)
+        else:
+            sent = seen["thread_id"] = self.notifier.open_thread(
+                unread_title(label), text, attention=UNREAD_ATTENTION)
+        if sent:
+            print(f"{LOG} {slug}: {unread['standing']} mail(s) it cannot read, "
+                  f"{unread.get('lost', 0)} it looks for again", flush=True)
+            seen.update(told=standing, last_notice=now)
+        # else: backend unreachable — retry on the next tick
 
     def step(self, slug: str, label: str, verdict: str, reason: str | None,
-             now: float | None = None, channel: str | None = None) -> None:
+             now: float | None = None, channel: str | None = None,
+             unread: dict | None = None) -> None:
         if verdict == "unconfigured":
             self.state.pop(slug, None)
             return
@@ -310,7 +423,9 @@ class MonitorEngine:
                         recovery_message(label, channel, blocked=entry.get("told")),
                         quiet=True)
                 print(f"{LOG} {slug}: recovered", flush=True)
-            self.state[slug] = {"status": "up", "fails": 0}
+            self.state[slug] = {"status": "up", "fails": 0,
+                                **({"unread": entry["unread"]} if entry.get("unread") else {})}
+            self._note_unread(slug, label, unread, now, channel)
             return
 
         # verdict == "down", "blocked" or "faulty"
@@ -387,8 +502,10 @@ def _save_state(state: dict) -> None:
         print(f"{LOG} could not persist state: {exc}", flush=True)
 
 
-def check_gateway(gw: dict) -> tuple[str, str | None]:
-    """GET <base_url>/health and classify the result."""
+def check_gateway(gw: dict) -> tuple[str, str | None, dict | None]:
+    """GET <base_url>/health and classify the result: ``(verdict, reason,
+    unread)`` — the last is what the gateway says of mail it could not read
+    (``unread_mail``), None for one that says nothing of the kind."""
     url = f"{gw['base_url']}/health"
     headers = {}
     if gw.get("token"):
@@ -397,11 +514,11 @@ def check_gateway(gw: dict) -> tuple[str, str | None]:
         req = urllib.request.Request(url, headers=headers)
         with urllib.request.urlopen(req, timeout=HEALTH_TIMEOUT) as resp:
             body = json.loads(resp.read().decode("utf-8"))
-            return classify_health(resp.status, body)
+            return (*classify_health(resp.status, body), unread_mail(body))
     except urllib.error.HTTPError as exc:
-        return classify_health(exc.code, None)
+        return (*classify_health(exc.code, None), None)
     except Exception as exc:  # noqa: BLE001 - unreachable counts as down
-        return classify_health(None, None, error=str(exc))
+        return (*classify_health(None, None, error=str(exc)), None)
 
 
 def main() -> None:
@@ -420,9 +537,9 @@ def main() -> None:
     while True:
         for slug, gw in watched.items():
             try:
-                verdict, reason = check_gateway(gw)
+                verdict, reason, unread = check_gateway(gw)
                 engine.step(slug, gw.get("label") or slug.title(), verdict, reason,
-                            channel=gw.get("channel"))
+                            channel=gw.get("channel"), unread=unread)
             except Exception as exc:  # noqa: BLE001 - one gateway must not stall the loop
                 print(f"{LOG} error checking {slug}: {exc}\n{traceback.format_exc()}", flush=True)
         _save_state(engine.state)

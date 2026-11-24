@@ -63,9 +63,37 @@ The format is **N-Triples**, which gives two properties at once:
   path;
 - a person or agent may add triples of their own (an address, a birthday, an
   organisation, a note). A rewrite removes only the triples this module would
-  itself have written for the person's previous state and keeps every other
-  line byte for byte, comments included. Deleting a person removes their
+  itself have written for the person's previous state, and the lines a read
+  *took* into the person in a spelling of their own (below), and keeps every
+  other line byte for byte, comments included. Deleting a person removes their
   managed triples; if anything else is left, the file stays.
+
+**Values written by hand, twice or in another spelling.** A read takes a value
+it understands into the person, whatever spelling a hand edit or a merged
+chamber sync left: every domain, address and telephone (each once, in today's
+spelling), the VIP flag (`"true"`/`"1"`, any case; any one says VIP), the
+highest importance of the literals that hold one, and **every** instruction
+literal that says anything, joined by a blank line — so no instruction hides
+behind another, and the one the user is shown is all the gate reads. A rewrite
+removes exactly what the read took, and only on these terms:
+
+- a line the read did not take stays exactly as written: a domain that is
+  none, a VIP flag or importance in a spelling this module does not read, an
+  empty instruction;
+- a rewrite that leaves the instruction as it was leaves its literals as the
+  user wrote them (two stay two); one that changes it — the user edited the
+  text they were shown, or the migration added a rule to it — writes the new
+  text as one literal. Sending back the instruction a person carries (the
+  editors send the one they showed with every save) leaves it as it was;
+- literals that join to more than the instruction's limit (2000
+  characters) are read whole — no word is dropped, and the brief carries
+  all of it. Every write that leaves the instruction (a name, VIP, a handle,
+  importance) goes through and keeps them; a write that changes it is held
+  to the limit, and the refusal says how long the joined one is now — cut
+  it to 2000 to change it;
+- a second importance below the one read stays while the importance is left
+  as it was; a rewrite that sets the importance replaces every literal it was
+  read from, so the value the user removed or lowered does not come back.
 
 A person described by hand in the address-book directory (`foaf:Person` or
 `schema:Person`, with a name, `vcard:hasEmail` or `vcard:hasTelephone`) is a
@@ -299,7 +327,8 @@ applies to each message**, and that brief, not the arrival, should decide how
 loudly the message rings.
 
 That is the **instruction**: free text the user writes on the person
-(`kb:instruction`; at most 2000 characters). It is the **person's, on every
+(`kb:instruction`; at most 2000 characters — a hand edit or a merge can join
+more, see "Values written by hand"). It is the **person's, on every
 channel**: an instruction written for their mail also briefs a turn for each
 of their Signal, WhatsApp, Telegram and SMS messages, whose ring then waits for
 that turn's verdict. When a message arrives from a person with an instruction:
@@ -366,13 +395,53 @@ instruction without VIP and has it ask for a high importance.
   Read · Archived* in docs/messenger-chats.md.
 - **A turn cannot silence the mail it was given.** An instructed mail turn
   may archive its thread (`scripts/chat-flags.py`) where the instruction
-  asks. An archive or a mute the turn sets is recorded as the turn's own: a
-  turn that ends with a verdict keeps them, and the mail rings nothing; a turn
-  that fails, ends without a verdict or times out has them undone — the thread
-  un-archived and un-muted — before the failure ring. And a turn's archive covers only what
-  the turn was started for: if another mail arrived in the thread after the
-  turn's own, the thread is not archived (the answer says `newer mail
-  arrived`), and the mailbox is touched only for the mail the turn worked.
+  asks — and that is all a turn may do with a chat's flags. It cannot mute
+  it: a mute asked by a running arrival turn is taken as an archive of the
+  turn's own mail (the answer says `a turn cannot mute; archived instead`,
+  or why the archive was not made either). Nor can it take a mute off,
+  bring an archived thread back or star it: those change nothing, and the
+  answer says so (`a turn cannot unmute or unarchive`). The web gateway
+  decides that, not the turn: a call on the thread while a mail's turn runs
+  on it is the turn's whether it carries the turn's token
+  (`RETINUE_ARRIVAL_TURN`, sent by `chat-flags.py`) or leaves it out — the
+  answer then says `a turn is running on this chat; …` — unless it carries
+  the proof a dashboard thread's turn is handed (`RETINUE_USER_TURN`). The
+  user's own endpoint (`POST /chats/<id>/flags`, which needs no token) is
+  accepted only through the reverse proxy, like a chat's delete and send,
+  where `EDGE_PROXY_PEERS` names the reverse proxy: the web gateway then
+  refuses every peer it does not name, a caller inside the container
+  included. Without that setting it refuses only a loopback peer and a
+  peer that is the very address the caller dialled, so a caller inside the
+  container that comes in from another of the container's addresses, or
+  through a sibling that relays (the egress-audit proxy), is taken for the
+  dashboard; and where the proxy itself arrives on loopback (host
+  networking) it cannot tell the two apart at all. So, on a deployment
+  that sets `EDGE_PROXY_PEERS` to its proxy, a mail asking its turn to
+  undo the user's mute on its own thread gets nowhere while the turn runs.
+  That is all it holds: the turn's session holds the backend token every
+  agent session holds, so it can set another chat's flags with the
+  user's meaning, and a process it leaves behind can act once the turn has
+  ended; and while a dashboard turn the user started runs, its proof sits
+  in that turn's process environment, which another session of the same
+  uid can read — sessions are not sandboxed from one another. A guard
+  against a turn that was talked into something, not a sandbox. Muting stays the user's — their own flags, or
+  Ara acting on their word from their own dashboard thread, whose call
+  carries that turn's proof and mutes even while a mail's turn runs (on a
+  messenger chat, as before the gate, any call without a turn's token
+  does). The archive a mail turn sets
+  is recorded as the turn's own: a turn that ends with a verdict keeps it, and
+  the mail rings nothing; a turn that fails, ends without a verdict or times
+  out has it undone — the thread un-archived — before the failure ring. That
+  undo is for mail only: a messenger turn's archive stands as it always did
+  (docs/messenger-chats.md). And a turn's archive covers only what the turn
+  was started for and shown: if another mail arrived in the thread after the
+  turn's own, or waits for a turn of its own, the thread is not archived
+  (the answer says `newer mail arrived`), and the mailbox is touched only
+  for the mail the turn worked — unless every mail after the turn's own was
+  worked by a completed turn that asked for the archive too, and was
+  trusted with it (a verdict, set before the timeout rang), since the user
+  last brought the thread back: the turn for the older mails of a batch too
+  big to quote whole, which runs last, archives the thread then.
 - **No sending on a messenger.** A reply is only ever staged in the chat's
   draft; the user's send press is the only way a chat reply leaves in their
   name. That is how the chat surface works for every agent

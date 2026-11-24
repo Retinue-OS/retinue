@@ -294,7 +294,8 @@ why is `docs/mail-chats.md`, "The migration"; this is how an operator runs it.
 
 **It runs by itself.** The entrypoint secures the legacy whitelist triples
 first thing (`--step snapshot`, which also fixes the cutoff: only `sender:`
-memories recorded before the new code first ran are triage's) and starts the
+memories recorded before the new code first ran are triage's; it is kept in
+the marker, in `.migration-cutoff` beside it and in the snapshot) and starts the
 migration in the background once the daemons are up (`--boot`): the pending
 steps, a few tries where the life store or the model is not there yet, polls
 while the mail mirror does its first backfill (at most
@@ -338,8 +339,10 @@ docker exec <retinue> python3 /workspace/scripts/migrate-triage.py --step memori
 Run it with `docker exec` on the `retinue` container rather than from an
 agent session where you can: the user's own addresses get no contact, and the
 script knows them by the mailbox variables a session's environment does not
-carry (a session gets `TRIAGE_STATE_DIR`, `MAIL_OWN_ADDRESSES` and the
-script's tunables — enough for the thread's "show the report" — but never
+carry (a session gets `TRIAGE_STATE_DIR`, `MAIL_OWN_ADDRESSES`, the
+script's tunables and the two verdict timeouts its report states,
+`MAIL_INSTRUCTION_TIMEOUT` and `CHAT_INSTRUCTION_TIMEOUT` — enough for the
+thread's "show the report" — but never
 `EMAIL_USER*`; beyond those the script knows them only by what the mirror
 shows: its accounts, and the addresses the user's mail went out under). A run
 by hand opens no thread; it prints the report. The memories step starts a
@@ -356,12 +359,39 @@ beforehand.
   is on a contact and whose memory waits to be superseded is not written
   again, so an edit on the contact meanwhile stands.
 - **Exit status** 0: everything asked for is complete; 75: something is
-  pending, and the report says what; 1: the marker could not be read —
-  nothing was changed, move the file aside (every step is safe to repeat).
+  pending, and the report says what; 1: the marker, the cutoff file or the
+  snapshot could not be read — nothing was changed, and the log line names
+  the file and its way out:
+  - **the marker** (`.migrated-to-contacts.json`): move it aside to start
+    its journal afresh (every step is safe to repeat), but **keep
+    `.migration-cutoff` and `.legacy-email-whitelist.json`**: the cutoff they
+    hold is what keeps the sender memories stored since the upgrade out of
+    the migration, and a marker that is missing adopts it from them;
+  - **the cutoff file** (`.migration-cutoff`): where the marker or the
+    snapshot still holds the cutoff (the log line says so, with the time),
+    move it aside — the next run writes it back from them; where neither
+    does, restore it from a backup (one line, the time it held), since a run
+    with none of the three takes a new cutoff;
+  - **the snapshot** (`.legacy-email-whitelist.json`): restore it from a
+    backup rather than move it aside — it holds the legacy whitelist, which
+    the policy file loses on its next write; moved aside, only what the
+    policy files still hold is secured again.
 - **The model only classifies.** Either way an instruction's text is the
-  memory's own (or, for a filing memory whose text names a document and
-  filing it, the fixed filing instruction); nothing the model writes reaches
-  a contact.
+  memory's own, first — for a filing memory whose text names a document and
+  filing it, followed by one fixed line that yields to those words
+  ("Unless the note above says otherwise: file the document …"), placed as
+  the instruction's last paragraph — a later note goes in front of it, and
+  it is never added twice. It is known by its exact text (as a line of its
+  own, or at the very end whatever stands before it), and, on a person the
+  migration's journal records it placed the line on, by that opening at the
+  start of any line however you edit or move it (there, a paragraph of
+  yours that begins with those words is taken for the line too; of several,
+  the exact one, then the last); on anyone else a paragraph of yours that
+  begins with those words is yours — notes go after it, and a filing note
+  adds the real line. A line you delete stays deleted: a later filing note
+  for that person adds its own words alone. Nothing the model writes
+  reaches a contact, and nothing but a later note in front of that line is
+  ever put in front of the user's words or in their place.
 - **`--no-model`** carries every sender rule over verbatim. Nothing then
   judges whether a memory's text was the user's instruction or something a
   message said: read the instructions it wrote (the report lists them).
@@ -371,16 +401,25 @@ beforehand.
   message worked by a model turn from then on, its ring waiting up to
   `CHAT_INSTRUCTION_TIMEOUT`; a mail's ring waits up to
   `MAIL_INSTRUCTION_TIMEOUT` (600 s by default; raise it where filing turns
-  run longer). The report names the briefed people who hold messenger
-  handles or a phone.
+  run longer). Briefed means the migration set the person's first
+  instruction, as its journal recorded at the write (a contact it created
+  by the creation time it journaled: one you file by hand after a kill is
+  read as it stands). The report names the
+  briefed people who hold messenger handles or a phone, and lists apart
+  those of them whose instruction the user has edited since (taking it off
+  would take those edits too). A person who already carried an instruction
+  of the user's is not among them: where a rule was appended to it, the
+  report lists them apart again — take such a rule back off by editing the
+  instruction, never with `--no-instruction`, which takes the user's own
+  words too.
 - **What is left for a person:** the scheduled jobs that run `triage-gate.py`
   (to remove) and the prompt jobs that only mention triage (to check — a
   messenger recovery job still belongs), both named in the report; a rule the
   report lists as left alone that should stand (`contacts.py update <id>
   --instruction …`, then `memory.py store --supersedes <memory id> …`); two
   contacts the report says share a name; and taking the instruction off any
-  migrated contact whose messages do not need a model turn each time
-  (`contacts.py update <id> --no-instruction`, or the Contacts page).
+  contact the migration briefed whose messages do not need a model turn each
+  time (`contacts.py update <id> --no-instruction`, or the Contacts page).
 - **Nothing is deleted, and the way back is by hand.** A contact it created
   is deleted on the Contacts page; an instruction is edited there. A
   superseded memory is still in the log (`memory.py recall --tag

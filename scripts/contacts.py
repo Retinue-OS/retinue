@@ -173,7 +173,9 @@ _HEADER = ("# Contact managed by scripts/contacts.py (docs/contacts.md).\n"
            "# Lines it did not write are kept on every rewrite: add your own freely.\n")
 
 # An instruction is a brief, not a document: it rides in every prompt a
-# message of this person's buys, so it is kept to what a brief needs.
+# message of this person's buys, so it is kept to what a brief needs: every
+# write that sets one is held to this. Literals a hand edit or a merge joined
+# past it are read whole and left as they are until the user changes them.
 INSTRUCTION_MAX = 2000
 
 
@@ -495,13 +497,41 @@ def _person_triples(record: dict) -> set[tuple[str, str, str]]:
     return out
 
 
-def _read_spellings(record: dict, triples) -> set[tuple[str, str, str]]:
-    """The person's triples a read took into ``record`` from a spelling other
+_VIP_SPELLINGS = {"true": True, "1": True, "false": False, "0": False}
+
+
+def _vip_value(term: str) -> bool | None:
+    """What a ``kb:vip`` literal says, or None for a spelling this module
+    does not read (it then says nothing)."""
+    return _VIP_SPELLINGS.get((_lit_value(term) or "").strip().lower())
+
+
+def _instruction_texts(terms) -> list[str]:
+    """The texts of a person's ``kb:instruction`` literals that say anything,
+    each once, in a fixed order (the literals' own, so that a rewrite that
+    re-sorts the file reads them the same)."""
+    texts = [(_lit_value(term) or "").replace("\r\n", "\n").strip() for term in sorted(terms)]
+    return list(dict.fromkeys(t for t in texts if t))
+
+
+def _read_spellings(record: dict, triples, new: dict | None = None) -> set[tuple[str, str, str]]:
+    """The person's triples a read TOOK into ``record`` from a spelling other
     than the one _person_triples renders — a domain written by hand as
     ``*@acme.org`` or ``ACME.org``, ``mailto:Mara@…``, ``tel:+41 79 …``, a VIP
-    flag as ``"1"``. A rewrite takes them away with the rest; otherwise a value
-    the user removed stays in the file, and the next read brings it back. A
-    line that read nothing into the record (a domain that is none) is left."""
+    flag as ``"1"``, an importance as ``"4.50"``, every instruction literal
+    the record's instruction was joined from (which only a rewrite that
+    changes the instruction replaces: _write). A rewrite takes them away with
+    the rest; otherwise a value the user removed stays in the file, and the
+    next read brings it back. ``new`` is what the rewrite writes (None: the
+    person is deleted).
+
+    A literal the read did not take stays exactly as it was written: a
+    domain that is none, an importance or VIP flag in a spelling this module
+    does not read, an empty instruction — and a second importance that the
+    record's (the highest) is not a spelling of, as long as the rewrite
+    leaves the importance as it was. A rewrite that changes the importance
+    replaces every literal it was read from: the user set the value they
+    were shown, and a lower one left behind would come back in its place."""
     s = _iri(record["iri"])
     phones = set(record.get("all_phones") or record.get("phones") or [])
     out = set()
@@ -520,15 +550,23 @@ def _read_spellings(record: dict, triples) -> set[tuple[str, str, str]]:
         elif pred == VCARD + "hasTelephone":
             value = _iri_value(obj) or ""
             hit = value.lower().startswith("tel:") and normalize_phone(value[4:]) in phones
-        elif pred in (KB + "vip", KB + "instruction"):
-            # One value of the person's, read from whichever literal decides;
-            # one left behind would surface the moment the user changes it.
-            hit = _lit_value(obj) is not None
+        elif pred == KB + "vip":
+            # Read as "any literal says true": every literal that says what
+            # the record holds is a spelling of it. One that says the other
+            # value decides nothing (a "false" beside a "true") and stays.
+            said = _vip_value(obj)
+            hit = said is not None and (new is None or said == bool(record.get("vip")))
+        elif pred == KB + "instruction":
+            # The record holds every literal that says anything, joined.
+            hit = bool(_instruction_texts([obj]))
         elif pred == KB + "importance":
             try:
-                hit = _importance(_lit_value(obj)) is not None
+                value = _importance(_lit_value(obj))
             except ContactError:
-                hit = False
+                value = None
+            hit = value is not None and (
+                value == record.get("importance") or new is None
+                or new.get("importance") != record.get("importance"))
         else:
             hit = False
         if hit:
@@ -550,6 +588,7 @@ def _records_from(triples, path: Path, chamber: str, rel: str) -> list[dict]:
                   "phones": [], "accounts": [], "created": None, "importance": None,
                   "permits": [], "vip": False, "instruction": None, "domains": []}
         tels = []
+        importances = []
         for p, o in sorted(props):
             pred = _iri_value(p)
             if pred in (VCARD + "fn", FOAF + "name", "http://schema.org/name") and not record["name"]:
@@ -562,15 +601,15 @@ def _records_from(triples, path: Path, chamber: str, rel: str) -> list[dict]:
                 record["tags"].append(urllib.parse.unquote(_iri_value(o)[len(SPHERE_PREFIX):]))
             elif pred == KB + "importance":
                 try:
-                    record["importance"] = _importance(_lit_value(o))
+                    value = _importance(_lit_value(o))
                 except ContactError:
-                    pass
+                    value = None
+                if value is not None:
+                    importances.append(value)
             elif pred == KB + "permit" and (_iri_value(o) or "").startswith(MODE_PREFIX):
                 record["permits"].append(urllib.parse.unquote(_iri_value(o)[len(MODE_PREFIX):]))
             elif pred == KB + "vip":
-                record["vip"] = (_lit_value(o) or "").strip().lower() in ("true", "1")
-            elif pred == KB + "instruction" and not record["instruction"]:
-                record["instruction"] = (_lit_value(o) or "").strip() or None
+                record["vip"] = record["vip"] or bool(_vip_value(o))
             elif pred == VCARD + "hasEmail" and (_iri_value(o) or "").lower().startswith("mailto:"):
                 record["emails"].append(_iri_value(o)[7:].lower())
             elif pred == KB + "emailDomain":
@@ -588,6 +627,12 @@ def _records_from(triples, path: Path, chamber: str, rel: str) -> list[dict]:
                 handle = _lit_value(acct.get(_iri(FOAF + "accountName"), "") or "")
                 if channel and handle:
                     record["accounts"].append((channel, handle))
+        # One value from however many literals a hand edit or a merge left:
+        # the highest importance, and every instruction, joined — no word of
+        # the user's is dropped, and a rewrite that changes it writes one.
+        record["importance"] = max(importances) if importances else None
+        record["instruction"] = "\n\n".join(_instruction_texts(
+            o for p, o in props if _iri_value(p) == KB + "instruction")) or None
         # A telephone an account already implies is not a number of its own.
         implied = {h for _c, h in record["accounts"] if _PHONE_RE.match(h)}
         record["phones"] = sorted({t for t in tels if t not in implied})
@@ -623,15 +668,23 @@ def _importance(value) -> float | None:
     return number
 
 
-def _instruction(value) -> str | None:
+def _instruction_text(value) -> str | None:
+    """An instruction as it is compared and kept: trimmed, line ends
+    normalised, None for none."""
+    return None if value is None else (str(value).replace("\r\n", "\n").strip() or None)
+
+
+def _instruction(value, current: str | None = None) -> str | None:
     """A standing instruction as the person keeps it: the user's own words,
-    trimmed, or None for none."""
-    if value is None:
-        return None
-    text = str(value).replace("\r\n", "\n").strip()
-    if len(text) > INSTRUCTION_MAX:
-        raise ContactError(f"an instruction is at most {INSTRUCTION_MAX} characters, not {len(text)}")
-    return text or None
+    trimmed, or None for none — held to INSTRUCTION_MAX. ``current`` is the
+    one the person carries now, which the refusal states: joined from
+    several literals of a hand edit or a merge, it can be longer (read
+    whole, kept as it is by every write that leaves it: ContactBook.update)."""
+    text = _instruction_text(value)
+    if text and len(text) > INSTRUCTION_MAX:
+        now = f"; the one they carry now is {len(current)}" if current else ""
+        raise ContactError(f"an instruction is at most {INSTRUCTION_MAX} characters, not {len(text)}{now}")
+    return text
 
 
 def _modes(values) -> list[str]:
@@ -884,9 +937,14 @@ class ContactBook:
             triples, other = [], []
         keep = set(triples)
         if old:
-            keep -= _person_triples(old) | _read_spellings(old, triples)
+            keep -= _person_triples(old) | _read_spellings(old, triples, new)
         if new:
             keep |= _person_triples(new)
+        if old and new and old.get("instruction") == new.get("instruction"):
+            # A rewrite that leaves the instruction leaves its literals as the
+            # user wrote them — two of them stay two, not one joined text.
+            s, pred = _iri(old["iri"]), _iri(KB + "instruction")
+            keep = {t for t in keep if t[:2] != (s, pred)} | {t for t in triples if t[:2] == (s, pred)}
         if not keep and not other:
             path.unlink(missing_ok=True)
         else:
@@ -956,8 +1014,12 @@ class ContactBook:
                 new["permits"] = _modes(permits)
             if vip is not None:
                 new["vip"] = bool(vip)
-            if instruction is not False:
-                new["instruction"] = _instruction(instruction)
+            if instruction is not False and _instruction_text(instruction) != old.get("instruction"):
+                # The instruction as it stands, sent back with a change to
+                # something else (the editors send what they showed), is
+                # left as it is — also one a hand edit or a merge joined
+                # past the limit: only a change is held to it.
+                new["instruction"] = _instruction(instruction, old.get("instruction"))
             for channel, handle in (normalize_handle(c, h) for c, h in remove):
                 _remove_pair(new, (channel, handle))
             for channel, handle in (normalize_handle(c, h) for c, h in add):

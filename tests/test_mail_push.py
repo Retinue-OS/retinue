@@ -326,6 +326,12 @@ def test_one_run_is_one_mail():
                              "unconfirmed": True, "message_id": "m@example.org"})
         code, out, err = push("--to", "ann@x.org", "x", env=env)
         assert code == 1 and "NOT KNOWN" in err and f"--request-key {stub.key()}" in err
+        # Whatever status it comes with: something between this and the
+        # gateway that answered 202 for it has not made it "sent".
+        stub.answer = (202, {"error": "the mail server has not confirmed this mail",
+                             "unconfirmed": True, "message_id": "m@example.org"})
+        code, out, err = push("--to", "ann@x.org", "x", env=env)
+        assert code == 1 and "mail-push: sent" not in out and "NOT KNOWN" in err, (out, err)
         stub.answer = (502, {"error": "send failed: 554 rejected"})
         code, out, err = push("--to", "ann@x.org", "x", env=env)
         assert code == 1 and "554" in err and "NOT KNOWN" not in err

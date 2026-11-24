@@ -470,8 +470,8 @@ def _load_gateway(tmp: Path, sparql_port: int, gw_port: int):
     # These tests drive the handler directly over loopback, which the
     # user-authority gate refuses (see tests/test_chat_send_authority.py).
     # Pinning the harness's own peer is the same knob a deployment uses to name
-    # its reverse proxy, so the send paths run exactly as the dashboard reaches
-    # them; the gate itself is covered in its own file.
+    # its reverse proxy, so the send, delete and flags paths run exactly as the
+    # dashboard reaches them; the gate itself is covered in its own file.
     os.environ["EDGE_PROXY_PEERS"] = "127.0.0.1"
     os.environ["CHAT_STATE_DIR"] = str(tmp / "chat-state")
     os.environ["CHAT_LIST_CACHE_SECONDS"] = "0"
@@ -540,9 +540,10 @@ def _stub_send_message(prompt, display_question=None, session_key=None,
                        model=None, restart_message=None, resume=True,
                        reply_attachments=False, reply_shell_actions=None,
                        thread_id=None, prompt_builder=None,
-                       display_message_id=None):
+                       display_message_id=None, arrival_turn=None, user_turn=None):
     TURNS.append({"prompt": prompt, "question": display_question,
-                  "session": session_key, "resume": resume})
+                  "session": session_key, "resume": resume, "token": arrival_turn,
+                  "user_turn": user_turn})
     # What the session does while it runs — an instructed turn setting its
     # verdict, say.
     during = TURN_GATE.get("during")

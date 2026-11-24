@@ -394,7 +394,8 @@ def _load_gateway(tmp: Path, sparql_port: int):
                 "RETINUE_CSP"):
         os.environ.pop(var, None)
     # The harness's own peer stands for the reverse proxy, as in
-    # tests/test_chat_api.py: the user-authority gate has its own file.
+    # tests/test_chat_api.py — the user's own flags, send and delete calls
+    # are the dashboard's: the user-authority gate has its own file.
     os.environ["EDGE_PROXY_PEERS"] = "127.0.0.1"
     os.environ["CHAT_STATE_DIR"] = str(tmp / "chat-state")
     os.environ["CHAT_LIST_CACHE_SECONDS"] = "0"

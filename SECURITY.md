@@ -142,9 +142,12 @@ nothing new.
   narrow: a mail has a gate sender only when it carries exactly one `From`
   header holding exactly one address the mail gateway's own grammar accepts,
   lowercased by its ASCII letters alone — and none at all where a character
-  of that address folds into ASCII on some reading (a Kelvin sign, a
-  fullwidth letter), so no Unicode folding, on either side, can make it equal
-  to an address the address book holds. The `Sender` header, and the first of
+  of that address stands in for an ASCII one on its own (its compatibility
+  form is ASCII, or its lowercase or case fold is one ASCII character: a
+  Kelvin sign, a long s, a fullwidth letter), so no Unicode folding, on
+  either side, can make it equal to an ASCII address the address book holds;
+  nor where its header block was cut at its bound, since a second `From`
+  past the cut is never seen. The `Sender` header, and the first of
   several `From` addresses, are shown as who a mail is from and decide
   nothing. That address, or a domain a contact files, is what the gate
   matches against the VIP and instructed senders, what the instruction is
@@ -162,7 +165,27 @@ nothing new.
   briefed by the sender's instruction — which can file the documents it
   carries, archive the thread (moving its mails out of the inbox) and send a
   reply under the mailbox's send policy, at once under `allow` where the
-  instruction approves that in so many words. One that forges a contact with
+  instruction approves that in so many words. Archiving is all such a turn
+  can do with its own thread's flags while it runs: the web gateway takes a
+  flags call on that thread as the turn's — its mute an archive, its unmute,
+  unarchive and star nothing — whether or not the call carries the turn's
+  token, unless it carries the proof a dashboard thread's turn is handed
+  (the user's word); the user's own flags endpoint, which needs no token,
+  refuses a caller inside the container where `EDGE_PROXY_PEERS` names the
+  reverse proxy (any peer it does not name is refused). Without that
+  setting it refuses only a loopback peer and a peer that is the very
+  address the caller dialled, so a caller inside the container that comes
+  in from another of the container's addresses, or through a sibling that
+  relays (the egress-audit proxy), is taken for the dashboard — and where
+  the proxy arrives on loopback (host networking) the two cannot be told
+  apart at all.
+  That holds no further. The turn's session holds the backend token every
+  agent session holds, so it can set **another** chat's flags — mute it —
+  with the user's meaning, and a process it leaves behind can do so on its
+  own thread once the turn has ended; and while a dashboard turn the user
+  started runs, its proof sits in that turn's process environment, which
+  another session of the same uid can read — sessions are not sandboxed from
+  one another. What keeps a turn to its brief there is the brief. One that forges a contact with
   an importance prior or a permit rings as that contact would. The turn
   reads the mail as data: everything the mail says of itself — its sender's
   name, its subject, its id, its text, and the thread's earlier mails in the

@@ -494,6 +494,7 @@ import subprocess
 import tempfile
 import threading
 import time
+import unicodedata
 import urllib.parse
 import urllib.error
 import urllib.request
@@ -1959,9 +1960,14 @@ AUTH_CONFIG = gateway_auth.config_from_env()
 #
 # What distinguishes the two callers is the TCP peer address, which they cannot
 # choose: Traefik connects from another container's address, while an
-# in-container caller connects either from loopback or, having dialled this
-# container's own address, from the very address this socket is bound to. That
-# is the discriminator; it fails closed on anything it cannot classify.
+# in-container caller connects from loopback or, having dialled this
+# container's own address, usually from the very address this socket is bound
+# to. Without EDGE_PROXY_PEERS that is the whole discriminator, and it is no
+# more: a caller in a container on two networks that dials one of its
+# addresses from the other, or one whose request a sibling relays (the
+# egress-audit proxy), arrives from an address that is neither, and is taken
+# for the proxy. Only EDGE_PROXY_PEERS naming the proxy refuses those. It fails
+# closed on anything it cannot classify.
 #
 # BE CLEAR ABOUT WHAT THIS IS. The web-gateway and the agents share one
 # container, and the channel gateways' tokens are in that container's
@@ -4358,18 +4364,50 @@ def _prompt_elements(text: str) -> list[tuple[int, int]]:
     return merged
 
 
+# The elements of ours whose content is one message per line, oldest first:
+# a thread's messages, as a companion's note quotes them (_conv_chat_note).
+_PROMPT_LIST_RE = re.compile(r"<(mail_thread|chat_messages)>\n(.*?)\n</\1>", re.S)
+
+
+def _prompt_shed(text: str, excess: int) -> str:
+    """``text`` with the oldest messages of its thread elements
+    (_PROMPT_LIST_RE) left out, one whole line — one message — at a time,
+    until ``excess`` bytes are gone or nothing is left to shed; a line in
+    their place says how many. Only data goes: never a sentence of ours,
+    and never what an element of ours encloses but its messages."""
+    out, at = [], 0
+    for m in _PROMPT_LIST_RE.finditer(text):
+        lines = m.group(2).split("\n")
+        dropped = 0
+        while excess > 0 and dropped < len(lines):
+            excess -= len(lines[dropped].encode("utf-8")) + 1
+            dropped += 1
+        if not dropped:
+            continue
+        marker = (f"  [{dropped} older message{'s' if dropped != 1 else ''} of this thread "
+                  f"{'is' if dropped == 1 else 'are'} left out here: the prompt would be too "
+                  "long. The life store has them.]")
+        excess += len(marker.encode("utf-8")) + 1
+        out += [text[at:m.start(2)], "\n".join([marker] + lines[dropped:])]
+        at = m.end(2)
+    return "".join(out) + text[at:]
+
+
 def _prompt_fit(head: str, middle: str = "", tail: str = "") -> str:
     """``head + middle + tail`` within PROMPT_MAX_BYTES — the most one
     command-line argument carries — so a prompt that is too long is cut,
     never one a turn cannot start with.
 
-    ``middle`` is a replayed transcript and goes first, from its start: its
-    oldest part is left out, with a line that says so. Should that not do
-    (the bounds on every block of outside text make it a last resort), a
-    stretch from the middle of the whole is left out, between two points
-    outside every element of ours — so the instruction
-    at the head and the commands at the tail stay, and what is cut is whole
-    blocks, never half of one with its end standing in another
+    What goes is data, the oldest first, and each cut says so. ``middle`` is
+    a replayed transcript and goes first, from its start: its oldest part is
+    left out, with a line that says so. Then the oldest messages of the
+    thread the note quotes (_prompt_shed), one whole message at a time —
+    never the instruction at the head, the commands, or the arrival the turn
+    is for, whose block its builder bounds (_mail_arrival_quotes). Should
+    even that not do (the bounds on every block of outside text make it a
+    last resort), a stretch from the middle of the whole is left out,
+    between two points outside every element of ours — what is cut is
+    whole blocks, never half of one with its end standing in another
     (_prompt_elements)."""
     whole = head + middle + tail
     if len(whole.encode("utf-8")) <= PROMPT_MAX_BYTES:
@@ -4381,7 +4419,14 @@ def _prompt_fit(head: str, middle: str = "", tail: str = "") -> str:
         dropped = len(middle) - len(kept)
         return (head + f"[{dropped} characters of the thread's beginning are left out "
                 "here: the prompt would be too long]\n" + kept + tail)
+    if middle:
+        head += ("[the thread so far is left out here: the prompt would be too long "
+                 "with it]\n")
     whole = head + tail
+    excess = len(whole.encode("utf-8")) - PROMPT_MAX_BYTES
+    whole = _prompt_shed(whole, excess)
+    if len(whole.encode("utf-8")) <= PROMPT_MAX_BYTES:
+        return whole
     marker = ("\n[… a stretch of this prompt is left out here: it would have "
               "been too long …]\n")
     half = (PROMPT_MAX_BYTES - len(marker.encode("utf-8"))) // 2
@@ -5029,7 +5074,8 @@ _conv_pending_lock = threading.Lock()
 
 
 def _conv_worker(cid: str, session_key: str, *, arrival: str | None = None,
-                 push: bool = True, error_reply: bool = True) -> bool:
+                 push: bool = True, error_reply: bool = True,
+                 arrival_turn: str | None = None) -> bool:
     """Background worker: ask Ara for the next turn in a thread and store it.
 
     `arrival` runs the turn on a chat message instead of on something the user
@@ -5037,6 +5083,10 @@ def _conv_worker(cid: str, session_key: str, *, arrival: str | None = None,
     itself already notified the user's devices, and a second push for the same
     message would say the same thing twice. `error_reply` False stores nothing
     for a turn that failed (a mail's arrival turn, which is retried by design).
+    `arrival_turn` is that turn's token (send_message). A turn without
+    `arrival` is the user's own conversation with Ara: its sessions are
+    handed a proof of that (`user_turn`, _user_turn_begin), valid while the
+    turn runs.
 
     Returns True only when a model turn actually produced a reply — what the
     arrival path reports back as the job's outcome, and therefore what decides
@@ -5120,18 +5170,31 @@ def _conv_worker(cid: str, session_key: str, *, arrival: str | None = None,
             # longer type, though the dashboard message it started for is
             # still covered (and answered, without typing).
             typing_ok[0] = typing_ok[0] and _conv_turn_may_type(msgs, arrival)
+            if not typing_ok[0]:
+                # Nor does it speak for the user any more (decision AK).
+                _user_turn_end(user_turn)
             return _conv_engage_prompt(current, fresh_now, arrival)
 
-        result = send_message(prompt, display_question=latest, session_key=session_key,
-                              model=chosen, restart_message=None,
-                              resume=resume,
-                              reply_attachments=True,
-                              # Only a turn the user started, from the
-                              # dashboard, may type on their paired device —
-                              # asked once the prompt is built, as it is then.
-                              reply_shell_actions=lambda: may_type and typing_ok[0],
-                              thread_id=cid, prompt_builder=build_prompt,
-                              display_message_id=target_id)
+        # A turn the user started from the dashboard — never an arrival's, and
+        # never one a "user" message posted from inside the container started
+        # (the rule that decides who may type, `may_type`) — carries the proof
+        # that a flags call of its sessions is on the user's word, for as
+        # long as it runs and answers the user's own message.
+        user_turn = _user_turn_begin() if may_type and not arrival_turn else None
+        try:
+            result = send_message(prompt, display_question=latest, session_key=session_key,
+                                  model=chosen, restart_message=None,
+                                  resume=resume,
+                                  reply_attachments=True,
+                                  # Only a turn the user started, from the
+                                  # dashboard, may type on their paired device —
+                                  # asked once the prompt is built, as it is then.
+                                  reply_shell_actions=lambda: may_type and typing_ok[0],
+                                  thread_id=cid, prompt_builder=build_prompt,
+                                  display_message_id=target_id, arrival_turn=arrival_turn,
+                                  user_turn=user_turn)
+        finally:
+            _user_turn_end(user_turn)
         if result.get("skipped"):
             skipped = True
         elif "error" not in result and covered[0]:
@@ -6840,7 +6903,9 @@ def send_message(message: str, display_question: str | None = None,
                  reply_shell_actions=None,
                  thread_id: str | None = None,
                  prompt_builder=None,
-                 display_message_id: str | None = None) -> dict:
+                 display_message_id: str | None = None,
+                 arrival_turn: str | None = None,
+                 user_turn: str | None = None) -> dict:
     """Send message to the session for `session_key` (resume or new) and return result.
 
     `prompt_builder(fresh)` (a dashboard thread's), when given, builds the
@@ -6906,6 +6971,15 @@ def send_message(message: str, display_question: str | None = None,
     spawn as RETINUE_THREAD_ID: the push CLIs stamp it on the sends they
     queue, so the user's Allow/Deny on /sends lands back in this thread
     (_report_send_decision).
+
+    `arrival_turn` is set for a turn a chat arrival started: the turn's own
+    token, handed to every spawn as RETINUE_ARRIVAL_TURN, which
+    scripts/chat-flags.py sends along — what makes a flags call that turn's
+    (_turn_by_token). `user_turn` is set for a dashboard thread's turn, the
+    user's own conversation with Ara, and only for it: its proof, handed to
+    every spawn as RETINUE_USER_TURN and sent by scripts/chat-flags.py too —
+    what gives a flags call the user's semantics on a mail thread a turn is
+    working (_handle_internal_chat_flags).
     """
     # Hold the per-session lock first (so the same key's messages stay ordered
     # and queued requests don't occupy a worker slot), then acquire a worker slot
@@ -7020,7 +7094,8 @@ def send_message(message: str, display_question: str | None = None,
                     escalate_file=escalate_flag if offer_flag else None,
                     reply_attachments_file=manifest,
                     reply_shell_actions_file=action_manifest,
-                    thread_id=thread_id)
+                    thread_id=thread_id, arrival_turn=arrival_turn,
+                    user_turn=user_turn)
                 return _run_claude(cmd, capture_output=True, text=True,
                                    cwd="/workspace", env=env)
 
@@ -9933,6 +10008,12 @@ MAIL_ARRIVAL_QUOTE_CHARS = 8000
 # among them — what keeps the prompt within PROMPT_MAX_BYTES.
 MAIL_ARRIVAL_QUOTE_BYTES = 24 * 1024
 MAIL_ARRIVAL_QUOTES_BYTES = 32 * 1024
+# …and the whole of the quoted block, each mail's header lines included —
+# its name, subject and Message-ID are bounded per line, not per turn, and a
+# batch of mails that arrived while an earlier turn ran brings them all. The
+# newest mail is always quoted; older ones while they fit, and the rest are
+# named by count (_mail_arrival_quotes).
+MAIL_ARRIVAL_BATCH_BYTES = 48 * 1024
 # A sender's address as it may stand in a command the turn is told to run
 # (the memory recall by `sender:<address>`): ASCII letters, digits and the
 # punctuation an ordinary address has, around one `@`. The local part of an
@@ -9983,6 +10064,9 @@ _INSTRUCTED_RINGS: dict[str, dict] = {}
 # merge can put two chats' running turns under one id — each a record:
 #
 #   jobs        the job ids of the arrivals the turn works;
+#   token       one of them, handed to the turn's session as
+#               RETINUE_ARRIVAL_TURN: a flags call that carries it is the
+#               turn's (_turn_by_token), one without it the user's word;
 #   names       the chat ids its prompt named (the turn calls back with
 #               those; after a merge, an absorbed one);
 #   mids/seqs   the message ids of those arrivals and their places in the
@@ -9994,18 +10078,33 @@ _INSTRUCTED_RINGS: dict[str, dict] = {}
 #   verdict     the verdict it set (POST /internal/chats/<id>/verdict) — a
 #               verdict for a chat nobody is working on as instructed is
 #               refused rather than kept for a turn it does not belong to;
-#   flags       which of archived/muted the turn set itself
+#   asked       whether it asked for its mail thread's archive, made or
+#               not: noted on its mails once it completes (_turns_over), so
+#               that a turn worked after it — for older mail its batch left
+#               for a turn of its own — may archive the thread over them
+#               (ChatStateStore.archive_through);
+#   epoch       for a mail turn that asked, the chat's asked_epoch when it
+#               asked: where the user has brought the thread back since,
+#               the ask is noted as none (ChatStateStore.note_turn_done
+#               ``epoch``) — also where the unarchive lands while the turn
+#               wraps up, off this registry, where _turn_flags_overruled no
+#               longer finds its record. (A merge landing in that window
+#               finds no record to carry the note along either, and the
+#               ask is then noted as none too: the thread stays in view);
+#   flags       {"archived"} where the turn archived the chat itself
 #               (POST /internal/chats/<id>/flags) and the user has not set
-#               since — "file the document, then archive the mail". With a
-#               verdict that is the instruction's answer, and the ring that
-#               waited is not delivered; without one, or once the timeout
-#               rang, both are undone before the failure ring
-#               (_turn_flags_undo).
+#               the flag since — "file the document, then archive the mail".
+#               With a verdict that is the instruction's answer, and the
+#               ring that waited is not delivered; without one — or, in a
+#               mail thread, once the timeout rang — it is undone before the
+#               failure ring (_turn_flags_undo). A turn can only archive:
+#               its mute is this archive (_turn_flags).
 #
-# Registered for every turn an instruction briefs, and for every turn of a
+# Registered for every arrival turn: one an instruction briefs, one of a
 # mail thread (a VIP's too: its archive may reach no more than what it was
-# given either). What a turn notes on the chat is noted only while the
-# chat's status still shows one of its own arrivals.
+# given either), and a messenger VIP's, which may only archive too. What a
+# turn notes on the chat is noted only while the chat's status still shows
+# one of its own arrivals.
 _RUNNING_TURNS: dict[str, list[dict]] = {}
 
 
@@ -10321,7 +10420,28 @@ def _mail_arrival_quote(arrival: dict, max_bytes: int | None = None) -> str:
     return quote
 
 
-def _mail_arrival_prompt(arrivals: list[dict], chat_id: str = "") -> str:
+def _mail_arrival_quotes(arrivals: list[dict]) -> tuple[list[str], list[bool]]:
+    """The quotes of a batch's mails, oldest first, and which of the arrivals
+    they are: the newest always, the ones before it while the block stays
+    within MAIL_ARRIVAL_BATCH_BYTES. What is left out is the oldest, and it
+    is no mail of this turn's: it stays on the chat's queue for a turn of its
+    own next, and the turn is told only that it waits (_chat_arrival_worker,
+    _mail_arrival_prompt)."""
+    share = min(MAIL_ARRIVAL_QUOTE_BYTES, MAIL_ARRIVAL_QUOTES_BYTES // max(1, len(arrivals)))
+    quotes = [_mail_arrival_quote(a, share) for a in arrivals]
+    shown = [False] * len(arrivals)
+    used = 0
+    for i in range(len(arrivals) - 1, -1, -1):
+        size = len(quotes[i].encode("utf-8")) + 1
+        if i != len(arrivals) - 1 and used + size > MAIL_ARRIVAL_BATCH_BYTES:
+            break
+        shown[i] = True
+        used += size
+    return [q for q, keep in zip(quotes, shown) if keep], shown
+
+
+def _mail_arrival_prompt(arrivals: list[dict], chat_id: str = "", deferred: int = 0,
+                         quotes: list[str] | None = None) -> str:
     """_chat_arrival_prompt for a mail thread (docs/mail-chats.md, "The
     gate"): the same turn, worded for what a mail is.
 
@@ -10338,10 +10458,35 @@ def _mail_arrival_prompt(arrivals: list[dict], chat_id: str = "") -> str:
     instruction's turn is briefed by it (_instruction_brief) and may use a
     mail thread's own means — the Archivist for a document, a send under the
     mailbox's policy where the instruction asks for one, the archive — and
-    ends with the verdict."""
+    ends with the verdict.
+
+    ``deferred`` is how many older mails of the batch were left for a turn
+    of their own (_chat_arrival_worker): the turn is told they wait, so that
+    it leaves them be — it is for the mails it is shown, and only those.
+
+    ``quotes`` are the quotes of exactly ``arrivals``, as the worker decided
+    them for the whole batch (_mail_arrival_quotes) — quoted as they are:
+    worked out again for the mails it kept, each would get a larger share,
+    and some of them would no longer fit, so that a mail the turn takes
+    would never be shown to it. Without them (a caller that has not
+    decided), the decision is made here, once."""
+    if quotes is None:
+        quotes, shown = _mail_arrival_quotes(arrivals)
+        arrivals = [a for a, keep in zip(arrivals, shown) if keep]
+        deferred += shown.count(False)
+    quoted = list(quotes)
     count = len(arrivals)
-    share = min(MAIL_ARRIVAL_QUOTE_BYTES, MAIL_ARRIVAL_QUOTES_BYTES // max(1, count))
-    quoted = [_mail_arrival_quote(a, share) for a in arrivals]
+    left = deferred
+    if left:
+        quoted.insert(0, (
+            f"  [{left} older mail{'s' if left != 1 else ''} of this thread "
+            f"{'have' if left != 1 else 'has'} arrived as well and {'are' if left != 1 else 'is'} "
+            "not quoted here: with them this prompt would be too long. "
+            f"{'They get a turn' if left != 1 else 'It gets a turn'} of {'their' if left != 1 else 'its'} "
+            "own next. This turn is for the "
+            + ("mail" if count == 1 else f"{count} mails")
+            + " quoted below, and only for "
+            + ("it" if count == 1 else "them") + ": leave the others be.]"))
     briefed = [a for a in arrivals if a.get("instruction")]
     if not briefed:
         why = ("The user marked its sender a VIP, which is them asking for "
@@ -10439,7 +10584,8 @@ def _mail_arrival_prompt(arrivals: list[dict], chat_id: str = "") -> str:
     return "\n\n".join(lines)
 
 
-def _chat_arrival_prompt(arrivals: list[dict], chat_id: str = "") -> str:
+def _chat_arrival_prompt(arrivals: list[dict], chat_id: str = "", deferred: int = 0,
+                         quotes: list[str] | None = None) -> str:
     """The instruction for a turn the chat itself triggered.
 
     Never asks the user to rule on a correspondent. Who is worth a turn is
@@ -10461,9 +10607,12 @@ def _chat_arrival_prompt(arrivals: list[dict], chat_id: str = "") -> str:
     from the `secretary` subagent, that they go into the chat's shared draft,
     and that nothing here reaches the wire without the user's send press.
 
-    A mail thread's turn has a wording of its own (_mail_arrival_prompt)."""
+    A mail thread's turn has a wording of its own (_mail_arrival_prompt), and
+    is told of the ``deferred`` older mails of its batch that wait for a turn
+    of their own, and quotes them as ``quotes`` says (the worker's one
+    decision)."""
     if any(a.get("mail") for a in arrivals):
-        return _mail_arrival_prompt(arrivals, chat_id)
+        return _mail_arrival_prompt(arrivals, chat_id, deferred, quotes)
     quoted = []
     share = min(MAIL_ARRIVAL_QUOTE_BYTES, MAIL_ARRIVAL_QUOTES_BYTES // max(1, len(arrivals)))
     for arrival in arrivals:
@@ -10595,6 +10744,45 @@ def _arrival_told(chat_id: str, message_id: str | None) -> None:
         print(f"[web-gateway] could not note {chat_id} {message_id} as told ({exc})", flush=True)
 
 
+def _arrival_job_rung_late(job_url: str, chat_id: str, message_id: str | None) -> None:
+    """The handle of a mail whose ring an offer has just delivered
+    (_ring_orphaned): where the turn completed and only its ring could not go
+    out (_chat_arrival_worker), the mail is done with now, and so is its
+    handle. Rewritten whole, so nothing of the error it held is read as this
+    one's. A turn that failed keeps its error — the mail is owed another
+    turn, up to MAIL_ARRIVAL_TURN_ATTEMPTS — and a pending job (a turn still
+    running) or a done one is left as it is."""
+    if not chat_state_mod.turn_done(_CHAT_STATE.get(_live_chat(chat_id)), message_id):
+        return
+    job_id = job_url.rsplit("/", 1)[-1]
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+        if job is None or job.get("status") in ("pending", "done"):
+            return
+        _jobs[job_id] = {"status": "done", "created": job.get("created"),
+                         "finished": _now_ts(),
+                         "result": {"chat": chat_id, "rung_late": True}}
+
+
+def _turns_over(chat_id: str, message_id: str | None, *, asked: bool = False,
+                epoch: int | None = None) -> None:
+    """A mail's turns are over — one completed, or they gave up
+    (ChatStateStore.note_turn_done): its next offer starts none. ``asked``:
+    the completed turn asked for the thread's archive, which a later turn's
+    archive may then reach over this mail (_turn_put_away) — unless the
+    user brought the thread back after ``epoch``, the turn's note of the
+    chat's asked_epoch when it asked. A write that fails leaves the
+    in-memory handle to say so until a restart."""
+    if not message_id:
+        return
+    try:
+        _CHAT_STATE.note_turn_done(_live_chat(chat_id), message_id, asked=asked,
+                                   epoch=epoch)
+    except OSError as exc:
+        print(f"[web-gateway] could not note the turns of {chat_id} {message_id} as over "
+              f"({exc})", flush=True)
+
+
 def _ring_orphaned(chat_id: str, job_url: str, message_id: str | None) -> bool:
     """For a mail whose ring is owed (_arrival_untold) and whose offer got
     the handle ``job_url`` back: whether no turn will deliver that ring —
@@ -10681,8 +10869,18 @@ def _rekey_turns(absorbed: str, survivor: str, doc: dict, gone: dict | None) -> 
             if not theirs.get("running") and mine.get("running"):
                 theirs["running"], theirs["worker"] = True, mine.get("worker")
     moved = _RUNNING_TURNS.pop(absorbed, None) or []
+    # The merge added the halves' asked_epoch up: each turn's note of it
+    # takes the other half's, so it still says whether the user has brought
+    # its own half back since it started.
+    their_epoch = chat_state_mod.asked_epoch(gone)
+    survivor_epoch = chat_state_mod.asked_epoch(doc) - their_epoch
+    for record in _RUNNING_TURNS.get(survivor) or []:
+        if record.get("epoch") is not None:
+            record["epoch"] += their_epoch
     for record in moved:
         record["chat"] = survivor
+        if record.get("epoch") is not None:
+            record["epoch"] += survivor_epoch
     if moved:
         _RUNNING_TURNS.setdefault(survivor, []).extend(moved)
     their_reads = int((gone or {}).get("read_seq") or 0)
@@ -10768,20 +10966,37 @@ def _start_chat_arrival_turn(chat_id: str, entry: dict, *,
     def minted() -> str | None:
         # Under _chat_turns_lock.
         seen = _CHAT_ARRIVAL_JOBS.get(key) if key is not None else None
-        if not (seen and again and _arrival_job_spent(seen)):
+        if seen and not (again and _arrival_job_spent(seen)):
             return seen
-        attempts = chat_state_mod.turn_attempts(_CHAT_STATE.get(chat_id), message_id)
-        if not mail or attempts < MAIL_ARRIVAL_TURN_ATTEMPTS:
+        if not (mail and again):
             return None
-        # The turns for this mail have given up — the last one died with
-        # the process before it could say so (a last turn that failed says
-        # so itself: _chat_arrival_worker). A handle that is done, so the
-        # mail is accepted as it stands.
+        # A mail with no handle that answers for it: its turn failed long
+        # enough ago, or this process never minted one — a restart emptied
+        # the handles, and maybe in the middle of a turn. Which is why the
+        # cap is read from the durable count either way, and whether a turn
+        # for it completed: each restart must not buy the mail another turn.
+        doc = _CHAT_STATE.get(chat_id)
+        attempts = chat_state_mod.turn_attempts(doc, message_id)
+        if chat_state_mod.turn_done(doc, message_id):
+            # Its turns are over: one completed — the answer to the offer it
+            # completed for was lost, or the ring it owed could not go out
+            # then (this offer rings it: _ring_orphaned) — or they gave up,
+            # and the companion has its note. Accepted as it stands.
+            result = {"chat": chat_id, "over": True}
+        elif attempts < MAIL_ARRIVAL_TURN_ATTEMPTS:
+            return None
+        else:
+            # The turns for this mail have given up — the last one died with
+            # the process before it could say so (a last turn that failed
+            # says so itself: _chat_arrival_worker). A handle that is done,
+            # so the mail is accepted as it stands, and noted as over, so
+            # the note is not posted again after the next restart.
+            result = {"chat": chat_id, "gave_up": True, "attempts": attempts}
+            gave_up.append(attempts)
+            _turns_over(chat_id, message_id)
         job_id = _create_job()
-        _finish_job(job_id, status="done",
-                    result={"chat": chat_id, "gave_up": True, "attempts": attempts})
+        _finish_job(job_id, status="done", result=result)
         _CHAT_ARRIVAL_JOBS[key] = f"/jobs/{job_id}"
-        gave_up.append(attempts)
         return f"/jobs/{job_id}"
 
     if key is not None:
@@ -10913,25 +11128,47 @@ def _chat_arrival_worker(chat_id: str, cid: str, worker: object = None) -> None:
             # first one's brief — a VIP's without one, or one person's under
             # their instruction — are worked together; anyone else's wait for
             # a turn of their own, so in a group one person's verdict never
-            # decides another person's message.
-            brief = _arrival_brief(state["arrivals"][0])
-            take = [i for i, a in enumerate(state["arrivals"]) if _arrival_brief(a) == brief]
+            # decides another person's message. A mail an earlier batch left
+            # out (``deferred``, below) gets the turn of its own it was
+            # promised, shared only with the others left out with it.
+            first = state["arrivals"][0]
+            brief = _arrival_brief(first)
+            take = [i for i, a in enumerate(state["arrivals"])
+                    if _arrival_brief(a) == brief
+                    and (not first.get("deferred") or a.get("deferred"))]
+            deferred = 0
+            quotes = None
+            if any(state["arrivals"][i].get("mail") for i in take):
+                # A turn is for the mails it is shown (_mail_arrival_quotes).
+                # The oldest of a batch too big to quote whole stay on the
+                # queue, where they are, for the next turn: nothing this
+                # turn settles — its archive, its verdict, the rings,
+                # "told", turns_done — is about a mail it never saw. One
+                # decision: the prompt quotes what is decided here, as it is.
+                quotes, shown = _mail_arrival_quotes([state["arrivals"][i] for i in take])
+                for i, keep in zip(take, shown):
+                    if not keep:
+                        state["arrivals"][i]["deferred"] = True
+                deferred = shown.count(False)
+                take = [i for i, keep in zip(take, shown) if keep]
             jobs = [state["jobs"][i] for i in take]
             arrivals = [state["arrivals"][i] for i in take]
             state["jobs"] = [j for i, j in enumerate(state["jobs"]) if i not in take]
             state["arrivals"] = [a for i, a in enumerate(state["arrivals"]) if i not in take]
             instructed = any(a.get("instruction") for a in arrivals)
             mail = any(a.get("mail") for a in arrivals)
-            record = None
-            if instructed or mail:
-                # A verdict, and an archive, belong to the turn that is about
-                # to run, never to one before it.
-                record = {"chat": key, "jobs": set(jobs), "names": {key},
-                          "mids": [a.get("message_id") for a in arrivals],
-                          "seqs": [a.get("seq") for a in arrivals],
-                          "instructed": instructed, "verdict": None, "flags": set()}
-                _RUNNING_TURNS.setdefault(key, []).append(record)
-        prompt = _chat_arrival_prompt(arrivals, key)
+            # A verdict, and an archive, belong to the turn that is about to
+            # run, never to one before it — and what a flags call asks of
+            # the chat is the turn's (_turn_flags) on the word of the token
+            # its session is handed: one of its own job ids, unguessable
+            # (_turn_by_token).
+            record = {"chat": key, "jobs": set(jobs), "names": {key}, "token": jobs[0],
+                      "mids": [a.get("message_id") for a in arrivals],
+                      "seqs": [a.get("seq") for a in arrivals],
+                      "instructed": instructed, "verdict": None, "flags": set(),
+                      "asked": False, "epoch": None}
+            _RUNNING_TURNS.setdefault(key, []).append(record)
+        prompt = _chat_arrival_prompt(arrivals, key, deferred=deferred, quotes=quotes)
         stored = [f for a in arrivals for f in (a.get("files") or [])]
         if stored:
             prompt += _message_files_note(stored)
@@ -10939,31 +11176,42 @@ def _chat_arrival_worker(chat_id: str, cid: str, worker: object = None) -> None:
         error = "the chat's companion turn did not complete"
         try:
             ok = _conv_worker(cid, f"conv:{cid}", arrival=prompt, push=False,
-                              error_reply=not mail)
+                              error_reply=not mail, arrival_turn=record["token"])
         except Exception as exc:  # noqa: BLE001 - a failed turn is a job result
             print(f"[web-gateway] companion turn for {key} failed: {exc!r}",
                   flush=True)
-        if record is not None:
+        with _chat_turns_lock:
+            # Where the turn's chat is now (a merge may have moved it).
+            live = record["chat"]
+            left = [r for r in _RUNNING_TURNS.get(live) or [] if r is not record]
+            if left:
+                _RUNNING_TURNS[live] = left
+            else:
+                _RUNNING_TURNS.pop(live, None)
+        # Whether what the turn asked counts once it is over: for an
+        # instructed turn, only where it is trusted with its put-away.
+        trusted = True
+        if instructed:
+            trusted = False
+            try:
+                trusted = _instructed_settle(live, arrivals, ok, record["verdict"],
+                                             record=record)
+            except Exception as exc:  # noqa: BLE001 - never leave a ring hanging
+                print(f"[web-gateway] settling the instructed turn for {live} "
+                      f"failed: {exc!r}", flush=True)
+                for arrival in arrivals:
+                    if arrival.get("ring"):
+                        _instructed_ring_fire(arrival["ring"], None,
+                                              "the turn's outcome could not be applied")
+        if ok:
+            # Durably: a mail whose turn completed is worked, also for the
+            # process that comes after this one (_start_chat_arrival_turn).
             with _chat_turns_lock:
-                # Where the turn's chat is now (a merge may have moved it).
-                live = record["chat"]
-                left = [r for r in _RUNNING_TURNS.get(live) or [] if r is not record]
-                if left:
-                    _RUNNING_TURNS[live] = left
-                else:
-                    _RUNNING_TURNS.pop(live, None)
-            if instructed:
-                try:
-                    _instructed_settle(live, arrivals, ok, record["verdict"], record=record)
-                except Exception as exc:  # noqa: BLE001 - never leave a ring hanging
-                    print(f"[web-gateway] settling the instructed turn for {live} "
-                          f"failed: {exc!r}", flush=True)
-                    for arrival in arrivals:
-                        if arrival.get("ring"):
-                            _instructed_ring_fire(arrival["ring"], None,
-                                                  "the turn's outcome could not be applied")
-        else:
-            live = key
+                asked = bool(record.get("asked")) and trusted
+            for arrival in arrivals:
+                if arrival.get("mail"):
+                    _turns_over(live, arrival.get("message_id"), asked=asked,
+                                epoch=record.get("epoch"))
         doc = _CHAT_STATE.get(live) if mail else {}
         for job_id, arrival in zip(jobs, arrivals):
             mid = arrival.get("message_id")
@@ -10986,6 +11234,7 @@ def _chat_arrival_worker(chat_id: str, cid: str, worker: object = None) -> None:
                 _finish_job(job_id, status="done",
                             result={"chat": live, "conversation": cid, "gave_up": True,
                                     "attempts": attempts})
+                _turns_over(live, mid)
                 _arrival_gave_up(live, cid, attempts, "the turn did not complete")
             else:
                 _finish_job(job_id, status="error", error=error)
@@ -11055,15 +11304,19 @@ def _instructed_ring_timeout(job_id: str) -> None:
     """The turn ran past its timeout (_instruction_timeout: a mail's is
     MAIL_INSTRUCTION_TIMEOUT, any other message's CHAT_INSTRUCTION_TIMEOUT):
     ring now. The turn goes on, and what it stages still lands; its verdict
-    then only records. What the turn archived or muted until now is undone
-    first (_turn_flags_undo)."""
+    then only records. In a mail thread, what the turn archived until now is
+    undone first (_turn_flags_undo): the mailbox follows that archive, and
+    a mail put away by a turn that has not finished is not one the user
+    was told of. A messenger chat's timeout only rings, as it always did —
+    its archive stays the turn's (docs/messenger-chats.md)."""
     ring = _instructed_ring_take(job_id)
     if ring is None:
         return
     timeout = float(ring.get("timeout") or CHAT_INSTRUCTION_TIMEOUT)
     with _chat_turns_lock:
         record = _turn_of_job(job_id)
-    if record is not None:
+        live = record["chat"] if record is not None else ""
+    if record is not None and _is_mail((chat_state_mod.split_chat_id(live) or ("",))[0]):
         _turn_flags_undo(record, "ran past its timeout")
     print(f"[web-gateway] the instructed turn for {ring['chat_id']} ran past "
           f"{timeout:g}s; ringing the message as a VIP's", flush=True)
@@ -11071,24 +11324,22 @@ def _instructed_ring_timeout(job_id: str) -> None:
 
 
 def _turn_flags_undo(record: dict, why: str) -> None:
-    """Undo what a turn that did not finish put away itself — its archive,
-    and its mute (which archives) — before the failure rule rings: such a
-    turn is not trusted with having put the message away, and a ring into a
-    chat it muted would be no ring at all. What the user set meanwhile is
-    theirs and stays (_set_chat_flags takes it off the turn's record)."""
+    """Undo the archive a turn that did not finish made itself, before the
+    failure rule rings: such a turn is not trusted with having put the
+    message away. (A turn cannot mute — _turn_flags — so there is no mute of
+    its own to undo.) What the user set meanwhile is theirs and stays
+    (_set_chat_flags takes it off the turn's record): a chat they muted is
+    left muted."""
     with _chat_turns_lock:
         flags = set(record["flags"])
         record["flags"].clear()
         live = record["chat"]
-    if not flags:
+    if "archived" not in flags:
         return
     doc = _CHAT_STATE.get(live)
-    if "muted" in flags and doc.get("muted"):
-        undo = {"muted": False, "archived": False}
-    elif doc.get("archived") and not doc.get("muted"):
-        undo = {"archived": False}
-    else:
+    if not doc.get("archived") or doc.get("muted"):
         return
+    undo = {"archived": False}
     print(f"[web-gateway] the turn for {live} put the chat away and {why}; "
           "bringing the chat back", flush=True)
     _set_chat_flags(live, undo)
@@ -11225,26 +11476,32 @@ def _attention_note_verdict(chat_id: str, verdict: dict) -> None:
 
 
 def _instructed_settle(chat_id: str, arrivals: list[dict], ok: bool,
-                       verdict: dict | None, *, record: dict | None = None) -> None:
+                       verdict: dict | None, *, record: dict | None = None) -> bool:
     """After an instructed turn: deliver each ring that waited on it — by the
     verdict when the turn completed and set one, as a VIP's otherwise — and
     note the outcome on the chat. ``chat_id`` is the chat the turn works
     now (a merge may have moved it since it started).
 
     ``record`` is the turn's (_RUNNING_TURNS): its ``flags`` say whether it
-    archived the chat itself, or muted it (which archives), and the user has
-    not set either since (_turn_flags). With a verdict, and the chat still
+    archived the chat itself (a mute it asked for is an archive: _turn_flags),
+    and the user has not set the flag since. With a verdict, and the chat still
     archived, that is the instruction's answer to the message — "file it,
     then archive the mail" — and a ring that waited is not delivered: an
     archived chat rings nothing and lists nothing, and reopening its item
     would undo what the turn was asked to do. The outcome is noted as
     ``quiet``, with that reason and the verdict. Without a verdict the turn
     did not finish, and it is not trusted with having put the message away
-    either: what it archived or muted is undone (_turn_flags_undo), and the
-    message rings by the failure rule like any other."""
+    either: what it archived is undone (_turn_flags_undo), and the message
+    rings by the failure rule like any other.
+
+    Returns whether the turn is trusted with having put its mails away: it
+    set a usable verdict, and the timeout had not rung for it already.
+    Only such a turn's ask for the archive is remembered on its mails
+    (_turns_over), for a later turn's archive to reach past them
+    (_turn_put_away) — decided here, with the ring, and nowhere else."""
     briefed = [a for a in arrivals if a.get("instruction")]
     if not briefed:
-        return
+        return True
     if not ok:
         why = "the turn did not complete"
     elif verdict is None:
@@ -11258,19 +11515,19 @@ def _instructed_settle(chat_id: str, arrivals: list[dict], ok: bool,
         _turn_flags_undo(record, "did not finish")
         still = False
     put_away = still and usable is not None
-    late = False
+    late = rung = False
     for arrival in briefed:
         if arrival.get("ring") and put_away:
             ring = _instructed_ring_take(arrival["ring"])
             if ring is None:
-                late = True  # the timeout rang it before the turn archived
+                late = rung = True  # the timeout rang it before the turn archived
             else:
                 _arrival_told(chat_id, ring.get("message_id"))
                 _instructed_note(chat_id, jobs={ring.get("job")}, delivery="quiet",
                                  reason="the turn archived the chat", fallback=None)
         elif arrival.get("ring"):
             if _instructed_ring_fire(arrival["ring"], usable, why or "") is None:
-                late = True  # the timeout rang it already
+                late = rung = True  # the timeout rang it already
         elif arrival.get("vip") or arrival.get("told"):
             late = True  # rung on arrival, or by an earlier turn's failure
         # Neither: a muted chat or a held group, which rings nothing — the
@@ -11282,6 +11539,7 @@ def _instructed_settle(chat_id: str, arrivals: list[dict], ok: bool,
                      finished=chat_state_mod.iso_z(), verdict=verdict, failure=why)
     if why:
         print(f"[web-gateway] instructed turn for {chat_id}: {why}", flush=True)
+    return usable is not None and not rung
 
 
 def _parse_verdict(payload: dict) -> dict:
@@ -13197,67 +13455,196 @@ def _read_chat_flags(payload: dict) -> dict[str, bool]:
     return flags
 
 
-def _set_chat_flags(chat_id: str, flags: dict[str, bool]) -> dict:
+def _set_chat_flags(chat_id: str, flags: dict[str, bool], *, user: bool = False) -> dict:
     """Set a chat's flags and everything that follows from them: the list,
     the attention item, the mailbox. Returns the chat's state document.
 
     Whoever sets a flag here has the last word on it: a running turn that
-    had archived or muted the chat itself no longer counts as having done
-    so (_turn_flags_overruled) — the user's archive while the turn works is
+    had archived the chat itself no longer counts as having done so
+    (_turn_flags_overruled) — the user's archive or mute while the turn works is
     the user's, and stays when the turn fails. A turn's own call goes
-    through _turn_flags instead."""
+    through _turn_flags instead.
+
+    ``user``: the call is the user's word (their own endpoint, or an agent's
+    call with the user's meaning). Where it brings the chat back, the
+    archive the completed turns asked for is forgotten with it
+    (ChatStateStore.set_flags ``forget_asked``): only a turn asking after
+    the user's last unarchive can put the thread away over a newer mail
+    (_turn_put_away) — also where the turn is wrapping up as this lands
+    (the record's ``epoch``). The undo of a turn that did not finish is no
+    such word."""
     before = _CHAT_STATE.get(chat_id)
-    doc = _CHAT_STATE.set_flags(chat_id, **flags)
+    doc = _CHAT_STATE.set_flags(chat_id, **flags,
+                                forget_asked=user and flags.get("archived") is False)
     _turn_flags_overruled(chat_id, flags)
     return _chat_flags_follow(chat_id, flags, before, doc)
 
 
 def _turn_flags_overruled(chat_id: str, flags: dict[str, bool]) -> None:
-    """Take what ``flags`` names off the record of each turn running for
-    the chat: the flag is no longer the turn's doing. A mute is an archive
-    as well."""
-    named = {name for name in ("archived", "muted") if name in flags}
-    if flags.get("muted"):
-        named.add("archived")
-    if not named:
+    """Take the archive off the record of each turn running for the chat
+    when ``flags`` sets it: it is no longer the turn's doing. A mute — the
+    user's alone — is an archive as well."""
+    if "archived" not in flags and not flags.get("muted"):
         return
     with _chat_turns_lock:
         for record in _RUNNING_TURNS.get(chat_id) or []:
-            record["flags"] -= named
+            record["flags"].discard("archived")
+            if flags.get("archived") is False:
+                # Brought back on the user's word: what the turn asked is
+                # no archive a later turn may make over its mails either.
+                record["asked"] = False
+
+
+# What an arrival turn is answered when it asks for what is the user's
+# (_turn_flags): "a turn cannot mute", "… cannot unmute or unarchive".
+TURN_CANNOT = "a turn cannot "
+TURN_CANNOT_MUTE = TURN_CANNOT + "mute"
+# The header an arrival turn's flags call proves itself by
+# (scripts/chat-flags.py sends RETINUE_ARRIVAL_TURN in it).
+ARRIVAL_TURN_HEADER = "X-Arrival-Turn"
+# …and the one a dashboard thread's turn proves itself by: the user's own
+# conversation with Ara (scripts/chat-flags.py sends RETINUE_USER_TURN in it).
+USER_TURN_HEADER = "X-User-Turn"
+# The answer's ``reason`` for a call that proved neither, on a mail thread a
+# turn is working: it was taken as that turn's (_handle_internal_chat_flags).
+TURN_RUNNING = "a turn is running on this chat"
+# The proofs of the dashboard-thread turns running now: one unguessable token
+# per turn, handed to its sessions as RETINUE_USER_TURN (_conv_worker), valid
+# while the turn runs and never after.
+_USER_TURNS: set[str] = set()
+_user_turns_lock = threading.Lock()
+
+
+def _user_turn_begin() -> str:
+    """Mint the proof of a dashboard-thread turn about to run (_conv_worker)."""
+    token = uuid.uuid4().hex
+    with _user_turns_lock:
+        _USER_TURNS.add(token)
+    return token
+
+
+def _user_turn_end(token: str | None) -> None:
+    """The turn is over: its proof proves nothing any more."""
+    with _user_turns_lock:
+        _USER_TURNS.discard(token or "")
+
+
+def _user_turn_valid(token: str) -> bool:
+    """Whether ``token`` is the proof of a dashboard-thread turn running now."""
+    if not token:
+        return False
+    with _user_turns_lock:
+        return any(hmac.compare_digest(token, held) for held in _USER_TURNS)
+
+
+def _mail_turn_running(chat_id: str) -> dict | None:
+    """A mail arrival turn running on the mail thread ``chat_id`` names (on
+    it, or on the chat it is part of now), or None — for a messenger chat
+    always None. Under _chat_turns_lock."""
+    channel = (chat_state_mod.split_chat_id(_live_chat(chat_id)) or ("",))[0]
+    return _turn_record(chat_id) if _is_mail(channel) else None
+
+
+def _turn_by_token(chat_id: str, token: str) -> dict | None:
+    """The running arrival turn a flags call comes from, by the token its
+    session was handed (RETINUE_ARRIVAL_TURN, sent by scripts/chat-flags.py:
+    one of the turn's own job ids) — only where that turn is running on the
+    chat the call names: on it, or on the chat it is part of now (a merge
+    folds the id the prompt named into another; _live_chat). None for any
+    other token. Under _chat_turns_lock."""
+    if not token:
+        return None
+    for record in _RUNNING_TURNS.get(_live_chat(chat_id)) or []:
+        if token in record["jobs"]:
+            return record
+    return None
 
 
 def _turn_flags(record: dict, flags: dict[str, bool]) -> tuple[dict, dict]:
     """A running arrival turn sets its chat's flags
-    (POST /internal/chats/<id>/flags): what "file the document, then archive
-    the mail" ends in. Returns ``(doc, what the answer adds)``.
+    (POST /internal/chats/<id>/flags, with its token): what "file the
+    document, then archive the mail" ends in. Returns ``(doc, what the
+    answer adds)``.
 
-    The user's semantics (_set_chat_flags), with two differences, both
-    about what the turn was given. **Its archive reaches only that.** In a
-    mail thread, where the mailbox follows the chat, the archive — a mute
-    too, which archives — is made only if no mail has arrived in the chat
-    since the turn's own (ChatStateStore.archive_through), and the mailbox
-    is told of the mails up to the turn's own, never of a later one. Where
-    one has arrived the chat is not archived — the turn never saw that
-    mail, and the user would not either — and only the mails the turn
-    worked leave the inbox; the answer says so (``archived`` false,
-    ``reason``), and the ring that waited is decided by the verdict as on
-    any chat in view. (That call, made late because the gateway is away, is
-    not made again: an archive is owed only while the chat is archived.)
-    **And what it archives or mutes is noted as its own** (``flags`` on its
-    record): with a verdict, a ring that waited is then not delivered;
-    without one, or once the timeout rings, both are undone first
+    **A turn can only archive its own mails.** Everything else a flag says
+    is the user's to decide, never a turn's that one message started (and
+    whose words that message may have chosen): the mute, which keeps every
+    later message of the chat out of view and unrung — a VIP's included —
+    and taking it off again, bringing an archived chat back, the star. A
+    ``muted: true`` is taken as the archive it also is — the same archive
+    as ``archived: true``, which the chat's next message undoes — unless
+    the call also says ``archived: false``; everything else of the user's
+    changes nothing. The answer says what was refused and what was done,
+    in that order (``reason`` "a turn cannot mute; archived instead",
+    "a turn cannot mute; newer mail arrived", "a turn cannot unmute or
+    unarchive"), and its flags are the chat's as they stand. Muting stays
+    the user's: their own flags endpoint, and an agent acting on their word
+    from any other session — a call without the turn's token.
+
+    **Its archive reaches only what it was given** (_turn_put_away). **And
+    what it archives is noted as its own** (``flags`` on its record): with
+    a verdict, a ring that waited is then not delivered; without one — or,
+    in a mail thread, once the timeout rings — it is undone first
     (_turn_flags_undo)."""
     with _chat_turns_lock:
         live = record["chat"]
-    put_away = flags.get("archived") is True or flags.get("muted") is True
+    # What the call asked that is the user's, as the words for it.
+    refused = [on if flags[name] else off
+               for name, on, off in (("muted", "mute", "unmute"),
+                                     ("archived", None, "unarchive"),
+                                     ("starred", "star", "unstar"))
+               if name in flags and not (name == "archived" and flags[name])]
+    archive = flags.get("archived") is True or (flags.get("muted") is True
+                                                 and "archived" not in flags)
+    if archive:
+        doc, extra = _turn_put_away(record, live)
+    else:
+        doc, extra = _CHAT_STATE.get(live), {}
+    if refused:
+        said = TURN_CANNOT + " or ".join(refused)
+        if extra.get("reason"):
+            said += "; " + extra["reason"]  # the archive was not made either
+        elif archive and flags.get("archived") is not True:
+            said += "; archived instead"
+        extra["reason"] = said
+        print(f"[web-gateway] chat {live}: a turn asked for the user's flags — {said}",
+              flush=True)
+    return doc, extra
+
+
+def _turn_put_away(record: dict, live: str) -> tuple[dict, dict]:
+    """A turn's archive (_turn_flags), scoped to the turn's own mails.
+
+    In a mail thread, where the mailbox follows the chat, the archive is
+    made only if no mail has arrived in the chat since the turn's own
+    (ChatStateStore.archive_through) and none waits on the chat's queue for
+    a turn of its own (an older one its batch could not quote, another
+    sender's under another brief): the turn never saw that mail, and the
+    user would not either. The mailbox is told of exactly the mails the turn
+    worked, by Message-ID, never of another. Where the archive is not made
+    only the mails the turn worked leave the inbox, and the answer says so
+    (``archived`` false, ``reason``); the ring that waited is then decided
+    by the verdict as on any chat in view. (That call, made late because
+    the gateway is away, is not made again: an archive is owed only while
+    the chat is archived.)
+
+    What the turn asked is remembered on its mails once it completes
+    (``asked``, _turns_over), made or not — an instructed turn's only where
+    it is trusted with its put-away (_instructed_settle), and only until the
+    user brings the thread back (_set_chat_flags ``user``): mail newer than
+    the turn's own whose turn asked as well is no reason to leave the chat
+    in view — the chain of turns a batch too big to quote whole leaves
+    behind (the newest mails' first, refused while the older ones wait)
+    archives the thread with its last turn (decision AR)."""
     channel = (chat_state_mod.split_chat_id(live) or ("",))[0]
-    if not put_away:
-        # Bringing the chat back, a star: the user's semantics, and what the
-        # turn takes back is no longer its doing.
-        return _set_chat_flags(live, flags), {}
+    flags = {"archived": True}
     if not _is_mail(channel):
         doc = _set_chat_flags(live, flags)
     else:
+        with _chat_turns_lock:
+            record["asked"] = True
+            record["epoch"] = chat_state_mod.asked_epoch(
+                _CHAT_STATE.get(_live_chat(record["chat"])))
         before = _CHAT_STATE.get(live)
         # Where the turn's own mails stand in the count now — by id, since a
         # merge renumbers it; by the place they had when the turn started
@@ -13269,34 +13656,46 @@ def _turn_flags(record: dict, flags: dict[str, bool]) -> tuple[dict, dict]:
                   or (seq if unmoved and isinstance(seq, int) else None)
                   for mid, seq in zip(record["mids"], record["seqs"])]
         cut = max(places) if places and None not in places else None
-        doc, done = ((before, False) if cut is None
-                     else _CHAT_STATE.archive_through(live, cut, muted=bool(flags.get("muted"))))
-        rest = {k: v for k, v in flags.items() if not (k in ("archived", "muted") and v)}
+        # A mail queued for a turn of its own that came before the cut (or
+        # cannot be placed) would be put away by it unseen; one after it is
+        # newer mail, which archive_through refuses for.
+        with _chat_turns_lock:
+            queued = [a for a in (_CHAT_TURNS.get(live) or {}).get("arrivals") or []
+                      if a.get("mail")]
+        earlier = cut is not None and any(
+            (chat_state_mod.recent_place(before, a.get("message_id"))
+             or (a.get("seq") if isinstance(a.get("seq"), int) else None) or 0) <= cut
+            for a in queued)
+        doc, done = ((before, False) if cut is None or earlier
+                     else _CHAT_STATE.archive_through(live, cut))
+        # The mailbox hears of exactly the mails the turn worked, named now,
+        # at the decision: a mail the mirror has already written to the
+        # store, or the overlay holds, but whose offer the rail has not
+        # counted yet is no mail of this turn's — a scope built later from
+        # the store would take it out of the inbox all the same.
+        mids = [mid for mid in record["mids"] if mid]
         if not done:
-            if rest:
-                doc = _set_chat_flags(live, rest)
-            mids = [mid for mid in record["mids"] if mid]
             if mids:
                 _mailbox_follow_async(live, "archive", scope=mids)
-            reason = ("newer mail arrived" if cut is not None
-                      else "the mail it worked cannot be told from the rest of the thread")
+            reason = ("the mail it worked cannot be told from the rest of the thread"
+                      if cut is None else
+                      "an earlier mail of the thread waits for a turn of its own" if earlier
+                      else "newer mail arrived")
             print(f"[web-gateway] chat {live}: a turn's archive left the chat in view — "
                   f"{reason}", flush=True)
             return doc, {"archived": bool(doc.get("archived")), "reason": reason}
-        if rest:
-            doc = _CHAT_STATE.set_flags(live, **rest)
-        doc = _chat_flags_follow(live, flags, before, doc, cut=cut)
+        doc = _chat_flags_follow(live, flags, before, doc, scope=mids)
     with _chat_turns_lock:
-        record["flags"] |= {name for name in ("archived", "muted") if flags.get(name)}
+        record["flags"].add("archived")
     return doc, {}
 
 
 def _chat_flags_follow(chat_id: str, flags: dict[str, bool], before: dict, doc: dict, *,
-                       cut: int | None = None) -> dict:
+                       scope: list[str] | None = None) -> dict:
     """What follows from flags just set (``before`` the chat's state before,
     ``doc`` after): the list, the attention item, the mailbox — an archive
-    reaching up to ``cut`` in the chat's count where given, else everything
-    that has landed."""
+    reaching the mails ``scope`` names where given (a turn's own), else
+    everything that has landed."""
     # The list is cached; a chat just archived must leave it now, not on
     # the next refresh window.
     _chats_cache_invalidate()
@@ -13313,7 +13712,7 @@ def _chat_flags_follow(chat_id: str, flags: dict[str, bool], before: dict, doc: 
     # Bringing the chat back moves nothing back and calls nothing; it
     # only withdraws an archive the mailbox was still owed.
     if doc.get("archived") and (flags.get("archived") or flags.get("muted")):
-        _mailbox_follow_async(chat_id, "archive", cut)
+        _mailbox_follow_async(chat_id, "archive", scope=scope)
     elif flags.get("archived") is False:
         _mailbox_forget(chat_id, "archive")
     return doc
@@ -14990,6 +15389,24 @@ def _chats_ingest_authorized(provided: str, mail: bool = False) -> bool:
     return _token_matches(provided, CHATS_INGEST_TOKEN)
 
 
+_ASCII_LOWER = str.maketrans("ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz")
+
+
+def _stands_for_ascii(ch: str) -> bool:
+    """Whether a character that is not ASCII maps to one ASCII character,
+    one for one, under compatibility normalization (NFKC) or case folding:
+    KELVIN SIGN folds to "k", LONG S to "s", a fullwidth letter is its ASCII
+    one. Such a character in an address is a look-alike. A letter whose case
+    mapping merely contains ASCII letters — ß ("ss"), İ ("i̇") — or that has
+    an ASCII case partner only one way (ı, upper-cased "I") is an ordinary
+    letter of an internationalized address: no reader here folds it into
+    ASCII (they lower-case)."""
+    if ch.isascii():
+        return False
+    return any(len(form) == 1 and form.isascii()
+               for form in (unicodedata.normalize("NFKC", ch), ch.casefold(), ch.lower()))
+
+
 def _rail_gate_sender(payload: dict) -> str | None:
     """Who the mail gateway's gate took an arriving mail for: the event's
     ``gate_sender`` (docs/mail-chats.md, "The gate") — the one address of a
@@ -14999,20 +15416,24 @@ def _rail_gate_sender(payload: dict) -> str | None:
     ``Sender`` header's, or the first of several, and it is only what the
     mail is shown as from.
 
-    Lower-cased, and ASCII only — an address that is not is nobody's here, so
-    no Unicode folding can turn it into one the address book holds. ``None``
-    where the event carries no ``gate_sender`` at all (a gateway from before
-    the field): nobody either, for every decision; its ``sender`` may still
-    be shown (_chat_push_notification)."""
+    Lower-cased in its ASCII letters only, and nobody's where one of its
+    characters stands for an ASCII one (_stands_for_ascii: KELVIN SIGN,
+    a fullwidth letter) — the same rule as the mail gateway's — so no
+    folding a reader may do turns it into an address the address book holds
+    for somebody else. A letter that merely has no ASCII form (ß, ı, ü) is
+    an internationalized address's own, and stays. ``None`` where the event
+    carries no ``gate_sender`` at all (a gateway from before the field):
+    nobody either, for every decision; its ``sender`` may still be shown
+    (_chat_push_notification)."""
     if "gate_sender" not in payload:
         return None
     value = payload.get("gate_sender")
     if not isinstance(value, str):
         return ""
     value = value.strip()
-    if not value.isascii():
+    if any(_stands_for_ascii(ch) for ch in value):
         return ""
-    party = chat_state_mod.clean_party({"address": value})
+    party = chat_state_mod.clean_party({"address": value.translate(_ASCII_LOWER)})
     if party is None or party["address"].count("@") != 1:
         return ""
     return party["address"]
@@ -15841,6 +16262,39 @@ def _attention_append(conv: dict, message: str, payload: dict) -> tuple[int, dic
     return (push_notify.subscription_count() if push_notify.enabled() else 0), told
 
 
+def _mail_item_peer(entry: dict, book: _AddressBook | None = None) -> dict:
+    """Who a mail chat's item is about once this mail is its newest arrival
+    — the one helper every builder of such an item asks (_attention_arrive_chat,
+    _attention_relist_chat; the sweep, the home list and a correction rebuild
+    the item from what those kept: _mail_item_nobody).
+
+    This mail's own sender — the one the gate took it for (_rail_gate_sender)
+    — by the address book: the holder of the address, else whoever's domain
+    covers it (_mail_party). Never the thread's peer on record, which is
+    whoever last wrote with an address (and, for a ring that waited on a
+    turn, may be somebody who wrote after this mail): a mail the gate took
+    for nobody is about nobody — no card, no prior, no permit
+    (attention_store.MAIL_NOBODY)."""
+    address = _mail_gate_address(entry)
+    sender = (_mail_party({"address": address, "name": entry.get("sender_name")},
+                          book or _AddressBook())
+              if address else None)
+    return sender if sender is not None else dict(attention_store.MAIL_NOBODY)
+
+
+def _mail_item_nobody(block: dict, peer: dict) -> None:
+    """Keep with a mail chat's attention block whether its item is about
+    nobody (``peer`` from _mail_item_peer): every item rebuilt from the chat
+    — the home list, the sweep, a correction — would otherwise take the
+    state's peer, the thread's earlier correspondent, for a mail from nobody
+    (attention_store.chat_item). Set by an arrival from nobody, cleared by
+    the next one with a sender."""
+    if peer.get("nobody") is True:
+        block["nobody"] = True
+    else:
+        block.pop("nobody", None)
+
+
 def _attention_arrive_chat(chat_id: str, doc: dict, entry: dict, spec=None,
                            vip: bool = False, vip_from: str | None = None,
                            attended: int | None = None) -> tuple[dict, dict]:
@@ -15869,21 +16323,10 @@ def _attention_arrive_chat(chat_id: str, doc: dict, entry: dict, spec=None,
                          "kind": "image" if entry.get("attachments") and not entry.get("text") else "text"})
         state = dict(doc)
         if row["channel"] == MAIL_CHANNEL:
-            # A mail is judged as the person it is from: this mail's own
-            # sender — the one the gate took it for (_rail_gate_sender) —
-            # by the address book: the holder of the address, else whoever's
-            # domain covers it (_mail_party). Never the thread's peer on
-            # record, which is whoever last wrote with an address (and, for
-            # a ring that waited on a turn, may be somebody who wrote after
-            # this mail): a mail the gate took for nobody is judged as
-            # nobody — no card, no prior, no permit
-            # (attention_store.MAIL_NOBODY) — and the state's peer, which
-            # the item falls back on, is this sender too.
-            address = _mail_gate_address(entry)
-            sender = (_mail_party({"address": address, "name": entry.get("sender_name")}, book)
-                      if address else None)
-            row["peer"] = sender if sender is not None else dict(attention_store.MAIL_NOBODY)
-            state["peer"] = row["peer"]
+            # A mail is judged as the person it is from (_mail_item_peer),
+            # and the state's peer, which the item falls back on, is this
+            # sender too.
+            row["peer"] = state["peer"] = _mail_item_peer(entry, book)
         previous = dict(doc.get("attention") or {})
         # Whose item the chat holds, against whose message this is: a
         # messenger chat is one person or one group for good, a mail thread's
@@ -15917,6 +16360,8 @@ def _attention_arrive_chat(chat_id: str, doc: dict, entry: dict, spec=None,
         # group a VIP's post rings and the next member's does not.
         block["vip"] = bool(vip)
         block["vip_from"] = vip_from if vip else None
+        if row["channel"] == MAIL_CHANNEL:
+            _mail_item_nobody(block, row["peer"])
         state["attention"] = block
         item = attention_store.chat_item(row, state, profile)
         # Every message restarts the sender's timer, if they have one: the
@@ -15934,7 +16379,7 @@ def _attention_arrive_chat(chat_id: str, doc: dict, entry: dict, spec=None,
         return decision, item
 
 
-def _attention_relist_chat(chat_id: str, attended: int) -> bool:
+def _attention_relist_chat(chat_id: str, attended: int, entry: dict) -> bool:
     """A mail landed in this chat that nothing judges — held by the gate, or
     unread history the mirror is catching up on: where the chat's attention
     item was settled, it is open again. True when this call reopened it.
@@ -15958,7 +16403,10 @@ def _attention_relist_chat(chat_id: str, attended: int) -> bool:
 
     ``attended`` is the arrival's place in the chat's count. The caller
     passes a counted arrival only, never a repeated event — a repeat would
-    reopen what the user settled after the first."""
+    reopen what the user settled after the first. ``entry`` is that mail:
+    the reopened item is about its sender, as an arrival's is
+    (_mail_item_peer) — nobody's for a mail the gate took for nobody, never
+    the thread's earlier correspondent's."""
     with _attention_lock:
         state = _CHAT_STATE.get(chat_id)
         block = state.get("attention") or {}
@@ -15967,9 +16415,15 @@ def _attention_relist_chat(chat_id: str, attended: int) -> bool:
         now = _attention_now()
         fresh = {k: v for k, v in block.items() if k in ("pushed", "boost")}
         fresh.update(state="open", released=True)
-        item = attention_store.chat_item(
-            dict(_attention_chat_row_from_state(chat_id, state), unread=1, archived=False),
-            dict(state, attention=fresh), _ATTENTION.profile())
+        book = _AddressBook()
+        row = dict(_attention_chat_row_from_state(chat_id, state, book), unread=1,
+                   archived=False)
+        if row["channel"] == MAIL_CHANNEL:
+            row["peer"] = _mail_item_peer(entry, book)
+            state = dict(state, peer=row["peer"])
+            _mail_item_nobody(fresh, row["peer"])
+        item = attention_store.chat_item(row, dict(state, attention=fresh),
+                                         _ATTENTION.profile())
         item["last_level"] = attention_policy.level(item, now)
         _attention_persist(item, attended=attended)
         return True
@@ -17798,8 +18252,23 @@ class Handler(BaseHTTPRequestHandler):
         the user's interest is in a person.
 
         Same-origin only, like a send: archiving a mail chat moves real mail.
+        And, like a send, only through the reverse proxy (_request_from_edge):
+        these are the user's own flags, which a mail's turn running on the
+        chat must not be able to set by calling here instead of the internal
+        endpoint, whose rules decide who an agent's call is
+        (_handle_internal_chat_flags — scripts/chat-flags.py).
         """
         if not self._user_act_same_origin():
+            return
+        ok, reason = self._request_from_edge(f"chat flags of {raw_id}")
+        if not ok:
+            self._send_json(403, {
+                "error": "a chat's flags are the user's own and are set here only "
+                         "from the dashboard through the reverse proxy",
+                "detail": reason,
+                "remedy": "An agent sets a chat's flags with scripts/chat-flags.py "
+                          "(POST /internal/chats/<id>/flags).",
+            })
             return
         chat_id = self._chat_id_or_404(raw_id)
         if chat_id is None:
@@ -17813,7 +18282,7 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError as exc:
             self._send_json(400, {"error": str(exc)})
             return
-        doc = _set_chat_flags(chat_id, flags)
+        doc = _set_chat_flags(chat_id, flags, user=True)
         self._send_json(200, {"id": chat_id,
                               "archived": bool(doc.get("archived")),
                               "muted": bool(doc.get("muted")),
@@ -17835,18 +18304,45 @@ class Handler(BaseHTTPRequestHandler):
         delete here, on purpose: erasing a chat is the user's own act
         (_handle_chat_delete), and no agent has the erase capability.
 
-        A call made while an arrival turn is running for the chat is taken
-        as that turn's (_turn_flags): its archive — or mute, which archives —
-        reaches only the mail the turn was given, and is left undone where
-        mail arrived after it (the answer then says ``archived`` false, with
-        the ``reason``); and what it put away is noted as its own, so that
-        with a verdict the ring that waits on the turn is not delivered, and
-        without one, or past the timeout, the chat is brought back before
-        the failure rule rings it (_instructed_settle). Such a turn calls
-        with the chat id its prompt named, and a merge may have folded that
-        chat into another meanwhile: the call is the turn's all the same and
-        acts on the chat it is part of now — a merged id answers 410 only
-        where no turn answers to it."""
+        A call is an arrival turn's when it proves it: it carries the
+        token the turn's session was handed (``X-Arrival-Turn``, from
+        RETINUE_ARRIVAL_TURN — scripts/chat-flags.py sends it) and that turn
+        is running on this chat (_turn_by_token). Such a call can only
+        archive the turn's own mails (_turn_flags): its mute is taken as
+        that archive, its unmute, unarchive and star change nothing, and the
+        answer says what was refused and what was done (``reason``: "a turn
+        cannot mute; archived instead"). Its archive reaches only the mail
+        the turn was given, and is left undone where other mail arrived or
+        waits (``archived`` false, with the ``reason``); and it is noted as
+        the turn's own, so that with a verdict the ring that waits on the
+        turn is not delivered, and without one — or, in a mail thread, past
+        the timeout — the chat is brought back before the failure rule rings
+        it (_instructed_settle). Such a turn calls with the chat id its
+        prompt named, and a merge may have folded that chat into another
+        meanwhile: the call is the turn's all the same and acts on the chat
+        it is part of now. A token that names no turn running on this chat
+        — a turn's session asking about another chat, or one whose turn is
+        over — is refused (403) and changes nothing.
+
+        A call that carries no such token is Ara's on the user's word, with
+        the user's semantics — the mute included — when it proves that
+        (``X-User-Turn``: the token a dashboard thread's turn is handed,
+        RETINUE_USER_TURN, valid while that turn runs — _user_turn_valid),
+        and whenever no mail arrival turn is running on the chat: a
+        messenger chat's call is the user's as before the gate. A call that
+        proves neither, on a mail thread a mail's turn is working, is taken
+        as that turn's (``reason`` "a turn is running on this chat; …"), so
+        that whoever made it can ask again once the turn is over: what
+        stands between a turn and the user's word is this, not the turn's
+        cooperation. A merged id answers 410.
+
+        This holds on the turn's own chat while the turn runs, and no
+        further: an arrival turn's session holds the backend token every
+        agent session holds, so a call it makes without its token about
+        another chat — or one a process it left behind makes once the turn
+        is over — is an agent's like any other, with the user's semantics.
+        It is a guard against a turn that was talked into something, not a
+        sandbox; what keeps a turn to its brief there is the brief."""
         chat_id = _chat_id_from_path(raw_id)
         if chat_id is None:
             self._send_json(404, {"error": "not a chat id"})
@@ -17854,8 +18350,23 @@ class Handler(BaseHTTPRequestHandler):
         payload = self._agent_conversation_payload()
         if payload is None:
             return
+        token = self.headers.get(ARRIVAL_TURN_HEADER, "").strip()
+        proof = self.headers.get(USER_TURN_HEADER, "").strip()
+        users = not token and _user_turn_valid(proof)
+        implied = False
         with _chat_turns_lock:
-            record = _turn_record(chat_id)
+            record = _turn_by_token(chat_id, token)
+            if record is None and not token and not users:
+                record = _mail_turn_running(chat_id)
+                implied = record is not None
+        if proof and not users and not token:
+            print(f"[web-gateway] chat {chat_id}: a flags call's user-turn proof names no "
+                  "dashboard turn running now — no proof", flush=True)
+        if token and record is None:
+            self._send_json(403, {"error": "this arrival turn is not running on this chat: "
+                                           "a turn sets the flags of its own chat only, "
+                                           "while it runs"})
+            return
         if record is None and self._answered_merged(chat_id):
             return
         try:
@@ -17866,11 +18377,16 @@ class Handler(BaseHTTPRequestHandler):
         extra: dict = {}
         if record is not None:
             doc, extra = _turn_flags(record, flags)
+            if implied:
+                extra["reason"] = (TURN_RUNNING + "; the call was taken as the turn's"
+                                   + (f"; {extra['reason']}" if extra.get("reason") else "")
+                                   + "; ask again once it is over")
         else:
-            doc = _set_chat_flags(chat_id, flags)
+            doc = _set_chat_flags(chat_id, flags, user=True)
         # What was done, which a turn's archive refused (``reason``) is not.
-        print(f"[web-gateway] chat {doc.get('id', chat_id)}: flags set by "
-              f"{'its turn' if record is not None else 'an agent'} — "
+        who = ("a call taken as its turn's" if implied
+               else "its turn" if record is not None else "an agent")
+        print(f"[web-gateway] chat {doc.get('id', chat_id)}: flags set by {who} — "
               + ", ".join(f"{k}={str(bool(doc.get(k))).lower()}" for k in sorted(flags))
               + (f" (asked {', '.join(f'{k}={str(v).lower()}' for k, v in sorted(flags.items()))}"
                  f"; not done: {extra['reason']})" if extra.get("reason") else ""),
@@ -19271,13 +19787,6 @@ class Handler(BaseHTTPRequestHandler):
         direction = (payload.get("direction") or "").strip()
         channel = (payload.get("channel") or "").strip()
         chat_key = (payload.get("chat") or "").strip()
-        if _is_mail(channel) and not _chats_ingest_authorized(token, mail=True):
-            # A mail is never announced on an open rail: its turn may send.
-            self._send_json(403, {"error": "forbidden"})
-            return
-        if direction not in ("in", "out") or not channel or not chat_key:
-            self._send_json(400, {"error": "direction (in|out), channel and chat are required"})
-            return
         # The account rides on the event and is half the chat's identity — the
         # same value the writing gateway stamped as kb:account on the ledger
         # record for this very message, so the overlay entry and the row the
@@ -19286,7 +19795,28 @@ class Handler(BaseHTTPRequestHandler):
         # authorizes) sends none, and its events compose the unqualified id its
         # records will also produce.
         account = (payload.get("account") or "").strip() or None
-        chat_id = chat_state_mod.make_chat_id(channel, chat_key, account)
+        chat_id = (chat_state_mod.make_chat_id(channel, chat_key, account)
+                   if channel and chat_key else "")
+        # Whether this is a mail is read off the id the event composes — the
+        # one every later step reads its channel from (the turn's wording,
+        # the note, the push, the companion) — never off the raw field: a
+        # channel of "email:~<account>" composes a real mail thread's id
+        # out of a field that does not say "email".
+        ref = chat_state_mod.split_chat_ref(chat_id) if chat_id else None
+        if (_is_mail(channel) or (ref is not None and _is_mail(ref[0]))) \
+                and not _chats_ingest_authorized(token, mail=True):
+            # A mail is never announced on an open rail: its turn may send.
+            self._send_json(403, {"error": "forbidden"})
+            return
+        if direction not in ("in", "out") or not channel or not chat_key:
+            self._send_json(400, {"error": "direction (in|out), channel and chat are required"})
+            return
+        if ref is None or ref[0] != channel or ref[1] != account:
+            # One canonical channel value from here on: the field as given is
+            # the channel of the id it composes, or the event is refused.
+            self._send_json(400, {"error": "channel must be a plain channel name "
+                                           "(the account goes in `account`)"})
+            return
         ts = stamp = chat_state_mod.iso_z(payload.get("ts"))
         if direction == "in":
             # An arrival's stamp is the sender's clock (Signal) or a phone's
@@ -19463,7 +19993,8 @@ class Handler(BaseHTTPRequestHandler):
                     chat_id, ts, message_id=entry["message_id"], stamp=stamp)
                 if counted:
                     _attention_relist_chat(
-                        chat_id, chat_state_mod.arrival_seq(counted_doc, entry["message_id"]))
+                        chat_id, chat_state_mod.arrival_seq(counted_doc, entry["message_id"]),
+                        entry)
             elif direction == "in" or author in ("user", "device"):
                 _CHAT_STATE.advance_last_read(chat_id, ts)
             self._send_json(200, {"ok": True, "id": chat_id, "pushed": False})
@@ -19586,7 +20117,7 @@ class Handler(BaseHTTPRequestHandler):
                 # per mail — a counted arrival, or a repeat of one whose first
                 # offer never got this far; never a repeat of one that did,
                 # which would reopen what the user settled after the first.
-                _attention_relist_chat(chat_id, inbound_seq)
+                _attention_relist_chat(chat_id, inbound_seq, entry)
             if untold and not (defer and not quiet):
                 # What this mail owed the user has run to the end: its
                 # attention step and push — or nothing, in a chat the user
@@ -19654,6 +20185,11 @@ class Handler(BaseHTTPRequestHandler):
                              "message_id": entry["message_id"]},
                             None, "the turn it waited on is over", note=False)
                         pushed = outcome["delivery"] == "rang"
+                        # And where its turn ran, the mail is done with:
+                        # what it owed has gone out now. The handle answers
+                        # done, so the gateway accepts the mail instead of
+                        # offering it again for a turn that would run twice.
+                        _arrival_job_rung_late(job_url, chat_id, entry["message_id"])
                     # A VIP is owed work. If the companion thread could not be
                     # opened, this rail cannot do it — so the message is not
                     # accepted either, and the gateway's own forward gets it

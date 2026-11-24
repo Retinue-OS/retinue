@@ -35,7 +35,12 @@ job a turn runs under is polled by the mail gateway's real job_delivery
   a newer mail arrived meanwhile: the chat stays, only the turn's mail moves;
 - a news-flagged list's mail goes to the feed and makes no chat; a VIP's
   mail in that list gets its chat and its turn, is still filed, and stays in
-  the INBOX.
+  the INBOX;
+- a mail the web gateway answers 5xx for, for ever — one that arrived, and
+  the user's own sent mail — then a VIP's reply in the same thread: the
+  failing mail steps aside after RAIL_HOLD_ATTEMPTS tries, the reply is
+  offered, rings once and gets its turn, and /health counts the one that
+  keeps failing until it is taken.
 
 Standalone:
 
@@ -46,6 +51,8 @@ from __future__ import annotations
 import email
 import functools
 import importlib.util
+import io
+import json
 import os
 import re
 import subprocess
@@ -75,15 +82,25 @@ TURNS: list = []
 TURN_GATE: dict = {"during": None, "hold": None, "fail": False}
 
 
+# The token the running turn's session was handed (RETINUE_ARRIVAL_TURN),
+# per thread: the scripts `during` runs get it in their environment, as the
+# session's own commands would (World.script).
+_TURN = threading.local()
+
+
 def _stub_send_message(prompt, display_question=None, session_key=None, **_kw):
     """The model turn: records its prompt, runs what the test has it do."""
-    TURNS.append({"prompt": prompt, "session": session_key})
-    during = TURN_GATE.get("during")
-    if during is not None:
-        during(prompt)
-    hold = TURN_GATE.get("hold")
-    if hold is not None:
-        hold.wait(30)
+    TURNS.append({"prompt": prompt, "session": session_key, "token": _kw.get("arrival_turn")})
+    _TURN.token = _kw.get("arrival_turn")
+    try:
+        during = TURN_GATE.get("during")
+        if during is not None:
+            during(prompt)
+        hold = TURN_GATE.get("hold")
+        if hold is not None:
+            hold.wait(30)
+    finally:
+        _TURN.token = None
     if TURN_GATE.get("fail"):
         return {"error": "upstream is down"}
     return {"response": "Read it; nothing to add.", "model_name": "stub-model", "cost_usd": 0.0}
@@ -232,9 +249,14 @@ class World:
         return _set
 
     def script(self, name, *args) -> tuple[int, str]:
-        """One of the scripts a turn is told to run, as it would run it."""
+        """One of the scripts a turn is told to run, as it would run it: in
+        the turn's environment, its token included, when run from the turn
+        (`during`); without one — Ara in another session — elsewhere."""
         env = dict(os.environ, CHAT_DRAFT_BACKEND_URL=self.base + "/internal/chats",
                    CONVERSATION_BACKEND_TOKEN="agent-token")
+        env.pop("RETINUE_ARRIVAL_TURN", None)
+        if getattr(_TURN, "token", None):
+            env["RETINUE_ARRIVAL_TURN"] = _TURN.token
         proc = subprocess.run([sys.executable, str(SCRIPTS / name), *args], env=env,
                               capture_output=True, text=True, timeout=30)
         return proc.returncode, proc.stdout + proc.stderr
@@ -594,6 +616,408 @@ def test_a_newer_mail_keeps_the_chat(w: World):
     print("PASS test_a_newer_mail_keeps_the_chat")
 
 
+# ── One mail the web gateway always fails on ──────────────────────────────────
+
+def _poisoned(w: World, poison: set):
+    """The web gateway's rail handler fails for these message ids, every
+    time — a fault in its own work, which its catch-all answers with a 500.
+    Returns the undo."""
+    handler = w.wg.Handler
+    real = handler._chats_inbound_event
+
+    def faulty(self):
+        length = int(self.headers.get("Content-Length") or 0)
+        body = self.rfile.read(length)
+        self.rfile = io.BytesIO(body)
+        try:
+            message_id = json.loads(body or b"{}").get("message_id")
+        except ValueError:
+            message_id = None
+        if message_id in poison:
+            raise RuntimeError("a fault in the handler's own work for this mail")
+        return real(self)
+    handler._chats_inbound_event = faulty
+    return lambda: setattr(handler, "_chats_inbound_event", real)
+
+
+def test_a_vips_reply_behind_a_mail_the_rail_always_fails_on(w: World):
+    """A mail the web gateway answers 5xx for, for ever — a first offer, and
+    the user's own sent mail — holds its thread back only while the failure
+    is young: the VIP's reply in it is offered, rings and gets its turn."""
+    holds = w.gw.RAIL_HOLD_ATTEMPTS
+    for first, own in (("big@x.org", False), ("s1@example.org", True)):
+        _reset()
+        undo = _poisoned(w, {first})
+        try:
+            if own:
+                w.box.put("Sent", t.msg(first, sender=t.ME, to="boss@corp.example",
+                                        subject="Contract",
+                                        day=(time.time() - 5 - t.T0) / t.DAY))
+                w.mirror.poll()
+            else:
+                w.arrives(first, sender="Ann <ann@x.org>", subject="Contract")
+            reply = "re-" + first.replace("@", ".") + "@corp.example"
+            w.arrives(reply, sender="Boss <boss@corp.example>", subject="Re: Contract",
+                      irt=first, refs=[first])
+            assert w.rec(reply)["chat"] == w.rec(first)["chat"]
+            assert not PUSHES and not TURNS and w.mirror.health_notice() is None
+            # Held while young; then the mail steps aside and the reply goes.
+            for _ in range(holds + 1):
+                w.later(4000)
+            _wait(lambda: w.delivered(reply), "the VIP's reply delivered")
+            assert len(PUSHES) == 1 and len(TURNS) == 1, (PUSHES, len(TURNS))
+            assert "marked its sender a VIP" in TURNS[0]["prompt"]
+            if own:
+                assert w.mirror.index.one("SELECT attempts FROM outbox")["attempts"] >= holds
+            else:
+                assert not w.delivered(first) and w.owed(first)
+            notice = w.mirror.health_notice()
+            assert notice and notice.startswith(
+                "1 rail event(s) keep failing while others are taken"), notice
+            assert w.gw._health_snapshot()["waiting"]["failing"] == 1
+            # Still tried on its own clock; no second ring, no second turn.
+            w.later(4000)
+            assert len(PUSHES) == 1 and len(TURNS) == 1
+        finally:
+            undo()
+        # The fault is fixed: the mail is taken, /health says nothing more.
+        w.later(4000)
+        _wait(lambda: w.mirror.index.one(
+            "SELECT COUNT(*) AS n FROM outbox")["n"] == 0 and not w.owed(first), "taken")
+        if not own:
+            assert w.delivered(first)
+        assert w.mirror.health_notice() is None
+        assert len(PUSHES) == 1 and len(TURNS) == 1
+    print("PASS test_a_vips_reply_behind_a_mail_the_rail_always_fails_on")
+
+
+def _failing(w: World, name: str):
+    """The web gateway's handler of one rail endpoint fails (its catch-all
+    answers 500) until healed. Returns ``(state, undo)``; ``state["heal"]``
+    heals it."""
+    handler = w.wg.Handler
+    real = getattr(handler, name)
+    state = {"heal": False}
+
+    def faulty(self):
+        if not state["heal"]:
+            raise RuntimeError("a fault in the handler's own work")
+        return real(self)
+    setattr(handler, name, faulty)
+    return state, lambda: setattr(handler, name, real)
+
+
+def test_a_late_removal_of_a_mail_that_came_back(w: World):
+    """A removal the web gateway fails on until it has stepped aside; the
+    user moves the mail back into the INBOX, which is heard at once; then
+    the fault heals. The late removal says what is true when it is sent —
+    nothing: the chat is not archived, and its mail is there."""
+    _reset()
+    key = "late-rm@x.org"
+    state, undo = _failing(w, "_handle_chats_removed")
+    try:
+        raw = t.msg(key, sender="Dora <dora@x.org>", subject="Invoice",
+                    day=(time.time() + w.offset - 5 - t.T0) / t.DAY)
+        uid = w.box.put("INBOX", raw)
+        w.mirror.poll()
+        assert w.exists(key) and not w.doc(key).get("archived")
+        w.box.remove("INBOX", uid)
+        w.mirror.poll()
+        for _ in range(w.gw.RAIL_HOLD_ATTEMPTS + 1):
+            w.later(4000)
+        row = w.mirror.index.one("SELECT attempts FROM outbox WHERE kind = 'removed'")
+        assert row and row["attempts"] >= w.gw.RAIL_HOLD_ATTEMPTS, row
+        w.box.put("INBOX", raw)
+        w.mirror.poll()
+        assert not w.doc(key).get("archived") and w.listed(key)
+        state["heal"] = True
+        w.later(4000)
+        _wait(lambda: w.mirror.index.one("SELECT COUNT(*) AS n FROM outbox")["n"] == 0,
+              "the outbox empty")
+    finally:
+        undo()
+    doc = w.doc(key)
+    assert not doc.get("archived") and w.listed(key), doc
+    assert (doc.get("attention") or {}).get("done_how") != "archived", doc.get("attention")
+    seq = [s for mid, s in doc.get("inbound_recent") or [] if mid == key]
+    assert seq and seq[-1] not in mail.cs.gone_arrivals(doc), doc
+    assert w.in_folder("INBOX", key) and w.rec(key).get("removed_at") is None
+    print("PASS test_a_late_removal_of_a_mail_that_came_back")
+
+
+def test_a_late_told_mail_that_is_gone(w: World):
+    """The user's own sent mail, which the web gateway fails on until it has
+    stepped aside; the user deletes it in a client, and its removal is
+    taken. When the fault heals, the told event is not heard: the chat does
+    not show a mail that is gone."""
+    _reset()
+    day = (time.time() + w.offset - 5 - t.T0) / t.DAY
+    w.box.put("Sent", t.msg("late-out-root@example.org", sender=t.ME, to="erin@x.org",
+                            subject="Lunch", day=day))
+    w.mirror.poll()
+    gone = "late-out@x.org"
+    undo = _poisoned(w, {gone})
+    try:
+        uid = w.box.put("Sent", t.msg(gone, sender=t.ME, to="erin@x.org", subject="Re: Lunch",
+                                      irt="late-out-root@example.org",
+                                      refs=["late-out-root@example.org"], day=day))
+        w.mirror.poll()
+        for _ in range(w.gw.RAIL_HOLD_ATTEMPTS + 1):
+            w.later(4000)
+        row = w.mirror.index.one("SELECT attempts FROM outbox WHERE kind = 'inbound'")
+        assert row and row["attempts"] >= w.gw.RAIL_HOLD_ATTEMPTS, row
+        w.box.remove("Sent", uid)
+        w.later(10)
+        assert w.rec(gone).get("removed_at")
+    finally:
+        undo()
+    w.later(4000)
+    _wait(lambda: w.mirror.index.one("SELECT COUNT(*) AS n FROM outbox")["n"] == 0,
+          "the outbox empty")
+    key = w.rec(gone)["chat"]
+    shown = [entry.get("message_id") for entry in w.wg._CHAT_OVERLAY.entries(w.chat(key))]
+    assert "late-out-root@example.org" in shown and gone not in shown, shown
+    print("PASS test_a_late_told_mail_that_is_gone")
+
+
+def test_a_removal_waits_for_the_merge_of_its_chat(w: World):
+    """Two chats, and a mail that joins them: the web gateway fails on the
+    merge until it has stepped aside. The user deletes a mail of the chat
+    the merge folds away; its removal names the surviving chat, where the
+    web gateway does not have that mail yet. It waits for the merge, so once
+    the merge is taken the mail is gone from the chat it was folded into."""
+    _reset()
+    day = lambda: (time.time() + w.offset - 5 - t.T0) / t.DAY  # noqa: E731
+    state, undo = _failing(w, "_handle_chats_merge")
+    try:
+        w.box.put("INBOX", t.msg("wm-root@x.org", sender="Fay <fay@x.org>", subject="Trip",
+                                 day=day()))
+        w.mirror.poll()
+        w.offset += 10
+        uid = w.box.put("INBOX", t.msg("wm-m@x.org", sender="Gus <gus@x.org>",
+                                       subject="Re: Trip", irt="wm-lost@x.org",
+                                       refs=["wm-lost@x.org"], day=day()))
+        w.mirror.poll()
+        absorbed = w.rec("wm-m@x.org")["chat"]
+        w.offset += 10
+        w.box.put("INBOX", t.msg("wm-c@x.org", sender="Fay <fay@x.org>", subject="Re: Trip",
+                                 irt="wm-root@x.org", refs=["wm-root@x.org", "wm-lost@x.org"],
+                                 day=day()))
+        w.mirror.poll()
+        survivor = w.rec("wm-c@x.org")["chat"]
+        assert survivor != absorbed and w.rec("wm-m@x.org")["chat"] == survivor
+        for _ in range(w.gw.RAIL_HOLD_ATTEMPTS + 1):
+            w.later(4000)
+        row = w.mirror.index.one("SELECT attempts FROM outbox WHERE kind = 'merge'")
+        assert row and row["attempts"] >= w.gw.RAIL_HOLD_ATTEMPTS, row
+        w.box.remove("INBOX", uid)
+        w.later(10)
+        assert w.rec("wm-m@x.org").get("removed_at")
+        state["heal"] = True
+        w.later(4000)
+        w.later(4000)
+        _wait(lambda: w.mirror.index.one("SELECT COUNT(*) AS n FROM outbox")["n"] == 0,
+              "the outbox empty")
+    finally:
+        undo()
+    doc = w.wg._CHAT_STATE.get(w.chat(survivor))
+    seq = [s for mid, s in doc.get("inbound_recent") or [] if mid == "wm-m@x.org"]
+    assert seq and seq[-1] in mail.cs.gone_arrivals(doc), doc
+    print("PASS test_a_removal_waits_for_the_merge_of_its_chat")
+
+
+def test_a_removal_before_a_merge_goes_first(w: World):
+    """Decision AV: a removal waits only for a merge queued before it. The
+    web gateway is away for a moment: the user deletes a mail of one chat,
+    and then a mail joins that chat with another — the removal is queued
+    first. The web gateway comes back and fails on the merge every time;
+    the removal names the chat as the web gateway still has it, so it goes
+    in its order, and the deleted mail is gone from the chat."""
+    _reset()
+    day = lambda: (time.time() + w.offset - 5 - t.T0) / t.DAY  # noqa: E731
+    w.box.put("INBOX", t.msg("rb-root@x.org", sender="Fay <fay@x.org>", subject="Trip",
+                             day=day()))
+    w.mirror.poll()
+    w.offset += 10
+    uid = w.box.put("INBOX", t.msg("rb-m@x.org", sender="Fay <fay@x.org>", subject="Re: Trip",
+                                   irt="rb-root@x.org", refs=["rb-root@x.org"], day=day()))
+    w.mirror.poll()
+    w.offset += 10
+    w.box.put("INBOX", t.msg("rb-o@x.org", sender="Gus <gus@x.org>", subject="Other",
+                             irt="rb-lost@x.org", refs=["rb-lost@x.org"], day=day()))
+    w.mirror.poll()
+    root, lost = w.rec("rb-m@x.org")["chat"], w.rec("rb-o@x.org")["chat"]
+    assert root != lost
+    state, undo = _failing(w, "_handle_chats_merge")
+    try:
+        w.stop_wg()
+        w.box.remove("INBOX", uid)
+        w.later(10)
+        w.offset += 10
+        w.box.put("INBOX", t.msg("rb-c@x.org", sender="Fay <fay@x.org>", subject="Re: Trip",
+                                 irt="rb-root@x.org", refs=["rb-root@x.org", "rb-lost@x.org"],
+                                 day=day()))
+        w.later(10)
+        queued = [r["kind"] for r in w.mirror.index.rows("SELECT kind FROM outbox ORDER BY seq")]
+        assert queued.index("removed") < queued.index("merge"), queued
+        w.start_wg()
+        for _ in range(w.gw.RAIL_HOLD_ATTEMPTS + 2):
+            w.later(4000)
+        _wait(lambda: not w.mirror.index.one(
+            "SELECT seq FROM outbox WHERE kind = 'removed'"), "the removal taken")
+        row = w.mirror.index.one("SELECT attempts FROM outbox WHERE kind = 'merge'")
+        assert row and row["attempts"] >= w.gw.RAIL_HOLD_ATTEMPTS, row
+        doc = w.doc(root)
+        shown = [entry.get("message_id") for entry in w.wg._CHAT_OVERLAY.entries(w.chat(root))]
+        assert "rb-m@x.org" not in shown, shown
+        seq = [s for mid, s in doc.get("inbound_recent") or [] if mid == "rb-m@x.org"]
+        assert seq and seq[-1] in mail.cs.gone_arrivals(doc), doc
+        # Healed, the merge goes too, and the deleted mail stays gone.
+        state["heal"] = True
+        w.later(4000)
+        w.later(4000)
+        _wait(lambda: w.mirror.index.one("SELECT COUNT(*) AS n FROM outbox")["n"] == 0,
+              "the outbox empty")
+    finally:
+        undo()
+    shown = [entry.get("message_id") for entry in w.wg._CHAT_OVERLAY.entries(w.chat(root))]
+    assert "rb-m@x.org" not in shown and "rb-o@x.org" in shown, shown
+    print("PASS test_a_removal_before_a_merge_goes_first")
+
+
+class _Killed(BaseException):
+    """The process stopping in the middle of a transaction."""
+
+
+def test_a_removal_behind_a_chain_of_merges(w: World):
+    """Decision BB: three chats Z, Y, X (oldest first; X holds a reply).
+    While the web gateway is away, one mail joins X into Y (M1), a later one
+    Y into Z (M2), and the user deletes X's reply: its removal names Z, and
+    waits for no merge but M2. The web gateway fails on every merge of X, so
+    M1 steps aside, M2 is taken and the removal behind it — while the web
+    gateway still holds the mail under X. When M1 is finally taken, it
+    carries the mail into the survivor with its arrival; so the removals of
+    the chats it absorbed are announced again, and the deleted mail is gone
+    from the survivor and counted as gone. The same where the removal is
+    queued between the two merges, and where M2 names X itself; and a stop
+    while the late merge is taken off the outbox loses none of it."""
+    _reset()
+    day = lambda: (time.time() + w.offset - 5 - t.T0) / t.DAY  # noqa: E731
+    for n, (order, mid, kill) in enumerate((("zyx", False, False), ("zyx", True, False),
+                                            ("zxy", False, False), ("zyx", False, True))):
+        p = f"ch{n}"
+        roots = {k: (f"{p}{k}-root@x.org", f"{k.upper()}a <{p}{k}@x.org>") for k in "xyz"}
+        for k in order:
+            w.box.put("INBOX", t.msg(roots[k][0], sender=roots[k][1], subject="S" + k,
+                                     day=day()))
+            w.mirror.poll()
+            w.offset += 10
+        gone = f"{p}x-m@x.org"
+        uid = w.box.put("INBOX", t.msg(gone, sender=roots["x"][1], subject="Re: Sx",
+                                       irt=roots["x"][0], refs=[roots["x"][0]], day=day()))
+        w.mirror.poll()
+        w.offset += 10
+        X, Z = w.rec(gone)["chat"], w.rec(roots["z"][0])["chat"]
+        real = w.wg._merge_chats
+        state = {"heal": False, "killed": False}
+
+        def faulty(channel, account, absorbed, into, X=X, state=state, real=real):
+            if not state["heal"] and (X in absorbed or into == X):
+                raise RuntimeError("a fault on the merge of one chat")
+            return real(channel, account, absorbed, into)
+        w.wg._merge_chats = faulty
+        try:
+            w.stop_wg()
+            for k, mail_id in (("y", f"{p}c1@x.org"), ("z", f"{p}c2@x.org")):
+                cited = [roots["x" if k == "y" else "y"][0], roots[k][0]]
+                w.box.put("INBOX", t.msg(mail_id, sender=roots[k][1], subject="Re: Sx",
+                                         irt=cited[0], refs=cited, day=day()))
+                w.later(10)
+                w.offset += 10
+                if mid and k == "y":
+                    w.box.remove("INBOX", uid)
+                    w.later(10)
+                    w.offset += 10
+            if not mid:
+                w.box.remove("INBOX", uid)
+                w.later(10)
+            assert w.rec(gone).get("removed_at") and w.rec(gone)["chat"] == Z, w.rec(gone)
+            queued = [r["kind"] for r in w.mirror.index.rows(
+                "SELECT kind FROM outbox ORDER BY seq")]
+            assert queued.count("merge") == 2 and "removed" in queued, queued
+            w.start_wg()
+            for _ in range(w.gw.RAIL_HOLD_ATTEMPTS + 3):
+                w.later(4000)
+            left = [dict(r) for r in w.mirror.index.rows("SELECT kind, attempts FROM outbox")]
+            if order == "zyx" and not mid:
+                # M2 and the removal behind it were taken; M1 stepped aside.
+                assert [r["kind"] for r in left] == ["merge"], left
+                assert left[0]["attempts"] >= w.gw.RAIL_HOLD_ATTEMPTS, left
+            state["heal"] = True
+            if kill:
+                # The process stops just after the late merge's row is
+                # deleted — by whatever write deletes it, inside the
+                # transaction it is in. With a restart, nothing the merge
+                # owed is lost.
+                index = w.mirror.index
+                merge = index.one("SELECT seq FROM outbox WHERE kind = 'merge'")["seq"]
+                real_run, real_atomic = index.run, index.atomic
+                deletes = lambda st: (st is not None  # noqa: E731
+                                      and st[0].startswith("DELETE FROM outbox")
+                                      and tuple(st[1]) == (merge,))
+
+                def undo():
+                    index.run, index.atomic = real_run, real_atomic
+
+                def run(sql, args=(), state=state):
+                    if deletes((sql, args)):
+                        undo()
+                        state["killed"] = True
+                        real_run(sql, args)
+                        raise _Killed()
+                    return real_run(sql, args)
+
+                def atomic(statements, state=state):
+                    statements = list(statements)
+                    if not any(deletes(st) for st in statements):
+                        return real_atomic(statements)
+                    undo()
+                    state["killed"] = True
+
+                    def stopped():
+                        for st in statements:
+                            yield st
+                            if deletes(st):
+                                raise _Killed()
+                    return real_atomic(stopped())
+                index.run, index.atomic = run, atomic
+                try:
+                    w.later(4000)
+                except _Killed:
+                    pass
+                undo()
+                assert state["killed"], "the late merge was not taken"
+                w.mirror.index.close()
+                w.mirror.threads.close()
+                w.mirror = w.gw.MIRROR = w.gw.Mirror(
+                    w.box, clock=lambda: time.time() + w.offset)
+            for _ in range(3):
+                w.later(4000)
+            _wait(lambda: w.mirror.index.one("SELECT COUNT(*) AS n FROM outbox")["n"] == 0,
+                  "the outbox empty")
+        finally:
+            w.wg._merge_chats = real
+        for key in {X, Z, w.rec(roots["y"][0])["chat"]} - {Z}:
+            assert w.wg._CHAT_STATE.merged_into(w.chat(key)) == w.chat(Z), key
+        shown = [entry.get("message_id") for entry in w.wg._CHAT_OVERLAY.entries(w.chat(Z))]
+        assert gone not in shown and f"{p}c2@x.org" in shown, (order, mid, kill, shown)
+        doc = w.doc(Z)
+        seq = [s for m, s in doc.get("inbound_recent") or [] if m == gone]
+        assert seq and seq[-1] in mail.cs.gone_arrivals(doc), (order, mid, kill, doc)
+        assert not doc.get("archived"), doc
+    print("PASS test_a_removal_behind_a_chain_of_merges")
+
+
 # ── The two axes ──────────────────────────────────────────────────────────────
 
 def test_news_and_a_vip_in_the_list(w: World):
@@ -622,6 +1046,47 @@ def test_news_and_a_vip_in_the_list(w: World):
     print("PASS test_news_and_a_vip_in_the_list")
 
 
+def test_a_turns_mute_is_an_archive(w: World):
+    """Decision S across the seam: a turn that runs `chat-flags.py --mute`
+    archives — the mailbox moves the turn's own mail, the answer says the
+    mute was not made — and the thread's next mail, a VIP's, brings it back
+    and rings."""
+    _reset()
+    w.archived.clear()
+    key = "inv4@pay.bills.example"
+    answers: list = []
+
+    def mutes(prompt):
+        code, out = w.script("chat-flags.py", "--chat", w.chat(key), "--mute")
+        answers.append(out)
+        assert code == 0, out
+        code, out = w.script("chat-verdict.py", "--chat", w.chat(key), "--importance", "0")
+        assert code == 0, out
+
+    TURN_GATE["during"] = mutes
+    w.arrives(key, sender="Billing <invoices@bills.example>", subject="Invoice 9")
+    _wait(lambda: w.delivered(key), "delivered")
+    TURN_GATE["during"] = None
+    w.wg._mailbox_wait()
+    assert answers and "a turn cannot mute; archived instead" in answers[0], answers
+    assert w.archived == [(key, {key})], w.archived
+    doc = w.doc(key)
+    assert doc["archived"] is True and doc["muted"] is False, doc
+    assert not PUSHES
+    hold = TURN_GATE["hold"] = threading.Event()
+    try:
+        w.arrives("inv5@corp.example", sender="Boss <boss@corp.example>",
+                  subject="Re: Invoice 9", refs=[key], irt=key)
+        _wait(lambda: len(PUSHES) == 1, "the VIP's reply to ring")
+        assert w.rec("inv5@corp.example")["chat"] == key
+        assert w.doc(key)["archived"] is False and w.listed(key)
+    finally:
+        hold.set()
+        TURN_GATE["hold"] = None
+    _wait(lambda: w.delivered("inv5@corp.example"), "the VIP's reply delivered")
+    print("PASS test_a_turns_mute_is_an_archive")
+
+
 def main():
     started = time.time()
     with tempfile.TemporaryDirectory() as tmp:
@@ -646,6 +1111,13 @@ def main():
             test_the_turn_archives_its_mail(w)
             test_a_newer_mail_keeps_the_chat(w)
             test_news_and_a_vip_in_the_list(w)
+            test_a_turns_mute_is_an_archive(w)
+            test_a_vips_reply_behind_a_mail_the_rail_always_fails_on(w)
+            test_a_late_removal_of_a_mail_that_came_back(w)
+            test_a_late_told_mail_that_is_gone(w)
+            test_a_removal_waits_for_the_merge_of_its_chat(w)
+            test_a_removal_before_a_merge_goes_first(w)
+            test_a_removal_behind_a_chain_of_merges(w)
         finally:
             TURN_GATE.update(during=None, fail=False)
             if TURN_GATE.get("hold") is not None:

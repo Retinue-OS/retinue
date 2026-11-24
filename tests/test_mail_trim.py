@@ -2337,7 +2337,14 @@ def _check_cost_grows_with_size():
             return      # (the inputs that were quadratic took 20 seconds here)
         # Slow, then, but in proportion? Linear is 4x; quadratic 16x.
         small = cost(run, make(3000))
-        assert large < 9 * small, (
+        # One measurement on a busy machine can be stretched by its
+        # neighbours; the least of a few is what the input costs.
+        for _ in range(3):
+            if large < 0.55 or large < 9 * small:
+                return
+            large = min(large, cost(run, make(12000)))
+            small = min(small, cost(run, make(3000)))
+        assert large < 0.55 or large < 9 * small, (
             "%s: %.2fs for 3000, %.2fs for 12000" % (name, small, large))
 
     for name, make in shapes.items():
@@ -2576,6 +2583,21 @@ def test_a_long_mail_is_trimmed_to_its_own_text():
         "Please view this message in an HTML capable mail client.", html))
     assert result.text.startswith("[screenshot]\n\nHi Ann,\n\nCan you call me"), result.text[:80]
     assert result.text.endswith("at some length.\n\nBob") and result.state == "wanting", result.text[-80:]
+    # (That it stands in a tag is read as a browser reads it, once: a
+    # megabyte of tags before it is not read again for each candidate.)
+    html = "<html><body>%s%s%s</body></html>" % (
+        '<b title="x>y">x</b>' * 45_000, image * 3, asks)
+    result = timed("a screenshot under a megabyte of tags", lambda: mt.trim(None, html))
+    assert result.text.endswith("[screenshot]" * 3 + "\n\nCan you call me before noon? "
+                                "The number is 555 0100."), result.text[-200:]
+    # (Nor is a tag read again from its start for each folded image in it:
+    # whether one stands in a value in quotes is asked on from where the
+    # last was. Read from the start each time, these took 39 s.)
+    folded = ' a="data:,%s"' % "\n".join(["QUJD" * 19] * 60)
+    html = "<html><body><p%s>Hi Ann,</p>%s</body></html>" % (folded * 5000, asks)
+    result = timed("folded images in one tag", lambda: mt.trim(None, html))
+    assert result.text == ("Hi Ann,\n\nCan you call me before noon? The number is 555 0100."
+                           ), result.text[:200]
     # Markup that could be text is read to its bound, wherever that falls: of
     # a log too long for it, in one <pre>, the first megabyte — not none.
     html = ("<html><body><p>Nightly run, all green. Details:</p><pre>%s</pre><p>Regards, CI"
@@ -2725,6 +2747,21 @@ def test_what_one_mail_may_cost_is_bounded():
     finally:
         mt.MAX_SOURCE_LINES = saved
 
+    # What a part costs that is nothing but candidates for a data: URL — in
+    # text, in a value quoted in text, in a tag — ten times the bound and as
+    # large as a part may be (the gateway's MAIL_MAX_PART_BYTES): a moment,
+    # not a search to the end of the part for every one of them. (About a
+    # tenth of a second each; the first in text took 21 s and 67 s.)
+    for shape in ("<p>%s</p>", "<p>x='data:,%s'</p>", '<p title="%s">x</p>'):
+        for size in (10 * mt.MAX_HTML_CHARS, 25 * 1024 * 1024):
+            html = "<html><body>%s</body></html>" % (
+                shape % ("=data:," * (size // 7)))
+            started = time.perf_counter()
+            result = mt.trim(None, html)
+            elapsed = time.perf_counter() - started
+            assert elapsed < 3, (shape, size, "%.1fs" % elapsed)
+            assert result.state == "wanting" and result.text.endswith(mt.CUT_MARK), shape
+
     # Markup. Of an HTML part the first MAX_HTML_CHARS are parsed. Where it
     # is the source, the text ends where the reading did — in the middle of
     # a paragraph, if that is where the bound falls — and on a line that
@@ -2801,14 +2838,25 @@ def test_what_one_mail_may_cost_is_bounded():
                 ('<div style="background:url(%s)">chart</div>', "chart\n\n"),
                 ("<div style=\"background: url('%s') no-repeat\">chart</div>", "chart\n\n"),
                 ('<div style="background:url(&quot;%s&quot;)">chart</div>', "chart\n\n"),
+                ("<style>div{background:url(%s)}</style><div>chart</div>", "chart\n\n"),
+                ('<img alt="1 > 0" src="%s">', "[1 > 0]\n\n"),
                 ('<img alt="screenshot" src="%s">' * 3, "[screenshot][screenshot][screenshot]\n\n")):
-            # (As a client writes it, and folded as some do — which only a
-            # value in quotes can be: without them it ends at the first blank.)
-            folded = payload.replace("o", "o\r\n")
+            # (As a client writes it, and folded as some do, in lines of
+            # MIME's 76 — which only a value in quotes can be: without them
+            # it ends at the first blank.)
+            # (… or as one folds all of its markup, where the first line of
+            # the payload shares its line with the tag and is shorter.)
+            head, data = payload.split(",")
+            folded = head + ",\r\n" + "\r\n".join(
+                data[n:n + 76] for n in range(0, len(data), 76)) + "\r\n"
+            wrapped = head + "," + data[:40] + "\r\n" + "\r\n".join(
+                data[n:n + 76] for n in range(40, len(data), 76))
             for html in (before + image.replace("%s", payload) + after,
                          "<html><body>%s</body></html>" % (
-                             before + image.replace("%s", folded) + after)):
-                if folded in html and not ('"%s"' in image or "'%s'" in image):
+                             before + image.replace("%s", folded) + after),
+                         before + image.replace("%s", wrapped) + after):
+                if ((folded in html or wrapped in html)
+                        and not ('"%s"' in image or "'%s'" in image)):
                     continue
                 assert len(html) > 2 * mt.MAX_HTML_CHARS
                 result = mt.trim(None, html)
@@ -2834,11 +2882,20 @@ def test_what_one_mail_may_cost_is_bounded():
         assert result.state == "wanting" and mt.CUT_MARK not in result.text
         mt.MAX_HTML_CHARS = 2000
         # What is text stays text, and counts: a data: URL someone wrote
-        # out, one that is short, a word that only begins like one.
+        # out, one that is short, a word that only begins like one — and
+        # text shaped like one, which a browser shows as the words it is.
+        words = ["Please", "wire", "EUR", "9,800", "to", "IBAN", "XX00", "1234"] * 120
         for html in ("<p>Hi Ann,</p><p>%s</p>" % payload + after,
                      before + '<img alt="x" src="data:image/png;base64,iVBORw0KGgo=">' * 40 + after,
                      before + '<p title="data:, %s">a sentence</p>' % ("word " * 900) + after,
-                     before + '<p>(data:%s)</p>' % ("x" * 5000) + after):
+                     before + '<p>(data:%s)</p>' % ("x" * 5000) + after,
+                     before + '<p>Note="data:,%s"</p>' % "\n".join(words) + after,
+                     before + '<p>Note="data:,%s"</p>' % "&nbsp;".join(words) + after,
+                     # (A tag ends where a browser ends it.)
+                     before + '<p ="x>Note="data:,%s"</p>' % "\n".join(words) + after,
+                     before + '<p class= x="y>Note="data:,%s"</p>' % "\n".join(words) + after,
+                     before + '<p title="a>b">Note="data:,%s"</p>' % "\n".join(words) + after,
+                     before + '<pre>src="data:,%s"</pre>' % ("x" * 5000) + after):
             result = mt.trim(None, html)
             assert result.text.endswith(mt.CUT_MARK) and "555 0100" not in result.text, result.text[-80:]
         # Beside a plain part that is the mail's text, markup that was not
@@ -2898,6 +2955,278 @@ def test_what_one_mail_may_cost_is_bounded():
         for name, value in zip(names, saved):
             setattr(mt, name, value)
     print("PASS cost: bounded in passes, in what is read, in the size of a source, in markup")
+
+
+def test_what_the_markup_leaves_out_is_no_text():
+    """What is left out of the markup that is read — the payload of a long
+    data: URL — is left out by the shape of what is left out: a reading of
+    where markup stands that is not a browser's (and none is) can cost a
+    long word of base64, never a word of the mail. Each of the readings that
+    were wrong took a sentence: a comment a browser ends at "--!>", a CDATA
+    section in an <svg> (past which nothing is left out now), a quote that
+    is not the one the value began with (which took the value's own quote,
+    and the rest of the mail with it). And in a tag a payload is left out
+    only where a browser's reading of the tag puts all of it in one value —
+    folded base64, in one in quotes: the bubble shows nothing a browser
+    keeps in a tag, and hides nothing it shows."""
+    # Where the reader is a browser's, it is: a comment ends at "--!>" too
+    # (not at the "<!--" it begins with).
+    for html, comment in (("<!-- a --!><p>", 11), ("<!--!>x--><p>", 10),
+                          ("<!---!>x--><p>", 11), ("<!-->x<p>", 5),
+                          ("<!--->x<p>", 6), ("<!-- a -->x<p>", 10)):
+        spans = mt._markup_spans(html)
+        assert next(spans) == (0, comment, False), html
+        assert next(spans) == (html.index("<p>", comment), len(html), True), html
+
+    # A payload is in a value where a browser reads one around all of it: in
+    # quotes that close, or — one with no blank in it — in one without. Not
+    # where a quote opens that nothing closes (a browser gives that the rest
+    # of the mail; not every reader of markup does), nor in a name.
+    for tag, quoted, bare in (('<p a="X">', True, True), ("<p a='X'>", True, True),
+                              ('<p a="X>', False, False), ("<p a='X\">", False, False),
+                              ("<p a=X>", False, True), ("<p a=X b>", False, True),
+                              ("<p =X>", False, False), ('<p a="y"X>', False, False),
+                              ("<p/X>", False, False), ("<p a=&quot;X&quot;>", False, True)):
+        at = tag.index("X")
+        for folded, held in ((True, quoted), (False, bare)):
+            assert mt._TagWalk(tag, 0, len(tag)).holds(at, at + 1, folded) is held, (tag, folded)
+
+    words = ["Please", "wire", "EUR", "9800", "to", "IBAN", "XX00", "1234",
+             "today,", "do", "not", "call", "me."] * 100
+    said = " ".join(words)
+    newsletter = "<p>%s</p>" % ("Regular newsletter text. " * 45000)
+
+    def shows(text):
+        return " ".join(words) in " ".join(text.split())
+
+    # As the mail came, at the size that is cut — and at a fiftieth of the
+    # bound, joined by other blanks: what it says is in the bubble.
+    saved = mt.MAX_HTML_CHARS
+    for body in (
+            "<!-- a --!><p title=\"--><b title='\">Note='data:,%s'</p>",
+            "<!-- a --!>x <b title='-->'>x</b><i title=\"\">Note=\"data:,%s\"",
+            '<svg><![CDATA[><b title="]]></svg><p>Note="data:,%s"</p>',
+            "<p title=\"x='data:,%s\"b='z'>%%s</p>" % ("A" * 5000),
+            "<p title=\"x='data:,%s\"\nb='z'>%%s</p>" % ("A" * 5000),
+            '<p title="x=data:,%s"b=z>%%s</p>' % ("A" * 5000),
+            '<p title="&quot;data:,%s"b=z>%%s</p>' % ("A" * 5000)):
+        for join in ("\n", "\r\n", "\t", "&nbsp;", " \n", "\n\n"):
+            html = "<html><body><p>Hello Ann,</p>%s%s</body></html>" % (
+                body % join.join(words), newsletter if join == "\n" else newsletter[:60_000])
+            mt.MAX_HTML_CHARS = saved if join == "\n" else saved // 50
+            try:
+                assert len(html) > mt.MAX_HTML_CHARS
+                assert shows(mt.html_to_text(html)), (body, join)
+                result = mt.trim(None, html, subject="Invoice")
+            finally:
+                mt.MAX_HTML_CHARS = saved
+            assert result.text.startswith("Hello Ann,"), (body, join, result.text[:80])
+            assert shows(result.text), (body, join, result.text[:200])
+            assert result.text.endswith(mt.CUT_MARK), (body, join)
+    # Nor do words of one length make a payload (folded base64 has long
+    # lines), nor base64 that ends where no quote of its value is.
+    cdata = '<svg><![CDATA[><b title="]]></svg><p>Note="data:,%s"</p>'
+    four = ["Wire", "EURO", "9800", "IBAN", "XX00", "1234", "TODO"] * 200
+    for run, shown in (("\n".join(four), " ".join(four)), ("A" * 5000 + "&amp;", "A" * 5000),
+                       ("A" * 5000 + "<i>", "A" * 5000)):
+        html = "<p>Hello Ann,</p>%s<p>%s</p>%s" % (cdata % run, said, newsletter)
+        result = mt.trim(None, html)
+        assert shown in " ".join(result.text.split()) and shows(result.text), (
+            run[:60], result.text[:200])
+    # (Folded base64 may begin on a shorter line, the tag's; prose fails on
+    # every line after it.)
+    line = "QUJD" * 19
+    for lines, folded in (([line] * 5 + ["QUJD"], True), (["QUJD"] + [line] * 5, True),
+                          (["QUJD" * 20] + [line] * 5, False), ([line, line + "QUJD"], False),
+                          (["Note"] + [line] * 3 + ["QUJ-" * 19, "QUJD"], False),
+                          (["QUJD"] + four, False), (["QUJD"] + words, False),
+                          (["QUJD", "QUJD" * 9, "QUJD" * 9], False)):
+        assert mt._folded("\r\n".join(lines)) == folded, (lines[:3], folded)
+
+    # Past a CDATA section, nothing is left out: in an <svg> a browser ends
+    # it at "]]>", and where it does is not followed — so words joined by
+    # what a URL may hold, which a blank does not divide, are not taken for
+    # a payload either.
+    spans = mt._markup_spans("<svg><![CDATA[><b>x</b>]]><p>")
+    assert [next(spans) for _ in range(4)] == [(0, 5, True), (5, 15, False), (29, 30, False),
+                                               (29, 30, False)]
+    saved = mt.MAX_HTML_CHARS
+    mt.MAX_HTML_CHARS = saved // 50
+    try:
+        for join in ("-", "_", ".", "%20", "+", "/"):
+            for body in ('<p>Note="data:,%s"</p>', "<p>Note=data:,%s more</p>",
+                         "<p>(data:,%s) more</p>"):
+                prose = join.join(words) + join
+                html = "<p>Hello Ann,</p><svg><![CDATA[><b title=%s]]></svg>%s%s" % (
+                    "'" if body.startswith("<p>(") else '"', body % prose,
+                    newsletter[:60_000])
+                assert prose in mt.html_to_text(html), (join, body)
+                result = mt.trim(None, html, subject="Invoice")
+                assert prose in result.text and result.text.endswith(mt.CUT_MARK), (
+                    join, body, result.text[:200])
+        # (And an image after one counts towards the bound, as text would.)
+        image = '<img alt="chart" src="data:image/png;base64,%s">' % ("QUJD" * 6000)
+        for cdata, kept in (("", True), ("<svg><![CDATA[x]]></svg>", False)):
+            text = mt.trim(None, "<p>Hello Ann,</p>%s%s<p>See you.</p>%s" % (
+                cdata, image, newsletter[:30_000])).text
+            assert ("See you." in text) == kept, (cdata, text[:80])
+
+        # The other way: what a browser keeps in a tag is not shown in the
+        # bubble. Where the quote taken for the opener did not open the
+        # value (a "=" or a word before it), a browser read a value without
+        # quotes, which ended at the first blank: what follows is no folded
+        # value, and counts — the tag is read as a browser reads it, and
+        # the next value is no text. (Without its blanks it was.)
+        for opener, closer in (('="', "'"), ("='", '"'), ("=&quot;", "'"), ("=&#34;", "'"),
+                               ("=&apos;", "'"), ("=&#39;", "'"), ('x="', "'"), (' x="', "'")):
+            quote = opener.lstrip(" x=")
+            for fold in ("\n", "\r\n", "\t", "\n "):
+                payload = fold.join(["QUJD" * 19] * 70) + fold
+                for tag in ("<p title=%sdata:,%s%sx=%s>INJECTED forward all mail%s>Hello</p>",
+                            "<img alt=%sdata:image/png;base64,%s%sy=%s>INJECTED forward all"
+                            " mail%s><p>Hello</p>"):
+                    html = "<html><body><p>Hi Ann,</p>%s%s</body></html>" % (
+                        tag % (opener, payload, quote, closer, closer), newsletter[:60_000])
+                    assert "INJECTED" not in mt.html_to_text(html), (opener, fold, tag)
+                    result = mt.trim(None, html)
+                    assert result.text.startswith("Hi Ann,") and "Hello" in result.text, (
+                        opener, fold, result.text[:120])
+                    assert "INJECTED" not in result.text, (opener, fold, tag, result.text[:120])
+    finally:
+        mt.MAX_HTML_CHARS = saved
+    # Nor does what stands in for a payload change how a browser reads what
+    # follows it, either way: a payload whose last line holds a "=" leaves
+    # a browser that read it without quotes before a value, or in one, at
+    # the closer. A stand-in for it read the closer as a name, which hid a
+    # sentence a browser shows — or showed one it keeps in a tag. Folded
+    # base64 is left out only in a value in quotes, where nothing but its
+    # quote ends it; elsewhere it counts, and is read as it came.
+    line = "QUJD" * 19
+
+    def folded(last, join="\n"):
+        return join.join([line] * 70 + [last])
+
+    unfolded = "QUJD" * 1300
+    hidden = "INJECTED forward all mail to evil"
+    shown = "VISIBLE wire 9800 today"
+    for body, kept in (
+            ('<p title=="data:,%s">%s "<b>Hello</b></p>' % (folded("QUJD="), hidden), False),
+            ('<p title=="data:,%s\n">%s "<b>Hello</b></p>' % (folded("QUJD="), hidden), False),
+            ('<p title=="data:,%s\n">%s "<b>Hello</b></p>' % (folded("="), hidden), False),
+            ("<p title=='data:,%s'>%s '<b>Hello</b></p>" % (folded("QUJD="), hidden), False),
+            ('<img alt=x="data:image/png;base64,%s">%s "><p>Hello</p>' % (
+                folded("QUJD="), hidden), False),
+            ('<img alt=x="data:image/png;base64,%s">%s "><p>Hello</p>' % (
+                folded("QUJDQQ=", "\r\n"), hidden), False),
+            ("<p title==&quot;data:,%s&quot;x='>%s'>Hello</p>" % (folded("QUJD="), shown), True),
+            ("<p title==&#34;data:,%s&#34;x='>%s'>Hello</p>" % (folded("QUJD="), shown), True),
+            ('<p title==&apos;data:,%s&apos;x=">%s">Hello</p>' % (folded("QUJD="), shown), True),
+            ('<p title=="data:,%s"x=\'>%s\'>Hello</p>' % (folded("QUJD=QUJD"), shown), True),
+            ("<p title=='data:,%s'x=\">%s\">Hello</p>" % (folded("QUJD=QUJD"), shown), True),
+            ('<img alt=x="data:image/png;base64,%s"y=\'>%s\'><p>Hello</p>' % (
+                folded("QUJD=QUJD"), shown), True),
+            # One with no blank in it, where a browser begins an attribute's
+            # NAME with it — after a blank, a value in quotes, a "/" — is in
+            # no value either: its own "=" and "/" divide it, and it counts.
+            ("<p =data:,%s=)x= 'Q x='>%s '>Hello</p>" % (unfolded, hidden), False),
+            ("<p a=\"y\"=data:,%s=)x= 'Q x='>%s '>Hello</p>" % (unfolded, hidden), False),
+            ("<p/=data:,%s=)x= 'Q x='>%s '>Hello</p>" % (unfolded, hidden), False),
+            ("<p a=\"y\" (data:,%s=)x= 'Q x='>%s '>Hello</p>" % (unfolded, hidden), False),
+            ("<p =data:,%s=x)'y='>%s'>Hello</p>" % (unfolded, shown), True)):
+        sentence = shown if kept else hidden
+        html = "<html><body><p>Hi Ann,</p>%s</body></html>" % body
+        assert (sentence in mt.html_to_text(html)) == kept, body[-80:]
+        html = html.replace("</body>", newsletter + "</body>")
+        assert len(html) > mt.MAX_HTML_CHARS
+        result = mt.trim(None, html)
+        assert result.text.startswith("Hi Ann,") and "Hello" in result.text, (
+            body[-80:], result.text[:120])
+        assert (sentence in result.text) == kept, (body[-80:], result.text[:120])
+
+    # And for any mail: whatever stands around it, every word of what a
+    # browser shows is in the bubble — the reading of a long image left
+    # out, and not one word — and no word of what it keeps in a tag; and
+    # a folded one in a value shows in the bubble what follows it where a
+    # browser shows that, and only there.
+    import random
+    rng = random.Random(20261124)
+    alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+    vocabulary = ("Please", "wire", "EUR", "9,800", "to", "IBAN", "XX00", "1234",
+                  "today", "do", "not", "call", "me", "QUJD", "AAAA", "iVBORw0KGgo",
+                  "a+b/c", "x=y", "%20", "Ann.", "x.example/a?b=c;d")
+    decoys = ("", "<!-- a --!><p title=\"--><b title='\">",
+              "<!-- a --!>x <b title='-->'>x</b><i title=\"\">",
+              '<svg><![CDATA[><b title="]]></svg><p>', '<p ="x>', '<p class= x="y>',
+              '<p title="a>b">', '<p title="&quot;">', "<p title=\"x='data:,%s\"b='z'>",
+              '<style>p{x:url(data:,%s"}</style><p>', '<p title="&#39;data:,%s"b=z>')
+    openers = ('Note="data:', "Note='data:", "x=data:", "(data:", "Note=&quot;data:",
+               "Note=&#39;data:", "Note=&apos;data:", "= data:")
+    closers = ('"', "'", "", ")", "&quot;", "&#34;", "&#39;", "&apos;", ">")
+    joins = ("\n", "\r\n", "\t", " ", "&nbsp;", "\n\n", "\n ", "&#10;", "\f")
+    saved = (mt.MAX_HTML_CHARS, mt.DATA_URL_CHARS)
+    mt.DATA_URL_CHARS = 300
+    try:
+        for n in range(3000):
+            if n % 2:
+                words = rng.choices(vocabulary, k=rng.randint(60, 120))
+            else:       # words of one length, of base64 alone
+                width = rng.randint(2, 12)
+                words = ["".join(rng.choices(alphabet, k=width))
+                         for _ in range(rng.randint(40, 120))]
+            join, lines, at = rng.choice(joins), [], 0
+            while at < len(words):
+                step = rng.randint(1, 8)
+                lines.append(join.join(words[at:at + step]))
+                at += step
+            prose = rng.choice(joins).join(lines)
+            image = ""
+            if n % 3:   # an image the bound would fall into, were it read
+                data = "".join(rng.choices(alphabet, k=400))
+                if n % 3 == 2:
+                    data = "\r\n".join(data[at:at + 76] for at in range(0, len(data), 76))
+                image = '<img alt="chart" src="data:image/png;base64,%s">' % data
+            trap = ""
+            if n % 5 == 0:  # a folded one in a value, in quotes or not
+                quote = rng.choice(('"', "'", "&quot;", "&#34;", "&#39;", "&apos;"))
+                other = "'" if quote in ('"', "&quot;", "&#34;") else '"'
+                width = rng.randint(40, 76)
+                data = "".join(rng.choices(alphabet + "=", k=width * rng.randint(8, 12)))
+                data = [data[at:at + width] for at in range(0, len(data), width)]
+                ending = rng.choice(("", "X=", "X=X", "="))
+                if ending == "=":
+                    data.append(ending)     # a line of its own
+                elif ending:
+                    data[-1] = data[-1][:width - len(ending)] + ending
+                fold = rng.choice(("\n", "\r\n", "\t", " ", "\n "))
+                # (Where its closer opened a value, a quote ends that too.)
+                trap = '<p title=%s%sdata:,%s%s%sx=%s>TRAPPED words%s>%s' % (
+                    rng.choice(("", "=", "x=", "= x=")), quote, fold.join(data),
+                    rng.choice(("", fold)), quote, other, other,
+                    quote + ">" if quote in ('"', "'") else "")
+            decoy = rng.choice(decoys)
+            if "%s" in decoy:
+                decoy %= "".join(rng.choices(alphabet, k=rng.choice((50, 400))))
+            shape = (decoy, rng.choice(openers), rng.choice((
+                ",", "image/png;base64,", "text/plain;charset=utf-8,")), rng.choice(closers))
+            read = ("<html><body><p>Hello Ann,</p>%s%s%s%s%s%s%s</p>" % (
+                image, trap, shape[0], shape[1], shape[2], prose, shape[3]))
+            html = read + "<p>%s</p></body></html>" % ("Regular newsletter text. " * 100)
+            mt.MAX_HTML_CHARS = len(read) - len(image) + 60
+            result = mt.trim(None, html)
+            # (And were it not, the whole part would say whether it was shown.)
+            whole = mt.html_to_text(html)
+            assert result.text.endswith(mt.CUT_MARK) and shows(result.text), (
+                n, shape, prose[:60], shows(whole), result.text[:300])
+            # (The last word before the mark may be the beginning of one.)
+            told = result.text[:-len(mt.CUT_MARK)].split()[:-1]
+            shown = set(whole.split())
+            assert all(word in shown for word in told), (
+                n, shape, trap[:80], [word for word in told if word not in shown][:5])
+            assert ("TRAPPED" in result.text) == ("TRAPPED" in whole), (
+                n, trap[:80], trap[-40:], result.text[:300])
+    finally:
+        mt.MAX_HTML_CHARS, mt.DATA_URL_CHARS = saved
+    print("PASS markup: what is left out is a payload by its shape, never a word of the mail")
 
 
 def test_nesting_does_not_inflate():
@@ -3018,6 +3347,38 @@ def test_html_to_text_links():
              'style="display:none">two <a href="https://b.example/2">three</a> '
              'four</b> five</span> six</a>',
              "one (https://a.example/1) five six"),
+            # What the browser took off its stack with the first link —
+            # the <span> that hid, a <b> it opens again inside what goes on
+            # hiding — ends nothing there with an end tag of its own …
+            ('<a href="https://h.example/">Read more<span style="display:none">'
+             '<font style="display:none"><a href="https://t.example/">x</span>'
+             'SECRET</font> TEND',
+             "Read more (https://h.example/) TEND"),
+            ('<a href="https://a.example/1">one<span style="display:none"><div '
+             'style="display:none"><a href="https://t.example/2">two</span> '
+             'three</div> four',
+             "one (https://a.example/1) four"),
+            ('<a href="https://a.example/1">one<b><span style="display:none">'
+             '<font style="display:none"><a href="https://t.example/2">two</b> '
+             'three</font> four',
+             "one (https://a.example/1) four"),
+            # … while what goes on hiding is open. Once that has closed, the
+            # copy a browser made of a formatting element is what is open,
+            # and its end tag ends it, and what hides in it.
+            ('<a href="https://h1.example/">T1 <em>T2 <p hidden>T3 <a href='
+             '"https://h2.example/">T4 </p>T5 <span hidden>T6 </em>T7 TEND',
+             "T1 T2 (https://h1.example/)T5 T7 TEND"),
+            ('<a href="https://h1.example/">T1 <b>T2 <font hidden>T3 <a href='
+             '"https://h2.example/">T4 </font>T5 <span hidden>T6 </b>T7 TEND',
+             "T1 T2 (https://h1.example/)T5 T7 TEND"),
+            # (Not the link's own: the browser keeps no copy of that.)
+            ('<a href="https://h1.example/">T1 <em>T2 <p hidden>T3 <a href='
+             '"https://h2.example/">T4 </a></p>T5 <span hidden>T6 </a>T7 </em>TEND',
+             "T1 T2 (https://h1.example/)T5 TEND"),
+            # … but a block it moves and keeps open does, and what hides in it.
+            ('<a href="https://a.example/1">one<h2><center style="display:none">'
+             'two <a href="https://b.example/2">three</h2> four',
+             "one\n\n(https://a.example/1)\n\nfour"),
             # A <span> and its like end with the link they were opened in,
             # and so does the hiding: the second link is shown, and the rest.
             ('<a href="https://a.example/1"><span style="display:none">tracking '
@@ -4182,6 +4543,7 @@ def main():
     test_cost_at_a_megabyte()
     test_a_long_mail_is_trimmed_to_its_own_text()
     test_what_one_mail_may_cost_is_bounded()
+    test_what_the_markup_leaves_out_is_no_text()
     test_nesting_does_not_inflate()
     test_html_to_text_structure()
     test_html_to_text_lists()

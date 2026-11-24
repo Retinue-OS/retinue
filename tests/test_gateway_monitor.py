@@ -486,6 +486,149 @@ def test_a_mail_gateway_at_fault_itself_is_neither_an_imap_outage_nor_a_setup_wa
     assert gm.classify_health(200, dict(body, blocked="policy"))[0] == "blocked"
 
 
+def test_mail_the_gateway_cannot_read_is_a_notice_and_no_outage():
+    """The mail gateway counts on /health the mail it could not read and
+    shows as placeholders — and stays ``connected``: one such mail is the
+    mail's own doing. But a reader that broke turns a tenth of the arriving
+    mail into placeholders the same way, and nothing read the count: the
+    monitor stayed green. A run of them is told — as a notice in a thread of
+    its own, in words that report no outage, and not once a minute."""
+    def health(standing, made, **why):
+        return {"status": "ok", "configured": True, "connected": True, "mode": "inbox",
+                "placeholders": {"standing": standing, "made": made,
+                                 "why": {key.replace("_", " "): n for key, n in why.items()}}}
+
+    body = health(7, 9, took_too_long_to_read=6, RecursionError=3)
+    assert gm.classify_health(200, body) == ("up", None)
+    assert gm.unread_mail(body) == {"standing": 7, "made": 9, "why": {
+        "took too long to read": 6, "RecursionError": 3}, "lost": 0}
+    # A gateway that says nothing of the kind, or nothing that can be read.
+    for other in ({"connected": True}, None, {"placeholders": "many"},
+                  {"placeholders": {"standing": "x"}}):
+        assert gm.unread_mail(other) is None, other
+    assert gm.unread_mail({"placeholders": {"standing": 2}}) == {
+        "standing": 2, "made": 0, "why": {}, "lost": 0}
+
+    n = FakeNotifier()
+    e = gm.MonitorEngine(n, fail_threshold=2, remind_seconds=3600, unread_step=5)
+
+    def check(now, standing, made, **why):
+        e.step("mail-gateway", "E-mail", "up", None, now=now, channel="email",
+               unread=gm.unread_mail(health(standing, made, **why)))
+
+    # A mail now and then is no news.
+    check(1000, 0, 0)
+    check(1060, 4, 4, RecursionError=4)
+    assert n.opened == [] and e.state["mail-gateway"]["status"] == "up"
+    # A run of them is: told once, with the count and the reasons.
+    check(1120, 7, 9, took_too_long_to_read=6, RecursionError=3)
+    (title, notice), = n.opened
+    assert title == "E-mail gateway cannot read some mail", title
+    assert "7 mail(s)" in notice and "9 made since" in notice
+    assert "took too long to read (6); RecursionError (3)" in notice
+    assert "Nothing is lost" in notice and "/gateways)" in notice
+    # It is no outage, and is not worded as one — or as a messenger's.
+    for word in _IMAP_WORDS + _PAIRING_WORDS + ("NOT reaching", "not running", "stopped"):
+        assert word.lower() not in (title + notice).lower(), (word, notice)
+    assert e.state["mail-gateway"]["status"] == "up"
+    # Not again for the same mails, and not once a minute while they come:
+    # the next word is a reminder interval later, in the same thread.
+    check(1180, 7, 9)
+    check(1240, 60, 62, took_too_long_to_read=62)
+    assert len(n.opened) == 1 and n.appended == []
+    check(1120 + 3600, 60, 62, took_too_long_to_read=62)
+    assert len(n.opened) == 1 and len(n.appended) == 1
+    thread, text = n.appended[0]
+    assert thread == "thread1" and "60 mail(s)" in text and n.quiet_flags == [False]
+    check(1120 + 7300, 63, 65)                  # three more: no news
+    assert len(n.appended) == 1
+    # They read again (the reader was fixed): the count goes down by itself,
+    # and a later run is news again.
+    check(20000, 1, 65)
+    check(20060, 6, 70)
+    assert len(n.appended) == 2 and "6 mail(s)" in n.appended[1][1]
+    # An outage in between is the outage's thread; what was told of the
+    # unread mail is not forgotten over it.
+    for now in (30000, 30060):
+        e.step("mail-gateway", "E-mail", "down", "IMAP login failed", now=now, channel="email")
+    e.step("mail-gateway", "E-mail", "up", None, now=30120, channel="email",
+           unread=gm.unread_mail(health(6, 70)))
+    assert len(n.opened) == 2 and n.opened[1][0] == "E-mail gateway disconnected"
+    assert e.state["mail-gateway"]["unread"]["told"] == 6 and len(n.appended) == 3
+    # A notice the backend did not take is tried again.
+    n.fail = True
+    check(40000, 20, 90)
+    assert e.state["mail-gateway"]["unread"]["told"] == 6
+    n.fail = False
+    check(40060, 20, 90)
+    assert "20 mail(s)" in n.appended[-1][1] and e.state["mail-gateway"]["unread"]["told"] == 20
+    # A gateway that reports none keeps no such state.
+    e.step("signal", "Signal", "up", None, now=1000, channel="signal", unread=None)
+    e.step("sms", "SMS", "up", None, now=1000, unread=gm.unread_mail(health(0, 0)))
+    assert "unread" not in e.state["signal"] and "unread" not in e.state["sms"]
+
+    # check_gateway hands on what /health says, beside the verdict.
+    class Answer:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def read(self):
+            return json.dumps(body).encode()
+    real = gm.urllib.request.urlopen
+    gm.urllib.request.urlopen = lambda request, timeout=None: Answer()
+    try:
+        assert gm.check_gateway({"base_url": "http://mail-gateway:8096"}) == (
+            "up", None, gm.unread_mail(body))
+    finally:
+        gm.urllib.request.urlopen = real
+    assert gm.check_gateway({"base_url": "http://127.0.0.1:9"})[0::2] == ("down", None)
+
+
+def test_mail_whose_records_were_lost_is_counted_with_the_unread():
+    """The mail gateway counts on /health, beside its placeholders, the mail
+    it had mirrored and whose records are gone from its ledger (restored
+    from an older backup): it looks for each in the mailbox again, and until
+    then the mail is in no chat. Nothing read that count. A run of them is
+    told like a run of placeholders — as a notice, in words that report no
+    outage — and counts with them."""
+    def health(standing, lost):
+        return {"status": "ok", "configured": True, "connected": True, "mode": "inbox",
+                "placeholders": {"standing": standing, "made": standing, "why": {}},
+                "lost": lost}
+
+    assert gm.unread_mail(health(0, 7)) == {"standing": 0, "made": 0, "why": {}, "lost": 7}
+    assert gm.unread_mail(dict(health(0, 0), lost="x")) is None
+    n = FakeNotifier()
+    e = gm.MonitorEngine(n, fail_threshold=2, remind_seconds=3600, unread_step=5)
+
+    def check(now, standing, lost):
+        e.step("mail-gateway", "E-mail", "up", None, now=now, channel="email",
+               unread=gm.unread_mail(health(standing, lost)))
+
+    check(1000, 0, 4)
+    assert n.opened == []
+    check(1060, 0, 40)
+    (title, notice), = n.opened
+    assert "40 mail(s) it had mirrored are missing from its records" in notice, notice
+    assert "Message-ID" in notice and "/gateways)" in notice and "placeholders" not in notice
+    for word in _IMAP_WORDS + _PAIRING_WORDS + ("NOT reaching", "not running", "stopped"):
+        assert word.lower() not in (title + notice).lower(), (word, notice)
+    assert e.state["mail-gateway"]["status"] == "up"
+    assert e.state["mail-gateway"]["unread"]["told"] == 40
+    # They are found again; placeholders and lost mail count together.
+    check(1120, 0, 0)
+    check(1120 + 3600, 3, 3)
+    assert len(n.appended) == 1
+    text = n.appended[0][1]
+    assert "3 mail(s) could not be read" in text and "And 3 mail(s) it had mirrored" in text
+    print("ok: mail whose records the gateway lost is counted with the mail it cannot read")
+
+
 def test_messenger_notices_keep_their_wording():
     for channel in (None, "signal", "telegram", "unknown"):
         outage = gm.outage_message("Signal", "unlinked", channel=channel)
@@ -532,7 +675,7 @@ def test_the_loop_passes_the_registry_channel():
     gm.messenger_gateways.channel_gateways = lambda _prefix: {
         "mail-gateway": {"base_url": "http://mail-gateway:8096", "token": "",
                          "label": "E-mail", "channel": "email"}}
-    gm.check_gateway = lambda gw: ("down", "IMAP login refused")
+    gm.check_gateway = lambda gw: ("down", "IMAP login refused", None)
     gm.time.sleep = sleep
     gm.ConversationNotifier = lambda **_kw: n
     gm._load_state = dict

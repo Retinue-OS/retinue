@@ -375,13 +375,24 @@ def _lost_answer_then_ann_replies(r: Rig, root: str, key: str) -> dict:
     # It goes out, and the rail announces it: the bubble gives way to the
     # mail, and now the reply reads the chat — here and in the mailbox.
     assert _wait_for(lambda: (r.gw.SENDS.get(entry["id"]) or {}).get("status") == "approved")
-    r.loop()
+    # "approved" is set during the SMTP session, before the send's record —
+    # and the rail's event — are written: wait for the mail itself, letting
+    # the mirror loop turn until the rail has announced it, never on time.
+
+    def listed_once() -> bool:
+        r.loop()
+        body = r.messages(root)
+        return (body["pending"] == []
+                and [m["id"] for m in body["messages"]].count(entry["message_id"]) == 1)
+
+    assert _wait_for(listed_once), r.messages(root)
     body = r.messages(root)
     assert body["pending"] == []
     assert [m["id"] for m in body["messages"]].count(entry["message_id"]) == 1
     assert r.listed(root)["unread"] == 0
-    r.settle()
-    assert r.seen(root)
+    # The read reaches the mailbox through a hook off the rail's request:
+    # waited for as the flag it sets, not for a fixed while.
+    assert _wait_for(lambda: r.settle() or r.seen(root))
     # Later: the correspondent answers, and the user starts something new.
     late = "late-" + root
     r.arrives(late, irt=root, refs=[root], day=2, subject="Re: Quarterly numbers")

@@ -275,13 +275,17 @@ services:
       # in the thread's companion.
       - MAIL_ARRIVAL_TURN_ATTEMPTS
       # Which TCP peers count as "arrived through the reverse proxy" for the
-      # endpoints that act with the user's own authority: the chat send press
-      # and approving a pending send. Defence in depth only — no send skips an
-      # account's policy any more, whoever calls. Unset (the default) means anything that
-      # is neither loopback nor this container's own address — which is what
-      # Traefik in its own container looks like. Set it (addresses or CIDRs)
-      # to pin the proxy explicitly, and set it to include loopback only in a
-      # host-networking topology, where the distinction is unavailable.
+      # endpoints that act with the user's own authority: the chat send press,
+      # a chat's flags and delete, and approving a pending send. Defence in
+      # depth only — no send skips an account's policy any more, whoever
+      # calls. Unset (the default) refuses only a loopback peer and a peer
+      # that is the very address the caller dialled: Traefik in its own
+      # container passes, but so does a caller inside this container that
+      # comes in from its other network's address, or is relayed by a sibling
+      # (the egress-audit proxy). So set it (addresses or CIDRs) to the
+      # proxy's address — see docker-compose.override.example.yml — and to
+      # include loopback only in a host-networking topology, where the
+      # distinction is unavailable.
       - EDGE_PROXY_PEERS
       # scripts/self-update.py pokes the updater sidecar (below) to rebuild
       # and restart the whole stack; must match the updater's own token.
@@ -1249,7 +1253,8 @@ services:
       # (MAIL_SENT_GRACE_SECONDS), the poll interval,
       # the backfill window in days (0 mirrors only new mail), the backfill's
       # batch size and the pause between batches, the IMAP socket timeout,
-      # the size caps for one part and one mail, the trim's "wanting"
+      # the size caps for one part and one mail, the seconds reading one
+      # mail may take before it is a placeholder, the trim's "wanting"
       # threshold, the limit on waiting for the e-mail policy file before the
       # mirror starts (unset or 0: no limit), how many chats /recent-chats
       # answers, the timeout of the chats rail's POSTs, the size up to which
@@ -1268,6 +1273,7 @@ services:
       - MAIL_IMAP_TIMEOUT
       - MAIL_MAX_PART_BYTES
       - MAIL_MAX_MAIL_BYTES
+      - MAIL_READ_SECONDS
       - MAIL_TRIM_WANTING_CHARS
       - MAIL_POLICY_WAIT_SECONDS
       - MAIL_RECENT_CHATS_MAX
