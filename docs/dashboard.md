@@ -1293,7 +1293,9 @@ are said outright:
 It says that the quick patterns' words — the last message, the draft, the
 composer — mean the thread's mails and its shared draft, and how many sends
 of the thread wait for approval, are on the way out, or failed, so a turn
-does not send one twice.
+does not send one twice. A send whose outcome is not known — handed to the
+mail server, never confirmed — is counted apart from those that failed and
+said as that: "it failed" is what gets a mail sent a second time.
 
 `tests/test_chat_mail.py` covers all of the above against real ledger
 records.
@@ -1302,7 +1304,11 @@ records.
 
 [mail-chats.md](mail-chats.md), "Writing", is the contract; this is the web
 gateway's side of it. `tests/test_chat_mail_send.py` covers it against a mock
-mail gateway.
+mail gateway that answers as `scripts/mail-gateway.py` does (real-length
+`Message-ID`s, a dismissed keyed entry kept and answered by id, `repeat`, a
+failed key tried afresh), and `tests/test_chat_mail_e2e.py` across the seam
+with no mock of either side: the real mail gateway's HTTP handler, over a
+fake mailbox and SMTP server, behind the real web gateway.
 
 **A reply** is `POST /chats/<id>/send`, as on every chat, with two more
 fields: `reply`, `"all"` or `"sender"` (optional; the gateway's default is
@@ -1379,11 +1385,33 @@ endings apart by what they prove:
 | The hop ended with | Answer to the browser |
 |---|---|
 | the gateway's `200 sent` / `202 pending_approval` | `200` Message / `202 {pending}` |
-| no connection — the request was never written | `502 {error}`: nothing was sent |
-| the gateway's own refusal: a `4xx`, a `503` (it cannot send, could not queue), a `502` naming an error | that status (`400`, `409`, `413`, `503`; else `502`) with **its sentence** |
+| no connection — the request was never written | `502 {error, sent: false, request_key}`: nothing was asked |
+| the gateway's word on the request itself: `400`, `409`, `413` | that status, `{error, sent: false, request_key}` with **its sentence** |
+| the gateway's `503` (it cannot send, could not queue) | `503 {error, sent: false, request_key}` with its sentence |
+| the gateway took the request and the mail did not go: its `502` naming an error ("send failed: …" — the SMTP server refused the mail, the login failed), or any other `4xx` | **`424`** `{error, sent: false, request_key}` with its sentence |
 | a timeout, or a connection lost, after the request was written | `202 {unconfirmed}` |
-| the gateway's `502 {unconfirmed: true}` / `{outcome_unknown: true}` (the SMTP server's answer was never seen) | `202 {unconfirmed}` with its `message_id` and its sentence as `note` |
+| the gateway's `502 {unconfirmed: true}` / `{outcome_unknown: true}` (the SMTP server's answer was never seen), or its `202 sending` for a queued mail that is being sent | `202 {unconfirmed}` with its `message_id` and its sentence as `note` |
 | any answer nobody planned for (a `500`, a `504`, a body that is no object) | `202 {unconfirmed}` |
+
+A gateway's error answer is read **whole** before any of this is decided
+(`_gateway_hop`): its `502 {unconfirmed, outcome_unknown, request_id,
+message_id, chat}` carries two `Message-ID`s — a correspondent chooses the
+length of one of them — and is longer than any cut made for display. Only a
+body that is no JSON at all is cut, and passed on as the error.
+
+**A send that certainly failed ends its press; only an unknown outcome keeps
+its key.** Every answer that says the mail did not go carries `"sent":
+false` — the web gateway's own word that nothing was handed to a mail
+server — beside its sentence and the press's `request_key`. A page reads it
+as *Not sent: …*: the words stay in the box, the press's key is dropped, and
+the next press mints a new one. `424` is that answer for a mail the gateway
+took and could not send; `502` is kept for "the gateway was never reached"
+and `503` for "it cannot send". A `5xx` **without** `"sent": false` did not
+come from the web gateway (a proxy, a crash) and proves nothing: the page
+keeps the key for it. Anything whose outcome is open is `202 {unconfirmed}`,
+never a `4xx` or `5xx`. After a `424` on a reply, the chat's copy of the
+queue is brought in line at once, so a send a poll had listed as `sending`
+while its SMTP session lasted does not stand there after the answer.
 
 An error answer leaves the draft in the composer. An unconfirmed one clears
 it — the words are with the gateway — and marks nothing read: no reply is
@@ -1398,12 +1426,29 @@ words where no id is known.
 
 `request_key` is the **idempotency key** of one press of Send: an opaque
 token of at most 64 printable characters that the page mints, sent in the
-body of `/send` and of `POST /chats/compose` and passed on to the gateway,
-which answers a repeat of a key it has seen within 24 h with what it
-answered the first time and sends nothing. So the same press can be retried
-safely. A request without one gets a key minted here; the answers of the hop
-that are not `sent` or `queued` — an error of the gateway's, and
-`unconfirmed` — name the key.
+body of `/send` and of `POST /chats/compose` and passed on to the gateway.
+The gateway answers a repeat of a key whose mail went out, waits, is being
+sent or may have gone out with what became of that send, and sends nothing;
+a key whose send failed for certain is a new attempt. So the same press can
+be retried safely. A request without one gets a key minted here; the answers
+of the hop that are not `sent` or `queued` — "not sent", and `unconfirmed` —
+name the key.
+
+**A repeat is not a reply.** An answer the gateway gave from an earlier
+entry of the key says so (`"repeat": true`), and the web gateway then only
+reconciles: it returns the Message (or the Pending, or `unconfirmed`) and
+brings the chat's copy of the queue in line. It clears no draft — the words
+of that press left the composer when it was made, and what stands there now
+was typed since — advances no read mark, settles no attention item and
+tells the mailbox nothing: the rail did all of that when the mail went out,
+and what has arrived since has not been answered by anyone. A gateway built
+before it said `repeat` is read by what its answer proves (`_mail_repeated`):
+the chat knew that `Message-ID` before this request began (as a mail, or as
+a send in its copy of the queue), or the instant the gateway gives for the
+mail lies more than `MAIL_REPEAT_SLACK_SECONDS` (2) before it. *Before* is
+the point: the rail may announce a direct send, and a page's poll may list
+it, while the request that made it still waits for its answer — that is a
+reply.
 
 `approval_url` is the path of this dashboard's own approval page, built here
 from the gateway's registry slug and the request id. What a gateway states
@@ -1466,14 +1511,36 @@ gateway whose list left it out loses nothing. A send whose mail is among the
 page's messages is never also listed as pending, whatever a queue that lags
 says.
 
+**A dismissed entry is over.** The mail gateway does not forget a failed
+send that named its `request_key` when it is dismissed: it keeps the entry
+for as long as the key is remembered (24 h), stops listing it, and still
+answers for it by id — `{status: "error", dismissed: true}`. It dismisses
+one itself when a direct send failed for certain and its caller has that as
+the answer. Every reader here takes `dismissed: true` as ended, whatever
+else the entry says (`_pending_ended`, and a list that still names such an
+entry): it leaves the chat's copy, and a chat that was only that mail is
+forgotten with it. Read as a failure it would stand in the chat as a failed
+bubble for words the composer was just handed back, and return with every
+poll.
+
+**An unknown outcome is never worded as "failed".** An entry that ended as
+`error` with `outcome_unknown: true` may have gone out, and "it failed" is
+what makes a person or an agent send it again. Every reader of an entry
+asks (`_send_outcome_unknown`) before it words one: the chat's Pending
+(`outcome_unknown`), the chat list (`last.outcome_unknown`), the companion's
+note (which counts such sends apart from failed ones), the approval page and
+what it polls, and the note into the thread that queued the send (below).
+
 **A new mail that is only queued is listed.** The `Message-ID` that keys a
 new thread is minted when the send is accepted, so a queued new mail has its
 chat id before any mail exists. Such a chat is in no ledger; its state — the
 copy of the queued send — lists it: `last` is that send
-(`{direction: "out", text, author, pending: true}`), `list_group` is
+(`{direction: "out", text, author, pending: true, status}` — `status` is the
+Pending's: `"pending"`, `"sending"` or `"failed"`), `list_group` is
 `"read"`, its name is the subject and its participants are who the mail is
 to. Allowed, it is a chat of messages. A send of it that failed keeps it
-listed (`last.failed: true`) until the user dismisses it. Denied, retracted
+listed (`last.failed: true`, and `last.outcome_unknown` — true where the
+mail may have gone out all the same) until the user dismisses it. Denied, retracted
 or dismissed, it is no longer listed — **and nothing is kept of it**: the
 state document of a chat that was only ever a mail that never went out
 (`unsent`, cleared by the first mail of it that exists) is deleted with its
@@ -1498,6 +1565,25 @@ mail by the addresses it goes to and nothing else — that note is replayed to
 Ara's sessions as her own words, and a reply's subject and its recipients'
 display names are a stranger's; where recipients were refused it names them
 too, and badges the thread.
+
+A send that was allowed and ended with its **outcome unknown** (the entry's
+`outcome_unknown`: the mail server was handed the mail and its answer was
+never seen) is not shown as a failure anywhere on this path. The status
+page draws a question mark and "Not confirmed — it is not known whether
+this went out, so do not send it again unchecked: …" with the gateway's
+sentence, where a failure reads "The gateway could not deliver the message:
+…". `GET /sends/<gateway>/<id>/status` always states `outcome_unknown`
+(`{status, error, outcome_unknown, next?}`), and for such an entry carries
+`note`, the whole sentence the page shows in place of its "could not
+deliver" line (the status row carries that sentence's lead-in as
+`data-note-unknown`, beside the other notes). The
+note into the queuing thread says "It was handed over and never confirmed:
+it is not known whether it went out. Do not send it again before checking",
+never "sending it failed"; the turn context it leaves says the same — "NOT
+a failed send … must not be sent again unless the user, having checked,
+asks for that" — with the gateway's sentence as one bounded line, and the
+thread is badged and woken as for a failure, since the user has not seen
+the end of it.
 
 **A new mail.** `GET /chats/compose` answers what the ＋ of the Chats page
 can offer: `{"channels": [{"channel": "email", "label": "E-mail",
@@ -1574,6 +1660,15 @@ thread's mails to the Trash before it erases its mirror. Only when it
 answers that all of it is done (`errors: 0`) does the web gateway erase its
 own state, the copy of the queued sends and the companion; otherwise the
 answer is `502` and the chat is as it was. The report carries `trashed`.
+A gateway that erased nothing says why in a sentence of its own (`error`
+beside `errors`: the mailbox has no Trash folder and which variable names
+one; mails moved since the mirror last looked, try again in a minute), and
+that sentence is the reason in the `502` — "the chat's messages could not
+be completely erased (`<gateway>`: `<its sentence>`)" — in place of a count
+of files: the remedy is in it. It is a gateway's text and may repeat a mail
+server's, so it is passed on as one line of at most
+`CHAT_DELETE_REASON_MAX` (300) characters, control characters removed, in a
+JSON string the page shows as text.
 
 ## Archived, muted, starred, deleted
 

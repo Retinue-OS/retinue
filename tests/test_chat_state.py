@@ -672,8 +672,22 @@ def test_overlay_merge_dedup_expiry():
                "ts": cs.iso_z(150.0), "message_id": "m2"})
     got = ov.entries(cid)
     assert [e["text"] for e in got] == ["a (edited)", "b"], got
-    assert all("_inserted" not in e for e in got)
+    assert all("_inserted" not in e and "_first" not in e for e in got)
     assert len(ov.entries()) == 3
+    # When a message was first seen outlasts its re-delivery (what tells a
+    # mail the chat already had from one that arrived a moment ago), and is
+    # asked by chat and message id: none for another chat, an unknown id, an
+    # entry without an id.
+    first = ov.first_seen(cid, "m1")
+    assert isinstance(first, float) and first <= time.time()
+    with ov._lock:
+        ov._entries[("id", cid, "m1")]["_first"] = first - 500.0
+    ov.insert({"chat_id": cid, "direction": "in", "text": "a (edited)",
+               "ts": cs.iso_z(100.0), "message_id": "m1"})
+    assert ov.first_seen(cid, "m1") == first - 500.0, "a re-delivery is not a first sight"
+    assert ov.first_seen("telegram:1", "m1") is None and ov.first_seen(cid, "m2") is None
+    assert ov.first_seen(cid, None) is None and ov.first_seen(cid, "") is None
+    assert ov.first_seen("telegram:1", "m2") is not None
     # Expiry: a stale entry drops out (backdated directly, as the RecentSends
     # test does — the clock is the contract, not a sleep).
     with ov._lock:
@@ -681,6 +695,7 @@ def test_overlay_merge_dedup_expiry():
             if ov._entries[key].get("message_id") == "m1":
                 ov._entries[key]["_inserted"] = time.time() - 120.0
     assert [e["text"] for e in ov.entries(cid)] == ["b"]
+    assert ov.first_seen(cid, "m1") is None, "an expired entry was never seen, as far as this knows"
     print("PASS test_overlay_merge_dedup_expiry")
 
 
