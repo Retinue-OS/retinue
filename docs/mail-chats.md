@@ -401,14 +401,17 @@ renumbered Sent, moved out and back, a second copy, it is one more place of
 the record under the id the gateway minted, and where that record is a
 tombstone, the record is written again in its own place, under the minted
 id, by the user; never a second record under the provider's id. (A
-tombstone keeps no addresses: its copy is told by the rest.) Outside Sent,
-nothing a recipient holds is evidence that a mail is the user's send — not
-the gateway's `X-Retinue-Message-ID`, not From, To, Cc or Date, alone or
-together: the mail that went out carries them all, and whoever got it can
-write them on a mail of their own. A mail there under the provider's id is
+tombstone keeps no addresses, nor does a placeholder, whose were never
+read: its copy is told by the rest.) Outside Sent, nothing a recipient
+holds is evidence that a mail is the user's send — not the gateway's
+`X-Retinue-Message-ID`, not From, To, Cc or Date, alone or together: the
+mail that went out carries them all, and whoever got it can write them on
+a mail of their own. A mail there under the provider's id is
 the send's only by the very header block its live record keeps (the copy
 the record was written from, moved), and then only one more place of it;
-it never revives the send's tombstone, and never rewrites the record. Any
+it never revives the send's tombstone, and never rewrites the record —
+unless that record is a placeholder made from this very copy, which then
+takes its place as it would under any id, as what the record already is. Any
 other mail under that id — a stranger's, a recipient's forgery of the
 send's header block — is a mail of its own that came in, recorded under its
 own id, and no place of the send's: the send stays what it was, a tombstone
@@ -696,8 +699,18 @@ reverse").
   The user's own is a mail on record as theirs; one that came in `From` an
   address of theirs (an INBOX copy of their own mail, or anyone's mail
   claiming that `From`) has no say in the addressing — its `To` and `Cc` are
-  its sender's to write — and where only such mails are left, the reply goes
-  to that address alone.
+  its sender's to write. Where only such mails are left (the user wrote from
+  another address of theirs, or "send as" from a phone, with this mailbox in
+  copy and the Sent copy in no followed folder), the newest of them is
+  followed up as the user's own is: to its `To` and `Cc` but the account's
+  own addresses, and to that address only where nobody else is left — the
+  same exposure as any mail's reply-all, shown in the preview before
+  anything is sent. So a forgery `From` the user steers no reply beside a
+  real mail; in a thread made of it alone, the reply goes where a mail
+  `From` its writer would. The cost: beside real mails, a mail the user
+  wrote from another address of theirs adds nobody to a reply (Ann writes,
+  the user answers her and Bob from work: a reply-all goes to Ann and her
+  `Cc`, not Bob).
   An older record does not keep `Reply-To`: its header block says it, and is
   read in the reader process — only where the block has a `Reply-To` line, so
   a reply to a mail that named none waits for nothing, and once for both

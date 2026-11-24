@@ -4833,19 +4833,24 @@ class Mirror:
         # under the alias. Elsewhere it is only ever one more place of the
         # live record: nothing there is the user's send on a recipient's
         # evidence, and every recipient holds that id and every other header
-        # of the mail but the trace fields. Any other mail under it is a mail
-        # of its own, under its own id, and no place of the send's.
+        # of the mail but the trace fields. (Unless that record is a
+        # placeholder made from this very copy: then the copy takes its
+        # place, as for any id — as what the record already is.) Any other
+        # mail under it is a mail of its own, under its own id, and no place
+        # of the send's.
         mapped = False
         if known is None or known["direction"] == "in":
             minted = self.index.one(
                 "SELECT m.* FROM aliases a JOIN mails m ON m.message_id = a.message_id "
                 "WHERE a.alias = ? AND m.record != ''", (mail.message_id,))
             if minted is not None and self._send_copy(role, mail, minted):
-                if role != "sent":
+                placeholder = minted["message_id"] in self._placeholders
+                if role != "sent" and not placeholder:
                     self._locate(role, uid, minted["message_id"])
                     return
                 mail, known = dataclasses.replace(mail, message_id=minted["message_id"]), minted
-                outbound = mapped = True
+                outbound = role == "sent" or known["direction"] == "out"
+                mapped = role == "sent"
         # (A copy whose alias is not known yet: _own_send says whether it is
         # one — also beside a mail under that id that came in first.)
         if not mapped and role == "sent" and (known is None or known["direction"] == "in") \
@@ -5028,7 +5033,10 @@ class Mirror:
         fields = _ibstore.read_record(path) or {}
         sent_to = [*(fields.get("recipients") or []), *(fields.get("cc") or []),
                    *(fields.get("refused") or [])]
-        if not self._copy_of(mail, sent_to, row["ts"], addressed=whole):
+        # (A placeholder's recipients were never read: its copy is told by
+        # the rest.)
+        if not self._copy_of(mail, sent_to, row["ts"],
+                             addressed=whole and minted not in self._placeholders):
             return False
         if alias not in (fields.get("sent_as") or []):
             _ibstore.update_message(path, sent_as=alias)
@@ -5059,17 +5067,17 @@ class Mirror:
         which every recipient has. In Sent, :meth:`_own_send`'s: naming no
         other send (``submitted_as``), From the account, addressed to
         exactly the people the record says it went to and dated when it
-        went (a tombstone keeps no addresses: its copy is told by the
-        rest). Elsewhere, only the very header block the live record keeps
-        (:meth:`_own_copy`): every recipient holds the id, the gateway's
-        header naming the send, From, To, Cc and Date, and can write them
-        all on a mail of their own — and a tombstone, whose copy only Sent
-        tells, is no mail's outside it."""
+        went (a tombstone keeps no addresses, nor does a placeholder, whose
+        were never read: its copy is told by the rest). Elsewhere, only the
+        very header block the live record keeps (:meth:`_own_copy`): every
+        recipient holds the id, the gateway's header naming the send, From,
+        To, Cc and Date, and can write them all on a mail of their own — and
+        a tombstone, whose copy only Sent tells, is no mail's outside it."""
         if role != "sent":
             return not minted["removed"] and self._own_copy(minted["message_id"], mail.headers)
         sent_to = []
         addressed = mail.unreadable is None and not minted["removed"] \
-            and minted["direction"] == "out"
+            and minted["direction"] == "out" and minted["message_id"] not in self._placeholders
         if addressed:
             fields = _ibstore.read_record(self._record_path(minted["record"])) or {}
             sent_to = [*(fields.get("recipients") or []), *(fields.get("cc") or []),
@@ -6128,8 +6136,9 @@ class Mirror:
         the reply is a follow-up to it: to whom that went, again. The user's
         own is a mail on record as theirs (sent); one that came in From an
         address of theirs is left out of all this — its headers are its
-        sender's to write — and where only such mails are left, the reply
-        goes to that address alone.
+        sender's to write — and where only such mails are left, the newest
+        of them is followed up like the user's own: to whom it went but the
+        user, else to that address.
 
         Everything here was a stranger's to write. So what becomes a header
         is only what has the shape of its field — an address that reads as
@@ -6176,19 +6185,27 @@ class Mirror:
             return list(dict.fromkeys(a for a in addresses if _sendable(a)))
 
         # (Such mails have no say in how the reply is addressed, unless they
-        # are all the thread has left: then it goes to that address alone.)
+        # are all the thread has left: then the newest of them is followed
+        # up — to whom it went, as any mail's reply-all goes to its To and
+        # Cc, and the preview shows them; to that address where it went to
+        # nobody else. Beside a real mail, a forgery From the user steers
+        # nothing; the cost: a mail the user wrote from an address of theirs
+        # adds nobody to a reply in a thread with real mails.)
         basis = [row for row in live if not from_self(row)]
         latest = (basis or live)[0]
         answered = next((row for row in basis if not own(row)), latest)
         fields = _ibstore.read_record(self._record_path(answered["record"])) or {}
-        if not basis:
-            to, cc = sendable([latest["sender"] or ""]), []
-        elif own(latest):
+        if own(latest) or not basis:
             to = sendable(listed(latest, "recipients"))
             cc = sendable(listed(latest, "cc"), "cc")
             others = [a for a in to if a not in OWN_ADDRESSES]
-            # (A mail to oneself alone is answered to oneself.)
-            to = others or to or [a for a in cc if a not in OWN_ADDRESSES]
+            copied = [a for a in cc if a not in OWN_ADDRESSES]
+            if basis:
+                # (A mail to oneself alone is answered to oneself.)
+                to = others or to or copied
+            else:
+                # (One that came in to nobody else: to the address it is From.)
+                to = others or copied or sendable([latest["sender"] or ""])
             cc = [a for a in cc if a not in OWN_ADDRESSES and a not in to]
         else:
             # The record keeps Reply-To from this phase on; an older one has

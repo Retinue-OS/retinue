@@ -466,6 +466,61 @@ def test_a_follow_up_to_the_users_own_mail_goes_to_its_recipients_again():
     print("ok: with the user's own mail as the latest, a reply goes to its recipients again")
 
 
+def test_a_thread_of_mails_from_the_users_own_addresses_is_followed_up():
+    """A mail that came in From an address of the user's has no say in a
+    reply beside real mails — its To and Cc are its sender's to write — but
+    where only such mails are left, the newest is followed up as the user's
+    own is: to its To and Cc but the user's own addresses (D: From this very
+    account, a "send as" from a phone whose Sent copy is in no followed
+    folder; D': from another listed address), to that address only where it
+    went to nobody else. Beside a real mail, a forgery From the user To
+    mal@ steers nothing, and nor does the user's mail from another listed
+    address: Bob, whom it added, is not on the reply (the stated cost)."""
+    def drafts(env_own, *mails):
+        w = world(save_sent=False, MAIL_OWN_ADDRESSES=env_own)
+        try:
+            for message in mails:
+                w.box.put("INBOX", message)
+            for _ in range(3):
+                w.mirror.poll()
+            (chat,) = {r["chat"] for r in t.records(w.gw)}
+            return {mode: (d["to"], d["cc"], d["in_reply_to"])
+                    for mode, d in w.mirror.reply_drafts(chat).items()}
+        finally:
+            done(w)
+
+    own, work = "alias@example.org", "alias@example.org, me@work.org"
+    # D: only the user's mail, From the account, To Ann and Bob, Cc itself.
+    got = drafts(own, t.msg("ph1@example.org", sender=f"Me <{ACCOUNT}>",
+                            to="ann@x.org, bob@x.org", cc=ACCOUNT, subject="Plans", day=2))
+    assert got == {m: (["ann@x.org", "bob@x.org"], [], "ph1@example.org")
+                   for m in ("all", "sender")}, got
+    # D': the same from another listed address.
+    got = drafts(work, t.msg("w1@work.org", sender="Me <me@work.org>",
+                             to="ann@x.org, bob@x.org", cc=ACCOUNT, subject="Plans", day=2))
+    assert got == {m: (["ann@x.org", "bob@x.org"], [], "w1@work.org")
+                   for m in ("all", "sender")}, got
+    # To nobody else: to that address.
+    got = drafts(work, t.msg("w2@work.org", sender="Me <me@work.org>", to=ACCOUNT,
+                             subject="Note", day=2))
+    assert got["all"] == (["me@work.org"], [], "w2@work.org"), got
+    # Beside Ann's mail, a forgery From the user To Mallory steers nothing.
+    ann = t.msg("a1@x.org", sender="Ann <ann@x.org>", to=ACCOUNT, cc="dan@x.org",
+                subject="Plans", day=1)
+    got = drafts(own, ann, t.msg("f1@evil.org", sender=f"Me <{ACCOUNT}>",
+                                 to="mal@evil.org", subject="Re: Plans", refs=["a1@x.org"],
+                                 irt="a1@x.org", day=2))
+    assert got == {"all": (["ann@x.org"], ["dan@x.org"], "a1@x.org"),
+                   "sender": (["ann@x.org"], [], "a1@x.org")}, got
+    # Nor does the user's answer from work, to Ann and Bob: Bob is not on it.
+    got = drafts(work, ann, t.msg("w1@work.org", sender="Me <me@work.org>",
+                                  to="ann@x.org, bob@x.org", cc=ACCOUNT, subject="Re: Plans",
+                                  refs=["a1@x.org"], irt="a1@x.org", day=2))
+    assert got["all"] == (["ann@x.org"], ["dan@x.org"], "a1@x.org"), got
+    print("ok: a thread of mails from the user's own addresses alone is followed up to whom "
+          "they went; beside a real mail they have no say")
+
+
 def test_a_tombstone_is_not_answered():
     w = world()
     try:
@@ -4849,10 +4904,12 @@ def _forged(delivered: bytes, *, to=None) -> bytes:
     return head + sep + body.replace(b"Hello.", b"Pay Mallory 5000, as agreed.")
 
 
-def _the_forgery_is_its_own(w, mirror, M, P, *, send_live: bool):
+def _the_forgery_is_its_own(w, mirror, M, P, *, send_live: bool, to=None):
     """The send stays what it was, by the user; the forgery is a mail that
     came in, under its own id, in the send's chat; and a reply goes to
-    nobody the user did not write to."""
+    nobody the user did not write to — beside the live send. With the send
+    a tombstone, the forgery is all the thread has left: the reply goes to
+    its To, as it would for a mail From its writer."""
     gw = w.gw
     records = t.by_id(gw)
     assert sorted(records) == sorted([M, P]), sorted(records)
@@ -4869,7 +4926,10 @@ def _the_forgery_is_its_own(w, mirror, M, P, *, send_live: bool):
     for mode in ("all", "sender"):
         draft = mirror.reply_draft(send["chat"], mode)
         addressed = set(draft["to"] + draft["cc"])
-        assert addressed <= {"ann@x.org", ACCOUNT}, (mode, draft)
+        if send_live:
+            assert addressed <= {"ann@x.org", ACCOUNT}, (mode, draft)
+        else:
+            assert addressed == {to or "ann@x.org"}, (mode, draft)
         assert draft["in_reply_to"] == P, draft
 
 
@@ -4896,18 +4956,18 @@ def test_a_recipients_forgery_of_the_send_revives_no_tombstone():
             box.put("INBOX", _forged(raw, to=to), date=NOW + 600)
             mirror.poll()
             mirror.poll()
-            _the_forgery_is_its_own(w, mirror, M, P, send_live=False)
+            _the_forgery_is_its_own(w, mirror, M, P, send_live=False, to=to)
             news = [(kind, p.get("direction"), p.get("message_id")) for kind, p in
                     w.events[told:] if kind == "inbound"]
             assert news == [("inbound", "in", P)], news
             mirror = w.restart()
             mirror.poll()
             assert mirror._known_as(M) == [M, P], mirror._known_as(M)
-            _the_forgery_is_its_own(w, mirror, M, P, send_live=False)
+            _the_forgery_is_its_own(w, mirror, M, P, send_live=False, to=to)
             box.move_mail("Trash", trashed, "Sent")
             mirror.poll()
             mirror.poll()
-            _the_forgery_is_its_own(w, mirror, M, P, send_live=True)
+            _the_forgery_is_its_own(w, mirror, M, P, send_live=True, to=to)
             assert _places_of(mirror, "sent", M)
         finally:
             done(w)
@@ -4928,11 +4988,11 @@ def test_a_recipients_forgery_beside_the_live_send_is_no_place_of_it():
             forged = box.put("INBOX", _forged(raw, to=to), date=NOW + 600)
             mirror.poll()
             mirror.poll()
-            _the_forgery_is_its_own(w, mirror, M, P, send_live=True)
+            _the_forgery_is_its_own(w, mirror, M, P, send_live=True, to=to)
             box.move_mail("Sent", uid, "Trash")
             mirror.poll()
             mirror.poll()
-            _the_forgery_is_its_own(w, mirror, M, P, send_live=False)
+            _the_forgery_is_its_own(w, mirror, M, P, send_live=False, to=to)
             told = len(w.events)
             forged = box.move_mail("INBOX", forged, "Archive")
             mirror.poll()
@@ -4940,7 +5000,7 @@ def test_a_recipients_forgery_beside_the_live_send_is_no_place_of_it():
             box.move_mail("Archive", forged, "INBOX")
             mirror.poll()
             mirror.poll()
-            _the_forgery_is_its_own(w, mirror, M, P, send_live=False)
+            _the_forgery_is_its_own(w, mirror, M, P, send_live=False, to=to)
             assert not [p for kind, p in w.events[told:]
                         if kind == "inbound" and p.get("direction") == "out"], w.events[told:]
         finally:
@@ -5150,6 +5210,102 @@ def test_an_unreadable_sent_copy_of_a_send_is_that_send():
         done(w)
     print("ok: an unreadable Sent copy of the gateway's own send is that send, not a "
           "placeholder of its own")
+
+
+def _the_send_as_a_placeholder(w):
+    """A rewritten send whose Sent copy went to the Trash (a tombstone) and
+    came back while the reader could not read it: the send is a placeholder
+    under its minted id, made from that copy's header block, with no
+    recipients read. ``(minted id, provider id, the copy's bytes, its UID in
+    Sent, the undo)``."""
+    gw, box, mirror = w.gw, w.box, w.mirror
+    M, P, raw, uid = _rewritten_send(w, keep_own_header=True)
+    trashed = box.move_mail("Sent", uid, "Trash")
+    mirror.poll()
+    mirror.poll()
+    assert t.by_id(gw)[M]["removed_at"], "the copy left: a tombstone"
+    real = gw.read_mail
+
+    def read_mail(raw, date=None, *args, **kwargs):
+        if b"p@provider.example" in raw:
+            raise gw.UnreadableMail("too much work", "work")
+        return real(raw, date, *args, **kwargs)
+    gw.read_mail = read_mail
+    back = box.move_mail("Trash", trashed, "Sent")
+    mirror.poll()
+    mirror.poll()
+    (record,) = t.records(gw)
+    assert record["message_id"] == M and M in mirror._placeholders, record
+    assert record["recipients"] == [] and record["cc"] == [], record
+    return M, P, raw, back, lambda: setattr(gw, "read_mail", real)
+
+
+def _read_again(mirror, rounds=3):
+    for _ in range(rounds):
+        mirror._retry_at = 0
+        mirror._retried.clear()
+        mirror.poll()
+
+
+def test_a_placeholder_of_a_send_is_replaced_by_its_own_copy_outside_sent():
+    """A placeholder of the user's send whose copy (the one it was made
+    from, under the provider's id) a client moved out of Sent reads again
+    from there: the copy, proven its own by the very header block the
+    placeholder keeps, takes the placeholder's place, as what the record
+    already is — the user's send, under the minted id. A recipient's
+    forgery under that id beside it is still a mail of its own."""
+    for where in ("Archive", "INBOX"):
+        w = world(save_sent=False)
+        try:
+            gw, box, mirror = w.gw, w.box, w.mirror
+            M, P, raw, back, undo = _the_send_as_a_placeholder(w)
+            moved = box.move_mail("Sent", back, where)
+            mirror.poll()
+            mirror.poll()
+            assert M in mirror._placeholders, "it still does not read: it stays as it is"
+            undo()
+            _read_again(mirror)
+            assert not mirror._placeholders, mirror._placeholders
+            _the_one_send(w, M, P)
+            assert _places_of(mirror, where.lower(), M) == {moved: None}, \
+                _places_of(mirror, where.lower(), M)
+            # (Beside it, a forgery under the provider's id with other
+            # people on its To: no place of the send's, the send unchanged.)
+            box.put("INBOX", _forged(raw, to="mal@evil.org"), date=NOW + 600)
+            mirror.poll()
+            mirror.poll()
+            records = t.by_id(gw)
+            assert sorted(records) == sorted([M, P]), sorted(records)
+            assert records[P]["type"] == gw._ibstore.T_INBOUND and not records[P].get("author")
+            assert records[M]["text"] == "Hello." and records[M]["author"] == "user"
+        finally:
+            done(w)
+    print("ok: a placeholder of the user's send is replaced by its own copy outside Sent, "
+          "as what it already is")
+
+
+def test_a_placeholder_of_a_send_is_replaced_by_its_own_copy_in_sent():
+    """The same placeholder whose copy stays in Sent: a placeholder keeps no
+    recipients, so its copy is told by the rest (as a tombstone's is) — the
+    copy reads under the minted id, by the user, never as a second record
+    under the provider's id by the device."""
+    w = world(save_sent=False)
+    try:
+        gw, box, mirror = w.gw, w.box, w.mirror
+        M, P, _raw, back, undo = _the_send_as_a_placeholder(w)
+        told = len(w.events)
+        undo()
+        _read_again(mirror)
+        assert not mirror._placeholders, mirror._placeholders
+        _the_one_send(w, M, P)
+        assert _places_of(mirror, "sent", M) == {back: None}
+        assert not _places_of(mirror, "sent", P)
+        assert all(p.get("message_id") == M and p.get("author") == "user"
+                   for kind, p in w.events[told:] if kind == "inbound"), w.events[told:]
+    finally:
+        done(w)
+    print("ok: a placeholder of the user's send is replaced by its own copy in Sent, "
+          "under the minted id")
 
 
 def test_a_reply_asks_the_reader_only_for_a_header_block_with_a_reply_to():
