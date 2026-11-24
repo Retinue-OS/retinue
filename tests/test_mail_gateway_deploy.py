@@ -10,9 +10,9 @@ policy file the two sides look for under different names. What these pin:
 - the service names every variable it reads and loads no env_file (it holds a
   mailbox password; .env holds every other secret too), names the send policy
   and the erase capability it needs to write (and the approval-link variables
-  a queued send builds its URL from) but no setting or credential it does not
-  read (the news rail's), runs without a profile, and mounts its ledger and
-  its state volume;
+  a queued send builds its URL from), the two rails the gate hands mail to
+  (chats and news) but no setting or credential it does not read, runs
+  without a profile, and mounts its ledger and its state volume;
 - the retinue entrypoint places the e-mail policy file before anything slow,
   since the mirror does not start without it;
 - the ledger volume is mounted by the retinue service and read-only by
@@ -20,7 +20,8 @@ policy file the two sides look for under different names. What these pin:
 - the retinue service enrols the gateway and keeps the mailbox credentials
   its own e-mail backend still uses;
 - the e-mail policy path the gateway is told is the very file the retinue
-  side writes by default, seen through the other mount;
+  side writes by default, seen through the other mount — and so is the
+  sender policy (who is a VIP, who is instructed) the gate reads;
 - the image copies every local module its code imports, lazily imported
   ones included.
 
@@ -98,11 +99,19 @@ def test_the_service_names_what_it_reads_and_nothing_else():
                 "MAIL_MAX_PART_BYTES", "MAIL_MAX_MAIL_BYTES", "MAIL_TRIM_WANTING_CHARS",
                 "MAIL_DATA_DIR", "MAIL_GATEWAY_HTTP_PORT", "MAIL_GATEWAY_TOKEN",
                 "MAIL_POLICY_WAIT_SECONDS", "MAIL_RECENT_CHATS_MAX", "MAIL_RAIL_TIMEOUT",
+                # The gate: what travels with an offer, how long a turn's
+                # job is waited for, and what becomes of consumed news mail.
+                "MAIL_RAIL_FILE_BYTES", "MAIL_RAIL_JOB_TIMEOUT",
+                "MAIL_NEWS_FOLDER", "MAIL_NEWS_EXCERPT_CHARS",
                 # Writing: how long its own send waits for the Sent copy.
                 "MAIL_SENT_GRACE_SECONDS",
                 # The default account idles where the channel set leaves out email.
                 "MESSENGER_BUILTIN_CHANNELS"}
+    # The two rails the gate hands mail to — the chats rail (every mail that
+    # arrives is offered there) and the news rail (the gateway files news
+    # mail itself, now that e-mail triage is gone) — and the ledger.
     rails = {"CHATS_INGEST_URL", "CHATS_INGEST_TOKEN",
+             "NEWS_INGEST_URL", "NEWS_INGEST_TOKEN",
              "INBOUND_STORE_DIR", "TRIAGE_EMAIL_WHITELIST_PATH"}
     # The send policy it applies, the approval link a queued send returns, and
     # the capability the user's delete presents.
@@ -113,15 +122,21 @@ def test_the_service_names_what_it_reads_and_nothing_else():
     entries = _entries(block)
     for fixed in ("MAIL_GATEWAY_HTTP_PORT=8096", "INBOUND_STORE_DIR=/inbound",
                   "CHATS_INGEST_URL=http://retinue:8080/internal/chats/inbound",
+                  "NEWS_INGEST_URL=http://retinue:8080/internal/news",
                   "mail-data:/root/.local/share/mail", "messenger-email:/inbound"):
         assert fixed in entries, f"mail-gateway: expected `{fixed}`"
-    # Secrets it has no use for stay out — and so does the one a later phase
-    # reads: it files no news yet (e-mail triage still does). The container
-    # that parses mail from strangers holds no credential it has no use for.
+    # Secrets it has no use for stay out: the container that parses mail from
+    # strangers holds no credential it has no use for. Nor the address of the
+    # retinue gateway's /message: there is no triage forward for mail, and a
+    # gateway that cannot name the endpoint cannot grow one.
     for foreign in ("LITELLM_MASTER_KEY", "OPENROUTER_API_KEY", "CALDAV_PASSWORD",
                     "SMS_SERVER_PASSWORD", "TELEGRAM_API_HASH",
-                    "NEWS_INGEST_URL", "NEWS_INGEST_TOKEN"):
+                    "RETINUE_GATEWAY_URL", "INBOUND_GATE"):
         assert foreign not in names, foreign
+    # The news folder is passed without a value: "set and empty" in .env has
+    # a meaning of its own (leave the mail in the INBOX), which a default
+    # here would overwrite.
+    assert "MAIL_NEWS_FOLDER" in entries, "MAIL_NEWS_FOLDER must be passed through as it is"
     # Both ways for the gateway's own settings: every MAIL_* it names is one
     # the gateway's code reads (a value-less name the code ignores would be a
     # setting that silently does nothing), and every variable the gateway's
@@ -257,6 +272,40 @@ def test_both_sides_name_the_same_policy_file():
 _IMPORT_RE = re.compile(r"^\s*(?:import|from)\s+([A-Za-z_][A-Za-z0-9_]*)", re.M)
 
 
+def test_both_sides_name_the_same_sender_policy_file():
+    """The sender axis of the gate: the address book projects who is a VIP
+    and who is instructed into the `email` channel's policy file, in the
+    messengers' shape and place; the gateway reads it off its own mount,
+    with nothing in compose to say where. Mapped through the two mounts,
+    they must be one file — or no mail would ever buy a turn, silently."""
+    tp = _load("triage_policy_deploy_under_test_senders", SCRIPTS_DIR / "triage_policy.py")
+    saved = (tp.CHAMBERS_DIR, os.environ.pop("TRIAGE_MESSENGER_DIR", None))
+    try:
+        tp.CHAMBERS_DIR = Path("/workspace/chambers")
+        retinue_side = tp.messenger_policy_path("email")
+    finally:
+        tp.CHAMBERS_DIR = saved[0]
+        if saved[1] is not None:
+            os.environ["TRIAGE_MESSENGER_DIR"] = saved[1]
+    retinue_mount = Path("/workspace/chambers/_generated/messenger/email")
+    store = next(e.split("=", 1)[1] for e in _entries(_service_block("mail-gateway"))
+                 if e.startswith("INBOUND_STORE_DIR="))
+    helpers = _load("mail_gateway_helpers_deploy", REPO_ROOT / "tests" / "test_mail_gateway.py")
+    import tempfile  # noqa: PLC0415
+    kept = dict(os.environ)
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            # (Only imported: nothing is read from or written to the store.)
+            gw = helpers.load(tmp, INBOUND_STORE_DIR=store)
+            gateway_side = gw.SENDER_POLICY_PATH
+    finally:
+        os.environ.clear()
+        os.environ.update(kept)
+    assert Path(store) / retinue_side.relative_to(retinue_mount) == gateway_side, \
+        (retinue_side, gateway_side)
+    print("PASS test_both_sides_name_the_same_sender_policy_file")
+
+
 def test_the_image_carries_every_module_it_imports():
     """A module imported lazily (email_client imports triage_policy inside a
     function) fails only when that path first runs, in production. So the
@@ -336,6 +385,7 @@ def main() -> int:
     test_the_retinue_side_enrols_it_and_keeps_its_own_credentials()
     test_the_retinue_service_passes_the_mail_tunables_its_code_reads()
     test_both_sides_name_the_same_policy_file()
+    test_both_sides_name_the_same_sender_policy_file()
     test_the_image_carries_every_module_it_imports()
     print("all mail-gateway deployment tests passed")
     return 0

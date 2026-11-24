@@ -1136,9 +1136,12 @@ services:
   # token-gated /media/<id>. It also writes: /send (a reply, a new mail, an
   # agent's mail) under EMAIL_SEND_POLICY, with its own pending sends on
   # /sends, and the mailbox follows the chat (read, archive, delete to the
-  # Trash). It pushes nothing and starts no model turn for an arriving mail
-  # (the gate phase) — e-mail triage runs beside it unchanged, and still
-  # files news mail to the feed.
+  # Trash). And it is mail's delivery gate: a mail that arrives is persisted
+  # undelivered, gated (its group: news / quieted / ignored; its sender: VIP /
+  # instructed / anyone) and offered to the chats rail, which alone decides
+  # whether it rings and — for a VIP or an instructed sender — runs the turn
+  # that works it. A mail the rail did not take is offered again; nothing is
+  # forwarded to triage. News mail is filed to the feed from here.
   #
   # Not behind a profile, but opt-in: it mirrors nothing and serves nothing
   # until MAIL_GATEWAY_TOKEN is set (in .env; compose passes it to both
@@ -1207,7 +1210,12 @@ services:
       # the size caps for one part and one mail, the trim's "wanting"
       # threshold, the limit on waiting for the e-mail policy file before the
       # mirror starts (unset or 0: no limit), how many chats /recent-chats
-      # answers, and the timeout of the chats rail's POSTs.
+      # answers, the timeout of the chats rail's POSTs, the size up to which
+      # one attachment travels with the offer of a VIP's or an instructed
+      # sender's mail (MAIL_RAIL_FILE_BYTES; the web gateway's own per-file
+      # cap is CONVERSATION_MAX_ATTACHMENT_BYTES), and how long the job of a
+      # turn that works a mail is waited for before the mail is offered again
+      # (MAIL_RAIL_JOB_TIMEOUT).
       - MAIL_ARCHIVE_FOLDER
       - MAIL_TRASH_FOLDER
       - MAIL_SENT_GRACE_SECONDS
@@ -1222,21 +1230,39 @@ services:
       - MAIL_POLICY_WAIT_SECONDS
       - MAIL_RECENT_CHATS_MAX
       - MAIL_RAIL_TIMEOUT
+      - MAIL_RAIL_FILE_BYTES
+      - MAIL_RAIL_JOB_TIMEOUT
+      # News mail: where a mail of a group that is both `news` and `ignored`
+      # is moved once the feed has it. Unset: the archive folder. Set and
+      # EMPTY (MAIL_NEWS_FOLDER= in .env): marked read, left in the INBOX —
+      # which is why this one is passed only when .env names it. And how
+      # much of a mail's text its feed item carries.
+      - MAIL_NEWS_FOLDER
+      - MAIL_NEWS_EXCERPT_CHARS
       - MAIL_DATA_DIR=/root/.local/share/mail
       - MAIL_GATEWAY_HTTP_PORT=8096
       # The operator's opt-in: unset, the gateway neither mirrors nor serves.
       # The same value as on the retinue service (one line in .env).
       - MAIL_GATEWAY_TOKEN
-      # Chats rail — as on telegram-gateway above. The merge and removal rails
-      # are derived from CHATS_INGEST_URL. No news rail: in this phase a mail
-      # of a `news` sender or list is only skipped here, and e-mail triage
-      # files it to the feed as before; the gate phase moves that here.
+      # Chats rail — as on telegram-gateway above: every mail that arrives is
+      # offered here, and the job of a turn that works one is polled on the
+      # same host. The merge and removal rails are derived from
+      # CHATS_INGEST_URL. Emptied, mail is mirrored and offered to nobody.
       - CHATS_INGEST_URL=http://retinue:8080/internal/chats/inbound
       - CHATS_INGEST_TOKEN
-      # The ledger, and the e-mail policy file in it: the retinue side writes
-      # that file at chambers/_generated/messenger/email/policy/, which is
-      # this volume's policy/ here. Named explicitly because the two sides see
-      # the volume under different paths (scripts/triage_policy.py,
+      # News rail — as on telegram-gateway above: a mail of a `news` sender or
+      # list is filed to the feed (and starts no chat). The endpoint is open
+      # unless NEWS_INGEST_TOKEN is set on both sides. Emptied, the `news`
+      # flag does nothing here and such mail is mirrored like any other.
+      - NEWS_INGEST_URL=http://retinue:8080/internal/news
+      - NEWS_INGEST_TOKEN
+      # The ledger, and the two policy files in it. The retinue side writes
+      # both into chambers/_generated/messenger/email/policy/, which is this
+      # volume's policy/ here: the e-mail group flags (email-policy.nt) and
+      # the sender policy the address book projects (policy.nt: who is a VIP,
+      # who is instructed — read at <store>/policy/policy.nt, as on every
+      # gateway). The first is named explicitly because the two sides see the
+      # volume under different paths (scripts/triage_policy.py,
       # email_whitelist_path); a deployment that moves the file moves it here
       # too.
       - INBOUND_STORE_DIR=/inbound
