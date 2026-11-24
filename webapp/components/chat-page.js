@@ -73,12 +73,30 @@
 // stages a reply into the chat's draft, and the chat poll adopts it into the
 // composer — empty, or holding the text she was asked to rework — marked as
 // hers; the send press stays the user's.
+//
+// A mail thread is a chat too (docs/mail-chats.md). What differs is said
+// where it differs: the header names the subject, the participants and the
+// account, never the thread's Message-ID key; an inbound mail carries its
+// sender's name in a group, and its own subject where that is not the
+// thread's; a mail sent from another client is "You · mail client". A bubble
+// shows the mail's trimmed text, and its **Original** control expands the
+// whole mail in place — the headers, the HTML part in a sandboxed frame (or
+// the full plain text), every attachment — fetched once from the URL the
+// message names and only when that URL is this chat's own (ownOriginal). A
+// mail removed in a mail client stays as a quiet tombstone. The poll does not
+// only append: a message on screen whose removal, text, trim or attachments
+// changed is re-rendered in its place (_reconcileChanged). And a chat the
+// server says cannot be written to (`can_send: false`, the read-only mirror
+// of phase 1) shows the server's reason where the composer would be — one
+// switch, _canSend, that the writing phase flips by answering true.
 
 import { esc, webLink, WIDE_FRAME, deepActiveElement, onPressOutside, softKeyboard, visibleHeight } from './base.js';
 import { deviceGet, deviceSet } from './device-store.js';
 import { canRecord, micErrorText, recordingRowHtml, statusRowHtml, Waveform, VOICE_CSS } from './voice.js';
 import { pastedFiles, pastedText } from './clipboard.js';
-import { avatarHtml, colorFor, initials, CHANNELS } from './chats.js';
+import {
+  avatarHtml, avatarInitials, avatarKey, colorFor, CHANNELS, isMail, participantsText,
+} from './chats.js';
 import { openAttentionSheet, instructedSummary } from './attention-sheet.js';
 import { shelf, goLive, takeRestore, threadFacts } from './shelf-store.js';
 import { UNDO_MS } from './swipe-rows.js';
@@ -156,6 +174,101 @@ function linkUrl(a) {
   const url = typeof a.url === 'string' ? a.url : '';
   if (MEDIA_PROXY_RE.test(url)) return url;
   return webLink(url);
+}
+
+// A mail's Original (docs/mail-chats.md, "The original"). The message names
+// where its full form is served (`original`) and the page follows that URL
+// verbatim — it never builds one — but only when it is exactly this chat's
+// own path, /chats/<this chat's id>/messages/<token>/original: the id segment
+// decoded must be the open chat's id (the server's percent-encoding and the
+// browser's need not agree, so the decoded forms are compared), and the token
+// is one path segment of URL-safe characters that does not decode to a dot
+// segment or a slash (the URL parser resolves "%2e%2e" as ".."). Anything
+// else gets no Original control at all: the URL comes with a record, and a
+// record is not trusted to point this page anywhere else. The HTML part is
+// framed only from `html_url`, and only when that is the original's own URL
+// plus ".html" — the one document the server serves under the mail's own
+// policy (sandboxed, nothing loads, nothing runs, scripts/web-gateway.py).
+const ORIGINAL_PATH_RE =
+  /^\/chats\/([^/?#]+)\/messages\/((?:[A-Za-z0-9._~-]|%[0-9A-Fa-f]{2})+)\/original$/;
+// The frame's sandbox: links open in a new tab (the sanitiser targets them
+// there) and leave the sandbox behind; the mail's document never runs a
+// script and never shares this origin.
+const FRAME_SANDBOX = 'allow-popups allow-popups-to-escape-sandbox';
+// The frame cannot be measured from here (a sandboxed document of its own
+// origin), so its height is estimated from the mail's plain text — between
+// these bounds, the CSS cap on small screens, and the user's own drag (the
+// box resizes vertically where the browser offers a handle); the frame
+// scrolls inside for the rest. A plain part shorter than FRAME_STUB_CHARS
+// says nothing about the HTML beside it — an HTML-only mail has none, a
+// "view this mail in your browser" stub next to nothing — and the box opens
+// at FRAME_MAX_PX: too short is the costly guess (a phone gives the box no
+// handle, and the mail reads through a slot), too tall costs a scroll, and
+// the CSS cap keeps it on the screen.
+const FRAME_MIN_PX = 160;
+const FRAME_MAX_PX = 560;
+const FRAME_STUB_CHARS = 200;
+// The controls of a bubble that a re-render gives the focus back to, by kind
+// (_replaceBubble): the retry of a failed Original, the full header block's
+// disclosure, the Original control itself.
+const FOCUS_KINDS = ['[data-orig-retry]', '[data-orig-raw] > summary', '[data-orig-toggle]'];
+
+function ownOriginal(url, chatId) {
+  if (typeof url !== 'string' || !chatId) return '';
+  const m = ORIGINAL_PATH_RE.exec(url);
+  if (!m) return '';
+  try {
+    const token = decodeURIComponent(m[2]);
+    if (/^\.*$/.test(token) || token.includes('/') || token.includes('\\')) return '';
+    if (decodeURIComponent(m[1]) !== chatId) return '';
+  } catch (_e) { return ''; }
+  return url;
+}
+
+function ownOriginalHtml(doc, original) {
+  const url = doc && doc.html_url;
+  return original && typeof url === 'string' && url === `${original}.html` ? url : '';
+}
+
+// Whether a mail's own subject says something the thread's name does not —
+// then the bubble shows it. Reply and forward markers do not count, and they
+// are told by their shape rather than by a word list: a short token and a
+// colon at the start ("Re:", "AW:", "Fwd:", "回复：", "Re[2]:"), and a list
+// tag in brackets, are peeled off both sides before they are compared. The
+// price of a shape is that a subject which only grew a short "Word:" in
+// front reads as the thread's; that is a line not shown, never a wrong one.
+const SUBJECT_LEAD_RE = /^(?:\[[^[\]]*\]|[^\s:：[\]]{1,8}\s*(?:\[\d+\]|\(\d+\)|\^\d+)?\s*[:：])\s*/u;
+
+function subjectCore(s) {
+  let t = String(s || '').replace(/\s+/g, ' ').trim();
+  for (let i = 0; i < 32; i += 1) {
+    const m = SUBJECT_LEAD_RE.exec(t);
+    if (!m || !m[0]) break;
+    t = t.slice(m[0].length);
+  }
+  return t.replace(/\[[^[\]]*\]\s*/g, '').trim().toLowerCase();
+}
+
+function subjectDiffers(subject, name) {
+  const own = subjectCore(subject);
+  return !!own && own !== subjectCore(name);
+}
+
+// What of a message, when it changes on the server, changes its bubble — the
+// poll re-renders a bubble on screen in place when this differs
+// (_reconcileChanged): a mail removed in a client, a better trim, an
+// attachment's facts filled in, the author of a mail first seen in the Sent
+// folder named by the note that follows it (`device` → Ara or the user).
+function msgSig(m) {
+  return JSON.stringify([!!m.removed, m.removed_at || null, m.text || '', m.trim || null,
+    Array.isArray(m.attachments) ? m.attachments : [], m.subject || null, m.original || null,
+    m.sender_name || null, m.author || null, m.agent || null]);
+}
+
+// Epoch milliseconds of a message's timestamp, or NaN — which compares as
+// neither older nor newer, so a message without a usable time goes at the end.
+function tsMs(m) {
+  return m && typeof m.ts === 'string' ? Date.parse(m.ts) : NaN;
 }
 
 // Splitter persistence, per device — same pattern as layout.js (STORE_KEY).
@@ -368,6 +481,7 @@ class RetinueChatPage extends HTMLElement {
     this._draftTimer = null;
     this._draftInflight = null;
     this._pollTimer = null;
+    this._pollDone = false;    // the chat moved or went: no more polls (_stopPolling)
     this._onVis = null;
     // Mark as read (_markRead): a read or its undo on the wire, the Undo still
     // offered ({restore, marked, unread, listGroup, armedAt, timer} — what
@@ -383,6 +497,14 @@ class RetinueChatPage extends HTMLElement {
     // first message that was unread then, or -1, and how many there were.
     this._firstUnread = -1;
     this._newCount = 0;
+    // A mail's Original, expanded in its bubble: the message ids whose
+    // Original is open, the fetched originals by message id ({url, state:
+    // loading | ok | error, doc} — fetched once, kept for the page's life),
+    // and the ids whose full header block is disclosed. On the instance, so a
+    // render, a poll or a bubble's re-render opens nothing and shuts nothing.
+    this._origOpen = new Set();
+    this._origCache = new Map();
+    this._origRawOpen = new Set();
     // Voice dictation: this element is a host of voice.js's presentation
     // contract — the third one, after conversations.js and project-page.js.
     // The host owns the MediaRecorder state machine and what ✓/➤ mean;
@@ -575,6 +697,16 @@ class RetinueChatPage extends HTMLElement {
       const list = await listRes.json();
       const summary = (list.chats || []).find((c) => c.id === this._id);
       if (!summary || !summary.messages) {
+        // Not listed: perhaps a thread a merge folded into another chat (a
+        // reload, a push or a bookmark of the old id). Its messages' address
+        // is the one place the server says where it went; asked only here,
+        // on the way to the error, never to load a chat.
+        let moved = false;
+        try {
+          const probe = await fetch(`/chats/${encodeURIComponent(this._id)}/messages`, { cache: 'no-store' });
+          moved = (await this._whereGone(probe)) === 'moved';
+        } catch (_e) { moved = false; }
+        if (moved) return;
         this._state = 'error';
         this._error = 'This chat is not in the chat list.';
         this.render();
@@ -583,6 +715,14 @@ class RetinueChatPage extends HTMLElement {
       this._msgUrl = summary.messages;
       const msgRes = await fetch(this._msgUrl, { cache: 'no-store' });
       if (msgRes.status === 502) throw new Error('store');
+      const gone = msgRes.ok ? '' : await this._whereGone(msgRes);
+      if (gone === 'moved') return;
+      if (gone) {
+        this._state = 'error';
+        this._error = 'This chat is not in the chat list.';
+        this.render();
+        return;
+      }
       if (!msgRes.ok) throw new Error(String(msgRes.status));
       const doc = await msgRes.json();
       this._chat = doc.chat || summary;
@@ -605,14 +745,16 @@ class RetinueChatPage extends HTMLElement {
       const draft = this._chat.draft;
       this._draftVersion = (draft && draft.version) || 0;
       this._draftSaved = (draft && draft.text) || '';
-      if (draft && draft.text && !this._draft) {
+      if (draft && draft.text && !this._draft && this._canSend()) {
         this._draft = draft.text;
         this._draftByAra = draft.author === 'agent';
       }
       // What an earlier visit left in the composer and the server may not
-      // have got: its words, its images, its dictations (once per page).
+      // have got: its words, its images, its dictations (once per page). A
+      // chat that cannot be written to has no composer to put them in; they
+      // stay on the device for when it can.
       let unsaved = false;
-      if (!this._restoredLocal) {
+      if (!this._restoredLocal && this._canSend()) {
         this._restoredLocal = true;
         // Whatever is kept on the device, a bad record there must not keep
         // the chat from opening.
@@ -687,9 +829,28 @@ class RetinueChatPage extends HTMLElement {
     return !!t && t.scrollHeight - t.scrollTop - t.clientHeight < NEAR_BOTTOM_PX;
   }
 
+  // A chat a merge absorbed (docs/mail-chats.md, "Threading", case 4): the
+  // server answers its documents 410 with `merged_into`, the surviving chat,
+  // and the page follows — quietly, replacing this history entry, so Back
+  // does not lead to the dead id. A 404, or a 410 that names nowhere usable,
+  // is a chat gone. One answer `res` (not ok) → 'moved' (the page is on its
+  // way to the survivor), 'gone', or '' for an answer of any other kind.
+  async _whereGone(res) {
+    if (!res || (res.status !== 410 && res.status !== 404)) return '';
+    let to = '';
+    try {
+      const doc = await res.json();
+      to = doc && typeof doc.merged_into === 'string' ? doc.merged_into : '';
+    } catch (_e) { to = ''; }
+    if (!to || to === this._id || to.length > 2048) return 'gone';
+    this._stopPolling();
+    location.replace(`/chat.html?id=${encodeURIComponent(to)}`);
+    return 'moved';
+  }
+
   // ── Live mirror: poll ──────────────────────────────────────────────────────
   _startPolling() {
-    if (this._pollTimer) return;
+    if (this._pollTimer || this._pollDone) return;
     this._pollTimer = setInterval(() => this._poll(), POLL_MS);
     this._onVis = () => {
       // Coming back to a visible page: catch up at once. Looking is not
@@ -699,29 +860,53 @@ class RetinueChatPage extends HTMLElement {
     document.addEventListener('visibilitychange', this._onVis);
   }
 
+  // For good: the chat moved (_whereGone) or went.
+  _stopPolling() {
+    this._pollDone = true;
+    if (this._pollTimer) clearInterval(this._pollTimer);
+    this._pollTimer = null;
+  }
+
   async _poll() {
-    if (this._state !== 'ok' || !this._msgUrl || document.hidden) return;
+    if (this._state !== 'ok' || this._pollDone || !this._msgUrl || document.hidden) return;
     // A read posted from here after this poll left makes its answer's unread
     // state stale, and a flag set from here its flags (_adoptSummary).
     const readEpoch = this._readEpoch;
     const flagEpoch = this._flagEpoch;
     try {
       const res = await fetch(this._msgUrl, { cache: 'no-store' });
-      if (!res.ok) throw new Error(String(res.status));
+      if (!res.ok) {
+        // Merged into another chat: the page follows. Gone without a word:
+        // what is on screen stays, and the poll stops asking.
+        const gone = await this._whereGone(res);
+        if (gone === 'gone' && !this._pollDone) {
+          this._stopPolling();
+          this._showNote('This chat is no longer in the chat list.');
+        }
+        if (gone) return;
+        throw new Error(String(res.status));
+      }
       const doc = await res.json();
       const msgs = Array.isArray(doc.messages) ? doc.messages : [];
       const stick = this._atBottom();
+      // Never a full re-render, which would fight the composer (focus, IME,
+      // dictation) and the reader's place. First the messages on screen that
+      // changed since (a mail removed in a client, a better trim, its author
+      // named): each re-rendered where it is, and nothing else with it.
+      for (const m of msgs) {
+        if (m && this._seen.has(m.id)) this._reconcileChanged(m, stick);
+      }
+      // Then the ones not seen yet. A messenger message is appended, as it
+      // arrived; a mail goes to its place by time — most are the newest and
+      // are appended too, but a mail thread is not monotonic: a merge brings
+      // another chat's mails, a parent arrives after its reply, and those go
+      // in between (_insertChatMessage).
       let added = false;
-      // Append only unseen messages — never a full re-render, which would
-      // fight the composer (focus, IME, dictation) and the scroll position.
-      // Chat streams are monotonic enough that appending in payload order is
-      // right; anything older is history this page already shows.
       for (const m of msgs) {
         if (!m || this._seen.has(m.id)) continue;
         this._seen.add(m.id);
         if (this._reconcileUnconfirmed(m)) continue;
-        this._messages.push(m);
-        this._appendChatMessage(m, stick);
+        this._insertChatMessage(m, stick);
         added = true;
       }
       // The chat as the server now sees it — read by a reply from the
@@ -745,7 +930,7 @@ class RetinueChatPage extends HTMLElement {
       // reading or typing in them.
       const d = doc.chat && doc.chat.draft;
       const settled = this._draft === this._draftSaved;
-      if (d && d.text && settled && (d.version || 0) > (this._draftVersion || 0)) {
+      if (d && d.text && settled && this._canSend() && (d.version || 0) > (this._draftVersion || 0)) {
         this._draftVersion = d.version;
         this._draftSaved = d.text;
         const byAra = d.author === 'agent';
@@ -810,15 +995,279 @@ class RetinueChatPage extends HTMLElement {
     const node = thread && [...thread.querySelectorAll('[data-mid]')]
       .find((n) => n.getAttribute('data-mid') === pending.id);
     if (node) {
-      const tpl = document.createElement('template');
-      tpl.innerHTML = this._chatMsgHtml(m);
-      node.replaceWith(tpl.content.firstElementChild);
+      this._replaceBubble(node, m);
     } else if (idx < 0) {
       // The bubble is gone (a re-render dropped it) and nothing holds the
       // message: let the caller append it normally rather than losing it.
       return false;
     }
     return true;
+  }
+
+  // One polled message the page already shows, against the version on
+  // screen. Unchanged (msgSig), nothing happens. Changed, the message is
+  // replaced in `_messages` and its bubble re-rendered in place — the rest of
+  // the thread, the reader's place (the bottom when they sat there, `stick`,
+  // else the message they were looking at) and the Mark as read row beside
+  // it stay as they are. An open
+  // Original stays open while it still applies: the mail is still there and
+  // still names the same original (which never changes — the record's parts
+  // are immutable), so a better trim leaves it, and a removal shuts it.
+  // Returns true when the bubble changed.
+  _reconcileChanged(m, stick) {
+    const i = this._messages.findIndex((x) => x && x.id === m.id);
+    if (i < 0) return false;
+    const old = this._messages[i];
+    if (msgSig(old) === msgSig(m)) return false;
+    this._messages[i] = m;
+    const original = m.removed ? '' : ownOriginal(m.original, this._id);
+    if (!original) {
+      this._origOpen.delete(m.id);
+      this._origCache.delete(m.id);
+      this._origRawOpen.delete(m.id);
+    } else {
+      const cached = this._origCache.get(m.id);
+      if (cached && cached.url !== original) this._origCache.delete(m.id);
+      if (this._origOpen.has(m.id) && !this._origCache.has(m.id)) {
+        this._loadOriginal(m, original, stick ? 'bottom' : 'reader');
+        return true;
+      }
+    }
+    this._rerenderMessage(m, stick ? 'bottom' : 'reader');
+    return true;
+  }
+
+  // One message not on screen yet, into the thread at its place.
+  //
+  // On a messenger chat that is the end, whatever its stamp says. The stamp
+  // is the sender's clock (Signal) or the receiving phone's (SMS), a message
+  // can land after ones stamped later than it, and the server counts it
+  // unread by arrival (docs/messenger-chats.md, "By arrival order"). Placed
+  // by its stamp it would go in above what the reader has read — out of
+  // view, above the waterline, above their own message still on its way
+  // (stamped by this device's clock) — and Mark as read would be offered for
+  // a message they never saw.
+  //
+  // A mail thread is the one stream that is out of order by design, and
+  // there the place is by time: after the last message not newer than it.
+  // That is the end for nearly every arrival (appended, _appendChatMessage);
+  // a mail a merge brought from another chat, or a parent arriving after its
+  // reply, goes in before the first newer bubble instead — the bubbles
+  // around it stay the nodes they are (an open Original's frame, a focused
+  // control), the day separators and the waterline are drawn again around
+  // them (_reflowSeparators), and the reader keeps the message they were
+  // looking at, or the bottom. So a mail thread's `_messages` stays in time
+  // order, and its last inbound message is the newest one, the one the Mark
+  // as read row belongs under; a messenger chat's is the last to arrive.
+  _insertChatMessage(m, stick) {
+    let i = this._messages.length;
+    if (isMail(this._chat)) {
+      const t = tsMs(m);
+      while (i > 0 && tsMs(this._messages[i - 1]) > t) i -= 1;
+    }
+    const thread = this.shadowRoot.querySelector('[data-chat-thread]');
+    const next = thread && i < this._messages.length ? this._bubbleNode(this._messages[i].id) : null;
+    if (!next) {
+      this._messages.push(m);
+      this._appendChatMessage(m, stick);
+      return;
+    }
+    const loc = stick ? null : this._mirrorLocation();
+    this._messages.splice(i, 0, m);
+    // The waterline marks what was new when the chat was opened; a message
+    // that turns up older than its first is above it.
+    if (this._firstUnread >= i) this._firstUnread += 1;
+    next.insertAdjacentHTML('beforebegin', this._chatMsgHtml(m));
+    this._reflowSeparators(thread);
+    if (stick) thread.scrollTop = thread.scrollHeight;
+    else this._scrollMirrorTo(loc);
+  }
+
+  // The separators before the message at index `i` of `_messages`, the one
+  // before it being of day `prevDay`: a day's, where the day changes, and
+  // the waterline, where it stands.
+  _sepHtml(m, i, prevDay) {
+    let html = '';
+    if (dayKey(m.ts) !== prevDay) html += `<div class="day-sep"><span>${esc(fmtDay(m.ts))}</span></div>`;
+    if (i === this._firstUnread) {
+      html += `<div class="unread-sep"><span>${this._newCount ? `${this._newCount} new` : 'New'}</span></div>`;
+    }
+    return html;
+  }
+
+  // Every day separator and the waterline taken out and put back before the
+  // bubbles they belong to, by `_messages` as it now is. The bubbles are not
+  // touched; the Mark as read row is _placeMarkRead's.
+  _reflowSeparators(thread) {
+    thread.querySelectorAll('.day-sep, .unread-sep').forEach((n) => n.remove());
+    const nodes = new Map();
+    for (const n of thread.querySelectorAll('[data-mid]')) nodes.set(n.getAttribute('data-mid'), n);
+    let prevDay = '';
+    this._messages.forEach((m, i) => {
+      const node = nodes.get(m.id);
+      if (!node) return;
+      const html = this._sepHtml(m, i, prevDay);
+      if (html) node.insertAdjacentHTML('beforebegin', html);
+      prevDay = dayKey(m.ts);
+    });
+  }
+
+  // The bubble of a message on screen, found by walking rather than by
+  // selector (a message id is text from outside, see _reconcileUnconfirmed).
+  _bubbleNode(id) {
+    const thread = this.shadowRoot && this.shadowRoot.querySelector('[data-chat-thread]');
+    return (thread && [...thread.querySelectorAll('[data-mid]')]
+      .find((n) => n.getAttribute('data-mid') === id)) || null;
+  }
+
+  // Re-render one bubble where it is, the reader kept in place by what is on
+  // screen — never by writing back a scroll offset, which a bubble changing
+  // height above the view turns into a jump. `place`:
+  //  - 'bottom': the reader was at the newest message and stays there;
+  //  - 'reader' (a poll): the first message on screen keeps its offset, and
+  //    a bubble that was on screen does not leave it upwards (a long mail
+  //    turned tombstone under the reader shows at the top of the view);
+  //  - 'own' (the reader acted on this bubble — Original, Hide original, Try
+  //    again): its top stays where it was, or comes to the top of the view
+  //    where it had scrolled above it, so a long Original closed from its
+  //    foot leaves the mail and its control in view. A bubble off screen by
+  //    then (a load that settled after the reader scrolled on) is 'reader'.
+  // Focus inside the bubble stays inside it (_replaceBubble; `prefer`).
+  _rerenderMessage(m, place = 'reader', prefer = '') {
+    const thread = this.shadowRoot && this.shadowRoot.querySelector('[data-chat-thread]');
+    const node = this._bubbleNode(m.id);
+    if (!thread || !node) return;
+    const view = thread.getBoundingClientRect();
+    const r0 = node.getBoundingClientRect();
+    const inView = r0.bottom > view.top && r0.top < view.bottom;
+    const loc = place === 'bottom' ? null : this._mirrorLocation();
+    const next = this._replaceBubble(node, m, prefer);
+    if (place === 'bottom') {
+      thread.scrollTop = thread.scrollHeight;
+    } else if (place === 'own' && inView) {
+      const top = thread.getBoundingClientRect().top;
+      thread.scrollTop += next.getBoundingClientRect().top - top - Math.max(r0.top - view.top, 0);
+    } else {
+      this._scrollMirrorTo(loc);
+      const top = thread.getBoundingClientRect().top;
+      const r1 = next.getBoundingClientRect();
+      if (inView && r1.bottom <= top) thread.scrollTop += r1.top - top;
+    }
+  }
+
+  // The bubble `node` replaced by one rendered from `m` (and the frame of an
+  // open Original mounted); returns the new node. Focus inside the old bubble
+  // must not fall to the document with it: it goes to the same control in
+  // the new one — `prefer` first, where that names one present — else to the
+  // Original control, else to the bubble itself (a tombstone has no
+  // control). A control with no counterpart of its kind (a link) falls back;
+  // the message itself focused (where _placeMarkRead leaves it) stays so.
+  _replaceBubble(node, m, prefer = '') {
+    const active = deepActiveElement();
+    let kind = '';
+    if (active && active === node) kind = 'self';
+    else if (active && node.contains(active)) {
+      kind = FOCUS_KINDS.find((k) => active.matches && active.matches(k)) || '*';
+    }
+    const tpl = document.createElement('template');
+    tpl.innerHTML = this._chatMsgHtml(m);
+    const next = tpl.content.firstElementChild;
+    node.replaceWith(next);
+    this._mountFrame(next, m);
+    if (!kind) return next;
+    const pick = (sel) => (FOCUS_KINDS.includes(sel) ? next.querySelector(sel) : null);
+    const target = (kind === 'self' && next) || pick(prefer) || pick(kind)
+      || next.querySelector('[data-orig-toggle]') || next.querySelector('.bubble') || next;
+    const focusable = !!target.matches && target.matches('button, summary, a[href], [tabindex]');
+    if (!focusable) target.setAttribute('tabindex', '-1');
+    target.focus({ preventScroll: true });
+    return next;
+  }
+
+  // ── The Original of a mail, in place ───────────────────────────────────────
+  // A tap on a bubble's Original shows the whole mail in that bubble; a
+  // second gives the trimmed text back. The original is fetched on the first
+  // tap and kept (per message, for the page's life): every later tap, a
+  // render or a poll shows it from the cache.
+  _toggleOriginal(id) {
+    const m = this._messages.find((x) => x && x.id === id);
+    const original = m && !m.removed ? ownOriginal(m.original, this._id) : '';
+    if (!original) return;
+    if (this._origOpen.has(id)) {
+      this._origOpen.delete(id);
+      this._rerenderMessage(m, 'own');
+      return;
+    }
+    this._origOpen.add(id);
+    const cached = this._origCache.get(id);
+    if (!cached || cached.url !== original || cached.state === 'error') this._loadOriginal(m, original);
+    else this._rerenderMessage(m, 'own');
+  }
+
+  // Fetch a mail's original into the cache, the bubble showing the loading
+  // line meanwhile and the result once it settles (`place` as for
+  // _rerenderMessage; a press on the bubble is 'own'). A 'Try again' pressed
+  // has the focus back if the retry fails too — while loading it rests on
+  // the Original control, the one control the bubble then has.
+  async _loadOriginal(m, url, place = 'own') {
+    const node = this._bubbleNode(m.id);
+    const active = deepActiveElement();
+    const retry = !!node && !!active && node.contains(active) && !!active.matches
+      && active.matches('[data-orig-retry]');
+    const entry = { url, state: 'loading', doc: null };
+    this._origCache.set(m.id, entry);
+    this._rerenderMessage(m, place);
+    try {
+      const res = await fetch(url, { cache: 'no-store' });
+      // The chat merged into another meanwhile: the page follows it there.
+      if (!res.ok && (await this._whereGone(res)) === 'moved') return;
+      if (!res.ok) throw new Error(String(res.status));
+      const doc = await res.json();
+      if (!doc || typeof doc !== 'object' || Array.isArray(doc)) throw new Error('shape');
+      entry.doc = doc;
+      entry.state = 'ok';
+    } catch (_err) {
+      entry.state = 'error';
+    }
+    // Superseded meanwhile (the message changed, or a retry began): the
+    // newer entry renders itself.
+    if (this._origCache.get(m.id) !== entry) return;
+    const cur = this._messages.find((x) => x && x.id === m.id);
+    if (cur && this._origOpen.has(m.id)) {
+      this._rerenderMessage(cur, place === 'bottom' ? 'reader' : place, retry ? '[data-orig-retry]' : '');
+    }
+  }
+
+  // The frame for a bubble whose Original is open on an HTML mail: built
+  // here, element by element, never from markup — the one place this page
+  // loads a document into itself — and only for the original's own
+  // `.html` URL (ownOriginalHtml).
+  _mountFrame(node, m) {
+    if (!node || !node.querySelector || !this._origOpen.has(m.id)) return;
+    const slot = node.querySelector('[data-orig-frame]');
+    if (!slot) return;
+    const original = m.removed ? '' : ownOriginal(m.original, this._id);
+    const entry = this._origCache.get(m.id);
+    const url = entry && entry.state === 'ok' && entry.url === original
+      ? ownOriginalHtml(entry.doc, original) : '';
+    if (!url) return;
+    const frame = document.createElement('iframe');
+    frame.setAttribute('sandbox', FRAME_SANDBOX);
+    frame.setAttribute('referrerpolicy', 'no-referrer');
+    const subject = entry.doc.headers && typeof entry.doc.headers.subject === 'string'
+      ? entry.doc.headers.subject.trim() : '';
+    frame.setAttribute('title', subject ? `The original mail: ${subject}` : 'The original mail');
+    frame.className = 'orig-html';
+    frame.setAttribute('src', url);
+    slot.appendChild(frame);
+  }
+
+  // After a full render: the frames of every Original left open.
+  _mountFrames() {
+    for (const id of this._origOpen) {
+      const m = this._messages.find((x) => x && x.id === id);
+      if (m) this._mountFrame(this._bubbleNode(id), m);
+    }
   }
 
   // ── Read state: the server's, followed; Mark as read ───────────────────────
@@ -856,6 +1305,17 @@ class RetinueChatPage extends HTMLElement {
     if (flagsFresh && flags.some((f) => f in s && !!s[f] !== !!c[f])) {
       for (const f of flags) if (f in s) c[f] = !!s[f];
       this._refreshFlagsUi();
+    }
+    // Whether the chat can be written to, and why not: a flip changes what
+    // the pane holds below the thread (the grip goes with the composer), so
+    // the page is rendered anew; a new reason only replaces its line.
+    if ('can_send' in s || 'cannot_send_reason' in s) {
+      const could = this._canSend();
+      const why = c.cannot_send_reason;
+      if ('can_send' in s) c.can_send = s.can_send;
+      if ('cannot_send_reason' in s) c.cannot_send_reason = s.cannot_send_reason;
+      if (could !== this._canSend()) this.render();
+      else if (!could && why !== c.cannot_send_reason) this._refreshChatComposer();
     }
     return changed;
   }
@@ -1144,6 +1604,9 @@ class RetinueChatPage extends HTMLElement {
   // (_restoreLocal) — that it went out as a keepalive request is no proof it
   // arrived: the browser finishes those, but not offline.
   _leaving() {
+    // No composer, nothing in it: and what the device keeps for this chat
+    // from a time it could be written to is left where it is.
+    if (!this._canSend()) return;
     if (this._recState === 'recording' && !this._recAborted) this._handOffRecording();
     const out = this._sendingNow;
     this._keepLocal(out ? { text: out.text, at: out.at, images: out.images.length, seen: out.seen } : null);
@@ -1520,6 +1983,7 @@ class RetinueChatPage extends HTMLElement {
     if (this._state === 'ok') {
       this._applySizes();
       this._wire();
+      this._mountFrames();
       this._scrollThread('[data-chat-thread]');
       this._setPane(this._pane, 'instant');
     }
@@ -1548,15 +2012,29 @@ class RetinueChatPage extends HTMLElement {
     // any pairing of those facts overflows it; what a truncated subtitle drops
     // is the tail, which is exactly the half that disambiguates. Hence one
     // rule for both group and 1:1, short enough to always fit.
-    const sub = c.account
-      ? `via ${esc(c.account)}`
-      : (c.group
-        ? `${ch} group${c.members ? ` &middot; ${Number(c.members)} members` : ''}`
-        : `${ch} &middot; ${esc(key)}`);
+    //
+    // A mail thread is the exception, with two lines under its subject: who
+    // is in it, and which mailbox it is on. The title is the subject there,
+    // not a person, so the participants are what the rule above calls the
+    // peer — and they are not the handle the title already gives; the account
+    // gets its own line rather than the tail of theirs, for the same reason
+    // the rule gives. The key, the thread's root Message-ID, is never shown.
+    let sub;
+    if (isMail(c)) {
+      const people = participantsText(c);
+      sub = `<small class="head-sub"${people ? ` title="${esc(people)}"` : ''}>${people ? esc(people) : ch}</small>` +
+        (c.account ? `<small class="head-sub head-acct">via ${esc(c.account)}</small>` : '');
+    } else {
+      sub = `<small class="head-sub">${c.account
+        ? `via ${esc(c.account)}`
+        : (c.group
+          ? `${ch} group${c.members ? ` &middot; ${Number(c.members)} members` : ''}`
+          : `${ch} &middot; ${esc(key)}`)}</small>`;
+    }
     return `<header class="chat-head">` +
       avatarHtml(c) +
       `<div class="head-txt"><div class="head-name">${this._starHtml()}${esc(c.name)}</div>` +
-      `<small class="head-sub">${sub}</small></div>` +
+      `${sub}</div>` +
       `<nav class="pane-tabs" role="tablist" aria-label="Pane">` +
       `<button role="tab" data-pane-tab="chat" aria-selected="true">Chat</button>` +
       `<button role="tab" data-pane-tab="companion" aria-selected="false">Ara</button>` +
@@ -1786,37 +2264,147 @@ class RetinueChatPage extends HTMLElement {
     let html = '';
     let lastDay = '';
     msgs.forEach((m, i) => {
-      const day = dayKey(m.ts);
-      if (day !== lastDay) {
-        html += `<div class="day-sep"><span>${esc(fmtDay(m.ts))}</span></div>`;
-        lastDay = day;
-      }
-      if (i === this._firstUnread) {
-        html += `<div class="unread-sep"><span>${this._newCount ? `${this._newCount} new` : 'New'}</span></div>`;
-      }
+      html += this._sepHtml(m, i, lastDay);
+      lastDay = dayKey(m.ts);
       html += this._chatMsgHtml(m);
       if (m === anchor) html += this._markReadHtml();
     });
     return html;
   }
 
+  // One bubble. Outbound carries its author — the user, Ara, or the user's
+  // own device, which on e-mail is whichever mail client sent it. Inbound in
+  // a group carries the sender's name (on e-mail the address where the mail
+  // gave no name); in a 1:1 the header already says who. A mail whose own
+  // subject is not the thread's shows it as a line of its own, and a mail
+  // with an original to show offers it (_originalHtml). A message removed in
+  // a mail client is a tombstone (_tombHtml).
   _chatMsgHtml(m) {
     const out = m.direction === 'out';
+    const mail = isMail(this._chat);
     const author = out ? (m.author || 'user') : '';
-    const cls = out ? `msg out by-${author}` : 'msg in';
+    if (m.removed) return this._tombHtml(m, out, author);
+    const original = ownOriginal(m.original, this._id);
+    const open = !!original && this._origOpen.has(m.id);
+    const cls = (out ? `msg out by-${author}` : 'msg in') + (open ? ' orig-open' : '');
     let head = '';
     if (out) {
-      const tag = author === 'agent' ? esc(m.agent || 'Ara')
-        : author === 'device' ? 'You &middot; phone' : 'You';
-      head = `<div class="msg-head"><small class="who">${tag}</small></div>`;
-    } else if (this._chat.group && m.sender_name) {
-      head = `<div class="msg-head"><small class="who sender" ` +
-        `style="color:${colorFor(m.sender)}">${esc(m.sender_name)}</small></div>`;
+      head = `<div class="msg-head"><small class="who">${this._authorTag(m, author)}</small></div>`;
+    } else {
+      const name = this._senderLabel(m);
+      if (name) {
+        head = `<div class="msg-head"><small class="who sender" ` +
+          `style="color:${colorFor(m.sender)}">${esc(name)}</small></div>`;
+      }
     }
-    const media = (m.attachments || []).map((a) => this._attachmentHtml(a)).join('');
-    const text = m.text ? `<span class="txt">${linkify(m.text)}</span>` : '';
-    return `<div class="${cls}" data-mid="${esc(m.id)}">${head}<div class="bubble">${media}${text}` +
-      `<span class="stamp">${esc(fmtTime(m.ts))}</span></div></div>`;
+    const subject = mail && typeof m.subject === 'string' && subjectDiffers(m.subject, this._chat.name)
+      ? `<div class="msg-subj">${esc(m.subject.trim())}</div>` : '';
+    let body;
+    if (open) {
+      body = this._originalHtml(m, original);
+    } else {
+      const media = (m.attachments || []).map((a) => this._attachmentHtml(a)).join('');
+      const text = m.text ? `<span class="txt">${linkify(m.text)}</span>` : '';
+      body = media + text;
+    }
+    // The control says what a press does now: show the whole mail, or give
+    // the trimmed text back.
+    const toggle = original
+      ? `<div class="orig-bar"><button type="button" class="orig-btn" data-orig-toggle ` +
+        `aria-expanded="${open}" title="${open ? 'Back to the mail as a message' : 'The whole mail as it was sent'}">` +
+        `${open ? 'Hide original' : 'Original'}</button></div>`
+      : '';
+    return `<div class="${cls}" data-mid="${esc(m.id)}">${head}<div class="bubble">${subject}${body}` +
+      `${toggle}<span class="stamp">${esc(fmtTime(m.ts))}</span></div></div>`;
+  }
+
+  _authorTag(m, author) {
+    if (author === 'agent') return esc(m.agent || 'Ara');
+    if (author === 'device') return isMail(this._chat) ? 'You &middot; mail client' : 'You &middot; phone';
+    return 'You';
+  }
+
+  // Who an inbound bubble names: the sender, in a group — by the name the
+  // message carried, or on e-mail by the address a mail without a display
+  // name was sent from. '' in a 1:1, where the header names them.
+  _senderLabel(m) {
+    if (!this._chat || !this._chat.group) return '';
+    const name = typeof m.sender_name === 'string' ? m.sender_name.trim() : '';
+    if (name) return name;
+    return isMail(this._chat) && typeof m.sender === 'string' ? m.sender.trim() : '';
+  }
+
+  // A mail that was deleted or moved away in a mail client: what is left of
+  // it is who it was from and when — no text, no attachments, no Original
+  // (docs/mail-chats.md, "The mirror"). Quiet, so a thread of them reads as
+  // what is gone rather than as messages.
+  _tombHtml(m, out, author) {
+    const mail = isMail(this._chat);
+    const who = out ? (author === 'agent' ? (m.agent || 'Ara') : 'You')
+      : ((typeof m.sender_name === 'string' && m.sender_name.trim())
+        || (typeof m.sender === 'string' && m.sender.trim()) || '');
+    const at = (iso) => [fmtDay(iso), fmtTime(iso)].filter(Boolean).join(', ');
+    const meta = [who, at(m.ts)].filter(Boolean).join(' · ');
+    const gone = m.removed_at ? at(m.removed_at) : '';
+    const title = gone ? ` title="Removed ${esc(gone)}"` : '';
+    return `<div class="msg ${out ? 'out' : 'in'} tomb" data-mid="${esc(m.id)}">` +
+      `<div class="bubble" role="note"${title}>` +
+      `<span class="tomb-txt">This ${mail ? 'mail' : 'message'} was removed in a ${mail ? 'mail client' : 'client'}</span>` +
+      (meta ? `<span class="tomb-meta">${esc(meta)}</span>` : '') +
+      `</div></div>`;
+  }
+
+  // The whole mail, in place of its trimmed text (docs/mail-chats.md, "The
+  // original"): the headline headers, the full header block behind a
+  // disclosure, then the HTML part in a sandboxed frame — its slot here, the
+  // frame itself built by _mountFrame — or the full plain text where there
+  // is no HTML part, then every attachment, under the same rules as any
+  // attachment. Every value is text from the mail and is escaped as text.
+  _originalHtml(m, original) {
+    const entry = this._origCache.get(m.id);
+    if (!entry || entry.url !== original || entry.state === 'loading') {
+      return '<div class="orig orig-wait" role="status">Loading the original &#8230;</div>';
+    }
+    if (entry.state !== 'ok') {
+      return `<div class="orig orig-err" role="status">Couldn&rsquo;t load the original. ` +
+        `<button type="button" class="orig-retry" data-orig-retry>Try again</button></div>`;
+    }
+    const doc = entry.doc;
+    const h = doc.headers && typeof doc.headers === 'object' ? doc.headers : {};
+    const str = (v) => (typeof v === 'string' ? v.trim() : '');
+    const heads = [['From', h.from], ['To', h.to], ['Cc', h.cc], ['Date', h.date], ['Subject', h.subject]]
+      .filter(([, v]) => str(v))
+      .map(([k, v]) => `<div><dt>${k}</dt><dd>${esc(str(v))}</dd></div>`).join('');
+    const block = str(doc.header_block);
+    const raw = block
+      ? `<details class="orig-raw" data-orig-raw${this._origRawOpen.has(m.id) ? ' open' : ''}>` +
+        `<summary>All headers</summary><pre>${esc(block)}</pre></details>`
+      : '';
+    let body;
+    if (ownOriginalHtml(doc, original)) {
+      body = `<div class="orig-frame" data-orig-frame style="height:${this._frameHeight(doc)}px"></div>`;
+    } else if (str(doc.text)) {
+      body = `<div class="orig-text">${linkify(doc.text)}</div>`;
+    } else {
+      body = '<p class="orig-none">This mail has no text.</p>';
+    }
+    const atts = Array.isArray(doc.attachments)
+      ? doc.attachments.filter((a) => a && typeof a === 'object').map((a) => this._attachmentHtml(a)).join('')
+      : '';
+    return `<div class="orig">` +
+      (heads ? `<dl class="orig-heads">${heads}</dl>` : '') + raw + body +
+      (atts ? `<div class="orig-atts">${atts}</div>` : '') + `</div>`;
+  }
+
+  // The frame's height in px, estimated from the mail's plain text (see
+  // FRAME_MIN_PX): a line per 72 characters of each line, 20px a line; no
+  // plain text worth the name opens it at its cap.
+  _frameHeight(doc) {
+    const text = typeof doc.text === 'string' ? doc.text : '';
+    if (text.trim().length < FRAME_STUB_CHARS) return FRAME_MAX_PX;
+    let lines = 0;
+    for (const l of text.split('\n')) lines += Math.max(1, Math.ceil(l.length / 72));
+    return Math.max(FRAME_MIN_PX, Math.min(FRAME_MAX_PX, lines * 20 + 48));
   }
 
   // The attachment the bubble of a send on its way shows for one of the
@@ -1903,7 +2491,7 @@ class RetinueChatPage extends HTMLElement {
 
   _avatar() {
     const c = this._chat || {};
-    return { text: initials(c.name), color: colorFor(`${c.channel || ''}\u0000${c.key || c.id || ''}`) };
+    return { text: avatarInitials(c), color: colorFor(avatarKey(c)) };
   }
 
   _companionThread() {
@@ -1973,7 +2561,9 @@ class RetinueChatPage extends HTMLElement {
   // the reader to another message), or the newest.
   _scrollMirrorTo(m) {
     const t = this.shadowRoot.querySelector('[data-chat-thread]');
-    if (!t || !m) return;
+    // Not displayed (the draft has the pane): there is no place to keep, and
+    // the one it had is restored when it shows again.
+    if (!t || !m || this.hasAttribute('draft-expanded')) return;
     if (m.bottom) { t.scrollTop = t.scrollHeight; return; }
     const el = m.anchor && [...t.querySelectorAll('[data-mid]')].find((n) => n.getAttribute('data-mid') === m.anchor);
     if (el) t.scrollTop += el.getBoundingClientRect().top - t.getBoundingClientRect().top - (m.offset || 0);
@@ -2068,12 +2658,38 @@ class RetinueChatPage extends HTMLElement {
   // Outside the composer block, so a composer refresh leaves it (and a drag
   // on it) alone. See _wireGrip.
   _gripHtml() {
+    // Nothing to resize where there is no composer (_canSend).
+    if (!this._canSend()) return '';
     return `<div class="grip" data-grip role="separator" aria-orientation="horizontal" ` +
       `aria-label="Resize the composer" tabindex="0" ` +
       `title="Drag to resize &middot; double-click to reset"></div>`;
   }
 
+  // Whether this chat can be written to from here. The server says so on the
+  // chat summary: `can_send: false` (the read-only mail mirror of phase 1,
+  // docs/mail-chats.md) with `cannot_send_reason`; absent or true on every
+  // other chat. This is the one switch: false replaces the composer, its
+  // chips and its draft with the reason (_cannotSendHtml), drops the grip,
+  // and keeps the draft machinery from loading, adopting or saving anything;
+  // the rest of the page — the thread, Mark as read, the companion — is the
+  // same either way.
+  _canSend() {
+    return !this._chat || this._chat.can_send !== false;
+  }
+
+  _cannotSendHtml() {
+    const why = this._chat && typeof this._chat.cannot_send_reason === 'string'
+      ? this._chat.cannot_send_reason.trim() : '';
+    // The note line stays: Mark as read reports through it.
+    return `<div class="composer-off" data-composer-off>` +
+      `<div class="note" data-note role="status" hidden></div>` +
+      this._instructedHtml() +
+      `<p class="cannot-send">${esc(why || 'Nothing can be sent from here in this chat.')}</p>` +
+      `</div>`;
+  }
+
   _chatComposerHtml() {
+    if (!this._canSend()) return this._cannotSendHtml();
     const draftTag = this._draftByAra
       ? `<div class="draft-tag" data-draft-tag ` +
         `title="Ara staged this text into the shared draft. Edit freely — sending sends your words.">` +
@@ -2096,7 +2712,8 @@ class RetinueChatPage extends HTMLElement {
       this._imgPreviewsHtml() +
       this._errRowHtml('chat') +
       this._toLineHtml() +
-      this._composerRowHtml('chat', this._recipient() ? `Message ${this._recipient()} …` : 'Message …', true) +
+      this._composerRowHtml('chat', this._recipient()
+        ? `${isMail(this._chat) ? 'Reply to' : 'Message'} ${this._recipient()} …` : 'Message …', true) +
       `</div>`;
   }
 
@@ -2106,8 +2723,12 @@ class RetinueChatPage extends HTMLElement {
   // standing "To <name> · <channel>" line above it, the recipient in its
   // placeholder and send label, and the outbound colour on the field and the
   // send button, where the companion composer keeps Ara's accent blue.
+  // A mail thread is named by its subject, not by whom a reply reaches: the
+  // recipient there is its participants.
   _recipient() {
-    return (this._chat && this._chat.name) || '';
+    const c = this._chat;
+    if (!c) return '';
+    return (isMail(c) && participantsText(c)) || c.name || '';
   }
 
   _toLineHtml() {
@@ -2115,7 +2736,7 @@ class RetinueChatPage extends HTMLElement {
     if (!name) return '';
     const ch = this._chat.channel;
     const via = esc((CHANNELS[ch] || { label: ch || '' }).label);
-    const who = this._chat.group ? `everyone in ${esc(name)}` : esc(name);
+    const who = this._chat.group && !isMail(this._chat) ? `everyone in ${esc(name)}` : esc(name);
     return `<div class="to-line" title="What you send here goes to ${who}${via ? ` on ${via}` : ''}, not to Ara.">` +
       `<span aria-hidden="true">&#10148;</span> To <b>${who}</b>${via ? ` &middot; ${via}` : ''}</div>`;
   }
@@ -2327,13 +2948,19 @@ class RetinueChatPage extends HTMLElement {
     this._wireChatComposer();
     this._wireGrip();
 
-    // Image lightbox and the Mark as read row: delegated on the thread
-    // container, so bubbles appended by polls and sends, and the row as it
-    // moves, are covered without per-message wiring.
+    // Image lightbox, the Mark as read row and a mail's Original: delegated
+    // on the thread container, so bubbles appended by polls and sends,
+    // bubbles re-rendered in place, and the row as it moves, are covered
+    // without per-message wiring. The message a control belongs to is its
+    // bubble's data-mid, read as an attribute, never put into a selector.
     const chatThread = root.querySelector('[data-chat-thread]');
     if (chatThread) {
       chatThread.addEventListener('click', (e) => {
         const at = (sel) => e.target && e.target.closest && e.target.closest(sel);
+        const mid = () => {
+          const node = at('[data-mid]');
+          return node ? node.getAttribute('data-mid') : null;
+        };
         const btn = at('[data-lightbox]');
         if (btn) {
           this._openLightbox(btn.getAttribute('data-lightbox'),
@@ -2342,6 +2969,23 @@ class RetinueChatPage extends HTMLElement {
           this._markRead();
         } else if (at('[data-mark-read-undo]')) {
           this._undoMarkRead();
+        } else if (at('[data-orig-toggle]')) {
+          const id = mid();
+          if (id !== null) this._toggleOriginal(id);
+        } else if (at('[data-orig-retry]')) {
+          const id = mid();
+          const m = id !== null && this._messages.find((x) => x && x.id === id);
+          const original = m && !m.removed ? ownOriginal(m.original, this._id) : '';
+          if (original) this._loadOriginal(m, original);
+        } else if (at('[data-orig-raw] > summary')) {
+          // The disclosure toggles itself after this click; what it is about
+          // to be is remembered, so a re-render of the bubble keeps it.
+          const id = mid();
+          const d = at('[data-orig-raw]');
+          if (id !== null && d) {
+            if (d.open) this._origRawOpen.delete(id);
+            else this._origRawOpen.add(id);
+          }
         }
       });
     }
@@ -2460,7 +3104,7 @@ class RetinueChatPage extends HTMLElement {
   }
 
   _refreshChatComposer() {
-    const el = this.shadowRoot.querySelector('.pane-chat .composer');
+    const el = this.shadowRoot.querySelector('.pane-chat .composer, .pane-chat [data-composer-off]');
     if (!el) { this.render(); return; }
     const tpl = document.createElement('template');
     tpl.innerHTML = this._chatComposerHtml();
@@ -3132,11 +3776,7 @@ class RetinueChatPage extends HTMLElement {
         this._seen.add(msg.id);
       }
       const cur = findLocal();
-      if (cur) {
-        const tpl = document.createElement('template');
-        tpl.innerHTML = this._chatMsgHtml(msg);
-        cur.replaceWith(tpl.content.firstElementChild);
-      }
+      if (cur) this._replaceBubble(cur, msg);
       images.forEach((im) => { try { URL.revokeObjectURL(im.url); } catch (_e) { /* ignore */ } });
       // The server cleared the shared draft and read the chat with this send
       // — a reply reads it, the server's rule, so nothing is posted for it
@@ -3203,6 +3843,10 @@ class RetinueChatPage extends HTMLElement {
     // A message arriving while the user reads old history must not yank the
     // view to the bottom; only stick when they were already there.
     const keep = thread.scrollTop;
+    // The first message of an empty thread takes the place of its "No
+    // messages." line.
+    const empty = thread.querySelector(':scope > .center');
+    if (empty) empty.remove();
     thread.insertAdjacentHTML('beforeend', html);
     thread.scrollTop = stick ? thread.scrollHeight : keep;
   }
@@ -3429,6 +4073,47 @@ const CSS = `
   /* Optimistic bubble awaiting the server's send confirmation. */
   .msg.sending .bubble { opacity: .7; }
 
+  /* ── Mail: its own subject, the Original, the tombstone ──────────────────── */
+  .msg-subj { font-size: .74rem; font-weight: 650; opacity: .8; margin-bottom: 3px;
+              overflow-wrap: anywhere; }
+  .orig-bar { display: inline-block; margin-top: 6px; }
+  .orig-btn { border: 1px solid currentColor; background: transparent; color: inherit; opacity: .8;
+              border-radius: 999px; padding: 2px 10px; font: inherit; font-size: .72rem;
+              cursor: pointer; -webkit-tap-highlight-color: transparent; }
+  .orig-btn:hover { opacity: 1; }
+  .orig-btn:focus-visible, .orig-retry:focus-visible { outline: 2px solid var(--fg, #e7ebf2);
+                                                       outline-offset: 2px; }
+  /* Open, the whole mail takes the thread's width: a newsletter in 86% of
+     a phone is a column too narrow to read. */
+  .msg.orig-open { max-width: 100%; align-self: stretch; }
+  .msg.out.orig-open { align-items: stretch; }
+  .orig { display: flex; flex-direction: column; gap: 8px; font-size: .84rem; }
+  .orig-wait, .orig-err { font-style: italic; opacity: .8; }
+  .orig-retry { background: none; border: 0; padding: 0; font: inherit; font-style: normal;
+                font-weight: 600; color: inherit; text-decoration: underline; cursor: pointer; }
+  .orig-heads { margin: 0; display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 2px 10px; }
+  .orig-heads > div { display: contents; }
+  .orig-heads dt { opacity: .7; }
+  .orig-heads dd { margin: 0; overflow-wrap: anywhere; }
+  .orig-raw summary { cursor: pointer; opacity: .8; font-size: .78rem; }
+  .orig-raw pre { white-space: pre-wrap; overflow-wrap: anywhere; font-size: .72rem; max-height: 40vh;
+                  overflow: auto; margin: 6px 0 0; padding: 8px; border-radius: 8px;
+                  background: rgba(0, 0, 0, .2); }
+  /* The HTML part's box: the estimated height (_frameHeight), never more
+     than most of the screen, and the user's to drag taller or shorter where
+     the browser gives the box a handle; the mail scrolls inside it. White, as nearly every HTML mail assumes. */
+  .orig-frame { resize: vertical; overflow: hidden; min-height: 120px; max-height: 70vh;
+                border-radius: 8px; background: #fff; }
+  .orig-html { display: block; width: 100%; height: 100%; border: 0; background: #fff; }
+  .orig-text, .orig-none { overflow-wrap: anywhere; }
+  .orig-none { margin: 0; font-style: italic; opacity: .8; }
+  /* A mail removed in a mail client: an outline where the bubble was. */
+  .msg.tomb .bubble, .msg.out.tomb .bubble {
+    background: transparent; color: var(--muted, #8b93a3); font-size: .8rem;
+    border: 1px dashed var(--line, rgba(231, 235, 242, .16)); }
+  .tomb-txt { display: block; font-style: italic; }
+  .tomb-meta { display: block; font-size: .7rem; opacity: .85; }
+
   /* ── Lightbox ────────────────────────────────────────────────────────────── */
   .lightbox { position: fixed; inset: 0; z-index: 60; background: rgba(4, 6, 10, .93);
               display: flex; align-items: center; justify-content: center; outline: none; }
@@ -3495,6 +4180,11 @@ const CSS = `
     background: var(--accent, #6ea8fe); opacity: 1; }
   .grip:focus-visible { outline: none; }
   .composer { flex: none; padding: 2px 2px 2px; }
+  /* A chat that cannot be written to (_canSend): the server's reason in the
+     composer's place, one quiet line under the thread. */
+  .composer-off { flex: none; padding: 8px 4px 4px;
+                  border-top: 1px solid var(--line, rgba(231, 235, 242, .08)); }
+  .cannot-send { margin: 0; color: var(--muted, #8b93a3); font-size: .8rem; line-height: 1.4; }
   /* Sized by the grip: the composer is as tall as it was dragged — never
      shorter than its contents (the automatic minimum of a flex item), and
      never so tall that the thread has less than its minimum, unless those

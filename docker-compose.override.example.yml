@@ -46,7 +46,8 @@ services:
       # session should ALSO receive go into RETINUE_SESSION_ENV_EXTRA
       # (scripts/session_env.py; `PREFIX_*` admits a family); the e-mail ones
       # must not — the gateway's backend keeps the mailbox credentials on the
-      # agent's behalf.
+      # agent's behalf. A named account mirrored as chats is listed a second
+      # time, on its own mail gateway service (see mail-gateway-ari below).
       # - EMAIL_USER_ARI
       # - EMAIL_PASS_ARI
       # - IMAP_HOST_ARI
@@ -263,6 +264,43 @@ services:
   # values replace rather than merge, so declare all extras together:
   #     - 'MESSENGER_GATEWAYS=[{"base_url":"http://signal-gateway-personal:8090","token":"${SIGNAL_GATEWAY_TOKEN}","label":"Signal (personal)"},{"base_url":"http://caldav-gateway:8094","token":"${CALDAV_GATEWAY_TOKEN}","label":"Calendar"}]'
 
+  # Optional: a named e-mail account mirrored as chats. The base mail-gateway
+  # service mirrors the default account (EMAIL_USER, …); each further account
+  # is one more service reusing it via `extends`, with MAIL_ACCOUNT_NAME naming
+  # the account and that account's suffixed variables listed (the base file
+  # loads no env_file, so a variable this service reads must be named). It
+  # shares the messenger-email ledger — every record carries its account, as
+  # on the messengers — but gets its OWN mail-data volume. Enrol it in
+  # MESSENGER_GATEWAYS with "channel":"email": its name does not say which
+  # channel it serves. Merge it into the same array as any other extra.
+  # `extends` hands it the base service's MAIL_GATEWAY_TOKEN (without which
+  # it mirrors nothing) and MAIL_OWN_ADDRESSES: let that one .env value list
+  # every address of the user's — every mirrored account and its aliases — so
+  # neither gateway counts the user's other account as a correspondent.
+  # retinue:
+  #   environment:
+  #     - 'MESSENGER_GATEWAYS=[{"base_url":"http://mail-gateway-ari:8096","token":"${MAIL_GATEWAY_TOKEN}","label":"E-mail (Ari)","channel":"email"}]'
+  # mail-gateway-ari:
+  #   extends:
+  #     file: docker-compose.yml
+  #     service: mail-gateway
+  #   environment:
+  #     - MAIL_ACCOUNT_NAME=ARI
+  #     # `extends` inherits the default account's variables too; blank its
+  #     # password so this container holds only the account it serves.
+  #     - EMAIL_PASS=
+  #     - EMAIL_USER_ARI
+  #     - EMAIL_PASS_ARI
+  #     - IMAP_HOST_ARI
+  #     - SMTP_HOST_ARI
+  #     - SENT_FOLDER_ARI
+  #     - SMTP_SAVE_SENT_ARI
+  #   volumes:
+  #     - mail-data-ari:/root/.local/share/mail   # its OWN volume
+  #     - messenger-email:/inbound
+  #   networks:
+  #     - agents
+
   # ── Optional: SMS (the `sms` compose profile) ──────────────────────────────
   # The phone reaches two things over public HTTPS, both on one hostname:
   # sms-server's mobile API (where the app registers and fetches queued sends)
@@ -296,9 +334,9 @@ services:
   #     - "traefik.http.services.sms-webhook.loadbalancer.server.port=8095"
 
   # Opting a built-in gateway channel OUT entirely — a deployment that never
-  # runs signal-gateway/whatsapp-gateway/telegram-gateway at all (not even
-  # unpaired). docker-compose.yml unconditionally points the retinue service
-  # at all three via *_GATEWAY_BASE_URL; if the corresponding container never
+  # runs signal-gateway/whatsapp-gateway/telegram-gateway/mail-gateway at all
+  # (not even unconfigured). docker-compose.yml unconditionally points the
+  # retinue service at all four via *_GATEWAY_BASE_URL; if the corresponding container never
   # starts, gateway-monitor.py sees a DNS failure and reports it as a real
   # outage forever. Name only the channels you actually run in
   # MESSENGER_BUILTIN_CHANNELS (see scripts/messenger_gateways.py) so the
@@ -307,16 +345,27 @@ services:
   # (If instead you keep a container running but deliberately unpaired, none
   # of this is needed — its own /health reports configured: false and every
   # consumer already skips it.)
+  # The mail gateway reads the variable too: its default account idles as not
+  # configured where the set leaves out `email` — so a deployment that pinned
+  # its set before e-mail became a channel adds `email` to get mail chats.
+  # A value set only on the retinue service here does not reach mail-gateway:
+  # set it in .env, or on both services. To run no mail gateway container at
+  # all, also give it a profile nobody enables:
+  # mail-gateway:
+  #   profiles: ["off"]
   # retinue:
   #   environment:
-  #     # Signal-only deployment. Set to an empty string to enrol none of
-  #     # the three built-in channels.
+  #     # Signal-only deployment (no mail mirror either). Set to an empty
+  #     # string to enrol none of the built-in channels; add `email` to keep
+  #     # the mail gateway.
   #     - MESSENGER_BUILTIN_CHANNELS=signal
 
 # volumes:
 #   genomics-index:
 #   # An extra account (see signal-gateway-personal above) needs its own volume:
 #   # signal-data-personal:
+#   # and so does an extra mail account (mail-gateway-ari above):
+#   # mail-data-ari:
 #   # An existing deployment can keep previously created volumes by pinning
 #   # their names, e.g.:
 #   # retinue-root:

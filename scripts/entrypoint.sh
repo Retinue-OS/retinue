@@ -18,6 +18,20 @@ LETTERBOX_DIR="${LETTERBOX_DIR:-$CHAMBERS_DIR/inbox}"
 export CHAMBERS_DIR CHAMBERS_MANIFEST LETTERBOX_DIR
 is_letterbox() { [[ "${1%/}" == "${LETTERBOX_DIR%/}" ]]; }
 
+# ── The e-mail policy file, first thing ──────────────────────────────
+# The mail gateway does not start its mirror until the e-mail policy file
+# (whitelist and group flags) is where it reads it, on the mail ledger volume
+# (docs/mail-chats.md, docs/messaging.md "E-mail (the mail gateway)"): a
+# backfill without the `news` flags would turn every newsletter of the window
+# into a chat, for good. So the file is placed — moved from its old place, or
+# created empty — before anything slow or failure-prone below (chamber clones,
+# plugin installs, pip). Both paths are on volumes mounted at container start,
+# and the script needs only the standard library. Best effort: the web gateway
+# places it again when it starts.
+python3 /workspace/scripts/triage_policy.py place-email-policy \
+  | sed 's/^/[policy] e-mail policy file: /' \
+  || echo "[policy][warn] could not place the e-mail policy file; the web gateway retries" >&2
+
 # Retinue keeps its own session memory in the life store (scripts/memory.py,
 # CLAUDE.md "Memory"); Claude Code's built-in auto memory would be a second,
 # opaque memory beside it, invisible to SPARQL and to the reinforce/challenge

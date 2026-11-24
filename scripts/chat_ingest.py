@@ -80,6 +80,11 @@ def notify_chat_event(
     gate: dict | None = None,
     files: list[dict] | None = None,
     handover: bool = False,
+    subject: str | None = None,
+    participants: list[dict] | None = None,
+    peer: dict | None = None,
+    backfill: bool = False,
+    seen: bool = False,
     timeout: float = 3.0,
 ) -> dict | None:
     """Synchronous rail POST; returns the answer body, or None if it failed.
@@ -126,6 +131,20 @@ def notify_chat_event(
     starting a turn on its event would have the message handled twice. During
     a rollout where the web-gateway is rebuilt before the gateways, the absent
     offer is what keeps the old behaviour whole instead of doubling it.
+
+    Five fields are a mail thread's (docs/mail-chats.md) and are sent only
+    where given, so a messenger event is byte for byte what it was. A mail
+    chat is named by its subject — ``chat_name`` is the thread's — and says
+    who is in it beside that: ``subject`` is this mail's own subject,
+    ``participants`` the thread's people as ``[{"address", "name"}]`` and
+    ``peer`` the one it is with (the latest inbound sender, or the first
+    recipient of a thread the user started). ``backfill`` marks a mail the
+    mirror is catching up on rather than one that just arrived: the chat
+    takes it without pushing, starting a turn or bringing an archived chat
+    back. ``seen``, with it, says the mailbox had the mail marked read
+    already, which is where the chat's read mark starts from. Like every
+    event it may be delivered more than once and is taken once, by its
+    ``message_id`` — which a backfilled mail therefore always carries.
     Never raises.
     """
     if not CHATS_INGEST_URL:
@@ -152,6 +171,16 @@ def notify_chat_event(
         "files": files or None,
         "handover": True if handover else None,
     }
+    # The mail fields, only where a caller gave them.
+    if subject is not None:
+        payload["subject"] = subject
+    if participants is not None:
+        payload["participants"] = participants
+    if peer is not None:
+        payload["peer"] = peer
+    if backfill:
+        payload["backfill"] = True
+        payload["seen"] = bool(seen)
     body = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
         CHATS_INGEST_URL,

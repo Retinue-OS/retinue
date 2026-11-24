@@ -11,7 +11,10 @@ semantics, the restore's two guards, the arrival count that decides what
 landed after a read (a mark guarded by what was seen, a reply, the undo; one
 count per message, however often its event is delivered), the reach of a
 read to a message stamped by a fast clock, path-safe state filenames, and
-the overlay's merge/dedup/expiry contract.
+the overlay's merge/dedup/expiry contract — an entry is keyed by its chat as
+well as its message id. And what a mailbox adds: an arrival that is gone is
+no unread one, a merge keeps every arrival's place in the count true, and
+the id of a chat that was folded into another says where it went.
 
 Standalone, no third-party deps:
 
@@ -708,6 +711,388 @@ def test_delete_forgets_the_chat():
     print("PASS test_delete_forgets_the_chat")
 
 
+MAIL_A = "email:~me@example.org:root-a@x.org"
+MAIL_B = "email:~me@example.org:root-b@x.org"
+
+
+def test_a_mail_chat_keeps_its_subject_and_its_people():
+    """A mail thread is named by its subject: the people in it are kept
+    beside the name, and a contact card never writes over it."""
+    assert cs.named_by_subject("email") and not cs.named_by_subject("signal")
+    # A Message-ID is a key like any other: it round-trips, colons, slashes
+    # and all, and never touches the file system.
+    key = "a/b:c+d=@mail.example.org"
+    cid = cs.make_chat_id("email", key, "me@example.org")
+    assert cs.split_chat_ref(cid) == ("email", "me@example.org", key)
+    assert "/" not in cs.state_filename(cid)
+    # Participants are text from outside: an address must read as one, a
+    # name is one bounded line, each address is listed once.
+    assert cs.clean_party({"address": " Ann@X.org ", "name": "Ann\r\n Example\x00"}) == {
+        "address": "ann@x.org", "name": "Ann Example"}
+    assert cs.clean_party({"address": "ann@x.org"}) == {"address": "ann@x.org", "name": None}
+    for bad in (None, "ann@x.org", {}, {"address": "no-at-sign"}, {"address": "a b@x.org"},
+                {"address": "@x.org"}, {"address": "a@"}, {"address": 7},
+                {"address": "a@x.org\nBcc: y@z.org"}, {"address": "a" * 400 + "@x.org"}):
+        assert cs.clean_party(bad) is None, bad
+    assert len(cs.clean_party({"address": "a@x.org", "name": "n" * 999})["name"]) == 200
+    parties = cs.clean_parties([{"address": "A@x.org", "name": "A"}, "junk",
+                                {"address": "a@x.org", "name": "again"},
+                                {"address": "b@y.org"}])
+    assert parties == [{"address": "a@x.org", "name": "A"}, {"address": "b@y.org", "name": None}]
+    assert cs.clean_parties("not a list") == [] and cs.clean_parties(None) == []
+    assert len(cs.clean_parties([{"address": f"p{i}@x.org"} for i in range(500)])) \
+        == cs.PARTICIPANTS_MAX
+    with tempfile.TemporaryDirectory() as tmp:
+        store = cs.ChatStateStore(tmp)
+        assert store.get(MAIL_A)["participants"] is None and store.get(MAIL_A)["peer"] is None
+        doc = store.note_message(MAIL_A, name="Quarterly numbers", group=False,
+                                 participants=[{"address": "Ann@x.org", "name": "Ann"}],
+                                 peer={"address": "ann@x.org", "name": "Ann"})
+        assert doc["participants"] == [{"address": "ann@x.org", "name": "Ann"}]
+        assert doc["peer"] == {"address": "ann@x.org", "name": "Ann"}
+        # None leaves them; a list replaces; a peer that is none is not stored.
+        doc = store.note_message(MAIL_A, sender="ann@x.org", sender_name="Ann")
+        assert doc["participants"] and doc["peer"]
+        doc = store.note_message(MAIL_A, participants=[], peer={"address": "nonsense"})
+        assert doc["participants"] == [] and doc["peer"] == {"address": "ann@x.org", "name": "Ann"}
+        # The contact card: filed beside the subject, and removed without
+        # taking the subject with it.
+        doc = store.set_contact(MAIL_A, name="Ann Meier", sphere="Customers", person="ann-1")
+        assert doc["name"] == "Quarterly numbers" and doc["contact"]["name"] == "Ann Meier"
+        assert doc["contact"]["sphere"] == "customers" and doc["contact"]["person"] == "ann-1"
+        doc = store.set_contact(MAIL_A, name="")
+        assert doc["name"] == "Quarterly numbers" and doc["contact"] is None
+        # A messenger chat is still called by its card, and loses the name with it.
+        sig = "signal:+41794456312"
+        assert store.set_contact(sig, name="Mara Meier")["name"] == "Mara Meier"
+        assert store.set_contact(sig, name="")["name"] is None
+    print("PASS test_a_mail_chat_keeps_its_subject_and_its_people")
+
+
+def test_merge_folds_one_chat_into_another():
+    with tempfile.TemporaryDirectory() as tmp:
+        store = cs.ChatStateStore(tmp)
+        # Nothing to fold: nothing written, either way round.
+        doc, gone = store.merge(MAIL_B, MAIL_A)
+        assert gone is None and not store.exists(MAIL_A) and not store.exists(MAIL_B)
+        store.note_message(MAIL_A, name="Offer", participants=[{"address": "a@x.org"}],
+                           peer={"address": "a@x.org"}, group=False)
+        assert store.merge(MAIL_A, MAIL_A) == (store.get(MAIL_A), None)
+
+        # The survivor: one arrival, read past it, then one more — unread.
+        store.mark_unread(MAIL_A, cs.iso_z(100.0))
+        store.advance_last_read(MAIL_A, cs.iso_z(150.0))
+        store.mark_unread(MAIL_A, cs.iso_z(140.0))     # landed late, stamped early
+        store.set_draft(MAIL_A, "mine", author="user")
+        store.set_companion(MAIL_A, "a" * 32)
+        store.set_attention(MAIL_A, {"state": "done", "done_how": "replied"}, attended=1)
+        # The absorbed: read later, two arrivals of which one came after.
+        store.note_message(MAIL_B, name="Re: Offer", group=False,
+                           participants=[{"address": "b@y.org", "name": "B"}],
+                           peer={"address": "b@y.org", "name": "B"},
+                           sender="b@y.org", sender_name="B", unknown_sender=True)
+        store.mark_unread(MAIL_B, cs.iso_z(200.0))
+        store.advance_last_read(MAIL_B, cs.iso_z(300.0))
+        store.mark_unread(MAIL_B, cs.iso_z(400.0))
+        store.set_flags(MAIL_B, starred=True, archived=True)
+        store.set_draft(MAIL_B, "theirs", author="agent", agent="Ara")
+        store.set_draft(MAIL_B, "theirs, again", author="agent", agent="Ara")
+        store.set_companion(MAIL_B, "b" * 32)
+        store.set_attention(MAIL_B, {"state": "open", "importance": 4.0}, attended=1)
+        store.set_contact(MAIL_B, name="B Person", person="b-1")
+        before = store.get(MAIL_B)
+
+        doc, gone = store.merge(MAIL_B, MAIL_A)
+        assert gone == before and not store.exists(MAIL_B)
+        assert MAIL_B not in store.all() and store.get(MAIL_A) == doc
+        # The later read mark; the arrivals that landed after each chat's own
+        # read are still unread, wherever the other's mark falls.
+        assert doc["last_read"] == cs.iso_z(300.0)
+        assert doc["inbound_seq"] == 4 and doc["read_inbound"] == 2
+        assert cs.arrived_since_read(doc) == 2
+        assert doc["read_seq"] == 2 and doc["attended_seq"] == 2
+        assert doc["read_undo"] is None, "no undo reaches behind a merge that moved the mark"
+        # Flags: the star follows; archived only if both were.
+        assert doc["starred"] is True and doc["archived"] is False and doc["muted"] is False
+        # The survivor's draft and companion stand; its settled attention
+        # block gives way to the one still open.
+        assert doc["draft"]["text"] == "mine" and doc["companion"] == "a" * 32
+        assert doc["draft_version"] >= 2, "never behind a version the absorbed chat handed out"
+        assert doc["attention"] == {"state": "open", "importance": 4.0}
+        # Its own name and peer; the absorbed chat's where it had none.
+        assert doc["name"] == "Offer" and doc["peer"] == {"address": "a@x.org", "name": None}
+        assert doc["contact"]["name"] == "B Person" and doc["unknown_sender"] is True
+        assert doc["participants"] == [{"address": "a@x.org", "name": None},
+                                       {"address": "b@y.org", "name": "B"}]
+        assert doc["group"] is True, "two participants make a group"
+        assert doc["roster"] == {"b@y.org": "B"}
+        # Idempotent: the absorbed chat is gone, so a repeat changes nothing.
+        again, gone = store.merge(MAIL_B, MAIL_A)
+        assert gone is None and again == doc
+
+        # A survivor with nothing of its own takes the draft (under a version
+        # later than any either handed out), the companion and the gateway
+        # stamp with its provenance; muted on the absorbed side mutes — and
+        # so archives — the whole.
+        c, d = "email:~me@example.org:c@x.org", "email:~me@example.org:d@x.org"
+        store.set_draft(c, "x", author="user")
+        store.set_draft(c, "", author="user")          # cleared: version 2, no draft
+        store.set_draft(d, "staged", author="agent", agent="Ara")
+        store.set_companion(d, "d" * 32)
+        store.set_flags(d, muted=True)
+        store.note_message(d, gateway="mail-gateway", gateway_source=cs.GATEWAY_SOURCE_ACCOUNT)
+        doc, gone = store.merge(d, c)
+        assert doc["draft"]["text"] == "staged" and doc["draft"]["agent"] == "Ara"
+        assert doc["draft"]["version"] == doc["draft_version"] == 3
+        ok, _doc = store.set_draft(c, "stale", author="user", base_version=2)
+        assert not ok, "a writer holding the old version is refused"
+        assert doc["companion"] == "d" * 32 and doc["cleared"] is None
+        assert doc["muted"] is True and doc["archived"] is True
+        assert doc["gateway"] == "mail-gateway"
+        assert doc["gateway_source"] == cs.GATEWAY_SOURCE_ACCOUNT
+        # Two chats never read have no mark between them: the timestamps
+        # go on deciding, and nothing is counted as landed after a read.
+        assert doc["last_read"] is None and doc["read_inbound"] is None
+        assert cs.arrived_since_read(doc) == 0
+        # A chat never read keeps its arrivals unread behind the mark it
+        # inherits from the other.
+        e, f = "email:~me@example.org:e@x.org", "email:~me@example.org:f@x.org"
+        store.mark_unread(e, cs.iso_z(10.0))
+        store.mark_unread(e, cs.iso_z(20.0))
+        store.advance_last_read(f, cs.iso_z(500.0))
+        doc, _gone = store.merge(e, f)
+        assert doc["last_read"] == cs.iso_z(500.0) and cs.arrived_since_read(doc) == 2
+        assert doc["unread_since"] is None or doc["unread_since"] > doc["last_read"]
+    print("PASS test_merge_folds_one_chat_into_another")
+
+
+def test_overlay_follows_a_merge_and_a_removal():
+    ov = cs.ChatOverlay(ttl=60.0)
+    ov.insert({"chat_id": "a", "message_id": "1", "ts": cs.iso_z(1.0), "text": "x"})
+    ov.insert({"chat_id": "a", "ts": cs.iso_z(2.0), "text": "no id"})
+    ov.insert({"chat_id": "b", "message_id": "3", "ts": cs.iso_z(3.0), "text": "y"})
+    ov.insert({"chat_id": "b", "ts": cs.iso_z(2.0), "text": "no id"})
+    assert ov.rekey("a", "b") == 2 and not ov.entries("a")
+    # The id-less entry that was already there under the same key keeps its
+    # place; nothing is doubled.
+    assert [(e.get("message_id"), e["text"]) for e in ov.entries("b")] == [
+        ("1", "x"), (None, "no id"), ("3", "y")]
+    assert ov.rekey("a", "b") == 0, "a repeat moves nothing"
+    # A re-delivery after the move replaces the moved entry, never doubles it.
+    ov.insert({"chat_id": "b", "message_id": "1", "ts": cs.iso_z(1.0), "text": "x again"})
+    assert len(ov.entries("b")) == 3
+    assert ov.forget_messages("b", ["1", "nope", None]) == 1
+    assert ov.forget_messages("c", ["3"]) == 0, "only that chat's"
+    assert [e.get("message_id") for e in ov.entries("b")] == [None, "3"]
+    assert ov.forget_messages("b", []) == 0 and ov.forget_messages("b", None) == 0
+    print("PASS test_overlay_follows_a_merge_and_a_removal")
+
+
+def test_overlay_keys_an_entry_by_its_chat():
+    """A message id is unique within a conversation, not across them: one
+    mail to two of the user's addresses is one Message-ID in two chats."""
+    ov = cs.ChatOverlay(ttl=60.0)
+    mine = {"chat_id": "email:~me@x.org:root@y.org", "message_id": "dup@y.org",
+            "ts": cs.iso_z(5.0), "text": "to both"}
+    theirs = dict(mine, chat_id="email:~other@x.org:root@y.org")
+    ov.insert(mine)
+    ov.insert(theirs)
+    assert len(ov.entries(mine["chat_id"])) == 1 and len(ov.entries(theirs["chat_id"])) == 1
+    assert cs.ChatOverlay.entry_key(mine) != cs.ChatOverlay.entry_key(theirs)
+    # Within one chat a re-delivery still replaces.
+    ov.insert(dict(mine, text="again"))
+    assert [e["text"] for e in ov.entries(mine["chat_id"])] == ["again"]
+    assert len(ov.entries()) == 2
+    # A merge of the two (not that these two ever merge) keeps one.
+    assert ov.rekey(theirs["chat_id"], mine["chat_id"]) == 1
+    assert [e["text"] for e in ov.entries(mine["chat_id"])] == ["again"]
+    print("PASS test_overlay_keys_an_entry_by_its_chat")
+
+
+def test_an_arrival_that_is_gone_is_not_unread():
+    with tempfile.TemporaryDirectory() as tmp:
+        st = cs.ChatStateStore(tmp)
+        cid = "email:~me@x.org:root@y.org"
+        st.advance_last_read(cid, 100.0)
+        # count_arrival says whether the event counted; mark_unread is its
+        # two-value form.
+        doc, had, counted = st.count_arrival(cid, 200.0, message_id="a@y.org")
+        assert (had, counted) == (False, True) and doc["inbound_seq"] == 1
+        doc, had, counted = st.count_arrival(cid, 200.0, message_id="a@y.org")
+        assert (had, counted) == (True, False) and doc["inbound_seq"] == 1
+        assert st.mark_unread(cid, 210.0, message_id="b@y.org")[1] is True
+        st.mark_unread(cid, 220.0, message_id="c@y.org")
+        assert cs.arrived_since_read(st.get(cid)) == 3
+
+        # The middle one is deleted in a client: not unread, still counted —
+        # so a client's `seen` and every remembered place stay true.
+        doc = st.forget_arrivals(cid, ["b@y.org", "never-seen@y.org", None])
+        assert doc["inbound_gone"] == [2] and doc["inbound_seq"] == 3
+        assert cs.arrived_since_read(doc) == 2 and doc["unread_since"]
+        assert cs.arrival_seq(doc, "c@y.org") == 3
+        # Safe to repeat: nothing moves, nothing is written.
+        before = st.get(cid)
+        assert st.forget_arrivals(cid, ["b@y.org"]) == before and st.get(cid) == before
+        # The rest go too: nothing unread is left, and the watermark of the
+        # first unread message goes with them.
+        doc = st.forget_arrivals(cid, ["a@y.org", "c@y.org"])
+        assert cs.arrived_since_read(doc) == 0 and doc["unread_since"] is None
+        # Announced again after it was gone, a message has come back (the
+        # mail gateway re-announces a mail only then): it counts anew, at a
+        # new place, and the old one stays gone.
+        doc, _had, counted = st.count_arrival(cid, 230.0, message_id="b@y.org")
+        assert counted and doc["inbound_seq"] == 4 and doc["inbound_gone"] == [1, 2, 3]
+        assert cs.arrived_since_read(doc) == 1 and cs.arrival_seq(doc, "b@y.org") == 4
+        assert [mid for mid, _seq in doc["inbound_recent"]].count("b@y.org") == 1
+        # …and its own repeat is a repeat again.
+        assert st.count_arrival(cid, 230.0, message_id="b@y.org")[2] is False
+
+        # A read covers what it covered; a gone arrival behind it changes
+        # nothing, and the undo brings back only what is still there.
+        st.mark_unread(cid, 240.0, message_id="d@y.org")
+        marked, doc, previous = st.mark_read_unless_arrived(cid, None, 5)
+        assert marked and cs.arrived_since_read(doc) == 0
+        st.forget_arrivals(cid, ["d@y.org"])
+        restored, doc = st.restore_last_read(cid, restore=previous, marked=doc["last_read"])
+        assert restored and cs.arrived_since_read(doc) == 1, "b came back; d is gone"
+
+        # No document is made for a chat that has none, and ids a chat never
+        # counted write nothing.
+        st.forget_arrivals("email:~me@x.org:nobody@y.org", ["x@y.org"])
+        assert not st.exists("email:~me@x.org:nobody@y.org")
+        # A chat never read counts nothing by arrival, gone or not.
+        st.mark_unread("email:~me@x.org:new@y.org", 10.0, message_id="n@y.org")
+        assert cs.arrived_since_read(st.forget_arrivals("email:~me@x.org:new@y.org",
+                                                         ["n@y.org"])) == 0
+        # What is stored is read defensively.
+        assert cs.gone_arrivals({"inbound_gone": [3, "x", True, 1, 3, -2, None]}) == [1, 3]
+        assert cs.gone_arrivals(None) == [] and cs.gone_arrivals({"inbound_gone": "no"}) == []
+    print("PASS test_an_arrival_that_is_gone_is_not_unread")
+
+
+def test_merge_keeps_the_arrivals_places_true():
+    """After a merge a place in the count still says read or unread, so a
+    repeated event and a removal find the absorbed chat's messages too."""
+    with tempfile.TemporaryDirectory() as tmp:
+        st = cs.ChatStateStore(tmp)
+        a, b = "email:~me@x.org:a@y.org", "email:~me@x.org:b@y.org"
+        # The survivor: two read, then one unread. The absorbed chat: one
+        # read, two unread — one of which is gone already.
+        for n, ts in ((1, 10.0), (2, 20.0)):
+            st.mark_unread(a, ts, message_id=f"a{n}")
+        st.mark_read(a)
+        st.mark_unread(a, 30.0, message_id="a3")
+        st.mark_unread(b, 11.0, message_id="b1")
+        st.mark_read(b)
+        st.mark_unread(b, 21.0, message_id="b2")
+        st.mark_unread(b, 31.0, message_id="b3")
+        st.forget_arrivals(b, ["b2"])
+        doc, gone = st.merge(b, a)
+        assert gone is not None and doc["inbound_seq"] == 6 and doc["read_inbound"] == 3
+        places = dict(doc["inbound_recent"])
+        assert places == {"a1": 1, "a2": 2, "b1": 3, "a3": 4, "b2": 5, "b3": 6}, places
+        assert [mid for mid, _seq in doc["inbound_recent"]] == ["a1", "a2", "b1", "a3", "b2", "b3"]
+        assert doc["inbound_gone"] == [5]
+        assert cs.arrived_since_read(doc) == 2, "a3 and b3; b2 was gone before the merge"
+        # A repeated event for a message of either chat is a repeat.
+        for mid in ("a3", "b1", "b3"):
+            assert st.count_arrival(a, 40.0, message_id=mid)[2] is False, mid
+        # A removal finds the absorbed chat's message, and a read one's
+        # removal changes nothing.
+        assert cs.arrived_since_read(st.forget_arrivals(a, ["b3"])) == 1
+        assert cs.arrived_since_read(st.forget_arrivals(a, ["b1", "a1"])) == 1
+        assert cs.arrived_since_read(st.forget_arrivals(a, ["a3"])) == 0
+
+        # Neither chat ever read: no mark between them, the places simply
+        # follow on.
+        c, d = "email:~me@x.org:c@y.org", "email:~me@x.org:d@y.org"
+        st.mark_unread(c, 10.0, message_id="c1")
+        st.mark_unread(d, 11.0, message_id="d1")
+        doc, _gone = st.merge(d, c)
+        assert doc["read_inbound"] is None and dict(doc["inbound_recent"]) == {"c1": 1, "d1": 2}
+
+        # A settled block of the absorbed chat is not taken over a survivor
+        # that has none; an open one is, and the survivor's open one stays.
+        e, f = "email:~me@x.org:e@y.org", "email:~me@x.org:f@y.org"
+        st.mark_unread(e, 10.0, message_id="e1")
+        st.set_attention(f, {"state": "done", "done_how": "marked"})
+        assert st.merge(f, e)[0]["attention"] is None
+        st.set_attention(f, {"state": "open", "importance": 2.0})
+        st.set_attention(e, {"state": "done"})
+        assert st.merge(f, e)[0]["attention"] == {"state": "open", "importance": 2.0}
+        st.set_attention(f, {"state": "open", "importance": 5.0})
+        assert st.merge(f, e)[0]["attention"]["importance"] == 2.0
+    print("PASS test_merge_keeps_the_arrivals_places_true")
+
+
+def test_a_merged_chats_id_says_where_it_went():
+    with tempfile.TemporaryDirectory() as tmp:
+        st = cs.ChatStateStore(tmp)
+        a, b, c, d = (f"email:~me@x.org:{k}@y.org" for k in "abcd")
+        assert st.merged_into(a) is None and st.merged_away() == {}
+        st.note_message(a, name="A")
+        st.note_message(b, name="B")
+        st.merge(b, a)
+        st.note_merged(b, a)
+        assert st.merged_into(b) == a and st.merged_into(a) is None
+        assert st.merged_away() == {b: a}
+        # Not a chat document: all() lists chats, and b is none.
+        assert set(st.all()) == {a}
+        # Idempotent, and nothing is noted about a chat and itself.
+        index = (Path(tmp) / "merged" / "into.json").read_text()
+        st.note_merged(b, a)
+        st.note_merged(a, a)
+        st.note_merged("", a)
+        assert (Path(tmp) / "merged" / "into.json").read_text() == index
+        # A chat that never had a document can be noted all the same (its
+        # messages were in the ledger).
+        st.note_merged(d, a)
+        assert st.merged_into(d) == a
+        # The survivor is absorbed in turn: everything folded into it follows.
+        st.note_message(c, name="C")
+        st.merge(a, c)
+        st.note_merged(a, c)
+        assert st.merged_into(b) == c and st.merged_into(d) == c and st.merged_into(a) == c
+        assert st.merged_away() == {a: c, b: c, d: c}
+        # An id that has a document again is a chat again, whatever is noted
+        # — and what was folded into it leads there, not past it.
+        st.note_message(a, name="A again")
+        assert st.merged_into(a) is None and st.merged_into(b) == a
+        assert st.merged_away() == {b: a, d: a}
+        st.delete(a)
+        assert st.merged_away() == {}, "a delete forgets both sides of a merge"
+        # A chat absorbed by the one it once absorbed: no loop, and the
+        # survivor's own note is dropped.
+        st.note_message(a, name="A")
+        st.note_merged(b, a)
+        st.note_message(b, name="B")
+        st.merge(a, b)
+        st.note_merged(a, b)
+        assert st.merged_into(a) == b and st.merged_into(b) is None
+        # Deleting the chat at the end of a chain forgets the whole chain.
+        st.note_merged(d, a)
+        assert st.merged_into(d) == b
+        st.delete(b)
+        assert st.merged_into(d) is None and st.merged_into(a) is None
+        assert not (Path(tmp) / "merged" / "into.json").exists()
+        # A damaged index is no index, and a loop in one ends.
+        path = Path(tmp) / "merged" / "into.json"
+        path.write_text('{"x": {"into": "y"}, "y": {"into": "x"}, "z": "junk", "w": {"into": 5}}')
+        assert st.merged_into("x") == "y" and st.merged_into("z") is None
+        assert st.merged_into("w") is None
+        path.write_text("not json")
+        assert st.merged_into("x") is None and st.merged_away() == {}
+        # Bounded: the newest notes are kept.
+        was, cs.MERGED_MAX = cs.MERGED_MAX, 3
+        try:
+            for n in range(5):
+                st.note_merged(f"email:~me@x.org:old{n}@y.org", c)
+            assert len(st.merged_away()) == 3
+        finally:
+            cs.MERGED_MAX = was
+    print("PASS test_a_merged_chats_id_says_where_it_went")
+
+
 if __name__ == "__main__":
     test_split_and_filename_safety()
     test_account_is_half_the_identity()
@@ -727,4 +1112,11 @@ if __name__ == "__main__":
     test_overlay_merge_dedup_expiry()
     test_iso_z_normalizes()
     test_delete_forgets_the_chat()
+    test_a_mail_chat_keeps_its_subject_and_its_people()
+    test_merge_folds_one_chat_into_another()
+    test_overlay_follows_a_merge_and_a_removal()
+    test_overlay_keys_an_entry_by_its_chat()
+    test_an_arrival_that_is_gone_is_not_unread()
+    test_merge_keeps_the_arrivals_places_true()
+    test_a_merged_chats_id_says_where_it_went()
     print("all chat-state tests passed")

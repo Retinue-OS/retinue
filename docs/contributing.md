@@ -160,11 +160,17 @@ So every image says what it is, on its `/health`:
   rather than guessed at.
 - **`framework`** — a digest of the shared modules *as baked in*, computed at
   runtime by `scripts/build_stamp.py`. It needs nothing from the build
-  pipeline, so it is always there. The retinue container and all three
-  messenger gateways copy the same modules, so **a gateway whose digest
+  pipeline, so it is always there. The retinue container and every channel
+  gateway — Signal, WhatsApp, Telegram, SMS and the mail gateway — copy the
+  same modules (`build_stamp.FRAMEWORK_MODULES`), so **a gateway whose digest
   differs from the dashboard's was not rebuilt** — which the `/gateways` page
   says on the card, in as many words, even while the gateway is connected and
-  otherwise looks well.
+  otherwise looks well. The mail gateway also bakes modules no messenger
+  carries (`email_client.py`, `mail_threads.py`, `mail_trim.py`); those are
+  outside the digest, so a mail gateway stale in them alone shows only by its
+  `sha`. A new gateway image copies every module in `FRAMEWORK_MODULES` and
+  joins the lists `tests/test_build_stamp.py` pins (its Dockerfile, its compose
+  service, the health loop).
 
 To check a deployment: open `/gateways`, or compare by hand —
 
@@ -246,8 +252,10 @@ gateway-spawned sessions run in API-key mode), `CLAUDE_*`, `RETINUE_*` (minus
 `RETINUE_LITELLM_KEY`), `SPARQL_ENDPOINT_*`, `NEWS_*`, `TRIAGE_*`, the
 capability tokens with their service URLs (`EMAIL_BACKEND_*`,
 `CONVERSATION_BACKEND_*`, `NEWS_INGEST_*`, `CHATS_INGEST_*`, `UPDATER_*`), the
-messenger and calendar gateways' client side (`*_GATEWAY_TOKEN`,
-`*_GATEWAY_BASE_URL`, `*_GATEWAY_SEND_URL`, `*_DEFAULT_RECIPIENT`, …).
+messenger, mail and calendar gateways' client side (`*_GATEWAY_TOKEN`,
+`*_GATEWAY_BASE_URL`, `*_GATEWAY_SEND_URL`, `*_DEFAULT_RECIPIENT`, …;
+`MAIL_GATEWAY_*` among them — the mail gateway's own `MAIL_*` settings are
+not, and live on its service only).
 Everything else is dropped — `EMAIL_PASS*`,
 `LITELLM_*`, `OPENROUTER_API_KEY`, `TRAEFIK_BASIC_AUTH_USERS`, `GITHUB_TOKEN`
 (`git` keeps working through the credential helper the entrypoint configures;

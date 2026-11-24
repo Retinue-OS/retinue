@@ -487,7 +487,9 @@ self.addEventListener('fetch', (e) => {
   if (url.pathname === '/conversations' || url.pathname.startsWith('/conversations/')) return;
 
   // The chat API is the live messenger mirror (messages, unread, the shared
-  // draft): a cached copy would show a stale thread. The page shells
+  // draft): a cached copy would show a stale thread. A mail's original and
+  // its framed HTML part (…/original, …/original.html) are under it too and
+  // are served no-store: they pass through as well. The page shells
   // (/chats.html, /chat.html) are separate paths and stay cache-first.
   if (url.pathname === '/chats' || url.pathname.startsWith('/chats/')) return;
 

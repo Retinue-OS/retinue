@@ -8,6 +8,15 @@ path now lands in the chat, not in triage.** Phases 5 and 6 (summaries, forking,
 the polish list) are still the target picture. This supersedes the "one
 dashboard conversation per inbound message" model for messenger channels.
 
+**E-mail has since joined it.** A mail thread is a chat in every sense this
+document defines — the same ledger, list, page, state and companion — and
+only what differs is stated in [mail-chats.md](mail-chats.md): the identity
+(a thread's root `Message-ID`), a name that is a subject, the trimmed bubble
+with its original, and a mailbox behind the chat. Where this document says
+"messenger", read "channel"; where it leaves e-mail out, that document picks
+it up. What the web gateway serves for a mail chat is in
+[dashboard.md](dashboard.md), "Mail threads as chats".
+
 ## Problem
 
 Messenger support today routes every inbound message through triage into
@@ -198,7 +207,9 @@ anyway: arrivals (and own-device echoes) flow through
 `POST /internal/chats/inbound`, and sends flow through the web-gateway itself.
 Each such event also drops an entry into a small in-memory overlay; the chat
 API serves the store's answer plus whatever overlay entries the store has not
-caught up to, deduplicated on `kb:messageId`. Entries expire after a minute or
+caught up to, deduplicated on the chat and `kb:messageId` (an id is unique
+within a conversation, not across them: one mail to two of the user's
+addresses is one id in two chats). Entries expire after a minute or
 so — by then the store holds them — and the overlay is disposable: a restart
 loses nothing but a few seconds of freshness. The message a push announced is
 *by construction* in the view the tap opens, because the same event produced
@@ -254,7 +265,9 @@ persistent volume — high-churn disposable data, the news-store precedent):
   decides whether a message came after the user last dealt with the chat
   (same section). `inbound_recent` holds the message ids of the newest
   arrivals with their place in the count, so that a message is counted once
-  however often its event is delivered;
+  however often its event is delivered; `inbound_gone` holds the places of
+  counted arrivals that are gone from where they came from (a mail deleted
+  in a client), which are no unread messages;
 - `inbound_ahead`, `read_ahead` — the latest stamp an arrival carried from a
   little ahead of the gateway's clock, and how far past `last_read` the
   newest read reaches because of it (same section);
@@ -274,6 +287,12 @@ persistent volume — high-churn disposable data, the news-store precedent):
   which it has folded both rails;
 - `companion` — the companion thread's conversation id, once created;
 - display metadata (resolved name, group flag) cached from the gateway.
+
+Beside the documents sits one small index, `merged/into.json`: which chat ids
+were folded into which chat. Only mail threads merge
+([mail-chats.md](mail-chats.md), "Threading"); the index is what lets an id
+from before a merge be answered with where the chat went, and it forgets a
+chat that is deleted.
 
 Single-writer: only the web-gateway writes chat state (user edits and the
 token-gated agent endpoints both go through it).
@@ -358,7 +377,9 @@ an agent answering on its own must not hide a message the user never saw, so
 `kb:author "agent"` moves nothing, on the rail and in the ledger alike.
 Timestamps are whole seconds and the comparison is strict, so in this view an
 inbound message stamped in the very second of a reply or a mark counts as
-covered by it.
+covered by it. A record that carries `kb:removedAt` — a mail gone from the
+mailbox, a tombstone ([mail-chats.md](mail-chats.md)) — is not counted: it
+keeps its place in the thread and can be neither read nor answered.
 
 *By arrival order:* the number of inbound messages that have landed since the
 newest read. A timestamp says when a message was stamped, and by whose clock
@@ -377,7 +398,11 @@ across a restart) is a repeat. It is answered as before, with the same
 acceptance and the same job handle, and counted no second time; the
 attention model and a ring held for the message are given the place the
 message was counted at. An event that carries no message id cannot be told
-from a new message and is counted.
+from a new message and is counted. An arrival that is gone again — the mail
+gateway says which (`POST /internal/chats/removed`) — stays in the count, so
+that every remembered place and a client's `seen` stay true, and is left out
+of what is unread (`inbound_gone`); announced again, it has come back and is
+a new arrival.
 
 A read covers what has landed when it is *Mark as read* with `{}` or
 `{seen}`, or the dashboard's own send; an own-device echo and a `{ts}` mark
@@ -402,7 +427,9 @@ with that — which is what `read_ahead` is for (*Mark as read*, below).
 carries `unread`, `list_group` (`"unread"` | `"read"` | `"archived"`),
 `last_read` and `inbound_seq`, and the payload carries `counts` — the number
 of chats per group. (`group` on a chat is, as it always was, the boolean
-"this is a group chat".) The chat summary inside `GET /chats/<id>/messages`
+"this is a group chat".) A chat's `last.text` is a preview of its newest
+message, at most 300 characters; the message is read whole from the chat's
+own endpoint. The chat summary inside `GET /chats/<id>/messages`
 carries the same four fields, so an open chat page shows and clears its own
 state from its poll; its `inbound_seq` is read before the page's messages are
 collected, so every arrival it counts is among them. With the store away the
@@ -787,7 +814,11 @@ ledger and `delivered` semantics; the news rail; the daily drain; reply tokens
 and the push CLIs (still the right tool for headless sends and escalations);
 the conversation concept, dashboard, and push machinery for everything that is
 not a messenger chat; e-mail triage in full (pull channel, own flow — it can
-adopt this pattern later, but nothing here depends on it).
+adopt this pattern later, but nothing here depends on it). *It since has:*
+[mail-chats.md](mail-chats.md) mirrors the mailbox into this same ledger and
+shows a mail thread as a chat. Its first phase is a read-only mirror beside
+which e-mail triage keeps running untouched; a later one retires triage for
+mail.
 
 **Converges with:** issue #130 — the message-id plumbing is shared, and the
 chat page is the missing answer to where reactions and quoted replies surface.

@@ -372,7 +372,10 @@ the chat's peer:
   chat's account to that person. If another person held the handle, it moves.
 - **A card already filed** updates its person. A change to a person (name,
   spheres) is copied to every chat whose card points there, and what the
-  attention profile learned under the old name moves with it.
+  attention profile learned under the old name moves with it. A mail thread
+  whose peer the book no longer gives to the card's person shows no card
+  (`docs/dashboard.md`, "A card is about one address"), and is filed like a
+  chat without one: the person on the hidden card is not touched.
 - **VIP** is a switch on the card, and it is the person's. So is the
   **instruction**, a text field beside it, with *Copy from…* for an
   instruction another person already carries.

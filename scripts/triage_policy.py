@@ -179,12 +179,116 @@ def _channel_subject(channel: str) -> str:
 CHAMBERS_DIR = Path(os.environ.get("CHAMBERS_DIR") or "/workspace/chambers")
 
 
+def _messenger_root() -> Path:
+    base = os.environ.get("TRIAGE_MESSENGER_DIR")
+    return Path(base) if base else (CHAMBERS_DIR / "_generated" / "messenger")
+
+
 def email_whitelist_path() -> Path:
-    """Where the e-mail whitelist `.nt` lives (retinue side, indexed by qlever)."""
-    return Path(
-        os.environ.get("TRIAGE_EMAIL_WHITELIST_PATH")
-        or (CHAMBERS_DIR / "_generated" / "triage" / "email-whitelist.nt")
-    )
+    """Where the e-mail policy `.nt` lives: the whitelist and the group flags.
+
+    On the mail gateway's ledger volume, in its ``policy/`` folder beside the
+    one ``messenger_policy_path("email")`` names, because the mail gateway
+    reads the group flags at ingest and mounts no other part of the retinue
+    side (docs/mail-chats.md). qlever indexes it there like every messenger
+    policy. ``TRIAGE_EMAIL_WHITELIST_PATH`` overrides the path, and is how the
+    gateway container, which sees the volume at ``/inbound``, names the same
+    file. The file used to live at :func:`legacy_email_policy_path`;
+    :func:`ensure_email_policy_location` moves it.
+    """
+    override = os.environ.get("TRIAGE_EMAIL_WHITELIST_PATH")
+    if override:
+        return Path(override)
+    return _messenger_root() / "email" / "policy" / "email-policy.nt"
+
+
+def legacy_email_policy_path() -> Path:
+    """Where the e-mail policy lived before the mail gateway had to read it."""
+    return CHAMBERS_DIR / "_generated" / "triage" / "email-whitelist.nt"
+
+
+def ensure_email_policy_location(path: Path | None = None,
+                                 legacy: Path | None = None) -> dict:
+    """Make sure the e-mail policy file exists where it now lives.
+
+    Retinue side only: the gateway never writes policy. Holds the policy lock
+    of the new file (and of the old one, so a writer still on the old path
+    cannot slip a change in between) and then, in this order:
+
+      * the new file exists — nothing to do. If the old one exists too and
+        differs, the new one wins and the old is left alone and reported: it
+        may hold a flag the new one lacks, which only a person can judge, and
+        deleting it would lose that. The same bytes in both is a move that
+        crashed after its write; the old one is then removed.
+      * only the old file exists — its content moves to the new path (one
+        atomic write there; the volumes differ, so it is a copy) and the old
+        file is removed only after the new one is in place: a crash between
+        the two leaves both, which the case above resolves.
+      * neither exists — the new file is created empty, so a reader can tell
+        "no flags" (an empty file) from "not set up yet" (no file); the mail
+        gateway waits on the latter before its first backfill.
+
+    The old path is moved only when ``TRIAGE_EMAIL_WHITELIST_PATH`` is unset:
+    an explicit path is the operator's statement of where the file lives, and
+    the default location is then not this function's to empty. Idempotent.
+    Returns ``{"path", "action": "present" | "moved" | "created",
+    "legacy_left": <old path> | None}``; raises OSError when the new path
+    cannot be written (the caller reports it).
+    """
+    explicit = path is not None or bool(os.environ.get("TRIAGE_EMAIL_WHITELIST_PATH"))
+    path = Path(path) if path is not None else email_whitelist_path()
+    if legacy is not None:
+        old = Path(legacy)
+    elif explicit:
+        old = None
+    else:
+        old = legacy_email_policy_path()
+    if old is not None and old.resolve() == path.resolve():
+        old = None
+    with contextlib.ExitStack() as locks:
+        locks.enter_context(policy_lock(path))
+        if old is not None and old.exists():
+            locks.enter_context(policy_lock(old))
+        if path.exists():
+            left = None
+            if old is not None and old.exists():
+                # The same bytes on both sides is a move that crashed after
+                # its write: finishing it loses nothing.
+                if old.read_bytes() == path.read_bytes():
+                    old.unlink()
+                else:
+                    left = str(old)
+            return {"path": str(path), "action": "present", "legacy_left": left}
+        if old is not None and old.exists():
+            # Bytes, not text: the file moves exactly as it is, whatever it
+            # holds — this is a move, not a rewrite.
+            _atomic_write_bytes(old.read_bytes(), path)
+            old.unlink()
+            return {"path": str(path), "action": "moved", "legacy_left": None}
+        _atomic_write_bytes(b"", path)
+        return {"path": str(path), "action": "created", "legacy_left": None}
+
+
+def _email_policy_read_path() -> Path:
+    """The file a default read of the e-mail policy reads.
+
+    The new location, except while it does not exist yet and the old one
+    still does, before :func:`ensure_email_policy_location` has run: a reader
+    then sees the policy that is in force, never an empty one, and a writer
+    that loads, changes and saves to the new path carries the old flags
+    along instead of stranding them. An explicit path is read as given."""
+    path = email_whitelist_path()
+    if os.environ.get("TRIAGE_EMAIL_WHITELIST_PATH") or path.exists():
+        return path
+    old = legacy_email_policy_path()
+    return old if old.exists() else path
+
+
+def _atomic_write_bytes(data: bytes, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_bytes(data)
+    tmp.replace(path)
 
 
 def messenger_policy_path(channel: str) -> Path:
@@ -298,7 +402,7 @@ def write_if_changed(content: str, path: Path) -> bool:
 
 def load_email_policy(path: Path | None = None) -> EmailPolicy:
     """Return the whole e-mail policy: whitelist pair + one pair per group flag."""
-    path = path or email_whitelist_path()
+    path = path or _email_policy_read_path()
     buckets: dict[str, set[str]] = {
         key: set() for key in
         ("addresses", "wildcards", "news", "news_wildcards",
@@ -696,7 +800,20 @@ def gate_decision(
     return dec
 
 
+def _ensure_before_write() -> None:
+    """Place the e-mail policy file before a retinue-side write of it.
+
+    Outside the lock the write then takes (flock does not nest across two
+    opens, even in one process). Best effort: the write reports its own
+    failure."""
+    try:
+        ensure_email_policy_location()
+    except OSError:
+        pass
+
+
 def _mutate_email(*args, **kwargs) -> None:
+    _ensure_before_write()
     with policy_lock(email_whitelist_path()):
         _mutate_email_locked(*args, **kwargs)
 
@@ -817,6 +934,7 @@ def sync_contacts(vip_handles: dict[str, set[str]], emails: set[str],
                                                                   instructed_contacts=briefed)), path):
                 written.append(str(path))
     want = {e.strip().lower() for e in emails if e.strip()}
+    _ensure_before_write()
     with policy_lock(email_whitelist_path()):
         pol = load_email_policy()
         if set(pol.contact_addresses) != want and save_email_policy(pol._replace(contact_addresses=want)):
@@ -829,6 +947,9 @@ def main(argv: list[str] | None = None) -> int:
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     sub.add_parser("show-email")
+    # Only the placement every command does first (below), and its result on
+    # stdout; the entrypoint runs it before anything slow at start.
+    sub.add_parser("place-email-policy")
     p = sub.add_parser("email-add-address"); p.add_argument("address", nargs="+")
     p = sub.add_parser("email-add-wildcard"); p.add_argument("wildcard", nargs="+")
     p = sub.add_parser("email-remove"); p.add_argument("entry", nargs="+")
@@ -861,7 +982,26 @@ def main(argv: list[str] | None = None) -> int:
 
     args = parser.parse_args(argv)
 
-    if args.cmd == "show-email":
+    # This CLI runs on the retinue side only, so it is one of the places that
+    # puts the e-mail policy file where the mail gateway reads it. A failure
+    # is reported and the command still runs: reading or editing a messenger
+    # policy does not depend on it, and an e-mail edit fails on its own write.
+    try:
+        placed = ensure_email_policy_location()
+    except OSError as exc:
+        print(f"triage_policy: could not place the e-mail policy file: {exc}", file=sys.stderr)
+        placed = None
+    if placed is not None:
+        note = (f"left the old file at {placed['legacy_left']} (it differs; the new "
+                f"one is used)" if placed["legacy_left"] else placed["action"])
+        if args.cmd == "place-email-policy":
+            print(f"{placed['path']}: {note}")
+        elif placed["action"] != "present" or placed["legacy_left"]:
+            print(f"triage_policy: e-mail policy {placed['path']}: {note}", file=sys.stderr)
+
+    if args.cmd == "place-email-policy":
+        return 0 if placed is not None else 1
+    elif args.cmd == "show-email":
         pol = load_email_policy()
         for a in sorted(pol.addresses | pol.contact_addresses | pol.wildcards):
             print(f"whitelist\t{a}")

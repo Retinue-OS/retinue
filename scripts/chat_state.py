@@ -34,7 +34,10 @@ one JSON document per chat under ``CHAT_STATE_DIR``:
   after the user last dealt with the chat (:func:`arrived_since_read`). An
   arrival is counted once: ``inbound_recent`` remembers the message ids of
   the newest ones, so a rail event repeated for the same message is no second
-  arrival (:meth:`ChatStateStore.mark_unread`).
+  arrival (:meth:`ChatStateStore.count_arrival`). And a counted arrival that
+  is gone from where it came from — a mail deleted in a client, a tombstone
+  now — is no unread message: ``inbound_gone`` holds the places in the count
+  of those (:meth:`ChatStateStore.forget_arrivals`).
 - ``inbound_ahead`` / ``read_ahead`` — the latest stamp an arrival carried
   from a little ahead of this clock, and how far past ``last_read`` the
   newest read reaches by it: a message stamped by a clock running fast lies
@@ -54,6 +57,15 @@ one JSON document per chat under ``CHAT_STATE_DIR``:
   was established, and a per-chat ``roster`` of sender handle → display name
   (the ledger stores handles only; names arrive on the notify rail and are
   remembered here).
+- for a mail thread (docs/mail-chats.md) — a chat whose ``name`` is its
+  subject — the people in it: ``participants`` and ``peer``. See
+  :data:`MAIL_CHANNEL`.
+
+Beside the documents the store keeps one small index, ``merged/into.json``:
+which chat ids were folded into which chat
+(:meth:`ChatStateStore.note_merged`), so that an id a client, a link or a
+list from before the merge still holds can be answered with where the chat
+went (:meth:`ChatStateStore.merged_into`).
 
 ``gateway_source`` exists because a slug alone says nothing about how much it
 can be trusted. Stamps written before the gateways reported their account were
@@ -122,6 +134,79 @@ READ_SKEW_SECONDS = 120.0
 # to ride in every state write.
 INBOUND_RECENT_MAX = 64
 
+# How many merges the store remembers (ChatStateStore.note_merged), newest
+# kept. A merge consumes a chat, so there are never more of them than there
+# were chats; the bound only keeps one small file small.
+MERGED_MAX = 2000
+# How many hops merged_into follows: a chat that absorbed others can be
+# absorbed in turn. Far more than any thread's history needs, and the end of
+# a walk through a file somebody damaged.
+_MERGED_HOPS = 16
+
+# The channel whose chats are mail threads (docs/mail-chats.md). Two things
+# about them are this module's business. A mail chat is **named by its
+# subject**, not by its peer, so nothing that names a *person* — a contact
+# card, a profile name passing by — may write its ``name`` (set_contact, and
+# the callers of note_message). And since the name no longer says who the chat
+# is with, the people are kept beside it: ``participants`` and ``peer``.
+MAIL_CHANNEL = "email"
+
+# How many participants a chat document keeps, and how long an address and a
+# display name may be. A thread's participants come from its mails'
+# From/To/Cc — text from outside — so they are bounded here, where they are
+# stored.
+PARTICIPANTS_MAX = 100
+_PARTY_NAME_MAX = 200
+_PARTY_ADDRESS_MAX = 320
+_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f  ]")
+
+
+def named_by_subject(channel: str | None) -> bool:
+    """Whether a channel's chats carry a subject as their name (see
+    :data:`MAIL_CHANNEL`) rather than the name of whoever they are with."""
+    return channel == MAIL_CHANNEL
+
+
+def clean_party(value) -> dict | None:
+    """One participant as a chat document keeps it: ``{"address", "name"}``.
+
+    The address is lower-cased and must read as one — a local part, an ``@``,
+    a domain, no blank and no control character; anything else is no
+    participant. The name is the display name a mail carried, or None: one
+    line, control characters dropped, bounded. Both are text from outside and
+    are only ever shown or compared, never interpreted."""
+    if not isinstance(value, dict):
+        return None
+    address = value.get("address")
+    if not isinstance(address, str):
+        return None
+    address = address.strip().lower()
+    local, at, domain = address.rpartition("@")
+    if (not at or not local or not domain or len(address) > _PARTY_ADDRESS_MAX
+            or _CONTROL_RE.search(address) or any(ch.isspace() for ch in address)):
+        return None
+    name = value.get("name")
+    name = " ".join(_CONTROL_RE.sub(" ", name).split()) if isinstance(name, str) else ""
+    return {"address": address, "name": name[:_PARTY_NAME_MAX] or None}
+
+
+def clean_parties(values) -> list[dict]:
+    """A participants list as stored: cleaned, one entry per address (the
+    first wins, so the order the gateway gave — most recent sender first — is
+    kept), at most :data:`PARTICIPANTS_MAX`."""
+    out: list[dict] = []
+    seen: set[str] = set()
+    for value in values if isinstance(values, list) else []:
+        party = clean_party(value)
+        if party is None or party["address"] in seen:
+            continue
+        seen.add(party["address"])
+        out.append(party)
+        if len(out) >= PARTICIPANTS_MAX:
+            break
+    return out
+
+
 _ISO_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$")
 
 
@@ -158,12 +243,29 @@ def arrived_since_read(doc: dict | None) -> int:
     count by timestamp finds them. The arrival count does, so a caller takes
     the larger of the two (the web gateway's _chats_payload).
 
+    Landed and still there, that is: an arrival that is gone from where it
+    came from (``inbound_gone`` — a mail deleted or moved away in a client)
+    is nothing the user can read or answer, and is not counted.
+
     0 for a chat never read, and for a document from before ``read_inbound``
     existed: with nothing recorded there the timestamps alone decide."""
     covered = (doc or {}).get("read_inbound")
     if covered is None:
         return 0
-    return max(0, int((doc or {}).get("inbound_seq") or 0) - int(covered))
+    covered = int(covered)
+    landed = int((doc or {}).get("inbound_seq") or 0) - covered
+    return max(0, landed - sum(1 for seq in gone_arrivals(doc) if seq > covered))
+
+
+def gone_arrivals(doc: dict | None) -> list[int]:
+    """The places in the chat's arrival count of the counted arrivals that are
+    gone from where they came from (``inbound_gone``), ascending — whatever of
+    the stored value reads as such."""
+    out = set()
+    for seq in (doc or {}).get("inbound_gone") or []:
+        if isinstance(seq, int) and not isinstance(seq, bool) and seq > 0:
+            out.add(seq)
+    return sorted(out)
 
 
 def arrival_seq(doc: dict | None, message_id: str | None) -> int:
@@ -371,6 +473,14 @@ class ChatStateStore:
             "gateway_source": None,
             "roster": {},
             "roster_refreshed": None,
+            # A mail thread's people (see MAIL_CHANNEL): everyone on its
+            # mails' From/To/Cc but the account itself, as ``[{"address",
+            # "name"}]``, and ``peer`` — the one the thread is with: its
+            # latest inbound sender, or the first recipient of a thread the
+            # user started. Both None until the rail (or the name backfill)
+            # has said; an empty list is an answer, None is not knowing.
+            "participants": None,
+            "peer": None,
             # First-unread watermark: set when an inbound lands on a fully-read
             # chat, cleared when the user catches up. Its presence is what
             # classifies the next notification as "reply" rather than "new".
@@ -391,6 +501,12 @@ class ChatStateStore:
             # message a repeat and not a second arrival, also across a
             # restart of the web gateway (see mark_unread, arrival_seq).
             "inbound_recent": [],
+            # The places in the count (``inbound_seq`` values) of counted
+            # arrivals that are gone from where they came from: mails the
+            # gateway turned into tombstones. They stay arrivals — the count
+            # never goes back — and are no longer unread ones
+            # (arrived_since_read, forget_arrivals).
+            "inbound_gone": [],
             # The latest stamp a counted arrival carried from ahead of this
             # clock, no further than READ_SKEW_SECONDS: a sender's clock, or
             # a receiving phone's, running a little fast. The rail takes
@@ -458,6 +574,48 @@ class ChatStateStore:
         tmp.write_text(json.dumps(doc, ensure_ascii=False), encoding="utf-8")
         os.replace(tmp, path)
 
+    def _merged_path(self) -> Path:
+        # A directory of its own: all() reads every *.json beside the chat
+        # documents as one.
+        return self._dir / "merged" / "into.json"
+
+    def _merged_read(self) -> dict[str, dict]:
+        try:
+            data = json.loads(self._merged_path().read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {}
+        if not isinstance(data, dict):
+            return {}
+        return {str(k): v for k, v in data.items()
+                if isinstance(v, dict) and isinstance(v.get("into"), str) and v["into"]}
+
+    def _merged_write(self, index: dict[str, dict]) -> None:
+        path = self._merged_path()
+        if not index:
+            path.unlink(missing_ok=True)
+            return
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(index, ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp, path)
+
+    def _merged_target(self, index: dict[str, dict], chat_id: str) -> str | None:
+        """Where ``chat_id`` went, by ``index`` — the chat at the end of its
+        merges — or None for an id that is a chat (it has a document: a new
+        conversation under an old id outranks the note of a merge) or that
+        nothing was noted for."""
+        seen = {chat_id}
+        current = chat_id
+        for _hop in range(_MERGED_HOPS):
+            if self._path(current).exists():
+                break
+            nxt = (index.get(current) or {}).get("into")
+            if not nxt or nxt in seen:
+                break
+            seen.add(nxt)
+            current = nxt
+        return current if current != chat_id else None
+
     # -- reads ----------------------------------------------------------------
 
     def get(self, chat_id: str) -> dict:
@@ -487,7 +645,53 @@ class ChatStateStore:
                     out[doc["id"]] = doc
         return out
 
+    def merged_into(self, chat_id: str) -> str | None:
+        """The chat this id was folded into (see :meth:`note_merged`), through
+        every later merge of that chat; None for an id that is a chat itself
+        or that was never merged away."""
+        with self._lock:
+            return self._merged_target(self._merged_read(), chat_id)
+
+    def merged_away(self) -> dict[str, str]:
+        """``{absorbed chat id: the chat it is part of now}`` for every merge
+        on record that still stands — one read for a caller that has a whole
+        list to check."""
+        with self._lock:
+            index = self._merged_read()
+            out = {}
+            for chat_id in index:
+                target = self._merged_target(index, chat_id)
+                if target:
+                    out[chat_id] = target
+            return out
+
     # -- writes ---------------------------------------------------------------
+
+    def note_merged(self, absorbed_id: str, survivor_id: str) -> None:
+        """Remember that ``absorbed_id`` is part of ``survivor_id`` now.
+
+        Kept apart from :meth:`merge`, which has nothing to fold where the
+        absorbed chat never had a document — its messages can be in the
+        ledger all the same, and its id in a client's hands. What is noted
+        says where an old id went (:meth:`merged_into`) and nothing else: no
+        state hangs on it, an id that has a document again is a chat again
+        whatever is noted, and :meth:`delete` forgets it with either chat.
+        Idempotent. A survivor that is a chat again after having once been
+        absorbed somewhere loses its own note — it leads nowhere any more."""
+        if not absorbed_id or not survivor_id or absorbed_id == survivor_id:
+            return
+        with self._lock:
+            index = self._merged_read()
+            was = dict(index)
+            if self._path(survivor_id).exists():
+                index.pop(survivor_id, None)
+            if (index.get(absorbed_id) or {}).get("into") != survivor_id:
+                index[absorbed_id] = {"into": survivor_id, "at": iso_z()}
+            if len(index) > MERGED_MAX:
+                newest = sorted(index, key=lambda k: str(index[k].get("at") or ""))[-MERGED_MAX:]
+                index = {k: index[k] for k in newest}
+            if index != was:
+                self._merged_write(index)
 
     def delete(self, chat_id: str) -> dict | None:
         """Forget a chat entirely; returns the document it had, or None.
@@ -495,8 +699,17 @@ class ChatStateStore:
         Not a reset to defaults: the file goes, so ``all()`` no longer lists
         the chat and a later message about the same peer starts from a fresh
         document — the chat-delete contract (see web-gateway's chat delete).
+        The notes of merges that name the chat go with it, on either side.
         """
         with self._lock:
+            # Nothing remembers a deleted chat: neither that it was merged
+            # away, nor which chats were folded into it.
+            index = self._merged_read()
+            kept = {k: v for k, v in index.items()
+                    if k != chat_id and v.get("into") != chat_id
+                    and self._merged_target(index, k) != chat_id}
+            if kept != index:
+                self._merged_write(kept)
             path = self._path(chat_id)
             if not path.exists():
                 return None
@@ -509,14 +722,24 @@ class ChatStateStore:
                      gateway_source: str | None = None,
                      sender: str | None = None,
                      sender_name: str | None = None,
-                     unknown_sender: bool | None = None) -> dict:
+                     unknown_sender: bool | None = None,
+                     participants=None, peer=None) -> dict:
         """Cache display metadata learned from a message event (the rail).
 
         The ledger persists handles, never names — names are remembered here as
         they pass by, so group bubbles can label their senders and a send can
-        route back through the exact gateway account the chat lives on."""
+        route back through the exact gateway account the chat lives on.
+
+        ``participants`` (a list) and ``peer`` are a mail thread's people as
+        its gateway states them (see MAIL_CHANNEL); each replaces what was
+        kept, cleaned (:func:`clean_parties`). None leaves them as they are,
+        and a ``peer`` that does not read as one is not stored."""
         with self._lock:
             doc = self._read(chat_id)
+            if participants is not None:
+                doc["participants"] = clean_parties(participants)
+            if peer is not None:
+                doc["peer"] = clean_party(peer) or doc.get("peer")
             if name:
                 doc["name"] = name
             if group is not None:
@@ -570,6 +793,11 @@ class ChatStateStore:
         profile, the life-store record — is the web-gateway's business; this
         is only what a chat document knows about it.
 
+        A mail thread is the exception to the first half (see MAIL_CHANNEL):
+        its name is its subject and stays that, card or no card — the card
+        says who the thread is *with*, which the document keeps as ``contact``
+        beside the name.
+
         ``unknown_sender`` is deliberately left alone: it is what the rail
         last said about the sender, and the card is the *user's* word about
         the person. A named chat is not screened because a card exists (see
@@ -582,14 +810,17 @@ class ChatStateStore:
         with self._lock:
             doc = self._read(chat_id)
             clean = " ".join(str(name or "").split())
+            titled = named_by_subject(doc["channel"])
             if not clean:
                 # Back to a handle: the name went with the card, and whatever
                 # the channel itself passes by next will name the chat again.
                 doc["contact"] = None
-                doc["name"] = None
+                if not titled:
+                    doc["name"] = None
                 self._write(doc)
                 return doc
-            doc["name"] = clean
+            if not titled:
+                doc["name"] = clean
             doc["contact"] = {
                 "name": clean,
                 "sphere": (str(sphere).strip().lower() or None) if sphere else None,
@@ -600,6 +831,157 @@ class ChatStateStore:
                 doc["contact"].update(person=str(person), chamber=chamber or None, path=path or None)
             self._write(doc)
             return doc
+
+    def merge(self, absorbed_id: str, survivor_id: str) -> tuple[dict, dict | None]:
+        """Fold one chat's state into another's and forget the first; returns
+        ``(survivor, absorbed)`` — the surviving document as it now stands and
+        the absorbed one as it was, or None where there was none to fold.
+
+        For two chats that turned out to be one conversation: mail threads a
+        later mail linked (docs/mail-chats.md, "Threading"). The messages are
+        the gateway's to re-key; this is everything else, and nothing the
+        user did to either chat may be lost in it:
+
+        - the **read mark** is the later of the two, and the arrival counts
+          add up — what had landed unread in either is still unread, by its
+          place in the count (:func:`arrived_since_read`), wherever the other
+          chat's mark falls. That holds for a chat never read as well: the
+          user said "read" about the other one, having seen only that, so
+          every arrival of the unread one stays unread behind the mark it
+          inherits. (Two chats never read have no mark between them, and
+          their timestamps go on deciding.) The arrivals remembered by
+          message id (``inbound_recent``) and those that are gone
+          (``inbound_gone``) come along, renumbered into the one count so
+          that a place in it still says read or unread: what either chat's
+          read covered first, then what had landed since. Where the mark
+          moved, the undo of the survivor's last *Mark as read* is dropped —
+          it names a mark that no longer stands;
+        - the **flags**: starred if either was; muted if either was (the user
+          silenced this conversation, whichever half they did it on), and
+          muting archives, as everywhere; otherwise archived only if both
+          were — the half that was in view keeps the whole in view;
+        - the **draft** stays the survivor's; an absorbed draft moves over
+          only where the survivor has none, under a version later than any
+          either chat has handed out, so a writer holding an old one is
+          refused;
+        - the **companion** stays the survivor's; an absorbed one moves over
+          only where the survivor has none. What becomes of a second
+          companion thread is the caller's business (it holds the
+          conversations) — the absorbed document it gets back names it;
+        - the **attention block** in force is the open one, the survivor's
+          first. A settled block of the absorbed chat is never taken: it
+          was the user's word about that chat's mail, and on a survivor
+          that has none it would speak for mail it was never about. The
+          ``instructed`` block is the survivor's, else the absorbed chat's;
+        - the survivor keeps its own name, people and contact card, and takes
+          the absorbed chat's only where it has none; the participants and
+          the roster are the union.
+
+        One step under the lock, the survivor written before the absorbed
+        file goes: a crash in between leaves both, and a repeat folds again —
+        read mark, flags and people come out the same, the arrival counts
+        higher than the truth by the absorbed chat's, which shows at worst a
+        read chat as unread, never the reverse. Idempotent otherwise: with no
+        absorbed document (a repeat, a chat nothing was ever noted for)
+        nothing is written."""
+        with self._lock:
+            if absorbed_id == survivor_id or not self._path(absorbed_id).exists():
+                return self._read(survivor_id), None
+            gone = self._read(absorbed_id)
+            doc = self._read(survivor_id)
+
+            def covered(d: dict) -> int:
+                # The arrivals a chat's newest read covered: none, for a chat
+                # never read.
+                return int(d.get("read_inbound") or 0)
+
+            mark = max(doc.get("last_read") or "", gone.get("last_read") or "") or None
+            if mark != doc.get("last_read"):
+                doc["read_undo"] = None
+                doc["read_settled"] = None
+            read_before = (doc.get("read_inbound") is not None
+                           or gone.get("read_inbound") is not None)
+
+            # One count out of two, in an order that still means something:
+            # the arrivals the survivor's read covered keep their places,
+            # those the absorbed chat's read covered follow, then the
+            # survivor's unread ones and last the absorbed chat's. A place at
+            # or below the merged ``read_inbound`` is then a read arrival and
+            # one above it an unread one, as in any chat.
+            mine_seq, mine_read = int(doc.get("inbound_seq") or 0), covered(doc)
+            their_seq, their_read = int(gone.get("inbound_seq") or 0), covered(gone)
+
+            def placed(seq: int, theirs: bool) -> int:
+                if theirs:
+                    return seq + (mine_read if seq <= their_read else mine_seq)
+                return seq if seq <= mine_read else seq + their_read
+
+            recent: dict[str, int] = {}
+            for source, theirs in ((gone, True), (doc, False)):
+                for pair in source.get("inbound_recent") or []:
+                    if (isinstance(pair, list) and len(pair) == 2 and pair[0]
+                            and isinstance(pair[1], int)):
+                        recent[str(pair[0])] = placed(pair[1], theirs)
+            doc["inbound_recent"] = [
+                [mid, seq] for mid, seq in sorted(recent.items(), key=lambda kv: kv[1])
+            ][-INBOUND_RECENT_MAX:]
+            doc["inbound_gone"] = sorted(
+                {placed(seq, False) for seq in gone_arrivals(doc)}
+                | {placed(seq, True) for seq in gone_arrivals(gone)})[-INBOUND_RECENT_MAX:]
+
+            doc["read_inbound"] = mine_read + their_read if read_before else None
+            doc["last_read"] = mark
+            for key in ("read_seq", "inbound_seq", "attended_seq"):
+                doc[key] = int(doc.get(key) or 0) + int(gone.get(key) or 0)
+            marks = [m for m in (doc.get("unread_since"), gone.get("unread_since")) if m]
+            doc["unread_since"] = min(marks) if marks else None
+            if doc["unread_since"] and mark and mark >= doc["unread_since"]:
+                doc["unread_since"] = None
+
+            doc["starred"] = bool(doc.get("starred") or gone.get("starred"))
+            doc["muted"] = bool(doc.get("muted") or gone.get("muted"))
+            doc["archived"] = doc["muted"] or bool(doc.get("archived") and gone.get("archived"))
+
+            version = max(int(doc.get("draft_version") or 0),
+                          int(gone.get("draft_version") or 0))
+            if (gone.get("draft") or {}).get("text") and not (doc.get("draft") or {}).get("text"):
+                version += 1
+                doc["draft"] = dict(gone["draft"], version=version)
+                doc["cleared"] = None
+            # Never behind a version the absorbed chat handed out: its clients
+            # are about to be looking at this document.
+            doc["draft_version"] = version
+
+            doc["companion"] = doc.get("companion") or gone.get("companion")
+            mine, theirs = doc.get("attention") or None, gone.get("attention") or None
+            if (theirs and theirs.get("state", "open") == "open"
+                    and (not mine or mine.get("state", "open") != "open")):
+                # The open one is the one still asking for something.
+                doc["attention"] = theirs
+            for key in ("instructed", "name", "peer", "contact"):
+                if not doc.get(key) and gone.get(key):
+                    doc[key] = gone[key]
+            if not doc.get("gateway") and gone.get("gateway"):
+                # Slug and provenance travel as one, as everywhere.
+                doc["gateway"] = gone["gateway"]
+                doc["gateway_source"] = gone.get("gateway_source")
+            if doc.get("unknown_sender") is None:
+                doc["unknown_sender"] = gone.get("unknown_sender")
+            if doc.get("participants") is not None or gone.get("participants") is not None:
+                doc["participants"] = clean_parties(
+                    list(doc.get("participants") or []) + list(gone.get("participants") or []))
+            if doc.get("group") is not None or gone.get("group") is not None:
+                doc["group"] = bool(doc.get("group") or gone.get("group")
+                                    or len(doc.get("participants") or []) > 1)
+            roster = dict(gone.get("roster") or {})
+            roster.update(doc.get("roster") or {})
+            if roster != (doc.get("roster") or {}):
+                doc["roster"] = roster
+                doc["roster_refreshed"] = time.time()
+
+            self._write(doc)
+            self._path(absorbed_id).unlink(missing_ok=True)
+            return doc, gone
 
     def set_attention(self, chat_id: str, block: dict | None, *,
                       attended: int | None = None) -> dict:
@@ -825,7 +1207,15 @@ class ChatStateStore:
     def mark_unread(self, chat_id: str, ts: str | float | None, *,
                     message_id: str | None = None,
                     stamp: str | float | None = None) -> tuple[dict, bool]:
-        """Note one inbound landing unread; returns ``(doc, had_unread)``.
+        """:meth:`count_arrival` for a caller that does not ask whether the
+        event was a repeat: ``(doc, had_unread)``."""
+        return self.count_arrival(chat_id, ts, message_id=message_id, stamp=stamp)[:2]
+
+    def count_arrival(self, chat_id: str, ts: str | float | None, *,
+                      message_id: str | None = None,
+                      stamp: str | float | None = None) -> tuple[dict, bool, bool]:
+        """Note one inbound landing unread; returns ``(doc, had_unread,
+        counted)``.
 
         ``had_unread`` says whether the chat already held unread messages
         *before* this one — the notification-mode split (False = "new",
@@ -841,11 +1231,17 @@ class ChatStateStore:
         never told was taken), and a second event for one message is no
         second arrival. ``message_id`` is what tells: one that is among the
         chat's newest counted arrivals (``inbound_recent``) is a repeat, and
-        nothing is counted or written for it — ``had_unread`` is then
-        simply how the chat stands, and :func:`arrival_seq` gives the place
-        the message was counted at. The record is in the document, so the
-        answer is the same after a restart. An event without an id cannot
-        be told from a new message and is counted.
+        nothing is counted or written for it — ``counted`` is False,
+        ``had_unread`` is then simply how the chat stands, and
+        :func:`arrival_seq` gives the place the message was counted at. The
+        record is in the document, so the answer is the same after a
+        restart. An event without an id cannot be told from a new message
+        and is counted.
+
+        One repeat is an arrival: a message that was gone (its place is in
+        ``inbound_gone`` — :meth:`forget_arrivals`) and is announced again
+        has come back, a mail moved out of the Trash. Its old place stays
+        gone and it is counted anew, like the new message it is to the chat.
 
         ``stamp`` is the message's own stamp where ``ts`` is not it — the
         rail hands on a stamp from ahead of this clock as now. One that lies
@@ -861,8 +1257,11 @@ class ChatStateStore:
             had_unread = bool(doc.get("unread_since"))
             recent = [pair for pair in doc.get("inbound_recent") or []
                       if isinstance(pair, list) and len(pair) == 2]
-            if message_id and any(mid == message_id for mid, _seq in recent):
-                return doc, had_unread
+            if message_id:
+                places = [seq for mid, seq in recent if mid == message_id]
+                if places and places[-1] not in gone_arrivals(doc):
+                    return doc, had_unread, False
+                recent = [pair for pair in recent if pair[0] != message_id]
             if not had_unread:
                 doc["unread_since"] = mark
             doc["inbound_seq"] = int(doc.get("inbound_seq") or 0) + 1
@@ -873,7 +1272,38 @@ class ChatStateStore:
                     and stamp > (doc.get("inbound_ahead") or "")):
                 doc["inbound_ahead"] = stamp
             self._write(doc)
-            return doc, had_unread
+            return doc, had_unread, True
+
+    def forget_arrivals(self, chat_id: str, message_ids) -> dict:
+        """Messages of the chat are gone from where they came from — mails
+        deleted or moved away in a client, tombstones in the ledger now.
+        Those among the counted arrivals stop being unread ones: their
+        places go into ``inbound_gone``, which :func:`arrived_since_read`
+        leaves out. Returns the document.
+
+        By message id, through ``inbound_recent``: an arrival older than
+        that remembers keeps its place, and at worst a chat shows unread
+        until it is marked — never the reverse. The count itself does not
+        move (a client's ``seen``, the attention model's ``attended_seq``
+        and every remembered place stay true), so the call is safe to
+        repeat. Nothing is written for ids the chat never counted, and no
+        document is made for a chat that has none."""
+        wanted = {str(m) for m in message_ids or [] if m}
+        with self._lock:
+            doc = self._read(chat_id)
+            gone = set(gone_arrivals(doc))
+            found = {pair[1] for pair in doc.get("inbound_recent") or []
+                     if isinstance(pair, list) and len(pair) == 2
+                     and str(pair[0]) in wanted and isinstance(pair[1], int)}
+            if found <= gone:
+                return doc
+            doc["inbound_gone"] = sorted(gone | found)[-INBOUND_RECENT_MAX:]
+            if (doc.get("unread_since") and doc.get("read_inbound") is not None
+                    and arrived_since_read(doc) == 0):
+                # The watermark of the first unread message, and none is left.
+                doc["unread_since"] = None
+            self._write(doc)
+            return doc
 
     def archive_unless_arrived(self, chat_id: str) -> tuple[dict, bool]:
         """Archive a chat on its attention timer's behalf — unless a message
@@ -1070,8 +1500,11 @@ class ChatOverlay:
     has not caught up to yet — the message a push notification announced is by
     construction in the view the tap opens, because the same rail event
     produced both. Entries expire after ``ttl`` seconds (by then the store
-    holds them) and are deduplicated on the channel message id, falling back to
-    ``(chat, ts, text)`` when a producer captured no id. Disposable by design:
+    holds them) and are deduplicated on the chat and the channel message id,
+    falling back to ``(chat, ts, text)`` when a producer captured no id. The
+    chat is part of either key: a message id is unique within a conversation,
+    not across them — one mail to two of the user's addresses is one
+    ``Message-ID`` in two chats. Disposable by design:
     a web-gateway restart loses only those seconds of freshness, never a
     message — the ledger is the record.
     """
@@ -1086,7 +1519,7 @@ class ChatOverlay:
     def entry_key(entry: dict) -> tuple:
         mid = entry.get("message_id")
         if mid:
-            return ("id", str(mid))
+            return ("id", entry.get("chat_id"), str(mid))
         return ("txt", entry.get("chat_id"), entry.get("ts"), entry.get("text"))
 
     def insert(self, entry: dict) -> None:
@@ -1111,6 +1544,33 @@ class ChatOverlay:
         """Drop every live entry of one chat (a deleted chat); returns the count."""
         with self._lock:
             doomed = [k for k, e in self._entries.items() if e.get("chat_id") == chat_id]
+            for k in doomed:
+                self._entries.pop(k, None)
+        return len(doomed)
+
+    def rekey(self, old_chat_id: str, new_chat_id: str) -> int:
+        """Move every live entry of one chat to another (two chats that
+        turned out to be one — ChatStateStore.merge); returns the count.
+
+        An entry's dedup key names its chat, so the entries are filed anew;
+        one that already stands under the new chat's key keeps its place."""
+        with self._lock:
+            moving = [(k, e) for k, e in self._entries.items()
+                      if e.get("chat_id") == old_chat_id]
+            for key, entry in moving:
+                self._entries.pop(key, None)
+                entry["chat_id"] = new_chat_id
+                self._entries.setdefault(self.entry_key(entry), entry)
+        return len(moving)
+
+    def forget_messages(self, chat_id: str, message_ids) -> int:
+        """Drop the live entries of one chat that carry one of these message
+        ids (messages gone from where they came from); returns the count."""
+        wanted = {str(m) for m in message_ids or [] if m}
+        with self._lock:
+            doomed = [k for k, e in self._entries.items()
+                      if e.get("chat_id") == chat_id
+                      and str(e.get("message_id") or "") in wanted]
             for k in doomed:
                 self._entries.pop(k, None)
         return len(doomed)

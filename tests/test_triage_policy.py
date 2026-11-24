@@ -644,6 +644,171 @@ def test_instructed_handles():
             del os.environ["TRIAGE_EMAIL_WHITELIST_PATH"]
 
 
+# --------------------------------------------------------------------------- #
+# Where the e-mail policy file lives                                          #
+# --------------------------------------------------------------------------- #
+
+class _PolicyEnv:
+    """A temp chambers tree with the module's paths pointed into it.
+
+    CHAMBERS_DIR is read at import, so the module constant is swapped for the
+    duration; TRIAGE_MESSENGER_DIR and the override are cleared so the
+    defaults are what is tested."""
+
+    def __enter__(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        root = Path(self._tmp.name)
+        self._saved = (tp.CHAMBERS_DIR, {k: os.environ.pop(k, None) for k in
+                                         ("TRIAGE_MESSENGER_DIR", "TRIAGE_EMAIL_WHITELIST_PATH")})
+        tp.CHAMBERS_DIR = root
+        self.new = root / "_generated" / "messenger" / "email" / "policy" / "email-policy.nt"
+        self.old = root / "_generated" / "triage" / "email-whitelist.nt"
+        return self
+
+    def __exit__(self, *exc):
+        tp.CHAMBERS_DIR, env = self._saved
+        for key, value in env.items():
+            if value is not None:
+                os.environ[key] = value
+            else:
+                os.environ.pop(key, None)
+        self._tmp.cleanup()
+
+    def write_old(self, content: str) -> None:
+        self.old.parent.mkdir(parents=True, exist_ok=True)
+        self.old.write_text(content, encoding="utf-8")
+
+
+def _policy_with(**sets) -> str:
+    return tp.render_email_policy(tp.EmailPolicy(frozenset(), frozenset())._replace(**sets))
+
+
+def test_email_policy_lives_beside_the_mail_channel_policy():
+    with _PolicyEnv() as env:
+        assert tp.email_whitelist_path() == env.new
+        # The mail gateway's ledger volume: the same policy/ folder as the
+        # channel's own policy file.
+        assert tp.email_whitelist_path().parent == tp.messenger_policy_path("email").parent
+        os.environ["TRIAGE_MESSENGER_DIR"] = str(env.new.parents[3] / "elsewhere")
+        assert tp.email_whitelist_path() == env.new.parents[3] / "elsewhere" / "email" / \
+            "policy" / "email-policy.nt"
+        os.environ["TRIAGE_EMAIL_WHITELIST_PATH"] = "/inbound/policy/email-policy.nt"
+        assert tp.email_whitelist_path() == Path("/inbound/policy/email-policy.nt")
+
+
+def test_ensure_moves_the_old_file_content_and_all():
+    with _PolicyEnv() as env:
+        content = _policy_with(addresses={"boss@work.com"}, news_wildcards={"*@substack.com"},
+                               ignored={"spam.list.example"})
+        env.write_old(content)
+        # Before the move a default read sees the policy in force, not nothing.
+        assert tp.load_email_policy().addresses == {"boss@work.com"}
+        got = tp.ensure_email_policy_location()
+        assert got == {"path": str(env.new), "action": "moved", "legacy_left": None}, got
+        assert env.new.read_text(encoding="utf-8") == content, "moved byte for byte"
+        assert not env.old.exists()
+        pol = tp.load_email_policy()
+        assert pol.ignored == {"spam.list.example"} and pol.news_wildcards == {"*@substack.com"}
+        # Idempotent.
+        assert tp.ensure_email_policy_location()["action"] == "present"
+        assert env.new.read_text(encoding="utf-8") == content
+
+
+def test_ensure_creates_an_empty_file_when_there_is_none():
+    """An empty file is "no flags"; no file is "not set up yet" — the mail
+    gateway waits on the second before its first backfill."""
+    with _PolicyEnv() as env:
+        got = tp.ensure_email_policy_location()
+        assert got["action"] == "created" and env.new.read_bytes() == b"", got
+        assert tp.load_email_policy() == tp.EmailPolicy(frozenset(), frozenset())
+        assert tp.ensure_email_policy_location()["action"] == "present"
+        assert not env.old.exists(), "nothing is created at the old place"
+
+
+def test_ensure_leaves_a_differing_old_file_and_reports_it():
+    with _PolicyEnv() as env:
+        new = _policy_with(addresses={"new@x.org"})
+        env.new.parent.mkdir(parents=True)
+        env.new.write_text(new, encoding="utf-8")
+        env.write_old(_policy_with(addresses={"old@x.org"}))
+        got = tp.ensure_email_policy_location()
+        assert got == {"path": str(env.new), "action": "present",
+                       "legacy_left": str(env.old)}, got
+        assert env.new.read_text(encoding="utf-8") == new, "the new file wins"
+        assert env.old.exists(), "a flag only the old file holds is never deleted"
+        # The same bytes on both sides is a move that crashed after its write.
+        env.write_old(new)
+        assert tp.ensure_email_policy_location()["legacy_left"] is None
+        assert not env.old.exists()
+
+
+def test_ensure_moves_nothing_for_an_explicit_path():
+    """TRIAGE_EMAIL_WHITELIST_PATH is the operator saying where the file is;
+    the default old location is then not this function's to empty."""
+    with _PolicyEnv() as env:
+        env.write_old(_policy_with(addresses={"old@x.org"}))
+        pinned = env.new.parents[3] / "pinned.nt"
+        os.environ["TRIAGE_EMAIL_WHITELIST_PATH"] = str(pinned)
+        assert tp.ensure_email_policy_location()["action"] == "created"
+        assert pinned.read_bytes() == b"" and env.old.exists()
+        assert tp.load_email_policy() == tp.EmailPolicy(frozenset(), frozenset()), "an explicit path is read as given"
+
+
+def test_a_write_before_the_move_strands_no_flag():
+    """A retinue-side writer that runs before anything placed the file (the
+    whitelist-on-send, the contacts projection) moves it first, so the old
+    flags travel with its change."""
+    with _PolicyEnv() as env:
+        env.write_old(_policy_with(addresses={"boss@work.com"}, quieted={"list.example"}))
+        tp._mutate_email(add_addresses=["peer@partner.com"])
+        pol = tp.load_email_policy(env.new)
+        assert pol.addresses == {"boss@work.com", "peer@partner.com"}, pol
+        assert pol.quieted == {"list.example"}, pol
+        assert not env.old.exists()
+    with _PolicyEnv() as env:
+        env.write_old(_policy_with(addresses={"boss@work.com"}))
+        tp.sync_contacts({}, {"vip@x.org"})
+        pol = tp.load_email_policy(env.new)
+        assert pol.addresses == {"boss@work.com"} and pol.contact_addresses == {"vip@x.org"}, pol
+
+
+def test_the_cli_places_the_file():
+    with _PolicyEnv() as env:
+        env.write_old(_policy_with(addresses={"boss@work.com"}))
+        assert tp.main(["show", "--channel", "signal"]) == 0
+        assert env.new.exists() and not env.old.exists()
+
+
+def test_place_email_policy_says_what_it_did_and_fails_loudly():
+    """The entrypoint's first step: the placement alone, its result on stdout,
+    a non-zero exit when the file cannot be put in place (the entrypoint
+    then warns), never a silent success."""
+    import contextlib
+    import io
+    with _PolicyEnv() as env:
+        content = _policy_with(news_wildcards={"*@substack.com"})
+        env.write_old(content)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            assert tp.main(["place-email-policy"]) == 0
+        assert out.getvalue() == f"{env.new}: moved\n", out.getvalue()
+        assert env.new.read_text(encoding="utf-8") == content and not env.old.exists()
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            assert tp.main(["place-email-policy"]) == 0
+        assert out.getvalue() == f"{env.new}: present\n", out.getvalue()
+    with _PolicyEnv() as env:
+        # A file where the policy folder should be: the new path cannot be
+        # written.
+        blocker = env.new.parents[1]
+        blocker.parent.mkdir(parents=True)
+        blocker.write_text("not a directory", encoding="utf-8")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+            assert tp.main(["place-email-policy"]) == 1
+        assert "could not place the e-mail policy file" in err.getvalue(), err.getvalue()
+
+
 def _run() -> int:
     tests = [v for k, v in sorted(globals().items())
              if k.startswith("test_") and callable(v)]

@@ -1066,7 +1066,7 @@ interruptions into a pile of identical threads.
 | `TRIAGE_SENT_RECONCILE` | `0` switches off the gate's credit-free archiving of INBOX mail the Sent folder proves already answered (`email_client answered` is the authority; move, never delete). | `1` |
 | `TRIAGE_ANSWERED_FOLDER` | Where the gate moves answered mail. | `TRIAGE_NEWS_FOLDER`, i.e. `Archive` |
 | `EMAIL_PROCESSING_INTERVAL` | Seconds; **only** the gap between omnibus proposals and the grace period before the first reminder. **Not** the triage run frequency (that is the scheduler's). | `86400` (24 h) |
-| `TRIAGE_EMAIL_WHITELIST_PATH` | The e-mail whitelist `.nt` (exact addresses + `*@domain` wildcards) the frequent gate reads. Retinue writes it; qlever indexes it. | `<chambers>/_generated/triage/email-whitelist.nt` |
+| `TRIAGE_EMAIL_WHITELIST_PATH` | The e-mail whitelist `.nt` (exact addresses + `*@domain` wildcards) the frequent gate reads. Retinue writes it; qlever indexes it. | `<chambers>/_generated/messenger/email/policy/email-policy.nt` (moved there from `_generated/triage/email-whitelist.nt` on start) |
 | `TRIAGE_MESSENGER_DIR` | Retinue-side root under which each channel's `policy/policy.nt` is written. Mirrors what the gateway reads via `INBOUND_POLICY_PATH`. | `<chambers>/_generated/messenger` |
 | `INBOUND_STORE_DIR` | *(gateway side)* Where a gateway writes its `kb:InboundMessage` `.nt` files and reads/flips the `delivered` flag. | `<gateway-data>/inbound` |
 | `INBOUND_POLICY_PATH` | *(gateway side)* The policy `.nt` the gateway reads raw at classify time — the same file Ara writes. | `<INBOUND_STORE_DIR>/policy/policy.nt` |
