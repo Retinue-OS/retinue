@@ -33,7 +33,8 @@ two processes:
 - **a kept key is dropped only on the mail gateway's own word about it**
   (H): every "not sent" says who said it ("by"), and an answer cut short
   on the wire is "not confirmed", never "not sent";
-- **a repeat clears the draft it repeats** (I), and only that draft;
+- **a repeat clears the draft it repeats** (I), and only that draft — a
+  new attempt under the press's kept key too;
 - a delete on a mailbox without a Trash says why, in the gateway's words.
 
 Standalone:
@@ -741,6 +742,39 @@ def test_a_repeat_clears_the_draft_it_repeats(r: Rig):
     (entry,) = r.entries(key)
     assert r.http("POST", f"/chats/{mail._quote(cid)}/pending/{entry['id']}/dismiss",
                   {})[0] == 200
+
+
+def test_a_new_attempt_under_a_kept_key_leaves_a_draft_typed_since(r: Rig):
+    """Decision I is about the words, not about the gateway's "repeat". A
+    press is not confirmed; its send then fails for certain; the user types
+    something new; "Check again" on the old bubble is a new attempt at the
+    gateway — the mail goes out now, answered as no repeat — and the draft
+    typed meanwhile stays."""
+    r.arrives("j@x.org", day=1)
+    key = KEY.format(49)
+    body = {"text": "First words", "request_key": key}
+    r.draft("j@x.org", body["text"])
+    saved, r.wg.MAIL_SEND_TIMEOUT = r.wg.MAIL_SEND_TIMEOUT, 0.4
+    r.smtp.refuse_login = True
+    try:
+        with _SlowSmtp(r) as smtp:
+            status, out = r.send("j@x.org", body)
+            assert smtp.entered.is_set()
+            assert status == 202 and out["unconfirmed"] is True, out
+            assert r.draft("j@x.org") is None, "the press's own words go"
+            (entry,) = r.entries(key)
+        assert _wait_for(lambda: (r.gw.SENDS.get(entry["id"]) or {}).get("status") == "error")
+        assert r.gw._failed_for_certain(r.gw.SENDS.get(entry["id"]))
+    finally:
+        r.smtp.refuse_login = False
+        r.wg.MAIL_SEND_TIMEOUT = saved
+    r.draft("j@x.org", "typed since")
+    mails = len(r.smtp.mails)
+    status, msg = r.send("j@x.org", body)
+    assert status == 200 and len(r.smtp.mails) == mails + 1, msg
+    assert r.entries(key)[-1]["message_id"] == msg["id"]
+    assert r.draft("j@x.org") == "typed since", "a draft written since the press stays"
+    r.wg._CHAT_STATE.clear_draft(r.chat("j@x.org"))
 
 
 def test_an_allowed_mail_whose_answer_was_lost_is_not_worded_as_failed(r: Rig):

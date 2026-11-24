@@ -4104,7 +4104,10 @@ class Mirror:
         \\Deleted, on a server without MOVE or UIDPLUS — this very delete's,
         or an earlier archive's) is no place of the mail: the search finds
         it all the same, and taken for one it would be moved to the Trash a
-        second time. It is answered as not held. (A real copy that came back
+        second time. It is answered as not held — while the server still
+        flags it ``\\Deleted``. A client may have cleared that flag since
+        (an undelete keeps the UID): then it is the mail's place again, and
+        the caller's ``_locate`` makes it one. (A real copy that came back
         to the folder since has the higher UID, and the search's newest
         match is that one.)"""
         name, folder = self._folders.get(role), self._folder(role)
@@ -4116,7 +4119,10 @@ class Mirror:
         if uid is not None and uid is not UNSURE and self.index.one(
                 "SELECT 1 FROM locations WHERE role = ? AND gen = ? AND uid = ? "
                 "AND skipped = 'moved'", (role, folder["gen"], uid)):
-            return None
+            # (Its flags as the server has them now; one byte of it is read.)
+            fetched = self.mailbox.fetch(name, uid, limit=1)
+            if fetched is None or "\\Deleted" in fetched.flags:
+                return None
         return uid
 
     def delete_chat(self, chat: str) -> dict:

@@ -623,12 +623,13 @@ reverse").
   advanced, no attention item settled, no mailbox read hook. The rail did all
   of that when the mail went out. **A repeat clears the draft it repeats, and
   no other**: the chat's shared draft is cleared exactly when it still holds
-  this press's own words, and a draft written since stays. (A press whose
-  answer never reached the page puts its words back in the box, and the box
-  saves them as the shared draft; the repeat that finds the mail sent takes
-  them out again, or every device and every session would get a sent mail
-  back as the draft, and one more press would send it twice.) `mail-push.py`
-  prints that the answer was a repeat. A new attempt after a certain failure is no repeat.
+  this press's own words, and a draft written since stays — on every answer
+  to a press made before, a new attempt under its kept key included. (A
+  press whose answer never reached the page puts its words back in the box,
+  and the box saves them as the shared draft; the repeat that finds the mail
+  sent takes them out again, or every device and every session would get a
+  sent mail back as the draft, and one more press would send it twice.)
+  `mail-push.py` prints that the answer was a repeat. A new attempt after a certain failure is no repeat.
 - **A failed or partly refused send leaves a trace.** `GET /pending-sends`
   (and `?chat=`) lists entries with status `pending`, `sending` and `error`;
   an `error` entry carries a sentence `error` and `outcome_unknown` (the hand-over

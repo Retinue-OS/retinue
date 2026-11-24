@@ -11078,8 +11078,25 @@ def _clear_pressed_draft(chat_id: str, text: str, repeat: bool) -> None:
     words back into the box, and its autosave made them the shared draft
     again; left there, the next opening, another device or an agent would
     be handed a mail that has gone out, to send a second time. A draft
-    that holds other words was written since, and stays."""
+    that holds other words was written since, and stays.
+
+    A repeat of the press, that is — not only of its mail: ``repeat`` is
+    also a request under a key the chat knew before it (_press_known),
+    whatever the gateway made of it. "Check again" on a send that failed
+    for certain since is a new attempt there, and goes out now; the draft
+    typed in the meantime is no part of it. A first press clears the
+    draft whatever it holds: the box may have been sent before its last
+    words were saved."""
     _CHAT_STATE.clear_draft(chat_id, only_text=text if repeat else None)
+
+
+def _press_known(chat_id: str, request_key: str | None) -> bool:
+    """Whether the chat's copy of the queue holds a send under this press's
+    key — made by an earlier request of the same press, whatever became of
+    it. Asked before the request goes to the gateway, which may note the
+    send anew."""
+    return bool(request_key) and any(p.get("request_key") == request_key
+                                     for p in _chat_pending(_CHAT_STATE.get(chat_id)))
 
 
 def _epoch(value) -> float | None:
@@ -16103,7 +16120,9 @@ class Handler(BaseHTTPRequestHandler):
         (_mail_repeated) returns that Message and brings the chat's copy of
         the queue in line — nothing is marked read, no attention item is
         settled and the mailbox is told nothing; the draft is cleared only
-        where it still holds this press's words (_clear_pressed_draft)."""
+        where it still holds this press's words (_clear_pressed_draft) — as
+        it is on any answer to a press made before (_press_known), a new
+        attempt at the gateway included."""
         # (Every "not sent" this side answers a mail chat by itself says so:
         # "by": "dashboard" — _mail_send. A messenger's answers are as they
         # were.)
@@ -16189,6 +16208,9 @@ class Handler(BaseHTTPRequestHandler):
         asked_at = time.time()
         since = chat_state_mod.iso_z(asked_at - CHAT_UNCONFIRMED_SKEW_SECONDS)
         if mail:
+            # (Whether this press was made before, for the draft: asked now,
+            # before the send is noted anew.)
+            again = _press_known(chat_id, request_key)
             sent = _mail_send(gw, send_payload)
             if sent["outcome"] == "failed":
                 # Nothing left (_mail_send): the gateway's own refusal — the
@@ -16226,7 +16248,7 @@ class Handler(BaseHTTPRequestHandler):
                 # the words back into the box and saved them as the draft
                 # again. A draft that still holds them goes; one written
                 # since stays: _clear_pressed_draft.)
-                _clear_pressed_draft(chat_id, text, repeat)
+                _clear_pressed_draft(chat_id, text, repeat or again)
                 print(f"[web-gateway] chat send to {chat_id} via {slug} waits for "
                       f"approval ({pending['request_id']})"
                       + (" — a repeat, answered from its entry" if repeat else ""), flush=True)
@@ -16235,7 +16257,7 @@ class Handler(BaseHTTPRequestHandler):
             if sent["outcome"] == "unconfirmed":
                 self._answer_unconfirmed_mail(chat_id, slug, gw, sent, text=text,
                                               request_key=request_key, since=since,
-                                              asked_at=asked_at)
+                                              asked_at=asked_at, again=again)
                 return
             result = {"message_id": sent["answer"].get("message_id"),
                       "ts": sent["answer"].get("ts"),
@@ -16259,7 +16281,7 @@ class Handler(BaseHTTPRequestHandler):
             if send_error:
                 self._send_json(502, {"error": send_error})
                 return
-            repeat = False
+            repeat = again = False
         message_id = (str(result.get("message_id") or "").strip() or None)
         unconfirmed = bool(result.get("unconfirmed"))
         # With no confirmation there is no channel instant either, so this is
@@ -16338,7 +16360,9 @@ class Handler(BaseHTTPRequestHandler):
         # on under the account that actually holds it.
         _CHAT_OVERLAY.insert({**entry, "unconfirmed": unconfirmed,
                               "since": since if unconfirmed else None})
-        _CHAT_STATE.clear_draft(chat_id)
+        # (A messenger's draft: cleared, as ever. A mail's: as on a repeat,
+        # where an earlier request of this press was made — _press_known.)
+        _clear_pressed_draft(chat_id, text, again)
         # Written here and now, in answer to everything the chat held —
         # whatever instant the channel stamps the send with.
         _CHAT_STATE.advance_last_read(chat_id, ts, everything=True)
@@ -16360,7 +16384,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def _answer_unconfirmed_mail(self, chat_id: str | None, slug: str, gw: dict,
                                  sent: dict, *, text: str, request_key: str,
-                                 since: str, asked_at: float) -> None:
+                                 since: str, asked_at: float, again: bool = False) -> None:
         """Answer a mail send whose outcome nobody knows (_mail_send):
         **202 {"unconfirmed": true, "request_key", "since", "message_id"?,
         "id"?, "note"?}** — never an error, which would hand the words back
@@ -16383,11 +16407,12 @@ class Handler(BaseHTTPRequestHandler):
         **No message is made of it**: a mail that is not known to have gone
         out is no entry of the thread, and showing one would tell the page
         it had. The draft is cleared — the words are with the gateway; on a
-        repeat (``asked_at`` is when the /send was asked; _mail_repeated)
-        only where it still holds this press's words, and a draft written
-        since stays (_clear_pressed_draft). Nothing is marked read and no
-        reply is noted: the rail does both when the mail goes out, and
-        neither if it never did."""
+        repeat (``asked_at`` is when the /send was asked; _mail_repeated) —
+        or where an earlier request of the press was made (``again``:
+        _press_known) — only where it still holds this press's words, and a
+        draft written since stays (_clear_pressed_draft). Nothing is marked
+        read and no reply is noted: the rail does both when the mail goes
+        out, and neither if it never did."""
         message_id = sent.get("message_id")
         body = {"unconfirmed": True, "request_key": request_key, "since": since}
         if sent.get("note"):
@@ -16411,7 +16436,7 @@ class Handler(BaseHTTPRequestHandler):
                 _CHAT_STATE.add_pending(chat_id, pending)
                 if isinstance(mine.get("message_id"), str):
                     message_id = message_id or mine["message_id"]
-            _clear_pressed_draft(chat_id, text, repeat)
+            _clear_pressed_draft(chat_id, text, repeat or again)
             _chats_cache_invalidate()
             body["id"] = chat_id
         if message_id:

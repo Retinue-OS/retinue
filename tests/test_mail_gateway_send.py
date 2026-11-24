@@ -2553,6 +2553,29 @@ def test_one_message_in_two_folders_is_read_archived_and_deleted_as_one():
         assert t.records(gw) == [] and mirror.thread("z@x.org") is None
     finally:
         done(w)
+    # …but a leftover a client undeleted since (the same UID, no \Deleted
+    # any more) is the mail's place again: found there and moved to the
+    # Trash, not called absent and erased while it sits live in the INBOX.
+    w = world()
+    try:
+        gw, box, mirror = w.gw, w.box, w.mirror
+        box.can_expunge = False
+        box.put("INBOX", t.msg("u@x.org", day=1))
+        mirror.poll()
+        assert mirror.archive("u@x.org")["moved"] == 1
+        leftover = box.boxes["INBOX"]["mails"][box.uid_of("INBOX", "u@x.org")]
+        leftover["flags"] = leftover["flags"] - {"\\Deleted"}
+        box.remove("Archive", box.uid_of("Archive", "u@x.org"))
+        box.writes.clear()
+        result = mirror.delete_chat("u@x.org")
+        assert result["errors"] == 0 and result["trashed"] == 1, result
+        assert held_in(box, "Trash") == ["u@x.org"]
+        assert "\\Deleted" in flags(box, "INBOX", "u@x.org")
+        assert [write for write in box.writes if write[0] == "move"] == [
+            ("move", "Archive", (1,), "Trash"), ("move", "INBOX", (1,), "Trash")]
+        assert t.records(gw) == [] and mirror.thread("u@x.org") is None
+    finally:
+        done(w)
     print("ok: one message in two folders is flagged, archived and deleted as the one mail "
           "it is")
 
