@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="dark">
+  <meta name="theme-color" content="#0b0d12">
+  <title>Routine timer</title>
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="icon" href="icon.svg">
+  <link rel="stylesheet" href="app.css">
+  <!-- Retinue's client: present when Retinue serves the app, absent (a
+       harmless 404) when the app runs anywhere else. -->
+  <script src="/apps/retinue.js"></script>
+  <script type="module" src="app.js"></script>
+</head>
+<body>
+  <main>
+    <header>
+      <h1 id="title">Routine</h1>
+      <p id="host" class="muted"></p>
+    </header>
+    <section class="card">
+      <p id="step" class="step">Ready when you are.</p>
+      <p id="clock" class="clock">–</p>
+      <div class="row">
+        <button id="start" type="button">Start</button>
+        <button id="stop" type="button" disabled>Stop</button>
+      </div>
+    </section>
+    <section class="card">
+      <h2>Daily reminder</h2>
+      <p id="reminder-note" class="muted"></p>
+      <div class="row">
+        <input id="reminder-at" type="time" value="07:30" aria-label="Reminder time">
+        <button id="reminder-set" type="button">Set</button>
+        <button id="reminder-clear" type="button">Clear</button>
+      </div>
+      <div class="row">
+        <button id="skip-today" type="button">Not today</button>
+      </div>
+    </section>
+    <section class="card">
+      <h2>Sessions</h2>
+      <ul id="log"></ul>
+    </section>
+  </main>
+</body>
+</html>

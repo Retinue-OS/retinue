@@ -572,6 +572,8 @@ def subject_iri(item: dict) -> str:
         return f"urn:retinue:thread:{item['source_id']}"
     if kind == "chat":
         return "urn:retinue:chat:" + urllib.parse.quote(str(item["source_id"]), safe=":~+@=.-_")
+    if kind == "reminder":
+        return "urn:retinue:reminder:" + urllib.parse.quote(str(item["source_id"]), safe=":~+@=.-_")
     return str(item["source_id"])
 
 
