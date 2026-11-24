@@ -746,6 +746,37 @@ case("the same reply, not known to be bulk mail: two delimiters, both stay",
      keeps=("Ann Example\nExample Ltd", "dev+unsubscribe@googlegroups.com"),
      drops=("> Hi all",), state="wanting")
 
+# A post that is an attachment and the sender's name: the signature is all
+# the text the mail has. Cut with the footer, it left nothing — and the answer
+# to nothing is the mail as it came, list footer and all.
+_SIGNED_ONLY = "-- \nAnn Example\nExample Ltd\n"
+
+case("a post to a list that is its sender's signature: the footer goes, the "
+     "signature is the mail",
+     subject="[dev] minutes attached", bulk=True,
+     plain=_SIGNED_ONLY + "\n" + _GROUP_FOOTER % "-- ",
+     text="--\nAnn Example\nExample Ltd", state="wanting", removed=("footer",))
+
+case("the same post in HTML",
+     subject="[dev] minutes attached", bulk=True,
+     html="-- <br>Ann Example<br>Example Ltd<br><p></p>\n\n"
+          + (_GROUP_FOOTER % "-- ").replace("\n", "<br />\n"),
+     text="--\nAnn Example\nExample Ltd", state="wanting", removed=("footer",))
+
+case("a mail that is a signature and nothing else keeps it",
+     plain=_SIGNED_ONLY, text="--\nAnn Example\nExample Ltd", state="wanting")
+
+case("a reply that is a signature above the quote keeps it",
+     reply=True, plain=_SIGNED_ONLY + "\n" + ATTRIBUTION + "\n> Hi Ann,\n> see you.\n",
+     text="--\nAnn Example\nExample Ltd", state="wanting", removed=("quote",))
+
+case("a signature alone above a forwarded message is an intro, and goes",
+     subject="Fwd: Quarterly numbers",
+     plain=_SIGNED_ONLY + "\n---------- Forwarded message ---------\n" + _FORWARDED,
+     keeps=("---------- Forwarded message ---------\nFrom: ",
+            "the numbers are attached.\n\nAnn"),
+     drops=("Example Ltd",), state="deterministic", removed=("signature",))
+
 case("a sign-off above an unsubscribe line is not taken for its delimiter",
      bulk=True,
      plain="The new price list is attached.\n\nBest,\n--Bob\n"
@@ -1724,6 +1755,12 @@ def check_case(c):
     again = mt.trim(result.text, None)
     assert again.text == result.text, "%s is not idempotent\n--- first ---\n%s\n--- second ---\n%s" % (
         where, result.text, again.text)
+    # … and with the same evidence beside it, as a mirror that trims a mail
+    # twice would: what the first trim kept is no footer to the second.
+    again = mt.trim(result.text, None, subject=c["subject"],
+                    is_reply=c["is_reply"], bulk=c["bulk"])
+    assert again.text == result.text, "%s is not idempotent with its evidence\n--- first ---\n%s\n--- second ---\n%s" % (
+        where, result.text, again.text)
 
     # Nothing invented: a plain mail's result is made of that mail's lines.
     if c["plain"] and c["plain"].strip():
@@ -2154,7 +2191,8 @@ def test_never_raises_and_stays_fast():
 class _unbounded:
     """The trim with no bound on the size of what it works on."""
 
-    _NAMES = ("MAX_SOURCE_LINES", "MAX_SOURCE_CHARS", "MAX_HTML_CHARS")
+    _NAMES = ("MAX_SOURCE_LINES", "MAX_SOURCE_CHARS", "MAX_READ_LINES",
+              "MAX_READ_CHARS", "MAX_HTML_CHARS")
 
     def __enter__(self):
         self._saved = [getattr(mt, name) for name in self._NAMES]
@@ -2294,13 +2332,13 @@ def _check_cost_grows_with_size():
         return time.perf_counter() - started
 
     def check(name, make, run):
-        large = cost(run, make(20000))
-        if large < 1.5:
-            return      # (the inputs that were quadratic took a minute here)
+        large = cost(run, make(12000))
+        if large < 0.55:
+            return      # (the inputs that were quadratic took 20 seconds here)
         # Slow, then, but in proportion? Linear is 4x; quadratic 16x.
-        small = cost(run, make(5000))
+        small = cost(run, make(3000))
         assert large < 9 * small, (
-            "%s: %.2fs for 5000, %.2fs for 20000" % (name, small, large))
+            "%s: %.2fs for 3000, %.2fs for 12000" % (name, small, large))
 
     for name, make in shapes.items():
         check(name, make, lambda text: mt.trim(text, None))
@@ -2316,6 +2354,42 @@ def _check_cost_grows_with_size():
         check(name + " (sanitize)", make, lambda text: mt.sanitize_html(text, cids))
     print("PASS cost: linear on %d hostile shapes" % (
         3 * len(shapes) + 4 * len(markup)))
+
+
+def test_a_separator_line_is_read_by_hand():
+    """"----- Some words -----" was a pattern, and the pattern read the
+    dashes of a line once for every length its words could have — the
+    slowest line a mail could be made of, fifty thousand times a reading.
+    What reads it now answers as the pattern did, line for line."""
+    import random
+    pattern = re.compile(r"^[-_=]{3,}\s*([^\W_].{1,60}?)\s*[-_=]{3,}$")
+    for line, words in (("-----Original Message-----", "Original Message"),
+                        ("---------- Forwarded message ---------", "Forwarded message"),
+                        ("=== Weitergeleitete Nachricht ===", "Weitergeleitete Nachricht"),
+                        ("___ab___", "ab"), ("---a---", None), ("--- x ---", "x "),
+                        ("-- Original Message --", None), ("--- Original Message", None),
+                        ("---a" + "-" * 58 + "!", None), ("--------", None), ("", None)):
+        assert mt._dashed(line) == words, (line, mt._dashed(line))
+    rng = random.Random(20250303)
+    letters = ("-", "-", "_", "=", " ", " ", "\t", "\xa0", "a", "b", "Z", "9", "é", "中",
+               "½", ".", "!", "*", ":", "​", "\x1c")
+    for n in range(20000):
+        # Around every edge of it: three dashes, two characters, sixty-one.
+        body = "".join(rng.choice(letters) for _ in range(
+            rng.choice((0, 1, 2, 3, 5, 9, 58, 59, 60, 61, 62, 63, 70))))
+        line = (rng.choice("-_=") * rng.randint(0, 5) + " " * rng.randint(0, 2) + body
+                + " " * rng.randint(0, 2) + rng.choice("-_=") * rng.randint(0, 5)).strip()
+        match = pattern.match(line)
+        assert mt._dashed(line) == (match.group(1) if match else None), (line, mt._dashed(line))
+    # … and reads a line once, however long it is.
+    started = time.perf_counter()
+    for line, words in (("---a" + "-" * 4_000_000 + "!", None), ("-" * 4_000_000, None),
+                        ("---a" + " " * 4_000_000 + "---", "a "),
+                        ("---" + "a" * 4_000_000 + "---", None)):
+        assert mt._dashed(line) == words, line[:20]
+    elapsed = time.perf_counter() - started
+    assert elapsed < 2, "%.1fs" % elapsed
+    print("PASS separator lines: read by hand as the pattern read them")
 
 
 # A tail that changes in every pass: a pass cuts the last "-- " with the
@@ -2345,26 +2419,197 @@ def test_cost_at_a_megabyte():
         for evidence in ({}, {"subject": "Re: x", "is_reply": True}):
             result = timed("marker elements", lambda: mt.trim("hello", markers, **evidence))
             assert result.text == "hello", (evidence, result.text[:80])
-    # … and a call as it is made, which is given what the bounds allow.
-    unsettling = "a:\n" * 200000 + _UNSETTLING
-    timed("a tail that never settles", lambda: mt.trim(unsettling, None))
-    timed("a tail that never settles, HTML-only", lambda: mt.trim(
-        None, "<pre>%s</pre>" % unsettling.replace(">", "&gt;")))
-    timed("25 MB of lines", lambda: mt.trim(
-        unsettling * 40, None, subject="Re: x", is_reply=True, bulk=True))
+    # … and a call as it is made, which is given what the bounds allow: as
+    # many lines as a source may have, every one of them to be read closely,
+    # above a tail that never settles. A reading reads what it may of them
+    # and gives up; the answer is the mail as it came.
+    unsettling = "a:\n" * (mt.MAX_SOURCE_LINES - 400) + _UNSETTLING
+    assert not mt._oversize(mt._as_it_came(unsettling))
+    reply = {"subject": "Re: x", "is_reply": True, "bulk": True}
+    result = timed("a tail that never settles", lambda: mt.trim(unsettling, None, **reply))
+    assert result.text == _normal(unsettling) and result.state == "wanting", result.text[-80:]
+    # The same under as many quoted lines as fit above it, which are skipped.
+    # (Given up on as well — and then read as a later trim would read it:
+    # with no blank on its delimiters, the tail is no signature that could
+    # go, the text settles, and the quotes above it are gone.)
+    quoted = "> q\n" * (mt.MAX_SOURCE_LINES - mt.MAX_READ_LINES // 2)
+    mail = quoted + "a:\n" * (mt.MAX_READ_LINES // 2 - 400) + _UNSETTLING
+    assert not mt._oversize(mt._as_it_came(mail))
+    result = timed("a tail that never settles, under quotes", lambda: mt.trim(mail, None, **reply))
+    assert result.text == _normal(mail[len(quoted):]) and result.state == "wanting", result.text[-80:]
+    assert result.removed["quote"] == len(quoted), result.removed
+    # … as the only text of an HTML part, of which a megabyte is read …
+    result = timed("a tail that never settles, HTML-only", lambda: mt.trim(
+        None, "<pre>%s</pre>" % unsettling.replace(">", "&gt;"), **reply))
+    assert result.text.startswith("a:\na:\n") and result.state == "wanting", result.text[:40]
+    # … and beyond what a source may be, where nothing is read at all.
+    timed("25 MB of lines", lambda: mt.trim(unsettling * 40, None, **reply))
+    # (What every answer has done to it is done to these too. A part that
+    # is all marks around one line: they are taken out of it in a fraction of
+    # the time it takes to ask a pattern about each — which, of the fifty
+    # megabytes a mail may be, was most of ten seconds.)
+    marks = "\x01" * 6_000_000 + "\nHello.\n" + "\x02" * 10_000
+    started = time.perf_counter()
+    re.sub("[\x01\x02]", "", marks)
+    asked = time.perf_counter() - started
+    started = time.perf_counter()
+    result = mt.trim(marks, None, **reply)
+    elapsed = time.perf_counter() - started
+    assert result.text == "Hello." and result.state == "deterministic", result.text[:80]
+    assert elapsed < asked / 2, "6 MB of marks: %.2fs, a pattern %.2fs" % (elapsed, asked)
     assert timed("marker elements", lambda: mt.trim("hello", markers)).text == "hello"
     print("PASS cost: a megabyte of the worst in seconds")
+
+
+def test_a_long_mail_is_trimmed_to_its_own_text():
+    """Never cut what the author wrote, and bounded cost: both at once. The
+    bounds are on what a mail can cost, not on how long it may be — a short
+    reply above megabytes of thread, a log of fifteen thousand lines sent in
+    answer, a digest are ordinary mail, and each comes out as its own text.
+    (With the size of a source tested before any work, each of these got no
+    trim at all and its whole quoted history was the bubble.)"""
+    def timed(name, run):
+        started = time.perf_counter()
+        result = run()
+        elapsed = time.perf_counter() - started
+        assert elapsed < 10, "%s: %.1fs" % (name, elapsed)
+        assert mt.trim(result.text, None).text == result.text, name
+        return result
+
+    def words(n, seed=0):
+        return ["line %d of %d: lorem ipsum dolor sit amet, consectetur "
+                "adipiscing elit" % (i, seed) for i in range(n)]
+
+    attribution = "On Mon, Mar 3, 2025 at 2:02 PM Bob Example <bob@example.net> wrote:"
+    reply = {"subject": "Re: x", "is_reply": True}
+    # A thread as clients nest it, four megabytes of it: 12,500 lines of it
+    # are what the first of these mails had.
+    thread, level = [], 1
+    for n, line in enumerate(words(57000)):
+        if n % 40 == 39:
+            line, level = "On Tue, Mar 4, 2025 at 9:07 AM %s wrote:" % ANN, level % 9 + 1
+        thread.append(">" * level + " " + line)
+    thread = "\n".join(thread)
+    assert len(thread) > 4_000_000 and thread.count("\n") > 50_000
+    for name, mail, want in (
+            ("a reply above 12,500 quoted lines",
+             "Agreed, go ahead.\n\n" + attribution + "\n" + "\n".join(thread.split("\n")[:12500]),
+             "Agreed, go ahead."),
+            ("a reply above a thread of 4 MB",
+             "Agreed, go ahead.\n\n" + attribution + "\n" + thread, "Agreed, go ahead."),
+            ("a reply under it", attribution + "\n" + thread + "\n\nAgreed, go ahead.\n\nAnn\n",
+             "Agreed, go ahead.\n\nAnn"),
+            ("a reply between its halves",
+             attribution + "\n" + thread[:2_000_000].rsplit("\n", 1)[0]
+             + "\n\nAgreed, go ahead.\n\n" + thread[2_000_000:].split("\n", 1)[1],
+             "Agreed, go ahead.")):
+        result = timed(name, lambda: mt.trim(mail, None, **reply))
+        assert result == (want, "deterministic", {
+            "quote": result.removed["quote"], "signature": 0, "footer": 0,
+            "pixels": 0}), (name, result.text[:200], result.state)
+        assert result.removed["quote"] >= len(mail) - len(want) - 4, name
+    # (Outlook's way, with no ">" on any line of the 4 MB.)
+    history = ("-----Original Message-----\nFrom: %s\nSent: Monday, March 3, 2025 "
+               "2:02 PM\nTo: %s\nSubject: RE: x\n\n" % (BOB, ANN)) + "\n".join(words(57000))
+    result = timed("a reply above 4 MB of Outlook's history",
+                   lambda: mt.trim("Agreed, go ahead.\n\n" + history, None, **reply))
+    assert result.text == "Agreed, go ahead." and result.state == "deterministic", result.text[:200]
+    # A log sent in answer: fifteen thousand lines of the author's own, the
+    # sign-off, the signature, and the mail it answers. All of the log
+    # stays, and only it.
+    log = "\n".join("2025-03-03 14:%02d:%02d,%03d INFO  [worker-%d] request %06x done"
+                    % (n // 60 % 60, n % 60, n % 1000, n % 8, n * 7919 % 0xFFFFFF)
+                    for n in range(15000))
+    own = "Here is the log you asked for:\n\n" + log + "\n\nCheers\nAnn"
+    quoted = "\n".join("> " + line for line in words(40))
+    for name, mail in (("a log in a reply", own + "\n\n" + attribution + "\n" + quoted + "\n"),
+                       ("a log in a signed reply", own + "\n\n-- \nAnn Example\nExample Ltd\n\n"
+                        + attribution + "\n" + quoted + "\n")):
+        result = timed(name, lambda: mt.trim(mail, None, **reply))
+        assert result.text == own and result.state == "wanting", (name, result.text[-200:])
+        assert result.removed["quote"] > 2000, (name, result.removed)
+    # A digest of a megabyte, in plain text: its footer goes.
+    digest = "ACME Weekly\n\n" + "\n\n".join(
+        "\n".join(words(4 + n % 5, n)) for n in range(2400))
+    footer = ("\n\nYou are receiving this because you subscribed to ACME Weekly.\n"
+              "Unsubscribe: https://news.example.com/u/abc123\n\nACME Inc, 1 Example Road\n")
+    assert len(digest) > 1_000_000 and digest.count("\n") > 16_000
+    result = timed("a digest", lambda: mt.trim(digest + footer, None, bulk=True))
+    assert result.text == digest and result.removed["footer"], result.text[-200:]
+    # An HTML part is no different. The log in a <pre>, in a reply: the log,
+    # and not the mail it answers …
+    html = ("<html><body><p>Here is the log you asked for:</p><pre>%s</pre><p>Cheers<br>Ann"
+            "</p><blockquote type=cite>%s</blockquote></body></html>" % (log, "<p>earlier</p>" * 40))
+    result = timed("a log in an HTML reply", lambda: mt.trim(None, html, **reply))
+    assert result.text == own and result.removed["quote"], result.text[-200:]
+    # … a newsletter of nearly a megabyte of markup: its footer goes …
+    story = ('<tr><td style="padding:10px 20px;font-family:Arial,Helvetica,sans-serif;'
+             'font-size:14px;line-height:20px;color:#333333" align="left" valign="top">'
+             '<a href="https://news.example.com/a/%d?utm_source=nl&utm_medium=email" '
+             'style="color:#0055aa;text-decoration:none">Story %d</a><br>The teaser of '
+             'story %d, which runs a little longer.</td></tr>\n')
+    html = ("<html><head><style>.x{color:red}</style></head><body><p>ACME Weekly</p><table>"
+            + "".join(story % (n, n, n) for n in range(2800)) + "</table><p>Kind regards<br>"
+            "The ACME team</p><p>You are receiving this because you subscribed. <a href="
+            '"https://news.example.com/u/abc123">Unsubscribe</a></p></body></html>')
+    assert 900_000 < len(html) < mt.MAX_HTML_CHARS
+    result = timed("a newsletter in HTML", lambda: mt.trim(None, html, bulk=True))
+    assert result.text.startswith("ACME Weekly\n\nStory 0 (https://news.example.com/a/0?"), result.text[:80]
+    assert result.text.endswith("which runs a little longer.\n\nKind regards\nThe ACME team"), result.text[-200:]
+    assert result.removed["footer"] and result.text.count("\n") > 5000, result.removed
+    # … and a screenshot written into the part, a megabyte of it between
+    # two paragraphs, is no markup to read: the question under it is asked.
+    image = '<img alt="screenshot" src="data:image/png;base64,%s">' % ("iVBORw0KGgo" * 100_000)
+    asks = "<p>Can you call me before noon? The number is 555 0100.</p>"
+    html = ("<html><body><p>Hi Ann,</p><p>this is what I see:</p>%s%s<p>Bob</p><blockquote "
+            "type=cite><p>earlier</p></blockquote></body></html>" % (image, asks))
+    assert len(html) > mt.MAX_HTML_CHARS
+    result = timed("a screenshot in an HTML reply", lambda: mt.trim(None, html, **reply))
+    assert result.text == ("Hi Ann,\n\nthis is what I see:\n\n[screenshot]\n\nCan you call me "
+                           "before noon? The number is 555 0100.\n\nBob"), result.text[:200]
+    assert result.state == "wanting" and result.removed["quote"], result
+    # (With the image first, beside a plain part that is a stub, the HTML
+    # part is the mail — as it is when it is short.)
+    html = "<html><body>%s<p>Hi Ann,</p>%s<p>Bob</p></body></html>" % (
+        image, asks.replace("</p>", " And once more, at some length." * 40 + "</p>"))
+    result = timed("a screenshot beside a stub", lambda: mt.trim(
+        "Please view this message in an HTML capable mail client.", html))
+    assert result.text.startswith("[screenshot]\n\nHi Ann,\n\nCan you call me"), result.text[:80]
+    assert result.text.endswith("at some length.\n\nBob") and result.state == "wanting", result.text[-80:]
+    # (That it stands in a tag is read as a browser reads it, once: a
+    # megabyte of tags before it is not read again for each candidate.)
+    html = "<html><body>%s%s%s</body></html>" % (
+        '<b title="x>y">x</b>' * 45_000, image * 3, asks)
+    result = timed("a screenshot under a megabyte of tags", lambda: mt.trim(None, html))
+    assert result.text.endswith("[screenshot]" * 3 + "\n\nCan you call me before noon? "
+                                "The number is 555 0100."), result.text[-200:]
+    # Markup that could be text is read to its bound, wherever that falls: of
+    # a log too long for it, in one <pre>, the first megabyte — not none.
+    html = ("<html><body><p>Nightly run, all green. Details:</p><pre>%s</pre><p>Regards, CI"
+            "</p></body></html>" % (log + "\n" + log))
+    result = timed("a log in HTML, longer than is read", lambda: mt.trim(None, html))
+    assert result.text.startswith("Nightly run, all green. Details:\n\n" + log[:5000]), result.text[:80]
+    assert result.text.endswith("\n\n" + mt.CUT_MARK) and len(result.text) > 0.99 * mt.MAX_HTML_CHARS
+    assert result.state == "wanting", result.state
+    # What is the author's own beyond what a reading reads is not trimmed,
+    # and is all there: twice the log is more than two passes may read.
+    twice = own.replace(log, log + "\n" + log) + "\n\n" + attribution + "\n" + quoted + "\n"
+    assert twice.count("\n") > mt.MAX_READ_LINES // 2
+    result = timed("a log of 30,000 lines", lambda: mt.trim(twice, None, **reply))
+    assert result.text == _normal(twice) and result.state == "wanting", result.text[-200:]
+    print("PASS a long mail: megabytes of thread, a log, a digest — each trimmed to its own text")
 
 
 def test_what_one_mail_may_cost_is_bounded():
     """Linear is not enough when the factor is the mail's to choose: a tail
     of a kilobyte that changes in every pass made the whole pipeline run
     over the whole mail 21 times, and 41 times over an HTML-only one. So
-    what a call works on is bounded — in passes, in the size of a source, in
-    the markup it parses — and what is beyond a bound is answered as it
-    came, never looked at line by line."""
-    assert (mt.MAX_SOURCE_LINES, mt.MAX_SOURCE_CHARS, mt.MAX_HTML_CHARS,
-            mt._MAX_PASSES) == (10_000, 500_000, 1_000_000, 4)
+    what a call works on is bounded — in passes, in what a reading reads
+    closely, in the size of a source, in the markup it parses — and what is
+    beyond a bound is answered as it came."""
+    assert (mt.MAX_SOURCE_LINES, mt.MAX_SOURCE_CHARS, mt.MAX_READ_LINES,
+            mt.MAX_READ_CHARS, mt.MAX_HTML_CHARS, mt._MAX_PASSES) == (
+        200_000, 5_000_000, 50_000, 4_000_000, 1_000_000, 4)
     zero = {"quote": 0, "signature": 0, "footer": 0, "pixels": 0}
 
     # Passes. A text that does not settle is given up on after _MAX_PASSES
@@ -2406,18 +2651,65 @@ def test_what_one_mail_may_cost_is_bounded():
             bulk=True))
         assert passes <= 4 * mt._MAX_PASSES, (n, passes)
 
-    # Size. One line more than the pipeline works on, or one character: the
+    # What a reading reads. Quoted lines are skipped and cost it nothing;
+    # every other line is read closely and counted, once for each pass —
+    # here 198 lines of the author's, a blank line, the attribution and the
+    # quote block in the pass that trims, the 198 again in the one that
+    # confirms. One line more than a reading may read, or one character, and
+    # it is given up: no trim, the mail as it came, however often asked.
+    own = ["Line %d of what the author wrote." % n for n in range(1, 199)]
+    mail = "\n".join(own) + "\n\n" + ATTRIBUTION + "\n" + "> earlier\n" * 5000
+    read_lines = 2 * len(own) + 3
+    read_chars = 2 * sum(map(len, own)) + len(ATTRIBUTION)
+    saved = (mt.MAX_READ_LINES, mt.MAX_READ_CHARS)
+    try:
+        for lines, chars, trimmed in ((read_lines, read_chars, True),
+                                      (read_lines - 1, read_chars, False),
+                                      (read_lines, read_chars - 1, False)):
+            mt.MAX_READ_LINES, mt.MAX_READ_CHARS = lines, chars
+            for evidence in ({}, {"subject": "Re: x", "is_reply": True, "bulk": True}):
+                result, passes = _count_passes(lambda: mt.trim(mail, None, **evidence))
+                if trimmed:
+                    assert result.text == "\n".join(own) and passes == 2, (lines, chars, passes)
+                    assert result.removed["quote"] > 45000, result.removed
+                else:
+                    assert result == (_normal(mail), "wanting", zero), (lines, chars, result.text[-80:])
+                    assert passes <= 4, (lines, chars, passes)
+                assert mt.trim(result.text, None).text == result.text, (lines, chars)
+        # A text that is all its author's is read once, and is settled.
+        mt.MAX_READ_LINES, mt.MAX_READ_CHARS = len(own), sum(map(len, own))
+        result, passes = _count_passes(lambda: mt.trim("\n".join(own), None))
+        assert result.text == "\n".join(own) and passes == 1, passes
+        # Lines that look like quotes and are kept — a diff — are read too.
+        diff = "3c3\n" + "> a line of the new file\n" * 300
+        mt.MAX_READ_LINES, mt.MAX_READ_CHARS = 301, saved[1]
+        result, passes = _count_passes(lambda: mt.trim(diff, None))
+        assert result.text == diff.strip() and passes == 1, (passes, result.text[:60])
+        mt.MAX_READ_LINES = 300
+        assert mt.trim(diff, None) == (diff.strip(), "wanting", zero)
+        # … and so is a forwarded message, which is kept whole.
+        forward = "FYI.\n\n---------- Forwarded message ---------\n" + _FORWARDED + "more\n" * 300
+        mt.MAX_READ_LINES = len(mt._clean_lines(forward)) + 1
+        result, passes = _count_passes(lambda: mt.trim(forward, None))
+        assert result == (_normal(forward), "deterministic", zero) and passes == 1, passes
+        mt.MAX_READ_LINES -= 1
+        assert mt.trim(forward, None) == (_normal(forward), "wanting", zero)
+    finally:
+        mt.MAX_READ_LINES, mt.MAX_READ_CHARS = saved
+
+    # Size. One line more than a source may have, or one character: the
     # answer is the mail as it came — a quote, a signature and all — and no
     # line of it was looked at. One fewer, and it is trimmed like any mail.
     tail = "\n\n> a quote\n\n-- \nBob\n"
-    lines = "Hello,\n" + "a line\n" * (mt.MAX_SOURCE_LINES - 7) + "the end." + tail
+    lines = "Hello,\n" + "> a line\n" * (mt.MAX_SOURCE_LINES - 7) + "the end." + tail
     assert lines.strip("\n").count("\n") + 1 == mt.MAX_SOURCE_LINES
-    chars = "Hello, " + "x" * (mt.MAX_SOURCE_CHARS - len("Hello, " + tail.rstrip("\n"))) + tail
+    chars = "Hello,\n> " + "x" * (mt.MAX_SOURCE_CHARS - len(
+        "Hello,\n> \nthe end." + tail.rstrip("\n"))) + "\nthe end." + tail
     assert len(chars.strip("\n")) == mt.MAX_SOURCE_CHARS
     for name, within in (("lines", lines), ("characters", chars)):
         result, passes = _count_passes(lambda: mt.trim(within, None))
         assert passes and result.removed["quote"] and result.removed["signature"], name
-        assert result.text == _normal(within[:-len(tail)]), (name, result.text[-80:])
+        assert result.text == "Hello,\n\nthe end.", (name, result.text[-80:])
         beyond = within.replace("Hello,", "Hello,\n" if name == "lines" else "Hello, x", 1)
         for evidence in ({}, {"subject": "Re: x", "is_reply": True, "bulk": True}):
             result, passes = _count_passes(lambda: mt.trim(
@@ -2426,38 +2718,59 @@ def test_what_one_mail_may_cost_is_bounded():
             assert result == (beyond.strip("\n"), "wanting", zero), (name, result.text[-80:])
             assert mt.trim(result.text, None) == result, name
     # The text an HTML part turns into is a source like any other.
-    for count, trimmed in ((mt.MAX_SOURCE_LINES - 4, True), (mt.MAX_SOURCE_LINES, False)):
-        html = ("<div>Hello,<br>%s</div><blockquote type=cite>a quote</blockquote>"
-                % ("a line<br>" * count))
-        result, passes = _count_passes(lambda: mt.trim(None, html))
-        assert bool(passes) == trimmed and result.state == "wanting", (count, passes)
-        assert ("> a quote" in result.text) != trimmed, (count, result.text[-80:])
-        assert result.text.startswith("Hello,\na line\na line\n"), result.text[:80]
-        assert mt.trim(result.text, None).text == result.text, count
+    saved = mt.MAX_SOURCE_LINES
+    mt.MAX_SOURCE_LINES = 3000
+    try:
+        for count, trimmed in ((mt.MAX_SOURCE_LINES - 4, True), (mt.MAX_SOURCE_LINES, False)):
+            html = ("<div>Hello,<br>%s</div><blockquote type=cite>a quote</blockquote>"
+                    % ("a line<br>" * count))
+            result, passes = _count_passes(lambda: mt.trim(None, html))
+            assert bool(passes) == trimmed and result.state == "wanting", (count, passes)
+            assert ("> a quote" in result.text) != trimmed, (count, result.text[-80:])
+            assert result.text.startswith("Hello,\na line\na line\n"), result.text[:80]
+            assert mt.trim(result.text, None).text == result.text, count
+    finally:
+        mt.MAX_SOURCE_LINES = saved
 
     # Markup. Of an HTML part the first MAX_HTML_CHARS are parsed. Where it
-    # is the source, the text ends where the reading did — at a tag, and on
-    # a line that says so.
+    # is the source, the text ends where the reading did — in the middle of
+    # a paragraph, if that is where the bound falls — and on a line that
+    # says so.
     saved = mt.MAX_HTML_CHARS
     mt.MAX_HTML_CHARS = 2000
     try:
         document = "<html><body>%s</body></html>"
         html = document % "".join("<p>Paragraph %d.</p>" % n for n in range(1, 400))
         for name, plain in (("HTML-only", None), ("beside a stub", "Read this in a browser.")):
-            result = mt.trim(plain, html, subject="Re: x", is_reply=True)
-            *read, mark = result.text.split("\n\n")
-            assert mark == mt.CUT_MARK, (name, result.text[-120:])
-            assert read == ["Paragraph %d." % n for n in range(1, len(read) + 1)], name
-            assert (html.index("Paragraph %d." % len(read)) < mt.MAX_HTML_CHARS
-                    <= html.index("Paragraph %d." % (len(read) + 2))), (name, len(read))
-            assert result.state == "wanting", name
-            assert mt.trim(result.text, None).text == result.text, name
+            for bound in range(1990, 2030):
+                mt.MAX_HTML_CHARS = bound
+                result = mt.trim(plain, html, subject="Re: x", is_reply=True)
+                *read, mark = result.text.split("\n\n")
+                assert mark == mt.CUT_MARK, (name, bound, result.text[-120:])
+                want = [text.strip() for text in re.findall(r"<p>([^<]*)", html[:bound]) if text]
+                assert read == want and len(read) > 80, (name, bound, read[-2:], want[-2:])
+                assert result.state == "wanting", (name, bound)
+                assert mt.trim(result.text, None).text == result.text, (name, bound)
+        # Nothing of what the bound falls into is taken for text: not a tag
+        # (though a ">" stands in it), not a comment, not a character
+        # reference, whatever the parser makes of an unfinished one.
+        for hidden in ('<span title="internal > campaign=42 <b> do-not-show" lang=en>',
+                       "<!-- internal: campaign=42 > do-not-show <b> -->",
+                       "<![if !mso]>", "<?xml internal?>", "</p   >", "<p\n id=x>"):
+            html = "<p>Hello.</p>" + hidden + "more</span><p>Bye, R&amp;D &#8212; &lt;all&gt;.</p>"
+            for bound in range(len("<p>Hello.</p>"), len(html)):
+                mt.MAX_HTML_CHARS = bound
+                text = mt.trim(None, html).text
+                head, _, tail = text.partition("\n\n")
+                assert head == "Hello." and tail.endswith(mt.CUT_MARK), (hidden, bound, text)
+                said = tail[:-len(mt.CUT_MARK)].strip()
+                assert "more\n\nBye, R&D — <all>.".startswith(said), (hidden, bound, text)
         # Where the reading ended is not where the mail ends: a delimiter
         # right above it has no signature under it that anyone has seen, so
         # nothing is cut there — now, or when the text is trimmed again.
         read = ("<div>Hello Bob,</div><blockquote type=cite>earlier</blockquote>"
                 "<div>the details:<br>-- <br>first, the budget<br>")
-        mt.MAX_HTML_CHARS = len(read) + 1
+        mt.MAX_HTML_CHARS = len(read)
         result = mt.trim(None, read + "then, the hiring<br>" * 200 + "</div>")
         assert result.text == ("Hello Bob,\n\nthe details:\n--\nfirst, the budget\n\n"
                                + mt.CUT_MARK), result.text
@@ -2470,7 +2783,82 @@ def test_what_one_mail_may_cost_is_bounded():
         whole = mt.trim(None, document % "".join("<p>Paragraph %d.</p>" % n for n in range(1, 51)))
         assert whole.text.endswith("Paragraph 50.") and mt.CUT_MARK not in whole.text
         # … and html_to_text reads all of whatever it is given.
-        assert mt.html_to_text(html).endswith("Paragraph 399.")
+        assert mt.html_to_text(html).endswith("<all>.")
+        # An element longer than the bound has left is read as far as that
+        # goes: its first lines, not none of it. (Cut back to where its tag
+        # begins, a log in a <pre> was gone from its first word on.)
+        log = "".join("07:00:%02d job %d finished ok\n" % (n % 60, n) for n in range(400))
+        result = mt.trim(None, "<p>All green. Details:</p><pre>%s</pre><p>Regards, CI</p>" % log)
+        assert result.text.startswith("All green. Details:\n\n07:00:00 job 0 finished ok\n"), result.text[:80]
+        assert result.text.count("\n") > 60 and result.text.endswith("\n\n" + mt.CUT_MARK)
+        # An image written into the part is no markup to read: the payload
+        # of a long data: URL does not use up the bound, and the mail's text
+        # after it is not dropped with the tag the bound would fall into.
+        payload = "data:image/png;base64," + "iVBORw0KGgo" * 500
+        assert len(payload) > mt.DATA_URL_CHARS > mt.MAX_HTML_CHARS
+        before, after = "<p>Hi Ann,</p><p>this is what I see:</p>", (
+            "<p>Can you call me before noon? The number is 555 0100.</p><p>Bob</p>")
+        said = ("Hi Ann,\n\nthis is what I see:\n\n%sCan you call me before noon? "
+                "The number is 555 0100.\n\nBob")
+        for image, shown in (
+                ('<img alt="screenshot" src="%s">', "[screenshot]\n\n"),
+                ("<img alt='screenshot' src='%s'>", "[screenshot]\n\n"),
+                ("<img alt=screenshot src=%s>", "[screenshot]\n\n"),
+                ('<img alt="screenshot" src = "%s" width="600">', "[screenshot]\n\n"),
+                ('<div style="background:url(%s)">chart</div>', "chart\n\n"),
+                ("<div style=\"background: url('%s') no-repeat\">chart</div>", "chart\n\n"),
+                ('<div style="background:url(&quot;%s&quot;)">chart</div>', "chart\n\n"),
+                ("<style>div{background:url(%s)}</style><div>chart</div>", "chart\n\n"),
+                ('<img alt="1 > 0" src="%s">', "[1 > 0]\n\n"),
+                ('<img alt="screenshot" src="%s">' * 3, "[screenshot][screenshot][screenshot]\n\n")):
+            # (As a client writes it, and folded as some do — which only a
+            # value in quotes can be: without them it ends at the first blank.)
+            folded = payload.replace("o", "o\r\n")
+            for html in (before + image.replace("%s", payload) + after,
+                         "<html><body>%s</body></html>" % (
+                             before + image.replace("%s", folded) + after)):
+                if folded in html and not ('"%s"' in image or "'%s'" in image):
+                    continue
+                assert len(html) > 2 * mt.MAX_HTML_CHARS
+                result = mt.trim(None, html)
+                assert result == (said % shown, "wanting", zero), (image, result.text)
+        # (A payload is not searched for more of them: what stands in one
+        # is not looked at, however often it says the word, and does not
+        # count towards the candidates a part may have.)
+        wordy = '<img alt="screenshot" src="data:image/png;base64,%s">' % ("data:" * 1200)
+        html = before + wordy * 4 + after
+        candidates, mt._MAX_DATA_URLS = mt._MAX_DATA_URLS, 5
+        try:
+            assert mt.trim(None, html).text == said % ("[screenshot]" * 4 + "\n\n")
+        finally:
+            mt._MAX_DATA_URLS = candidates
+        # (The image first, beside a plain part that is a stub: the HTML
+        # part is the mail, as it is when it is short.)
+        stub = "Please view this message in an HTML capable mail client."
+        html = '<img alt="logo" src="%s">%s%s' % (
+            payload, before, after.replace("</p><p>Bob", " And again, at length." * 60 + "</p><p>Bob"))
+        mt.MAX_HTML_CHARS = len(html) - len(payload) + 100
+        result = mt.trim(stub, html)
+        assert result.text.startswith("[logo]\n\nHi Ann,") and result.text.endswith("Bob"), result.text[:80]
+        assert result.state == "wanting" and mt.CUT_MARK not in result.text
+        mt.MAX_HTML_CHARS = 2000
+        # What is text stays text, and counts: a data: URL someone wrote
+        # out, one that is short, a word that only begins like one — and
+        # text shaped like one, which a browser shows as the words it is.
+        words = ["Please", "wire", "EUR", "9,800", "to", "IBAN", "XX00", "1234"] * 120
+        for html in ("<p>Hi Ann,</p><p>%s</p>" % payload + after,
+                     before + '<img alt="x" src="data:image/png;base64,iVBORw0KGgo=">' * 40 + after,
+                     before + '<p title="data:, %s">a sentence</p>' % ("word " * 900) + after,
+                     before + '<p>(data:%s)</p>' % ("x" * 5000) + after,
+                     before + '<p>Note="data:,%s"</p>' % "\n".join(words) + after,
+                     before + '<p>Note="data:,%s"</p>' % "&nbsp;".join(words) + after,
+                     # (A tag ends where a browser ends it.)
+                     before + '<p ="x>Note="data:,%s"</p>' % "\n".join(words) + after,
+                     before + '<p class= x="y>Note="data:,%s"</p>' % "\n".join(words) + after,
+                     before + '<p title="a>b">Note="data:,%s"</p>' % "\n".join(words) + after,
+                     before + '<pre>src="data:,%s"</pre>' % ("x" * 5000) + after):
+            result = mt.trim(None, html)
+            assert result.text.endswith(mt.CUT_MARK) and "555 0100" not in result.text, result.text[-80:]
         # Beside a plain part that is the mail's text, markup that was not
         # read to its end is not consulted: it cannot stand in for a text
         # that was. What it may have known leaves the state open.
@@ -2482,6 +2870,13 @@ def test_what_one_mail_may_cost_is_bounded():
         result = mt.trim(long_plain, long_html, subject="Re: Meeting", is_reply=True)
         assert result.text == _normal(long_plain) and result.state == "wanting", result
         assert not result.removed["quote"], result
+        # Nor is a short plain part settled by a part that says nothing as
+        # far as it was read: whether it is a stub beside the rest of that
+        # part, nobody has seen.
+        styled = "<html><head><style>%s</style></head><body>%s</body></html>" % (
+            "p{margin:0}" * 400, "<p>See you at ten, and bring the long list.</p>" * 60)
+        result = mt.trim("See you at ten.", styled)
+        assert result == ("See you at ten.", "wanting", zero), result
         mt.MAX_HTML_CHARS = saved
         result = mt.trim(long_plain, long_html, subject="Re: Meeting", is_reply=True)
         assert result.text == "Rendben." and result.state == "deterministic", result
@@ -2491,19 +2886,22 @@ def test_what_one_mail_may_cost_is_bounded():
     # Wherever the bounds fall in a mail, the answer holds the invariants of
     # every answer: asked for again it is the same, a plain mail's is made
     # of that mail's lines and is not blank, and no mark is in it.
-    saved = (mt.MAX_SOURCE_LINES, mt.MAX_SOURCE_CHARS, mt.MAX_HTML_CHARS)
+    names = ("MAX_SOURCE_LINES", "MAX_SOURCE_CHARS", "MAX_READ_LINES",
+             "MAX_READ_CHARS", "MAX_HTML_CHARS")
+    saved = [getattr(mt, name) for name in names]
     try:
-        for n in range(1200):
-            mt.MAX_SOURCE_LINES = rng.choice((4, 8, 16, saved[0]))
-            mt.MAX_SOURCE_CHARS = rng.choice((120, 400, saved[1]))
-            mt.MAX_HTML_CHARS = rng.choice((60, 200, 600, saved[2]))
+        for n in range(1600):
+            for name, small, real in zip(names, ((8, 16, 40), (120, 400), (4, 9, 24, 60),
+                                                 (90, 300, 1200), (60, 200, 600)), saved):
+                setattr(mt, name, rng.choice(small + (real,)))
             plain = html = None
             if n % 4:
                 plain = "\n".join(rng.choice(_FUZZ_PLAIN) for _ in range(rng.randint(1, 24)))
             if n % 4 in (0, 3):
                 html = "".join(rng.choice(_FUZZ_HTML) for _ in range(rng.randint(1, 24)))
-            result = mt.trim(plain, html, subject=rng.choice((None, "Re: x", "Fwd: x")),
-                             is_reply=rng.choice((None, True)), bulk=rng.choice((None, True)))
+            evidence = {"subject": rng.choice((None, "Re: x", "Fwd: x")),
+                        "is_reply": rng.choice((None, True)), "bulk": rng.choice((None, True))}
+            result = mt.trim(plain, html, **evidence)
             context = (n, plain, html, result)
             assert mt.trim(result.text, None).text == result.text, context
             assert "\x01" not in result.text and "\x02" not in result.text, context
@@ -2515,8 +2913,9 @@ def test_what_one_mail_may_cost_is_bounded():
             elif plain is None and len(html) > mt.MAX_HTML_CHARS:
                 assert result.state == "wanting" or not result.text, context
     finally:
-        mt.MAX_SOURCE_LINES, mt.MAX_SOURCE_CHARS, mt.MAX_HTML_CHARS = saved
-    print("PASS cost: bounded in passes, in the size of a source, in markup")
+        for name, value in zip(names, saved):
+            setattr(mt, name, value)
+    print("PASS cost: bounded in passes, in what is read, in the size of a source, in markup")
 
 
 def test_nesting_does_not_inflate():
@@ -2615,22 +3014,76 @@ def test_html_to_text_links():
     # A link does not nest: the second ends the first.
     assert h('<a href="https://a.example/1">one <a href="https://b.example/2">'
              'two</a></a>') == "one (https://a.example/1)two (https://b.example/2)"
-    # Not a link inside what is hidden, though — a mobile duplicate, a
-    # preheader, a muted element. It ends nothing: what hides it stays open
-    # around the rest of what it hides, and the first link takes its text.
+    # A second link inside what is hidden ends the first as well — and what
+    # it then shows is what a browser shows, and the Original view. Hidden
+    # stays what a block hides that was opened in the first link (a mobile
+    # duplicate: the browser moves the block out, whole), and what a
+    # formatting element hides (it is opened again): the first link ends,
+    # the rest of the hidden text does not appear.
     for html, want in (
             ('<div><a href="https://example.org/view">View in browser<div '
              'class="mobile-only" style="display:none">Mobile copy: <a '
              'href="https://example.org/m">open</a> hidden duplicate text</div>'
              '</div><p>Hello Bob, the real text.</p>',
              "View in browser (https://example.org/view)\n\nHello Bob, the real text."),
+            ('<a href="https://a.example/1">one<div hidden>two <a '
+             'href="https://b.example/2">three</a> four</div> five</a> six',
+             "one (https://a.example/1) five six"),
+            ('<a href="https://a.example/1">one<font style="display:none">two '
+             '<a href="https://b.example/2">three</a> four</font> five</a> six',
+             "one (https://a.example/1) five six"),
+            ('<a href="https://a.example/1">one<span style="display:none"><b '
+             'style="display:none">two <a href="https://b.example/2">three</a> '
+             'four</b> five</span> six</a>',
+             "one (https://a.example/1) five six"),
+            # What the browser took off its stack with the first link —
+            # the <span> that hid, a <b> it opens again inside what goes on
+            # hiding — ends nothing there with an end tag of its own …
+            ('<a href="https://h.example/">Read more<span style="display:none">'
+             '<font style="display:none"><a href="https://t.example/">x</span>'
+             'SECRET</font> TEND',
+             "Read more (https://h.example/) TEND"),
+            ('<a href="https://a.example/1">one<span style="display:none"><div '
+             'style="display:none"><a href="https://t.example/2">two</span> '
+             'three</div> four',
+             "one (https://a.example/1) four"),
+            ('<a href="https://a.example/1">one<b><span style="display:none">'
+             '<font style="display:none"><a href="https://t.example/2">two</b> '
+             'three</font> four',
+             "one (https://a.example/1) four"),
+            # … but a block it moves and keeps open does, and what hides in it.
+            ('<a href="https://a.example/1">one<h2><center style="display:none">'
+             'two <a href="https://b.example/2">three</h2> four',
+             "one\n\n(https://a.example/1)\n\nfour"),
+            # A <span> and its like end with the link they were opened in,
+            # and so does the hiding: the second link is shown, and the rest.
             ('<a href="https://a.example/1"><span style="display:none">tracking '
              '<a href="https://t.example/2">x</a> never shown</span>Read more</a>',
-             "Read more (https://a.example/1)"),
+             "x (https://t.example/2) never shownRead more"),
             ('<a href="https://a.example/1">one<span class="preheader"><a '
              'href="https://b.example/2">two</a> <a href="https://c.example/3">'
              'three</a> four</span> five</a> six',
-             "one five (https://a.example/1) six"),
+             "one (https://a.example/1)two (https://b.example/2) three "
+             "(https://c.example/3) four five six"),
+            # … also when the hidden element is the first link itself, or a
+            # block stands inside the <span> (it is moved out of it).
+            ('<a href="https://a.example/1" style="display:none">one <a '
+             'href="https://b.example/2">two</a> three',
+             "two (https://b.example/2) three"),
+            ('<a href="https://a.example/1">one<span style="display:none">two '
+             '<div>three <a href="https://b.example/2">four</a> five</div> six'
+             '</span> seven</a>',
+             "one (https://a.example/1)four (https://b.example/2) five six seven"),
+            # Hidden from outside the first link, nothing of it is shown …
+            ('<div style="display:none"><a href="https://t.example/1">one<a '
+             'href="https://t.example/2">two</div><p>Real <a '
+             'href="https://a.example/3">text</a> here.</p>',
+             "Real text (https://a.example/3) here."),
+            ('<u style="display:none"><a href="https://t.example/1"><u><a '
+             'href="https://t.example/2">one</u> two</a></u> three',
+             "three"),
+            # … and where an <a> is no link to a browser — in a <select>, in
+            # a script — it ends none.
             ('<a href="https://a.example/1">one<select><option><a '
              'href="https://b.example/2">two</a> three</select> four</a>',
              "one four (https://a.example/1)")):
@@ -3319,7 +3772,7 @@ def test_sanitize_malformed_markup():
     the allow-lists do not name."""
     assert _clean("<b><i>text</b></i>") == "<b><i>text</i></b>"
     assert _clean("<div><p>hello<table><tr><td>x") == \
-        "<div><p>hello<table><tr><td>x</td></tr></table></p></div>"
+        "<div><p>hello</p><table><tr><td>x</td></tr></table></div>"
     assert _clean("</div></p>text</span>") == "text"
     assert _clean("<unknown-tag foo=bar>kept</unknown-tag>") == "kept"
     assert _clean("<o:p>&nbsp;</o:p>") == "\u00a0"
@@ -3397,24 +3850,54 @@ def test_sanitize_writes_the_end_tags_a_mail_leaves_out():
             ("<table><td>a<tr><td>b", "<table><td>a</td><tr><td>b</td></tr></table>"),
             ("<table><tr><td><table><td>x<td>y</table><td>z",
              "<table><tr><td><table><td>x</td><td>y</td></table></td><td>z</td></tr></table>"),
+            # A paragraph ends at whatever a browser ends it at — a rule, a
+            # heading, a list, a table, a block — with what was opened in it.
+            ("<p>a<hr>b", "<p>a</p><hr>b"),
+            ("<p>a<h2>b</h2>c", "<p>a</p><h2>b</h2>c"),
+            ("<p>a<ul><li>b<p>c", "<p>a</p><ul><li>b<p>c</p></li></ul>"),
+            ("<p><span>a<div>b", "<p><span>a</span></p><div>b</div>"),
+            ("<p>a<div>b</div><span>c<p>d", "<p>a</p><div>b</div><span>c<p>d</p></span>"),
+            ("<div><p>hello<table><tr><td>x",
+             "<div><p>hello</p><table><tr><td>x</td></tr></table></div>"),
+            ("<table><p>a<tr><td>b", "<table><p>a</p><tr><td>b</td></tr></table>"),
             # Not ended, because a browser would not end it there: an item
             # in a list (or a quote) inside the open item is its descendant …
             ("<li>a<blockquote>b<li>c", "<li>a<blockquote>b<li>c</li></blockquote></li>"),
-            ("<p>a<ul><li>b<p>c", "<p>a<ul><li>b<p>c</p></li></ul></p>"),
-            # … a paragraph a block has ended already is not ended again
-            # (and what was opened since is not inside it) …
-            ("<p>a<div>b</div><span>c<p>d", "<p>a<div>b</div><span>c<p>d</p></span></p>"),
-            ("<div><p>hello<table><tr><td>x",
-             "<div><p>hello<table><tr><td>x</td></tr></table></p></div>"),
-            # … bold that runs on into the next paragraph or item is the
-            # browser's to carry over, so the end is left to it …
+            # … bold that runs on into the next paragraph, block or item is
+            # the browser's to carry over, so the end is left to it …
             ("<p><b>a<p>b", "<p><b>a<p>b</p></b></p>"),
+            ("<p><b>a<div>b</div>c", "<p><b>a<div>b</div>c</b></p>"),
             ("<li><i>a<li>b", "<li><i>a<li>b</li></i></li>"),
             ("<table><tr><li><b>a<tr><td>b",
              "<table><tr><li><b>a<tr><td>b</td></tr></b></li></tr></table>"),
             # … and outside a table a browser has no cells and no rows.
             ("<td>a<td>b<tr><td>c", "<td>a<td>b<tr><td>c</td></tr></td></td>")):
         assert _clean(html) == want, (html, _clean(html))
+    # So a mail whose paragraphs end at something else than the next one is
+    # a row of paragraphs too: each of the 400 has its tag, none is
+    # unwrapped past the depth that is tracked.
+    for unit, want in (
+            ("<p>x<hr>", "<p>x</p><hr>"),
+            ("<h2>t</h2><p>x", "<h2>t</h2><p>x</p>"),
+            ("<p>x<ul><li>y</ul>", "<p>x</p><ul><li>y</li></ul>"),
+            ("<p>x<div>y</div>", "<p>x</p><div>y</div>"),
+            ("<p>x<table><tr><td>y</table>", "<p>x</p><table><tr><td>y</td></tr></table>"),
+            ("<p>x<pre>y</pre>", "<p>x</p><pre>y</pre>"),
+            ("<p>x<blockquote>y</blockquote>", "<p>x</p><blockquote>y</blockquote>")):
+        assert _clean(unit * 400) == want * 400, (unit, _clean(unit * 400)[:200])
+    # (The known limit: with an inline element left open in each, they nest
+    # once per paragraph as before, and half the depth is what is kept.)
+    assert _clean("<p><b>x" * 400).count("<p>") == mt._MAX_DEPTH // 2
+    # Outside a table a browser drops the parts of one. Such a tag ends no
+    # paragraph, so the mail's own </p> still does — and what follows a
+    # hidden paragraph is not written into it, taking its style.
+    for part in ("tr", "tbody", "thead", "tfoot", "caption", "colgroup", "td", "th"):
+        assert _clean('<p style="display:none">a<%s></p>b' % part) == (
+            '<p style="display:none">a<%s></%s></p>b' % (part, part)), part
+        assert _clean("<p>a<%s>b<p>c" % part) == "<p>a<%s>b<p>c</p></%s></p>" % (part, part), part
+    # (In a table it is a part of it, and ends the paragraph with the cell.)
+    assert _clean('<table><tr><td><p style="display:none">a<tr><td></p>b</table>') == (
+        '<table><tr><td><p style="display:none">a</p></td></tr><tr><td>b</td></tr></table>')
     # An end tag written twice no longer meets an element left open, so it
     # must not reach further than a browser lets it: not out of the list it
     # stands in, not out of the table, not at a paragraph ended long ago.
@@ -3423,7 +3906,9 @@ def test_sanitize_writes_the_end_tags_a_mail_leaves_out():
     assert _clean("<tr><td><table><tr><td>x<tr><td>y</tr></tr><tr><td>z</table></td></tr>") == \
         "<tr><td><table><tr><td>x</td></tr><tr><td>y</td></tr><tr><td>z</td></tr></table></td></tr>"
     assert _clean("<p><div><p>one<p>two</p></p>after</div>") == \
-        "<p><div><p>one</p><p>two</p>after</div></p>"
+        "<p></p><div><p>one</p><p>two</p>after</div>"
+    assert _clean("<p><b>a<div><p>one</p></p>after</div>") == \
+        "<p><b>a<div><p>one</p>after</div></b></p>"
     # Whatever is left out, every element opened is closed, in order, and
     # the document is no deeper than the mail.
     for html in ("<p>a<li>b<td>c<dt>d<tr>e<dd>f<div>g<b>h" * 60,
@@ -3493,7 +3978,9 @@ def main():
     test_tables_cover_the_languages()
     test_never_raises_and_stays_fast()
     test_cost_grows_with_size_not_its_square()
+    test_a_separator_line_is_read_by_hand()
     test_cost_at_a_megabyte()
+    test_a_long_mail_is_trimmed_to_its_own_text()
     test_what_one_mail_may_cost_is_bounded()
     test_nesting_does_not_inflate()
     test_html_to_text_structure()

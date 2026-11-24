@@ -228,10 +228,19 @@ gateway's name can differ: each entry carries its `channel`, and the web
 gateway reads that before it falls back to reading a slug.
 
 `/health` answers `{configured, connected, mode: "inbox", account, error,
-blocked, needs_repair: false, build, backfill: {done, pending, days}}` —
-`backfill.days` is the window fixed at the first run. `blocked` names what
-holds the mirror when that is not the mailbox: `"policy"` (below) or
-`"mirror"` — it stopped on a fault of its own, and `error` says on what.
+blocked, needs_repair: false, build, backfill: {done, pending, days},
+placeholders: {standing, made, why}, lost}` — `backfill.days` is the window fixed
+at the first run. `blocked` names what holds the mirror when that is not the
+mailbox: `"policy"` (below) or `"mirror"` — it stopped on a fault of its own,
+and `error` says on what. `placeholders` counts the mail that could not be
+read (below): how many placeholders stand, how many were `made` since this
+start, and `why`, by reason — a mail that cannot be read leaves the mirror
+`connected`, so a run of them shows here, whatever the cause, and the
+connection monitor reads it: when five or more stand beyond those it last
+told the user of, it says so in a thread of its own — a notice, not an
+outage. `lost` counts the mails whose record is gone from the ledger and
+that are still looked for in the mailbox (below); the monitor counts them
+with the placeholders.
 An unconfigured gateway (`configured: false`) idles and is not an outage; so
 does one not opted in — no `MAIL_GATEWAY_TOKEN`, or the default account where
 `MESSENGER_BUILTIN_CHANNELS` is set without `email` — and `error` says which.
@@ -312,34 +321,153 @@ always kept. The work of parsing is bounded too, not only what is built: the
 parser tests every line against the boundary of every multipart around it, so
 a mail may nest 200 levels at most and ask for no more than 50 million such
 tests (lines × levels; under six seconds on Python 3.12, three on 3.13) —
-beyond either it is not parsed to the end.
+beyond either it is not parsed to the end. The parameters of all its parts'
+`Content-Type` and `Content-Disposition` fields have a sum of their own
+(semicolons × length, a thousand million), since the parser splits them at a
+cost that grows with both.
+
+**And so is the time one mail may take**, which is the bound for what the
+others did not foresee: each of them closes one way a mail made the standard
+library's mail code spend the square of something its sender chose, and each
+was found when some hundred kilobytes had held the mirror's one thread for a
+minute. Reading a mail has a deadline — `MAIL_READ_SECONDS` (30), and one
+more for every megabyte fetched; an ordinary mail reads in a millisecond, the
+heaviest honest one in a second or two. The gateway reads its mail in **a
+process of its own** (the same script, started with `--reader`, given none of
+the gateway's secrets): the reader looks at the clock wherever its own code
+runs, and where a single call into the library does not come back, the
+process is ended and replaced. Either way the mail is a placeholder — it took
+too long to read. (The slowest mail the bounds let through is one of
+thousands of parts under encoded file names, at about a second a megabyte:
+that is what the second per megabyte is for.) The header block a placeholder
+is made from, and the one a mail is found again by, are read the same way —
+with one difference, because of what is decided on them. A header block
+whose reading does not come back is read once more, after the reader has
+shown on the canaries that it works; if it still does not come back, that is
+**no answer**: the mail looked for is left as it is, nothing is remembered,
+and no mail is called gone on it. (Where the folders are followed, or old
+mail read, a placeholder must be made all the same, so the folder can go
+on: it is made without the block, under an id of the block's bytes, by which
+it is found again with no reading at all, and which gives way in one step
+once the mail reads under its own. The mail of a lost record — below — has
+no folder to keep going: its id is simply looked for again later.)
 
 **A mail that cannot be read is still there.** One mail's failure never stops
 the folder, or the backfill: a mail the gateway cannot read is mirrored as a
 placeholder that says so (with its sender, its time and its header block,
 unchanged in the mailbox), at once. It is read again at start and every hour
-(less often each time it changes nothing), and takes its placeholder's place
+(less often each time it changes nothing; a round of such readings has two
+minutes, and what it does not get to waits for the next — a mail that took
+too long to read takes that long again), and takes its placeholder's place
 when it reads — that mail, and no other: the placeholder's record keeps the
 header block of the copy it was made from, and only a mail with that very
 header block replaces it, wherever it lies by then. A mail that merely
-arrives under a placeholder's `Message-ID` is one more place of the mail on
-record, as a second copy of any mail is; ids are their sender's to choose.
+arrives under a placeholder's `Message-ID` replaces nothing, whether it can
+be read or not; ids are their sender's to choose. While the placeholder
+stands it is set apart as another mail's: the placeholder is never read
+again from it, and is not kept by it — when the placeholder's own copy has
+left the mailbox the placeholder leaves a tombstone like any mail, and what
+still lies there under its id is then mirrored as the mail it is. Once the
+placeholder has given way to its mail, the other is one more place of the
+mail on record, as a second copy of any mail is. Which is which is read off
+the mails, every time they are looked for: a folder may hold several mails
+under one id, all of them are looked at, and the placeholder's own copy may
+be the older one — after a move to the archive, or a folder renumbered.
+
+A mail whose record is written again — a placeholder that reads, a mail on
+record from its INBOX copy whose Sent copy shows, a tombstone whose mail is
+back — gets its new record in the old one's place, in one step, and only
+once that is written: until then, should writing fail for an hour or the
+process be stopped, the old record stands as it was, and its mail is followed
+like any (and tombstoned like any, if it leaves). A placeholder gives way only
+to the mail its record keeps the header block of; a UID is taken to be the
+mail the index has there only while its folder's `UIDVALIDITY` is the one it
+was recorded under. (A record whose file is gone when it is to be written
+again is written as the first time, and the index is matched with the
+ledger again.)
+
+A mail whose record is gone from the ledger (restored from an older backup,
+a file lost) is known no more: its row and its places go, and what the row
+said — the id, the sender, the direction, the chat, when the mail arrived —
+is kept as hints for finding the mail, never as knowledge of it (the
+`lost` list; nothing in it is a record, a place or a claim). The rest of
+the work looks for each such id by its `Message-ID` in Sent, INBOX and the
+archive — every mail under it in every folder, so a move or a renumbered
+folder makes no difference — at most `LOST_BATCH` ids a pass, the one
+tried least recently first, before the backfill and never in the way of
+new mail. Of what is found, ONE mail is read as the record's: for a row
+that said the mail was the user's, a Sent copy, whenever the server
+received it (a client may append its Sent copy late); then the copy the
+server received when the row said the mail arrived; then an archive copy;
+then the rest. For any other row, the copy From the sender the row named
+(the one received when the row said, else the first). A match whose header
+block does not come back counts as From nobody and comes last; it holds up
+nothing where the first is known to be the record's. That one mail is read
+as any mail is read the first time where it lies — what a Sent copy holds
+is the user's, what is in the archive the user's when it is from one of the
+user's own addresses and left Sent unseen — with one difference: in the
+archive, From that very sender, where the row said the mail was the
+user's, it is the user's again, whatever address that is (a copy the user
+can have put there). Never in INBOX: a From there is its sender's to write,
+and whoever was sent a mail knows its `Message-ID`, so a look-alike From
+the user's own address stays a mail that came in, and a second copy where
+the Sent copy is there. The others found are read as further copies of any
+mail are (one more place, another mail's, or a placeholder). Found in no
+folder, with every folder sure of it, the id is dropped. Where that cannot
+be told yet — a folder that would not answer, a header block that did not
+come back — the id stays, is looked for again less and less often, and
+holds back none behind it; `/health` counts it. An id that cannot be
+searched for (no `Message-ID`, or one the search cannot spell) is found by
+reading headers, and the copy received when the row said is read without
+waiting for that reading to cover the whole window. After `LOST_TRIES` (8)
+tries in vain, what was found is read as mail nothing is known of, a log
+line says so, and the id is looked for no more.
+
+What this leaves, plainly: while the archive does not answer, every lost id
+waits (`/health` says the archive does not answer, and counts them); an id
+whose mail is in no folder leaves the list with a log line and no `removed`
+event — there is no record to tombstone; a ledger restored from an older
+backup over a live one can leave two record files for one id (a record
+written as the first time takes a name of its own, and the backup brings
+back the one it had before); and a mail to oneself whose Sent copy is gone
+comes back as a mail that came in — nothing but its From says the user
+wrote it.
+
+The bookkeeping behind this keeps four rules, written out above `class
+Mirror` in the gateway: an answer that was not obtained is never an answer; a
+record is replaced or buried only on evidence about its own mail; a record
+stands until what replaces it does; and a fault delays only the work that
+failed.
 
 **Whose fault a failure is, is decided by what failed.** *Reading* a mail —
 the parse, the walk of its parts, the trim — fails on the mail's account when
-the same reader still reads a known-good mail the gateway carries with it
-(the canary): whatever was raised, one of the bounds above or a recursion or
-memory error among them, the mail is a placeholder and the mirror as healthy
-as it was. *Writing* — the ledger, the indexes, the blobs — never fails on a
-mail's account. A reader that cannot read the canary either, and any failure
-in writing, is a fault of the mirror itself, which must not turn the mailbox
-into placeholders one mail at a time with `/health` still `connected`: the
-pass ends there. No mail is set aside or marked over it, and no folder's mark
-moves past a mail that has neither a record nor a place — so the next pass
-reads it again, after a restart too, and if it has left for the archive by
-then it is read there, as a mail that came and went. `/health` reports
-`connected: false` with `blocked: "mirror"` meanwhile, and `error` says on
-what — naming the mail, where the pass stopped at one.
+the same reader still reads the known-good mails the gateway carries with it
+(the canaries, one for every path a mail takes through the reader: a plain
+reply beside its HTML, HTML alone, an inline image and a nested mail):
+whatever was raised, one of the bounds above or a recursion or memory error
+among them, the mail is a placeholder and the mirror as healthy as it was.
+Time is judged the same way: after a mail ran out of it, the canaries are read
+against the clock too, with a tenth of `MAIL_READ_SECONDS` for their few
+milliseconds — on a machine slow enough to time out ordinary mail they time
+out first, and that is no mail's fault. *Writing* — the ledger, the indexes,
+the blobs — never fails on a mail's account. A reader that cannot read the
+canaries either, or not in their time, and any failure in writing, is a fault
+of the mirror itself, which must not turn the mailbox into placeholders one
+mail at a time with `/health` still `connected`: the pass ends there. No mail
+is set aside or marked over it, and no folder's mark moves past a mail that
+has neither a record nor a place — so the next pass reads it again, after a
+restart too, and if it has left for the archive by then it is read there, as a
+mail that came and went. A mail whose record is to be written again and
+cannot be keeps the record it has meanwhile (see above). `/health` reports
+`connected: false` with `blocked: "mirror"`
+meanwhile, and `error` says on what — naming the mail, where the pass stopped
+at one. A fault delays only the work it was in. Following the folders — new
+mail, vanished mail — is done first and by itself, every poll interval; when
+that is what fails, it is tried again after one interval, then twice as long
+each time, up to an hour (every try fetches the mail in hand whole again).
+When the rest fails — finding mail again, reading mail again, the backfill —
+it is the rest that waits so, and new mail goes on being mirrored: `error`
+says that too.
 
 A record's time is the earlier of the mail's `Date` and the server's arrival
 time, never the future, so a forged date cannot pin a mail to the head of its
@@ -432,14 +560,22 @@ falls back to the untrimmed text: a bubble is never blank because the trim was
 greedy.
 
 **What one mail may cost is bounded**, like everything else it controls — the
-mirror has one thread for all of them. The trim works on at most 10,000 lines
-and 500,000 characters of text, and runs over them a fixed number of times
-(four passes a reading, four readings a mail); a longer text is not trimmed
-and is recorded as it came, `wanting`. Of an HTML part the first 1,000,000
-characters of markup are parsed: beside a plain part a longer one is not
-consulted, and where it is the mail's only text the bubble ends where the
-reading did, on a line `[…]` — *Original* shows all of it. Within those
-bounds the cost is linear in the size of the mail, for hostile mail too.
+mirror has one thread for all of them. The bounds are on the work, not on how
+long a mail may be: a short reply above megabytes of thread, a log sent in
+answer, a digest are ordinary mail and are trimmed to their own text. The
+trim runs over a text a fixed number of times (four passes a reading, four
+readings a mail). Lines it finds to be quoted history it skips, at next to no
+cost; every other line it reads closely, and one reading reads at most 50,000
+of them and 4,000,000 characters, counted once per pass — all four passes for
+12,500 lines of the author's own, the two an ordinary mail takes for 25,000.
+A mail that would take more is not trimmed and is recorded as it came,
+`wanting`, as is one of more than 200,000 lines or 5,000,000 characters,
+which is not read at all. Of an HTML part the first 1,000,000 characters of
+markup are parsed, not counting inline `data:` images: beside a plain part a
+longer one is not consulted, and where it is the mail's only text the bubble
+ends where the reading did, on a line `[…]` — *Original* shows all of it.
+Within those bounds the cost is linear in the size of the mail, for hostile
+mail too.
 
 ### The model trim (phase 4)
 

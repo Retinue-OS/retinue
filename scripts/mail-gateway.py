@@ -55,22 +55,31 @@ folders are mirrored — INBOX, Sent and the archive folder:
 bounded: its header block and the fields whose parameters are parsed, the
 codecs it is decoded under (charsets, and nothing else its sender may name),
 the ids it cites, its parts, the text its record carries, the chats it may
-merge, the work its parsing costs. A mail the reader cannot make sense of does
-not stop the folder and does not vanish either: it is mirrored as a
-placeholder that says a mail from this sender, at this time, could not be
-shown (the mailbox still has it), and is read again at start and every hour.
+merge, the work its parsing costs — and the time its reading takes as a
+whole, the bound for what none of the others foresaw: the running gateway
+reads its mail in a process of its own (``Reader``), which is ended when a
+mail outlasts its deadline. A mail the reader cannot make sense of, or not
+in its time, does not stop the folder and does not vanish either: it is
+mirrored as a placeholder that says a mail from this sender, at this time,
+could not be shown (the mailbox still has it), and is read again at start
+and every hour. ``/health`` counts them, and says why. What the bookkeeping
+of all this must keep, whatever case comes next, is written down in one
+place: the four invariants above ``class Mirror``.
 
 **Whose fault a failure is, is decided by what failed** (``read_mail``,
 ``Mirror._ingest``). READING a mail — the parse, the walk of its parts, the
 trim — fails on the mail's account when the same reader still reads the
-mirror's own built-in test mail (the canary): that mail is a placeholder at
-once, and the mirror is as healthy as before. WRITING — the ledger, the
-indexes, the blobs — never fails on a mail's account. A reader that cannot
-read the canary either, and any failure in writing, is a fault of the mirror
-itself, and must not be absorbed mail by mail: the pass ends, no mail is set
-aside over it, no mark moves past a mail that has neither a record nor a
-place — so the mail is read again wherever it is by then, also after a
-restart — and ``/health`` reports the mirror, not the mailbox, as at fault.
+mirror's own built-in test mails (the canaries, one for every path a mail
+takes through it), and in their time: that mail is a placeholder at once,
+and the mirror is as healthy as before. WRITING — the ledger, the indexes,
+the blobs — never fails on a mail's account. A reader that cannot read the
+canaries either, or is too slow for them, and any failure in writing, is a
+fault of the mirror itself, and must not be absorbed mail by mail: the pass
+ends, no mail is set aside over it, no mark moves past a mail that has
+neither a record nor a place — so the mail is read again wherever it is by
+then, also after a restart — and ``/health`` reports the mirror, not the
+mailbox, as at fault. Such a fault delays only the work it was in: new mail
+is followed at every poll unless following it is what fails.
 
 How the poll stays cheap: a **mailbox index** (sqlite, on the state volume)
 maps folder / UID ↔ Message-ID ↔ ledger record. New mail is the UIDs above a
@@ -156,14 +165,20 @@ import email.utils
 import hashlib
 import hmac
 import imaplib
+import io
 import json
 import os
+import pickle
 import re
 import select
+import signal
 import smtplib
 import socket
 import sqlite3
 import ssl
+import struct
+import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -365,11 +380,71 @@ MAX_NESTING = 200
 # mirror fetches would for an hour. (A line that begins like a long boundary
 # costs up to the boundary's length to compare: counted as one more line per
 # 64 bytes.) A mail that asks for more than this many tests is a placeholder:
-# the worst mail still read takes under six seconds on 3.12 and three on
-# 3.13, flat or at any depth. No mail a client makes comes near — one of the
-# largest size fetched, all of it base64, may still nest thirty levels.
+# the worst mail still read, as far as this bound goes, takes under six
+# seconds on 3.12 and three on 3.13, flat or at any depth (the slowest mail
+# of all is another: see MAIL_READ_SECONDS). No mail a client makes comes
+# near — one of the largest size fetched, all of it base64, may still nest
+# thirty levels.
 MAX_PARSE_WORK = 50_000_000
 PARSE_LINE_COST = 4
+# The parameters of those two fields. MAX_FIELD_BYTES bounds one field, not
+# the sum over the parts a mail may have: the parser's parameter splitter
+# counts the quotes before every ";" it meets — once more from the start of
+# the field for each on Python 3.12, a step of its own for each on 3.13 — and
+# the reader asks it up to three times a part (file name, charset, boundary).
+# So a field costs its semicolons times its length, with what a step costs
+# at all counted as PARAMETER_STEP_COST characters more, summed as the parser
+# takes the fields off the mail: 6,000 parts with two fields of 4,000
+# semicolons each (49 MB) held the poll for 131 seconds on 3.12. A mail that
+# asks for more than this is a placeholder; the worst still read takes under
+# four seconds on either version. Two hundred attachments under the longest
+# names, or fifty thousand parts that each name a charset, come to a
+# thirtieth of it.
+MAX_PARAMETER_WORK = 1_000_000_000
+PARAMETER_STEP_COST = 256
+# The time reading one mail may take, on the wall clock: the bound for what
+# the bounds above do not know of. Each of them closes one way a mail made
+# the standard library's mail code spend the square of something its sender
+# chose (the parser's boundary tests, its parameter splitter, the re-folding
+# of a nested mail's header, the decoder of encoded words), and each was
+# found only when a mail of some hundred kilobytes had held the mirror's one
+# thread for a minute. The next such path is not known yet, so the reading
+# as a whole has a deadline, kept two ways (read_mail, Reader): the reader's
+# own code looks at the clock wherever it is entered — for every header
+# field and part the parser takes up, every part walked, before the trim —
+# and the reading runs in a process of its own, which is ended when a single
+# call into the library outlasts the deadline (the looks at the clock alone
+# left two of the three paths found last to run their 52 and 139 seconds).
+# Either way the mail is a placeholder ("took too long to read"), as for any
+# other failure of its own.
+#
+# A mail gets MAIL_READ_SECONDS, and READ_SECONDS_PER_MB more for each
+# megabyte fetched. Measured, on Python 3.12 and 3.13 alike: an ordinary
+# mail reads in a millisecond; the trim's own bounds make the heaviest text
+# a second, whatever its size (a megabyte of HTML); an attachment costs
+# 25 ms a megabyte. The slowest mail the bounds above let through is not
+# one of these: well-formed parts by the thousand, each under a file name
+# in encoded words, read at some 0.9 s a megabyte (14 s for 16 MB) — which
+# is what the second a megabyte is for, and why the flat thirty alone would
+# not do. So the deadline is thirty times what the heaviest honest mail
+# needs and ten thousand times what an ordinary one does — and it must not
+# turn a slow machine into a mailbox of placeholders: after a mail ran out
+# of time the canaries are read against the clock too, with CANARY_SECONDS
+# for their five milliseconds. That is a far smaller multiple of what they
+# need, so on a machine slow enough to time out ordinary mail the canaries
+# time out first, and that is the mirror's fault, not a mail's (read_mail):
+# nothing is set aside. Only the heaviest mail can run out of time while the
+# canaries still read, on a machine thirty times too slow: a placeholder
+# each, read again like every placeholder at start and every hour — and
+# MAIL_READ_SECONDS is the setting for such a machine.
+READ_SECONDS = _env_float("MAIL_READ_SECONDS", 30.0, 1.0)
+READ_SECONDS_PER_MB = 1.0
+CANARY_SECONDS = READ_SECONDS / 10
+# How much longer than its deadline the reader process is waited for before
+# it is ended (it answers for itself when its own code sees the clock), and
+# how long a new one may take to start.
+READER_GRACE_SECONDS = 5.0
+READER_START_SECONDS = 60.0
 # The text a record carries (kb:text) — one literal on one line, read by
 # every reader of the record. The trim leaves a long mail long; the whole of
 # it is in the body blob either way, and "Original" shows it.
@@ -468,6 +543,15 @@ MAIL_RAIL_TEXT_CHARS = 64 * 1024
 # How many mails one poll looks for again (after a UIDVALIDITY change, a
 # rebuilt index, or because they left their folder) before it yields.
 RELOCATE_BATCH = 200
+# How many mails whose record is gone from the ledger one poll looks for by
+# their Message-ID (Mirror._read_lost): each is a search of three folders
+# and a mail read whole, and a ledger restored from an old backup may lose
+# thousands at once.
+LOST_BATCH = 50
+# How often such an id is looked for (at the set-aside back-off) before what
+# was found of it is read as mail nothing is known of, and the id leaves the
+# list: none is looked for for ever.
+LOST_TRIES = 8
 # A mail whose Message-ID the server cannot be searched for is looked for by
 # reading the headers of the mails in the folder that have no place yet and
 # are not older than it (a copy or a move keeps a mail's arrival time, or
@@ -488,6 +572,14 @@ ARRIVAL_SLACK_SECONDS = 3600.0
 # Mail that was set aside (mirrored as a placeholder) is read again at start
 # and then this often (Mirror._retry_set_aside).
 SET_ASIDE_RETRY_SECONDS = 3600.0
+# How long one such round may read (Mirror._retry_set_aside): reading a
+# placeholder again can take as long as its mail may (READ_SECONDS).
+SET_ASIDE_ROUND_SECONDS = 120.0
+# After a fault of the mirror's own, what failed waits one poll interval, then
+# twice as long after each further one in a row, up to this (_fault_wait) —
+# and only what failed: new mail is followed every interval unless following
+# it is what fails (_loop_step).
+MIRROR_FAULT_WAIT_MAX_SECONDS = 3600.0
 
 
 def _policy_path() -> Path:
@@ -560,9 +652,10 @@ def _health_snapshot() -> dict:
         # Set while what holds the mirror is not the mailbox — "policy": it
         # waits for the e-mail policy file, a matter of the deployment's
         # setup; "mirror": it stopped on a fault of its own (it cannot read
-        # or write mail — see Mirror._ingest). Not connected, then, is no
-        # word on the IMAP login, and whoever words an alert reads this
-        # first (gateway-monitor.py).
+        # or write mail — see Mirror._ingest), in all its work or in the
+        # part of it the error names. Not connected, then, is no word on
+        # the IMAP login, and whoever words an alert reads this first
+        # (gateway-monitor.py).
         "blocked": state["blocked"] if configured and MAIL_CONFIG is not None else None,
         # Whether a mail can leave through this gateway at all, and if not,
         # why — one sentence a chat can show. Not "is it connected": a
@@ -578,6 +671,17 @@ def _health_snapshot() -> dict:
         # to such a mail starts a chat of its own.
         "rewritten_message_ids": MIRROR.rewritten() if MIRROR is not None else 0,
         "backfill": backfill,
+        # Mail mirrored as placeholders: how many stand, how many were made
+        # since this start, and why — each a mail's own fault by the canary
+        # rule, and a run of them is to be seen here whatever the cause
+        # (the gateway monitor reads it, and says so).
+        "placeholders": (MIRROR.placeholders() if MIRROR is not None
+                         else {"standing": 0, "made": 0, "why": {}}),
+        # Mail whose record is gone from the ledger (restored from an older
+        # backup, a file lost) and that is still looked for in the mailbox
+        # by its Message-ID: how many. Until one is found it is in no chat
+        # (the gateway monitor reads this beside the placeholders).
+        "lost": MIRROR.lost() if MIRROR is not None else 0,
         "last_poll": state["last_poll"],
         "build": _build.build_info(),
     }
@@ -636,18 +740,70 @@ _UNFOLD_RE = re.compile(r"\r?\n(?=[ \t])")
 _HEADER_END_RE = re.compile(rb"\r?\n\r?\n")
 
 
+# Why a mail is a placeholder, in the few words /health counts them under
+# (Mirror.placeholders): one of these, or the name of what the reader raised.
+OVER_A_BOUND = "asks for more than a mail may"
+TOO_SLOW = "took too long to read"
+READER_ENDED = "the reader process ended on it"
+
+
 class UnreadableMail(Exception):
     """A mail the reader can make nothing of, by a fault that is the mail's:
     it asks for more than a mail may (MAX_PARSED_PARTS, MAX_NESTING,
-    MAX_PARSE_WORK), or the reader failed on it and still reads the canary
-    (:func:`read_mail`). It is mirrored as a placeholder."""
+    MAX_PARSE_WORK, MAX_PARAMETER_WORK), or the reader failed on it — an
+    error, or its time ran out — and still reads the canaries
+    (:func:`read_mail`). It is mirrored as a placeholder. ``kind`` is the
+    reason in a few words, for the count on /health."""
+
+    def __init__(self, why: str, kind: str = OVER_A_BOUND):
+        super().__init__(why)
+        self.kind = kind
 
 
 class MirrorFault(Exception):
-    """The mirror itself does not work: its reader fails on the canary too,
-    or a mail could not be written. No mail is set aside over it — the pass
-    ends, and /health reports the mirror as at fault (``blocked: "mirror"``).
-    The message is what /health reports, so it is written for the operator."""
+    """The mirror itself does not work: its reader fails on the canaries
+    too, or is too slow for them, or a mail could not be written. No mail is
+    set aside over it — the pass ends, and /health reports the mirror as at
+    fault (``blocked: "mirror"``). The message is what /health reports, so
+    it is written for the operator."""
+
+
+class TookTooLong(BaseException):
+    """The reading in hand is past its deadline (see READ_SECONDS). Not an
+    ``Exception``: the reader catches those part by part and field by field,
+    and time that is up is up for the whole mail."""
+
+
+# When the reading in hand must be done, on the monotonic clock; None while
+# nothing is being read against the clock. One reading at a time: the mirror
+# has one thread, and the reader process reads one mail.
+_READ_UNTIL: float | None = None
+
+
+class _within:
+    """``with _within(seconds):`` — what runs inside is a reading that must
+    be done in that time. Its own code asks :func:`_tick`."""
+
+    def __init__(self, seconds: float):
+        self.seconds = seconds
+
+    def __enter__(self):
+        global _READ_UNTIL
+        _READ_UNTIL = time.monotonic() + self.seconds
+        return self
+
+    def __exit__(self, *_exc):
+        global _READ_UNTIL
+        _READ_UNTIL = None
+
+
+def _tick() -> None:
+    """Called wherever the reader's own code is entered in the course of one
+    reading; raises :class:`TookTooLong` once the reading is past its
+    deadline. A call into the standard library that does not come back is
+    not interrupted by this — that is what the reader process is for."""
+    if _READ_UNTIL is not None and time.monotonic() > _READ_UNTIL:
+        raise TookTooLong("its reading was not done in time")
 
 
 @dataclass
@@ -744,6 +900,25 @@ def _raw_header(msg, name: str) -> str:
 
 _ENCODED_WORD_RE = re.compile(r"=\?[^?\s]+\?[bBqQ]\?[^?\s]*\?=")
 _BETWEEN_WORDS_RE = re.compile(r"(\?=)[ \t]+(?==\?[^?\s]+\?[bBqQ]\?)")
+# Where the standard decoder takes an encoded word to begin — it is laxer
+# about a word than _ENCODED_WORD_RE: any charset, any text up to "?=".
+_WORD_START_RE = re.compile(r"=\?[^?]*\?[bBqQ]\?")
+
+
+def _words_end(value: str) -> bool:
+    """Whether every encoded word the standard decoder would take up in
+    ``value`` also ends, on the line it begins on.
+
+    From one that does not, its pattern reads on to the end of the line
+    before it gives up, and then begins again at the next: a line of such
+    beginnings costs it the square of their number — 52 seconds for a
+    Subject of 250 kB, and a part's file name goes through the same call."""
+    for line in value.splitlines():
+        if "=?" in line:
+            last_end = line.rfind("?=")
+            if any(word.end() > last_end for word in _WORD_START_RE.finditer(line)):
+                return False
+    return True
 
 
 def _decode_word(match) -> str:
@@ -758,8 +933,13 @@ def _decode_words(value: str) -> str:
     """RFC 2047 encoded words decoded; never raises on a malformed one. The
     words name their own charset, so each is read through _charset and what
     comes back is scrubbed."""
+    _tick()
     try:
-        # As email_client._decode reads a header, but for the codec.
+        # As email_client._decode reads a header, but for the codec — and
+        # only where the standard decoder takes time in proportion: a value
+        # with a word that never ends is read word by word, below.
+        if not _words_end(value):
+            raise ValueError("an encoded word that does not end")
         out = []
         for chunk, charset in email.header.decode_header(value):
             if isinstance(chunk, bytes):
@@ -873,6 +1053,7 @@ def _parameter(msg, name: str, header: str = "content-type") -> str:
     not parse. An RFC 2231 value states its own charset; it is collapsed here
     (as ``email.utils.collapse_rfc2231_value`` would, but through _charset),
     which is why ``get_filename`` and ``get_content_charset`` are not used."""
+    _tick()
     try:
         value = msg.get_param(name, None, header)
         if isinstance(value, tuple) and len(value) == 3:
@@ -939,6 +1120,7 @@ def _collect(part, mail: Mail, texts: dict, depth: int = 0) -> None:
     message is one part, kept whole: its own bodies are not this mail's.
     A leaf beyond the cap, below the depth any client writes, or that cannot
     be read at all is counted, not kept — and never costs the mail the rest."""
+    _tick()
     if depth > 40:
         _drop_part(mail)
         return
@@ -992,21 +1174,46 @@ def _collect_leaf(part, payload, maintype: str, mail: Mail, texts: dict) -> None
 
 
 _STRUCTURED_FIELDS = frozenset({"content-type", "content-disposition"})
+_LINE_END_RE = re.compile(r"\r\n|\r|\n")
 
 
 class _BoundedPolicy(email.policy.Compat32):
     """The lenient legacy policy, with a Content-Type or Content-Disposition
-    field cut to MAX_FIELD_BYTES as the parser takes it off the mail.
+    field cut to MAX_FIELD_BYTES as the parser takes it off the mail, and
+    what the parameters of all those fields cost to parse counted against
+    MAX_PARAMETER_WORK (``spent``: one parse's count, see _parse_bytes).
 
     Cut here and not in the raw bytes: only the parser knows where a header
     field is — the mail's own block, a part's, a nested mail's — and whatever
     it does not read as one is content, to be kept byte for byte."""
 
+    spent = None
+
     def header_source_parse(self, sourcelines):
+        _tick()
         name, value = super().header_source_parse(sourcelines)
-        if len(value) > MAX_FIELD_BYTES and name.lower() in _STRUCTURED_FIELDS:
-            value = value[:MAX_FIELD_BYTES].rstrip("\r\n\t ")
+        if name.lower() in _STRUCTURED_FIELDS:
+            if len(value) > MAX_FIELD_BYTES:
+                value = value[:MAX_FIELD_BYTES].rstrip("\r\n\t ")
+            if self.spent is not None:
+                self.spent[0] += value.count(";") * (len(value) + PARAMETER_STEP_COST)
+                if self.spent[0] > MAX_PARAMETER_WORK:
+                    raise UnreadableMail("the parameters of its Content-Type and "
+                                         "Content-Disposition fields: more work than one "
+                                         "mail may ask for")
         return name, value
+
+    # A nested mail is written back for its part (Message.as_bytes) field by
+    # field as it was read, with the line ends the rest of it is written
+    # with. The legacy policy would wrap every field anew, and its wrapping
+    # takes time with the square of the line breaks a value holds — to it, a
+    # form feed is one: 28 seconds for a nested Subject of 2 MB, 139 for 4.
+    def fold(self, name, value):
+        _tick()
+        return f"{name}: {_LINE_END_RE.sub(self.linesep, str(value))}{self.linesep}"
+
+    def fold_binary(self, name, value):
+        return self.fold(name, value).encode("ascii", "surrogateescape")
 
 
 _BOUNDED = _BoundedPolicy()
@@ -1016,9 +1223,9 @@ def _parse_bytes(raw: bytes):
     """Bytes to a message, by the lenient legacy parser — which never raises
     on a malformed header — with what it may be asked to do bounded: the two
     fields whose parameters are parsed (_BoundedPolicy), the number of parts
-    it builds, how deep they nest and the work that nesting costs it
-    (:class:`UnreadableMail` beyond MAX_PARSED_PARTS, MAX_NESTING or
-    MAX_PARSE_WORK)."""
+    it builds, how deep they nest, the work that nesting costs it and the
+    work their parameters do (:class:`UnreadableMail` beyond
+    MAX_PARSED_PARTS, MAX_NESTING, MAX_PARSE_WORK or MAX_PARAMETER_WORK)."""
     made = 0
     # What one level of nesting costs: a test of every line (MAX_PARSE_WORK).
     # The parser ends a line at CR, LF or CRLF.
@@ -1034,6 +1241,7 @@ def _parse_bytes(raw: bytes):
         # parser's stack. (The stack is the parser's own business; without
         # it this raises on every mail, the canary included, which is loud.)
         nonlocal made
+        _tick()
         made += 1
         if made > MAX_PARSED_PARTS:
             raise UnreadableMail(f"more than {MAX_PARSED_PARTS} MIME parts")
@@ -1046,8 +1254,10 @@ def _parse_bytes(raw: bytes):
         return email.message.Message(policy=policy)
 
     # As email.message_from_bytes does it, but for the parser kept in hand.
-    parser = email.feedparser.BytesFeedParser(policy=_BOUNDED.clone(message_factory=part))
+    parser = email.feedparser.BytesFeedParser(
+        policy=_BOUNDED.clone(message_factory=part, spent=[0]))
     for start in range(0, len(raw), 8192):
+        _tick()
         parser.feed(raw[start:start + 8192])
     return parser.close()
 
@@ -1061,6 +1271,19 @@ def _head_and_rest(raw: bytes) -> tuple[bytes, bytes]:
         head = head[:MAX_HEADER_BYTES]
         head = head[:head.rfind(b"\n") + 1].rstrip(b"\r\n")
     return head, rest
+
+
+def _head_of(raw: bytes) -> bytes:
+    """A raw mail's header block (:func:`_head_and_rest`). Never raises."""
+    try:
+        return _head_and_rest(raw)[0]
+    except Exception:  # noqa: BLE001
+        return bytes(raw[:MAX_HEADER_BYTES])
+
+
+def _head_text(head: bytes) -> str:
+    """A header block as a record keeps it (kb:headerPart)."""
+    return head.decode("utf-8", errors="replace").replace("\r\n", "\n")
 
 
 def _read_ids(msg, mail: Mail) -> None:
@@ -1137,11 +1360,13 @@ def parse_mail(raw: bytes, internal_date: float | None = None) -> Mail:
     later than that. What the mail may ask of the reader is bounded before it
     is parsed (the header block, MAX_HEADER_BYTES), as it is parsed (a
     structured field, MAX_FIELD_BYTES; the number of parts, their nesting
-    and the work it costs: MAX_PARSED_PARTS, MAX_NESTING, MAX_PARSE_WORK)
-    and while it is read (MAX_PARTS, the ids, the addresses); a mail that
-    asks for more than can be parsed raises :class:`UnreadableMail` and is
-    the caller's to set aside. Anything else it raises is not yet known to
-    be the mail's fault: the mirror reads through :func:`read_mail`."""
+    and the work it costs: MAX_PARSED_PARTS, MAX_NESTING, MAX_PARSE_WORK,
+    MAX_PARAMETER_WORK) and while it is read (MAX_PARTS, the ids, the
+    addresses) — and by the clock, where the reading has a deadline
+    (:func:`_tick`). A mail that asks for more than can be parsed raises
+    :class:`UnreadableMail` and is the caller's to set aside. Anything else
+    it raises is not yet known to be the mail's fault: the mirror reads
+    through :func:`read_mail`."""
     head, rest = _head_and_rest(raw)
     msg = _parse_bytes(head + rest)
     mail = Mail(message_id=_identify(msg, head), arrived=internal_date)
@@ -1161,7 +1386,7 @@ def parse_mail(raw: bytes, internal_date: float | None = None) -> Mail:
     mail.bulk = _is_bulk(msg, mail.list_id)
     mail.resent = _is_resent(msg)
     mail.date = _read_date(msg, internal_date)
-    mail.headers = head.decode("utf-8", errors="replace").replace("\r\n", "\n")
+    mail.headers = _head_text(head)
     texts: dict = {"text/plain": [], "text/html": []}
     _collect(msg, mail, texts)
     if texts["text/plain"]:
@@ -1181,19 +1406,16 @@ def stub_mail(raw: bytes, internal_date: float | None, reason: str) -> Mail:
     each field on its own, and a field that will not read is left out. The
     id is the one the whole mail would have had, so the mail is still one
     record however many folders hold it, and is followed like any other."""
-    try:
-        head = _head_and_rest(raw)[0]
-    except Exception:  # noqa: BLE001
-        head = bytes(raw[:MAX_HEADER_BYTES])
+    head = _head_of(raw)
     try:
         msg = _parse_bytes(head + b"\r\n\r\n")
         mail = Mail(message_id=_identify(msg, head))
     except Exception:  # noqa: BLE001 - not even its headers: an id of its bytes
         msg = None
-        mail = Mail(message_id=f"{hashlib.sha256(head).hexdigest()[:32]}@{_SYNTHETIC_DOMAIN}")
+        mail = Mail(message_id=_bare_id(head))
     mail.unreadable = reason
     mail.arrived = mail.date = internal_date
-    mail.headers = head.decode("utf-8", errors="replace").replace("\r\n", "\n")
+    mail.headers = _head_text(head)
 
     def sender():
         found = _addresses(msg, "From") or _addresses(msg, "Sender")
@@ -1218,16 +1440,51 @@ def stub_mail(raw: bytes, internal_date: float | None, reason: str) -> Mail:
     return mail
 
 
+def _bare_id(head: bytes) -> str:
+    """The id of a mail of which not even the header block could be read: one
+    of its bytes. It needs no reading to be had again — a move keeps a header
+    block byte for byte — so a mail on record under it is found again
+    whatever the reader does (Mirror._find)."""
+    return f"{hashlib.sha256(head).hexdigest()[:32]}@{_SYNTHETIC_DOMAIN}"
+
+
+def _bare_stub(head: bytes, internal_date: float | None, reason: str) -> Mail:
+    """A placeholder for a mail of which not even the header block could be
+    read (see read_stub): nothing of it is parsed. Its id is one of its
+    bytes, and its header block is still what "Original" shows."""
+    return Mail(message_id=_bare_id(head), unreadable=reason, arrived=internal_date,
+                date=internal_date, headers=_head_text(head))
+
+
+def _head_facts(head: bytes) -> dict:
+    """What the mirror asks of a header block alone, to find a mail again:
+    the id the mail is mirrored under, its Message-ID field as it stands,
+    whether it was sent on as it stood (see read_head), and the address it
+    is From (None where there is none that reads — which takes nothing of
+    the rest)."""
+    msg = _parse_bytes(head + b"\r\n\r\n")
+    try:
+        sender = (_addresses(msg, "From") or _addresses(msg, "Sender") or [(None, None)])[0][0]
+    except Exception:  # noqa: BLE001 - left out, as stub_mail leaves it out
+        sender = None
+    return {"id": _identify(msg, head), "message_id": _raw_header(msg, "Message-ID"),
+            "resent": _is_resent(msg), "sender": sender}
+
+
 # What a placeholder's bubble says. The mail's sender and time are on the
 # record beside it, and its header block is what "Original" shows.
 UNREADABLE_TEXT = ("This mail could not be shown here: the mail gateway could not read it. "
                    "It is unchanged in the mailbox.")
 
-# The canary: a mail known to be good, with everything in it the reader has
-# a step for — encoded words, a thread, two bodies in two encodings, a
-# quoted reply for the trim, an attachment. When reading a mail fails, the
-# same reading is run on this one, and that decides whose fault it was
-# (read_mail). It is never mirrored.
+# The canaries: mails known to be good, with everything in them the reader
+# has a step for. When reading a mail fails, the same reading is run on
+# these, and that decides whose fault it was (read_mail). Every path a mail
+# can take through the reader is taken by one of them — a fault of the
+# mirror's own on a path no canary takes would be laid at the door of every
+# mail that takes it. They are never mirrored.
+#
+# The first: encoded words, a thread, two bodies in two encodings, a quoted
+# reply for the trim, an attachment.
 CANARY_MAIL = (
     b"From: =?utf-8?q?The_Canary?= <canary@canary.mail.invalid>\r\n"
     b"To: mirror@canary.mail.invalid\r\n"
@@ -1262,22 +1519,373 @@ CANARY_MAIL = (
     b"\r\n"
     b"Y2FuYXJ5\r\n"
     b"--outer--\r\n")
+# The second: HTML and nothing else, so its reading text is the converter's
+# (beside a plain part that reads, the trim never consults the HTML one) —
+# under a charset that is not UTF-8, and a Subject folded after an encoded
+# word in a third.
+CANARY_HTML_MAIL = (
+    b"From: canary@canary.mail.invalid\r\n"
+    b"To: mirror@canary.mail.invalid\r\n"
+    b"Subject: =?iso-8859-1?q?Gr=FC=DFe?= from\r\n"
+    b" the canary\r\n"
+    b"Date: Thu, 01 Jan 2026 12:00:00 +0000\r\n"
+    b"Message-ID: <page@canary.mail.invalid>\r\n"
+    b"MIME-Version: 1.0\r\n"
+    b"Content-Type: text/html; charset=windows-1252\r\n"
+    b"Content-Transfer-Encoding: quoted-printable\r\n"
+    b"\r\n"
+    b"<html><head><style>p { color: red }</style></head><body>\r\n"
+    b"<p>Only <b>HTML</b> here =97 the converter works.</p>\r\n"
+    b"<ul><li>one</li><li>two</li></ul>\r\n"
+    b"</body></html>\r\n")
+# The third: an inline image beside the HTML that shows it, and a nested
+# mail — written back for its part field by field (_BoundedPolicy.fold) —
+# under a file name spelled the RFC 2231 way.
+CANARY_FORWARD_MAIL = (
+    b"From: canary@canary.mail.invalid\r\n"
+    b"To: mirror@canary.mail.invalid\r\n"
+    b"Subject: Fwd: Still singing?\r\n"
+    b"Date: Thu, 01 Jan 2026 12:00:00 +0000\r\n"
+    b"Message-ID: <forward@canary.mail.invalid>\r\n"
+    b"MIME-Version: 1.0\r\n"
+    b"Content-Type: multipart/mixed; boundary=\"mixed\"\r\n"
+    b"\r\n"
+    b"--mixed\r\n"
+    b"Content-Type: multipart/related; boundary=\"related\"\r\n"
+    b"\r\n"
+    b"--related\r\n"
+    b"Content-Type: text/html; charset=utf-8\r\n"
+    b"\r\n"
+    b"<p>The mail below, under our sign <img src=\"cid:sign@canary.mail.invalid\">.</p>\r\n"
+    b"--related\r\n"
+    b"Content-Type: image/png\r\n"
+    b"Content-ID: <sign@canary.mail.invalid>\r\n"
+    b"Content-Disposition: inline\r\n"
+    b"Content-Transfer-Encoding: base64\r\n"
+    b"\r\n"
+    b"iVBORw0KGgoAAAANSUhEUgAAAAgAAAAICAYAAAA=\r\n"
+    b"--related--\r\n"
+    b"--mixed\r\n"
+    b"Content-Type: message/rfc822\r\n"
+    b"Content-Disposition: attachment; filename*=utf-8''fr%C3%BCher.eml\r\n"
+    b"\r\n"
+    b"From: mirror@canary.mail.invalid\r\n"
+    b"Subject: Still\r\n"
+    b"\tsinging?\r\n"
+    b"Message-ID: <question@canary.mail.invalid>\r\n"
+    b"\r\n"
+    b"Still singing?\r\n"
+    b"--mixed--\r\n")
+
+
+def _canary_answer(mail: Mail) -> bool:
+    return (mail.message_id == "answer@canary.mail.invalid" and len(mail.parts) == 1
+            and "the reader works" in (mail.plain or "") and bool(mail.reading[0]))
+
+
+def _canary_page(mail: Mail) -> bool:
+    text = mail.reading[0]
+    return (mail.subject == "Grüße from the canary" and mail.plain is None
+            and "Only HTML here — the converter works." in text
+            and "one" in text and "two" in text and "<" not in text and "color" not in text)
+
+
+def _canary_forward(mail: Mail) -> bool:
+    kinds = [(part.content_type, part.file_name, part.content_id, part.inline_image)
+             for part in mail.parts]
+    return (kinds == [("image/png", None, "sign@canary.mail.invalid", True),
+                      ("message/rfc822", "früher.eml", None, False)]
+            and mail.parts[0].data.startswith(b"\x89PNG")
+            and b"Subject: Still\n\tsinging?\n" in mail.parts[1].data
+            and mail.parts[1].data.endswith(b"\n\nStill singing?")
+            and "The mail below, under our sign" in mail.reading[0])
+
+
+_CANARIES = ((CANARY_MAIL, _canary_answer), (CANARY_HTML_MAIL, _canary_page),
+             (CANARY_FORWARD_MAIL, _canary_forward))
 
 
 def _reading(raw: bytes, internal_date: float | None) -> Mail:
     """All of READING one mail: the parse, the walk of its parts, and the
     trim of its text. Nothing in here writes, and nothing outside it reads."""
     mail = parse_mail(raw, internal_date)
+    _tick()
     mail.reading = Mirror._reading_text(mail)
     return mail
 
 
 def _read_canary() -> None:
-    """Read the canary; raises unless the reader makes of it what it is."""
-    mail = _reading(CANARY_MAIL, None)
-    if (mail.message_id != "answer@canary.mail.invalid" or len(mail.parts) != 1
-            or "the reader works" not in (mail.plain or "") or not mail.reading[0]):
-        raise ValueError("the reader misread the mirror's own test mail")
+    """Read the canaries; raises unless the reader makes of each what it is."""
+    for raw, read_right in _CANARIES:
+        if not read_right(_reading(raw, None)):
+            raise ValueError("the reader misread the mirror's own test mail")
+
+
+# ── The reader process ────────────────────────────────────────────────────────
+# The deadline on reading one mail (READ_SECONDS) is kept by the reader's own
+# looks at the clock wherever it can be — and those cannot end one call into
+# the standard library that does not come back, which is what two of the
+# three slow paths found last were: one regular expression over a Subject,
+# one header written back. Nothing in a thread ends such a call. A process
+# can be ended, so the running gateway reads its mail in one: this same
+# script, started with READER_FLAG, taking mails on its standard input and
+# answering on a pipe of its own (its standard output stays the log's, as
+# whatever a module prints when it is loaded expects). It costs a second interpreter (0.2 s to
+# start) and each mail's bytes across two pipes (nothing to speak of for an
+# ordinary mail; 0.2 s on the second a mail of 41 MB takes to read); it buys
+# a bound nothing a mail holds can get round.
+#
+#   gateway → reader   kind (M: a mail; C: read the canaries; S: a stub of
+#                      this header block; F: the facts of this header
+#                      block), the seconds it may take, a length and an
+#                      arrival time; that many bytes
+#   reader → gateway   H once, when it is ready; then per request a status,
+#                      a length and that many bytes:
+#                        M  the mail as read, or its stub; F its facts
+#                           (pickled, built-in types only)
+#                        K  the canaries read
+#                        U  refused by a bound: (kind, why)
+#                        T  its own look at the clock: out of time
+#                        E  the reader raised: (what, why)
+#
+# The reader is given none of the gateway's secrets: it reads text from
+# outside, and needs nothing but that text.
+
+READER_FLAG = "--reader"
+_REQUEST = struct.Struct("!cdQd")
+_ANSWER = struct.Struct("!cQ")
+_SECRET_NAME_RE = re.compile(r"PASS|TOKEN|SECRET|KEY", re.IGNORECASE)
+
+
+class ReaderDown(OSError):
+    """The reader process cannot be started or does not come up: like a full
+    disk, the mirror's surroundings failing — no mail is at fault, and the
+    pass ends (see _ENVIRONMENT)."""
+
+
+class _ReadFailed(Exception):
+    """What the reader process raised on a mail, by name — or that it ended."""
+
+    def __init__(self, what: str, why: str):
+        super().__init__(f"{what}: {why}" if why else what)
+        self.kind = what
+
+
+def _mail_from(plain: dict) -> Mail:
+    return Mail(**{**plain, "parts": [Part(**part) for part in plain["parts"]]})
+
+
+class _PlainUnpickler(pickle.Unpickler):
+    """Reads what the reader process answers: built-in types and nothing
+    else, whatever became of that process while it read text from outside."""
+
+    def find_class(self, module, name):
+        raise pickle.UnpicklingError(f"the reader's answer names {module}.{name}")
+
+
+def _unpickled(answer: bytes):
+    return _PlainUnpickler(io.BytesIO(answer)).load()
+
+
+def _serve_reader(answer_fd: int) -> None:
+    """The reader process: read each mail the gateway sends, within the time
+    it names, and answer on ``answer_fd``. Ends when the gateway closes the
+    pipe, or is gone."""
+    requests = sys.stdin.buffer
+    answers = os.fdopen(answer_fd, "wb")
+    # (The alarm set below must end this process, whatever it inherited.)
+    signal.signal(signal.SIGALRM, signal.SIG_DFL)
+    try:
+        _read_canary()      # everything the reading imports and compiles, once
+    except Exception:  # noqa: BLE001 - said when the gateway asks for the canaries
+        pass
+    answers.write(_ANSWER.pack(b"H", 0))
+    answers.flush()
+    while True:
+        head = requests.read(_REQUEST.size)
+        if len(head) < _REQUEST.size:
+            return
+        kind, seconds, length, date = _REQUEST.unpack(head)
+        raw = requests.read(length)
+        if len(raw) < length:
+            return
+        # Should the gateway be gone by then, or this process never get back
+        # to its own code: the alarm's default action ends it, in whatever
+        # call it is. (The gateway itself stops waiting sooner.)
+        signal.setitimer(signal.ITIMER_REAL, seconds + 2 * READER_GRACE_SECONDS)
+        try:
+            with _within(seconds):
+                if kind == b"C":
+                    _read_canary()
+                    status, answer = b"K", b""
+                elif kind == b"F":
+                    status, answer = b"F", pickle.dumps(_head_facts(raw))
+                else:
+                    date = None if date != date else date
+                    mail = stub_mail(raw, date, "") if kind == b"S" else _reading(raw, date)
+                    status, answer = b"M", pickle.dumps(
+                        {**vars(mail), "parts": [vars(part) for part in mail.parts]},
+                        protocol=pickle.HIGHEST_PROTOCOL)
+        except UnreadableMail as exc:
+            status, answer = b"U", pickle.dumps((exc.kind, str(exc)))
+        except TookTooLong:
+            status, answer = b"T", b""
+        except Exception as exc:  # noqa: BLE001 - RecursionError and MemoryError are among them
+            traceback.print_exc(limit=-8, file=sys.stderr)
+            status, answer = b"E", pickle.dumps((type(exc).__name__, str(exc)[:300]))
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        answers.write(_ANSWER.pack(status, len(answer)))
+        answers.write(answer)
+        answers.flush()
+        raw = mail = answer = None      # nothing of a mail is held while it waits
+
+
+class Reader:
+    """The gateway's side of the reader process: start it, hand it a mail,
+    wait for the answer no longer than the mail's deadline allows — and end
+    it when it does not answer. A process that was ended, or ended by
+    itself, is replaced when the next reading needs one."""
+
+    def __init__(self, command=None):
+        # (The number of the pipe it answers on is added as the last argument.)
+        self._command = command or [sys.executable, str(Path(__file__).resolve()), READER_FLAG]
+        self._process = None
+        self._answers = None    # the reading end of that pipe
+
+    def close(self) -> None:
+        process, self._process = self._process, None
+        answers, self._answers = self._answers, None
+        if answers is not None:
+            os.close(answers)
+        if process is None:
+            return
+        try:
+            process.kill()
+            process.wait(timeout=READER_GRACE_SECONDS)
+        except Exception:  # noqa: BLE001 - it is being dropped either way
+            pass
+        try:
+            process.stdin.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _start(self) -> None:
+        self.close()
+        try:
+            self._answers, theirs = os.pipe()
+            try:
+                self._process = subprocess.Popen(
+                    [*self._command, str(theirs)], stdin=subprocess.PIPE, bufsize=0,
+                    pass_fds=(theirs,),
+                    env={name: value for name, value in os.environ.items()
+                         if not _SECRET_NAME_RE.search(name)})
+            finally:
+                os.close(theirs)
+            os.set_blocking(self._process.stdin.fileno(), False)
+            status, _length = _ANSWER.unpack(self._receive(
+                _ANSWER.size, time.monotonic() + READER_START_SECONDS))
+        except (OSError, ValueError, struct.error, TookTooLong, _ReadFailed) as exc:
+            self.close()
+            raise ReaderDown("the mail reader process could not be started (" + (
+                "it ended before it was ready" if isinstance(exc, _ReadFailed)
+                else f"{type(exc).__name__}: {exc}") + ")") from exc
+        if status != b"H":
+            self.close()
+            raise ReaderDown("the mail reader process did not come up as one")
+
+    def _send(self, data: bytes, until: float) -> None:
+        fd, view = self._process.stdin.fileno(), memoryview(data)
+        while view:
+            left = until - time.monotonic()
+            if left <= 0:
+                raise TookTooLong("the reader process did not take it in time")
+            if not select.select([], [fd], [], left)[1]:
+                continue
+            try:
+                view = view[os.write(fd, view[:1 << 20]):]
+            except BlockingIOError:
+                continue
+            except OSError as exc:
+                raise _ReadFailed(READER_ENDED, str(exc)) from exc
+
+    def _receive(self, length: int, until: float) -> bytes:
+        fd, got = self._answers, bytearray()
+        while len(got) < length:
+            left = until - time.monotonic()
+            if left <= 0:
+                raise TookTooLong("the reader process did not answer in time")
+            if not select.select([fd], [], [], left)[0]:
+                continue
+            chunk = os.read(fd, min(length - len(got), 1 << 20))
+            if not chunk:
+                raise _ReadFailed(READER_ENDED, "")
+            got += chunk
+        return bytes(got)
+
+    def _ask(self, kind: bytes, raw: bytes, seconds: float, date: float | None):
+        """One request and its answer, ``(status, bytes)``. Raises
+        :class:`TookTooLong` when no answer came in time and the process was
+        ended for it, ``_ReadFailed`` when it ended by itself."""
+        if self._process is None or self._process.poll() is not None:
+            self._start()      # gone while nothing was asked of it: no mail's doing
+        until = time.monotonic() + seconds + READER_GRACE_SECONDS
+        try:
+            self._send(_REQUEST.pack(kind, seconds, len(raw),
+                                     float("nan") if date is None else date), until)
+            self._send(raw, until)
+            status, length = _ANSWER.unpack(self._receive(_ANSWER.size, until))
+            return status, self._receive(length, until)
+        except BaseException:
+            # No telling where in a request the pipes are: this one is done.
+            self.close()
+            raise
+
+    def read(self, raw: bytes, internal_date: float | None, seconds: float) -> Mail:
+        """:func:`_reading`, in the reader process and within ``seconds``."""
+        status, answer = self._ask(b"M", raw, seconds, internal_date)
+        if status == b"M":
+            return _mail_from(_unpickled(answer))
+        self._failed(status, answer)
+
+    def canary(self, seconds: float) -> None:
+        """:func:`_read_canary`, likewise."""
+        status, answer = self._ask(b"C", b"", seconds, None)
+        if status != b"K":
+            self._failed(status, answer)
+
+    def stub(self, head: bytes, internal_date: float | None, seconds: float) -> Mail:
+        """:func:`stub_mail` of a header block, likewise."""
+        status, answer = self._ask(b"S", head, seconds, internal_date)
+        if status == b"M":
+            return _mail_from(_unpickled(answer))
+        self._failed(status, answer)
+
+    def facts(self, head: bytes, seconds: float) -> dict:
+        """:func:`_head_facts`, likewise."""
+        status, answer = self._ask(b"F", head, seconds, None)
+        if status == b"F":
+            return _unpickled(answer)
+        self._failed(status, answer)
+
+    def _failed(self, status: bytes, answer: bytes):
+        if status == b"T":
+            raise TookTooLong("its reading was not done in time")
+        if status in (b"U", b"E"):
+            what, why = _unpickled(answer)
+            raise UnreadableMail(why, what) if status == b"U" else _ReadFailed(what, why)
+        self.close()
+        raise _ReadFailed(READER_ENDED, f"an answer of no known kind ({status!r})")
+
+
+# The reader process of the running gateway (main() makes it). Without one —
+# a Mirror built by hand, as the tests build theirs — a mail is read where
+# the mirror runs, with the reader's own looks at the clock for a deadline.
+READER = None
+
+
+def _read_seconds(size: int) -> float:
+    """How long the reading of a mail of ``size`` bytes may take."""
+    return READ_SECONDS + READ_SECONDS_PER_MB * size / 1_000_000
 
 
 def read_mail(raw: bytes, internal_date: float | None = None) -> Mail:
@@ -1285,27 +1893,156 @@ def read_mail(raw: bytes, internal_date: float | None = None) -> Mail:
     it is. A reader has every way to fail on text from outside: its own
     bounds, the parser's and the codecs' errors, a recursion that does not
     end, memory that does (a mail is some megabytes; what is made of it need
-    not be). No exception says whether the mail brought that out or the
-    reader is broken for every mail, so the reader is asked: the same reading
-    is run on the canary.
+    not be), time that runs out (:func:`_read_seconds`). No exception says
+    whether the mail brought that out or the reader is broken — or the
+    machine too slow — for every mail, so the reader is asked: the same
+    reading is run on the canaries, against the clock too (CANARY_SECONDS).
 
-      * It reads the canary: the reader works, and the failure is this
+      * It reads the canaries: the reader works, and the failure is this
         mail's — :class:`UnreadableMail`, a placeholder at once.
-      * It fails on the canary too: the fault is the mirror's —
-        :class:`MirrorFault`, and no mail is set aside over it."""
+      * It fails on a canary too, or is not done with them in their time:
+        the fault is the mirror's — :class:`MirrorFault`, and no mail is set
+        aside over it.
+
+    With a reader process (READER) both readings run there, and a process
+    that had to be ended over a mail is replaced before the canaries are
+    read; one that cannot be started is nobody's mail (:class:`ReaderDown`)."""
+    seconds = _read_seconds(len(raw))
     try:
-        return _reading(raw, internal_date)
-    except UnreadableMail:
-        raise   # refused on purpose, by a bound: the mail's
+        if READER is not None:
+            return READER.read(raw, internal_date, seconds)
+        with _within(seconds):
+            return _reading(raw, internal_date)
+    except (UnreadableMail, ReaderDown):
+        raise   # refused on purpose, by a bound: the mail's. No reader: nobody's.
+    except TookTooLong as exc:
+        failure, kind = exc, TOO_SLOW
+        why = f"{TOO_SLOW}: {exc} ({seconds:.0f} s for a mail of {_human_size(len(raw))})"
+    except _ReadFailed as exc:
+        failure, kind, why = exc, exc.kind, str(exc)[:300]
     except Exception as exc:  # noqa: BLE001 - RecursionError and MemoryError are among them
-        failure, why = exc, f"{type(exc).__name__}: {exc}"[:300]
+        failure, kind, why = exc, type(exc).__name__, f"{type(exc).__name__}: {exc}"[:300]
+    _ask_the_canaries(why, failure)
+    raise UnreadableMail(why, kind) from failure
+
+
+def _ask_the_canaries(why: str, failure: BaseException) -> None:
+    """Read the canaries after a reading failed (``why``). Returns when the
+    reader reads them, and in their time: the failure was not the reader's.
+    Raises :class:`MirrorFault` when it does not."""
     try:
-        _read_canary()
+        if READER is not None:
+            READER.canary(CANARY_SECONDS)
+        else:
+            with _within(CANARY_SECONDS):
+                _read_canary()
+    except ReaderDown:
+        raise
+    except TookTooLong as exc:
+        raise MirrorFault(
+            f"the mail reader is too slow: it did not read the mirror's own test mail in "
+            f"{CANARY_SECONDS:.0f} s ({exc}), after a mail ({why})") from failure
     except Exception as exc:  # noqa: BLE001 - the reader is broken, whatever the mail
+        said = str(exc) if isinstance(exc, _ReadFailed) else f"{type(exc).__name__}: {exc}"
         raise MirrorFault(
             f"the mail reader fails on the mirror's own test mail "
-            f"({type(exc).__name__}: {exc}"[:200] + f") as it did on a mail ({why})") from failure
-    raise UnreadableMail(why) from failure
+            f"({said}"[:200] + f") as it did on a mail ({why})") from failure
+
+
+class NotRead(Exception):
+    """The reading of a header block did not come back — it was late, or the
+    reader process ended over it — and did not on a second try either, with
+    the canaries read in their time in between (:func:`_read_guarded`).
+
+    That is NO ANSWER about the mail. A header block is read to decide
+    things for good — which mail lies at a UID, whether a mail is in a
+    folder at all — and a reader that was stopped for some seconds (a
+    process swapped out, a paused container, a thrashing host) looks just
+    like this. So whoever gets it decides nothing: no id is taken from it,
+    none is remembered, and no mail is called gone on it (UNSURE)."""
+
+
+def _read_guarded(in_reader, here):
+    """Read something off one header block as guarded as a mail is read:
+    where mail is read (the reader process, when there is one) and against
+    the clock — a header block is small, and gets what the canaries get.
+    It ends in one of four ways, and they are kept apart:
+
+      * the answer;
+      * :class:`UnreadableMail` — the reader raised on the block, or a bound
+        refused it. That is what these bytes do to the reader, at every
+        reading: an answer, and the block's own;
+      * :class:`MirrorFault` — it did not come back, and the canaries do
+        not either: the mirror's fault, and the pass ends;
+      * :class:`NotRead` — it did not come back, twice, though the reader
+        read the canaries in between: no answer (see there). The second
+        try is what keeps one stall of the reader from being so much as
+        that."""
+    for _attempt in (1, 2):
+        try:
+            if READER is None:
+                with _within(CANARY_SECONDS):
+                    return here()
+            return in_reader(CANARY_SECONDS)
+        except (UnreadableMail, ReaderDown):
+            raise
+        except TookTooLong as exc:
+            failure = exc
+        except _ReadFailed as exc:
+            if exc.kind != READER_ENDED:
+                raise UnreadableMail(str(exc)[:300], exc.kind) from exc
+            failure = exc
+        except Exception as exc:  # noqa: BLE001 - what these bytes bring out
+            raise UnreadableMail(f"{type(exc).__name__}: {exc}"[:300],
+                                 type(exc).__name__) from exc
+        _ask_the_canaries(f"its header block alone: {failure}", failure)
+    raise NotRead(f"a header block was not read in {CANARY_SECONDS:.0f} s, twice, by a "
+                  f"reader that read the mirror's own test mail in between ({failure})")
+
+
+def read_stub(raw: bytes, internal_date: float | None, reason: str, *,
+              go_on: bool = True) -> Mail:
+    """:func:`stub_mail` for the mirror: the placeholder of a mail that
+    could not be read. Never raises, but for a fault of the mirror's own
+    (:class:`MirrorFault`, :class:`ReaderDown`) — and :class:`NotRead`
+    where nothing has to go on (``go_on`` false, see below).
+
+    A stub is read off the mail's header block — the block the reading may
+    just have failed on, or run out of time over. So it is read as guarded
+    as the mail was (:func:`_read_guarded`). A block that cannot be read,
+    or does not come back, still gets its mail a placeholder — the folder
+    must go on: one that nothing was parsed for (:func:`_bare_stub`), under
+    an id of the block's bytes. That id is not for good: it is found again
+    without any reading, and gives way in one step when the mail is read
+    under its own (Mirror._ingest). Where nothing has to go on — the mail
+    read as the record of a lost one (Mirror._read_found), whose id is
+    looked for again later — a block that did not come back is no answer,
+    and the mail is left for another reading: under an id of its bytes, it
+    would leave the id it is looked for under to the next mail found."""
+    head = _head_of(raw)
+    try:
+        mail = _read_guarded(lambda seconds: READER.stub(head, internal_date, seconds),
+                             lambda: stub_mail(head, internal_date, reason))
+        mail.unreadable = reason
+        return mail
+    except (UnreadableMail, NotRead) as exc:
+        if isinstance(exc, NotRead) and not go_on:
+            raise
+        print(f"[mail-gateway] not even the header block of a mail could be read "
+              f"({type(exc).__name__}: {exc}); its placeholder carries none of it", flush=True)
+        return _bare_stub(head, internal_date, reason)
+
+
+def read_head(head: bytes) -> dict | None:
+    """:func:`_head_facts` for the mirror — a header block read as guarded
+    as a mail (:func:`_read_guarded`). None when the block cannot be read,
+    which is an answer: it has no id but the one of its bytes. Raises
+    :class:`NotRead` when the reading did not come back, which is none."""
+    try:
+        return _read_guarded(lambda seconds: READER.facts(head, seconds),
+                             lambda: _head_facts(head))
+    except UnreadableMail:
+        return None
 
 
 def _human_size(count: int) -> str:
@@ -1380,7 +2117,7 @@ def _dropped_parts_note(mail: Mail) -> tuple[bytes, str]:
 # connection) raises MailboxError, and the pass that asked ends there — but
 # for the archive folder's own look, whose refusal Mirror._sync sets down as
 # "no answer" and goes on without. And where the server answered but the
-# answer does not settle it, ``find`` returns UNSURE.
+# answer does not settle it, ``find`` says so (``Matches.whole``).
 # ══════════════════════════════════════════════════════════════════════════════
 
 class MailboxError(Exception):
@@ -1419,13 +2156,25 @@ class Listing(NamedTuple):
     uids: dict
 
 
+class Matches(NamedTuple):
+    """The mails a folder holds under one Message-ID: their UIDs, newest
+    first — all of them, since an id is its sender's to choose and a folder
+    may hold several mails under one — and whether these are all (``whole``).
+    Where they are not, "none of these" is no answer: UNSURE."""
+    uids: tuple
+    whole: bool
+
+
 class Fetched(NamedTuple):
     """One mail. ``raw`` is cut at the fetch limit when the mail is larger;
-    ``size`` is the whole mail's, so the caller can tell."""
+    ``size`` is the whole mail's, so the caller can tell. ``uidvalidity`` is
+    the folder's as it was opened for the fetch (None: not said): a UID names
+    this mail only under that one."""
     raw: bytes
     size: int
     flags: frozenset
     date: float | None
+    uidvalidity: int | None = None
 
 
 class Moved(NamedTuple):
@@ -1567,6 +2316,7 @@ class Mailbox:
         self._timeout = timeout
         self._conn = None
         self._selected = None
+        self._validity = None     # the selected folder's UIDVALIDITY
         self._caps: frozenset = frozenset()   # the server's, as of the last login
         self._lock = threading.RLock()
 
@@ -1652,10 +2402,11 @@ class Mailbox:
         would have every mail in the folder called gone; it raises instead."""
         if self._selected == folder and not fresh:
             return True
-        self._selected = None
+        self._selected = self._validity = None
         typ, data = conn.select(_ec._quote(folder), readonly=True)
         if typ == "OK":
-            self._selected = folder
+            # (Announced on opening only: what every UID read here is under.)
+            self._selected, self._validity = folder, self._number(conn, "UIDVALIDITY")
             return True
         said = _response_text(data)
         if "[NONEXISTENT]" in said.upper():
@@ -1692,7 +2443,7 @@ class Mailbox:
             # Opened afresh every time: UIDVALIDITY is only announced then.
             if not self._examine(conn, folder, fresh=True):
                 return None
-            validity = self._number(conn, "UIDVALIDITY")
+            validity = self._validity
             uidnext = self._number(conn, "UIDNEXT")
             if validity is None:
                 raise MailboxError(f"the IMAP server gave no UIDVALIDITY for {folder!r}")
@@ -1757,22 +2508,23 @@ class Mailbox:
             flags = frozenset(flag.decode("ascii", errors="replace")
                               for flag in imaplib.ParseFlags(envelope))
             return Fetched(bytes(raw), int(size.group(1)) if size else len(raw),
-                           flags, _internal_date(envelope))
+                           flags, _internal_date(envelope), self._validity)
         return self._run(command)
 
-    def find(self, folder: str, message_id: str):
-        """The UID of the mail with this Message-ID in ``folder``; None when
-        the server answers that the folder holds no such mail; UNSURE when
-        its answer does not settle it.
+    def find(self, folder: str, message_id: str) -> Matches:
+        """The mails with this Message-ID in ``folder``: every one of them
+        (see :class:`Matches`) — none, and ``whole``, when the server answers
+        that the folder holds no such mail, or is no folder.
 
         The server's HEADER search matches substrings, so each candidate's own
-        header is read back and compared whole; the newest match wins. A
-        candidate whose header the server will not hand over is not "another
-        mail" — that raises — and more look-alikes than are compared (anyone
-        can send mails whose ids contain a known one) is UNSURE, not None."""
+        header is read back and compared whole. A candidate whose header the
+        server will not hand over is not "another mail" — that raises — and
+        with more look-alikes than are compared (anyone can send mails whose
+        ids contain a known one) the matches among the newest are still
+        matches, and are not all there may be."""
         def command(conn):
             if not message_id or not self._examine(conn, folder):
-                return None
+                return Matches((), True)
             typ, data = conn.uid("search", None, "HEADER", "Message-ID",
                                  _ec._quote_mid(message_id))
             if typ != "OK":
@@ -1780,6 +2532,7 @@ class Mailbox:
                                    f"{_response_text(data) or typ}")
             candidates = sorted({int(token) for chunk in data or [] if chunk
                                  for token in chunk.split()}, reverse=True)
+            found = []
             for uid in candidates[:FIND_CANDIDATES_MAX]:
                 typ, data = conn.uid("fetch", str(uid),
                                      "(BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)])")
@@ -1791,8 +2544,9 @@ class Mailbox:
                         continue
                     header = email.message_from_bytes(item[1] or b"")
                     if _threads.normalize_id(_raw_header(header, "Message-ID")) == message_id:
-                        return uid
-            return UNSURE if len(candidates) > FIND_CANDIDATES_MAX else None
+                        found.append(uid)
+                        break
+            return Matches(tuple(found), len(candidates) <= FIND_CANDIDATES_MAX)
         return self._run(command)
 
     # -- writing ---------------------------------------------------------------
@@ -2029,19 +2783,35 @@ class Mailbox:
 #              has no record of its own ("news"; "draft", in the archive;
 #              "other" for a mail that came under the id of a placeholder
 #              and is not the copy that was made from — Mirror._mirror_one),
-#              so it is not read again. One value goes with a Message-ID:
-#              "moved" marks a copy the gateway moved on and the server kept
-#              (flagged \Deleted, no way to expunge exactly it): still a
-#              place of the mail, never one to move or flag again.
+#              so it is not read again. "moved" marks a copy the gateway
+#              moved on and the server kept (flagged \Deleted, no way to
+#              expunge exactly it): still a place of the mail, never one to
+#              move or flag again. "again" is the opposite of the first
+#              three, a note with no id: nothing is known of the mail at this
+#              UID, and it is to be read (Mirror._read_noted) — what lay
+#              beside a placeholder that is gone, what an older build marked
+#              "unreadable".
 #              Rows of an older generation are stale: mails to find again.
 #   mails      one row per mirrored mail: its record file, direction, chat and
-#              the facts a Thread answer needs. An empty `record` is a claim —
-#              the ledger write was begun and not confirmed. `arrived` is
+#              the facts a Thread answer needs. An empty `record` is a claim:
+#              a ledger write begun and not confirmed (Mirror._write). It has
+#              no place, and outlives no pass: a stop leaves it to the next
+#              start (_prepare). `arrived` is
 #              when the server received the mail (its `ts` is the sender's
 #              Date where that is earlier), as the record keeps it
 #              (kb:arrivedAt); NULL for a record written before it did.
-#   claims     what the rail is owed for a claim once its record stands: was
-#              the mail a backfill's, was it \Seen. Gone with the claim.
+#   claims     what the rail is owed for a write begun — of a claim, or of a
+#              record written again in its own place — once its record
+#              stands: was the mail a backfill's, was it \Seen. Gone when the
+#              write is confirmed, or given up.
+#   lost       the ids of rows whose record is gone from the ledger (restored
+#              from an older backup, a file lost), with what the row said of
+#              its sender, direction, chat and arrival — HINTS for finding
+#              the mail again by its Message-ID (Mirror._read_lost), never
+#              knowledge of it: nothing here is a record, a place or a claim,
+#              and nothing but _read_lost reads it. `tried`, `tries` and
+#              `due` are the looking's own: when it was last tried, how often
+#              in vain, and when it is tried next.
 #   notes      who authored a mail that will turn up in Sent (/outbound-note,
 #              and the gateway's own sends).
 #   settling   mails on record whose place in the mailbox the gateway itself
@@ -2097,6 +2867,11 @@ CREATE TABLE IF NOT EXISTS aliases (
     alias TEXT PRIMARY KEY, message_id TEXT NOT NULL
 ) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS aliases_mid ON aliases (message_id);
+CREATE TABLE IF NOT EXISTS lost (
+    message_id TEXT PRIMARY KEY, sender TEXT, direction TEXT, chat TEXT, arrived REAL,
+    noticed REAL NOT NULL, tried REAL, tries INTEGER NOT NULL DEFAULT 0,
+    due REAL NOT NULL DEFAULT 0
+) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS outbox (
     seq INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL, payload TEXT NOT NULL
 );
@@ -2250,13 +3025,110 @@ def _environment(exc: BaseException) -> bool:
     return isinstance(exc, _ENVIRONMENT) or type(exc) is sqlite3.DatabaseError
 
 
+# ── What the bookkeeping must keep ────────────────────────────────────────────
+# A mail is on record under an id (`mails`), lies at UIDs (`locations`), and
+# its row is a record, a placeholder or a tombstone. Each rule below
+# was a case first — one more mark, one more pass — and the cases kept
+# coming, each at the edge of the state the last one added. These are the
+# rules those cases were instances of. Whatever touches the bookkeeping keeps
+# them; tests/test_mail_gateway_mime.py walks them as such, apart from the
+# cases.
+#
+#   I1  AN ANSWER THAT WAS NOT OBTAINED IS NEVER AN ANSWER. A reading that
+#       was late, a reader process that ended, a folder that could not say:
+#       each reaches whoever asked as "could not tell" (NotRead, UNSURE,
+#       Matches.whole) and as nothing else. It is not remembered, it calls
+#       no mail gone, and it decides nothing for good — not which mail lies
+#       at a UID, not a mail's direction. An answer is what the server said,
+#       or what a mail's bytes do to the reader at every reading.
+#       (_read_guarded, read_head, Mirror._find, Mirror._ingest)
+#
+#   I2  A RECORD IS REPLACED OR BURIED ONLY ON EVIDENCE ABOUT ITS OWN MAIL.
+#       Never because another mail under its Message-ID is in the way: ids
+#       are their senders' to choose, a folder may hold several mails under
+#       one, and ALL of them are looked at (Matches, Mirror._adopt). A
+#       placeholder's own mail is the one whose header block its record
+#       keeps (Mirror._own_copy): only that mail takes its place, and only
+#       that mail's absence from every folder buries it. What marks a UID as
+#       another mail's ("other") is read off the mail there, never carried
+#       over from a UID that meant it once — and a UID is that mail only
+#       under the UIDVALIDITY it was recorded under (Fetched.uidvalidity,
+#       Mirror._ingest). Where one mail takes the record of another id, the
+#       header block is the evidence: the one that record keeps, or the
+#       one whose bytes the id was made of (_bare_id).
+#
+#   I3  A RECORD STANDS UNTIL WHAT REPLACES IT DOES. A record written again
+#       (a placeholder that reads now, a mail on record from its INBOX copy
+#       whose Sent copy shows, a tombstone whose mail is back) is written in
+#       its own place, in one rename (Mirror._write): wherever that stops
+#       or fails, the mail is the record it was, followed and tombstoned
+#       like any, and read again later. Nothing is dropped first, so no row
+#       ever stands for a mail in a record's stead — and what a row knows
+#       without a record is no knowledge: a row whose record is gone from
+#       the ledger goes, with its places, and what it said (id, sender,
+#       direction) is kept as HINTS for finding the mail again (`lost`,
+#       Mirror._prepare). Its mail is looked for by its Message-ID in every
+#       folder, and one mail found is read as a mail read the first time
+#       where it lies — for a record that was the user's, a Sent copy
+#       first, then the copy received when the record said, then the
+#       archive; for any other, the one From the sender the lost record had
+#       — and it is the user's own again only in Sent, or in the archive
+#       From that sender: a copy the user can have put there. Never in
+#       INBOX on the strength of its From, which is its sender's to write
+#       (Mirror._read_lost, Mirror._read_found). A mail that cannot be told
+#       yet stays looked for, and /health counts it — LOST_TRIES times at
+#       most; then what is found is read as mail nothing is known of.
+#       Nothing else is carried over to whatever mail is found under its id.
+#       The limits, as they stand: while the archive does not answer, every
+#       lost id waits (/health says the archive does not answer, and counts
+#       them); an id whose mail is in no folder leaves the list with a log
+#       line and no "removed" event (there is no record to tombstone); a
+#       ledger restored from an older backup over a live one can leave two
+#       record files for one id (a record written as the first time takes a
+#       name of its own, and the backup brings back the one it had before);
+#       and a mail to oneself whose Sent copy is gone comes back as one
+#       that came in.
+#
+#   I4  A FAULT DELAYS ONLY THE WORK THAT FAILED. Following the folders —
+#       new mail, vanished mail — keeps the poll interval whatever the rest
+#       of a turn does; what failed is tried again less and less often, by
+#       itself (_loop_step). And no mail is set aside over a fault of the
+#       mirror's own (Mirror._ingest); a mail that cannot be told now holds
+#       back none behind it — it is a placeholder where the folders are
+#       followed, and a lost record's id that is looked for again later
+#       (Mirror._read_lost).
+#
+# The states of a mail's row, and there are no others:
+#
+#   record != '', removed = 0    on record — a placeholder where the record
+#                                says so (Mirror._placeholders)
+#   record != '', removed = 1    a tombstone
+#   either, with a `claims` row  its record being written again in its own
+#                                place, inside Mirror._write (a stop there
+#                                is announced by _prepare, whichever record
+#                                stands)
+#   record  = ''                 a claim: its first record being written,
+#                                inside Mirror._write and nowhere else (a
+#                                stop there is put right by _prepare)
+#
+# (A row whose record file is gone is none of these: it is the ledger
+# restored or changed behind the mirror's back, and the next _prepare moves
+# what the row said into `lost` — Mirror._write, meeting one, writes the
+# record as the first time and has the index matched again.) And of a UID's:
+# a place of the mail under its id (skipped NULL); a UID with no record of
+# its own ("news", "draft", and "other" beside a placeholder); a UID to be
+# read with nothing known of it ("again": what lay beside a placeholder that
+# is gone, an older build's "unreadable"). An id in `lost` is no state of a
+# row or of a UID: it is a mail to be looked for.
+
 class Mirror:
     """One account's mailbox mirrored into the ledger.
 
     ``poll`` is one pass: follow the folders (new mail, vanished mail), look
-    again for mails that lost their place, backfill a batch, and hand the rail
-    what it is owed. Everything it needs to resume is in the two indexes; a
-    poll that fails midway is simply run again."""
+    again for mails that lost their place and for those whose record the
+    ledger lost, read again what is to be, backfill a batch, and hand the
+    rail what it is owed. Everything it needs to resume
+    is in the two indexes; a poll that fails midway is simply run again."""
 
     def __init__(self, mailbox, clock=time.time):
         self.mailbox = mailbox
@@ -2296,6 +3168,8 @@ class Mirror:
         self._retry_queue: list = []
         self._retry_round = 0
         self._retried: dict = {}      # placeholder → (re-reads that changed nothing, next round)
+        self._retry_spent = 0.0       # seconds of this round's re-reading
+        self._made: dict = {}         # why → placeholders made since this start
         self._send_said: dict = {}    # send → why it is not finished, as last logged
         self._prepare()
 
@@ -2377,11 +3251,13 @@ class Mirror:
         It is also where the rail gets what a stop between a ledger write and
         the index left unsaid. The ledger is always written first, so such a
         stop leaves a row that disagrees with its record in one of three ways
-        — a claim whose record stands, a row under a chat key its record no
-        longer has, a live row whose record is a tombstone — and each is put
-        right in one transaction with its event. At least once: a volume
-        restored from a backup leaves the same traces, and the web gateway
-        takes a repeat of any of the three as a no-op."""
+        — a write whose record stands and was not confirmed (a claim, or a
+        record written again in its place, with its flags in `claims`), a
+        row under a chat key its record no longer has, a live row whose
+        record is a tombstone — and each is put right in one transaction
+        with its event. At least once: a volume restored from a backup
+        leaves the same traces, and the web gateway takes a repeat of any of
+        the three as a no-op."""
         ledger = self._ledger()
         by_id = {fields["message_id"]: (path, fields) for path, fields in ledger}
         # A placeholder is told by its record: the text every one carries,
@@ -2407,6 +3283,7 @@ class Mirror:
                   flush=True)
         rows = {row["message_id"]: row for row in self.index.rows(
             "SELECT message_id, record, chat, removed FROM mails")}
+        begun = {row["message_id"] for row in self.index.rows("SELECT message_id FROM claims")}
         unknown, owed, claimed, merged, removed = [], [], [], {}, {}
         for mid, (path, fields) in by_id.items():
             row = rows.get(mid)
@@ -2414,10 +3291,17 @@ class Mirror:
             if row is None or row["record"] not in ("", path.name):
                 # Not indexed — every record, after a lost volume — or indexed
                 # under a file that is not this one. The rail heard of the
-                # mail long ago; its place is looked for again.
+                # mail long ago; its place is looked for again. (Unless a
+                # write of it was begun: a record whose file was gone is
+                # written under a name of its own — see _write.)
                 unknown.append(self._adoption(path, fields))
+                if row is not None and mid in begun:
+                    claimed.append(mid)
                 continue
-            if not row["record"]:
+            if not row["record"] or mid in begun:
+                # Its write was begun, and the record stands: the new one,
+                # or — a stop before the rename — the one it was to replace.
+                # Either way the index is told what the ledger says.
                 claimed.append(mid)
             elif row["chat"] == fields["chat"] and bool(row["removed"]) == gone:
                 continue
@@ -2440,6 +3324,8 @@ class Mirror:
             flags = self.index.one("SELECT backfill, seen FROM claims WHERE message_id = ?",
                                    (mid,))
             owed.append(("DELETE FROM claims WHERE message_id = ?", (mid,)))
+            if by_id[mid][1].get("removed_at"):
+                continue   # a tombstone stands still, which the rail was told of
             try:
                 # (A claim with no flags is an older build's: quiet is the
                 # safe reading of it.)
@@ -2459,29 +3345,48 @@ class Mirror:
                                                 "chat": chat, "message_ids": message_ids,
                                                 "live": live}))
         self.index.atomic(owed)
-        # Rows whose record is not in the ledger. A claim that never became a
-        # record just goes; a record that is gone takes its mail's places with
-        # it, and the folders are read again so a mail still there is mirrored
-        # anew (everything up to the high-water mark becomes the backfill's).
+        # Rows whose record is not in the ledger: a claim whose write never
+        # reached the ledger, a record gone from it since (restored from a
+        # backup, a file lost). Such a row knows nothing that can be trusted
+        # of whatever mail is found under its id: it goes, with its places.
+        # A claim just goes (its mail is above its folder's mark still, or
+        # in the work that wrote it). Of a record that is gone, what the row
+        # said is kept in `lost` as hints for finding its mail again by its
+        # Message-ID (_read_lost) — and as nothing else.
         lost = [mid for mid in rows if mid not in by_id]
+        noticed = self._clock()
+        hints = []
         for mid in lost:
-            self.index.run("DELETE FROM mails WHERE message_id = ?", (mid,))
-            self.index.run("DELETE FROM locations WHERE message_id = ?", (mid,))
-        # Places that say nothing true go the same way: those of a mail
-        # whose record was dropped to be written anew and then was not
-        # (_mirror_one), and the mark older builds put on a mail they could
-        # not write even a placeholder for — no mail is set aside over a
-        # failed write any more (_ingest), so these are read again.
-        stray = self.index.run(
-            "DELETE FROM locations WHERE skipped = 'unreadable' OR (skipped IS NULL "
-            "AND message_id IS NOT NULL "
-            "AND message_id NOT IN (SELECT message_id FROM mails))")
-        if stray or any(rows[mid]["record"] for mid in lost):
-            self.index.run("UPDATE folders SET ceiling = hwm")
-            self.index.set("backfill_done", "0")
-            self._plan = None
+            row = self.index.one("SELECT * FROM mails WHERE message_id = ?", (mid,))
+            if row["record"]:
+                hints.append((
+                    "INSERT OR IGNORE INTO lost (message_id, sender, direction, chat, "
+                    "arrived, noticed) VALUES (?, ?, ?, ?, ?, ?)",
+                    (mid, row["sender"] or None, row["direction"], row["chat"],
+                     row["arrived"] if row["arrived"] is not None else row["ts"], noticed)))
+            hints.append(("DELETE FROM mails WHERE message_id = ?", (mid,)))
+        # A place under an id that has no row (as an older build could
+        # leave one) says no more than that id: it is a hint like these.
+        hints += [
+            ("INSERT OR IGNORE INTO lost (message_id, noticed) SELECT DISTINCT message_id, ? "
+             "FROM locations WHERE message_id IS NOT NULL AND (skipped IS NULL OR "
+             "skipped = 'other') AND message_id NOT IN (SELECT message_id FROM mails)",
+             (noticed,)),
+            ("DELETE FROM locations WHERE message_id IS NOT NULL AND (skipped IS NULL OR "
+             "skipped = 'other') AND message_id NOT IN (SELECT message_id FROM mails)", ())]
+        self.index.atomic(hints)
+        # Places that say nothing true are noted to be read again, where
+        # they are (_read_noted): what lay beside a placeholder that is gone
+        # — buried by a pass that was stopped before the index heard of it
+        # (_bury) — and the mark older builds put on a mail they could not
+        # write even a placeholder for: no mail is set aside over a failed
+        # write any more (_ingest).
+        noted = self.index.run(
+            "UPDATE locations SET message_id = NULL, skipped = 'again' WHERE "
+            "skipped = 'unreadable' OR (skipped = 'other' AND message_id IN "
+            "(SELECT message_id FROM mails WHERE removed = 1))")
         self.index.run("DELETE FROM claims WHERE message_id NOT IN "
-                       "(SELECT message_id FROM mails WHERE record = '')")
+                       "(SELECT message_id FROM mails)")
         self.index.run("DELETE FROM settling WHERE message_id NOT IN "
                        "(SELECT message_id FROM mails)")
         # The ids a provider gave the gateway's own mails, as the records
@@ -2491,10 +3396,11 @@ class Mirror:
             + [("INSERT OR REPLACE INTO aliases (alias, message_id) VALUES (?, ?)", (alias, mid))
                for mid, (_path, fields) in by_id.items()
                for alias in fields.get("sent_as") or []])
-        if unknown or owed or lost or stray:
+        if unknown or owed or lost or noted:
             print(f"[mail-gateway] mailbox index reconciled with the ledger: "
-                  f"{len(unknown)} record(s) adopted, {len(lost)} row(s) dropped, "
-                  f"{stray} place(s) of no record cleared; "
+                  f"{len(unknown)} record(s) adopted, {len(lost)} row(s) with no record "
+                  f"dropped (their mails looked for again: {self.lost()} in all), "
+                  f"{noted} place(s) to be read again; "
                   f"announced to the rail: {len(claimed)} mail(s), {len(merged)} merge(s), "
                   f"{sum(map(len, removed.values()))} removal(s)", flush=True)
         # Where the thread index and the records disagree, a merge was begun
@@ -2516,23 +3422,43 @@ class Mirror:
         mail — the copy the placeholder was made from, and no other mail
         under its id (_mirror_one). One that still does not read stays
         exactly as it is — nothing is dropped in order to try — and is tried
-        less and less often, since each try fetches it whole."""
+        less and less often, since each try fetches it whole.
+
+        And reads it whole: a mail that is a placeholder because its reading
+        took too long takes that long again, with the mirror's one thread.
+        So a round has SET_ASIDE_ROUND_SECONDS for all its readings, those
+        tried least often first; what it does not get to waits for the next
+        round. However many such mails a mailbox holds, reading them again
+        costs the mirror that share of its time and no more."""
         now = self._clock()
         if not self._retry_queue and now >= self._retry_at:
             self._retry_at = now + SET_ASIDE_RETRY_SECONDS
             aside = sorted(self._placeholders)
             self._retried = {mid: self._retried[mid] for mid in aside if mid in self._retried}
             self._retry_round += 1
-            self._retry_queue = [mid for mid in aside
-                                 if self._retried.get(mid, (0, 0))[1] <= self._retry_round]
+            self._retry_spent = 0.0
+            self._retry_queue = sorted(
+                (mid for mid in aside
+                 if self._retried.get(mid, (0, 0))[1] <= self._retry_round),
+                key=lambda mid: (self._retried.get(mid, (0, 0))[0], mid))
             if self._retry_queue:
                 print(f"[mail-gateway] reading again {len(self._retry_queue)} mail(s) "
                       f"mirrored as placeholders", flush=True)
         done = 0
         while self._retry_queue and (limit is None or done < limit):
+            if self._retry_spent > SET_ASIDE_ROUND_SECONDS:
+                print(f"[mail-gateway] {len(self._retry_queue)} placeholder(s) wait for the "
+                      f"next round: this one has read for {self._retry_spent:.0f} s",
+                      flush=True)
+                self._retry_queue = []
+                break
             # (Taken off the queue only once it is dealt with: a pass that
             # fails reads it again.)
-            self._read_again(self._retry_queue[0], policy)
+            began = time.monotonic()
+            try:
+                self._read_again(self._retry_queue[0], policy)
+            finally:
+                self._retry_spent += time.monotonic() - began
             self._retry_queue.pop(0)
             done += 1
         return bool(self._retry_queue)
@@ -2598,6 +3524,18 @@ class Mirror:
         return ("the mail provider files its own copy of every sent mail, under a "
                 "Message-ID of its own: with the gateway filing one too, each mail it "
                 "sends is in the Sent folder twice — set SMTP_SAVE_SENT=false")
+
+    def placeholders(self) -> dict:
+        """What /health says of mail mirrored as placeholders: how many are
+        on record now, how many were made since this start, and why — by
+        the few words each reason comes under (UnreadableMail.kind)."""
+        made = dict(self._made)
+        return {"standing": len(self._placeholders), "made": sum(made.values()), "why": made}
+
+    def lost(self) -> int:
+        """What /health says of mail whose record is gone from the ledger:
+        how many ids are still looked for (`lost`, see _read_lost)."""
+        return self.index.one("SELECT COUNT(*) AS n FROM lost")["n"]
 
     def thread(self, chat: str, claimed: str | None = None) -> dict | None:
         """The ``Thread`` answer for one chat key, or None for no such chat.
@@ -2683,13 +3621,19 @@ class Mirror:
 
     # -- one pass --------------------------------------------------------------
 
-    def poll(self, *, sync: bool = True, backfill_limit: int | None = None) -> bool:
+    def poll(self, *, sync: bool = True, work: bool = True,
+             backfill_limit: int | None = None) -> bool:
         """One pass over the mailbox. Returns whether work is waiting that the
         next pass should not wait a whole poll interval for.
 
         ``sync`` looks at the folders (new and vanished mail); a pass without
         it only works on what an earlier look left to do — the loop runs
-        those between polls while a backfill is under way."""
+        those between polls while a backfill is under way. ``work`` is that
+        rest: finding mail again (and the mail of records the ledger lost),
+        reading mail again, the backfill. A pass
+        without it only follows the folders — the loop runs the two apart,
+        so that a fault in the second never keeps new mail waiting
+        (_loop_step)."""
         with self._lock:
             if self._reconcile:
                 # A record was written and the index could not be told (the
@@ -2712,15 +3656,21 @@ class Mirror:
             # nobody saw — once the folders are known.
             self._resume_sends(mailbox=bool(self._folders))
             more = False
-            if self._settled:
+            if work and self._settled:
                 # In this order: a mail must be found again before it can be
                 # called gone, and known mail before the backfill reads the rest.
                 more = (self._reidentify(RELOCATE_BATCH)
                         or self._settle_unlocated(RELOCATE_BATCH))
-            if self._read and not more:
+            if work and self._settled and not more:
+                # Before the backfill, which would read such a mail in INBOX
+                # or Sent as one nothing is known of.
+                more = self._read_lost(policy)
+            if work and self._read and not more:
                 # Not held back by an archive folder that will not answer:
-                # these read INBOX and Sent, and call nothing gone.
-                more = (self._retry_set_aside(policy, backfill_limit)
+                # these read INBOX and Sent (the archive only when it
+                # answers), and call nothing gone.
+                more = (self._read_noted(policy, backfill_limit)
+                        or self._retry_set_aside(policy, backfill_limit)
                         or self._backfill(policy, backfill_limit))
             if rail_up:
                 self._flush_rail()
@@ -2851,6 +3801,20 @@ class Mirror:
             print(f"[mail-gateway] {name!r}: the UIDs changed (UIDVALIDITY "
                   f"{folder['uidvalidity']} -> {listing.uidvalidity}); finding its "
                   f"mails again by Message-ID", flush=True)
+            looked = self.index.get("looked")
+            if role != "archive" and looked is not None:
+                # What arrived since the last look is new mail all the same:
+                # it is read now, as the folder is followed — not left to the
+                # backfill, which a fault in the rest may hold back (I4).
+                # (A mail of it on record is read as the follow reads it;
+                # should this fail, what is left is the backfill's, as the
+                # rest is.)
+                since = float(looked) - ARRIVAL_SLACK_SECONDS
+                recent = self.mailbox.list_uids(name, since=since, dates=True)
+                if recent is not None and recent.uidvalidity == listing.uidvalidity:
+                    for uid, arrived in sorted(recent.uids.items()):
+                        if arrived is None or arrived >= since:
+                            self._adopt_gained(role, name, uid, policy)
             return True
         present = set(listing.uids)
         for row in self.index.rows(
@@ -2934,7 +3898,7 @@ class Mirror:
             for uid in unseen[:RELOCATE_BATCH]:
                 arrived = listing.uids[uid]
                 if arrived is None or arrived >= float(due):
-                    self._adopt_archived(name, uid, policy)
+                    self._adopt_gained("archive", name, uid, policy)
                 self.index.run("UPDATE folders SET hwm = ? WHERE role = 'archive'", (uid,))
             if len(unseen) > RELOCATE_BATCH:
                 return   # still due: the next look reads on
@@ -2943,17 +3907,32 @@ class Mirror:
                        (int(before),))
         self.index.set("top:archive", top)
 
-    def _adopt_archived(self, name: str, uid: int, policy) -> None:
-        """One mail the archive gained: a place for it if it is on record,
-        else it is mirrored — inbound or outbound by who sent it."""
-        message_id = self._peek_id(name, uid)
-        known = self.index.one(
-            "SELECT removed FROM mails WHERE message_id = ? AND record != ''",
-            (message_id,)) if message_id else None
-        if known is not None and not known["removed"]:
-            self._locate("archive", uid, message_id)
-        else:
-            self._ingest("archive", name, uid, policy, backfill=False)
+    def _adopt_gained(self, role: str, name: str, uid: int, policy) -> None:
+        """One mail a folder gained that may be on record already — the
+        archive's (see _follow_archive), or a renumbered folder's latest.
+        In INBOX and Sent it is read as the folder is followed (_ingest):
+        a mail on record gets its place there, or is written again as what
+        that copy makes it — its Sent copy makes it the user's own, its
+        sender's INBOX copy a mail the user redirected theirs again
+        (_mirror_one). In the archive it gets a place if it is on record,
+        else it is mirrored, as new mail (inbound or outbound by who sent
+        it)."""
+        if role != "archive":
+            self._ingest(role, name, uid, policy, backfill=False)
+            return
+        head = self._peek_head(name, uid)
+        if head is None:
+            return   # the server's answer: gone again
+        try:
+            ids = self._ids_of(head)
+        except NotRead:
+            ids = ()   # not learned here: the mail is read whole, which says it too
+        for message_id in ids:
+            if self.index.one("SELECT 1 FROM mails WHERE message_id = ? AND removed = 0 "
+                              "AND record != ''", (message_id,)) is not None:
+                self._place(role, uid, message_id, head)
+                return
+        self._ingest(role, name, uid, policy, backfill=False)
 
     def _newest(self, name: str, listing: Listing) -> int:
         """The highest UID the folder has handed out so far."""
@@ -2964,20 +3943,30 @@ class Mirror:
 
     # -- finding a mail again --------------------------------------------------
 
-    def _peek_id(self, name: str, uid: int) -> str | None:
-        """The id of the mail at a UID, from its header block alone — the id
-        the mirror would record it under. None when the mail is not there."""
+    def _peek(self, name: str, uid: int) -> Fetched | None:
+        """The mail at a UID as far as its header block; None when the
+        server answers that the mail is not there."""
         got = self.mailbox.fetch(name, uid, limit=HEADER_PEEK_BYTES)
         if got is not None and got.size > len(got.raw) and not _HEADER_END_RE.search(got.raw):
             # A header block longer than the peek: read as far as one is read.
             got = self.mailbox.fetch(name, uid, limit=MAX_HEADER_BYTES + 4096)
-        if got is None:
-            return None
-        try:
-            head = _head_and_rest(got.raw)[0]
-            return _identify(_parse_bytes(head + b"\r\n\r\n"), head)
-        except Exception:  # noqa: BLE001 - no id can be read off it: it matches none
-            return None
+        return got
+
+    def _peek_head(self, name: str, uid: int) -> bytes | None:
+        """The header block of the mail at a UID, as it stands there; None
+        when the server answers that the mail is not there."""
+        got = self._peek(name, uid)
+        return _head_of(got.raw) if got is not None else None
+
+    @staticmethod
+    def _ids_of(head: bytes) -> tuple:
+        """The ids the mail with this header block can be on record under:
+        the one it is mirrored under when the block is read, and the one of
+        the block's bytes, which a placeholder made without reading it
+        carries (:func:`_bare_stub`). Raises :class:`NotRead` when the
+        reading did not come back — then only the second is known."""
+        facts = read_head(head)
+        return (facts["id"], _bare_id(head)) if facts else (_bare_id(head),)
 
     def _carried_whole(self, message_id: str) -> bool:
         """Whether the mail's own Message-ID header holds its id in one piece.
@@ -2988,11 +3977,8 @@ class Mirror:
         mail it holds. Read off the header block the record keeps; where that
         cannot be read the answer is no, and the mail is looked for the slow
         way, which is right for every mail."""
-        header = self._recorded_header(message_id)
-        try:
-            return header is not None and message_id in _raw_header(header, "Message-ID")
-        except Exception:  # noqa: BLE001
-            return False
+        facts = self._recorded_facts(message_id)
+        return facts is not None and message_id in facts["message_id"]
 
     def _recorded_head(self, message_id: str) -> bytes | None:
         """The header block a mail's record keeps, as it was stored (see
@@ -3005,32 +3991,45 @@ class Mirror:
         got = _ibstore.load_media(INBOUND_STORE_DIR, media_id) if media_id else None
         return got[0] if got is not None else None
 
-    def _recorded_header(self, message_id: str):
-        """The same, parsed; None when it cannot be."""
+    def _recorded_facts(self, message_id: str) -> dict | None:
+        """What that header block says (:func:`read_head`); None when there
+        is none, or it cannot be read. Raises :class:`NotRead` when its
+        reading did not come back: not known, and nothing to decide on."""
         head = self._recorded_head(message_id)
-        if head is None:
-            return None
-        try:
-            return _parse_bytes(head + b"\n\n")
-        except Exception:  # noqa: BLE001
-            return None
+        return read_head(head) if head is not None else None
 
     def _find(self, role: str, message_id: str, ts: float | None,
-              arrived: float | None = None):
-        """Where a mail is in one folder: its UID; None when the folder has
-        answered that it does not hold it (or the role has no folder); UNSURE
-        when that cannot be said yet — the caller then leaves the mail as it
-        is, for a later pass. ``ts`` is the mail's time on record and
+              arrived: float | None = None, every: bool = False) -> tuple:
+        """Where a mail may be in one folder: ``(uids, sure)`` — the UIDs
+        there that have no place yet and hold a mail under this id, newest
+        first, and whether the folder has answered that these are all.
+        (Without ``every`` the newest is enough, and the looking ends at
+        it.) No UID and not sure is "could not tell": the caller leaves the
+        mail as it is, for a later pass (see _adopt). A UID that has a place
+        is spoken for — the mail's own, or marked as another's — and is
+        never handed out again. ``ts`` is the mail's time on record and
         ``arrived`` when the server received it, where the index knows."""
         name = self._folders.get(role)
         folder = self._folder(role)
         if not name or folder is None:
-            return None
+            return [], True
+        gen = folder["gen"]
+        placed = {row["uid"] for row in self.index.rows(
+            "SELECT uid FROM locations WHERE role = ? AND gen = ?", (role, gen))}
         # (A mail with no record — one set aside as news, whose place alone is
         # kept — has no header block on record to check, and nothing to lose.)
-        ids = self._known_as(message_id)
-        if all(map(_searchable, ids)) and (ts is None or self._carried_whole(message_id)):
-            return self._find_by_id(name, ids)
+        # (And under every id it may be filed under: a mail of the gateway's
+        # own whose provider replaced its Message-ID is in the mailbox under
+        # that one — _known_as.)
+        known = self._known_as(message_id)
+        if all(map(_searchable, known)):
+            try:
+                carried = ts is None or self._carried_whole(message_id)
+            except NotRead:
+                return [], False   # its own header block, not read: not known
+            if carried:
+                found = self._find_by_id(name, known)
+                return [uid for uid in found.uids if uid not in placed], found.whole
         # No header to search for: read the headers of the mails here that
         # are not accounted for and compare ids, newest first. Not older than
         # the mail is all that bounds them — its time on record is the
@@ -3043,12 +4042,9 @@ class Mirror:
         when = arrived if arrived is not None else ts if ts is not None else self._clock()
         listing = self.mailbox.list_uids(name, since=when - SCAN_WINDOW_SECONDS)
         if listing is None:
-            return None
+            return [], True
         if listing.uidvalidity != folder["uidvalidity"]:
-            return UNSURE   # renumbered since the last look at the folders
-        gen = folder["gen"]
-        placed = {row["uid"] for row in self.index.rows(
-            "SELECT uid FROM locations WHERE role = ? AND gen = ?", (role, gen))}
+            return [], False   # renumbered since the last look at the folders
         for key in [key for key in self._peeked if key[0] == role and key[1] != gen]:
             del self._peeked[key]     # the UIDs of a folder since renumbered
         peeked = self._peeked.setdefault((role, gen), {})
@@ -3056,24 +4052,39 @@ class Mirror:
         unread = sum(1 for uid in candidates if uid not in peeked)
         if unread and unread + sum(map(len, self._peeked.values())) > SCAN_CACHE_MAX:
             # No room for what this search must read: what it has no use for
-            # goes. (If that is not enough it stays UNSURE, at no cost.)
+            # goes. (If that is not enough it stays unsure, at no cost.)
             wanted = set(candidates)
             for key, cache in self._peeked.items():
                 for uid in [uid for uid in cache if key != (role, gen) or uid not in wanted]:
                     del cache[uid]
         room = SCAN_CACHE_MAX - sum(map(len, self._peeked.values()))
-        unsure = False
+        found, sure = [], True
         for uid in candidates:
             if uid not in peeked:
                 if self._scan_budget <= 0 or room <= 0:
-                    unsure = True
+                    sure = False
                     continue    # the ones already read are still compared
                 self._scan_budget -= 1
-                room -= 1
-                peeked[uid] = self._peek_id(name, uid)
-            if peeked[uid] in ids:
-                return uid
-        return UNSURE if unsure else None
+                head = self._peek_head(name, uid)
+                try:
+                    ids = self._ids_of(head) if head is not None else ()
+                except NotRead:
+                    # No answer about this mail, so none is remembered and
+                    # nothing is concluded: the folder has not said. What
+                    # needs no reading is still compared — and a reader
+                    # that does not answer is asked no more this pass.
+                    self._scan_budget, sure = 0, False
+                    ids = (_bare_id(head),)
+                else:
+                    room -= 1
+                    peeked[uid] = ids
+            else:
+                ids = peeked[uid]
+            if any(wanted in ids for wanted in known):
+                found.append(uid)
+                if not every:
+                    break
+        return found, sure
 
     def _known_as(self, message_id: str) -> list:
         """The ids a mail may be filed under in the mailbox: its own, and
@@ -3081,19 +4092,18 @@ class Mirror:
         return [message_id] + [row["alias"] for row in self.index.rows(
             "SELECT alias FROM aliases WHERE message_id = ? ORDER BY alias", (message_id,))]
 
-    def _find_by_id(self, name: str, ids: list):
-        """The server's search for a mail under each id it may have — the
-        provider's first: where there is one, that is the copy the mailbox
-        holds. A UID, None once every one was answered with "not here",
-        else UNSURE."""
-        unsure = False
+    def _find_by_id(self, name: str, ids: list) -> Matches:
+        """The server's search for a mail under each id it may have: every
+        mail under any of them (see :class:`Matches`), the provider's ids'
+        first — where there is one, that is the copy the mailbox holds — and
+        newest first under each. ``whole`` once every id was answered in
+        full."""
+        uids, whole = [], True
         for wanted in reversed(ids):
-            uid = self.mailbox.find(name, wanted)
-            if uid is UNSURE:
-                unsure = True
-            elif uid is not None:
-                return uid
-        return UNSURE if unsure else None
+            found = self.mailbox.find(name, wanted)
+            uids += [uid for uid in found.uids if uid not in uids]
+            whole = whole and found.whole
+        return Matches(tuple(uids), whole)
 
     def _locate(self, role: str, uid: int, message_id: str | None, skipped=None) -> None:
         folder = self._folder(role)
@@ -3103,6 +4113,43 @@ class Mirror:
             # A mail with a place is followed like any other from here on.
             ("DELETE FROM settling WHERE message_id = ?", (message_id,))
             if message_id else None])
+
+    def _place(self, role: str, uid: int, message_id: str, head: bytes, skipped=None) -> bool:
+        """Give the mail at a UID — under ``message_id``, by its header
+        block — its place. For a mail on record whole that is one more place
+        of it. Beside a placeholder only the copy it was made from is one
+        (_own_copy): any other mail under its id is marked as another mail's
+        ("other"), whatever it was marked before — the mark is read off the
+        mail, never carried over from a UID that meant it once. Returns
+        whether the place is the record's own."""
+        if message_id in self._placeholders \
+                and not self._own_copy(message_id, _head_text(head)):
+            self._locate(role, uid, message_id, "other")
+            return False
+        self._locate(role, uid, message_id, None if skipped == "other" else skipped)
+        return True
+
+    def _adopt(self, role: str, message_id: str, ts: float | None,
+               arrived: float | None, skipped=None):
+        """Look in one folder for a mail the index knows and has no place
+        for there. Returns the UID that is its place from now on; None when
+        the folder has answered that it holds no such mail; UNSURE when that
+        cannot be said yet — the caller then leaves the mail as it is.
+
+        For a placeholder EVERY mail the folder holds under its id is looked
+        at, and each is placed as what its header block says it is: the
+        newest one may be anybody's (ids are the sender's to choose), and
+        the placeholder's own copy an older UID in the same folder."""
+        placeholder = message_id in self._placeholders
+        uids, sure = self._find(role, message_id, ts, arrived, every=placeholder)
+        for uid in uids:
+            if not placeholder:
+                self._locate(role, uid, message_id, None if skipped == "other" else skipped)
+                return uid
+            head = self._peek_head(self._folders[role], uid)
+            if head is not None and self._place(role, uid, message_id, head):
+                return uid
+        return None if sure else UNSURE
 
     def _reidentify(self, limit: int) -> bool:
         """Find again, by Message-ID, the mails of a folder whose UIDs changed.
@@ -3116,16 +4163,15 @@ class Mirror:
             "WHERE (l.role, l.gen, l.uid) > (?, ?, ?) "
             "ORDER BY l.role, l.gen, l.uid LIMIT ?", (*after, limit + 1))
         for row in stale[:limit]:
-            if row["message_id"]:
-                uid = self._find(row["role"], row["message_id"], row["ts"], row["arrived"])
-                if uid is UNSURE:
-                    # The row stays, a generation behind: the mail keeps a
-                    # place on record, so nothing calls it gone meanwhile.
-                    continue
-                if uid is not None:
-                    self._locate(row["role"], uid, row["message_id"], row["skipped"])
-            # Not found: the row goes, and a mail left with no place at all is
-            # looked for in every folder before it is called gone.
+            if row["message_id"] and self._adopt(
+                    row["role"], row["message_id"], row["ts"], row["arrived"],
+                    row["skipped"]) is UNSURE:
+                # The row stays, a generation behind: the mail keeps a
+                # place on record, so nothing calls it gone meanwhile.
+                continue
+            # Found, and placed under its new UID — or not found: the row
+            # goes, and a mail left with no place at all is looked for in
+            # every folder before it is called gone.
             self.index.run("DELETE FROM locations WHERE role = ? AND gen = ? AND uid = ?",
                            (row["role"], row["gen"], row["uid"]))
         # The rows that stayed are come back to once the others are through.
@@ -3135,14 +4181,21 @@ class Mirror:
         return more
 
     def _settle_unlocated(self, limit: int) -> bool:
-        """Mails with a record and no place: look in every mirrored folder —
-        this is how a move to the archive is followed — and tombstone the ones
-        that are in none. True while some are left for the next pass.
+        """Mails the index knows and has no place for: look in every
+        mirrored folder — this is how a move to the archive is followed —
+        and tombstone the ones that are in none. True while some are left
+        for the next pass.
 
         "In none" is what every folder *answered*. A folder that could not
         say (UNSURE) leaves the mail as it is, and one the server would not
         open or search ends the pass (MailboxError) — after the mails already
         found gone in it have been tombstoned and announced.
+
+        A place marked as another mail's ("other", see _place) is no place
+        of the mail on record: a placeholder whose own copy is gone is in
+        none, whatever else lies in the mailbox under its id — and is
+        tombstoned like any mail, its reading again pending or not. (A copy
+        the gateway moved on and the server kept, "moved", is still one.)
 
         A mail whose place the gateway itself is changing (``settling``) is
         not called gone while that settles: its own send has a record before
@@ -3157,7 +4210,8 @@ class Mirror:
             "SELECT m.*, s.until AS settling FROM mails m "
             "LEFT JOIN settling s ON s.message_id = m.message_id "
             "WHERE m.removed = 0 AND m.record != '' AND NOT EXISTS "
-            "(SELECT 1 FROM locations l WHERE l.message_id = m.message_id) "
+            "(SELECT 1 FROM locations l WHERE l.message_id = m.message_id "
+            "AND l.skipped IS NOT 'other') "
             "AND (s.message_id IS NULL OR s.until IS NOT NULL) "
             "AND (m.ts, m.message_id) > (?, ?) "
             "ORDER BY m.ts, m.message_id LIMIT ?", (*after, limit + 1))
@@ -3169,11 +4223,10 @@ class Mirror:
                     else ("inbox", "archive", "sent")
                 unsure = False
                 for role in order:
-                    uid = self._find(role, row["message_id"], row["ts"], row["arrived"])
+                    uid = self._adopt(role, row["message_id"], row["ts"], row["arrived"])
                     if uid is UNSURE:
                         unsure = True
                     elif uid is not None:
-                        self._locate(role, uid, row["message_id"])
                         break
                 else:
                     if not unsure and (row["settling"] is None or row["settling"] <= now):
@@ -3195,7 +4248,12 @@ class Mirror:
         announces it as one transaction. A stop in between leaves tombstones
         the index holds for live mail, which the next start announces
         (_prepare) — and a failed transaction leaves them unlocated, so the
-        next pass comes here again."""
+        next pass comes here again.
+
+        What still lies in the mailbox under a buried id — a place marked
+        "other" beside a placeholder — is another mail's no longer: it is
+        noted to be read again (_read_noted), and is then mirrored as the
+        mail it is, in the tombstone's place."""
         buried: dict = {}
         for row in rows:
             # The mail's blobs were stored for its record alone (_store_parts):
@@ -3219,10 +4277,193 @@ class Mirror:
                 (f"UPDATE mails SET removed = 1, recipients = '[]', cc = '[]' "
                  f"WHERE message_id IN ({marks})", tuple(message_ids)),
                 (f"DELETE FROM settling WHERE message_id IN ({marks})", tuple(message_ids)),
+                (f"UPDATE locations SET message_id = NULL, skipped = 'again' "
+                 f"WHERE skipped = 'other' AND message_id IN ({marks})", tuple(message_ids)),
                 self._event("removed", {"channel": CHANNEL, "account": ACCOUNT, "chat": chat,
                                         "message_ids": message_ids, "live": live})])
             print(f"[mail-gateway] {len(message_ids)} mail(s) of chat {chat!r} left the "
                   f"mailbox ({live} still there)", flush=True)
+
+    def _read_noted(self, policy, limit: int | None) -> bool:
+        """Read the UIDs noted "again" — mails of which nothing is known:
+        what lay under the id of a placeholder that is gone (_bury), what an
+        older build had marked unreadable (_prepare). Nothing else would
+        come back to them — the backfill reads INBOX and Sent only, and no
+        folder's mark is moved down. Each is read as any mail is the first
+        time it is read where it lies (_ingest, _mirror_one): a mail that
+        cannot be read is a placeholder, as where the folders are followed,
+        and holds back no note behind it. Old mail, quietly. True while some
+        are left for the next pass."""
+        noted = self.index.rows(
+            "SELECT l.role, l.gen, l.uid FROM locations l "
+            "JOIN folders f ON f.role = l.role AND f.gen = l.gen "
+            "WHERE l.skipped = 'again' "
+            "ORDER BY l.role != 'sent', l.role != 'inbox', l.role, l.uid")
+        done = 0
+        for row in noted:
+            name = self._folders.get(row["role"])
+            if not name or (row["role"] == "archive" and not self._settled):
+                continue   # the archive is not answering: another pass's
+            if limit is not None and done >= limit:
+                return True
+            self._ingest(row["role"], name, row["uid"], policy, backfill=True)
+            # The note goes: the mail there has a record or a place now —
+            # or the server said it holds none at that UID any more
+            # (expunged, or the folder renumbered since it was looked at,
+            # which leaves every place of that generation behind).
+            self.index.run("DELETE FROM locations WHERE role = ? AND gen = ? AND uid = ? "
+                           "AND skipped = 'again'", (row["role"], row["gen"], row["uid"]))
+            done += 1
+        return False
+
+    def _read_lost(self, policy) -> bool:
+        """Look for the mails whose record is gone from the ledger, by the
+        ids in `lost` (_prepare): at most LOST_BATCH of them a pass, the one
+        tried least recently first, the oldest among those (noticed first,
+        then arrived first, so a thread's first mail comes first). True
+        while some that are due are left for the next pass.
+
+        Each is looked for by its Message-ID in Sent, INBOX and the archive
+        — every mail under it in every folder (_find) — and, found, read as
+        a mail read for the first time (_read_found). Not found, with every
+        folder sure of it: the id goes, with nothing to tombstone (there is
+        no record). Not known (a folder that could not say, a header block
+        that was not read — I1): the id stays, and is looked for again
+        less and less often, as a placeholder is read again; the ids behind
+        it are not held back. At the LOST_TRIES-th time in vain, what is
+        found of it is read as mail nothing is known of, and it goes. A
+        UIDVALIDITY change asks nothing of this: nothing in `lost` names a
+        UID."""
+        now = self._clock()
+        due = self.index.rows(
+            "SELECT * FROM lost WHERE due <= ? "
+            "ORDER BY tried IS NOT NULL, tried, noticed, arrived IS NULL, arrived, message_id "
+            "LIMIT ?",
+            (now, LOST_BATCH + 1))
+        for hint in due[:LOST_BATCH]:
+            # Tried, whatever comes of it: should it end the pass (a write
+            # that fails), the next pass starts with the ids behind it.
+            self.index.run("UPDATE lost SET tried = ? WHERE message_id = ?",
+                           (now, hint["message_id"]))
+            if not self._read_found(hint, policy):
+                tries = hint["tries"] + 1
+                if tries >= LOST_TRIES:
+                    # Never told, however often it was looked for: what is
+                    # there is read as what it is, and the id waits no more.
+                    self._read_found(hint, policy, plain=True)
+                    continue
+                self.index.run(
+                    "UPDATE lost SET tries = ?, due = ? WHERE message_id = ?",
+                    (tries, now + SET_ASIDE_RETRY_SECONDS * (1 << min(tries, 5)),
+                     hint["message_id"]))
+        return len(due) > LOST_BATCH
+
+    def _read_found(self, hint, policy, plain: bool = False) -> bool:
+        """One id of `lost`: find its mail and read it, or know it is in no
+        folder. False when that cannot be told yet.
+
+        The mail read as the record's is ONE of what lies under the id. For
+        a row that said "out": a Sent copy, whenever the server received it
+        (a client may append its Sent copy late); then the copy the server
+        received when the row said the mail arrived; then an archive copy;
+        then the rest. For any other: the copy From the sender the lost row
+        named — the one received when the row said, else the first. A match
+        whose header block does not come back counts as From nobody, and
+        comes last (in Sent, still before the rest): it holds up nothing
+        where the first is known to be the record's — a Sent copy, an
+        archive copy From that sender for "out", one From that sender for
+        any other — and holds up the id where it may be the record's
+        itself. The one is read as a mail read for the first time where
+        it lies (_ingest), with one thing more: in the archive, From that
+        sender, where the row said "out", it is the user's own — a copy the
+        user can have put there, the same sender the lost record had
+        (_mirror_one). Never in INBOX: a From there is its sender's to write,
+        and whoever was sent a mail knows its id. The others are then read
+        as any further copy is: one more place of the record, marked as
+        another mail's, or a placeholder, by their own evidence.
+
+        When the row said the mail arrived is the search's only bound where
+        an id cannot be searched for (_find), and a copy received just then
+        is read without waiting for the scan to be whole. ``plain``: the id
+        was looked for LOST_TRIES times in vain, and nothing more is waited
+        for — what is found is read as mail nothing is known of (no hint),
+        and the id leaves `lost`, found or not (_read_lost)."""
+        mid = hint["message_id"]
+        found, sure = [], True
+        for order, role in enumerate(("sent", "inbox", "archive")):
+            name = self._folders.get(role)
+            if not name:
+                continue   # no such folder: nothing of the mail can be there
+            uids, whole = self._find(role, mid, None, hint["arrived"], every=True)
+            sure = sure and whole
+            found += [(order, role, name, uid) for uid in uids]
+        if not sure and not plain and (not found or _searchable(mid)):
+            return False
+        if plain:
+            print(f"[mail-gateway] the mail {mid!r}, whose record is gone from the ledger, "
+                  f"was looked for {LOST_TRIES} times: what was found of it "
+                  f"({len(found)} {'copy' if len(found) == 1 else 'copies'}) is read as mail "
+                  f"nothing is known of, and it is looked for no more", flush=True)
+        if not found:
+            self.index.run("DELETE FROM lost WHERE message_id = ?", (mid,))
+            if sure:
+                print(f"[mail-gateway] the mail {mid!r}, whose record is gone from the "
+                      f"ledger, is in no folder: there is no record to tombstone", flush=True)
+            return True
+        if len(found) > 1 or not sure:
+            # Which one is the record's: where it lies, who it is From, and
+            # when it came.
+            out, arrived = hint["direction"] == "out", hint["arrived"]
+            ranked, timely = [], False
+            for order, role, name, uid in found:
+                got = self._peek(name, uid)
+                if got is None:
+                    if plain:
+                        continue
+                    return False   # gone since the search: where to, the next one says
+                try:
+                    sender, unread = (read_head(_head_of(got.raw)) or {}).get("sender"), False
+                except NotRead:
+                    sender, unread = None, True
+                theirs = not (hint["sender"] and sender == hint["sender"])
+                # (An INTERNALDATE has whole seconds; what the record keeps
+                # of it may not.)
+                late = not (got.date is not None and arrived is not None
+                            and abs(got.date - arrived) < 1.0)
+                timely = timely or not late
+                key = ((role != "sent", unread, late, role != "archive", theirs) if out
+                       else (unread, theirs, late))
+                ranked.append(((*key, got.date is None, got.date or 0.0, order, uid),
+                               (order, role, name, uid), unread, theirs))
+            if not sure and not plain and not timely:
+                return False   # the scan reads on: the mail may be among the rest
+            ranked.sort(key=lambda entry: entry[0])
+            _rank, (_order, top, _name, _uid), _unread, stranger = ranked[0]
+            told = (top == "sent" or (top == "archive" and not stranger)) if out \
+                else not stranger
+            if not plain and not told and len(ranked) > 1 \
+                    and any(unread for _rank, _where, unread, _theirs in ranked):
+                # A match that did not come back may be the record's, and the
+                # first of those that did is not known to be: which one is,
+                # is not known yet (I1).
+                return False
+            found = [where for _rank, where, _unread, _theirs in ranked]
+        for n, (_order, role, name, uid) in enumerate(found):
+            first = n == 0 and not plain
+            try:
+                self._ingest(role, name, uid, policy, backfill=True,
+                             lost=hint if first else None)
+            except NotRead:
+                return False   # its header block did not come back: not read (I1)
+            if first and self.index.one(
+                    "SELECT 1 FROM locations l JOIN folders f ON f.role = l.role "
+                    "AND f.gen = l.gen WHERE l.role = ? AND l.uid = ?", (role, uid)) is None:
+                # Not read after all: the server holds no such mail there any
+                # more (moved since the search), or not under the UIDs it was
+                # found under. The next look tells where it is.
+                return False
+        self.index.run("DELETE FROM lost WHERE message_id = ?", (mid,))
+        return True
 
     # -- backfill --------------------------------------------------------------
 
@@ -3273,26 +4514,33 @@ class Mirror:
 
     # -- one mail --------------------------------------------------------------
 
-    def _ingest(self, role: str, name: str, uid: int, policy, *, backfill: bool) -> None:
+    def _ingest(self, role: str, name: str, uid: int, policy, *, backfill: bool,
+                lost=None) -> None:
         """Mirror the mail at one UID: a record, or one more place for a mail
         already recorded, or a note of why it has neither. It returns when
         the mail has one of the three and raises when it has none — so a
-        caller moves its mark past the UID exactly when this returns.
+        caller moves its mark past the UID exactly when this returns. (Or
+        when the server answers that no such mail is there: expunged, or
+        its folder renumbered since it was looked at — whoever asked looks
+        again: the folders' next look, the backfill's next plan, the next
+        look for a lost record's mail.) ``lost``: the hints `lost` holds of
+        the mail's id, for the one mail read as its record (_read_found).
 
         Whose fault a failure is, is decided by what failed:
 
           * READING the mail — the parse, the walk of its parts, the trim
             (:func:`read_mail`) — fails on the mail's account when the
-            reader still reads the canary. The mail is mirrored as a
-            placeholder (:func:`stub_mail`) at once, and the folder goes on:
+            reader still reads the canaries. The mail is mirrored as a
+            placeholder (:func:`read_stub`) at once, and the folder goes on:
             a mail is its sender's to write, and must stop neither the mails
             behind it nor the backfill.
-          * A reader that cannot read the canary either is the mirror's
-            fault, and so is every failure in WRITING — the ledger, the
-            indexes, the blobs — whatever mail was in hand: next to nothing
-            of a mail decides whether its record can be written, and a
-            mirror that set aside what it could not write would turn a
-            corrupt index or a bug into a mailbox of placeholders, quietly.
+          * A reader that cannot read the canaries either, or not in
+            their time, is the mirror's fault; so is a reader process that
+            cannot be started, and so is every failure in WRITING — the
+            ledger, the indexes, the blobs — whatever mail was in hand: next
+            to nothing of a mail decides whether its record can be written,
+            and a mirror that set aside what it could not write would turn
+            a corrupt index or a bug into a mailbox of placeholders, quietly.
             These end the pass (what the mailbox, a disk or an index file
             raised, as it is; anything else as a :class:`MirrorFault` that
             names the mail). Nothing is recorded, marked or skipped: the
@@ -3301,21 +4549,84 @@ class Mirror:
         fetched = self.mailbox.fetch(name, uid, limit=MAIL_MAX_MAIL_BYTES)
         if fetched is None:
             return   # the server's answer: expunged between the listing and now
+        folder = self._folder(role)
+        if fetched.uidvalidity is not None and folder is not None \
+                and fetched.uidvalidity != folder["uidvalidity"]:
+            # The folder was renumbered (or rebuilt) since it was looked at:
+            # what this UID names now is not what was listed, or placed,
+            # under it — nothing about the mail here is known from the index.
+            print(f"[mail-gateway] {name!r} was renumbered (UIDVALIDITY "
+                  f"{folder['uidvalidity']} -> {fetched.uidvalidity}) since it was looked "
+                  f"at; UID {uid} is left to the next look", flush=True)
+            return
         where = f"{name!r} UID {uid}"
+        why = None
+        # What the index holds this very UID to be: a UID is one mail for as
+        # long as its folder's UIDs hold, whatever is read off it this time.
+        at = self.index.one(
+            "SELECT m.* FROM locations l JOIN folders f ON f.role = l.role AND f.gen = l.gen "
+            "JOIN mails m ON m.message_id = l.message_id WHERE l.role = ? AND l.uid = ? "
+            "AND l.skipped IS NULL AND m.removed = 0 AND m.record != ''", (role, uid))
         try:
-            mail = read_mail(fetched.raw, fetched.date)
-        except UnreadableMail as exc:
-            cause = exc.__cause__
-            print(f"[mail-gateway] could not read the mail at {where}; mirroring a "
-                  f"placeholder: {exc}" + ("\n" + "".join(traceback.format_exception(
-                      type(cause), cause, cause.__traceback__, limit=-8)) if cause else ""),
-                  flush=True)
-            mail = stub_mail(fetched.raw, fetched.date, str(exc))
+            try:
+                mail = read_mail(fetched.raw, fetched.date)
+            except UnreadableMail as exc:
+                cause = exc.__cause__
+                print(f"[mail-gateway] could not read the mail at {where}; mirroring a "
+                      f"placeholder: {exc}" + ("\n" + "".join(traceback.format_exception(
+                          type(cause), cause, cause.__traceback__, limit=-8)) if cause else ""),
+                      flush=True)
+                # (The mail read as a lost record's has none to go on: a
+                # header block that does not come back leaves its id lost —
+                # unless that id is the one of the block's bytes, the record
+                # the mail had being a placeholder of the same.)
+                mail = read_stub(fetched.raw, fetched.date, str(exc), go_on=lost is None
+                                 or lost["message_id"] == _bare_id(_head_of(fetched.raw)))
+                # (Counted for /health only where a placeholder is made of it:
+                # a placeholder read again in vain is the one already on
+                # record, under whichever id.)
+                on_record = {mail.message_id, at["message_id"] if at is not None else None}
+                why = None if on_record & self._placeholders else exc.kind
         except MirrorFault as exc:
             raise MirrorFault(f"{exc}: the mail at {where} is not set aside over it — the "
                               f"pass ends there, and nothing is skipped") from exc
+        # On record under another id than it reads under now: the id was one
+        # of its bytes, made when its header block did not read (_bare_stub),
+        # or the block reads differently than it did. The mail is the same —
+        # where its header block says so: the block whose bytes the id was
+        # made of, or the one the record keeps (I2) — so what is known of it
+        # goes on to the new record (its direction), and the old one gives
+        # way in the same step: on what was read at its own place, not later
+        # for want of one.
+        head = _head_of(fetched.raw)
+        renamed = at is not None and at["message_id"] != mail.message_id
+        if renamed and not (at["message_id"] == _bare_id(head)
+                            or self._own_copy(at["message_id"], _head_text(head))):
+            # Another mail than the one on record at this UID, and the UIDs
+            # hold: the index does not know what lies here. The record keeps
+            # its place, and the next look at the folders sorts it out.
+            print(f"[mail-gateway] the mail at {where} is not the one on record there "
+                  f"({at['message_id']!r}); left as it is", flush=True)
+            return
+        if renamed and mail.unreadable is not None and mail.message_id == _bare_id(head):
+            # Only ever towards what was read. This time nothing was, not
+            # the header block either: no answer, and the record the mail
+            # has is the one it keeps.
+            return
         try:
-            self._mirror_one(role, uid, mail, fetched, policy, backfill)
+            self._mirror_one(role, uid, mail, fetched, policy, backfill,
+                             at["direction"] if renamed else None, lost=lost)
+            if renamed and self.index.one(
+                    "SELECT 1 FROM locations WHERE message_id = ? AND skipped IS NULL",
+                    (at["message_id"],)) is None:
+                self._bury([at])
+        except NotRead as exc:
+            # (The header block on record, asked whether the mail was sent
+            # on: no answer is not "no".)
+            raise MirrorFault(
+                f"what is on record of the mail at {where} could not be read ({exc}): "
+                f"nothing is decided on that — the pass ends there, and nothing is "
+                f"skipped") from exc
         except Exception as exc:  # noqa: BLE001 - writing: never this mail's fault
             if _environment(exc) or isinstance(exc, MirrorFault):
                 raise
@@ -3323,9 +4634,11 @@ class Mirror:
                 f"the mail at {where} could not be written ({type(exc).__name__}: "
                 f"{exc}"[:300] + "): it is not set aside over that — the pass ends "
                 "there, and nothing is skipped") from exc
+        if why is not None and mail.message_id in self._placeholders:
+            self._made[why] = self._made.get(why, 0) + 1
 
     def _mirror_one(self, role: str, uid: int, mail: Mail, fetched: Fetched, policy,
-                    backfill: bool) -> None:
+                    backfill: bool, direction: str | None = None, *, lost=None) -> None:
         if role == "archive" and any(flag.lower() == "\\draft" for flag in fetched.flags):
             # Where the archive is "all mail" it holds drafts too, and a draft
             # saved in that minute is not a mail anyone sent.
@@ -3339,10 +4652,30 @@ class Mirror:
         outbound = role == "sent" or (
             role == "archive" and mail.sender in OWN_ADDRESSES
             and self.index.get("archive_own") is not None)
+        # (A claim is a write under way, never seen here: see _write.)
         known = self.index.one("SELECT * FROM mails WHERE message_id = ? AND record != ''",
                                (mail.message_id,))
         if known is None and role == "sent" and self._own_send(uid, mail):
             return
+        if lost is not None and known is None and mail.message_id == lost["message_id"] \
+                and role in ("sent", "archive") and mail.sender \
+                and mail.sender == lost["sender"] and lost["direction"] == "out":
+            # The mail of a record gone from the ledger (_read_found), From the
+            # very sender that record had, which was the user's own, in a
+            # folder the user can have put it in: the user's again, whatever
+            # address that is (a plus-address, an alias nobody listed). Never
+            # in INBOX — a From there is its sender's to write, and whoever
+            # was sent a mail knows its id: a mail to oneself whose Sent copy
+            # is gone comes back as one that came in. Any other is read as a
+            # first reading here is.
+            outbound = True
+        if direction is not None and known is None:
+            # What the record it had under another id said (see _ingest): the
+            # mail is what it was, and no second look decides its direction,
+            # or whether it is news. (Only a copy in Sent still makes an
+            # inbound mail the user's own, as it does for a mail on record.)
+            outbound = direction == "out" or (role == "sent"
+                                              and not self._sent_on(mail, mail.resent))
         revived = False
         if known is not None:
             if known["removed"]:
@@ -3360,8 +4693,8 @@ class Mirror:
             elif role == "inbox" and known["direction"] == "out" and mail.sender \
                     and mail.sender == known["sender"] \
                     and mail.sender not in OWN_ADDRESSES \
-                    and self._sent_on(mail, _is_resent(
-                        self._recorded_header(mail.message_id))):
+                    and self._sent_on(mail, bool(
+                        (self._recorded_facts(mail.message_id) or {}).get("resent"))):
                 # The other way round: recorded from a Sent copy that says
                 # itself it was sent on, and here is its INBOX copy, from
                 # someone else. Somebody's mail the user redirected is still
@@ -3371,15 +4704,27 @@ class Mirror:
                 # the sender's to choose, and whoever was sent a mail knows
                 # its id — replaces nothing.)
                 pass
-            elif mail.unreadable is None and mail.message_id in self._placeholders:
-                if not self._placeholder_of(mail):
+            elif mail.message_id in self._placeholders:
+                if not self._own_copy(mail.message_id, mail.headers):
                     # A mail under the id of one on record as a placeholder
-                    # — and not the copy that was made from. Ids are the
-                    # sender's to choose, and whoever was sent a mail knows
-                    # its id: this one replaces nothing either. It is one
-                    # more place, marked so that the placeholder's reading
-                    # again does not come back to it.
+                    # — and not the copy that was made from, whether it
+                    # reads or not (a mail that cannot be read still has its
+                    # header block). Ids are the sender's to choose, and
+                    # whoever was sent a mail knows its id: this one
+                    # replaces nothing either. It is one more place, marked
+                    # so that the placeholder's reading again does not come
+                    # back to it — or stay with it, for good, in place of
+                    # the copy that may read by now.
                     self._locate(role, uid, mail.message_id, "other")
+                    return
+                if mail.unreadable is not None or not backfill:
+                    # The copy itself, and it still does not read: the
+                    # record it has is the one it keeps. Or it reads, where
+                    # the folders are followed (moved into INBOX, say): the
+                    # placeholder's reading again writes it, quietly, as old
+                    # mail (_retry_set_aside) — following the folders waits
+                    # on no record written again, should that fail (I4).
+                    self._locate(role, uid, mail.message_id)
                     return
                 # On record as a placeholder, and here is the very copy it
                 # was made from, read: the mail takes the placeholder's
@@ -3388,10 +4733,8 @@ class Mirror:
             else:
                 self._locate(role, uid, mail.message_id)
                 return
-            # (Reading the mail is done — read_mail, the trim included — so
-            # a mail that cannot be read anew keeps the record it has.)
-            self._drop_record(known)
-        if not outbound and known is None and self._is_news(mail, policy):
+        if not outbound and known is None and direction is None \
+                and self._is_news(mail, policy):
             self._locate(role, uid, mail.message_id, "news")
             return
         # A copy in Sent of a mail the gateway gave up on as "outcome
@@ -3399,17 +4742,18 @@ class Mirror:
         given_up = self._given_up(mail) if role == "sent" and known is None else []
         if given_up and self._author_noted(mail) is None:
             self.expect_sent(mail.message_id, given_up[0]["author"])
-        try:
-            self._write(mail, fetched, outbound=outbound,
-                        backfill=backfill and not revived)
-        except BaseException:
-            if known is not None:
-                # The record this was to replace is gone and its own is not
-                # written: the mail's places say nothing true now. _prepare
-                # clears them, and has the folders read again.
-                self._reconcile = True
-            raise
+        # (A record written again replaces the one on record in its place,
+        # and only once it stands: should this fail, the mail is still the
+        # record it was, and is read again from wherever it is — _write.)
+        self._write(mail, fetched, outbound=outbound,
+                    backfill=backfill and not revived, replace=known)
         self._locate(role, uid, mail.message_id)
+        if mail.unreadable is None:
+            # No placeholder (any more): what else lies under its id is a
+            # second copy like any mail's — one more place of the mail on
+            # record, not set apart from it.
+            self.index.run("UPDATE locations SET skipped = NULL WHERE message_id = ? "
+                           "AND skipped = 'other'", (mail.message_id,))
         self._went_out_after_all(given_up, mail)
 
     def _own_send(self, uid: int, mail: Mail) -> bool:
@@ -3572,14 +4916,14 @@ class Mirror:
                 print(f"[mail-gateway] could not note that send {entry['id']} went out: "
                       f"{exc}", flush=True)
 
-    def _placeholder_of(self, mail: Mail) -> bool:
-        """Whether ``mail`` is the copy its placeholder was made from, read
-        again: its header block is the one the placeholder's record keeps,
-        byte for byte. A move keeps a mail's header block as it stands, so
-        the copy is known wherever it is by now, and after a restart; no
-        other mail has it — what arrives is given trace fields of its own by
-        the server that takes it in."""
-        return self._recorded_head(mail.message_id) == mail.headers.encode("utf-8", "replace")
+    def _own_copy(self, message_id: str, headers: str) -> bool:
+        """Whether a mail with this header block is the copy the placeholder
+        under ``message_id`` was made from: its header block is the one the
+        placeholder's record keeps, byte for byte. A move keeps a mail's
+        header block as it stands, so the copy is known wherever it is by
+        now, and after a restart; no other mail has it — what arrives is
+        given trace fields of its own by the server that takes it in."""
+        return self._recorded_head(message_id) == headers.encode("utf-8", "replace")
 
     def _sent_on(self, mail: Mail, resent: bool) -> bool:
         """Whether the copy of ``mail`` in Sent is positively someone else's
@@ -3607,15 +4951,6 @@ class Mirror:
             print(f"[mail-gateway] e-mail gate failed ({exc}); mirroring the mail", flush=True)
             return False
         return bool(news) and not any(self.threads.chat_of(cited) for cited in mail.cited)
-
-    def _drop_record(self, row) -> None:
-        """Take a mail's record out of the ledger so it can be written anew."""
-        path = self._record_path(row["record"])
-        # Unlinks its blobs — the record's own, like every mail's.
-        _ibstore.tombstone_message(path, own_blobs=True)
-        path.unlink(missing_ok=True)
-        self.index.run("DELETE FROM mails WHERE message_id = ?", (row["message_id"],))
-        self._placeholders.discard(row["message_id"])
 
     def _store_parts(self, mail: Mail, fetched: Fetched, stored: list) -> dict:
         """Store a mail's parts as blobs; returns the record's references.
@@ -3688,7 +5023,8 @@ class Mirror:
         # trims better later. The whole text is the body blob.
         return trimmed.text[:MAX_RECORD_TEXT_CHARS].rstrip() + "\n…", "wanting"
 
-    def _write(self, mail: Mail, fetched: Fetched, *, outbound: bool, backfill: bool) -> None:
+    def _write(self, mail: Mail, fetched: Fetched, *, outbound: bool, backfill: bool,
+               replace=None) -> None:
         """Thread one mail, store its parts, write its record, tell the rail.
 
         In an order that leaves, wherever it stops, exactly one record and a
@@ -3696,7 +5032,21 @@ class Mirror:
         (ledger), then — one transaction — the claim confirmed and the event
         queued. A stop before the record leaves a claim that is dropped; a
         stop after it leaves a claim whose record stands, which _prepare
-        confirms and announces."""
+        confirms and announces.
+
+        ``replace`` is the row of the record on file for this mail, when it
+        is written again (I3): then there is no claim. The new record takes
+        the old one's place in one rename, and until then — a write that
+        fails, the process killed — the old one stands as it was, with its
+        row and its places; only its flags in `claims` say that a write was
+        begun, so that _prepare tells the rail whichever record stands. The
+        old record's blobs go once the new one stands. Where the old record's
+        file is gone (lost, or a ledger restored under the running gateway),
+        nothing stands to be replaced: the record is written as the first
+        time, under a name of its own, with the row standing as it was
+        until then — and the index is matched with the ledger again before
+        the next pass (_prepare), which also says what is to become of the
+        row should this write fail."""
         now = self._clock()
         ts = min(mail.date, now) if mail.date is not None else now
         # Threaded by when the server received the mail, not by its Date
@@ -3722,11 +5072,17 @@ class Mirror:
         text, state = mail.reading or self._reading_text(mail)
         direction = "out" if outbound else "in"
         seen = "\\Seen" in fetched.flags
+        old = self._record_path(replace["record"]) if replace is not None else None
+        if old is not None and not old.is_file():
+            old, self._reconcile = None, True
+        was = _ibstore.read_record(old) if old is not None else None
         # The claim goes in before the ledger write, so a crash between that
         # write and the index update leaves a row for the next start to match
         # to the record (_prepare) instead of a second record of the same
-        # mail — with what the rail is owed for it then.
+        # mail — with what the rail is owed for it then. (A record written
+        # again has its row: only the flags go in.)
         self.index.atomic([
+            None if replace is not None else
             ("INSERT OR REPLACE INTO mails (message_id, record, direction, chat, ts, sender, "
              "sender_name, recipients, cc, removed, arrived) "
              "VALUES (?, '', ?, ?, ?, ?, ?, ?, ?, 0, ?)",
@@ -3756,23 +5112,46 @@ class Mirror:
                 # someone said who wrote it.
                 author = self._author_noted(mail) or "device"
                 _urn, path = _ibstore.write_outbound(
-                    INBOUND_STORE_DIR, author=author, sender=mail.sender or None, **common)
+                    INBOUND_STORE_DIR, author=author, sender=mail.sender or None,
+                    replace=old, **common)
             else:
                 _urn, path = _ibstore.write_message(
                     INBOUND_STORE_DIR, sender=mail.sender,
-                    delivered=_delivered_on_write(direction), **common)
+                    delivered=_delivered_on_write(direction), replace=old, **common)
         except Exception:
             for media_id in stored:
                 _ibstore.discard_media(INBOUND_STORE_DIR, media_id)
             try:
                 self.index.atomic([
+                    # (A claim goes: its mail is not yet mirrored, and its
+                    # caller's mark comes back to it. A record written again
+                    # is the one it was.)
                     ("DELETE FROM mails WHERE message_id = ? AND record = ''",
                      (mail.message_id,)),
                     ("DELETE FROM claims WHERE message_id = ?", (mail.message_id,))])
             except sqlite3.Error:
-                pass   # a claim with no record: the next write of this mail replaces it
+                self._reconcile = True   # _prepare drops it, before anything is ingested
             raise
+        if was is not None:
+            # What the record it replaced named is named by none now (each
+            # mail's blobs are its record's alone: _store_parts).
+            for ref in [was.get(key) for key in ("body_part", "html_part", "header_part")] \
+                    + list(was.get("attachments") or ()):
+                media_id = _ibstore.media_id_of(ref or "")
+                if media_id and media_id not in stored:
+                    _ibstore.discard_media(INBOUND_STORE_DIR, media_id)
         try:
+            if replace is not None:
+                # The row says what the record in its place now does — before
+                # the event is made of it. (Its flags in `claims` stand until
+                # the event is queued: a stop in between is announced at the
+                # next start.)
+                self.index.run(
+                    "UPDATE mails SET direction = ?, chat = ?, ts = ?, sender = ?, "
+                    "sender_name = ?, recipients = ?, cc = ?, removed = 0, arrived = ? "
+                    "WHERE message_id = ?",
+                    (direction, chat, ts, mail.sender, mail.sender_name,
+                     json.dumps(mail.to), json.dumps(mail.cc), arrived, mail.message_id))
             if resolution.merged:
                 # Before the mail itself is announced, where it can be.
                 self._apply_merges()
@@ -6215,9 +7594,26 @@ POLICY_WAIT_REMEDY = (
     "TRIAGE_EMAIL_WHITELIST_PATH must reach the gateway's own mount)")
 
 
+def _fault_wait(faults: int) -> float:
+    """How long what failed on a fault of the mirror's own waits for its
+    next try, after ``faults`` such failures in a row: one poll interval,
+    then twice as long each time, up to MIRROR_FAULT_WAIT_MAX_SECONDS (and
+    never less than the interval a deployment set, however long)."""
+    return float(min(max(MIRROR_FAULT_WAIT_MAX_SECONDS, MAIL_POLL_SECONDS),
+                     MAIL_POLL_SECONDS * 2 ** min(faults - 1, 16)))
+
+
 def _loop_step(mirror: Mirror, loop: dict) -> float:
     """One turn of the mirror loop; returns how long to sleep before the next.
-    Never raises: a failure is a health state, and the next turn tries again."""
+    Never raises: a failure is a health state, and the next turn tries again.
+
+    A turn is two passes, and a fault of the mirror's own delays only the
+    one it was in. FOLLOWING the folders — new mail, vanished mail — comes
+    first and by itself, every poll interval, whatever became of the rest
+    last time. THE REST — finding mail again, reading mail again, the
+    backfill — is what an earlier look left to do: when it fails, it is
+    tried again with a later look at the folders, after one, then two, then
+    four of them … while new mail goes on being mirrored in between."""
     now = time.time()
     loop.setdefault("started", now)
     # (Whether a wake between two turns may reach for the mailbox: only
@@ -6237,13 +7633,42 @@ def _loop_step(mirror: Mirror, loop: dict) -> float:
                            notice=None, blocked="policy")
             return min(MAIL_POLL_SECONDS, 5.0)
         sync = now - loop.get("synced", 0.0) >= MAIL_POLL_SECONDS
-        more = mirror.poll(sync=sync, backfill_limit=MAIL_BACKFILL_BATCH)
-        SENDS.sweep()
         if sync:
+            mirror.poll(sync=True, work=False)
             loop["synced"] = now
-        _set_state(connected=mirror.fault is None, error=mirror.fault,
-                   notice=mirror.health_notice(), blocked=None, last_poll=time.time())
+            loop["faults"] = 0
+        more = False
+        held = loop.get("rest_faults", 0) > 0
+        if held and sync and loop.get("rest_skip", 0) > 0:
+            loop["rest_skip"] -= 1      # its wait, counted in looks at the folders
+        elif sync or not held:
+            try:
+                more = mirror.poll(sync=False, backfill_limit=MAIL_BACKFILL_BATCH)
+                loop["rest_faults"] = 0
+            except MailboxError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - reported, and tried again later
+                faults = loop["rest_faults"] = loop.get("rest_faults", 0) + 1
+                wait = _fault_wait(faults)
+                loop["rest_skip"] = int(wait // MAIL_POLL_SECONDS) - 1
+                loop["rest_error"] = (
+                    f"the mirror stopped on an internal error: {exc}"[:440]
+                    + " (new mail is still mirrored meanwhile)")
+                print(f"[mail-gateway] the work an earlier look left to do failed ({faults} "
+                      f"time(s) in a row; next try in {wait:.0f} s, new mail is followed "
+                      f"meanwhile): {exc}\n{traceback.format_exc()}", flush=True)
+        SENDS.sweep()
+        # The mailbox answered this turn, whatever became of the rest (a
+        # fault of the mirror's own is no word on the mailbox).
         loop["up"] = True
+        if loop.get("rest_faults", 0) > 0:
+            # New mail is mirrored, and still the mirror is at fault: what it
+            # cannot do must not go unseen behind what it can.
+            _set_state(connected=False, blocked="mirror", error=loop["rest_error"],
+                       last_poll=time.time())
+        else:
+            _set_state(connected=mirror.fault is None, error=mirror.fault,
+                       notice=mirror.health_notice(), blocked=None, last_poll=time.time())
         if more:
             return MAIL_BACKFILL_PAUSE_SECONDS
         return max(1.0, MAIL_POLL_SECONDS - (time.time() - loop.get("synced", now)))
@@ -6257,7 +7682,18 @@ def _loop_step(mirror: Mirror, loop: dict) -> float:
         # and the gateway monitor must not word that as a refused login.
         _set_state(connected=False, blocked="mirror",
                    error=f"the mirror stopped on an internal error: {exc}"[:500])
-        print(f"[mail-gateway] poll failed: {exc}\n{traceback.format_exc()}", flush=True)
+        # It failed while following the folders: the mail in hand is new
+        # mail, and none behind it can be mirrored before it. Nothing
+        # changes between two tries that fail the same way, and each fetches
+        # that mail whole again before it gets to where it failed (a full
+        # disk and one mail of 50 MB: 72 GB a day off a server that counts).
+        # So the wait doubles with every such failure in a row, up to an
+        # hour, and a look at the folders that goes through resets it.
+        loop["faults"] = faults = loop.get("faults", 0) + 1
+        wait = _fault_wait(faults)
+        print(f"[mail-gateway] poll failed ({faults} time(s) in a row; next try in "
+              f"{wait:.0f} s): {exc}\n{traceback.format_exc()}", flush=True)
+        return wait
     # A whole interval after a failure: a refused login retried every few
     # seconds is how a mailbox gets locked.
     return float(MAIL_POLL_SECONDS)
@@ -6593,7 +8029,7 @@ def _serve_http() -> None:
 
 
 def main() -> None:
-    global MIRROR
+    global MIRROR, READER
     if not CONFIGURED:
         # Stay up with /health reporting configured: false, like the other
         # gateways: an unconfigured channel is a deployment choice, not a fault.
@@ -6607,6 +8043,9 @@ def main() -> None:
     elif MAIL_CONFIG is None:
         print(f"[mail-gateway] the mailbox is not usable: {CONFIG_PROBLEM}", flush=True)
     else:
+        # Started with the first mail it is to read, and again whenever one
+        # had to be ended.
+        READER = Reader()
         MIRROR = Mirror(Mailbox(MAIL_CONFIG))
         print(f"[mail-gateway] mirroring {ACCOUNT} (backfill {MAIL_BACKFILL_DAYS} days; "
               + (f"sending under send policy {_send_category()!r}" if SMTP_PROBLEM is None
@@ -6619,4 +8058,7 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    if sys.argv[1:2] == [READER_FLAG]:
+        _serve_reader(int(sys.argv[2]))
+    else:
+        main()

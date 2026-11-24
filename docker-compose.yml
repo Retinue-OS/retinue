@@ -1209,7 +1209,8 @@ services:
       # (MAIL_SENT_GRACE_SECONDS), the poll interval,
       # the backfill window in days (0 mirrors only new mail), the backfill's
       # batch size and the pause between batches, the IMAP socket timeout,
-      # the size caps for one part and one mail, the trim's "wanting"
+      # the size caps for one part and one mail, the seconds reading one
+      # mail may take before it is a placeholder, the trim's "wanting"
       # threshold, the limit on waiting for the e-mail policy file before the
       # mirror starts (unset or 0: no limit), how many chats /recent-chats
       # answers, and the timeout of the chats rail's POSTs.
@@ -1223,6 +1224,7 @@ services:
       - MAIL_IMAP_TIMEOUT
       - MAIL_MAX_PART_BYTES
       - MAIL_MAX_MAIL_BYTES
+      - MAIL_READ_SECONDS
       - MAIL_TRIM_WANTING_CHARS
       - MAIL_POLICY_WAIT_SECONDS
       - MAIL_RECENT_CHATS_MAX

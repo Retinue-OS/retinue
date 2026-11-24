@@ -707,6 +707,7 @@ files news itself only from the gate phase on (`docs/mail-chats.md`).
 | `MAIL_IMAP_TIMEOUT` | `60` | IMAP socket timeout, seconds |
 | `MAIL_MAX_PART_BYTES` | 25 MiB | an attachment larger than this is not stored |
 | `MAIL_MAX_MAIL_BYTES` | 50 MiB | a larger mail keeps its text parts and no attachments |
+| `MAIL_READ_SECONDS` | `30` | how long reading one mail may take, plus a second for each megabyte of it, before the mail is mirrored as a placeholder (`docs/mail-chats.md`, *The mirror*); raise it on a very slow machine |
 | `MAIL_TRIM_WANTING_CHARS` | `2500` | the trim's "still long" threshold (`scripts/mail_trim.py`) |
 | `MAIL_POLICY_WAIT_SECONDS` | *(unset: no limit)* | a positive number: how long the mirror waits for the e-mail policy file before it starts as with no flags |
 | `MAIL_RECENT_CHATS_MAX` | `200` | how many chats `/recent-chats` answers at most |
@@ -837,7 +838,13 @@ notice by the registry entry's channel). A gateway whose `/health` names
 what holds it when that is not its link (`blocked` — the mail mirror waiting
 for the e-mail policy file) is reported as waiting for its setup, and one
 that names itself (`blocked: "mirror"`) as stopped on a fault of its own —
-with the gateway's own reason in the notice and in every reminder. An outage
+with the gateway's own reason in the notice and in every reminder. A mail
+gateway that works and still cannot read some of its mail says so in
+`/health` (`placeholders`), as does one looking for mail whose records its
+ledger lost (`lost`, counted with them); when five or more such mails stand
+beyond those the user was last told of, the monitor opens a thread of its own
+for it — a notice of lower importance, at most one per reminder interval,
+never an outage (the mail is in the mailbox, and is read again). An outage
 that turns into one of another kind (the gateway that waited for its setup
 now cannot log in) is told in the same thread once as many checks in a row
 have seen it as open an outage (`GATEWAY_MONITOR_FAILURES`), in the new

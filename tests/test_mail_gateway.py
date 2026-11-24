@@ -14,8 +14,10 @@ tests/test_mail_gateway_imap.py; both load this file for its helpers.
 
     python3 tests/test_mail_gateway.py
 """
+import contextlib
 import email.utils
 import importlib.util
+import io
 import json
 import os
 import shutil
@@ -166,12 +168,25 @@ class FakeMailbox:
         box["mails"] = {uid + offset: mail for uid, mail in box["mails"].items()}
         box["next"] += offset
 
+    def rebuild(self, folder) -> None:
+        """The folder rebuilt by the server: a UIDVALIDITY change, and the
+        same mails under UIDs handed out afresh from 1 — so an old UID may
+        hold another mail now."""
+        box = self.boxes[folder]
+        box["validity"] += 1
+        box["mails"] = {n: mail for n, (_uid, mail) in
+                        enumerate(sorted(box["mails"].items()), start=1)}
+        box["next"] = len(box["mails"]) + 1
+
+    def uids_of(self, folder, message_id) -> tuple:
+        """Every UID in ``folder`` under this Message-ID, newest first."""
+        return tuple(
+            uid for uid, mail in sorted(self.boxes[folder]["mails"].items(), reverse=True)
+            if (email.message_from_bytes(mail["raw"]).get("Message-ID") or ""
+                ).strip().strip("<>") == message_id)
+
     def uid_of(self, folder, message_id) -> int | None:
-        for uid, mail in sorted(self.boxes[folder]["mails"].items(), reverse=True):
-            header = email.message_from_bytes(mail["raw"]).get("Message-ID") or ""
-            if header.strip().strip("<>") == message_id:
-                return uid
-        return None
+        return next(iter(self.uids_of(folder, message_id)), None)
 
     # -- the adapter's surface ------------------------------------------------
 
@@ -215,19 +230,20 @@ class FakeMailbox:
     def fetch(self, folder, uid, limit=None):
         self._check(folder)
         self.fetched.append((folder, uid, limit))
-        mail = self.boxes.get(folder, {"mails": {}})["mails"].get(uid)
+        box = self.boxes.get(folder, {"mails": {}, "validity": None})
+        mail = box["mails"].get(uid)
         if mail is None:
             return None
         raw = mail["raw"]
         return self.gw.Fetched(raw[:limit] if limit else raw, len(raw),
-                               mail["flags"], mail["date"])
+                               mail["flags"], mail["date"], box["validity"])
 
     def find(self, folder, message_id):
         self._check(folder)
         self.found.append((folder, message_id))
         if folder not in self.boxes:
-            return None
-        return self.uid_of(folder, message_id)
+            return self.gw.Matches((), True)
+        return self.gw.Matches(self.uids_of(folder, message_id), True)
 
     # -- the adapter's write half ---------------------------------------------
 
@@ -538,6 +554,262 @@ def test_the_sent_copy_arriving_late_makes_it_the_users_own_mail():
     print("ok: a mail first seen in INBOX becomes the user's own once its Sent copy shows")
 
 
+def test_the_sent_copy_that_shows_as_sent_is_renumbered_still_counts():
+    """The same, with the Sent copy saved in the very poll in which the
+    server renumbers Sent. What arrived since the last look is read at once
+    then — and a mail of it on record was only given its place there, so
+    the user's own post stayed an inbound mail for good. It is read as the
+    folder is followed: the Sent copy makes it the user's."""
+    with tempfile.TemporaryDirectory() as tmp:
+        gw = load(tmp)
+        events = rail(gw)
+        clock = {"now": NOW}
+        box = FakeMailbox(gw)
+        mirror = gw.Mirror(box, clock=lambda: clock["now"])
+        mirror.poll()
+        post = msg("post@example.org", sender=ME, to="list@lists.x.org", cc=ACCOUNT, day=40)
+        box.put("INBOX", post, date=NOW)
+        clock["now"] += 60
+        mirror.poll()
+        assert records(gw)[0]["type"] == gw._ibstore.T_INBOUND
+        box.put("Sent", post, date=NOW + 60)
+        box.renumber("Sent")
+        for _ in range(4):
+            clock["now"] += 3600
+            mirror.poll()
+            while mirror.poll(sync=False):
+                pass
+        (record,) = records(gw)
+        assert record["type"] == gw._ibstore.T_OUTBOUND and record["author"] == "device"
+        assert [e["direction"] for e in inbound(events)] == ["in", "out"]
+        assert sorted((row["role"], row["uid"]) for row in mirror.index.rows(
+            "SELECT role, uid FROM locations WHERE message_id = 'post@example.org'")) == [
+                ("inbox", 1), ("sent", 51)]
+    print("ok: a Sent copy that shows as Sent is renumbered makes the mail the user's own")
+
+
+def test_a_record_whose_file_is_gone_is_written_as_the_first_time():
+    """A record file lost while the gateway runs (deleted by hand, a ledger
+    directory restored under it), and then its mail written again in its
+    place — here the Sent copy of the user's list post, recorded from
+    INBOX, shows. The record to replace was not there, the write raised,
+    and every look at the folders stopped at that mail: no new mail was
+    mirrored until a restart. Nothing stands to be replaced, so the record
+    is written as the first time, and the index is matched with the
+    ledger again."""
+    with tempfile.TemporaryDirectory() as tmp:
+        gw = load(tmp)
+        _write_policy(gw)
+        events = rail(gw)
+        clock = {"now": NOW}
+        box = FakeMailbox(gw)
+        mirror = gw.Mirror(box, clock=lambda: clock["now"])
+        mirror.poll()
+        post = msg("post@example.org", sender=ME, to="list@lists.x.org", cc=ACCOUNT, day=40)
+        box.put("INBOX", post, date=NOW)
+        clock["now"] += 60
+        mirror.poll()
+        (path,) = [p for p, _f in gw._ibstore.iter_records(gw.INBOUND_STORE_DIR)]
+        path.unlink()
+        box.put("Sent", post, date=NOW + 60)
+        loop = {}
+        for n in range(4):
+            clock["now"] += 600
+            box.put("INBOX", msg(f"new{n}@x.org", body=f"New {n}\n", day=40), date=clock["now"])
+            gw.MIRROR = mirror
+            loop.pop("synced", None)
+            gw._loop_step(mirror, loop)
+            snap = gw._health_snapshot()
+            assert snap["connected"] is True and snap["blocked"] is None, snap
+            assert f"new{n}@x.org" in by_id(gw), n
+        recs = by_id(gw)
+        assert recs["post@example.org"]["type"] == gw._ibstore.T_OUTBOUND
+        assert len(records(gw)) == 5 and mirror.lost() == 0
+        assert [e["direction"] for e in inbound(events)
+                if e["message_id"] == "post@example.org"] == ["in", "out"]
+        # The index says what the ledger does.
+        row = mirror.index.one("SELECT * FROM mails WHERE message_id = 'post@example.org'")
+        assert row["record"] == next(p.name for p, f in gw._ibstore.iter_records(
+            gw.INBOUND_STORE_DIR) if f["message_id"] == "post@example.org")
+        assert row["direction"] == "out" and mirror.index.rows("SELECT * FROM claims") == []
+    print("ok: a record whose file is gone is written as the first time, and the folders "
+          "go on")
+
+
+def _lost(gw, box, clock, mirror):
+    """The ledger restored from a backup that lacks every record — the state
+    volume closed for it, as a restore comes with a restart — and the mirror
+    started again."""
+    for path, _fields in list(gw._ibstore.iter_records(gw.INBOUND_STORE_DIR)):
+        path.unlink()
+    mirror.index.close()
+    mirror.threads.close()
+    return gw.Mirror(box, clock=lambda: clock["now"])
+
+
+def _turns(gw, mirror, clock, loop, n) -> dict:
+    """``n`` turns of the mirror loop a minute apart, each with a look at the
+    folders; what /health says after them."""
+    for _ in range(n):
+        clock["now"] += 61
+        gw.MIRROR = mirror
+        loop.pop("synced", None)
+        gw._loop_step(mirror, loop)
+    return gw._health_snapshot()
+
+
+def test_a_forged_from_in_inbox_never_makes_a_lost_record_the_users():
+    """The mail of a lost record that was the user's was the user's again
+    wherever it lay From the same sender — in INBOX too — and the copy the
+    server received first came before the Sent copy. Whoever was sent a
+    mail knows its id, and a From in INBOX is its sender's to write: a
+    look-alike From the user's address became the user's outbound mail,
+    the Sent copy deleted or appended later than the look-alike came in.
+    The hint's "out" counts in Sent and the archive only, and a Sent copy
+    comes first whenever it came. So a mail to oneself whose Sent copy is
+    gone comes back as one that came in: the stated limit."""
+    for variant in ("deleted", "appended late"):
+        with tempfile.TemporaryDirectory() as tmp:
+            gw = load(tmp)
+            _write_policy(gw)
+            events = rail(gw)
+            clock = {"now": NOW}
+            box = FakeMailbox(gw)
+            mirror = gw.Mirror(box, clock=lambda: clock["now"])
+            loop = {}
+            _turns(gw, mirror, clock, loop, 1)
+            sent, forged = T0 + 39.9 * DAY, T0 + 39.95 * DAY
+            if variant == "appended late":
+                sent = forged + 600
+            box.put("Sent", msg("own@example.org", sender=ME, to="Mallory <m@evil.org>",
+                                body="My offer: 100.\n", day=39.9), date=sent)
+            _turns(gw, mirror, clock, loop, 2)
+            # Mallory, who was sent it, sends a mail under its id From the
+            # user's own address.
+            box.put("INBOX", msg("own@example.org", sender=ME, to=ME, subject="Re",
+                                 body="I agree to pay Mallory 5000.\n", day=39.95), date=forged)
+            _turns(gw, mirror, clock, loop, 2)
+            assert by_id(gw)["own@example.org"]["text"] == "My offer: 100.", variant
+            if variant == "deleted":
+                box.remove("Sent", box.uid_of("Sent", "own@example.org"))
+                _turns(gw, mirror, clock, loop, 2)
+            told = len(events)
+            mirror, loop = _lost(gw, box, clock, mirror), {}
+            snap = _turns(gw, mirror, clock, loop, 4)
+            record = by_id(gw)["own@example.org"]
+            got = [(p["direction"], p["text"]) for p in inbound(events[told:])]
+            if variant == "deleted":
+                # Nothing but its From says the user wrote what lies in INBOX.
+                assert record["type"] == gw._ibstore.T_INBOUND and not record.get("author")
+                assert got == [("in", "I agree to pay Mallory 5000.")], got
+            else:
+                assert record["type"] == gw._ibstore.T_OUTBOUND, variant
+                assert got == [("out", "My offer: 100.")], got
+                assert sorted(row["role"] for row in mirror.index.rows(
+                    "SELECT role FROM locations WHERE message_id = 'own@example.org' "
+                    "AND skipped IS NULL")) == ["inbox", "sent"]
+            assert snap["lost"] == 0, snap
+    print("ok: a forged From in INBOX never makes a lost record the user's own mail — a "
+          "Sent copy comes first, whenever it was appended")
+
+
+def _hanging(gw):
+    """Every mail with an ``X-Hang`` header neither reads nor has a header
+    block that comes back. Returns the undo."""
+    saved = gw.read_mail, gw.stub_mail, gw._head_facts
+
+    def read_mail(raw, date, *args, **kwargs):
+        if b"X-Hang: yes" in raw:
+            raise gw.UnreadableMail("too much work", "work")
+        return saved[0](raw, date, *args, **kwargs)
+
+    def stub_mail(head, date, reason, *args, **kwargs):
+        if b"X-Hang: yes" in head:
+            raise gw.TookTooLong("hangs")
+        return saved[1](head, date, reason, *args, **kwargs)
+
+    def head_facts(head):
+        if b"X-Hang: yes" in head:
+            raise gw.TookTooLong("hangs")
+        return saved[2](head)
+    gw.read_mail, gw.stub_mail, gw._head_facts = read_mail, stub_mail, head_facts
+    return lambda: (setattr(gw, "read_mail", saved[0]), setattr(gw, "stub_mail", saved[1]),
+                    setattr(gw, "_head_facts", saved[2]))
+
+
+def test_a_lost_id_is_not_looked_for_for_ever():
+    """An id whose record the ledger lost stayed in `lost` for good where one
+    of its matches had a header block that does not come back (a look-alike
+    anybody can plant), or where an id that cannot be searched for needed a
+    scan that never got to be whole (an unreadable mail of any sender in
+    its window, or more unplaced mail there than the scan remembers): its
+    mail was never mirrored again, and only /health's count said so. A
+    match that does not read comes last and is read as a further copy (a
+    placeholder); a copy received when the record said needs no whole scan;
+    and after LOST_TRIES tries what was found is read as mail nothing is
+    known of, and a log line says so."""
+    cases = ("a look-alike that never reads", "no Message-ID, unreadable mail archived",
+             "no Message-ID, more archived mail than the scan remembers",
+             "a search that never settles")
+    for case in cases:
+        with tempfile.TemporaryDirectory() as tmp:
+            gw = load(tmp)
+            _write_policy(gw)
+            rail(gw)
+            clock = {"now": NOW}
+            box = FakeMailbox(gw)
+            undo = _hanging(gw)
+            try:
+                mirror = gw.Mirror(box, clock=lambda: clock["now"])
+                loop = {}
+                _turns(gw, mirror, clock, loop, 1)
+                mid = None if case.startswith("no Message-ID") else "a@x.org"
+                box.put("INBOX", msg(mid, body="Ann: the contract is signed.\n", day=39.0))
+                _turns(gw, mirror, clock, loop, 2)
+                if case == "a look-alike that never reads":
+                    box.put("INBOX", msg("a@x.org", sender="Mallory <m@evil.org>",
+                                         headers=[("X-Hang", "yes")], body="x\n", day=39.1))
+                elif case == "no Message-ID, unreadable mail archived":
+                    box.put("Archive", msg("junk@spam.org", sender="Spam <s@spam.org>",
+                                           headers=[("X-Hang", "yes")], body="x\n", day=39.5))
+                elif case == "no Message-ID, more archived mail than the scan remembers":
+                    gw.SCAN_CACHE_MAX, gw.SCAN_BUDGET = 100, 40
+                    for i in range(150):
+                        box.put("Archive", msg(f"arch{i}@x.org", subject=f"a{i}", day=39.2))
+                _turns(gw, mirror, clock, loop, 2)
+                (ann,) = [m for m, r in by_id(gw).items() if r["sender"] == "ann@x.org"]
+                if case == "a search that never settles":
+                    find = box.find
+                    box.find = lambda folder, wanted: (
+                        gw.Matches((), False) if folder == "Archive" else find(folder, wanted))
+                mirror, loop = _lost(gw, box, clock, mirror), {}
+                said, left = io.StringIO(), []
+                with contextlib.redirect_stdout(said):
+                    for _day in range(10):
+                        _turns(gw, mirror, clock, loop, 3)
+                        left.append(mirror.lost())
+                        clock["now"] += DAY
+                    snap = _turns(gw, mirror, clock, loop, 3)
+                recs = by_id(gw)
+                assert recs.get(ann, {}).get("text") == "Ann: the contract is signed.", (
+                    case, {m: r["text"] for m, r in recs.items()})
+                assert snap["lost"] == 0 and snap["connected"] is True, (case, snap)
+                if case == "a look-alike that never reads":
+                    # Mallory's is a placeholder of its own, under its bytes.
+                    assert [r["text"] for m, r in recs.items() if m != ann] == [
+                        gw.UNREADABLE_TEXT], case
+                if case == "a search that never settles":
+                    # Waited for, LOST_TRIES times, then read as what it is.
+                    assert gw.LOST_TRIES == 8 and left[:4] == [1] * 4, left
+                    assert f"was looked for {gw.LOST_TRIES} times" in said.getvalue(), case
+                else:
+                    assert left[0] == 0, (case, left)
+            finally:
+                undo()
+    print("ok: a lost id is not looked for for ever — a match that does not read is a "
+          "further copy, a copy received just then needs no whole scan, and the tries end")
+
+
 def test_a_move_to_the_archive_leaves_the_record_alone():
     with tempfile.TemporaryDirectory() as tmp:
         gw = load(tmp)
@@ -730,7 +1002,8 @@ def test_a_search_that_does_not_settle_it_calls_nothing_gone():
         # The archive's search matched more look-alike ids than are compared.
         real = box.find
         box.find = lambda folder, mid: (
-            gw.UNSURE if (folder, mid) == ("Archive", "a@x.org") else real(folder, mid))
+            gw.Matches((), False) if (folder, mid) == ("Archive", "a@x.org")
+            else real(folder, mid))
         mirror.poll()
         mirror.poll()
         recs = by_id(gw)
@@ -884,7 +1157,7 @@ def test_a_mail_without_a_searchable_id_is_found_among_many():
         uid = box.put("INBOX", raw, date=NOW)
         mirror.poll()
         mid = "a-very-long-left-part-of-an-id.continued@x.org"
-        assert list(by_id(gw)) == [mid] and box.find("INBOX", mid) is None
+        assert list(by_id(gw)) == [mid] and box.find("INBOX", mid).uids == ()
         box.move_mail("INBOX", uid, "Archive")
         box.found.clear()
         mirror.poll()
@@ -2424,12 +2697,162 @@ def test_health_states():
         # it is the mirror's own, said so: the mailbox answered, and nobody
         # is to be sent to check a password over it.
         gw.MIRROR.poll = lambda **kw: 1 / 0
+        loop.pop("synced")      # (at the next look at the folders)
         assert gw._loop_step(gw.MIRROR, loop) == gw.MAIL_POLL_SECONDS
         snap = gw._health_snapshot()
         assert snap["connected"] is False and "internal error" in snap["error"]
         assert snap["blocked"] == "mirror" and "division by zero" in snap["error"]
         json.dumps(snap)
     print("ok: health reports unconfigured, misconfigured, connected and failed")
+
+
+def test_a_fault_of_the_mirror_is_tried_again_less_and_less_often():
+    """While a fault of the mirror's own lasts, every turn of the loop
+    fetches the mail in hand whole again before it gets to where it failed,
+    and nothing changes between two turns that fail the same way: a full
+    disk and one mail of 18 MB were 180 MB off the server in ten minutes,
+    and at the fetch limit 72 GB a day. The wait doubles with every such
+    failure in a row, up to an hour; a pass that goes through resets it."""
+    with tempfile.TemporaryDirectory() as tmp:
+        gw = load(tmp)
+        _write_policy(gw)
+        rail(gw)
+        box = FakeMailbox(gw)
+        gw.MIRROR = mirror = gw.Mirror(box, clock=lambda: NOW)
+        loop: dict = {}
+        assert gw._loop_step(mirror, loop) <= gw.MAIL_POLL_SECONDS == 60.0
+        box.put("INBOX", msg("big@x.org", day=39.9))
+        real = gw._ibstore.store_media
+        gw._ibstore.store_media = lambda *a, **kw: (_ for _ in ()).throw(
+            OSError(28, "No space left on device"))
+        try:
+            loop.pop("synced")
+            waits = [gw._loop_step(mirror, loop) for _ in range(9)]
+            assert waits == [60.0, 120.0, 240.0, 480.0, 960.0, 1920.0, 3600.0, 3600.0, 3600.0]
+            assert gw.MIRROR_FAULT_WAIT_MAX_SECONDS == 3600.0
+            # (Each try still fetches the mail once: the saving is the wait.)
+            assert len(box.fetched) == 9 and records(gw) == []
+            snap = gw._health_snapshot()
+            assert snap["connected"] is False and snap["blocked"] == "mirror"
+            assert "No space left" in snap["error"]
+            # A mailbox that does not answer is another matter: it is asked
+            # again after one interval, and is neither such a failure nor a
+            # pass that went through.
+            box.fail = gw.MailboxError("the IMAP connection failed: timed out")
+            assert gw._loop_step(mirror, loop) == gw.MAIL_POLL_SECONDS
+            assert gw._health_snapshot()["blocked"] is None
+            assert gw._loop_step(mirror, loop) == 3600.0
+        finally:
+            gw._ibstore.store_media = real
+        # The disk has room again: the pass goes through, and the next
+        # fault of the mirror starts at one interval.
+        assert gw._loop_step(mirror, loop) <= gw.MAIL_POLL_SECONDS
+        assert gw._health_snapshot()["connected"] is True and len(records(gw)) == 1
+        mirror.poll = lambda **kw: 1 / 0
+        loop.pop("synced")
+        assert [gw._loop_step(mirror, loop) for _ in range(2)] == [60.0, 120.0]
+    with tempfile.TemporaryDirectory() as tmp:
+        # Never less than the poll interval a deployment set, however long.
+        gw = load(tmp, MAIL_POLL_SECONDS=7200)
+        _write_policy(gw)
+        rail(gw)
+        gw.MIRROR = mirror = gw.Mirror(FakeMailbox(gw), clock=lambda: NOW)
+        mirror.poll = lambda **kw: 1 / 0
+        assert [gw._loop_step(mirror, {}) for _ in range(2)] == [7200.0, 7200.0]
+        loop = {}
+        assert [gw._loop_step(mirror, loop) for _ in range(3)] == [7200.0, 7200.0, 7200.0]
+    print("ok: after a fault of its own the mirror waits twice as long each time, up to "
+          "an hour, and a pass that goes through resets the wait")
+
+
+def test_a_fault_in_old_work_keeps_no_new_mail_waiting():
+    """(I4) The doubling wait after a fault of the mirror's own was the whole
+    loop's: one old mail the backfill could not write — a fault that lasts
+    until a fix — and new mail was mirrored an hour late, for as long. A
+    fault delays only the work that failed. Following the folders comes
+    first and by itself, every poll interval; the rest is what is tried
+    again less and less often."""
+    with tempfile.TemporaryDirectory() as tmp:
+        gw = load(tmp)
+        _write_policy(gw)
+        rail(gw)
+        box = FakeMailbox(gw)
+        old = box.put("INBOX", msg("old@x.org", body="What the writer chokes on.\n", day=20))
+        gw.MIRROR = mirror = gw.Mirror(box, clock=lambda: NOW)
+        loop: dict = {}
+        real = gw._ibstore.store_media
+
+        def store(directory, data, *args, **kwargs):
+            if b"the writer chokes on" in data:
+                raise ValueError("a bug in the writer")
+            return real(directory, data, *args, **kwargs)
+        gw._ibstore.store_media = store
+
+        def turn(n: int) -> float:
+            """One poll interval later: a new mail has come."""
+            if n:
+                box.put("INBOX", msg(f"new{n}@x.org", body=f"New mail {n}.\n", day=40))
+            loop.pop("synced", None)
+            return gw._loop_step(mirror, loop)
+        try:
+            for n in range(17):
+                assert turn(n) <= gw.MAIL_POLL_SECONDS, "new mail waits for no fault but its own"
+                assert n == 0 or f"new{n}@x.org" in by_id(gw), n
+                # Mail is mirrored, and still the mirror is at fault: /health
+                # says so, and which part of its work it is.
+                snap = gw._health_snapshot()
+                assert snap["connected"] is False and snap["blocked"] == "mirror", snap
+                assert "a bug in the writer" in snap["error"] and "'INBOX' UID 1" in snap["error"]
+                assert "new mail is still mirrored" in snap["error"] and snap["last_poll"]
+            # What failed was tried again after one interval, then two, four,
+            # eight: each try fetches that mail whole.
+            tries = [i for i, fetch in enumerate(box.fetched) if fetch[:2] == ("INBOX", old)]
+            assert len(tries) == 5 and len(box.fetched) == 5 + 16, box.fetched
+            assert sorted(by_id(gw)) == sorted(f"new{n}@x.org" for n in range(1, 17))
+            # Between two looks at the folders it is not tried either.
+            assert gw._loop_step(mirror, loop) <= gw.MAIL_POLL_SECONDS
+            assert len(box.fetched) == 5 + 16
+        finally:
+            gw._ibstore.store_media = real
+        # The writer works again: at its next try the old mail is on record
+        # — as old mail — and the mirror is healthy.
+        for n in range(17, 33):
+            turn(n)
+            if "old@x.org" in by_id(gw):
+                break
+        assert n == 31, n     # sixteen intervals after the last try
+        snap = gw._health_snapshot()
+        assert snap["connected"] is True and snap["blocked"] is None and snap["error"] is None
+        assert mirror.backfill_done() and len(records(gw)) == n + 1
+        # And the next such fault starts at one interval again.
+        assert loop["rest_faults"] == 0
+    with tempfile.TemporaryDirectory() as tmp:
+        # A fault in following the folders is another matter: the mail in
+        # hand is new mail, none behind it can be mirrored before it, and
+        # the loop as a whole waits (see the test above). The rest is not
+        # run on a look at the folders that failed.
+        gw = load(tmp)
+        _write_policy(gw)
+        rail(gw)
+        box = FakeMailbox(gw)
+        gw.MIRROR = mirror = gw.Mirror(box, clock=lambda: NOW)
+        loop = {}
+        gw._loop_step(mirror, loop)
+        passes = []
+        real_poll = mirror.poll
+
+        def poll(**kwargs):
+            passes.append(kwargs)
+            if kwargs.get("sync"):
+                raise ValueError("a bug in following the folders")
+            return real_poll(**kwargs)
+        mirror.poll = poll
+        loop.pop("synced")
+        assert [gw._loop_step(mirror, loop) for _ in range(3)] == [60.0, 120.0, 240.0]
+        assert passes == [{"sync": True, "work": False}] * 3
+        assert "new mail is still mirrored" not in gw._health_snapshot()["error"]
+    print("ok: a fault in the work an earlier look left to do delays that work alone; "
+          "new mail is mirrored at every poll meanwhile")
 
 
 def test_missing_folders_are_reported():
