@@ -281,3 +281,72 @@ this way: it keeps the entrypoint's own scrub (mail credentials and the API
 key, for OAuth). What the allowlist cannot do is stop a session from reading a
 daemon's `/proc/<pid>/environ`, since everything runs as one uid; that is the
 sidecar work tracked separately (`SECURITY.md`, "Known limitations").
+
+## The triage migration (one-time)
+
+`scripts/migrate-triage.py` moves what e-mail triage knew — the whitelist and
+the `sender:` memories — onto contacts, as their instruction. What it does and
+why is `docs/mail-chats.md`, "The migration"; this is how an operator runs it.
+
+**It runs by itself.** The entrypoint secures the legacy whitelist triples
+first thing (`--step snapshot`) and starts the migration in the background
+once the daemons are up (`--boot`): the pending steps, a few tries where the
+life store or the model is not there yet, then one dashboard thread with the
+report. A boot that finds it complete does nothing. Its log lines carry
+`[migrate-triage]`.
+
+**To look before it acts**, keep the boot run from doing anything and read a
+dry run — which writes nothing and spawns no model:
+
+```bash
+# before the upgrade's first start: either the file …
+docker compose run --rm --entrypoint sh retinue -c \
+  'mkdir -p /root/.retinue/triage && touch /root/.retinue/triage/.migration-hold'
+# … or RETINUE_TRIAGE_MIGRATION=off on the retinue service (override file)
+
+docker exec <retinue> python3 /workspace/scripts/migrate-triage.py --dry-run
+```
+
+Remove the hold and restart, or run it by hand:
+
+```bash
+docker exec <retinue> python3 /workspace/scripts/migrate-triage.py            # what is pending, then the report
+docker exec <retinue> python3 /workspace/scripts/migrate-triage.py --step report [--json]
+docker exec <retinue> python3 /workspace/scripts/migrate-triage.py --step memories [--no-model]
+```
+
+Run it with `docker exec` on the `retinue` container rather than from an
+agent session: the user's own addresses get no contact, and the script knows
+them by the mailbox variables a session's environment does not carry (beyond
+those, only by what the mirror shows: its accounts, and the addresses the
+user's mail went out under). A run by hand opens no thread; it prints the
+report. The memories step starts a
+`claude` process the way every framework spawner does — it refreshes the
+sign-in under the shared lock first — so it needs no `claude_auth.py refresh`
+beforehand.
+
+- **A full run skips the steps the marker has complete; `--step <name>` runs
+  that step again whatever the marker says.** That is how to have it look
+  again after fixing something: `--step memories` re-reads the store and puts
+  what a model verdict left alone to the model once more. A whitelist entry
+  that was settled and a memory that was moved are never touched twice.
+- **Exit status** 0: everything asked for is complete; 75: something is
+  pending, and the report says what; 1: the marker could not be read —
+  nothing was changed, move the file aside (every step is safe to repeat).
+- **`--no-model`** carries every sender rule over verbatim. Nothing then
+  judges whether a memory's text was the user's instruction or something a
+  message said: read the instructions it wrote (the report lists them).
+- **What is left for a person:** the scheduled triage jobs in chambers'
+  `.schedule.json` (the report names them); a rule the report lists as left
+  alone that should stand (`contacts.py update <id> --instruction …`, then
+  `memory.py store --supersedes <memory id> …`); two contacts the report
+  says share a name; and taking the instruction off any migrated contact
+  whose mail does not need a model turn each time (`contacts.py update <id>
+  --no-instruction`, or the Contacts page).
+- **Nothing is deleted, and the way back is by hand.** A contact it created
+  is deleted on the Contacts page; an instruction is edited there. A
+  superseded memory is still in the log (`memory.py recall --tag
+  'sender:<address>' --include-superseded`) but cannot be made live again —
+  store it anew if it is wanted. The snapshot
+  (`.legacy-email-whitelist.json`), the marker and the old status store stay
+  in the state directory (`TRIAGE_STATE_DIR`, default `/root/.retinue/triage`).

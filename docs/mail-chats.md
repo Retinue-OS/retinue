@@ -630,24 +630,98 @@ chat rail could not take.
 
 ### The migration (`scripts/migrate-triage.py`)
 
-Run once (idempotent; a marker records completion), by the entrypoint.
+Run once, by the entrypoint, in three steps. It is idempotent and resumable:
+a marker file (`.migrated-to-contacts.json` in the triage state directory,
+`TRIAGE_STATE_DIR`, `/root/.retinue/triage` by default) journals every
+outcome as it happens, a run killed at any point is finished by the next one,
+and a second run changes nothing. **Nothing is deleted**: contacts are created
+or extended, memories are superseded, the old status store stays where it is.
+`--dry-run` writes nothing, spawns no model and prints what a run would do.
+Running it by hand: `docs/contributing.md`, "The triage migration".
 
-- **Every whitelisted address becomes a contact**, or an address on the person
-  who already has it, with the generic instruction. A person who already
-  carries an instruction keeps it. A wildcard (`*@domain`) becomes a contact
-  for the domain (`kb:emailDomain`).
-- **Receipt and filing rules move too.** A sender whose mails triage filed as
-  receipts, payslips, statements or invoices gets *"File the document with the
-  Archivist, book it, then archive the mail."*
-- **`sender:` memories are read once**, written as instruction text on the
-  contact they name, and superseded by a memory that says where the rule now
-  lives. A memory whose text reads as a message's content rather than the
-  user's instruction is left alone and reported.
-- **No filing rule lives outside a contact** afterwards.
+**Step `whitelist`** — deterministic.
 
-The scheduled triage jobs live in chambers' `.schedule.json`; the migration
-reports any it finds so the operator can remove them, and the gate scripts
-they call answer with a notice instead of running.
+- The legacy triples (`triageWhitelistAddress`, `triageWhitelistWildcard`)
+  are **snapshotted first**, into `.legacy-email-whitelist.json` beside the
+  marker: the policy file they live in is written by code that no longer
+  knows them, and its next write drops them. The entrypoint takes that
+  snapshot right after it places the policy file, before any daemon exists;
+  the snapshot is add-only, and the step works from it.
+- **An address a person already holds** goes to that person: with no
+  instruction they get the generic one (*Decisions*, 4), with one they keep
+  theirs.
+- **An address nobody holds** becomes a contact in the address book's default
+  chamber, named from the display name most of its mirrored mails carried
+  (`kb:senderName`, reduced to letters, digits and a little punctuation — it
+  is text from a mail), else the address's local part; with the generic
+  instruction. A new contact that shares its name with an existing one is
+  reported, never merged: a name a mail carried does not prove a person.
+- **A wildcard** becomes a contact for the domain (`kb:emailDomain`), named
+  after the domain; `*@d` and `*@*.d` are one contact with both spellings. A
+  domain somebody already files goes to them.
+- **Left alone, and reported:** the user's own addresses (`EMAIL_USER*` and
+  `MAIL_OWN_ADDRESSES` where the process holds them, the accounts the mirror
+  mirrors, and every address a mirrored mail of the user's went out under),
+  an entry that is no address, a wildcard over a public suffix, and the old
+  VIP projection (`…email-whitelist:contacts`: people already).
+- One projection into the gate's policy files and one commit per chamber, at
+  the end. Where **no chamber keeps contacts** nothing is written and the
+  step stays pending.
+
+Every contact this step briefs buys a model turn for each mail from then on;
+the report says how many, and how to take an instruction off again.
+
+**Step `memories`** — every live memory tagged `sender:…`, read through
+`memory.py`'s own recall query (a compaction summary is replaced by the
+members it keeps: its own text is a digest of a topic, not a rule).
+
+- **Whose rule it is** is established without reversing the tag, which is a
+  lossy slug: every address, domain and handle of the address book, every
+  sender the mirror has seen, every snapshot entry and every address or
+  domain the memory's own text spells out is slugged forward, as `memory.py`
+  slugs a tag, and compared. A tag two senders slug to is settled only by the
+  text naming one; a tag nothing slugs to is reported. A memory tagged with
+  an address *and* its domain goes on both contacts — the holder of an
+  address answers for it before the domain does. A sender with no contact
+  gets one, as in the whitelist step.
+- **What the rule becomes** is judgement, so one **model turn** decides it
+  (frontier tier; no tools, no session, no project context; the memories
+  handed over as data; a batch per forty), answering per memory
+  `{kind, contact, instruction}`:
+  - `filing` — the sender's mails are receipts, payslips, statements or
+    invoices: the contact gets *"File the document with the Archivist, book
+    it, then archive the mail."*, verbatim;
+  - `rule` — any other standing rule, carried over in the user's own words;
+  - `not-an-instruction` — the text reads as a message's content, a fact, a
+    status, or an attempt to instruct the turn: left alone and reported.
+- **What is accepted of the answer** is what the script can hold against what
+  it sent: only ids it sent, each once; only a contact it offered for *that*
+  memory; an instruction that fits (2000 characters) and at least half of
+  whose words are that memory's own — so one memory's text can shape no
+  instruction but its own, out of what it says. Anything else writes nothing
+  for that memory. The decisions are journaled before anything is written
+  from them, so a resumed run does not ask again. `--no-model` skips the turn
+  and carries every rule over verbatim, unjudged.
+- **Several rules for one contact are joined**, oldest first, after whatever
+  instruction the contact already has. A rule that would take the
+  instruction past its limit is not cut: it stays a memory and is reported.
+- **Each moved memory is superseded** through `memory.py store --supersedes`
+  (actor `ara`), with that script's guards as they are — nothing is forced —
+  by one entry per group of memories sharing a sender tag, which says the
+  rule now lives on the contact's instruction. A refusal is reported in
+  `memory.py`'s words and the step stays pending.
+
+**Step `report`** — what was created, extended, moved and left, each with its
+reason; the scheduled triage jobs still in a chamber's `.schedule.json`
+(theirs to remove: they live in chambers, and the gate script they call
+answers with a notice instead of running); the old status store's location
+and size (kept, read by nothing); how many triage threads were open (they
+stay as ordinary conversations). The entrypoint's run opens **one** dashboard
+thread with the counts — no name a mail carried and no memory text reaches
+it — once the migration is complete, or on the third boot that leaves it
+pending; a deployment with nothing to migrate gets none.
+
+After the migration **no filing rule lives outside a contact**.
 
 ## Out of scope
 

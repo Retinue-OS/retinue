@@ -32,6 +32,18 @@ python3 /workspace/scripts/triage_policy.py place-email-policy \
   | sed 's/^/[policy] e-mail policy file: /' \
   || echo "[policy][warn] could not place the e-mail policy file; the web gateway retries" >&2
 
+# ── Secure the legacy e-mail whitelist ───────────────────────────────
+# E-mail triage and its whitelist are retired, and what the whitelist held
+# becomes contacts (scripts/migrate-triage.py; docs/mail-chats.md, "The
+# migration"). Its triples live in the policy file placed above, and the code
+# that writes that file no longer knows them: the file's next write drops
+# them. So they are copied into the migration's state directory here, before
+# any daemon or session exists that could write it. Standard library only,
+# and nothing to do once taken. Best effort: the migration below takes the
+# snapshot itself as its first act.
+python3 /workspace/scripts/migrate-triage.py --step snapshot \
+  || echo "[migrate-triage][warn] could not secure the legacy e-mail whitelist; the migration retries" >&2
+
 # Retinue keeps its own session memory in the life store (scripts/memory.py,
 # CLAUDE.md "Memory"); Claude Code's built-in auto memory would be a second,
 # opaque memory beside it, invisible to SPARQL and to the reinforce/challenge
@@ -559,6 +571,17 @@ case "$MODE" in
     # immediate exits (scripts/letterbox-supervise.sh).
     echo "[claude] Starting letterbox intake watcher..."
     bash /workspace/scripts/letterbox-supervise.sh &
+    # One-time: what e-mail triage knew — the whitelist, the `sender:`
+    # memories — moves onto contacts (scripts/migrate-triage.py;
+    # docs/mail-chats.md, "The migration"). In the background and best effort,
+    # never in the boot's way: it waits for the life store and the model where
+    # it needs them, opens one dashboard thread with its report (hence after
+    # the web gateway), and a boot that finds the migration done exits at
+    # once. Forked here with the daemons, so it holds the environment they
+    # hold — it knows the user's own addresses by the mailbox variables that
+    # are scrubbed for the main session further down.
+    echo "[claude] Checking the one-time triage migration (background)..."
+    python3 /workspace/scripts/migrate-triage.py --boot &
     # Start the Claude.ai session only where it can actually connect. With a
     # base URL configured that takes two things: the deployment must hold a
     # Claude.ai sign-in at all (RETINUE_GATEWAY_USES_CLAUDE_OAUTH, as before),
