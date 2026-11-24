@@ -23,7 +23,33 @@ python3 /workspace/scripts/email_client.py --account ari list --folder INBOX
 ```
 
 Credentials defined this way are covered by the credential isolation described
-below. Avoid `--env-file` / `EMAIL_ENV_FILE`: a file loaded that way is readable
+below.
+
+## Mirrored threads: send with `mail-push.py`
+
+Where the **mail gateway** mirrors the mailbox (docs/messaging.md, "E-mail (the
+mail gateway)"), each mail thread is a chat, and mail *in* such a thread — a
+reply, or a new mail from the account it serves — is sent with
+`scripts/mail-push.py`, the sibling of the messenger push CLIs, not with this
+client:
+
+```bash
+python3 /workspace/scripts/mail-push.py --chat <chat id or key> --reply all "..."   # or --reply sender
+python3 /workspace/scripts/mail-push.py --reply-to <token> --file /tmp/reply.txt
+python3 /workspace/scripts/mail-push.py --to a@b.ch --subject "..." --attach /tmp/x.pdf "..."
+python3 /workspace/scripts/mail-push.py --retract <id>
+```
+
+It goes through the same `EMAIL_SEND_POLICY` (below) but a different queue: a
+`verify` send waits in the gateway's own pending store, shows in the chat as a
+pending bubble and is taken back with `mail-push.py --retract`, whereas a
+`send`/`reply` of this client waits as an IMAP draft and is taken back with
+`retract --request-id`. Both are approved on `/sends`. Use this client for
+everything else — reading, searching, flags, moving, drafts, attachments of a
+mail you have a UID for, and an account the gateway does not serve. A mail sent
+with it from a mirrored account still lands in its chat once it is in the Sent
+folder.
+ Avoid `--env-file` / `EMAIL_ENV_FILE`: a file loaded that way is readable
 by the agent and bypasses the isolation, giving it direct SMTP/IMAP access and
 allowing it to circumvent the send-control policy.
 

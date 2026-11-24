@@ -86,15 +86,17 @@ nothing new.
   **The mailbox credentials are now held by two containers**: the `retinue`
   container (for `email_client.py`'s backend, the e-mail triage and the
   approval of e-mail drafts, as before) and the `mail-gateway` container,
-  which mirrors the mailbox into the chat ledger and is given only the
-  variables it reads in this phase, no `.env` wholesale — not the send
-  policy, not the chat-erase token, not the news rail's token. Compose hands
+  which mirrors the mailbox into the chat ledger, sends mail and moves it
+  between folders, and is given only the variables it reads, no `.env`
+  wholesale — the send policy (`EMAIL_SEND_POLICY`) and the chat-erase token
+  since it sends and erases, but not the news rail's token. Compose hands
   it the credentials whether or not it mirrors; a deployment that wants them
   in one container only gives the service a profile nobody enables
   (`docs/messaging.md`). The mail gateway is the sidecar
-  that will close this gap for e-mail, but only once sending moves into it
-  and the credentials can leave the `retinue` service; until then it adds a
-  second place that holds them rather than taking one away. A named account
+  that can close this gap for e-mail, but only once the credentials can leave
+  the `retinue` service (its `email_client.py` backend and e-mail triage still
+  use them); until then it adds a second place that holds them rather than
+  taking one away. A named account
   mirrored as chats is held by its own mail gateway service as well. The mail
   gateway reaches no session and has no public route. It mirrors nothing and
   serves nothing but its `/health` until `MAIL_GATEWAY_TOKEN` is set — the
@@ -103,7 +105,22 @@ nothing new.
   Once set, what it serves — stored mail and its parts — is behind that
   token, which a session does inherit, like every gateway token, so a session
   can read the mirrored mail as it can already read the mailbox through the
-  backend. Closing
+  backend. What the gateway can now do to the mailbox, and what a session
+  holding `MAIL_GATEWAY_TOKEN` can ask of it: it **sends** under
+  `EMAIL_SEND_POLICY` (`verify` queues, `trust` sends only with
+  `user_approved`, `allow` sends — the request's `author` grants nothing), it
+  **sets `\Seen`** on a thread's mails, **moves** a thread's INBOX mails to
+  the archive folder and, on the user's delete, a thread's mails in every
+  mirrored folder to the Trash; it never expunges a folder. A session can, through
+  the API, send under the policy and mark a thread read or archive it, and —
+  as on every gateway — approve, reject or retract a pending send, since
+  those share the bearer token, which is why send approval is a workflow gate
+  rather than a boundary. It **cannot erase**: moving mail to the
+  Trash and erasing the mirror need `CHAT_ERASE_TOKEN`
+  (`X-Chat-Erase-Token`), which the gateway demands and which no session
+  inherits, so only the user's own delete reaches it; unset, the gateway
+  refuses with 503. Mail sent through the gateway does not add its recipient
+  to the e-mail whitelist — the gateway never writes policy. Closing
   that means holding each secret in its own sidecar or under a separate uid,
   which is a separate roadmap item. An outbound send still has to clear the
   sending identity's policy, but a pending `verify` approval is not bound to
