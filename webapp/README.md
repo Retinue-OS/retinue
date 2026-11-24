@@ -968,7 +968,8 @@ The API, as the components consume it:
   serves the sanitised HTML part as a document of its own under a policy
   that lets nothing load or run (the chat page's own policy gains
   `frame-src 'self'` for it). `POST /chats/<id>/messages/<token>/trim`
-  (same-origin; the original URL with `/trim` for `/original`) asks for a
+  (same-origin, and only through the reverse proxy like a chat's flags; the
+  original URL with `/trim` for `/original`) asks for a
   `wanting` mail's model trim: `200 {state: model | deterministic, text}`
   (settled), `202 {state: queued | running}` (a turn on its way; asking
   again never queues twice) or `200 {state: wanting, retry_after}` (nothing

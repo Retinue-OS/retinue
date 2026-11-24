@@ -9665,9 +9665,10 @@ def _chats_payload() -> dict:
             text = "" if gone else row["text"]
             if mail and not gone:
                 # A model trim settled a moment ago, not indexed yet: the row
-                # shows what the bubble shows (_mail_trim_took).
+                # shows what the bubble shows (_mail_trim_took). The row holds
+                # a preview, never the whole text: it is matched as one.
                 settled = _mail_trim_settled_get(chat_id, row.get("mid") or row.get("m") or "",
-                                                 text)
+                                                 text, preview=True)
                 if settled and settled[1] is not None:
                     text = settled[1]
             last = _chat_last_preview(
@@ -14108,20 +14109,31 @@ _MAIL_TRIM_MAX_RANGES = 200
 _MAIL_TRIM_FENCE_RE = re.compile(r"^```[A-Za-z]*[ \t]*\n(.*)\n[ \t]*```$", re.DOTALL)
 
 
-def _mail_trim_settled_get(chat_id: str, ident: str, shown: str | None = None):
+def _mail_trim_settled_get(chat_id: str, ident: str, shown: str | None = None, *,
+                           preview: bool = False):
     """``(state, text or None)`` this process settled the mail to lately, or
     None. ``shown``: the record's text as the store has it now, where the
     caller has it — a record written anew since (neither the text the trim
-    was asked about nor the one it settled to) is no longer this entry's."""
+    was asked about nor the one it settled to) is no longer this entry's.
+    ``preview``: ``shown`` is only the start of that text (_preview_text,
+    the chat list's), which is compared with the start of each and, where
+    it matches neither, gets None without dropping the entry — only a
+    caller that holds the record's whole text says it was written anew."""
     with _mail_trim_cond:
         hit = _mail_trim_settled.get((chat_id, ident))
         if hit is None:
             return None
-        if time.monotonic() - hit[0] > _MAIL_TRIM_SETTLED_SECONDS or (
-                shown is not None and hit[3] is not None
-                and shown not in (hit[3], hit[2])):
+        if time.monotonic() - hit[0] > _MAIL_TRIM_SETTLED_SECONDS:
             _mail_trim_settled.pop((chat_id, ident), None)
             return None
+        if shown is not None and hit[3] is not None:
+            known = (hit[3], hit[2])
+            if preview:
+                if shown not in [_preview_text(t) for t in known if t is not None]:
+                    return None
+            elif shown not in known:
+                _mail_trim_settled.pop((chat_id, ident), None)
+                return None
         return hit[1], hit[2]
 
 
@@ -18091,16 +18103,27 @@ class Handler(BaseHTTPRequestHandler):
     def _handle_chat_trim(self, raw_id: str, token: str) -> None:
         """POST /chats/<id>/messages/<token>/trim — the model trim of one mail
         the deterministic trim left `wanting` (_mail_trim_ask): asked for by
-        the chat page once the bubble has been in view, so a turn is spent
-        on a mail the user is looking at and on no other.
+        the chat page once the bubble has been in view.
 
         Same-origin, like the user's other acts on a chat: it spends a model
         turn of the day's budget, which another site's page must not make
-        the browser spend. The token is the one in the message's `original`;
-        a mail that is gone (a tombstone, a record erased with its chat)
-        answers 410, a token naming no mail of this chat and any chat that is
-        no mail thread answer 404, and none of them starts anything."""
+        the browser spend. And, like a chat's flags and send, only through
+        the reverse proxy (_request_from_edge): a caller inside the container
+        must not spend the day's turns on mails nobody looked at, leaving
+        the user's own first views without one. The token is the one in the
+        message's `original`; a mail that is gone (a tombstone, a record
+        erased with its chat) answers 410, a token naming no mail of this
+        chat and any chat that is no mail thread answer 404, and none of
+        them starts anything."""
         if not self._user_act_same_origin():
+            return
+        ok, reason = self._request_from_edge(f"model trim in {raw_id}")
+        if not ok:
+            self._send_json(403, {
+                "error": "a mail's model trim is asked for only by the dashboard, "
+                         "through the reverse proxy",
+                "detail": reason,
+            })
             return
         chat_id = self._chat_id_or_404(raw_id)
         if chat_id is None:

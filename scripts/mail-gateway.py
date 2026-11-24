@@ -6615,8 +6615,8 @@ class Mirror:
                 # every writer of a record holds: a model's judgement written
                 # since `was` was read is seen here, and kept where it is
                 # one about this very reading (_judged_reading).
-                judged = self._judged_reading(old, mail, refs, state) if old is not None \
-                    else None
+                judged = self._judged_reading(old, mail, refs, state, text) \
+                    if old is not None else None
                 if judged is not None:
                     text, state = judged
                     common.update(text=text, trim=state)
@@ -6693,10 +6693,12 @@ class Mirror:
         else:
             self._placeholders.discard(mail.message_id)
 
-    def _judged_reading(self, old: Path, mail: Mail, refs: dict, state: str):
+    def _judged_reading(self, old: Path, mail: Mail, refs: dict, state: str, text: str):
         """``(kb:text, "model")`` of the record at ``old`` where a model's
         judgement stands on it that is one about the reading written in its
-        place; None for anything else. Under the record lock (the caller's).
+        place, ``(text, "deterministic")`` — the new reading's own — where
+        the judgement settled it to the rules' text; None for anything else.
+        Under the record lock (the caller's).
 
         A judgement is cached on its record (docs/mail-chats.md, "The model
         trim"): it is a choice of the lines the rules gave that record, and
@@ -6707,17 +6709,28 @@ class Mirror:
         record's — the same subject, the same word on whether it answers a
         mail, and parts of the same bytes (the header block among them, which
         says whether it is bulk). Then its lines are the very ones the choice
-        was made of, and the mail is not asked about again. Anything else —
-        another copy's bytes, a placeholder, a tombstone, whose judgement
-        went with its text — is the new reading as the rules left it, and a
-        ``wanting`` one gets its own first view. Comparing bytes, not trims:
+        was made of, and the mail is not asked about again. The same holds
+        for a ``deterministic`` old record that is no placeholder: inputs
+        that give a ``wanting`` reading now gave one then, so it was settled
+        by a judgement too (an invalid choice, an unparseable answer, a mail
+        given up on). Anything else — another copy's bytes, a placeholder, a
+        tombstone, whose judgement went with its text — is the new reading as
+        the rules left it, and a ``wanting`` one gets its own first view.
+        Comparing bytes, not trims:
         no mail is trimmed or parsed in this process (the reader does that),
         and none under a lock."""
         if state != "wanting" or mail.unreadable is not None:
             return None
         now = _ibstore.read_record(old)
-        if (now is None or now.get("trim") != "model" or now.get("removed_at")
-                or not now.get("text")):
+        if now is None or now.get("removed_at"):
+            return None
+        if now.get("trim") == "model":
+            if not now.get("text"):
+                return None
+            judged = now["text"], "model"
+        elif now.get("trim") == "deterministic" and not self._trim_unread(now):
+            judged = text, "deterministic"
+        else:
             return None
         if ((now.get("subject_line") or "") != (mail.subject or "").strip()
                 or bool(now.get("in_reply_to") or now.get("references"))
@@ -6733,7 +6746,7 @@ class Mirror:
             got = [_ibstore.load_media(INBOUND_STORE_DIR, media_id) for media_id in ids]
             if None in got or got[0][0] != got[1][0]:
                 return None
-        return now["text"], "model"
+        return judged
 
     def _inbound_event(self, *, direction: str, chat: str, message_id: str, ts: float,
                        sender, sender_name, text: str, attachments: list, author,

@@ -1248,8 +1248,9 @@ on the router tier that picks the lines which are the author's own message.
 The chat page asks for it once the bubble has been in view:
 `POST /chats/<id>/messages/<token>/trim`, `<token>` being the segment of the
 message's `original`, resolved as the Original resolves it. Same-origin, like
-the user's other acts on a chat (it spends a turn of the day's budget). It
-answers
+the user's other acts on a chat (it spends a turn of the day's budget), and,
+like a chat's flags and send, only through the reverse proxy: `403` for a
+caller inside the container (`EDGE_PROXY_PEERS`). It answers
 
 - `200 {state: "model" | "deterministic", text}` — settled: from the record,
   or just now;
@@ -1273,10 +1274,13 @@ answers
 
 Nothing else starts a turn: not ingest, not the backfill, not a GET of the
 messages, not an agent reading the thread (the companion and the arrival turn
-read what is on the record). `GET /chats/<id>/messages` keeps carrying each
-mail's `trim`; for the seconds until the store has indexed a record the trim
-rewrote, the poll and the chat list's preview show the settled text this
-process holds, so a bubble that took it does not fall back — and the mail's
+read what is on the record), and not an agent that calls the endpoint from
+inside the container where `EDGE_PROXY_PEERS` names the reverse proxy — the
+day's budget bounds whatever still gets through. `GET /chats/<id>/messages`
+keeps carrying each mail's `trim`; for the seconds until the store has
+indexed a record the trim rewrote, the poll and the chat list's preview show
+the settled text this process holds, so a bubble that took it does not fall
+back — and the mail's
 arrival entry in the live overlay, which still carries the text from before,
 is forgotten when a model trim settles. What is held names the text the trim
 was asked about: a record the store shows with neither that text nor the

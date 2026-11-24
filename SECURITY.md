@@ -236,7 +236,11 @@ nothing new.
   companion's note — and the quote of an arrival turn offered the mail
   after it was viewed — marks the mail `trim="model"` and says the mail can
   steer it), and that the full mail is one tap away: its original parts are
-  never changed. `MAIL_MODEL_TRIM=0` switches the turn off.
+  never changed. Its endpoint is the dashboard's: a caller inside the
+  container that asks for a trim is refused where `EDGE_PROXY_PEERS` names
+  the reverse proxy (any peer it does not name is refused), and the day's
+  budget bounds whatever still gets through. `MAIL_MODEL_TRIM=0` switches
+  the turn off.
 - **Chambers are not compartmentalized from each other within a session.**
 - **The updater's Docker socket is root-equivalent on the host.** This is
   inherent to what the updater does and is documented in `docker-compose.yml`.

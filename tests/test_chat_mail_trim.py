@@ -360,6 +360,32 @@ def test_refusals(r: Rig):
     assert not r.claude.calls and not G["requests"], G["requests"]
 
 
+def test_the_trim_is_the_dashboards(r: Rig):
+    """The trim spends a turn of the day's budget, like a chat's flags and
+    send the user's own: asked for only through the reverse proxy. From
+    inside the container — loopback, where no proxy is named, or any peer
+    the named proxy is not — it is refused, and nothing is queued, spent or
+    asked of the mail gateway; through the pinned proxy (the harness's own
+    peer) it is the page's ask, as always."""
+    mid = r.mail()
+    saved = r.wg._EDGE_PEER_NETS
+    try:
+        for peers in ("", "10.99.0.1"):
+            r.wg._EDGE_PEER_NETS = r.wg._parse_edge_peers(peers)
+            for headers in (None, {"Sec-Fetch-Site": "same-origin"}):
+                status, body = r.trim(mid, headers=headers)
+                assert status == 403 and "reverse proxy" in body["error"], (status, body)
+                assert body["detail"], body
+    finally:
+        r.wg._EDGE_PEER_NETS = saved
+    r.idle()
+    assert not r.claude.calls and not G["requests"], G["requests"]
+    assert not r.wg._mail_trim_queue and mail._one(r.record(mid), "trim") == "wanting"
+    assert r.trim(mid)[0] == 202
+    r.idle()
+    assert _settled(r, mid)["state"] == "model" and len(r.claude.calls) == 1
+
+
 def test_the_token_is_resolved_before_the_settled_cache(r: Rig):
     """A mail settled here a moment ago and since removed from the mailbox,
     or erased with its chat, is not answered from what this process holds."""
@@ -449,6 +475,40 @@ def test_the_chat_list_follows_a_model_trim(r: Rig):
     r.wg._mail_trim_settle((CHAT, mid), "model", "Hi, the venue moved.")
     r.wg._chats_cache_invalidate()
     assert mail._chats(r.base)[CHAT]["last"]["text"] == "Hi, the venue moved."
+
+
+def test_a_long_mails_settled_text_outlasts_the_list(r: Rig):
+    """The chat list holds a preview of each head's text, never the whole
+    of a long mail: it is matched against the settled entry as a preview,
+    so neither a list build nor a poll (whose summary is one) throws the
+    entry away before the store has the trim's rewrite. A record written
+    anew — another whole text — still gives it up where it is read whole."""
+    lines = ["Hi,", ""] + [f"line {i} of what the author really says, word word word."
+                           for i in range(12)] + FOOTER_LINES
+    full = "\n".join(lines)
+    assert len(full) > r.wg.CHAT_PREVIEW_CHARS
+    mid = r.mail(lines=lines)
+    settled = "\n".join(lines[:14])
+    assert len(settled) > r.wg.CHAT_PREVIEW_CHARS
+    # Settled here; the store still shows the text the trim was asked about.
+    r.wg._mail_trim_settle((CHAT, mid), "model", settled, basis=full)
+    for _ in range(2):
+        shown = next(m for m in mail._messages(r.base, CHAT)["messages"] if m["id"] == mid)
+        assert (shown["trim"], shown["text"]) == ("model", settled), shown["trim"]
+        r.wg._chats_cache_invalidate()
+        row = mail._chats(r.base)[CHAT]
+        assert row["last"]["text"] == r.wg._preview_text(settled), row["last"]["text"]
+        assert r.wg._mail_trim_settled_get(CHAT, mid) == ("model", settled)
+    assert not r.claude.calls
+    # Written anew by its gateway: the list shows it and keeps the entry,
+    # the poll, which reads it whole, gives the entry up.
+    anew = "\n".join(["Another reading entirely."] * 20)
+    ist.update_message(G["sources"][mid]["path"], text=anew, trim="wanting")
+    r.wg._chats_cache_invalidate()
+    assert mail._chats(r.base)[CHAT]["last"]["text"] == r.wg._preview_text(anew)
+    shown = next(m for m in mail._messages(r.base, CHAT)["messages"] if m["id"] == mid)
+    assert (shown["trim"], shown["text"]) == ("wanting", anew), shown["trim"]
+    assert r.wg._mail_trim_settled_get(CHAT, mid) is None
 
 
 def _written_then_lost(r: Rig):

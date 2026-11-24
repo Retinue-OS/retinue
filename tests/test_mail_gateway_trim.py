@@ -816,10 +816,13 @@ def test_a_record_written_again_in_its_place_keeps_a_judgement_of_its_own_readin
     the Sent copy shows, the mirror writes the record again in its own place
     as the user's own (I3). The judgement is cached on the record: a copy of
     the very same bytes is the very same reading, and keeps it (no second
-    turn); the rail is told the text as the record has it, marked. A copy of
+    turn); the rail is told the text as the record has it, marked. So does a
+    judgement that settled the mail to the rules' text (an answer that was
+    none, a mail given up on): it is not asked about again either. A copy of
     other bytes is another reading, which the rules trim afresh — wanting
     again, and asked about on its own first view."""
-    for same in (True, False):
+    for same, how in ((True, {"keep": [[1, 3]]}), (True, {"failed": "unparseable"}),
+                      (False, {"keep": [[1, 3]]})):
         with tempfile.TemporaryDirectory() as tmp:
             gw, mirror, box, base, server = rig(tmp)
             try:
@@ -830,8 +833,9 @@ def test_a_record_written_again_in_its_place_keeps_a_judgement_of_its_own_readin
                 record = t.by_id(gw)[mid]
                 assert record["type"] == gw._ibstore.T_INBOUND and record["trim"] == "wanting"
                 got = source(base, mid)[1]
-                status, answer = result(base, mid, got["digest"], keep=[[1, 3]])
-                assert (status, answer["state"]) == (200, "model"), answer
+                status, answer = result(base, mid, got["digest"], **how)
+                chosen = "model" if "keep" in how else "deterministic"
+                assert (status, answer["state"]) == (200, chosen), answer
                 judged = answer["text"]
                 events.clear()
                 box.put("Sent", _own_post() if same else _own_post(
@@ -841,7 +845,11 @@ def test_a_record_written_again_in_its_place_keeps_a_judgement_of_its_own_readin
                 assert record["type"] == gw._ibstore.T_OUTBOUND, record["type"]
                 told = [p for kind, p in events if kind == "inbound"]
                 assert told and told[-1]["direction"] == "out"
-                if same:
+                if same and chosen == "deterministic":
+                    assert (record["trim"], record["text"]) == ("deterministic", judged), record
+                    assert told[-1]["text"] == judged and "trim" not in told[-1]
+                    assert source(base, mid) == (200, {"state": "deterministic"})
+                elif same:
                     assert (record["trim"], record["text"]) == ("model", judged)
                     assert told[-1]["text"] == judged and told[-1].get("trim") == "model"
                     assert source(base, mid) == (200, {"state": "model"})

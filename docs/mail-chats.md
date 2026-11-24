@@ -866,7 +866,10 @@ after it.
   subject, the same word on whether it answers a mail, parts of the very
   same bytes, the header block among them (the INBOX copy of the user's own
   post, then its Sent copy) — so its lines are the lines that were chosen
-  from, and the mail is not asked about twice. Checked under the record
+  from, and the mail is not asked about twice. A judgement that settled
+  the mail `deterministic` (an invalid choice, `failed`) is kept alike, with
+  the new reading's own text: inputs that read `wanting` now read `wanting`
+  then, so that `deterministic` was a judgement. Checked under the record
   lock, by comparing bytes — no mail is trimmed or parsed in the mirror's
   process, nor under a lock. Anything else is the new reading as the rules
   trim it, and a `wanting` one gets its own first view: a copy of other
@@ -903,8 +906,12 @@ before or just now; `202 {"state": "queued" | "running"}` while a turn is
 queued or in flight (asking again never queues twice); and `200 {"state":
 "wanting", "retry_after"}` when nothing was started — the feature off, the
 day's budget spent (`retry_after` until local midnight), the queue full (a
-short wait), the model in backoff. One worker thread
-runs one turn at a time from a bounded queue (`MAIL_MODEL_TRIM_QUEUE`, 30).
+short wait), the model in backoff. Like a chat's flags, the endpoint is
+the dashboard's: a caller inside the container is refused (`403`) where
+`EDGE_PROXY_PEERS` names the reverse proxy (a peer it does not name is
+refused), and the day's budget bounds whatever still gets through. One
+worker thread runs one turn at a time from a bounded queue
+(`MAIL_MODEL_TRIM_QUEUE`, 30).
 The model is `MAIL_MODEL_TRIM_MODEL`, else `RETINUE_ROUTER_MODEL`, else the
 transcript cleanup's fallback, spawned with that cleanup's discipline: no
 tools, no session persistence, the allowlisted environment, the sign-in
