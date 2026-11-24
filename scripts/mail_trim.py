@@ -165,13 +165,21 @@ The plain part, whenever it is the mail's text. The HTML part in three cases:
 The HTML is turned into text with its quotes as ``>`` lines and then goes
 through the very same pipeline, so there is one set of rules, not two.
 
+Of an HTML part the first ``MAX_HTML_CHARS`` characters of markup are read
+(see "Cost"). Beside a plain part a longer one is not consulted. Where it is
+the source, the text ends where the reading did, on a line of its own that
+says so (``CUT_MARK``), and what stands above that line is not taken for the
+end of the mail: quotes go, a signature or a footer is not looked for. The
+whole of the part is the caller's to show.
+
 State
 =====
 
 ``deterministic`` unless the trim could not settle, which is ``wanting`` — a
 model trim is due on first view: the mail is HTML-only (or its plain part a
 stub), or more than ``WANTING_CHARS`` remain (``MAIL_TRIM_WANTING_CHARS``,
-default 2500), or a quote marker survived, or a rule saw its shape and held
+default 2500), or the mail is more than the trim works on (see "Cost"), or
+a quote marker survived, or a rule saw its shape and held
 back for want of evidence (history in a mail not known to be a reply, an
 unsubscribe block in mail not known to be bulk, a bare ``--``, a notice with
 no sign-off above it, an attribution in a language without a verb here).
@@ -183,19 +191,33 @@ Idempotence
 fixpoint inside one call, and whatever it keeps is kept in a form the next
 call recognises the same way — a call with no evidence cuts nothing that a
 call with evidence kept. A text built never to settle gets no trim at all,
-which is the same answer however often it is asked for.
+and neither does one longer than the trim works on: the same answer however
+often it is asked for.
 
 Cost
 ====
 
-Linear in the size of the mail, for hostile mail too. Every look-ahead and
+Bounded, whatever a mail holds — it is anyone's to write, and the caller
+has one thread for all of them:
+
+  * The pipeline works on at most ``MAX_SOURCE_LINES`` lines and
+    ``MAX_SOURCE_CHARS`` characters. A longer source gets no trim: it is
+    answered as it came, ``wanting``, and no line of it is looked at.
+  * It runs over a source at most ``_MAX_PASSES`` times, and one call reads
+    a mail at most four ways (the plain part; the HTML part with what the
+    markup knows, and without; the text alone, when that left nothing).
+    After a reading that did not settle, only the last is still tried.
+  * Of an HTML part ``MAX_HTML_CHARS`` characters of markup are parsed.
+
+Within the bounds, linear, for hostile mail too. Every look-ahead and
 look-back is bounded by a count of lines AND by the length an attribution or
 a footer can have, so one long line is never read once per short line beside
 it; a judgement that came out "no" is not asked again of the same lines; the
 stages that repeat work only on the end of the text; element nesting is
 tracked through an index, not by walking a stack; and what quoting and
 listing add to the text made from HTML — the prefixes — is bounded by the
-size of the markup, whatever a mail nests.
+size of the markup, whatever a mail nests. (:func:`html_to_text` and
+:func:`sanitize_html` read the whole of what they are given, once.)
 """
 from __future__ import annotations
 
@@ -203,6 +225,7 @@ import html as _html
 import os
 import re
 import unicodedata
+from bisect import bisect_left, bisect_right
 from html.parser import HTMLParser
 from typing import NamedTuple
 from urllib.parse import unquote
@@ -227,6 +250,20 @@ SIGNATURE_MAX_LINES = 12
 #: How many closing paragraphs may be footer. Bilingual legal notices are long,
 #: so this is generous; a notice further up than this is left alone.
 FOOTER_MAX_PARAGRAPHS = 8
+
+#: What one call works on is bounded, whatever a mail holds (see "Cost" in the
+#: module docstring). A source with more lines or more characters than this
+#: gets no trim: it is answered as it came, state ``wanting``. Ten thousand
+#: lines are a thread of a few hundred replies. Read at call time.
+MAX_SOURCE_LINES = 10_000
+MAX_SOURCE_CHARS = 500_000
+
+#: Of an HTML part, this much markup is read. Where a longer one is the
+#: source, the text ends where the reading did, on a line that says so — and
+#: under which no signature and no footer is looked for, in this call or in
+#: a later one: the end of what was read is not the end of the mail.
+MAX_HTML_CHARS = 1_000_000
+CUT_MARK = "[…]"
 
 #: The marker written above an Outlook-style forward that has none of its own
 #: (see the module docstring). English, as every fixed string of the framework.
@@ -1546,7 +1583,8 @@ def _unsubscribe_start(lines: list, start: int, end: int) -> int:
     At its first line that carries the word, taken back over the lines of
     the sentence the word stands in — a full-width line above, or a line
     this one continues in lower case — and never over a short, finished
-    line, which is a sign-off.
+    line, which is a sign-off. Unless that line is the delimiter a list
+    writes above its footer ("-- ", as Google Groups does): it goes with it.
     """
     for first in range(start, end):
         if _UNSUBSCRIBE_RE.search(_fold(lines[first])):
@@ -1563,6 +1601,11 @@ def _unsubscribe_start(lines: list, start: int, end: int) -> int:
         first -= 1
     # Cut short only if what is cut is still the whole footer.
     if _unsubscribe_cue(" ".join(lines[first:end])) == 2:
+        # The delimiter a list writes above its footer is the footer's, not
+        # a sign-off: left behind, it stands as a second one under the
+        # sender's own, and two within reach are dividers that both stay.
+        if first > start and lines[first - 1] in (SIGNATURE_DELIMITER, "--"):
+            first -= 1
         return first
     return start
 
@@ -1718,7 +1761,13 @@ def _strip_tail(lines: list, removed: dict, end_cut: bool,
     run — so neither is done before both find nothing.
 
     `end_cut`: what stood under these lines was quoted history, and is gone.
+
+    Not for a text that was cut off (CUT_MARK): where that ends is not where
+    the mail ended, and a signature or a footer is one at the END only.
     """
+    if lines and lines[-1] == CUT_MARK:
+        evidence.unsettled = True
+        return
     counter = "quote"
     judged: dict = {}       # see _judged
     while True:
@@ -1747,11 +1796,13 @@ def _pass(raw: list, evidence: _Evidence, removed: dict) -> list:
     return _squeeze([_rstrip(line) for line in intro])
 
 
-#: Passes after which a text that still changes is given up on.
-_MAX_PASSES = 20
+#: Passes after which a text that still changes is given up on. A mail as
+#: clients write it is changed by the first and confirmed by the second;
+#: this allows for three that change it.
+_MAX_PASSES = 4
 
 
-def _trim_lines(raw: list, evidence: _Evidence, removed: dict) -> list:
+def _trim_lines(raw: list, evidence: _Evidence, removed: dict) -> list | None:
     """The pipeline, to its fixpoint.
 
     Removing the end of a text can change how the rest reads (a quote that
@@ -1759,8 +1810,8 @@ def _trim_lines(raw: list, evidence: _Evidence, removed: dict) -> list:
     signature), so the pipeline runs until a pass changes nothing — which is
     what makes the trim idempotent by construction. A real mail settles on
     the second pass. One that has not settled after `_MAX_PASSES` was built
-    not to, and gets no trim at all: the untrimmed text is the one answer
-    that is the same however often it is asked for.
+    not to, and gets no trim at all (None): the untrimmed text is the one
+    answer that is the same however often it is asked for.
     """
     lines = raw
     for _ in range(_MAX_PASSES):
@@ -1768,7 +1819,7 @@ def _trim_lines(raw: list, evidence: _Evidence, removed: dict) -> list:
         if after == lines:
             return lines
         lines = after
-    raise RuntimeError("the trim did not settle")
+    return None
 
 
 def _marker_survives(lines: list) -> bool:
@@ -1806,15 +1857,35 @@ def is_reply_subject(subject: str | None) -> bool:
 
 
 def _settle(raw: list, evidence: _Evidence) -> tuple:
-    """``(lines, removed, unsettled)`` of one source; no lines when the trim
-    failed or left nothing."""
+    """``(lines, removed, unsettled)`` of one source. No lines when the trim
+    left nothing; None for them when it failed or did not settle — after
+    which the caller tries no reading but its last, each of them costing up
+    to `_MAX_PASSES` again."""
     removed = {"quote": 0, "signature": 0, "footer": 0, "pixels": 0}
     evidence.held = False
     try:
         lines = _trim_lines(raw, evidence, removed)
     except Exception:       # a bubble with too much in it beats no bubble
-        return [], removed, True
+        lines = None
     return lines, removed, evidence.unsettled or evidence.held or not lines
+
+
+def _as_it_came(text: str) -> str:
+    """A plain part with nothing done to it but what every answer has done:
+    one kind of line end, no mark, no empty line at either end."""
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    return _MARKS_RE.sub("", text).strip("\n")
+
+
+def _oversize(text: str) -> bool:
+    """More text than the pipeline works on? (MAX_SOURCE_LINES, …_CHARS)"""
+    return (len(text) > MAX_SOURCE_CHARS
+            or text.count("\n") >= MAX_SOURCE_LINES)
+
+
+def _text_of(lines: list) -> str:
+    """The lines as the text they are answered as."""
+    return "\n".join(line.rstrip() for line in lines)
 
 
 # A quote container some client wrote into the HTML part: worth a parse when
@@ -1834,7 +1905,9 @@ STUB_RATIO = 8
 
 def _is_stub(plain: str, marked: str) -> bool:
     said = len(" ".join(plain.split()))
-    says = len(" ".join(_MARKS_RE.sub("", marked).split()))
+    # What the HTML part says to a reader: a line that only marks where
+    # history may begin says nothing, however many of them there are.
+    says = len(" ".join(" ".join(_unmarked(marked.split("\n"))).split()))
     return says > 1000 and says > STUB_RATIO * said
 
 
@@ -1867,6 +1940,19 @@ def trim(plain: str | None, html: str | None, subject: str | None = None, *,
         bulk=bulk is True)
     has_plain = isinstance(plain, str) and bool(plain.strip())
     has_html = isinstance(html, str) and bool(html.strip())
+    removed = {"quote": 0, "signature": 0, "footer": 0, "pixels": 0}
+    if has_plain:
+        whole = _as_it_came(plain)
+        if _oversize(whole):
+            # More than the pipeline works on: no trim, and no line of it is
+            # so much as looked at. Asked again, the answer is the same.
+            return TrimResult(whole, "wanting", removed)
+    cut = has_html and len(html) > MAX_HTML_CHARS
+    if cut:
+        # Read up to the last tag that begins within the bound, so that none
+        # is read in half.
+        end = html.rfind("<", 0, MAX_HTML_CHARS)
+        html = html[:end if end > 0 else MAX_HTML_CHARS]
     converted = None            # (marked text, pixels) of the HTML part, once
 
     def html_source():
@@ -1880,26 +1966,39 @@ def trim(plain: str | None, html: str | None, subject: str | None = None, *,
             and _is_stub(plain, html_source()[0])):
         has_plain = False       # the plain part is not the mail
 
-    lines: list = []
+    lines: list | None = []
     untrimmed: list = []
     unsettled = False
-    removed = {"quote": 0, "signature": 0, "footer": 0, "pixels": 0}
     if has_plain:
         untrimmed = _clean_lines(plain)
         lines, removed, unsettled = _settle(untrimmed, evidence)
-    if has_html and (not has_plain or (
-            not removed["quote"] and _HTML_QUOTE_HINT_RE.search(html))):
+    consult = has_html and (not has_plain or (
+        lines is not None and not removed["quote"]
+        and bool(_HTML_QUOTE_HINT_RE.search(html))))
+    if consult and has_plain and cut:
+        # Markup that was not read to its end cannot stand in for a text
+        # that was; what it may have known stays open.
+        consult, unsettled = False, True
+    if consult:
         marked, pixels = html_source()
         raw = _clean_lines(marked, keep_marks=True)
-        candidate, counted, open_ = _settle(raw, evidence)
-        if not candidate:
-            # The marks made the trim take everything. What the text alone
-            # supports is what a later trim of this result would arrive at,
-            # so it is the answer now.
-            candidate, counted, open_ = _settle(_unmarked(raw), evidence)
+        if cut:
+            raw += ["", CUT_MARK] if raw else [CUT_MARK]
+        bare = _unmarked(raw)
+        if _oversize(_text_of(bare)):
+            # More than the pipeline works on, as above: no trim.
+            candidate, open_ = bare, True
+            counted = {"quote": 0, "signature": 0, "footer": 0, "pixels": 0}
+        else:
+            candidate, counted, open_ = _settle(raw, evidence)
+            if candidate == []:
+                # The marks made the trim take everything. What the text
+                # alone supports is what a later trim of this result would
+                # arrive at, so it is the answer now.
+                candidate, counted, open_ = _settle(bare, evidence)
         counted["pixels"] = pixels
         if not has_plain:
-            untrimmed = _unmarked(raw)
+            untrimmed = bare
             lines, removed, unsettled = candidate, counted, open_
         elif candidate and counted["quote"] and (
                 not lines or _chars(candidate) < _chars(lines)):
@@ -1911,9 +2010,10 @@ def trim(plain: str | None, html: str | None, subject: str | None = None, *,
             unsettled = unsettled or open_
     if not lines:
         # Greedy to the point of nothing: the mail was all quote, or all
-        # signature. The answer is what a later trim of the mail as it came
-        # would make of it — its text alone, no evidence beside it — and, if
-        # that is nothing too, the mail as it came.
+        # signature — or it did not settle. The answer is what a later trim
+        # of the mail as it came would make of it — its text alone, no
+        # evidence beside it — and, if that is nothing too, the mail as it
+        # came.
         pixels = removed["pixels"]
         untrimmed = [line.rstrip() for line in untrimmed]
         lines, removed, _ = _settle(untrimmed, _Evidence())
@@ -2298,6 +2398,11 @@ class _TextConverter(HTMLParser):
         elif tag == "a":
             # A link does not nest: a second <a> ends the first. (Else every
             # word of a mail could be written into 256 open links at once.)
+            # Not one inside hidden content, though, which takes no text and
+            # no part in what is shown: ending the link around it would end
+            # what hides it too, and show the rest of what it hides.
+            if self._inert:
+                return
             found = self._find(("a",), ("td", "th", "table"))
         elif tag in _CLOSES_P:
             found = self._find(("p",), _P_BARRIERS)
@@ -2657,6 +2762,56 @@ _SAFE_TAG_ATTRS = {
     "li": frozenset(("type", "value")),
     "body": frozenset(("text",)),
 }
+# End tags a mail may leave out, and a browser then supplies: a paragraph
+# ends where the next begins, a list item at the next item, a cell at the
+# next cell, a row at the next row. The sanitiser writes them, or it would
+# count a long mail written that way as nested once per paragraph and unwrap
+# everything past _MAX_DEPTH. It writes one only where a browser reading the
+# output would end the very same element at the very same place — the tree
+# of the document is the mail's with the tag and without it:
+#
+#   * <p> ends the open paragraph, as long as nothing but inline markup has
+#     been opened since that began. The start tag of one of these has ended
+#     it for the browser already, and what was opened since is not inside
+#     it; that paragraph keeps its level, as it always did.
+_ENDS_P = frozenset((
+    "address", "article", "aside", "blockquote", "caption", "center",
+    "colgroup", "dd", "details", "div", "dl", "dt", "figcaption", "figure",
+    "footer", "h1", "h2", "h3", "h4", "h5", "h6", "header", "hr", "li",
+    "main", "nav", "ol", "pre", "section", "summary", "table", "tbody", "td",
+    "tfoot", "th", "thead", "tr", "ul"))
+#   * <li> ends the open item, <dt> and <dd> the open term or description —
+#     unless one of these was opened inside it, which makes the new one its
+#     descendant. (HTML's rule: a <div> or a <p> in between does not.)
+_ITEM_ENDS = {"li": ("li",), "dd": ("dd", "dt"), "dt": ("dd", "dt")}
+_ITEM_STOPS = tuple(sorted(_ENDS_P - {"address", "div", "hr"}))
+#   * Neither a paragraph nor an item is ended with one of these open in
+#     it: a browser opens them again in the next paragraph or item, and
+#     only it can. That end is left to the browser, as before.
+_CARRIED_TAGS = (
+    "a", "b", "big", "code", "em", "font", "i", "s", "small", "strike",
+    "strong", "tt", "u")
+#   * In a table, a cell ends the cell before it, a row the row, a group of
+#     rows the group: the outermost of them that belongs to the innermost
+#     open table. (A cell ends what was opened in it, carried or not.
+#     Outside a table a browser drops these tags, so nothing ends there.)
+_TABLE_ENDS = {
+    "td": (("td", "th"),),
+    "th": (("td", "th"),),
+    "tr": (("tr",), ("td", "th")),
+    "thead": (("thead", "tbody", "tfoot"), ("tr",), ("td", "th")),
+    "tbody": (("thead", "tbody", "tfoot"), ("tr",), ("td", "th")),
+    "tfoot": (("thead", "tbody", "tfoot"), ("tr",), ("td", "th")),
+}
+_TABLE_PARTS = ("td", "th", "tr", "thead", "tbody", "tfoot")
+# What an end tag does not reach across: a stray </div> inside a cell must
+# not close the table around it, nor a stray </li> the list it stands in,
+# nor a stray </tr> a row of the table around this one. (With the end tags
+# above written, an end tag written twice no longer meets an element that
+# was left open, and would otherwise end the next one out.)
+_END_WALLS = ("td", "th", "table")
+_ITEM_END_WALLS = _END_WALLS + ("ul", "ol")
+_PART_END_WALLS = ("table",)
 _SIZE_ATTR_RE = re.compile(r"\d{1,5}(?:\.\d+)?(?:%|px)?")
 _CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
 _CSS_PROPERTY_RE = re.compile(r"-?[a-z][a-z0-9-]*")
@@ -2686,7 +2841,9 @@ _CSS_SELECTOR_RE = re.compile(r"[\w\s.#:,>+~*\[\]=()^$|%-]{1,500}")
 _CSS_SELECTOR_FUNCTIONS = frozenset((
     "not", "is", "where", "lang", "dir", "nth-child", "nth-last-child",
     "nth-of-type", "nth-last-of-type"))
-_CSS_MEDIA_RE = re.compile(r"@media[\w\s(),:.%/-]{0,300}", re.I)
+# "@media", and the query after it. The keyword ends where a name would:
+# a mail may write its query right up against it ("@media(max-width:600px)").
+_CSS_MEDIA_RE = re.compile(r"@media(?![\w-])([\w\s(),:.%/-]{0,300})", re.I)
 _CSS_BRACE_RE = re.compile(r"[{}]")
 # What the finished sheet must not hold (the last word on _clean_stylesheet).
 _CSS_SHEET_FORBIDDEN_RE = re.compile(r"[<\\\"']|/\*|@(?!media[\s({])", re.I)
@@ -2845,13 +3002,18 @@ def _css_rules(css: str, out: list, nested: bool) -> None:
         if prelude.startswith("@"):
             # @media is the one at-rule a mail needs (its phone layout); one
             # level of it. @font-face, @import, @keyframes and the rest go.
-            if (not nested and _CSS_MEDIA_RE.fullmatch(prelude)
-                    and _css_balanced(prelude)
-                    and not any(_CSS_SHEET_CALL_RE.findall(prelude))):
+            # Its QUERY may call nothing — the keyword is not part of it, and
+            # is written with a blank after it, so that the finished sheet
+            # holds no "media(" for a call either.
+            media = None if nested else _CSS_MEDIA_RE.fullmatch(prelude)
+            query = media.group(1).strip() if media else ""
+            if (media and _css_balanced(query)
+                    and not any(_CSS_SHEET_CALL_RE.findall(query))):
                 inner: list = []
                 _css_rules(body, inner, True)
                 if inner:
-                    out.append("%s{%s}" % (prelude, "".join(inner)))
+                    out.append("%s{%s}" % (
+                        ("@media " + query).rstrip(), "".join(inner)))
         elif "{" not in body:
             selector = _css_selector(prelude)
             declarations = _clean_style(body, strings=False) if selector else ""
@@ -2964,6 +3126,9 @@ class _Sanitizer(HTMLParser):
         self._out: list = []
         self._open: list = []       # emitted and not yet closed
         self._open_at: dict = {}    # tag → where in _open it is open
+        # Where in _open stands what a browser has ended by itself and no
+        # end tag was written for (see _ENDS_P): not to be ended again.
+        self._ended: set = set()
         # The outermost open element whose content is dropped, and how many
         # of its own tag are open inside it. Leaving the state early only
         # ever hands more markup to the allow-lists, never past them.
@@ -3049,6 +3214,8 @@ class _Sanitizer(HTMLParser):
             return
         if tag not in _SAFE_TAGS:
             return                  # unwrapped: the tag goes, its content stays
+        if self._open:
+            self._implied_end(tag)
         if tag not in _SAFE_VOID and len(self._open) >= _MAX_DEPTH:
             return                  # deeper than any mail nests: unwrapped too
         extra = ""
@@ -3072,7 +3239,85 @@ class _Sanitizer(HTMLParser):
         while len(self._open) > index:
             tag = self._open.pop()
             self._open_at[tag].pop()
+            self._ended.discard(len(self._open))
             self._out.append("</%s>" % tag)
+
+    def _last(self, tags) -> int:
+        """Where the innermost open element with one of these tags is, or -1."""
+        best = -1
+        for tag in tags:
+            open_at = self._open_at.get(tag)
+            if open_at and open_at[-1] > best:
+                best = open_at[-1]
+        return best
+
+    def _implied_end(self, tag: str) -> None:
+        """Write the end tag this start tag stands for (see _ENDS_P).
+
+        Asked of the index like every other question about what is open,
+        and of the innermost element first: in a mail written without end
+        tags that is the paragraph, the item or the cell before this one.
+        """
+        if tag in _TABLE_ENDS:
+            self._implied_table_end(tag)
+        targets = ("p",) if tag == "p" else _ITEM_ENDS.get(tag)
+        if targets:
+            top = len(self._open) - 1
+            found = top if self._open[top] in targets else self._last(targets)
+            if found < 0 or found in self._ended:
+                pass
+            elif found == top:
+                self._close_to(found)
+            elif tag != "p" and self._last(_ITEM_STOPS) > found:
+                pass                # the new one is its descendant
+            elif self._last(_CARRIED_TAGS) > found:
+                self._ended.add(found)
+            else:
+                self._close_to(found)
+        if tag in _ENDS_P:
+            paragraphs = self._open_at.get("p")
+            if paragraphs:
+                self._ended.add(paragraphs[-1])
+
+    def _implied_table_end(self, tag: str) -> None:
+        """The same for a cell, a row or a group of rows (see _TABLE_ENDS)."""
+        tables = self._open_at.get("table")
+        if not tables:
+            return
+        for targets in _TABLE_ENDS[tag]:
+            found = self._last(targets)
+            if found > tables[-1]:
+                break
+        else:
+            return
+        if found in self._ended:
+            return
+        if (self._last(_CARRIED_TAGS) > found
+                and self._carried_outside_a_cell(found)):
+            # Opened in the row itself, not in a cell: the browser ends the
+            # row and carries it over. Left to the browser, all of it.
+            for part in _TABLE_PARTS:
+                for at in reversed(self._open_at.get(part, ())):
+                    if at < found:
+                        break
+                    self._ended.add(at)
+            return
+        self._close_to(found)
+
+    def _carried_outside_a_cell(self, found: int) -> bool:
+        """Is a carried element open above `found` that no cell above
+        `found` holds? (The lowest of them, against the lowest cell.)"""
+        lowest = len(self._open)
+        for tag in _CARRIED_TAGS:
+            open_at = self._open_at.get(tag)
+            if open_at and open_at[-1] > found:
+                lowest = min(lowest, open_at[bisect_right(open_at, found)])
+        for tag in ("td", "th"):
+            open_at = self._open_at.get(tag)
+            if open_at and open_at[-1] >= found:
+                if open_at[bisect_left(open_at, found)] < lowest:
+                    return False
+        return True
 
     def handle_endtag(self, tag):
         if tag == "style":
@@ -3093,12 +3338,20 @@ class _Sanitizer(HTMLParser):
         if not open_at:
             return
         index = open_at[-1]
-        if tag not in _TABLE_TAGS:
-            # A stray </div> inside a cell must not close the table around it.
-            for wall in ("td", "th", "table"):
-                inside = self._open_at.get(wall)
-                if inside and inside[-1] > index:
-                    return
+        if tag == "li":
+            walls = _ITEM_END_WALLS
+        elif tag not in _TABLE_TAGS:
+            walls = _END_WALLS
+        else:
+            walls = () if tag == "table" else _PART_END_WALLS
+        for wall in walls:
+            inside = self._open_at.get(wall)
+            if inside and inside[-1] > index:
+                return
+        if index in self._ended and index < len(self._open) - 1:
+            # Ended by the browser long ago: this end tag is a stray one to
+            # it, and would here end what was opened since instead.
+            return
         self._close_to(index)
 
     def handle_data(self, data):
@@ -3132,6 +3385,10 @@ def sanitize_html(html: str | None, cid_map: dict | None = None) -> str:
     forced to open in a new tab without an opener — and images whose ``src``
     is a ``cid:`` reference that `cid_map` (content-id → ``data:`` URL)
     resolves.
+
+    Written: the end tags HTML lets a mail leave out — of paragraphs, list
+    items, table cells and rows — where a browser would supply them, so a
+    long mail without them is a row of paragraphs and not a nest of them.
 
     Gone: script and link elements, every ``on*`` attribute, forms' controls,
     frames, objects and embeds, ``base``, ``meta`` (so no refresh), SVG and

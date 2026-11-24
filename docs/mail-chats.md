@@ -406,7 +406,17 @@ The state is `wanting` when the mail is HTML-only, when what is left is still
 long (more than `MAIL_TRIM_WANTING_CHARS`), when a quote marker survived, or
 when a rule saw its shape and held back for want of evidence. An empty result
 falls back to the untrimmed text: a bubble is never blank because the trim was
-greedy. Cost is linear in the size of the mail, for hostile mail too.
+greedy.
+
+**What one mail may cost is bounded**, like everything else it controls — the
+mirror has one thread for all of them. The trim works on at most 10,000 lines
+and 500,000 characters of text, and runs over them a fixed number of times
+(four passes a reading, four readings a mail); a longer text is not trimmed
+and is recorded as it came, `wanting`. Of an HTML part the first 1,000,000
+characters of markup are parsed: beside a plain part a longer one is not
+consulted, and where it is the mail's only text the bubble ends where the
+reading did, on a line `[…]` — *Original* shows all of it. Within those
+bounds the cost is linear in the size of the mail, for hostile mail too.
 
 ### The model trim (phase 4)
 
