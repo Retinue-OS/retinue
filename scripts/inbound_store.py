@@ -183,6 +183,11 @@ P_SENDER_NAME = KB + "senderName"
 # is one literal instead.
 P_RECIPIENT = KB + "recipient"
 P_CC = KB + "cc"
+# The Reply-To addresses, one triple each, where the mail carried the header:
+# whom an answer goes to instead of the sender. The mail gateway builds a
+# reply from its records of the thread (docs/mail-chats.md, "Writing"), so the
+# record has to say it. Addresses, like To and Cc: gone from a tombstone.
+P_REPLY_TO = KB + "replyTo"
 # Threading, as the headers carried it: the parent's id, and the References
 # ids space-separated in header order (followed by any further id the
 # In-Reply-To header named beside the parent, so the two together are every
@@ -225,7 +230,7 @@ TRIMS = ("deterministic", "wanting", "model")
 _MAIL_LITERALS = (("subject_line", P_SUBJECT), ("sender_name", P_SENDER_NAME),
                   ("in_reply_to", P_IN_REPLY_TO), ("references", P_REFERENCES),
                   ("list_id", P_LIST_ID), ("trim", P_TRIM))
-_MAIL_LISTS = (("recipients", P_RECIPIENT), ("cc", P_CC))
+_MAIL_LISTS = (("recipients", P_RECIPIENT), ("cc", P_CC), ("reply_to", P_REPLY_TO))
 _PARTS = (("body_part", P_BODY_PART), ("html_part", P_HTML_PART),
           ("header_part", P_HEADER_PART))
 
@@ -518,7 +523,8 @@ def _parse(text: str) -> dict | None:
     :func:`_render`, so no rewrite here ever drops a newer writer's facts.
 
     The mail fields (see :data:`P_SUBJECT`) read as ``subject_line``,
-    ``sender_name``, ``recipients`` and ``cc`` (lists), ``in_reply_to``,
+    ``sender_name``, ``recipients``, ``cc`` and ``reply_to`` (lists),
+    ``in_reply_to``,
     ``references`` (the space-separated literal as stored), ``list_id``,
     ``body_part``/``html_part``/``header_part`` (media IRIs), ``trim``,
     ``removed_at`` and ``arrived_at`` (ISO-8601); an inline part's Content-ID is
@@ -709,7 +715,8 @@ def _check_trim(trim) -> str | None:
 
 def _mail_fields(*, subject=None, sender_name=None, recipients=None, cc=None,
                  in_reply_to=None, references=None, list_id=None, body_part=None,
-                 html_part=None, header_part=None, trim=None, arrived_at=None) -> dict:
+                 html_part=None, header_part=None, trim=None, arrived_at=None,
+                 reply_to=None) -> dict:
     """The mail fields of a new record, normalised (see :data:`P_SUBJECT`).
 
     ``references`` is the References header's ids in header order, as one
@@ -725,6 +732,7 @@ def _mail_fields(*, subject=None, sender_name=None, recipients=None, cc=None,
         "sender_name": _one(sender_name),
         "recipients": _many(recipients),
         "cc": _many(cc),
+        "reply_to": _many(reply_to),
         "in_reply_to": _one(in_reply_to),
         "references": " ".join(str(references or "").split()) or None,
         "list_id": _one(list_id),
@@ -776,6 +784,7 @@ def write_message(
     trim: str | None = None,
     content_ids: dict | None = None,
     arrived_at: float | None = None,
+    reply_to: list[str] | None = None,
 ) -> tuple[str, Path]:
     """Persist one inbound message as a deterministic N-Triples file.
 
@@ -808,6 +817,7 @@ def write_message(
     The remaining arguments are a mail's (see :data:`P_SUBJECT` and
     docs/mail-chats.md, "The record"): ``subject`` its Subject, ``sender_name``
     the display name on From, ``recipients``/``cc`` the To/Cc addresses,
+    ``reply_to`` the Reply-To addresses (see :data:`P_REPLY_TO`),
     ``in_reply_to``/``references`` its threading headers, ``list_id``,
     ``body_part``/``html_part``/``header_part`` the media references of its
     parts (stored with :func:`store_media` first, like attachments, so their
@@ -826,7 +836,8 @@ def write_message(
         **_mail_fields(subject=subject, sender_name=sender_name, recipients=recipients,
                        cc=cc, in_reply_to=in_reply_to, references=references,
                        list_id=list_id, body_part=body_part, html_part=html_part,
-                       header_part=header_part, trim=trim, arrived_at=arrived_at),
+                       header_part=header_part, trim=trim, arrived_at=arrived_at,
+                       reply_to=reply_to),
         "type": T_INBOUND,
         "subject": urn,
         "channel": channel,
@@ -874,6 +885,7 @@ def write_outbound(
     trim: str | None = None,
     content_ids: dict | None = None,
     arrived_at: float | None = None,
+    reply_to: list[str] | None = None,
 ) -> tuple[str, Path]:
     """Persist one successfully sent outbound message as its own N-Triples file.
 
@@ -912,7 +924,8 @@ def write_outbound(
         **_mail_fields(subject=subject, sender_name=sender_name, recipients=recipients,
                        cc=cc, in_reply_to=in_reply_to, references=references,
                        list_id=list_id, body_part=body_part, html_part=html_part,
-                       header_part=header_part, trim=trim, arrived_at=arrived_at),
+                       header_part=header_part, trim=trim, arrived_at=arrived_at,
+                       reply_to=reply_to),
         "type": T_OUTBOUND,
         "subject": urn,
         "channel": channel,
@@ -1612,7 +1625,7 @@ def tombstone_message(path: str | Path, removed_at: str | float | None = None, *
     for a mail that no longer exists. It loses what the mail said and to
     whom: ``kb:text`` becomes the empty string (the triple stays: the parser
     and the web gateway's chat query require it), and the recipients, the Cc,
-    the trim, the parts, the attachments with what was stated about them, a
+    the Reply-To addresses, the trim, the parts, the attachments with what was stated about them, a
     retained voice-note spool, and any triple this version does not know (it
     cannot tell identity from content there, and a tombstone keeps only what
     it knows to be identity). ``kb:removedAt`` is set — ``removed_at`` as
@@ -1638,8 +1651,8 @@ def tombstone_message(path: str | Path, removed_at: str | float | None = None, *
         fields = _parse(p.read_text(encoding="utf-8"))
         if not fields:
             return False
-        stripped = {key for key in ("recipients", "cc", "attachments", "extra")
-                    if fields.get(key)}
+        gone = [key for key, _pred in _MAIL_LISTS] + ["attachments", "extra"]
+        stripped = {key for key in gone if fields.get(key)}
         stripped |= {key for key, _pred in _PARTS if fields.get(key)}
         stripped |= {key for key in ("text", "trim", "media", "attachment_meta")
                      if fields.get(key)}
@@ -1667,7 +1680,7 @@ def tombstone_message(path: str | Path, removed_at: str | float | None = None, *
             when = _parse_since(removed_at)
             fields["removed_at"] = _iso(time.time() if when is None else when)
         fields["text"] = ""
-        for key in ("recipients", "cc", "attachments", "extra"):
+        for key in gone:
             fields[key] = []
         for key, _pred in _PARTS:
             fields[key] = None

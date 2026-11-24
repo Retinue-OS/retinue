@@ -12,11 +12,19 @@ library.
     mailbox (IMAP) ──poll──▶ this gateway ──records, blobs──▶ the ledger
                                           └─events──▶ the web gateway (rail)
 
-**This is the read-only mirror.** Folders are selected read-only and no flag
-is ever stored; nothing is sent, nothing pushes, no model turn is started for
-a mail, and e-mail triage keeps running beside it untouched. Writing (reply,
-compose, the mailbox following the chat), the gate and the model trim are
-later phases; where one of them will take over, the code says so.
+**It mirrors, and it writes** (docs/mail-chats.md, "Writing"): replies and
+new mail leave through ``POST /send`` under the e-mail send policy, and what
+the user does to a chat reaches the mailbox — read, archive, delete. Nothing
+pushes and no model turn is started for a mail yet, and e-mail triage keeps
+running beside the mirror: the gate and the model trim are later phases, and
+where one of them will take over, the code says so.
+
+**Reading and writing are kept apart.** The mirror reads: folders are opened
+with EXAMINE and bodies fetched with BODY.PEEK, so no pass over the mailbox
+can change a flag. A folder is opened read-write only for the one command
+that writes — setting ``\\Seen``, moving a thread's mails, appending the Sent
+copy — and is back to read-only before the adapter returns. Nothing is ever
+expunged but the very UIDs a move just copied away.
 
 **The mailbox is the source of what exists; the mirror follows it.** Three
 folders are mirrored — INBOX, Sent and the archive folder:
@@ -77,12 +85,29 @@ mailbox from credentials the deployment already has, so "no token set" must
 not mean "open"): ``GET /health`` for the gateway monitor, ``GET /media/<id>``
 for the blobs,
 ``GET /recent-chats`` and ``GET /threads/<chat key>`` for a thread's name,
-participants and counts, and ``POST /outbound-note`` so a mail an agent or the
-user sent through ``email_client.py`` is not recorded as "some mail client".
-The endpoints of the later phases (``/send``, ``/pending-sends``,
-``/chats/delete|read|archive``) answer 501 with the reason.
+participants and counts, ``POST /outbound-note`` so a mail an agent or the
+user sent through ``email_client.py`` is not recorded as "some mail client",
+``POST /send`` with the pending-send store behind it (``/pending-sends``, on
+the SMS gateway's model), and ``POST /chats/read|archive|delete`` — the last
+behind the erase capability as well (``CHAT_ERASE_TOKEN``).
 
-What it tells the web gateway, over the chats rail: every mirrored mail
+**A send is made at most once, and a mail that went out has its record** —
+as far as one process can see to that against a mail server it shares no
+transaction with. Every send, queued and approved or direct, is an entry of
+the pending-send store on the state volume, and its entry is marked as it
+goes: ``sending`` (the decision stands; nothing has left), ``data`` (written
+the moment before the message is handed to the SMTP server), ``sent``
+(written the moment the server says it took it). Then the record with the
+rail's event, and the Sent copy — each found again by the mail's Message-ID,
+and never made twice. A stop is resumed from the last mark (``Sends.recover``,
+``Mirror._resume_sends``). The one stretch no mark can close, between
+``data`` and ``sent``, is never resumed by sending again: the mail is looked
+for in Sent — which settles it wherever the provider files sent mail itself —
+and where the mailbox cannot say, the send ends as failed, saying that its
+outcome is not known.
+
+What it tells the web gateway, over the chats rail: every mirrored mail and
+every mail it sent
 (held, no handover — so nothing rings and no turn starts), a thread merge, and
 a removal. Events wait in a queue on the state volume while the web gateway
 is away; the ledger is the record either way. A mail is recorded exactly
@@ -94,9 +119,12 @@ the next start (``Mirror._prepare``).
 Everything that speaks IMAP is confined to the "mailbox adapter" section; the
 rest works on the adapter's small surface and is unit-tested against a fake
 mailbox in tests/test_mail_gateway.py (the adapter itself, against a scripted
-IMAP server, in tests/test_mail_gateway_imap.py).
+IMAP server, in tests/test_mail_gateway_imap.py; sending, the queue and the
+mailbox following the chat in tests/test_mail_gateway_send.py). SMTP is
+``email_client``'s, used as a library.
 """
 import codecs
+import contextlib
 import email
 import email.header
 import email.message
@@ -108,19 +136,22 @@ import imaplib
 import json
 import os
 import re
+import smtplib
 import sqlite3
 import ssl
+import tempfile
 import threading
 import time
 import traceback
 import urllib.error
 import urllib.request
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import NamedTuple
-from urllib.parse import unquote
+from urllib.parse import parse_qs, unquote, urlsplit
 
 import email_client as _ec
 import inbound_store as _ibstore
@@ -129,6 +160,14 @@ import mail_trim as _trim
 import triage_policy as _triage
 import chat_ingest as _chats
 import build_stamp as _build
+import send_origin as _origin
+from reply_tokens import ReplyTokenStore
+
+# The gateway never writes policy (docs/mail-chats.md, "Writing"): a mail it
+# sends whitelists nobody. email_client does that for its own sends, in its
+# own process; here its helpers are a library, and this switches the side
+# effect off for everything this process does through them.
+_ec.WHITELIST_ON_SEND = False
 
 CHANNEL = "email"
 # Mail is the user's own correspondence; there is no control mode to run.
@@ -161,12 +200,37 @@ def _env_float(name: str, default: float, minimum: float = 0.0) -> float:
 MAIL_ACCOUNT_NAME = os.environ.get("MAIL_ACCOUNT_NAME", "").strip()
 
 
+def _config(name: str | None, suffix: str):
+    """``(Config, why it cannot send | None)``. email_client's Config wants an
+    SMTP server, since everything it is for ends in a send; a mailbox is still
+    a mailbox without one, and is mirrored — /health and ``POST /send`` then
+    say that nothing can be sent, and why. Raises as Config does for anything
+    else that is missing."""
+    key = "SMTP_HOST" + suffix
+    if (os.environ.get(key) or "").strip():
+        return _ec.Config(name), None
+    had = os.environ.get(key)
+    os.environ[key] = "unset.invalid"     # read once, by the constructor below
+    try:
+        cfg = _ec.Config(name)
+    finally:
+        if had is None:
+            del os.environ[key]
+        else:
+            os.environ[key] = had
+    cfg.smtp_host = ""
+    return cfg, (f"{key} is not set: the mailbox is mirrored, but no mail can be "
+                 f"sent from it until the SMTP server is configured")
+
+
 def _load_config():
-    """``(configured, Config | None, problem | None)`` for this container.
+    """``(configured, Config | None, problem | None, why it cannot send |
+    None)`` for this container.
 
     Not configured means the account's address variable is absent: the
     deployment runs no mail mirror, which is a choice, not a fault. An address
-    with the rest missing is a configuration error and is reported as one.
+    with the rest missing is a configuration error and is reported as one —
+    but for the SMTP server alone (see _config).
 
     The default account is also not configured when the deployment pinned its
     built-in channels (MESSENGER_BUILTIN_CHANNELS, read exactly as
@@ -180,16 +244,17 @@ def _load_config():
     if not suffix and pinned is not None and CHANNEL not in {
             name.strip() for name in pinned.split(",")}:
         return False, None, (f"the {CHANNEL} channel is not in MESSENGER_BUILTIN_CHANNELS "
-                             f"(add it to mirror this mailbox)")
+                             f"(add it to mirror this mailbox)"), None
     if not os.environ.get("EMAIL_USER" + suffix, "").strip():
-        return False, None, f"EMAIL_USER{suffix} is not set"
+        return False, None, f"EMAIL_USER{suffix} is not set", None
     try:
-        return True, _ec.Config(MAIL_ACCOUNT_NAME or None), None
+        cfg, no_smtp = _config(MAIL_ACCOUNT_NAME or None, suffix)
+        return True, cfg, None, no_smtp
     except (_ec.EmailError, ValueError) as exc:
-        return True, None, str(exc)
+        return True, None, str(exc), None
 
 
-CONFIGURED, MAIL_CONFIG, CONFIG_PROBLEM = _load_config()
+CONFIGURED, MAIL_CONFIG, CONFIG_PROBLEM, SMTP_PROBLEM = _load_config()
 # The account identity: the mailbox address, lowercased — what kb:account, the
 # chat id and /health all carry, compared as a string everywhere.
 ACCOUNT = MAIL_CONFIG.user.strip().lower() if MAIL_CONFIG else ""
@@ -266,11 +331,51 @@ MAX_ID_CHARS = 240
 MAX_RECIPIENTS = 500
 
 # Persistent state of this gateway alone (the two indexes, the outbound
-# notes), per account so a volume reused for another mailbox starts clean.
+# notes, the pending sends), per account so a volume reused for another
+# mailbox starts clean.
 MAIL_DATA_DIR = Path(os.environ.get("MAIL_DATA_DIR", "/root/.local/share/mail"))
 MAIL_STATE_DIR = MAIL_DATA_DIR / (re.sub(r"[^a-z0-9._@+-]", "_", ACCOUNT) or "unconfigured")
 MAIL_RECENT_CHATS_MAX = _env_int("MAIL_RECENT_CHATS_MAX", 200, 1)
 MAIL_NOTES_MAX = 2000
+
+# ── Writing ───────────────────────────────────────────────────────────────────
+# The send policy is EMAIL_SEND_POLICY, keyed by this account's address and
+# read by email_client (resolve_category) at every send, so the gateway and
+# email_client.py never disagree about it. Unset, or unreadable: verify.
+#
+# A mail the gateway sent is on record before its copy in Sent can be seen —
+# appended by the gateway a moment later, or filed by the provider in its own
+# time (SMTP_SAVE_SENT=false). For this long a record of the gateway's own
+# send that has no place in the mailbox yet is not looked for, and so not
+# called gone.
+MAIL_SENT_GRACE_SECONDS = _env_float("MAIL_SENT_GRACE_SECONDS", 600.0)
+# The separate capability POST /chats/delete requires (X-Chat-Erase-Token), as
+# on every gateway (see telegram-gateway.py). Unset, the endpoint refuses.
+CHAT_ERASE_TOKEN = os.environ.get("CHAT_ERASE_TOKEN", "").strip()
+SEND_APPROVAL_BASE_URL = os.environ.get("SEND_APPROVAL_BASE_URL", "").rstrip("/")
+# Optional override for the /sends/<slug>/<id> segment; normally unset (the
+# slug is the Host header's service name — see telegram-gateway.py).
+SEND_APPROVAL_SLUG = os.environ.get("SEND_APPROVAL_SLUG", "").strip("/")
+# What one /send may carry. The body cap is the other gateways' (attachments
+# travel base64 in the JSON); the rest are bounds on a single mail no real
+# one reaches.
+MAX_SEND_BODY_BYTES = 25 * 1024 * 1024
+MAX_SEND_TEXT_CHARS = 1024 * 1024
+MAX_SEND_RECIPIENTS = 100
+MAX_SEND_ATTACHMENTS = 20
+MAX_SUBJECT_CHARS = 500
+# How many ids a reply's References header carries: the thread's root and the
+# nearest parents (RFC 5322 lets a long chain be cut in the middle).
+MAX_REFERENCES = 30
+# How long a send waits for the mirror's lock before its record is left to
+# the mirror loop (which writes it at once): the mail is out either way, and
+# the caller's answer must not wait out a backfill batch.
+RECORD_LOCK_SECONDS = 5.0
+# And how long a read, an archive or a delete waits for it before answering
+# "busy": under the web gateway's own deadline for the call (30 s).
+EXCLUSIVE_SECONDS = 20.0
+MAIL_PENDING_SENDS_DIR = MAIL_STATE_DIR / "pending-sends"
+DEFAULT_SEND_CATEGORY = "verify"
 
 HTTP_PORT = _env_int("MAIL_GATEWAY_HTTP_PORT", 8096, 1)
 # Required, and the opt-in. Without it the gateway neither mirrors nor serves:
@@ -408,7 +513,12 @@ def _health_snapshot() -> dict:
         # connected, then, is no word on the IMAP login, and whoever words
         # an alert reads this first (gateway-monitor.py).
         "blocked": state["blocked"] if configured and MAIL_CONFIG is not None else None,
-        "read_only": True,
+        # Whether a mail can leave through this gateway at all, and if not,
+        # why — one sentence a chat can show. Not "is it connected": a
+        # mailbox can be mirrored and still have no SMTP server to send by.
+        "can_send": configured and MAIL_CONFIG is not None and SMTP_PROBLEM is None,
+        "cannot_send_reason": (SMTP_PROBLEM if configured and MAIL_CONFIG is not None
+                               else None),
         "backfill": backfill,
         # Mails in the mirrored folders that have no record at all — not
         # even a placeholder — because nothing could be made of them. The
@@ -484,6 +594,7 @@ class Mail:
     sender_name: str | None = None
     to: list = field(default_factory=list)  # [(address, display name | None)]
     cc: list = field(default_factory=list)
+    reply_to: list = field(default_factory=list)   # likewise; whom an answer goes to
     in_reply_to: str | None = None
     references: list = field(default_factory=list)
     cited: list = field(default_factory=list)
@@ -940,6 +1051,7 @@ def parse_mail(raw: bytes, internal_date: float | None = None) -> Mail:
         mail.sender, mail.sender_name = sender[0]
     mail.to = _addresses(msg, "To")
     mail.cc = _addresses(msg, "Cc")
+    mail.reply_to = _addresses(msg, "Reply-To")
     _read_ids(msg, mail)
     mail.list_id = _clean_line(_UNFOLD_RE.sub("", _raw_header(msg, "List-Id")), 998)
     mail.bulk = _is_bulk(msg, mail.list_id)
@@ -1065,7 +1177,13 @@ def _dropped_parts_note(mail: Mail) -> tuple[bytes, str]:
 #   fetch(folder, uid, limit)       one mail's raw bytes, flags and arrival time
 #   find(folder, message_id)        the UID of a mail, by Message-ID
 #   ensure() / close()              the connection's life
-#   set_seen() / move()             the next phase's seams; refused here
+#   set_seen(folder, uids)          \Seen on these mails
+#   move(folder, uids, to)          these mails into another folder
+#   append(folder, raw)             one mail added to a folder (the Sent copy)
+#   create(folder)                  a folder made, where it is not there yet
+#
+# The four that write are the only commands that can change the mailbox, and
+# each opens its folder read-write for itself alone (Mailbox._write).
 #
 # What an answer means is part of the surface, because the mirror calls a mail
 # gone on it. ``None`` is always the server's own word — it answered, and the
@@ -1080,6 +1198,11 @@ def _dropped_parts_note(mail: Mail) -> tuple[bytes, str]:
 class MailboxError(Exception):
     """The mailbox could not be reached or refused a command. The message is
     what /health reports, so it is written for the operator."""
+
+
+class FolderChanged(MailboxError):
+    """A write was asked for by UIDs that no longer name the mails they were
+    read as (see Mailbox._write). Nothing was written."""
 
 
 class _Unsure:
@@ -1115,6 +1238,19 @@ class Fetched(NamedTuple):
     size: int
     flags: frozenset
     date: float | None
+
+
+class Moved(NamedTuple):
+    """What became of a move, UID by UID. ``moved``: left the folder — each
+    mapped to its UID in the destination, or to None where the server did not
+    say (no COPYUID). ``left``: copied to the destination and still in the
+    folder, flagged ``\\Deleted`` — the server offers no way to remove exactly
+    these (no MOVE, no UIDPLUS), and nothing here ever expunges a whole
+    folder; mapped like ``moved``. ``absent``: no longer in the folder when
+    the move was made."""
+    moved: dict
+    left: dict
+    absent: tuple
 
 
 _LIST_HEAD_RE = re.compile(rb"^\((?P<flags>[^)]*)\)\s+(?:\"(?:[^\"\\]|\\.)*\"|NIL|\S+)\s*(?P<name>.*)$",
@@ -1201,22 +1337,41 @@ def _internal_date(envelope: bytes) -> float | None:
     return stamp if stamp is not None and stamp >= 0 else None
 
 
+def _expand_uid_set(spec: bytes, limit: int = 100_000) -> list:
+    """The UIDs of a set as a server writes one (``3,7:9``), in its order.
+    ValueError for anything that is not one, or that names more than
+    ``limit`` — a set is the server's to write, and is not expanded blindly."""
+    out: list = []
+    for part in spec.decode("ascii").split(","):
+        low, colon, high = part.partition(":")
+        low, high = sorted((int(low), int(high) if colon else int(low)))
+        if len(out) + high - low >= limit:
+            raise ValueError("UID set too large")
+        out.extend(range(low, high + 1))
+    return out
+
+
 class Mailbox:
-    """The IMAP side of one account, read-only.
+    """The IMAP side of one account.
 
     email_client.py logs in once per command; this is the first long-running
     IMAP client here, so the connection's life is handled in one place: every
     command runs through :meth:`_run`, which connects on demand, and on a
     dropped or timed-out connection reconnects and tries once more — servers
     close an idle session after half an hour, and that is not an outage.
-    Folders are opened with EXAMINE, never SELECT, and bodies are read with
-    BODY.PEEK: this phase cannot change a flag even by accident."""
+
+    Reading cannot change the mailbox: folders are opened with EXAMINE and
+    bodies read with BODY.PEEK, so no pass of the mirror sets a flag even by
+    accident. The four methods that write (the last section) each open their
+    folder with SELECT for that one command and put it back to EXAMINE before
+    they return (:meth:`_write`)."""
 
     def __init__(self, cfg, timeout: float = MAIL_IMAP_TIMEOUT):
         self._cfg = cfg
         self._timeout = timeout
         self._conn = None
         self._selected = None
+        self._caps: frozenset = frozenset()   # the server's, as of the last login
         self._lock = threading.RLock()
 
     # -- the connection --------------------------------------------------------
@@ -1245,6 +1400,15 @@ class Mailbox:
                 f"EMAIL_PASS (an app password, where the provider issues them)") from exc
         except OSError as exc:
             raise MailboxError(f"the IMAP connection failed during login: {exc}") from exc
+        # What the server can do, asked once it knows who is asking (many
+        # announce MOVE and UIDPLUS only then). Not known is "cannot": a move
+        # then takes the careful path (see move).
+        try:
+            typ, data = conn.capability()
+            said = data[-1] if typ == "OK" and data else b""
+            self._caps = frozenset(bytes(said or b"").decode("ascii", "replace").upper().split())
+        except (imaplib.IMAP4.error, OSError):
+            self._caps = frozenset()
         return conn
 
     def close(self) -> None:
@@ -1256,9 +1420,9 @@ class Mailbox:
             except Exception:  # noqa: BLE001 - it is being dropped either way
                 pass
 
-    def _run(self, command):
+    def _run(self, command, attempts: int = 2):
         with self._lock:
-            for attempt in (1, 2):
+            for attempt in range(1, attempts + 1):
                 if self._conn is None:
                     self._conn = self._connect()
                     self._selected = None
@@ -1270,7 +1434,7 @@ class Mailbox:
                     # The connection is gone or in an unknown state (a timeout
                     # mid-answer leaves half a response behind): drop it.
                     self.close()
-                    if attempt == 2:
+                    if attempt == attempts:
                         raise MailboxError(f"the IMAP connection failed: {exc}") from exc
                 except imaplib.IMAP4.error as exc:
                     # The server answered and said no; the connection is fine.
@@ -1433,17 +1597,204 @@ class Mailbox:
             return UNSURE if len(candidates) > FIND_CANDIDATES_MAX else None
         return self._run(command)
 
-    # -- the next phase's seams ------------------------------------------------
-    # The mailbox follows the chat from phase 2 on: a reply or "mark as read"
-    # sets \Seen, archiving moves a thread's INBOX mails to the archive folder,
-    # deleting moves them to Trash. Their place is here, in the adapter, and
-    # until then they refuse — nothing in this phase may write to the mailbox.
+    # -- writing ---------------------------------------------------------------
+    # The mailbox follows the chat (docs/mail-chats.md): "mark as read" and a
+    # reply set \Seen, archiving moves a thread's INBOX mails to the archive
+    # folder, deleting moves them to the Trash, and a mail the gateway sent is
+    # appended to Sent. These four are everything that changes the mailbox.
 
-    def set_seen(self, folder: str, uids) -> None:
-        raise MailboxError("the mail mirror is read-only")
+    def _write(self, folder: str, validity: int | None, command):
+        """Run ``command(conn)`` with ``folder`` opened read-write, and have
+        it read-only again before returning. None when the server says there
+        is no such folder.
 
-    def move(self, folder: str, uid: int, to_folder: str) -> int | None:
-        raise MailboxError("the mail mirror is read-only")
+        ``validity`` is the UIDVALIDITY the caller's UIDs were read under.
+        A folder that has another one now was renumbered, and the same
+        numbers name other mails: nothing is written, and FolderChanged is
+        raised. Checked on the very SELECT the write runs in, so there is no
+        moment between the check and the write.
+
+        Never tried a second time on a dropped connection, unlike a read: a
+        move the server carried out before the line went dead would be made
+        twice. So the session is checked first (a NOOP, where reconnecting
+        costs nothing — the usual dead connection is one the server closed
+        while it sat idle), and a failure after that is the caller's to
+        handle; every caller can, since each write is found again by what it
+        left in the mailbox."""
+        self.ensure()
+        quoted = _ec._quote(folder)
+
+        def run(conn):
+            self._selected = None
+            try:
+                typ, data = conn.select(quoted, readonly=False)
+            except imaplib.IMAP4.readonly as exc:
+                raise MailboxError(
+                    f"the IMAP server opens {folder!r} read-only: {exc}") from exc
+            if typ != "OK":
+                said = _response_text(data)
+                if "[NONEXISTENT]" in said.upper():
+                    return None
+                raise MailboxError(f"the IMAP server would not open {folder!r} "
+                                   f"for writing: {said or typ}")
+            try:
+                if validity is not None and self._number(conn, "UIDVALIDITY") != validity:
+                    raise FolderChanged(
+                        f"{folder!r} was renumbered since the mirror last looked at it; "
+                        f"nothing was changed, and its next poll finds the mails again")
+                return command(conn)
+            finally:
+                # Read-only again at once, by opening it afresh. Never CLOSE:
+                # on a folder opened read-write that expunges every mail
+                # flagged \Deleted in it, whoever flagged it.
+                try:
+                    if conn.select(quoted, readonly=True)[0] == "OK":
+                        self._selected = folder
+                except Exception:  # noqa: BLE001 - the connection is gone; the next command reopens it
+                    pass
+        return self._run(run, attempts=1)
+
+    @staticmethod
+    def _uid_set(uids) -> str:
+        return ",".join(str(uid) for uid in sorted({int(uid) for uid in uids}))
+
+    def _present(self, conn, folder: str, uids) -> list:
+        """Which of these UIDs the selected folder holds right now."""
+        typ, data = conn.uid("search", None, "UID", self._uid_set(uids))
+        if typ != "OK":
+            raise MailboxError(f"the IMAP server refused a search of {folder!r}: "
+                               f"{_response_text(data) or typ}")
+        wanted = {int(uid) for uid in uids}
+        return sorted({int(token) for chunk in data or [] if chunk
+                       for token in chunk.split()} & wanted)
+
+    @staticmethod
+    def _response_code(conn, name: str) -> bytes | None:
+        """The data of a bracketed response code the last command's answer
+        carried (``[COPYUID …]``, ``[APPENDUID …]``), and forget it."""
+        _typ, data = conn.response(name)
+        last = data[-1] if data else None
+        return bytes(last) if isinstance(last, (bytes, bytearray)) else None
+
+    def _copied(self, conn, uids: list) -> dict:
+        """``{UID here: UID there}`` from the COPYUID a COPY or MOVE answered
+        with (RFC 4315); every value None where the server gave none, or one
+        that does not account for exactly these mails."""
+        unknown = dict.fromkeys(uids)
+        try:
+            _validity, source, target = (self._response_code(conn, "COPYUID") or b"").split()
+            pairs = dict(zip(_expand_uid_set(source), _expand_uid_set(target), strict=True))
+        except ValueError:
+            return unknown
+        return {uid: pairs[uid] for uid in uids} if set(pairs) == set(uids) else unknown
+
+    def set_seen(self, folder: str, uids, *, validity: int | None = None) -> int | None:
+        """Set ``\\Seen`` on these mails; returns how many of them the folder
+        holds (a mail a client moved away since the last poll is not there to
+        flag). None when the server says there is no such folder."""
+        uids = list(uids)
+        if not uids:
+            return 0
+
+        def command(conn):
+            present = self._present(conn, folder, uids)
+            if present:
+                typ, data = conn.uid("STORE", self._uid_set(present),
+                                     "+FLAGS.SILENT", "(\\Seen)")
+                if typ != "OK":
+                    raise MailboxError(f"the IMAP server refused to flag mail in "
+                                       f"{folder!r}: {_response_text(data) or typ}")
+            return len(present)
+        return self._write(folder, validity, command)
+
+    def move(self, folder: str, uids, to_folder: str, *,
+             validity: int | None = None) -> Moved | None:
+        """Move these mails from ``folder`` to ``to_folder`` (see
+        :class:`Moved`). None when the server says ``folder`` does not exist;
+        a destination that does not exist is a refusal, and raises — the
+        caller makes it first (:meth:`create`).
+
+        By ``UID MOVE`` where the server has it (RFC 6851: atomic, and the
+        only way a server such as Gmail really moves). Else the three steps a
+        move is made of — ``UID COPY``, ``\\Deleted`` on the originals, and
+        ``UID EXPUNGE`` of exactly those UIDs, which needs UIDPLUS (RFC 4315).
+        A server with neither keeps the flagged originals: a plain EXPUNGE
+        removes every mail flagged ``\\Deleted`` in the folder, the user's
+        own marks included, and is never sent."""
+        uids = list(uids)
+        if not uids:
+            return Moved({}, {}, ())
+        target = _ec._quote(to_folder)
+
+        def refused(what, data, typ):
+            return MailboxError(f"the IMAP server refused to {what} mail from {folder!r} "
+                                f"to {to_folder!r}: {_response_text(data) or typ}")
+
+        def command(conn):
+            present = self._present(conn, folder, uids)
+            absent = tuple(uid for uid in sorted({int(u) for u in uids}) if uid not in present)
+            if not present:
+                return Moved({}, {}, absent)
+            uid_set = self._uid_set(present)
+            self._response_code(conn, "COPYUID")     # an earlier command's
+            if "MOVE" in self._caps:
+                typ, data = conn.uid("MOVE", uid_set, target)
+                if typ != "OK":
+                    raise refused("move", data, typ)
+                return Moved(self._copied(conn, present), {}, absent)
+            typ, data = conn.uid("COPY", uid_set, target)
+            if typ != "OK":
+                raise refused("copy", data, typ)
+            copied = self._copied(conn, present)
+            # From here on the copies exist: whatever the next two steps do,
+            # the answer says so, or the caller would copy them again.
+            try:
+                typ, data = conn.uid("STORE", uid_set, "+FLAGS.SILENT", "(\\Deleted)")
+                if typ == "OK" and "UIDPLUS" in self._caps:
+                    typ, data = conn.uid("EXPUNGE", uid_set)
+                    if typ == "OK":
+                        return Moved(copied, {}, absent)
+            except (imaplib.IMAP4.error, OSError):
+                pass    # the originals stay: reported as left
+            return Moved({}, copied, absent)
+        return self._write(folder, validity, command)
+
+    def append(self, folder: str, raw: bytes, *, when: float | None = None) -> tuple:
+        """Add one mail to ``folder``, seen, with ``when`` (epoch) as its
+        arrival time. Returns ``(UIDVALIDITY, UID)`` of the new mail where
+        the server names them (APPENDUID, RFC 4315), else ``(None, None)`` —
+        the caller finds it by Message-ID. A refusal, a folder that does not
+        exist included, raises.
+
+        Not tried twice on a dropped connection, like every write: the caller
+        looks for the mail before it appends again."""
+        self.ensure()
+
+        def command(conn):
+            self._response_code(conn, "APPENDUID")   # an earlier command's
+            typ, data = conn.append(_ec._quote(folder), "(\\Seen)",
+                                    time.time() if when is None else float(when), raw)
+            if typ != "OK":
+                raise MailboxError(f"the IMAP server refused to append to {folder!r}: "
+                                   f"{_response_text(data) or typ}")
+            try:
+                validity, uid = (self._response_code(conn, "APPENDUID") or b"").split()
+                return int(validity), int(uid)
+            except ValueError:
+                return None, None
+        return self._run(command, attempts=1)
+
+    def create(self, folder: str) -> None:
+        """Make ``folder``. That it is there already is no failure."""
+        self.ensure()
+
+        def command(conn):
+            typ, data = conn.create(_ec._quote(folder))
+            said = _response_text(data)
+            if typ != "OK" and "[ALREADYEXISTS]" not in said.upper():
+                raise MailboxError(f"the IMAP server would not create {folder!r}: "
+                                   f"{said or typ}")
+        self._run(command, attempts=1)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1465,7 +1816,10 @@ class Mailbox:
 #              has no record ("news"; "draft", in the archive; "unreadable"
 #              for a mail that could not even be a placeholder), so it is
 #              not read again — but for the unreadable, now and then
-#              (Mirror._retry_set_aside).
+#              (Mirror._retry_set_aside). One value goes with a Message-ID:
+#              "moved" marks a copy the gateway moved on and the server kept
+#              (flagged \Deleted, no way to expunge exactly it): still a
+#              place of the mail, never one to move or flag again.
 #              Rows of an older generation are stale: mails to find again.
 #   mails      one row per mirrored mail: its record file, direction, chat and
 #              the facts a Thread answer needs. An empty `record` is a claim —
@@ -1475,7 +1829,16 @@ class Mailbox:
 #              (kb:arrivedAt); NULL for a record written before it did.
 #   claims     what the rail is owed for a claim once its record stands: was
 #              the mail a backfill's, was it \Seen. Gone with the claim.
-#   notes      who authored a mail that will turn up in Sent (/outbound-note).
+#   notes      who authored a mail that will turn up in Sent (/outbound-note,
+#              and the gateway's own sends).
+#   settling   mails on record whose place in the mailbox the gateway itself
+#              has just changed or is still to make: its own send, before
+#              the Sent copy is there, and a mail it moved whose new UID the
+#              server did not say. Not called gone before `until` — and with
+#              no `until`, never: the gateway's own send where the provider
+#              files the Sent copy (SMTP_SAVE_SENT=false), which stays a
+#              record whether or not a copy ever shows. Gone with the first
+#              place the mail is given (Mirror._locate).
 #   outbox     rail events not yet taken by the web gateway, in order.
 #
 # A change the rail must hear of and the event that says it are written in ONE
@@ -1508,6 +1871,9 @@ CREATE TABLE IF NOT EXISTS claims (
 ) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS notes (
     message_id TEXT PRIMARY KEY, author TEXT NOT NULL, created REAL NOT NULL
+) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS settling (
+    message_id TEXT PRIMARY KEY, until REAL
 ) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS outbox (
     seq INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL, payload TEXT NOT NULL
@@ -1634,8 +2000,8 @@ MIRROR_GATE = {"forward": False, "vip": False, "instructed": False, "reason": "m
 def _delivered_on_write(direction: str) -> bool:
     """Whether a mail's record starts out ``delivered``.
 
-    THE read-only phase's handover decision, in one place: every record is
-    written delivered, because nothing is owed for it — e-mail triage still
+    THE handover decision of the phases before the gate, in one place: every
+    record is written delivered, because nothing is owed for it — e-mail triage still
     owns the handling of mail, and the rail is offered each mail without a
     handover. The gate phase replaces this with the messengers' flow: persist
     ``delivered: false``, offer the rail a handover, and flip the flag only on
@@ -1719,6 +2085,7 @@ class Mirror:
         self._retry_queue: list = []
         self._retry_round = 0
         self._retried: dict = {}      # set-aside mail → (re-reads that changed nothing, next round)
+        self._send_said: dict = {}    # send → why it is not finished, as last logged
         self._prepare()
 
     @staticmethod
@@ -1892,6 +2259,8 @@ class Mirror:
             self._plan = None
         self.index.run("DELETE FROM claims WHERE message_id NOT IN "
                        "(SELECT message_id FROM mails WHERE record = '')")
+        self.index.run("DELETE FROM settling WHERE message_id NOT IN "
+                       "(SELECT message_id FROM mails)")
         if unknown or owed or lost:
             print(f"[mail-gateway] mailbox index reconciled with the ledger: "
                   f"{len(unknown)} record(s) adopted, {len(lost)} row(s) dropped; "
@@ -1954,6 +2323,7 @@ class Mirror:
                 "JOIN folders f ON f.role = l.role AND f.gen = l.gen "
                 "JOIN mails m ON m.message_id = l.message_id "
                 "WHERE l.message_id = ? AND m.removed = 0 AND m.record != '' "
+                "AND l.skipped IS NULL "
                 "ORDER BY l.role = 'archive', l.role, l.uid LIMIT 1", (item[1],))
         return self.index.one(
             "SELECT l.role, l.uid FROM locations l "
@@ -2123,6 +2493,9 @@ class Mirror:
                 self._rereads = DOUBT_REREADS
                 self._read = self._settled = False
                 self._read, self._settled = self._sync(policy)
+            # What a send left undone (its record, its Sent copy, an outcome
+            # nobody saw) — with the mailbox once the folders are known.
+            self._resume_sends(mailbox=bool(self._folders))
             more = False
             if self._settled:
                 # In this order: a mail must be found again before it can be
@@ -2501,9 +2874,12 @@ class Mirror:
 
     def _locate(self, role: str, uid: int, message_id: str | None, skipped=None) -> None:
         folder = self._folder(role)
-        self.index.run(
-            "INSERT OR REPLACE INTO locations (role, gen, uid, message_id, skipped) "
-            "VALUES (?, ?, ?, ?, ?)", (role, folder["gen"], uid, message_id, skipped))
+        self.index.atomic([
+            ("INSERT OR REPLACE INTO locations (role, gen, uid, message_id, skipped) "
+             "VALUES (?, ?, ?, ?, ?)", (role, folder["gen"], uid, message_id, skipped)),
+            # A mail with a place is followed like any other from here on.
+            ("DELETE FROM settling WHERE message_id = ?", (message_id,))
+            if message_id else None])
 
     def _reidentify(self, limit: int) -> bool:
         """Find again, by Message-ID, the mails of a folder whose UIDs changed.
@@ -2543,16 +2919,26 @@ class Mirror:
         "In none" is what every folder *answered*. A folder that could not
         say (UNSURE) leaves the mail as it is, and one the server would not
         open or search ends the pass (MailboxError) — after the mails already
-        found gone in it have been tombstoned and announced."""
-        # (When the gateway sends mail itself, a record will exist before its
-        # Sent copy is visible; that phase must keep such a mail out of here
-        # until the copy has had time to appear.)
+        found gone in it have been tombstoned and announced.
+
+        A mail whose place the gateway itself is changing (``settling``) is
+        not called gone while that settles: its own send has a record before
+        the Sent copy can be seen, and a mail it moved may not show in its
+        new folder's search at once. Such a mail is looked for and placed,
+        only not buried — and one that settles never (the provider files the
+        Sent copy, or does not) is not looked for at all: a folder's own look
+        places it when its copy arrives, and till then, or for good, the
+        record stands for a mail that was sent."""
         after = self._settle_after or (-1.0, "")
         waiting = self.index.rows(
-            "SELECT * FROM mails m WHERE m.removed = 0 AND m.record != '' AND NOT EXISTS "
+            "SELECT m.*, s.until AS settling FROM mails m "
+            "LEFT JOIN settling s ON s.message_id = m.message_id "
+            "WHERE m.removed = 0 AND m.record != '' AND NOT EXISTS "
             "(SELECT 1 FROM locations l WHERE l.message_id = m.message_id) "
+            "AND (s.message_id IS NULL OR s.until IS NOT NULL) "
             "AND (m.ts, m.message_id) > (?, ?) "
             "ORDER BY m.ts, m.message_id LIMIT ?", (*after, limit + 1))
+        now = self._clock()
         gone, failure = [], None
         try:
             for row in waiting[:limit]:
@@ -2567,7 +2953,7 @@ class Mirror:
                         self._locate(role, uid, row["message_id"])
                         break
                 else:
-                    if not unsure:
+                    if not unsure and (row["settling"] is None or row["settling"] <= now):
                         gone.append(row)
         except MailboxError as exc:
             failure = exc
@@ -2609,6 +2995,7 @@ class Mirror:
                 # must say what a rebuild from the ledger would.
                 (f"UPDATE mails SET removed = 1, recipients = '[]', cc = '[]' "
                  f"WHERE message_id IN ({marks})", tuple(message_ids)),
+                (f"DELETE FROM settling WHERE message_id IN ({marks})", tuple(message_ids)),
                 self._event("removed", {"channel": CHANNEL, "account": ACCOUNT, "chat": chat,
                                         "message_ids": message_ids, "live": live})])
             print(f"[mail-gateway] {len(message_ids)} mail(s) of chat {chat!r} left the "
@@ -2996,8 +3383,10 @@ class Mirror:
                 message_id=mail.message_id, timestamp=ts,
                 attachment_urls=refs["attachments"], sender_name=mail.sender_name,
                 subject=mail.subject, recipients=[a for a, _n in mail.to],
-                cc=[a for a, _n in mail.cc], in_reply_to=mail.in_reply_to,
-                references=mail.references,
+                cc=[a for a, _n in mail.cc],
+                # Whom an answer goes to: a reply is built from the record.
+                reply_to=[a for a, _n in mail.reply_to],
+                in_reply_to=mail.in_reply_to, references=mail.references,
                 list_id=_triage.email_list_id(mail.list_id) or None,
                 body_part=refs.get("body_part"), html_part=refs.get("html_part"),
                 header_part=refs["header_part"], trim=state,
@@ -3126,6 +3515,9 @@ class Mirror:
                 + [self._event("merge", {"channel": CHANNEL, "account": ACCOUNT,
                                          "from": absorbed, "into": into})])
             self._merges_due.difference_update(absorbed)
+            # A send queued in an absorbed chat waits in the survivor now.
+            for old in absorbed:
+                SENDS.rekey(old, into)
             print(f"[mail-gateway] merged chat(s) {absorbed!r} into {into!r}", flush=True)
 
     # -- the rail's queue ------------------------------------------------------
@@ -3169,6 +3561,1448 @@ class Mirror:
                     self.index.run("DELETE FROM outbox WHERE seq = ?", (row["seq"],))
                 elif outcome == "down":
                     return False
+
+    # -- the mailbox follows the chat ------------------------------------------
+    # What the user did to a chat, done to its mails (docs/mail-chats.md, "The
+    # mailbox follows the chat, never the reverse"). Each works from the
+    # places the index holds — where the mirror last saw the thread's mails —
+    # under the UIDVALIDITY they were read with, and tells the index what it
+    # did at once: the next poll finds the mailbox as the index says it is,
+    # and reads none of it as mail that came or went.
+
+    @contextlib.contextmanager
+    def exclusive(self):
+        """The mirror's lock for a caller that is not the poll, waited for
+        EXCLUSIVE_SECONDS: these calls rewrite the index and the ledger,
+        which have one writer at a time. :class:`Busy` when a pass holds it
+        longer — the caller's request has a deadline of its own, and is made
+        again."""
+        if not self._lock.acquire(timeout=EXCLUSIVE_SECONDS):
+            raise Busy("the mirror is in the middle of a pass over the mailbox; "
+                       "try again in a moment")
+        try:
+            yield
+        finally:
+            self._lock.release()
+
+    def _places(self, chat: str, roles: tuple) -> dict:
+        """Where a thread's mails are: ``{role: {UID: Message-ID}}``, from
+        the index, in each folder's current numbering — without the copies
+        the gateway moved on already (``moved``)."""
+        out: dict = {}
+        for row in self.index.rows(
+                "SELECT l.role, l.uid, l.message_id FROM locations l "
+                "JOIN folders f ON f.role = l.role AND f.gen = l.gen "
+                "JOIN mails m ON m.message_id = l.message_id "
+                "WHERE m.chat = ? AND m.record != '' AND l.skipped IS NULL "
+                f"AND l.role IN ({','.join('?' * len(roles))}) "
+                "ORDER BY l.role, l.uid", (chat, *roles)):
+            out.setdefault(row["role"], {})[row["uid"]] = row["message_id"]
+        return out
+
+    def _destination(self, role: str, configured: str) -> str:
+        """The folder a move goes to, made if the mailbox has none: the
+        server's own (SPECIAL-USE), else the configured name."""
+        name = self.mailbox.folders().get(role)
+        if name:
+            return name
+        self.mailbox.create(configured)
+        name = self.mailbox.folders().get(role)
+        if not name:
+            raise MailboxError(f"the mailbox has no {role} folder, and {configured!r} "
+                               f"could not be made one")
+        print(f"[mail-gateway] made the {role} folder {name!r}", flush=True)
+        return name
+
+    def mark_read(self, chat: str) -> int:
+        """``\\Seen`` on every mail of the thread in INBOX or the archive
+        folder; how many were flagged. A reply, or "Mark as read"."""
+        with self.exclusive():
+            seen = 0
+            for role, uids in self._places(chat, ("inbox", "archive")).items():
+                folder = self._folder(role)
+                seen += self.mailbox.set_seen(folder["name"], list(uids),
+                                              validity=folder["uidvalidity"]) or 0
+            return seen
+
+    def archive(self, chat: str) -> dict:
+        """Move the thread's INBOX mails to the archive folder (made if
+        absent). ``{"moved", "flagged"}``: how many are in the archive now,
+        and how many of those the INBOX still holds, flagged ``\\Deleted``,
+        because the server has no way to remove exactly them.
+
+        The mirror follows by its own index: each mail's place moves with
+        it, so nothing is tombstoned and the rail hears nothing."""
+        with self.exclusive():
+            uids = self._places(chat, ("inbox",)).get("inbox")
+            if not uids:
+                return {"moved": 0, "flagged": 0}
+            target = self._destination("archive", MAIL_ARCHIVE_FOLDER)
+            folder = self._folder("inbox")
+            result = self.mailbox.move(folder["name"], list(uids), target,
+                                       validity=folder["uidvalidity"])
+            if result is None:
+                raise MailboxError("the server says there is no INBOX")
+            self._follow_move("inbox", uids, result, "archive", target)
+            if result.left:
+                print(f"[mail-gateway] {len(result.left)} mail(s) of chat {chat!r} were "
+                      f"copied to {target!r} and are still in the INBOX, flagged \\Deleted: "
+                      f"the server offers neither MOVE nor UIDPLUS", flush=True)
+            return {"moved": len(result.moved) + len(result.left), "flagged": len(result.left)}
+
+    def _follow_move(self, source: str, uids: dict, result: Moved,
+                     target: str | None = None, target_name: str | None = None) -> None:
+        """Make the index say what a move of the gateway's own did: the old
+        place gone (or marked ``moved``, where the server kept the copy), the
+        new one known — by the UID the server named, else by looking for the
+        mail there. ``target`` is the destination's role when it is a
+        mirrored folder; the Trash is none, and a mail gone there has no
+        place left.
+
+        A mail whose new place could not be told is no mail that left the
+        mailbox: it settles (``settling``), and the settle pass finds it."""
+        gen = self._folder(source)["gen"]
+        there = self._folder(target) if target else None
+        placeable = there is not None and there["name"] == target_name
+        for uid in result.absent:
+            # Not there to be moved: a client moved it first. Where it went
+            # is the settle pass's to find, like any mail that left a folder.
+            self.index.run("DELETE FROM locations WHERE role = ? AND gen = ? AND uid = ?",
+                           (source, gen, uid))
+        for uid, new in {**result.moved, **result.left}.items():
+            message_id, kept = uids[uid], uid in result.left
+            self.index.run(
+                "UPDATE locations SET skipped = 'moved' WHERE role = ? AND gen = ? AND uid = ?"
+                if kept else
+                "DELETE FROM locations WHERE role = ? AND gen = ? AND uid = ?",
+                (source, gen, uid))
+            if target is None:
+                continue
+            if new is None and placeable:
+                row = self.index.one("SELECT ts, arrived FROM mails WHERE message_id = ?",
+                                     (message_id,))
+                try:
+                    found = self._find(target, message_id, row["ts"] if row else None,
+                                       row["arrived"] if row else None)
+                except MailboxError:
+                    found = UNSURE
+                new = None if found is UNSURE else found
+            if new is not None and placeable:
+                self._locate(target, new, message_id)
+            elif not kept:
+                self.index.run(
+                    "INSERT OR REPLACE INTO settling (message_id, until) VALUES (?, ?)",
+                    (message_id, self._clock() + MAIL_SENT_GRACE_SECONDS))
+
+    def delete_chat(self, chat: str) -> dict:
+        """The user's delete: every mail of the thread, in every mirrored
+        folder, moved to the Trash — **then** the mirror of it erased.
+        Nothing is expunged.
+
+        In that order, and all or nothing on the second half: while a mail
+        of the thread could not be moved, nothing is erased, and the answer
+        says so (``errors``) — a chat that vanished here while its mails
+        stayed in the mailbox would only come back, and one erased before
+        its mails were safe in the Trash could not. What was moved stays
+        moved; the call is made again and finishes.
+
+        ``delete_chat``'s answer (inbound_store) plus ``trashed``,
+        ``pending_sends`` and ``recent``."""
+        result = {"messages": 0, "media": 0, "parts": 0, "errors": 0, "subjects": [],
+                  "message_ids": [], "pending_sends": 0, "recent": 0, "trashed": 0}
+        with self.exclusive():
+            if not self._folders:
+                self._folders = self.mailbox.folders()   # (no look at the folders yet)
+            # A mail of the thread the index has no place for right now may
+            # be in a mirrored folder all the same — moved there by a client
+            # since the last poll, or in a folder renumbered and not read
+            # again yet. It is looked for first: the thread is not erased
+            # while one of its mails could still be in the mailbox, untrashed.
+            for row in self.index.rows(
+                    "SELECT m.message_id, m.ts, m.arrived FROM mails m WHERE m.chat = ? "
+                    "AND m.record != '' AND m.removed = 0 AND NOT EXISTS (SELECT 1 FROM "
+                    "locations l JOIN folders f ON f.role = l.role AND f.gen = l.gen "
+                    "WHERE l.message_id = m.message_id)", (chat,)):
+                for role in ("inbox", "archive", "sent"):
+                    try:
+                        uid = self._find(role, row["message_id"], row["ts"], row["arrived"])
+                    except MailboxError:
+                        uid = UNSURE
+                    if uid is UNSURE:
+                        result["errors"] += 1
+                    elif uid is not None:
+                        self._locate(role, uid, row["message_id"])
+                    if uid is not None:
+                        break
+            if result["errors"]:
+                print(f"[mail-gateway] chat {chat!r} is not deleted: the mailbox cannot say "
+                      f"yet where {result['errors']} of its mail(s) are", flush=True)
+                return result
+            places = self._places(chat, ("inbox", "sent", "archive"))
+            trash = None
+            if places:
+                try:
+                    trash = self._destination("trash", MAIL_TRASH_FOLDER)
+                except MailboxError as exc:
+                    print(f"[mail-gateway] chat {chat!r} is not deleted: {exc}", flush=True)
+                    result["errors"] = sum(map(len, places.values()))
+                    return result
+            for role, uids in places.items():
+                folder = self._folder(role)
+                if folder["name"] == trash:
+                    continue    # (a mailbox whose Trash is one of the mirrored folders)
+                try:
+                    moved = self.mailbox.move(folder["name"], list(uids), trash,
+                                              validity=folder["uidvalidity"])
+                except MailboxError as exc:
+                    print(f"[mail-gateway] {len(uids)} mail(s) of chat {chat!r} could not be "
+                          f"moved from {folder['name']!r} to the Trash: {exc}", flush=True)
+                    result["errors"] += len(uids)
+                    continue
+                if moved is None:
+                    moved = Moved({}, {}, tuple(uids))   # the folder is gone, its mails with it
+                self._follow_move(role, uids, moved)
+                result["trashed"] += len(moved.moved) + len(moved.left)
+            if result["errors"]:
+                return result
+            erased = _ibstore.delete_chat(INBOUND_STORE_DIR, chat, ACCOUNT)
+            result.update(erased)
+            self._forget_chat(chat, whole=not erased["errors"])
+            if not erased["errors"]:
+                result["pending_sends"] = SENDS.purge(chat)
+            print(f"[mail-gateway] erased chat {chat!r}: {result['trashed']} mail(s) to the "
+                  f"Trash, {result['messages']} record(s), {result['media']} blob(s), "
+                  f"{result['errors']} error(s)", flush=True)
+            return result
+
+    def _forget_chat(self, chat: str, *, whole: bool) -> None:
+        """Take an erased chat out of the indexes: every mail of it whose
+        record is gone from the ledger — all of them when the erasure was
+        ``whole``, and then the thread itself and what the rail was still
+        owed about it. A place marked ``moved`` stays: that copy is still in
+        its folder, and must not be read as a new mail."""
+        gone = [row["message_id"] for row in self.index.rows(
+            "SELECT message_id, record FROM mails WHERE chat = ?", (chat,))
+            if whole or not row["record"] or not self._record_path(row["record"]).exists()]
+        for start in range(0, len(gone), 500):
+            batch = tuple(gone[start:start + 500])
+            marks = ",".join("?" * len(batch))
+            self.index.atomic(
+                [(f"DELETE FROM {table} WHERE message_id IN ({marks})", batch)
+                 for table in ("mails", "claims", "notes", "settling")]
+                + [(f"DELETE FROM locations WHERE message_id IN ({marks}) "
+                    f"AND skipped IS NULL", batch)])
+        self._placeholders.difference_update(gone)
+        if not whole:
+            return
+        self._merges_due.discard(chat)
+        self.threads.forget_chat(chat)
+        for row in self.index.rows(
+                "SELECT seq, payload FROM outbox WHERE kind IN ('inbound', 'removed')"):
+            try:
+                about = json.loads(row["payload"]).get("chat")
+            except (ValueError, AttributeError):
+                continue
+            if about == chat:
+                self.index.run("DELETE FROM outbox WHERE seq = ?", (row["seq"],))
+
+    # -- the gateway's own sends -----------------------------------------------
+    # A mail sent through POST /send is on record at once — written here, by
+    # the ledger's one writer, from what was sent — and its copy in Sent is
+    # the same mail by the same Message-ID: whichever of the two the mirror
+    # meets first, there is one record. (How a send gets here, and what a
+    # stop on the way leaves: the "Sending" section below.)
+
+    def reply_draft(self, chat: str, mode: str) -> dict:
+        """How a reply in this thread is addressed and threaded — built from
+        the mirror's own records of it, never from the caller
+        (docs/mail-chats.md, "Writing"): ``{chat, subject, to, cc,
+        in_reply_to, references, cited, names}``. :class:`SendRefused` for a
+        thread this mailbox does not mirror (400) or one with nothing left to
+        answer (409).
+
+        Answered is the latest mail still in the mailbox that is not the
+        user's own (else the latest): its id is In-Reply-To, its chain plus
+        its id the References. It goes to that mail's sender — its Reply-To,
+        where it named one — and, ``mode`` "all", in copy to everyone else on
+        its To and Cc but the user. Where the latest mail is the user's own,
+        the reply is a follow-up to it: to whom that went, again.
+
+        Everything here was a stranger's to write. So what becomes a header
+        is only what has the shape of its field — an address that reads as
+        one, an id that can stand between angle brackets — and the subject is
+        one clean line; anything else is left out, not escaped."""
+        rows = self.index.rows(
+            "SELECT * FROM mails WHERE chat = ? AND record != '' "
+            "ORDER BY ts DESC, message_id DESC", (chat,))
+        if not rows:
+            raise SendRefused(400, "unknown chat: this mailbox mirrors no thread under that key")
+        live = [row for row in rows if not row["removed"]]
+        if not live:
+            raise SendRefused(409, "this thread has no mail left to reply to: every mail "
+                                   "of it is gone from the mailbox")
+
+        def own(row) -> bool:
+            return row["direction"] == "out" or (row["sender"] or "") in OWN_ADDRESSES
+
+        def listed(row, column) -> list:
+            try:
+                return [str(a) for a, _n in json.loads(row[column] or "[]")]
+            except (ValueError, TypeError):
+                return []
+
+        def sendable(addresses) -> list:
+            return list(dict.fromkeys(a for a in addresses if _sendable(a)))
+
+        latest = live[0]
+        answered = next((row for row in live if not own(row)), latest)
+        fields = _ibstore.read_record(self._record_path(answered["record"])) or {}
+        if own(latest):
+            to = sendable(listed(latest, "recipients"))
+            cc = sendable(listed(latest, "cc"))
+            others = [a for a in to if a not in OWN_ADDRESSES]
+            # (A mail to oneself alone is answered to oneself.)
+            to = others or to or [a for a in cc if a not in OWN_ADDRESSES]
+            cc = [a for a in cc if a not in OWN_ADDRESSES and a not in to]
+        else:
+            # The record keeps Reply-To from this phase on; an older one has
+            # it in the header block it kept.
+            reply_to = list(fields.get("reply_to") or [])
+            if not reply_to:
+                header = self._recorded_header(answered["message_id"])
+                reply_to = [a for a, _n in _addresses(header, "Reply-To")] if header else []
+            to = sendable(reply_to) or sendable([answered["sender"] or ""])
+            cc = [a for a in sendable(listed(answered, "recipients") + listed(answered, "cc"))
+                  if a not in OWN_ADDRESSES and a not in to]
+        if mode == "sender":
+            cc = []
+        if not to:
+            raise SendRefused(409, "the mail to answer names nobody a reply could go to")
+        # Every id the answered mail cited, then its own: what the thread
+        # index goes by. The headers carry those of them that are ids a
+        # server ever saw (not the mirror's stand-ins for a missing or
+        # overlong one), the root and the nearest parents.
+        chain = (fields.get("references") or "").split()
+        parent = fields.get("in_reply_to")
+        cited = list(dict.fromkeys(
+            [*chain, *([parent] if parent else []), answered["message_id"]]))
+        cited = cited[:1] + cited[1:][-(_threads.MAX_CITED_IDS - 1):]
+        citable = [i for i in cited if _citable(i)]
+        thread = self.thread(chat) or {}
+        return {
+            "chat": chat,
+            "subject": ("Re: " + _clean_line(self.threads.subject_of(chat),
+                                             MAX_SUBJECT_CHARS)).strip(),
+            "to": to[:MAX_SEND_RECIPIENTS],
+            "cc": cc[:max(0, MAX_SEND_RECIPIENTS - len(to))],
+            "in_reply_to": answered["message_id"] if _citable(answered["message_id"]) else None,
+            "references": citable[:1] + citable[1:][-(MAX_REFERENCES - 1):],
+            "cited": cited,
+            "names": {p["address"]: p["name"] for p in thread.get("participants") or []
+                      if p.get("name")},
+        }
+
+    def expect_sent(self, message_id: str, author: str) -> None:
+        """Before the mail leaves: who wrote it, so that its Sent copy — if
+        the mirror reads that before the record is written, or instead of it
+        (a stop right after the server took the mail) — is credited rightly."""
+        self.index.run(
+            "INSERT INTO notes (message_id, author, created) VALUES (?, ?, ?) "
+            "ON CONFLICT (message_id) DO UPDATE SET author = excluded.author, "
+            "created = excluded.created", (message_id, author, self._clock()))
+
+    def record_sent(self, entry: dict) -> str:
+        """Write the record of a mail the gateway sent, and queue the rail's
+        word of it; returns the chat it is in. Under the mirror's lock.
+
+        A mail already on record — its Sent copy was mirrored first, or an
+        earlier try got this far — is left as it is, and the parts stored
+        for this record go. Otherwise as :meth:`_write` does it, and for the
+        same reason: the claim, the record, then the claim confirmed with
+        the event in one transaction."""
+        message_id, refs = entry["message_id"], entry.get("refs") or {}
+        known = self.index.one(
+            "SELECT chat, record FROM mails WHERE message_id = ? AND record != ''",
+            (message_id,))
+        if known is not None:
+            # Which record it is decides what goes: the one an earlier try of
+            # this very send wrote refers to these parts, and keeps them; the
+            # one read off the Sent copy has parts of its own.
+            fields = _ibstore.read_record(self._record_path(known["record"]))
+            if fields is not None:
+                kept = {fields.get("body_part"), fields.get("header_part"),
+                        *(fields.get("attachments") or [])}
+                _discard_parts({"attachments": [
+                    ref for ref in [refs.get("body_part"), refs.get("header_part"),
+                                    *(refs.get("attachments") or [])]
+                    if ref and ref not in kept]})
+            return known["chat"]
+        ts = float(entry["sent_at"])
+        subject = entry.get("subject") or ""
+        cited = list(entry.get("cited") or [])
+        resolution = self.threads.resolve(message_id, cited, ts, subject)
+        chat = resolution.chat
+        self._merges_due.update(resolution.merged)
+        name = _clean_line(MAIL_CONFIG.from_name, 200) or None
+        text = entry.get("message") or ""
+        attachments = list(refs.get("attachments") or [])
+        self.index.atomic([
+            ("INSERT OR REPLACE INTO mails (message_id, record, direction, chat, ts, sender, "
+             "sender_name, recipients, cc, removed, arrived) "
+             "VALUES (?, '', 'out', ?, ?, ?, ?, ?, ?, 0, ?)",
+             (message_id, chat, ts, ACCOUNT, name,
+              json.dumps([[a, None] for a in entry["to"]]),
+              json.dumps([[a, None] for a in entry["cc"]]), ts)),
+            ("INSERT OR REPLACE INTO claims (message_id, backfill, seen) VALUES (?, 0, 1)",
+             (message_id,)),
+            # Not called gone while its Sent copy is still to appear — and
+            # where the provider files that copy, or does not, never.
+            ("INSERT OR REPLACE INTO settling (message_id, until) SELECT ?, ? WHERE NOT EXISTS "
+             "(SELECT 1 FROM locations WHERE message_id = ?)",
+             (message_id, ts + MAIL_SENT_GRACE_SECONDS if MAIL_CONFIG.save_sent else None,
+              message_id))])
+        try:
+            _urn, path = _ibstore.write_outbound(
+                INBOUND_STORE_DIR, channel=CHANNEL, chat=chat, account=ACCOUNT, text=text,
+                author=entry["author"], message_id=message_id, timestamp=ts,
+                attachment_urls=attachments, sender=ACCOUNT, sender_name=name,
+                subject=subject or None, recipients=entry["to"], cc=entry["cc"],
+                in_reply_to=cited[-1] if cited else None, references=cited,
+                body_part=refs.get("body_part"), header_part=refs.get("header_part"),
+                trim="deterministic", arrived_at=ts)
+        except Exception:
+            try:
+                self.index.atomic([
+                    ("DELETE FROM mails WHERE message_id = ? AND record = ''", (message_id,)),
+                    ("DELETE FROM claims WHERE message_id = ?", (message_id,))])
+            except sqlite3.Error:
+                pass   # a claim with no record: the next write of this mail replaces it
+            raise
+        try:
+            if resolution.merged:
+                self._apply_merges()
+            event = self._inbound_event(
+                direction="out", chat=chat, message_id=message_id, ts=ts, sender=ACCOUNT,
+                sender_name=name, text=text, attachments=attachments, author=entry["author"],
+                subject=subject or None, backfill=False, seen=False)
+            self.index.atomic([
+                ("UPDATE mails SET record = ? WHERE message_id = ?", (path.name, message_id)),
+                ("DELETE FROM claims WHERE message_id = ?", (message_id,)),
+                self._event("inbound", event)])
+        except Exception:
+            # As in _write: the record stands and the index does not know it.
+            self._reconcile = True
+            raise
+        return chat
+
+    def sent_copy(self, message_id: str):
+        """Whether Sent holds this mail: its UID, None when the folder says
+        it does not, UNSURE when that cannot be told now."""
+        name = self._folders.get("sent")
+        return self.mailbox.find(name, message_id) if name else UNSURE
+
+    def place_sent(self, uid: int, message_id: str, validity: int | None = None) -> None:
+        """Give a mail its place in Sent — where the index's view of the
+        folder is the one the UID was read under. (Where it is not, the
+        folder's own look places the mail: it is on record.)"""
+        folder, name = self._folder("sent"), self._folders.get("sent")
+        if folder is not None and (not name or folder["name"] == name) \
+                and validity in (None, folder["uidvalidity"]):
+            self._locate("sent", uid, message_id)
+
+    def file_sent(self, message_id: str, raw: bytes, when: float, *, again: bool) -> None:
+        """Append the gateway's own mail to Sent and place it. ``again``:
+        an earlier try may have got through without its answer, so the mail
+        is looked for first — one copy, however often this is run. Raises
+        MailboxError while it cannot be done; the caller tries again."""
+        name = self._folders.get("sent") or self.mailbox.folders().get("sent")
+        if not name:
+            raise MailboxError("the mailbox has no Sent folder to keep the copy in"
+                               + (f" — set SENT_FOLDER (configured: "
+                                  f"{MAIL_CONFIG.sent_folder!r})" if MAIL_CONFIG else ""))
+        validity = uid = None
+        if again:
+            uid = self.mailbox.find(name, message_id)
+            if uid is UNSURE:
+                raise MailboxError(f"{name!r} cannot say yet whether it holds the copy")
+        if uid is None:
+            validity, uid = self.mailbox.append(name, raw, when=when)
+        if uid is None:
+            uid = self.mailbox.find(name, message_id)
+        if isinstance(uid, int):
+            self.place_sent(uid, message_id, validity)
+
+    def keep_settling(self, message_id: str) -> None:
+        """A send whose Sent copy is still owed is not called gone meanwhile."""
+        self.index.run("UPDATE settling SET until = ? WHERE message_id = ? "
+                       "AND until IS NOT NULL",
+                       (self._clock() + MAIL_SENT_GRACE_SECONDS, message_id))
+
+    def _resume_sends(self, *, mailbox: bool) -> None:
+        """Finish what sends left undone (see ``_finish_send``): a record the
+        mirror's lock was not free for, a Sent copy the mailbox would not
+        take, a send a stop interrupted. Never raises — one send's trouble
+        is logged and tried again, and does not cost the mirror its pass."""
+        if self._reconcile:
+            return     # the index is matched to the ledger first (poll)
+        for request_id in SENDS.due():
+            try:
+                _resume_send(request_id, self, mailbox=mailbox)
+            except Exception as exc:  # noqa: BLE001
+                _send_trouble(request_id, f"{type(exc).__name__}: {exc}")
+
+
+class Busy(Exception):
+    """The mirror's lock was not free in time (Mirror.exclusive)."""
+
+
+# ── Sending ───────────────────────────────────────────────────────────────────
+# POST /send takes a reply or a new mail, lets the send policy decide whether
+# it goes now or waits for the user's approval, and either way makes it an
+# entry of the pending-send store: one JSON file per send on the state volume,
+# as on the SMS gateway (whose store, statuses and endpoints these are), with
+# mail's own fields. A queued entry is what /sends lists and the chat shows as
+# pending. The same entry is the journal its sending is resumed from:
+#
+#   pending ──approve──▶ sending ──▶ approved        rejected / retracted / error
+#     (a direct send is born sending)
+#
+#   sending, no phase   The decision stands; nothing was handed to the SMTP
+#                       server. After a stop an approved entry is sent — the
+#                       approval was given — and a direct one is dropped: its
+#                       caller got no answer, and sends again if it wants to.
+#   sending, "data"     Written the moment before the message itself is handed
+#                       to the server (email_client._smtp_send, on_data). If
+#                       nothing follows it, nobody saw the server's answer,
+#                       and the mail is never sent again. It is looked for in
+#                       Sent: found, it went out. Not found — at once where the
+#                       gateway files the Sent copy itself, after
+#                       MAIL_SENT_GRACE_SECONDS where the provider does — the
+#                       send ends as an error that says its outcome is not
+#                       known.
+#   approved            The server took the mail (``sent_at``) — written the
+#                       moment it says so, before the session is closed
+#                       (on_taken). What remains
+#                       is done once each, and is found again by the mail's
+#                       Message-ID if a stop comes in between: the record with
+#                       the rail's event (``recorded``; Mirror.record_sent
+#                       writes none for a mail already on record) and the Sent
+#                       copy (``filed``; looked for before it is appended a
+#                       second time). ``done`` when both are.
+#
+# So a send is made at most once, and a mail the server took has its record:
+# the only stop that costs anything is one between "data" and the server's
+# answer, where no mark can be written in time and only the mailbox can say.
+
+def _now() -> float:
+    """The sending side's clock (one place, so a test can set it)."""
+    return time.time()
+
+
+def _atomic_json(path: Path, data) -> None:
+    """Write a store file whole or not at all — and on the disk before this
+    returns: the marks of a send are what a restart goes by."""
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=path.name + ".")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps(data, ensure_ascii=False))
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+class SendRefused(Exception):
+    """A send that will not be made as asked: the HTTP status, and one
+    sentence for whoever asked."""
+
+    def __init__(self, status: int, message: str):
+        super().__init__(message)
+        self.status = status
+
+
+_REQUEST_ID_RE = re.compile(r"[0-9a-f]{32}")
+_PENDING_SEND_RE = re.compile(r"^/pending-sends/([0-9a-f]{32})(?:/(approve|reject|retract))?$")
+# What an entry holds for the gateway alone, left out of every answer: the
+# blobs of the mail's own parts, the ids the thread index goes by.
+_ENTRY_PRIVATE = ("refs", "cited")
+# A decided entry is kept for the approval page and the thread that asked —
+# this long, then cleared away at a start.
+PENDING_KEEP_SECONDS = 30 * 86400.0
+UNKNOWN_OUTCOME = (
+    "the mail server was handed this mail and its answer was never seen: it is not "
+    "known whether the mail went out. It was not sent again, and no copy of it is "
+    "in the Sent folder — check with the recipient before sending it anew")
+_send_said: dict = {}
+
+
+def _send_trouble(request_id: str, said: str | None) -> None:
+    """Log why a send is not finished — once per reason, not once per poll."""
+    if said is None:
+        _send_said.pop(request_id, None)
+    elif _send_said.get(request_id) != said:
+        _send_said[request_id] = said
+        print(f"[mail-gateway] send {request_id} is not finished yet ({said}); "
+              f"will retry", flush=True)
+
+
+class Sends:
+    """The pending-send store: one ``<id>.json`` per send, under one lock.
+
+    Nothing is held in memory but which entries the mirror loop still has
+    work on (``due``): /pending-sends and the approval page read the files,
+    so an entry that is not on disk could never be approved, and a failed
+    write is the caller's to answer with a retryable error."""
+
+    def __init__(self, directory):
+        self._dir = Path(directory)
+        self._lock = threading.RLock()
+        self._due: set = set()
+
+    def _path(self, request_id) -> Path | None:
+        """The file of a request id, found by enumerating the directory —
+        never built from the caller's string, so it cannot leave the store."""
+        if not _REQUEST_ID_RE.fullmatch(str(request_id or "")):
+            return None
+        try:
+            for path in self._dir.iterdir():
+                if path.suffix == ".json" and path.stem == request_id and path.is_file():
+                    return path
+        except OSError:
+            pass
+        return None
+
+    @staticmethod
+    def _read(path) -> dict | None:
+        try:
+            entry = json.loads(Path(path).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        return entry if isinstance(entry, dict) else None
+
+    def get(self, request_id) -> dict | None:
+        path = self._path(request_id)
+        return self._read(path) if path else None
+
+    def entries(self) -> list:
+        """Every entry, oldest first. (Only ``<32 hex>.json`` files holding
+        an object: a stray file in the directory is no send.)"""
+        try:
+            paths = [p for p in self._dir.glob("*.json") if _REQUEST_ID_RE.fullmatch(p.stem)]
+        except OSError:
+            return []
+        found = [entry for entry in map(self._read, paths) if entry is not None]
+
+        def created(entry):
+            try:
+                return float(entry.get("created") or 0.0), str(entry.get("id"))
+            except (TypeError, ValueError):
+                return 0.0, str(entry.get("id"))
+        return sorted(found, key=created)
+
+    def waiting(self, chat: str | None = None) -> list:
+        """The sends that wait for the user's approval — of one chat."""
+        return [entry for entry in self.entries() if entry.get("status") == "pending"
+                and (chat is None or entry.get("chat") == chat)]
+
+    def _files(self, request_id) -> Path:
+        """Where a send's attachments are kept (for an id the store minted
+        or found — never a caller's string)."""
+        return self._dir / f"{request_id}.files"
+
+    def create(self, entry: dict, images: list | None = None) -> None:
+        """Add a send. Its attachments (``images``, the /send shape) go into
+        a file of their own beside the entry, written first so that no entry
+        stands without them: an entry is read at every listing, the bytes
+        only when the mail is built."""
+        with self._lock:
+            self._dir.mkdir(parents=True, exist_ok=True)
+            if images:
+                _atomic_json(self._files(entry["id"]), images)
+            _atomic_json(self._dir / f"{entry['id']}.json", entry)
+
+    def images(self, request_id) -> list:
+        """A send's attachments as they came in; none once it is over."""
+        if not _REQUEST_ID_RE.fullmatch(str(request_id or "")):
+            return []
+        try:
+            images = json.loads(self._files(request_id).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return []
+        return images if isinstance(images, list) else []
+
+    def release(self, request_id) -> None:
+        """Drop a send's attachments: nothing will build its mail again.
+        (Their names stay on the entry, or — once sent — their blobs' ids.)"""
+        if _REQUEST_ID_RE.fullmatch(str(request_id or "")):
+            with contextlib.suppress(OSError):
+                self._files(request_id).unlink(missing_ok=True)
+
+    def update(self, request_id, drop=(), **changes) -> dict | None:
+        """Change an entry on disk; returns it, or None when it is gone."""
+        with self._lock:
+            path = self._path(request_id)
+            entry = self._read(path) if path else None
+            if entry is None:
+                return None
+            entry.update(changes)
+            for key in drop:
+                entry.pop(key, None)
+            _atomic_json(path, entry)
+            return entry
+
+    def remove(self, request_id) -> None:
+        with self._lock:
+            path = self._path(request_id)
+            if path is not None:
+                path.unlink(missing_ok=True)
+            self.release(request_id)
+            self._due.discard(request_id)
+
+    def decide(self, request_id, verb: str) -> tuple:
+        """Approve, reject (the user) or retract (whoever queued it) a
+        pending send: ``(entry | None, whether this call decided it)``. An
+        entry that is no longer pending is answered as it is.
+
+        The decision is on disk before anything acts on it: a file still
+        saying "pending" could be approved a second time after the first
+        mail went out. A failed write raises (a retryable error to the
+        caller) and nothing is sent."""
+        with self._lock:
+            path = self._path(request_id)
+            entry = self._read(path) if path else None
+            if entry is None:
+                return None, False
+            if entry.get("status") != "pending":
+                return entry, False
+            entry["status"] = {"approve": "sending", "reject": "rejected",
+                               "retract": "retracted"}[verb]
+            _atomic_json(path, entry)
+            if verb != "approve":
+                self.release(request_id)
+            return entry, True
+
+    def owe(self, request_id) -> None:
+        """The mirror loop has something to finish for this send."""
+        with self._lock:
+            self._due.add(request_id)
+
+    def settled(self, request_id) -> None:
+        with self._lock:
+            self._due.discard(request_id)
+        _send_trouble(request_id, None)
+
+    def due(self) -> list:
+        with self._lock:
+            return sorted(self._due)
+
+    def recover(self) -> list:
+        """At start, what a stop left behind (see the table above). Returns
+        the ids of approved sends that were never begun — the caller's to
+        send now; entries with a mark are left to the mirror loop, a direct
+        send without one is dropped, and old decided entries are cleared."""
+        begin = []
+        for entry in self.entries():
+            request_id, status = entry.get("id"), entry.get("status")
+            if status == "sending" and not entry.get("phase"):
+                if entry.get("direct"):
+                    print(f"[mail-gateway] send {request_id} was stopped before anything "
+                          f"left; dropped (its caller was given no answer)", flush=True)
+                    self.remove(request_id)
+                else:
+                    begin.append(request_id)
+            elif status == "sending" or (status == "approved" and not entry.get("done")):
+                self.owe(request_id)
+            elif status != "pending":
+                try:
+                    old = _now() - float(entry.get("created") or 0.0) > PENDING_KEEP_SECONDS
+                except (TypeError, ValueError):
+                    old = False
+                if old:
+                    self.remove(request_id)
+        # Attachments whose entry never came to stand (a stop between the two
+        # files of one create) belong to no send.
+        with contextlib.suppress(OSError):
+            for path in self._dir.glob("*.files"):
+                if not path.with_suffix(".json").exists():
+                    path.unlink(missing_ok=True)
+        return begin
+
+    def purge(self, chat: str) -> int:
+        """Delete a chat's entries (its erasure); how many. Not one that is
+        being sent right now: its outcome is still to be written."""
+        with self._lock:
+            removed = _ibstore.purge_pending_sends(
+                self._dir, lambda entry: entry.get("chat") == chat)
+            for request_id in removed:
+                self.release(request_id)
+            self._due.difference_update(removed)
+            return len(removed)
+
+    def rekey(self, old: str, into: str) -> None:
+        """A merge: what waited in the absorbed chat waits in the survivor."""
+        for entry in self.entries():
+            if entry.get("chat") == old:
+                try:
+                    self.update(entry.get("id"), chat=into)
+                except OSError as exc:
+                    print(f"[mail-gateway] could not re-key pending send "
+                          f"{entry.get('id')}: {exc}", flush=True)
+
+
+SENDS = Sends(MAIL_PENDING_SENDS_DIR)
+_reply_tokens = None
+
+
+def reply_tokens() -> ReplyTokenStore:
+    """The store that signs and reads reply tokens (scripts/reply_tokens.py):
+    a token names a thread of this mailbox without the agent typing its key.
+    Made on first use — its key file belongs on the state volume of a
+    gateway that runs, not of one that idles unconfigured."""
+    global _reply_tokens
+    if _reply_tokens is None:
+        _reply_tokens = ReplyTokenStore(MAIL_STATE_DIR / "reply-tokens")
+    return _reply_tokens
+
+
+def _public(entry: dict) -> dict:
+    """An entry as the API answers it."""
+    return {key: value for key, value in entry.items() if key not in _ENTRY_PRIVATE}
+
+
+def _approval_slug(host_header) -> str:
+    """The /sends/<slug>/… segment for approval links this gateway emits."""
+    if SEND_APPROVAL_SLUG:
+        return SEND_APPROVAL_SLUG
+    host = (host_header or "").split(":", 1)[0].strip().strip("/")
+    return host or "mail-gateway"
+
+
+def _send_category() -> str:
+    """The send-control category of THIS mailbox's address, by
+    EMAIL_SEND_POLICY as email_client reads it. The recipient is never
+    consulted, and a policy that cannot be read is the strictest one."""
+    try:
+        return _ec.resolve_category(MAIL_CONFIG.user)
+    except Exception as exc:  # noqa: BLE001 - EmailError on a policy that does not parse
+        print(f"[mail-gateway] EMAIL_SEND_POLICY cannot be read ({exc}); every send "
+              f"queues for approval", flush=True)
+        return DEFAULT_SEND_CATEGORY
+
+
+def _send_is_direct(category: str, user_approved: bool) -> bool:
+    """Only the policy decides; no caller-supplied field goes around it (see
+    telegram-gateway.py for why ``author`` is not one)."""
+    return category == "allow" or (category == "trust" and user_approved)
+
+
+# -- what a caller may ask to be sent ------------------------------------------
+# The caller is an agent, or the web gateway passing on what a person typed;
+# either way a request's fields end up in header lines and in the envelope,
+# so each is reduced to the shape its field has before it is used: an address
+# is one address, a subject one line. What does not have the shape is refused
+# — nothing is repaired into something its sender did not write.
+
+_NAMED_ADDRESS_RE = re.compile(r"[^<>]*<([^<>\s]*)>")
+_TEXT_CONTROL_RE = re.compile("[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+_FROM_LINE_RE = re.compile(r"^From ", re.MULTILINE)
+_CITABLE_ID_RE = re.compile(r"[\x21-\x3b\x3d\x3f-\x7e]{1,%d}" % MAX_ID_CHARS)
+_MEDIA_TYPE_RE = re.compile(r"[a-z0-9][a-z0-9!#$&^_.+-]{0,126}/[a-z0-9][a-z0-9!#$&^_.+-]{0,126}")
+
+
+def _sendable(address) -> bool:
+    """Whether a mail can be addressed to this: one address, in ASCII (the
+    SMTP submission here asks for no SMTPUTF8)."""
+    return (isinstance(address, str) and len(address) <= 254 and address.isascii()
+            and bool(_ADDRESS_RE.fullmatch(address)))
+
+
+def _citable(message_id) -> bool:
+    """Whether an id can stand in In-Reply-To or References: one a server
+    ever saw (:func:`_searchable`), in printable ASCII, no bracket in it."""
+    return (isinstance(message_id, str) and _searchable(message_id)
+            and bool(_CITABLE_ID_RE.fullmatch(message_id)))
+
+
+def _send_address(value) -> str:
+    """One recipient as a caller names it — ``a@x.org`` or ``Name <a@x.org>``
+    — as the bare address it is sent to. ValueError for anything else.
+
+    The display name is not used: what goes into To and Cc is the address,
+    which is also what the approval page shows, so no name can make a header
+    read as going somewhere it does not. One entry is one address — a comma,
+    a second pair of brackets, a line break in it make it none."""
+    if not isinstance(value, str):
+        raise ValueError("an address must be a string")
+    shown = _clean_line(value, 80)
+    text = value.strip()
+    if _UNSAFE_LINE_RE.search(text):
+        raise ValueError(f"not an address: {shown!r}")
+    named = _NAMED_ADDRESS_RE.fullmatch(text)
+    address = (named.group(1) if named else text).strip().lower()
+    if not _sendable(address):
+        raise ValueError(f"not an address: {shown!r}")
+    return address
+
+
+def _send_addresses(value, field: str) -> list:
+    """A request's ``to`` or ``cc``: a list of addresses (one string is a
+    list of one), each once."""
+    if value is None or value == "":
+        return []
+    if isinstance(value, str):
+        value = [value]
+    if not isinstance(value, list):
+        raise ValueError(f"'{field}' must be a list of addresses")
+    if len(value) > MAX_SEND_RECIPIENTS:
+        raise ValueError(f"too many addresses in '{field}' (at most {MAX_SEND_RECIPIENTS})")
+    return list(dict.fromkeys(_send_address(item) for item in value))
+
+
+def _send_text(value) -> str:
+    """A request's text as a mail's body: its line ends made one kind, no
+    other control character, nothing that is not text."""
+    text = _scrub(value).replace("\r\n", "\n").replace("\r", "\n")
+    return _TEXT_CONTROL_RE.sub("", text).strip()
+
+
+def _send_files(images) -> list:
+    """A request's attachments (``images``: the other gateways' /send shape —
+    the key is historical, a file of any type) as ``[(bytes, content type,
+    file name)]``. ValueError for a malformed one."""
+    if not images:
+        return []
+    if not isinstance(images, list):
+        raise ValueError("'images' must be a list")
+    if len(images) > MAX_SEND_ATTACHMENTS:
+        raise ValueError(f"at most {MAX_SEND_ATTACHMENTS} attachments per mail")
+    files = []
+    for image in images:
+        # The shared reader of that shape: it decodes, names and types the
+        # file as every gateway does. Only its bytes are wanted here.
+        path, content_type, _name = _ibstore.materialize_outbound(image)
+        try:
+            data = path.read_bytes()
+        finally:
+            _ibstore.discard_outbound(path)
+        # A type the mail can carry as a leaf; a container type would have
+        # the MIME writer parse the bytes as parts of the mail.
+        if not _MEDIA_TYPE_RE.fullmatch(content_type) \
+                or content_type.startswith(("multipart/", "message/")):
+            content_type = "application/octet-stream"
+        files.append((data, content_type, _clean_line(path.name, 200) or "attachment"))
+    return files
+
+
+def _mint_message_id() -> str:
+    """A new mail's Message-ID, without brackets — minted when a send is
+    accepted, before it is queued, so the chat it starts is known at once."""
+    domain = ACCOUNT.rpartition("@")[2]
+    if not re.fullmatch(r"[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?", domain):
+        domain = "mail-gateway.invalid"
+    return _threads.normalize_id(email.utils.make_msgid(domain=domain))
+
+
+def _recipient_line(to: list, cc: list, names: dict) -> str:
+    """Whom a send goes to, as one line for a list: the first recipient —
+    by name where the thread knows one — and how many more."""
+    first = to[0]
+    more = len(to) + len(cc) - 1
+    return ((f"{names[first]} <{first}>" if names.get(first) else first)
+            + (f", +{more}" if more else ""))
+
+
+def _compose(payload: dict, mirror) -> tuple:
+    """Read one /send body into ``(the entry's mail fields, its files)``.
+    :class:`SendRefused` for anything that is not a send this gateway makes."""
+    def refuse(message, status=400):
+        return SendRefused(status, message)
+
+    author = str(payload.get("author") or "agent").strip().lower()
+    if author not in _NOTE_AUTHORS:
+        raise refuse("'author' must be one of " + "|".join(_NOTE_AUTHORS))
+    account = str(payload.get("account") or "").strip().lower()
+    if account and account != ACCOUNT:
+        raise refuse("not this gateway's account", 404)
+    message = payload.get("message") if payload.get("message") is not None \
+        else payload.get("text")
+    subject = payload.get("subject")
+    if not isinstance(message, (str, type(None))) or not isinstance(subject, (str, type(None))):
+        raise refuse("'message' and 'subject' must be text")
+    text = _send_text(message or "")
+    if len(text) > MAX_SEND_TEXT_CHARS:
+        raise refuse(f"the text is too long for one mail (at most {MAX_SEND_TEXT_CHARS} "
+                     f"characters)")
+    try:
+        files = _send_files(payload.get("images"))
+    except ValueError as exc:
+        raise refuse(str(exc)) from exc
+    if not text and not files:
+        raise refuse("an e-mail needs a text or an attachment")
+    if payload.get("bcc"):
+        raise refuse("blind copies are not supported: every recipient is in 'to' or 'cc'")
+    chat = str(payload.get("recipient") or "").strip()
+    token = str(payload.get("reply_to") or "").strip()
+    if token:
+        chat = reply_tokens().resolve(token) or ""
+        if not chat:
+            raise refuse("unknown or invalid reply_to token; name the thread by its "
+                         "chat key instead")
+    mode = payload.get("reply")
+    if chat:
+        if payload.get("to") or payload.get("cc") or subject:
+            raise refuse("a reply's recipients and subject are the thread's own — the "
+                         "gateway builds them from the mail it answers; leave 'to', "
+                         "'cc' and 'subject' out, or leave 'recipient' out for a new mail")
+        if mode not in (None, "all", "sender"):
+            raise refuse("'reply' must be \"all\" or \"sender\"")
+        draft = mirror.reply_draft(chat, mode or "all")
+    else:
+        if mode is not None:
+            raise refuse("'reply' answers a thread: name it in 'recipient' (its chat key)")
+        try:
+            to = _send_addresses(payload.get("to"), "to")
+            cc = [a for a in _send_addresses(payload.get("cc"), "cc") if a not in to]
+        except ValueError as exc:
+            raise refuse(str(exc)) from exc
+        if not to:
+            raise refuse("no recipients: a new mail needs an address in 'to' (a reply "
+                         "names its thread in 'recipient')")
+        if len(to) + len(cc) > MAX_SEND_RECIPIENTS:
+            raise refuse(f"too many recipients (at most {MAX_SEND_RECIPIENTS})")
+        draft = {"chat": None, "to": to, "cc": cc, "in_reply_to": None, "references": [],
+                 "cited": [], "names": {},
+                 "subject": _clean_line(_scrub(subject or ""), MAX_SUBJECT_CHARS)}
+    message_id = _mint_message_id()
+    names = draft.pop("names")
+    return {
+        **draft,
+        # A new mail starts the chat its own id names.
+        "chat": draft["chat"] or message_id,
+        "message_id": message_id,
+        "message": text,
+        "author": author,
+        "reply": (mode or "all") if chat else None,
+        "from": ACCOUNT,
+        "recipient": _recipient_line(draft["to"], draft["cc"], names),
+        # Until the mail is sent: the files' names, for whoever approves it —
+        # and how many there are, so a mail is never built with fewer.
+        "attachments": [name for _data, _type, name in files],
+        "files": len(files),
+    }, files
+
+
+class _OutgoingPolicy(email.policy.EmailPolicy):
+    """The standard policy, with In-Reply-To and References folded as what
+    they are: ids, one after another, never broken and never rewritten.
+
+    The standard folding takes them for free text, and a text that will not
+    fit a line is wrapped by encoding it — so an id longer than a line (the
+    ids of the large providers are) leaves as an RFC 2047 encoded word, which
+    no mail client reads as an id, and the reply falls out of its thread."""
+
+    def _ids(self, name: str, value) -> str | None:
+        if name.lower() not in ("in-reply-to", "references"):
+            return None
+        lines = [f"{name}:"]
+        for message_id in str(value).split():
+            if len(lines[-1]) + 1 + len(message_id) > self.max_line_length \
+                    and lines[-1] != f"{name}:":
+                lines.append("")
+            lines[-1] += " " + message_id
+        return self.linesep.join(lines) + self.linesep
+
+    def fold(self, name, value):
+        return self._ids(name, value) or super().fold(name, value)
+
+    def fold_binary(self, name, value):
+        folded = self._ids(name, value)
+        return folded.encode("ascii") if folded else super().fold_binary(name, value)
+
+
+_OUTGOING = _OutgoingPolicy()
+
+
+def _build_outgoing(entry: dict, when: float, files: list | None = None) -> tuple:
+    """The mail an entry describes, as ``(message, its bytes)`` — built with
+    email_client's own message builder, dated ``when``. The same mail
+    whenever it is built (but for the MIME boundaries), which is what lets
+    the Sent copy be made after a stop.
+
+    Every header value was reduced to its field's shape where it came in
+    (_compose, Mirror.reply_draft), and the builder refuses a line break in
+    one on top of that. The envelope is ``to`` + ``cc`` as they stand in the
+    entry, never anything read back out of a header."""
+    if files is None:
+        files = _stored_files(entry)
+    text = entry.get("message") or ""
+    msg = _ec._build_message(
+        MAIL_CONFIG, entry["to"], entry.get("subject") or "", text,
+        cc=entry.get("cc") or None,
+        in_reply_to=f"<{entry['in_reply_to']}>" if entry.get("in_reply_to") else None,
+        references=" ".join(f"<{i}>" for i in entry.get("references") or []) or None,
+        message_id=f"<{entry['message_id']}>")
+    msg.policy = _OUTGOING
+    if _FROM_LINE_RE.search(text):
+        # smtplib writes a mail out the way a mailbox file is written, with a
+        # ">" put before every line of the text that begins "From " — so the
+        # recipient would read what the author did not write. Encoded, the
+        # text has no such line, and arrives as it was typed.
+        msg.set_content(text, cte="base64")
+    msg["Date"] = email.utils.format_datetime(datetime.fromtimestamp(when, timezone.utc))
+    for data, content_type, name in files:
+        maintype, _slash, subtype = content_type.partition("/")
+        msg.add_attachment(data, maintype=maintype, subtype=subtype, filename=name)
+    return msg, msg.as_bytes(policy=_OUTGOING.clone(linesep="\r\n"))
+
+
+def _stored_files(entry: dict) -> list:
+    """A stored send's attachments, read back for building its mail — all of
+    them, or the send fails: a mail must not leave without a file that the
+    one who approved it was shown."""
+    files = _send_files(SENDS.images(entry.get("id")))
+    if len(files) != int(entry.get("files") or 0):
+        raise RuntimeError("the attachments of this send are no longer in the store")
+    return files
+
+
+def _store_sent_parts(entry: dict, raw: bytes, files: list, stored: list) -> dict:
+    """Store what the record of a sent mail refers to — its text, its header
+    block, its attachments — as blobs; ``{body_part, header_part,
+    attachments}``. Each id is appended to ``stored`` as it is written, for
+    the caller to undo if the mail does not go."""
+    def keep(data: bytes, content_type: str, file_name=None) -> str:
+        media_id = _ibstore.store_media(INBOUND_STORE_DIR, data, content_type,
+                                        file_name=file_name)
+        stored.append(media_id)
+        return _MEDIA_REF + media_id
+
+    head = _head_and_rest(raw)[0].decode("utf-8", errors="replace").replace("\r\n", "\n")
+    return {
+        "body_part": keep((entry.get("message") or "").encode("utf-8", "replace"),
+                          "text/plain; charset=utf-8"),
+        "header_part": keep(head.encode("utf-8", "replace"), "text/plain; charset=utf-8"),
+        "attachments": [keep(data, content_type, name) for data, content_type, name in files],
+    }
+
+
+def _discard_parts(refs: dict | None) -> None:
+    for ref in [(refs or {}).get("body_part"), (refs or {}).get("header_part"),
+                *((refs or {}).get("attachments") or [])]:
+        media_id = _ibstore.media_id_of(ref or "")
+        if media_id:
+            _ibstore.discard_media(INBOUND_STORE_DIR, media_id)
+
+
+def _smtp_refusal(exc: BaseException) -> bool:
+    """Whether what a send raised is the SMTP server's own no — an answer,
+    after which the mail is known not to have been taken. (email_client
+    wraps smtplib's error; the one it wraps is the context.)"""
+    cause = exc.__context__ if isinstance(exc, _ec.EmailError) else exc
+    return isinstance(cause, (smtplib.SMTPResponseException, smtplib.SMTPRecipientsRefused,
+                              smtplib.SMTPNotSupportedError))
+
+
+def _accept_send(payload: dict, host_header) -> tuple:
+    """POST /send: ``(HTTP status, answer)``."""
+    mirror = MIRROR
+    if mirror is None or MAIL_CONFIG is None:
+        return 503, {"error": "the mail gateway is not configured"}
+    if SMTP_PROBLEM is not None:
+        return 503, {"error": SMTP_PROBLEM}
+    try:
+        entry, files = _compose(payload, mirror)
+        # Built once now: no approval is asked for a mail that could only
+        # fail to be written.
+        _build_outgoing(entry, _now(), files)
+    except SendRefused as exc:
+        return exc.status, {"error": str(exc)}
+    except (ValueError, LookupError, TypeError) as exc:
+        return 400, {"error": f"this mail cannot be written: {_clean_line(exc, 200)}"}
+    category = _send_category()
+    direct = _send_is_direct(category, payload.get("user_approved") is True)
+    entry.update(id=uuid.uuid4().hex, category=category, created=_now(),
+                 thread=_origin.valid_thread(payload.get("thread")),
+                 status="sending" if direct else "pending", direct=direct)
+    try:
+        SENDS.create(entry, payload.get("images") or [])
+    except OSError as exc:
+        print(f"[mail-gateway] could not persist a send: {exc}", flush=True)
+        return 503, {"error": "could not queue the send; retry later"}
+    if not direct:
+        path = f"/sends/{_approval_slug(host_header)}/{entry['id']}"
+        print(f"[mail-gateway] pending send registered for chat {entry['chat']!r} "
+              f"(category={category}, id={entry['id']})", flush=True)
+        return 202, {
+            "status": "pending_approval", "request_id": entry["id"],
+            "approval_url": SEND_APPROVAL_BASE_URL + path if SEND_APPROVAL_BASE_URL else path,
+            "message_id": entry["message_id"], "chat": entry["chat"],
+            "note": "This e-mail requires web-gateway approval. "
+                    "Visit the approval URL to allow or deny."}
+    final = _execute_send(entry["id"]) or {}
+    if final.get("status") == "approved":
+        answer = {"status": "sent", "message_id": final["message_id"], "chat": final["chat"],
+                  "ts": final["sent_at"], "attachments": final.get("attachments") or []}
+        if final.get("refused"):
+            # The mail went to the others; these the server would not take.
+            answer["refused"] = final["refused"]
+        return 200, answer
+    if final.get("status") == "sending":
+        # Handed over, the server's answer not seen, and Sent cannot say yet.
+        return 502, {"error": "the mail server did not confirm this mail; it is not known "
+                              "yet whether it went out. It is not sent again, and shows "
+                              "in the thread if it did.",
+                     "unconfirmed": True, "message_id": entry["message_id"],
+                     "chat": entry["chat"]}
+    return 502, {"error": f"send failed: {final.get('error') or 'the send was lost'}"}
+
+
+def _decide_send(request_id: str, verb: str) -> dict | None:
+    """POST /pending-sends/<id>/approve|reject|retract. An approval is
+    carried out off the approving request (a slow SMTP server must not hold
+    it open); the entry is answered as "sending" and says the rest later."""
+    entry, decided = SENDS.decide(request_id, verb)
+    if entry is None:
+        return None
+    if decided and verb == "approve":
+        _in_background(_execute_send, request_id)
+    elif decided:
+        print(f"[mail-gateway] pending send {request_id} {entry['status']}", flush=True)
+    return entry
+
+
+def _execute_send(request_id: str) -> dict | None:
+    """Carry out one send whose decision stands and of which nothing has
+    left yet; returns the entry as it ends (for a direct send, which keeps
+    no entry once it is over, as it would have read). Never raises."""
+    entry = SENDS.get(request_id)
+    if entry is None or entry.get("status") != "sending" or entry.get("phase"):
+        return entry
+    mirror, stored, handed, taken = MIRROR, [], [], {}
+    refused: dict = {}
+    try:
+        if mirror is None or MAIL_CONFIG is None:
+            raise RuntimeError("the mail gateway is not configured")
+        if SMTP_PROBLEM is not None:
+            raise RuntimeError(SMTP_PROBLEM)
+        when = _now()
+        files = _stored_files(entry)
+        msg, raw = _build_outgoing(entry, when, files)
+        refs = _store_sent_parts(entry, raw, files, stored)
+        # Who wrote it, before it can turn up in Sent.
+        mirror.expect_sent(entry["message_id"], entry["author"])
+
+        def on_data():
+            # The mark of "handed over", on disk before any of the message
+            # is (a failure to write it aborts the send: nothing has left).
+            SENDS.update(request_id, phase="data", date=when, refs=refs)
+            handed.append(True)
+
+        def on_taken():
+            # The mark of "sent", the moment the server says so — before the
+            # session is even closed: what lies between its answer and this
+            # is the one stretch a stop cannot be told from.
+            taken.update(status="approved", phase="sent", sent_at=_now(),
+                         attachments=refs["attachments"])
+            try:
+                SENDS.update(request_id, **taken)
+            except OSError as exc:
+                # The mail is out and the mark is not: the send is finished
+                # from memory. (A stop now leaves "data", and the mailbox
+                # is asked.)
+                print(f"[mail-gateway] send {request_id}: could not note that the mail "
+                      f"was sent ({exc}); finishing regardless", flush=True)
+
+        refused = _ec._smtp_send(MAIL_CONFIG, msg, entry["to"] + entry["cc"],
+                                 on_data=on_data, on_taken=on_taken) or {}
+    except Exception as exc:  # noqa: BLE001 - every failure ends the send, as what it is
+        said = _clean_line(exc, 500) or type(exc).__name__
+        if taken:
+            # After the server took the mail (closing the session failed):
+            # nothing that follows makes it unsent.
+            print(f"[mail-gateway] send {request_id}: sent; the SMTP session then "
+                  f"failed ({said})", flush=True)
+        elif handed and not _smtp_refusal(exc):
+            print(f"[mail-gateway] send {request_id}: the SMTP server was handed the mail "
+                  f"and did not answer ({said}); not sent again — looking for it in Sent",
+                  flush=True)
+            return _settle_unknown({**entry, "phase": "data", "date": when, "refs": refs},
+                                   mirror)
+        else:
+            print(f"[mail-gateway] send {request_id} failed: {said}", flush=True)
+            for media_id in stored:
+                _ibstore.discard_media(INBOUND_STORE_DIR, media_id)
+            return _fail_send(entry, said)
+    if not taken:
+        # (A server answer the hook did not see as 250 and smtplib took for
+        # success cannot happen; a send helper without the hook can.)
+        taken.update(status="approved", phase="sent", sent_at=_now(),
+                     attachments=refs["attachments"])
+    entry = {**entry, "date": when, "refs": refs, **taken}
+    if refused:
+        entry["refused"] = sorted(refused)
+    try:
+        entry = SENDS.update(request_id, **taken, refused=sorted(refused)) or entry
+    except OSError as exc:
+        print(f"[mail-gateway] send {request_id}: its entry could not be written "
+              f"({exc}); finishing regardless", flush=True)
+    print(f"[mail-gateway] send {request_id} sent to {entry['recipient']} "
+          f"(chat {entry['chat']!r}, author={entry['author']})", flush=True)
+    return _finish_send(entry, mirror, raw=raw)
+
+
+def _fail_send(entry: dict, said: str) -> dict:
+    """End a send that did not go: a queued one as "error", with the reason
+    for the approval page and the thread that asked; a direct one is simply
+    over — its caller has the answer."""
+    request_id = entry["id"]
+    ended = {**entry, "status": "error", "error": said}
+    try:
+        if entry.get("direct"):
+            SENDS.remove(request_id)
+        else:
+            ended = SENDS.update(request_id, drop=("refs", "phase", "date"),
+                                 status="error", error=said) or ended
+            SENDS.release(request_id)
+    except OSError as exc:
+        print(f"[mail-gateway] could not note the outcome of send {request_id}: {exc}",
+              flush=True)
+    SENDS.settled(request_id)
+    return ended
+
+
+def _settle_unknown(entry: dict, mirror) -> dict:
+    """A send that was handed to the SMTP server and whose answer nobody
+    saw: ask the mailbox. The mail is in Sent — it went out, and the send is
+    finished as any other. It is not, and would be by now — the send ends as
+    an error that says its outcome is not known. Sent cannot say yet — the
+    entry waits for the mirror loop's next look."""
+    request_id, message_id = entry["id"], entry["message_id"]
+    try:
+        found = mirror.sent_copy(message_id)
+    except MailboxError:
+        found = UNSURE
+    if found is not UNSURE and found is not None:
+        mirror.place_sent(found, message_id)
+        changes = dict(status="approved", phase="sent", sent_at=entry["date"], filed=True,
+                       attachments=(entry.get("refs") or {}).get("attachments") or [])
+        print(f"[mail-gateway] send {request_id}: the mail is in Sent — it went out",
+              flush=True)
+        return _finish_send(SENDS.update(request_id, **changes) or {**entry, **changes}, mirror)
+    waited = _now() - float(entry.get("date") or 0.0) > MAIL_SENT_GRACE_SECONDS
+    # (After the grace, a mailbox that still cannot say has said as much as
+    # one that says no: nobody will ever know.)
+    if waited or (found is None and MAIL_CONFIG.save_sent):
+        print(f"[mail-gateway] send {request_id}: {UNKNOWN_OUTCOME}", flush=True)
+        _discard_parts(entry.get("refs"))
+        return _fail_send(entry, UNKNOWN_OUTCOME)
+    SENDS.owe(request_id)
+    return entry
+
+
+def _finish_send(entry: dict, mirror, *, raw: bytes | None = None,
+                 mailbox: bool = True, wake: bool = True) -> dict:
+    """What follows the SMTP server's acceptance, each step once: the record
+    with the rail's event, then the copy in Sent. Returns the entry as it
+    stands; never raises.
+
+    A step that cannot be done now is left to the mirror loop, which comes
+    here again (``Sends.owe``): the record while a pass over the mailbox
+    holds the mirror's lock, the Sent copy while the mailbox will not take
+    it. ``mailbox`` false does only what needs none; ``wake`` false is the
+    loop itself calling, which needs no telling."""
+    request_id, message_id = entry["id"], entry["message_id"]
+    changes: dict = {}
+    trouble = None
+    if not entry.get("recorded"):
+        if mirror._lock.acquire(timeout=RECORD_LOCK_SECONDS):
+            try:
+                if mirror._reconcile:
+                    trouble = "the mailbox index is being matched to the ledger"
+                else:
+                    changes.update(recorded=True, chat=mirror.record_sent(entry))
+            except Exception as exc:  # noqa: BLE001 - tried again by the loop
+                trouble = f"its record could not be written: {type(exc).__name__}: {exc}"
+            finally:
+                mirror._lock.release()
+        else:
+            trouble = "the mirror is busy"
+    if not entry.get("filed"):
+        if not MAIL_CONFIG.save_sent:
+            changes["filed"] = True     # the provider files the copy itself
+        elif mailbox:
+            try:
+                again = bool(entry.get("filing"))
+                if not again:
+                    SENDS.update(request_id, filing=True)
+                if raw is None:
+                    raw = _build_outgoing(entry, float(entry["date"]))[1]
+                mirror.file_sent(message_id, raw, float(entry["sent_at"]), again=again)
+                changes["filed"] = True
+            except Exception as exc:  # noqa: BLE001 - tried again by the loop
+                trouble = f"its Sent copy could not be filed: {type(exc).__name__}: {exc}"
+                mirror.keep_settling(message_id)
+    entry = {**entry, **changes}
+    done = bool(entry.get("recorded") and entry.get("filed"))
+    try:
+        if done and entry.get("direct"):
+            SENDS.remove(request_id)
+        elif done:
+            entry = SENDS.update(request_id, drop=_ENTRY_PRIVATE, done=True, **changes) or entry
+            SENDS.release(request_id)
+        elif changes:
+            SENDS.update(request_id, **changes)
+    except OSError as exc:
+        done, trouble = False, f"its entry could not be written: {exc}"
+    if done:
+        SENDS.settled(request_id)
+    else:
+        SENDS.owe(request_id)
+        _send_trouble(request_id, trouble)
+    if wake:
+        _wake()      # the rail is told by the mirror loop, off this request
+    return entry
+
+
+def _resume_send(request_id: str, mirror, *, mailbox: bool) -> None:
+    """One entry the mirror loop has work on (Mirror._resume_sends)."""
+    entry = SENDS.get(request_id)
+    status = (entry or {}).get("status")
+    if status == "approved" and not entry.get("done"):
+        _finish_send(entry, mirror, mailbox=mailbox, wake=False)
+    elif status == "sending" and entry.get("phase") == "data":
+        if mailbox:
+            _settle_unknown(entry, mirror)
+    else:
+        SENDS.settled(request_id)
+
+
+def _recover_sends() -> None:
+    """At start: carry out the approved sends a stop left unbegun, and leave
+    the rest of what it left to the mirror loop (Sends.recover)."""
+    for request_id in SENDS.recover():
+        print(f"[mail-gateway] send {request_id} was approved and not begun before "
+              f"the last stop; sending it now", flush=True)
+        _in_background(_execute_send, request_id)
+
+
+def _in_background(send, request_id: str) -> None:
+    """Carry a send out off the request (or the start) that set it going."""
+    threading.Thread(target=send, args=(request_id,), name=f"send-{request_id[:8]}",
+                     daemon=True).start()
+
+
+_WAKE = threading.Event()
+
+
+def _wake() -> None:
+    """Have the mirror loop do, now, what needs no mailbox (_between_polls)."""
+    _WAKE.set()
 
 
 # ── The mirror loop ───────────────────────────────────────────────────────────
@@ -3261,22 +5095,46 @@ def _loop_step(mirror: Mirror, loop: dict) -> float:
     return float(MAIL_POLL_SECONDS)
 
 
+def _between_polls(mirror: Mirror) -> None:
+    """What a send leaves for the mirror loop that cannot wait for the next
+    poll and needs no mailbox: a record its request could not write (the
+    mirror's lock was held), and the rail's word of a mail just sent. Never
+    raises."""
+    try:
+        with mirror._lock:
+            mirror._resume_sends(mailbox=False)
+            mirror._flush_rail()
+    except Exception as exc:  # noqa: BLE001 - the next poll does the same
+        print(f"[mail-gateway] could not finish a send between polls: {exc}", flush=True)
+
+
 def _mirror_loop(mirror: Mirror) -> None:
     loop: dict = {}
     while True:
-        time.sleep(_loop_step(mirror, loop))
+        # The pause between two turns is the mailbox's rhythm, and a send
+        # does not shorten it (a refused login retried at every send is how
+        # a mailbox gets locked): a wake does its own small work and waits on.
+        until = time.monotonic() + _loop_step(mirror, loop)
+        while _WAKE.wait(max(0.0, until - time.monotonic())):
+            _WAKE.clear()
+            _between_polls(mirror)
 
 
 # ── HTTP API ──────────────────────────────────────────────────────────────────
 
-READ_ONLY_ERROR = {"error": "the mail mirror is read-only"}
-# Present so a caller gets a reason, not a 404: each is a later phase's.
-_READ_ONLY_POSTS = ("/send", "/chats/delete", "/chats/read", "/chats/archive")
+# Who may be named as a mail's author, by a send or by a note: whoever wrote
+# it. ("device" is the mirror's own word for a mail some client sent.)
 _NOTE_AUTHORS = ("agent", "user")
+_CHAT_ACTIONS = ("/chats/read", "/chats/archive", "/chats/delete")
+_NOT_OURS = {"error": "not this gateway's account"}
 
 
-def _is_pending_sends(path: str) -> bool:
-    return path == "/pending-sends" or path.startswith("/pending-sends/")
+def _same_secret(given: str, expected: str) -> bool:
+    """Compared as bytes: compare_digest refuses text that is not ASCII, and
+    a header is whatever bytes the peer sent (read here as Latin-1) — a
+    secret with one such byte is a wrong secret, not a dropped connection."""
+    return bool(given) and hmac.compare_digest(
+        given.encode("latin-1", "replace"), expected.encode("utf-8", "surrogateescape"))
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -3307,11 +5165,7 @@ class _Handler(BaseHTTPRequestHandler):
             return False   # fail closed: no token set is not "open" (TOKEN_PROBLEM)
         auth = self.headers.get("Authorization", "")
         token = auth[len("Bearer "):].strip() if auth.startswith("Bearer ") else ""
-        # Compared as bytes: compare_digest refuses text that is not ASCII, and
-        # a header is whatever bytes the peer sent (read here as Latin-1) — a
-        # token with one such byte is a wrong token, not a dropped connection.
-        return bool(token) and hmac.compare_digest(
-            token.encode("latin-1", "replace"), GATEWAY_TOKEN.encode("utf-8", "surrogateescape"))
+        return _same_secret(token, GATEWAY_TOKEN)
 
     def _read_body(self, limit: int) -> bytes | None:
         try:
@@ -3321,6 +5175,20 @@ class _Handler(BaseHTTPRequestHandler):
         if length <= 0 or length > limit:
             return None
         return self.rfile.read(length)
+
+    def _read_object(self, limit: int = MAX_BODY_BYTES) -> dict | None:
+        """The request's body as a JSON object; None once a 400 has said why
+        it is none."""
+        raw = self._read_body(limit)
+        try:
+            body = json.loads(raw.decode("utf-8")) if raw else None
+        except (ValueError, UnicodeDecodeError):
+            body = None
+        if not isinstance(body, dict):
+            self._reply(400, {"error": "body must be a JSON object" if raw
+                              else "empty or oversized body"})
+            return None
+        return body
 
     def do_GET(self):
         path = self.path.split("?", 1)[0].rstrip("/")
@@ -3340,8 +5208,18 @@ class _Handler(BaseHTTPRequestHandler):
             else:
                 self._reply_raw(200, got[0], got[1])
             return
-        if _is_pending_sends(path):
-            self._reply(501, READ_ONLY_ERROR)
+        if path == "/pending-sends":
+            # What waits for approval — of one chat, with ?chat=<key>.
+            chat = (parse_qs(urlsplit(self.path).query).get("chat") or [None])[0]
+            self._reply(200, {"pending": [_public(entry) for entry in SENDS.waiting(chat)]})
+            return
+        pending = _PENDING_SEND_RE.match(path)
+        if pending and not pending.group(2):
+            entry = SENDS.get(pending.group(1))
+            if entry is None:
+                self._reply(404, {"error": "not found"})
+            else:
+                self._reply(200, _public(entry))
             return
         if path == "/recent-chats":
             self._reply(200, {"recent_chats": MIRROR.recent_chats() if MIRROR else []})
@@ -3361,19 +5239,93 @@ class _Handler(BaseHTTPRequestHandler):
         if not self._authorized():
             self._reply(401, {"error": "unauthorized"})
             return
-        if path in _READ_ONLY_POSTS or _is_pending_sends(path):
-            self._reply(501, READ_ONLY_ERROR)
-            return
-        if path != "/outbound-note":
+        decision = _PENDING_SEND_RE.match(path)
+        if decision and decision.group(2):
+            self._decide(decision.group(1), decision.group(2))
+        elif path in _CHAT_ACTIONS:
+            self._chat_action(path.rsplit("/", 1)[1])
+        elif path == "/send":
+            self._send()
+        elif path == "/outbound-note":
+            self._outbound_note()
+        else:
             self._reply(404, {"error": "not found"})
-            return
-        raw = self._read_body(MAX_BODY_BYTES)
+
+    def _decide(self, request_id: str, verb: str) -> None:
         try:
-            body = json.loads(raw.decode("utf-8")) if raw else None
-        except (ValueError, UnicodeDecodeError):
-            body = None
-        if not isinstance(body, dict):
-            self._reply(400, {"error": "body must be a JSON object"})
+            entry = _decide_send(request_id, verb)
+        except OSError as exc:
+            print(f"[mail-gateway] could not record the approval decision: {exc}", flush=True)
+            self._reply(503, {"error": "could not record the decision; retry later"})
+            return
+        if entry is None:
+            self._reply(404, {"error": "pending send not found"})
+        else:
+            self._reply(200, _public(entry))
+
+    def _send(self) -> None:
+        payload = self._read_object(MAX_SEND_BODY_BYTES)
+        if payload is None:
+            return
+        try:
+            status, answer = _accept_send(payload, self.headers.get("Host"))
+        except Exception as exc:  # noqa: BLE001 - an answer, never a dropped connection
+            print(f"[mail-gateway] /send failed: {exc}\n{traceback.format_exc()}", flush=True)
+            status, answer = 502, {"error": f"send failed: {_clean_line(exc, 300)}"}
+        self._reply(status, answer)
+
+    def _chat_action(self, action: str) -> None:
+        """POST /chats/read|archive|delete — the mailbox follows the chat."""
+        if action == "delete":
+            # The separate capability, checked before anything is read, as on
+            # every gateway: unset, the endpoint refuses.
+            if not CHAT_ERASE_TOKEN:
+                self._reply(503, {"error": "chat erasure is not configured "
+                                           "(CHAT_ERASE_TOKEN is unset)"})
+                return
+            if not _same_secret((self.headers.get("X-Chat-Erase-Token") or "").strip(),
+                                CHAT_ERASE_TOKEN):
+                self._reply(403, {"error": "chat erasure needs X-Chat-Erase-Token"})
+                return
+        body = self._read_object()
+        if body is None:
+            return
+        chat = str(body.get("chat") or "").strip()
+        if not chat:
+            self._reply(400, {"error": "chat (the chat key) is required"})
+            return
+        # One mailbox per gateway: a thread of another account is not here to
+        # be flagged, moved or erased, whatever key it has.
+        if str(body.get("account") or "").strip().lower() != ACCOUNT or not ACCOUNT:
+            self._reply(404, _NOT_OURS)
+            return
+        if MIRROR is None:
+            self._reply(503, {"error": "the mail gateway is not configured"})
+            return
+        try:
+            if action == "read":
+                answer = {"ok": True, "seen": MIRROR.mark_read(chat)}
+            elif action == "archive":
+                answer = {"ok": True, **MIRROR.archive(chat)}
+            else:
+                answer = {"status": "deleted", **MIRROR.delete_chat(chat)}
+        except Busy as exc:
+            self._reply(503, {"error": str(exc)})
+            return
+        except MailboxError as exc:
+            print(f"[mail-gateway] {action} of chat {chat!r} failed: {exc}", flush=True)
+            self._reply(502, {"error": str(exc)[:500]})
+            return
+        except Exception as exc:  # noqa: BLE001 - an answer, never a dropped connection
+            print(f"[mail-gateway] {action} of chat {chat!r} failed: {exc}\n"
+                  f"{traceback.format_exc()}", flush=True)
+            self._reply(500, {"error": f"{action} failed: {_clean_line(exc, 300)}"})
+            return
+        self._reply(200, answer)
+
+    def _outbound_note(self) -> None:
+        body = self._read_object()
+        if body is None:
             return
         message_id = _threads.normalize_id(str(body.get("message_id") or ""))
         author = str(body.get("author") or "").strip().lower()
@@ -3382,6 +5334,12 @@ class _Handler(BaseHTTPRequestHandler):
             return
         if author not in _NOTE_AUTHORS:
             self._reply(400, {"error": "'author' must be one of " + "|".join(_NOTE_AUTHORS)})
+            return
+        # email_client.py says whose mailbox the mail left from; a note about
+        # another account's mail is not this gateway's to keep.
+        account = str(body.get("account") or "").strip().lower()
+        if account and account != ACCOUNT:
+            self._reply(404, _NOT_OURS)
             return
         if MIRROR is None:
             self._reply(503, {"error": "the mail gateway is not configured"})
@@ -3419,8 +5377,11 @@ def main() -> None:
         print(f"[mail-gateway] the mailbox is not usable: {CONFIG_PROBLEM}", flush=True)
     else:
         MIRROR = Mirror(Mailbox(MAIL_CONFIG))
-        print(f"[mail-gateway] mirroring {ACCOUNT} (read-only; backfill "
-              f"{MAIL_BACKFILL_DAYS} days)", flush=True)
+        print(f"[mail-gateway] mirroring {ACCOUNT} (backfill {MAIL_BACKFILL_DAYS} days; "
+              + (f"sending under send policy {_send_category()!r}" if SMTP_PROBLEM is None
+                 else f"not sending: {SMTP_PROBLEM}") + ")", flush=True)
+        # Before the loop's first turn: what the last stop left of a send.
+        _recover_sends()
         threading.Thread(target=_mirror_loop, args=(MIRROR,), name="mail-mirror",
                          daemon=True).start()
     _serve_http()

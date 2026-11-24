@@ -34,7 +34,7 @@ ist = _load()
 
 ACCOUNT = "me@example.org"
 MAIL_PREDICATES = (ist.P_SUBJECT, ist.P_SENDER_NAME, ist.P_RECIPIENT, ist.P_CC,
-                   ist.P_IN_REPLY_TO, ist.P_REFERENCES, ist.P_LIST_ID, ist.P_BODY_PART,
+                   ist.P_REPLY_TO, ist.P_IN_REPLY_TO, ist.P_REFERENCES, ist.P_LIST_ID, ist.P_BODY_PART,
                    ist.P_HTML_PART, ist.P_HEADER_PART, ist.P_CONTENT_ID, ist.P_TRIM,
                    ist.P_REMOVED_AT, ist.P_ARRIVED_AT)
 
@@ -63,6 +63,8 @@ def _mail(tmp, *, outbound=False, chat="root@x.org", timestamp=1000.0, **over):
               timestamp=timestamp, attachment_urls=[refs["pic"], refs["doc"]],
               subject="Re: Quarterly numbers — Q3", sender_name="Ann Example",
               recipients=["me@example.org", "b@y.org"], cc=["c@z.org"],
+              # Whom an answer goes to (a list's address, an assistant's).
+              reply_to=["desk@x.org", " ", "second@x.org", "desk@x.org"],
               in_reply_to="root@x.org", references=["root@x.org", "mid@x.org"],
               list_id="team.lists.x.org", body_part=refs["body"], html_part=refs["html"],
               header_part=refs["head"], trim="deterministic",
@@ -82,6 +84,7 @@ def _assert_mail_fields(fields, refs):
     assert fields["sender_name"] == "Ann Example"
     assert sorted(fields["recipients"]) == ["b@y.org", "me@example.org"]
     assert fields["cc"] == ["c@z.org"]
+    assert sorted(fields["reply_to"]) == ["desk@x.org", "second@x.org"]
     assert fields["in_reply_to"] == "root@x.org"
     assert fields["references"] == "root@x.org mid@x.org"
     assert fields["list_id"] == "team.lists.x.org"
@@ -339,6 +342,7 @@ def test_tombstone():
         # Lost: what it said and to whom.
         assert f'<{urn}> <{ist.P_TEXT}> "" .' in text, "the empty text triple stays"
         assert after["text"] == "" and after["recipients"] == [] and after["cc"] == []
+        assert before["reply_to"] and after["reply_to"] == [] and "replyTo" not in text
         assert after["attachments"] == [] and after["attachment_meta"] == {}
         assert after["body_part"] is after["html_part"] is after["header_part"] is None
         assert after["trim"] is None and after["extra"] == []

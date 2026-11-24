@@ -1,0 +1,353 @@
+#!/usr/bin/env python3
+"""scripts/mail-push.py — the agents' way to send a mail (docs/mail-chats.md,
+"Writing"): its arguments, what it posts to the mail gateway's /send, and
+what it says of the answer.
+
+Against a stub gateway that records each request and answers as scripted,
+and once against the real gateway's handler, mirror and a scripted SMTP
+server, so the flags the companion's note names are known to do what it says:
+
+  * a reply names its thread — a chat id, a bare chat key, a reply token —
+    and nothing else; a new mail names recipients and a subject; mixing the
+    two is refused before anything is sent;
+  * the text comes from the argument, a file or standard input;
+  * --attach, --user-approved, --thread (and its environment default), --url;
+  * a queued send prints its id, how to take it back, and the approval URL
+    made absolute; --retract takes it back;
+  * a refusal is the gateway's own sentence, and a failure exit.
+
+    python3 tests/test_mail_push.py
+"""
+import base64
+import contextlib
+import importlib.util
+import io
+import json
+import os
+import sys
+import tempfile
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+SCRIPTS_DIR = REPO_ROOT / "scripts"
+if str(SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS_DIR))
+
+RID = "0123456789abcdef0123456789abcdef"
+THREAD = "ab" * 16
+_ENV = ("MAIL_GATEWAY_SEND_URL", "MAIL_GATEWAY_TOKEN", "MAIL_GATEWAY_TIMEOUT",
+        "SEND_APPROVAL_BASE_URL", "CONVERSATION_BASE_URL", "RETINUE_THREAD_ID")
+
+
+class Stub:
+    """A gateway that records what it is sent and answers what it is told to."""
+
+    def __init__(self):
+        self.requests = []      # (path, body | None, headers)
+        self.answer = (200, {"status": "sent", "message_id": "m1@example.org",
+                             "chat": "a@x.org", "ts": 1.0, "attachments": []})
+        stub = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, fmt, *args):
+                pass
+
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length", 0) or 0)
+                raw = self.rfile.read(length) if length else b""
+                stub.requests.append((self.path, json.loads(raw) if raw else None,
+                                      dict(self.headers)))
+                status, body = stub.answer
+                if self.path.endswith("/retract"):
+                    status, body = 200, {"id": RID, "status": "retracted"}
+                data = body if isinstance(body, bytes) else json.dumps(body).encode()
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.url = f"http://127.0.0.1:{self.server.server_address[1]}/send"
+
+    def body(self, index=-1) -> dict:
+        return self.requests[index][1]
+
+
+def push(*argv, env=None, stdin=None):
+    """Run mail-push.py's main(); ``(exit code, stdout, stderr)``."""
+    saved = {name: os.environ.pop(name, None) for name in _ENV}
+    os.environ.update(env or {})
+    spec = importlib.util.spec_from_file_location("mail_push_under_test",
+                                                  SCRIPTS_DIR / "mail-push.py")
+    module = importlib.util.module_from_spec(spec)
+    out, err = io.StringIO(), io.StringIO()
+    real_argv, real_stdin = sys.argv, sys.stdin
+    sys.argv = ["mail-push.py", *argv]
+    if stdin is not None:
+        sys.stdin = io.StringIO(stdin)
+    try:
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            spec.loader.exec_module(module)     # reads its environment as it loads
+            try:
+                code = module.main()
+            except SystemExit as exc:           # argparse, and a missing attachment
+                code = exc.code if isinstance(exc.code, int) else 1
+                if not isinstance(exc.code, int) and exc.code:
+                    err.write(str(exc.code))
+    finally:
+        sys.argv, sys.stdin = real_argv, real_stdin
+        for name in _ENV:
+            os.environ.pop(name, None)
+            if saved[name] is not None:
+                os.environ[name] = saved[name]
+    return code, out.getvalue(), err.getvalue()
+
+
+def test_a_reply_names_its_thread_and_nothing_else():
+    stub = Stub()
+    env = {"MAIL_GATEWAY_SEND_URL": stub.url, "MAIL_GATEWAY_TOKEN": "mail-secret"}
+    try:
+        # A chat id, as the companion's note gives it: the key, and the
+        # mailbox it names, for the gateway to check against its own.
+        code, out, err = push("--chat", "email:~me@example.org:root:1@x.org",
+                              "Thanks, got it.", env=env)
+        assert code == 0 and err == "", (code, err)
+        assert stub.body() == {"message": "Thanks, got it.", "recipient": "root:1@x.org",
+                               "account": "me@example.org"}
+        assert stub.requests[-1][0] == "/send"
+        assert stub.requests[-1][2]["Authorization"] == "Bearer mail-secret"
+        assert "sent" in out and "m1@example.org" in out and "a@x.org" in out
+        # An account with characters the id escapes comes back unescaped.
+        push("--chat", "email:~odd%3Aname@example.org:k@x.org", "x", env=env)
+        assert stub.body()["account"] == "odd:name@example.org"
+        # A bare chat key — whatever it looks like — is the key.
+        for key in ("root@x.org", "signal:+41790000000", "weird:~key@x.org"):
+            push("--chat", key, "--reply", "sender", "x", env=env)
+            assert stub.body() == {"message": "x", "recipient": key, "reply": "sender"}, key
+        push("--chat", "email:plain@x.org", "--reply", "all", "x", env=env)
+        assert stub.body() == {"message": "x", "recipient": "plain@x.org", "reply": "all"}
+        # A reply token names the thread; a --chat beside it is not sent.
+        push("--reply-to", "v1.abc.def", "--chat", "other@x.org", "x", env=env)
+        assert stub.body() == {"message": "x", "reply_to": "v1.abc.def"}
+        # Nothing of a new mail may ride on a reply, and the other way round.
+        sent = len(stub.requests)
+        for argv in (["--chat", "a@x.org", "--to", "ann@x.org", "x"],
+                     ["--chat", "a@x.org", "--cc", "ann@x.org", "x"],
+                     ["--reply-to", "v1.a.b", "--subject", "Other", "x"],
+                     ["--to", "ann@x.org", "--reply", "all", "x"],
+                     ["--reply", "sender", "x"], ["x"], ["--subject", "S", "x"],
+                     ["--cc", "ann@x.org", "x"],
+                     ["--chat", "a@x.org", "--reply", "everyone", "x"],
+                     ["--chat", "a@x.org"], ["--chat", "a@x.org", "   "],
+                     ["--to", "ann@x.org"]):
+            code, _out, err = push(*argv, env=env)
+            assert code == 2 and "mail-push" in err, (argv, code, err)
+        assert len(stub.requests) == sent, "refused before anything was sent"
+    finally:
+        stub.server.shutdown()
+    print("ok: a reply names its thread by chat id, key or token, and carries nothing else")
+
+
+def test_a_new_mail_its_text_and_its_attachments():
+    stub = Stub()
+    env = {"MAIL_GATEWAY_SEND_URL": stub.url}
+    with tempfile.TemporaryDirectory() as tmp:
+        try:
+            text = "Dear Ann,\n\nthe minutes.\n$HOME `id` 'quoted' \"too\"\n"
+            body = Path(tmp) / "mail.txt"
+            body.write_text(text, encoding="utf-8")
+            pdf = Path(tmp) / "minutes.pdf"
+            pdf.write_bytes(b"%PDF-1.4")
+            blob = Path(tmp) / "data.zzzz"
+            blob.write_bytes(b"\x00\x01")
+            code, out, err = push("--to", "ann@x.org", "--to", "Bob <bob@y.org>",
+                                  "--cc", "cat@z.org", "--subject", "Minutes",
+                                  "--file", str(body), "--attach", str(pdf),
+                                  "--attach", str(blob), "--user-approved",
+                                  "--thread", THREAD, env=env)
+            assert code == 0 and err == "", err
+            assert stub.body() == {
+                "message": text, "to": ["ann@x.org", "Bob <bob@y.org>"], "cc": ["cat@z.org"],
+                "subject": "Minutes", "user_approved": True, "thread": THREAD,
+                "images": [
+                    {"filename": "minutes.pdf", "content_type": "application/pdf",
+                     "data": base64.b64encode(b"%PDF-1.4").decode()},
+                    {"filename": "data.zzzz", "data": base64.b64encode(b"\x00\x01").decode()}]}
+            assert "Authorization" not in stub.requests[-1][2], "no token configured, none sent"
+            # Without the flags: no approval is claimed, no thread, no subject.
+            push("--to", "ann@x.org", "Short.", env=env)
+            assert stub.body() == {"message": "Short.", "to": ["ann@x.org"]}
+            # The thread defaults to the turn's own; one that is no id is dropped.
+            push("--to", "ann@x.org", "x", env={**env, "RETINUE_THREAD_ID": THREAD})
+            assert stub.body()["thread"] == THREAD
+            push("--to", "ann@x.org", "x", "--thread", "not-an-id", env=env)
+            assert "thread" not in stub.body()
+            # Standard input; an attachment alone; the text given twice.
+            push("--to", "ann@x.org", "--file", "-", env=env, stdin="From a pipe.\n")
+            assert stub.body()["message"] == "From a pipe.\n"
+            push("--to", "ann@x.org", "--attach", str(pdf), env=env)
+            assert stub.body()["message"] == "" and len(stub.body()["images"]) == 1
+            sent = len(stub.requests)
+            code, _out, err = push("--to", "ann@x.org", "--file", str(body), "Also this.", env=env)
+            assert code == 2 and "not both" in err
+            code, _out, err = push("--to", "ann@x.org", "--file", str(Path(tmp) / "nope"), env=env)
+            assert code == 1 and "cannot read" in err
+            code, _out, err = push("--to", "ann@x.org", "x", "--attach",
+                                   str(Path(tmp) / "nope.pdf"), env=env)
+            assert code == 1 and "attachment not found" in err
+            assert len(stub.requests) == sent
+            # --url is another mailbox's gateway.
+            other = Stub()
+            try:
+                push("--to", "ann@x.org", "x", "--url", other.url, env=env)
+                assert len(other.requests) == 1 and len(stub.requests) == sent
+            finally:
+                other.server.shutdown()
+        finally:
+            stub.server.shutdown()
+    print("ok: a new mail carries its recipients, subject, text from a file, and attachments")
+
+
+def test_what_it_says_of_the_answer():
+    stub = Stub()
+    env = {"MAIL_GATEWAY_SEND_URL": stub.url, "MAIL_GATEWAY_TOKEN": "mail-secret"}
+    try:
+        # Queued: the id, how to take it back, and the approval link — made
+        # absolute where the gateway handed back a path.
+        stub.answer = (202, {"status": "pending_approval", "request_id": RID,
+                             "approval_url": f"/sends/mail-gateway/{RID}",
+                             "message_id": "m2@example.org", "chat": "a@x.org",
+                             "note": "This e-mail requires web-gateway approval."})
+        code, out, err = push("--chat", "a@x.org", "x", env={
+            **env, "CONVERSATION_BASE_URL": "https://dash.example/"})
+        assert code == 0 and err == ""
+        assert f"queued for approval (id={RID})" in out
+        assert f"mail-push.py --retract {RID}" in out
+        assert f"approve or deny at https://dash.example/sends/mail-gateway/{RID}" in out
+        assert "requires web-gateway approval" in out
+        code, out, _err = push("--chat", "a@x.org", "x", env={
+            **env, "SEND_APPROVAL_BASE_URL": "https://sends.example",
+            "CONVERSATION_BASE_URL": "https://dash.example"})
+        assert f"https://sends.example/sends/mail-gateway/{RID}" in out
+        code, out, _err = push("--chat", "a@x.org", "x", env=env)
+        assert f"approve or deny at /sends/mail-gateway/{RID}" in out
+        stub.answer = (202, {"status": "pending_approval", "request_id": RID,
+                             "approval_url": f"https://abs.example/sends/mail-gateway/{RID}"})
+        code, out, _err = push("--chat", "a@x.org", "x", env={
+            **env, "CONVERSATION_BASE_URL": "https://dash.example"})
+        assert f"approve or deny at https://abs.example/sends/mail-gateway/{RID}" in out
+
+        # Take it back: the gateway's retract endpoint, beside /send.
+        code, out, err = push("--retract", RID, env=env)
+        assert code == 0 and "retracted; nothing was sent" in out
+        assert stub.requests[-1][0] == f"/pending-sends/{RID}/retract"
+        assert stub.requests[-1][2]["Authorization"] == "Bearer mail-secret"
+        code, _out, err = push("--retract", "nope", env=env)
+        assert code == 2 and "not a request id" in err
+
+        # Sent, with an address the server would not take.
+        stub.answer = (200, {"status": "sent", "message_id": "m3@example.org",
+                             "chat": "m3@example.org", "ts": 1.0, "attachments": [],
+                             "refused": ["bob@y.org"]})
+        code, out, _err = push("--to", "ann@x.org", "--to", "bob@y.org", "x", env=env)
+        assert code == 0 and "refused bob@y.org" in out
+        # A refusal is the gateway's sentence; so is an outcome nobody knows.
+        for status, answer, word in (
+                (409, {"error": "this thread has no mail left to reply to"}, "no mail left"),
+                (400, {"error": "not an address: 'x'"}, "not an address"),
+                (404, {"error": "not this gateway's account"}, "account"),
+                (502, {"error": "the mail server did not confirm this mail",
+                       "unconfirmed": True}, "did not confirm"),
+                (500, b"<html>oops</html>", "oops")):
+            stub.answer = (status, answer)
+            code, out, err = push("--chat", "a@x.org", "x", env=env)
+            assert code == 1 and out == "" and word in err and str(status) in err, (status, err)
+    finally:
+        stub.server.shutdown()
+    code, _out, err = push("--to", "ann@x.org", "x", "--timeout", "2",
+                           env={"MAIL_GATEWAY_SEND_URL": "http://127.0.0.1:9/send"})
+    assert code == 1 and "could not reach gateway" in err
+    print("ok: a queued send prints its approval link and how to retract it; a refusal fails")
+
+
+def test_against_the_gateway_itself():
+    """The flags the companion's note names, against the real /send."""
+    spec = importlib.util.spec_from_file_location(
+        "mail_gateway_send_helpers", REPO_ROOT / "tests" / "test_mail_gateway_send.py")
+    send = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(send)
+    t = send.t
+    w = send.world(policy="trust")
+    try:
+        gw, box, mirror, smtp = w.gw, w.box, w.mirror, w.smtp
+        box.put("INBOX", t.msg("a@x.org", cc="bob@y.org", day=1))
+        mirror.poll()
+        server, base = t.serve(gw)
+        env = {"MAIL_GATEWAY_SEND_URL": base + "/send", "MAIL_GATEWAY_TOKEN": t.TOKEN}
+        chat_id = f"email:~{send.ACCOUNT}:a@x.org"
+        with tempfile.TemporaryDirectory() as tmp:
+            text = Path(tmp) / "reply.txt"
+            text.write_text("Count me in.\n", encoding="utf-8")
+            try:
+                # Not approved by the user: queued, and retracted again.
+                code, out, err = push("--chat", chat_id, "--reply", "all", "--file",
+                                      str(text), env=env)
+                assert code == 0 and "queued for approval" in out, (out, err)
+                (entry,) = gw.SENDS.waiting("a@x.org")
+                assert entry["to"] == ["ann@x.org"] and entry["cc"] == ["bob@y.org"]
+                assert entry["author"] == "agent" and entry["message"] == "Count me in."
+                assert f"/sends/127.0.0.1/{entry['id']}" in out
+                code, out, _err = push("--retract", entry["id"], env=env)
+                assert code == 0 and "retracted" in out and smtp.sessions == 0
+                assert gw.SENDS.waiting() == []
+                # With the user's permission: sent, to the sender alone.
+                code, out, err = push("--chat", chat_id, "--reply", "sender", "--file",
+                                      str(text), "--user-approved", env=env)
+                assert code == 0 and "mail-push: sent" in out, (out, err)
+                assert smtp.mails[-1]["rcpt"] == ["ann@x.org"]
+                assert smtp.parsed().get_content().strip() == "Count me in."
+                # Too late to take back; and a thread of another mailbox is
+                # not this gateway's.
+                code, _out, err = push("--retract", "0" * 32, env=env)
+                assert code == 1 and "no pending send" in err
+                code, _out, err = push("--chat", "email:~other@example.org:a@x.org", "x", env=env)
+                assert code == 1 and "404" in err and "account" in err
+                # A new mail, with a file.
+                pdf = Path(tmp) / "plan.pdf"
+                pdf.write_bytes(b"%PDF-1.4")
+                code, out, err = push("--to", "dora@w.org", "--subject", "Plan", "--attach",
+                                      str(pdf), "--user-approved", "Attached.", env=env)
+                assert code == 0, err
+                assert smtp.mails[-1]["rcpt"] == ["dora@w.org"]
+                assert [p.get_filename() for p in smtp.parsed().iter_attachments()] == ["plan.pdf"]
+                assert len(smtp.mails) == 2
+            finally:
+                server.shutdown()
+    finally:
+        send.done(w)
+    print("ok: mail-push.py replies, queues, retracts and writes new mail through the gateway")
+
+
+def main():
+    tests = [v for k, v in globals().items() if k.startswith("test_") and callable(v)]
+    failures = 0
+    for test in tests:
+        try:
+            test()
+        except Exception as exc:  # noqa: BLE001
+            failures += 1
+            import traceback
+            print(f"FAIL {test.__name__}: {exc}")
+            traceback.print_exc()
+    if failures:
+        print(f"\n{failures} mail-push check(s) failed.")
+        return 1
+    print("\nAll mail-push checks passed.")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
