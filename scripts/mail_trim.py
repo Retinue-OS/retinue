@@ -2035,6 +2035,11 @@ _TAG_ATTRIBUTES_RE = re.compile(
     r"(?:[{b}/]+|[^{b}/>][^{b}/>=]*"
     r"""(?:[{b}]*=[{b}]*(?:"[^"]*"?|'[^']*'?|[^{b}>]*))?)*""".format(
         b=r"\t\n\f\r "))
+# … one of them at a time, a value in quotes (its quotes with it) in group 1.
+_TAG_ATTRIBUTE_RE = re.compile(
+    r"[{b}/]+|[^{b}/>][^{b}/>=]*"
+    r"""(?:[{b}]*=[{b}]*(?:("[^"]*"?|'[^']*'?)|[^{b}>]*))?""".format(
+        b=r"\t\n\f\r "))
 _RAW_TEXT_ENDS = {tag: re.compile(r"</%s[\t\n\f\r />]" % tag, re.I) for tag in (
     "style", "script", "xmp", "iframe", "noembed", "noframes", "textarea",
     "title")}
@@ -2070,8 +2075,9 @@ _CHARREF_END_RE = re.compile(r"[\s;<]")
 
 def _markup_spans(html: str):
     """``(start, end, markup)`` of each stretch of a part that is no text of
-    it, in order: a tag or a style sheet (`markup`), a comment, the text of
-    a script. Then ``(len, len + 1, False)``, for ever. A part is looked at
+    it, in order: a tag or a style sheet (`markup`: True, or "style" for the
+    sheet), a comment, the text of a script — up to the first CDATA
+    section. Then ``(len, len + 1, False)``, for ever. A part is looked at
     once, and only as far as it is asked for."""
     size = len(html)
     at = 0
@@ -2093,6 +2099,11 @@ def _markup_spans(html: str):
                 end = html.find(">", start + 2)
                 end = size if end < 0 else end + 1
             yield start, end, False
+            if html.startswith("<![CDATA[", start):
+                # In an <svg> or a <math> a browser ends one at "]]>", not
+                # here, and which this is, is not followed: from here on,
+                # nothing is markup a payload is left out of.
+                break
             at = end
             continue
         name = start + len(match.group()) - 1
@@ -2109,20 +2120,46 @@ def _markup_spans(html: str):
         if tag in _RAW_TEXT_ENDS:
             close = _RAW_TEXT_ENDS[tag].search(html, end)
             at = close.start() if close else size
-            yield end, at, tag == "style"
+            yield end, at, "style" if tag == "style" else False
     while True:
         yield size, size + 1, False
 
 
 def _folded(payload: str) -> bool:
     """Is a payload with blanks in it base64 folded into lines: each line
-    nothing but base64, every one but the last as long as the first, and
-    not short? Words joined by line breaks are not."""
+    nothing but base64, every one but the first and the last as long as the
+    second, these two no longer, and not short? (The first may share its
+    line with the tag, where a client folded all of the markup.) Words
+    joined by line breaks are not."""
     lines = payload.split()
-    width = len(lines[0]) if lines else 0
-    return (width >= BASE64_LINE_CHARS and len(lines[-1]) <= width
-            and all(len(line) == width for line in lines[:-1])
+    width = len(lines[1] if len(lines) > 2 else lines[0]) if lines else 0
+    return (width >= BASE64_LINE_CHARS
+            and len(lines[0]) <= width and len(lines[-1]) <= width
+            and all(len(line) == width for line in lines[1:-1])
             and all(_BASE64_RE.fullmatch(line) for line in lines))
+
+
+class _TagWalk:
+    """A browser's reading of one tag's attributes — the tokenizer's
+    attribute states, an attribute at a time — walked once: asked of
+    stretches of the tag in order, it goes on from where it stopped."""
+
+    def __init__(self, html: str, start: int, end: int):
+        self.html, self.start, self.end = html, start, end
+        name = _TAG_OPEN_RE.match(html, start).end() - 1
+        self.at = _TAG_NAME_RE.match(html, name).end()
+        self.attribute = None       # the first that does not end before
+
+    def quotes(self, start: int, end: int) -> bool:
+        """Is html[start:end] inside one value in quotes: opened by a quote
+        (an entity opens none) before it, and not closed before its end?"""
+        while self.attribute is None or self.attribute.end() <= start:
+            attribute = _TAG_ATTRIBUTE_RE.match(self.html, self.at, self.end)
+            if attribute is None:
+                return False            # the tag's ">", or its end
+            self.attribute, self.at = attribute, attribute.end()
+        opened, closed = self.attribute.span(1)
+        return opened < start and end < closed
 
 
 def _markup_read(html: str) -> tuple:
@@ -2139,7 +2176,15 @@ def _markup_read(html: str) -> tuple:
     base64 or a URL's characters, no blank but between the lines of folded
     base64, no quote — up to the first character that is none of it: where
     a home-made reading of the markup takes text for a tag, what that
-    costs is a long word of base64, never a sentence or the end of a value.
+    costs is a long run of a URL's characters, never words a blank divides
+    nor the end of a value. (Words joined by "-", "_", "." or "%20" are such
+    a run, so past a CDATA section — the one misreading known: a browser
+    ends one in an <svg> at "]]>" — nothing is left out.) Folded base64 is
+    left out only where a browser's own reading of the tag puts all of it
+    in one value in quotes, which nothing but its quote ends: what stands
+    in for it cannot change where the tag is split. Anywhere else a browser
+    ended the value at the first blank, and what follows is attributes or
+    text as it reads them — so the run is no folded value, and counts.
 
     A longer part is cut at the bound, wherever that falls: the parser is
     handed what was read and not told that it ends there (see _convert), so
@@ -2155,6 +2200,7 @@ def _markup_read(html: str) -> tuple:
     size = done = at = 0
     spans = _markup_spans(html)
     span = (0, 0, False)    # the first that does not end before a candidate
+    walk = None             # of the tag the last folded one stood in
     for _ in range(_MAX_DATA_URLS):
         # (Looked for from where the last payload, or what looked like one,
         # ended: what stands in one is not searched for more of them.)
@@ -2182,20 +2228,30 @@ def _markup_read(html: str) -> tuple:
         # … and what follows is a payload by its shape, which ends at the
         # first character that is none of one: what began the value must
         # end it there. Whatever else a reading of the markup gets wrong,
-        # what is left out is never a word of a text, nor a quote that ends
-        # one value and lets the next take the mail.
+        # what is left out is never words a blank divides, nor a quote that
+        # ends one value and lets the next take the mail.
         payload = (_DATA_URL_QUOTED_RE if opener else _DATA_URL_BARE_RE).match(html, at)
         if payload is None:
             continue                # no URL: it has no comma where one has
         end = at = payload.end()
         comma = html.index(",", start)
+        blank = "\n" if _BLANKS_RE.search(html, comma, end) else ""
         if (end - start <= DATA_URL_CHARS
                 or not html.startswith(_DATA_URL_CLOSERS[opener], end)
-                or (_BLANKS_RE.search(html, comma, end)
-                    and not _folded(html[comma + 1:end]))):
+                or (blank and not _folded(html[comma + 1:end]))):
             continue
-        kept.append(html[done:start + 5])
-        size += start + 5 - done
+        # Folded in a tag, it is a value in quotes as a browser reads the
+        # tag — or a browser read no such value, and it counts. (In a style
+        # sheet nothing but its end tag ends anything. A tag is walked once,
+        # on from where the last candidate in it was.)
+        if blank and span[2] is True:
+            if walk is None or walk.start != span[0]:
+                walk = _TagWalk(html, span[0], span[1])
+            if not walk.quotes(start, end):
+                continue
+        # (One blank stays for its blanks: in quotes it splits nothing.)
+        kept.append(html[done:start + 5] + blank)
+        size += start + 5 - done + len(blank)
         done = end
     kept.append(html[done:done + max(0, limit - size) + 1])
     markup = "".join(kept)

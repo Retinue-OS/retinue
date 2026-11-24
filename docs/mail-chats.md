@@ -440,45 +440,55 @@ then the rest. For any other row, the copy From the sender the row named
 evidence by itself: whoever was sent a mail knows its `Message-ID` and can
 write any From. What is: a copy in Sent (only the user's client or the
 gateway puts one there), or a copy received when the row said (a move
-keeps the arrival time; a look-alike delivered later does not have it). A
-match whose header block does not come back counts as From nobody and comes
-last; it holds up nothing where the first is known to be the record's — a
-Sent copy, or one From the row's sender received when the row said (in the
-archive, for a row that said the mail was the user's). That one mail is
-read as any mail is read the first time where it lies — what a Sent copy
-holds is the user's, what is in the archive the user's when it is from one
-of the user's own addresses and left Sent unseen — with one difference: in
-the archive, From that very sender and received when the row said, where
-the row said the mail was the user's, it is the user's again, whatever
-address that is — and found under an id its provider gave a send of the
-gateway's own, the record again under the id the gateway minted, with the
-provider's as `kb:sentAs` and the author noted for it. Never in INBOX, nor
-in the archive on its From alone: a
-look-alike From the user's own address stays a mail that came in — in
-INBOX, archived, or in an "all mail" archive — and a second copy where the
-Sent copy is there. The others found are read as further copies of any
+keeps the arrival time; a look-alike delivered a second or more later does
+not have it). A match whose header block does not come back counts as From
+nobody and comes last; it holds up nothing where the first is known to be
+the record's — a Sent copy, or one From the row's sender received when the
+row said (in the archive, for a row that said the mail was the user's).
+That one mail is read as any mail is read the first time where it lies —
+what a Sent copy holds is the user's, what is in the archive the user's when
+it is from one of the user's own addresses and left Sent unseen — with one
+difference: in the archive, From that very sender and received when the row
+said, where the row said the mail was the user's, it is the user's again,
+whatever address that is — and found under an id its provider gave a send of
+the gateway's own, the record again under the id the gateway minted, with
+the provider's as `kb:sentAs` and the author noted for it. Never in INBOX,
+nor in the archive on its From alone: a look-alike From the user's own
+address stays a mail that came in — in INBOX, archived, or in an "all mail"
+archive — and a second copy where the Sent copy is there. The others found
+are read as further copies of any
 mail are (one more place, another mail's, or a placeholder). Found in no
 folder, with every folder sure of it, the id is dropped. Where that cannot
 be told yet — a folder that would not answer, a header block that did not
-come back — the id stays, is looked for again less and less often, and
-holds back none behind it; `/health` counts it. An id that cannot be
-searched for (no `Message-ID`, or one the search cannot spell) is found by
-reading headers, and the copy received when the row said is read without
-waiting for that reading to cover the whole window. After `LOST_TRIES` (8)
-tries in vain, what was found is read as mail nothing is known of, a log
-line says so, and the id is looked for no more.
+come back — the id stays, is looked for again less and less often, and holds
+back none behind it; `/health` counts it. An id that cannot be searched for
+(no `Message-ID`, or one the search cannot spell) is found by reading
+headers, and the copy received when the row said is read without waiting for
+that reading to cover the whole window. After `LOST_TRIES` (8) tries in
+vain, what was found is read as mail nothing is known of, a log line says
+so, and the id is looked for no more — but where every match is gone between
+the search and the reading, or one is and what is left is not known to be the
+record's, it is looked for so once more, an hour on.
 
 What this leaves, plainly: while the archive does not answer, every lost id
 waits (`/health` says the archive does not answer, and counts them); an id
 whose mail is in no folder, or no more where the search found it, leaves
 the list with a log line and no `removed` event — there is no record to
-tombstone; a ledger restored from an older backup over a live one can leave
-two record files for one id (a record written as the first time takes a
-name of its own, and the backup brings back the one it had before); a mail
-to oneself whose Sent copy is gone comes back as a mail that came in —
-nothing but its From says the user wrote it; and on a server that stamps a
+tombstone — so a mail moved under both of the last looks can be left
+unmirrored, and a look-alike under its id read in its place;
+a ledger restored from an older backup over a live one can leave two
+record files for one id (a record written as the first time takes a name
+of its own, and the backup brings back the one it had before); a mail to
+oneself whose Sent copy is gone comes back as a mail that came in —
+nothing but its From says the user wrote it; on a server that stamps a
 moved mail with a new arrival time, an archived sent mail comes back as a
-mail that came in too — its From is all that is left to say so.
+mail that came in too — its From is all that is left to say so; and an
+arrival time has whole seconds, so a look-alike under the id, From the same
+address, delivered in the same second, cannot be told from the record's own
+mail: archived, with the Sent copy gone, it comes back as the user's, and
+where it and the record's mail lie in different folders, the folder
+decides which is read as the record — for a mail that came in, a
+look-alike in INBOX before the record's mail archived.
 
 The bookkeeping behind this keeps four rules, written out above `class
 Mirror` in the gateway: an answer that was not obtained is never an answer; a
@@ -618,9 +628,11 @@ of them and 4,000,000 characters, counted once per pass — all four passes for
 A mail that would take more is not trimmed and is recorded as it came,
 `wanting`, as is one of more than 200,000 lines or 5,000,000 characters,
 which is not read at all. Of an HTML part the first 1,000,000 characters of
-markup are parsed, not counting inline `data:` images: beside a plain part a
-longer one is not consulted, and where it is the mail's only text the bubble
-ends where the reading did, on a line `[…]` — *Original* shows all of it.
+markup are parsed, not counting inline `data:` images (but one folded into
+lines where a browser does not read it as a value in quotes, and any after
+a CDATA section, which mail almost never has): beside a plain part a longer
+one is not consulted, and where it is the mail's only text the bubble ends
+where the reading did, on a line `[…]` — *Original* shows all of it.
 Within those bounds the cost is linear in the size of the mail, for hostile
 mail too.
 

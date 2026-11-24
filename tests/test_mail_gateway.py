@@ -671,8 +671,13 @@ def test_a_forged_from_in_inbox_never_makes_a_lost_record_the_users():
     archive it counted on the From alone: the look-alike archived, or in an
     "all mail" archive, the Sent copy deleted, became the user's again. An
     archive copy counts only when it was received when the record said (a
-    move keeps the arrival time; the look-alike came later)."""
-    for variant in ("deleted", "appended late", "archived", "all mail"):
+    move keeps the arrival time; the look-alike came later). A look-alike
+    delivered in the same second as the Sent copy has all the user's own
+    mail has (an arrival time has whole seconds): archived, the Sent copy
+    deleted, it comes back as the user's — the stated limit, held here so
+    that a change that closes it is noticed."""
+    for variant in ("deleted", "appended late", "archived", "all mail",
+                    "archived, in the same second", "all mail, in the same second"):
         with tempfile.TemporaryDirectory() as tmp:
             gw = load(tmp)
             _write_policy(gw)
@@ -685,6 +690,8 @@ def test_a_forged_from_in_inbox_never_makes_a_lost_record_the_users():
             sent, forged = T0 + 39.9 * DAY, T0 + 39.95 * DAY
             if variant == "appended late":
                 sent = forged + 600
+            if variant.endswith("in the same second"):
+                sent = forged = float(int(sent))
             box.put("Sent", msg("own@example.org", sender=ME, to="Mallory <m@evil.org>",
                                 body="My offer: 100.\n", day=39.9), date=sent)
             _turns(gw, mirror, clock, loop, 2)
@@ -695,9 +702,9 @@ def test_a_forged_from_in_inbox_never_makes_a_lost_record_the_users():
             uid = box.put("INBOX", look, date=forged)
             _turns(gw, mirror, clock, loop, 2)
             assert by_id(gw)["own@example.org"]["text"] == "My offer: 100.", variant
-            if variant == "archived":
+            if variant.startswith("archived"):
                 box.move_mail("INBOX", uid, "Archive")
-            elif variant == "all mail":
+            elif variant.startswith("all mail"):
                 box.put("Archive", look, date=forged)
             if variant != "appended late":
                 box.remove("Sent", box.uid_of("Sent", "own@example.org"))
@@ -707,7 +714,12 @@ def test_a_forged_from_in_inbox_never_makes_a_lost_record_the_users():
             snap = _turns(gw, mirror, clock, loop, 4)
             record = by_id(gw)["own@example.org"]
             got = [(p["direction"], p["text"]) for p in inbound(events[told:])]
-            if variant != "appended late":
+            if variant.endswith("in the same second"):
+                # Nothing tells it from the user's own: the stated limit.
+                assert record["type"] == gw._ibstore.T_OUTBOUND, variant
+                assert record["author"] == "device", variant
+                assert got == [("out", "I agree to pay Mallory 5000.")], (variant, got)
+            elif variant != "appended late":
                 # Nothing but its From says the user wrote what lies in INBOX,
                 # or its copy in the archive.
                 assert record["type"] == gw._ibstore.T_INBOUND and not record.get("author")
@@ -721,6 +733,52 @@ def test_a_forged_from_in_inbox_never_makes_a_lost_record_the_users():
             assert snap["lost"] == 0, snap
     print("ok: a forged From in INBOX, archived or not, never makes a lost record the "
           "user's own mail — a Sent copy comes first, whenever it was appended")
+
+
+def test_a_look_alike_in_the_same_second_is_the_stated_limit():
+    """Of a lost record's mail that came in, the copy From the record's
+    sender received when the record said is read as the record. A look-alike
+    From that sender delivered a second or more later is not; delivered in
+    the same second, it has all Ann's own mail has (an arrival time has
+    whole seconds), and where the two lie in different folders the folder
+    decides — INBOX before the archive, so with Ann's mail archived the
+    look-alike is read as the record. The stated limit, held here so that a
+    change that closes it is noticed."""
+    for variant, kept in (("Ann's archived", False), ("the look-alike archived", True),
+                          ("both in INBOX", True),
+                          ("Ann's archived, the look-alike a second later", True)):
+        with tempfile.TemporaryDirectory() as tmp:
+            gw = load(tmp)
+            _write_policy(gw)
+            rail(gw)
+            clock = {"now": NOW}
+            box = FakeMailbox(gw)
+            mirror = gw.Mirror(box, clock=lambda: clock["now"])
+            loop = {}
+            _turns(gw, mirror, clock, loop, 1)
+            when = float(int(T0 + 39.0 * DAY))
+            real = box.put("INBOX", msg("a@x.org", body="Ann: the contract is signed.\n",
+                                        day=39.0), date=when)
+            _turns(gw, mirror, clock, loop, 2)
+            look = box.put("INBOX", msg("a@x.org", headers=[("X-Look", "yes")],
+                                        body="Ann: wire 5000 to Mallory.\n", day=39.0),
+                           date=when + (1.0 if variant.endswith("later") else 0.0))
+            _turns(gw, mirror, clock, loop, 2)
+            if variant.startswith("Ann's archived"):
+                box.move_mail("INBOX", real, "Archive")
+            elif variant == "the look-alike archived":
+                box.move_mail("INBOX", look, "Archive")
+            _turns(gw, mirror, clock, loop, 2)
+            assert by_id(gw)["a@x.org"]["text"] == "Ann: the contract is signed.", variant
+            mirror, loop = _lost(gw, box, clock, mirror), {}
+            snap = _turns(gw, mirror, clock, loop, 4)
+            record = by_id(gw)["a@x.org"]
+            assert record["type"] == gw._ibstore.T_INBOUND, variant
+            assert (record["text"] == "Ann: the contract is signed.") is kept, (
+                variant, record["text"])
+            assert snap["lost"] == 0, (variant, snap)
+    print("ok: a look-alike From the sender, delivered in the same second as a lost "
+          "record's mail, is the stated limit; a second later, it is not the record")
 
 
 def _hanging(gw):
@@ -757,10 +815,19 @@ def test_a_lost_id_is_not_looked_for_for_ever():
     match that does not read comes last and is read as a further copy (a
     placeholder); a copy received when the record said needs no whole scan;
     and after LOST_TRIES tries what was found is read as mail nothing is
-    known of, and a log line says so."""
+    known of, and a log line says so. And where on that last try every
+    match was gone since the search — Ann's mail archived by the user
+    between the search and the reading — the id left `lost` and her mail
+    was never mirrored again: it is looked for once more, and only once
+    (moved under that look too, it is left unmirrored: the stated limit).
+    So it is where one match is gone and what is left is not known to be
+    the record's: a look-alike From Ann, delivered an hour later under her
+    id, was read as her mail, and hers in the archive never was."""
     cases = ("a look-alike that never reads", "no Message-ID, unreadable mail archived",
              "no Message-ID, more archived mail than the scan remembers",
-             "a search that never settles")
+             "a search that never settles", "archived under the last look",
+             "archived under the last look, and back under the next",
+             "archived under the last look, a look-alike left")
     for case in cases:
         with tempfile.TemporaryDirectory() as tmp:
             gw = load(tmp)
@@ -774,9 +841,13 @@ def test_a_lost_id_is_not_looked_for_for_ever():
                 loop = {}
                 _turns(gw, mirror, clock, loop, 1)
                 mid = None if case.startswith("no Message-ID") else "a@x.org"
-                box.put("INBOX", msg(mid, body="Ann: the contract is signed.\n", day=39.0))
+                real = box.put("INBOX", msg(mid, body="Ann: the contract is signed.\n", day=39.0))
                 _turns(gw, mirror, clock, loop, 2)
-                if case == "a look-alike that never reads":
+                if case.endswith("a look-alike left"):
+                    box.put("INBOX", msg("a@x.org", headers=[("X-Look", "1")],
+                                         body="Ann: wire 5000 to Mallory.\n", day=39.0),
+                            date=box.boxes["INBOX"]["mails"][real]["date"] + 3600)
+                elif case == "a look-alike that never reads":
                     box.put("INBOX", msg("a@x.org", sender="Mallory <m@evil.org>",
                                          headers=[("X-Hang", "yes")], body="x\n", day=39.1))
                 elif case == "no Message-ID, unreadable mail archived":
@@ -792,6 +863,29 @@ def test_a_lost_id_is_not_looked_for_for_ever():
                     find = box.find
                     box.find = lambda folder, wanted: (
                         gw.Matches((), False) if folder == "Archive" else find(folder, wanted))
+                if case.startswith("archived under the last look"):
+                    # The last try is the first; the archive is unsure of the
+                    # id the first time, and the user moves the mail right
+                    # after the archive was searched (and, in the second case,
+                    # back to INBOX and to the archive again under the next;
+                    # in the third, the look-alike stays in INBOX).
+                    gw.LOST_TRIES, find, asked = 1, box.find, []
+
+                    def racing(folder, wanted, find=find, asked=asked, case=case, real=real):
+                        got = find(folder, wanted)
+                        if folder != "Archive" or wanted != "a@x.org":
+                            return got
+                        asked.append(folder)
+                        if len(asked) == 1:
+                            return gw.Matches((), False)
+                        if len(asked) == 2:
+                            box.move_mail("INBOX", real, "Archive")
+                        elif case.endswith("next") and len(asked) == 4:
+                            box.move_mail("INBOX", box.uid_of("INBOX", "a@x.org"), "Archive")
+                        elif case.endswith("next") and len(asked) == 3:
+                            box.move_mail("Archive", box.uid_of("Archive", "a@x.org"), "INBOX")
+                        return got
+                    box.find = racing
                 mirror, loop = _lost(gw, box, clock, mirror), {}
                 said, left = io.StringIO(), []
                 with contextlib.redirect_stdout(said):
@@ -801,9 +895,16 @@ def test_a_lost_id_is_not_looked_for_for_ever():
                         clock["now"] += DAY
                     snap = _turns(gw, mirror, clock, loop, 3)
                 recs = by_id(gw)
+                assert snap["lost"] == 0 and snap["connected"] is True, (case, snap)
+                if case.endswith("next"):
+                    # In the archive, and unmirrored: the id was looked for
+                    # once more, and leaves.
+                    assert ann not in recs and box.uid_of("Archive", ann), (case, recs)
+                    assert left[:2] == [1, 0], (case, left)
+                    assert "is no more where it was found" in said.getvalue(), case
+                    continue
                 assert recs.get(ann, {}).get("text") == "Ann: the contract is signed.", (
                     case, {m: r["text"] for m, r in recs.items()})
-                assert snap["lost"] == 0 and snap["connected"] is True, (case, snap)
                 if case == "a look-alike that never reads":
                     # Mallory's is a placeholder of its own, under its bytes.
                     assert [r["text"] for m, r in recs.items() if m != ann] == [
@@ -812,6 +913,9 @@ def test_a_lost_id_is_not_looked_for_for_ever():
                     # Waited for, LOST_TRIES times, then read as what it is.
                     assert gw.LOST_TRIES == 8 and left[:4] == [1] * 4, left
                     assert f"was looked for {gw.LOST_TRIES} times" in said.getvalue(), case
+                elif case.startswith("archived under the last look"):
+                    # Read from the archive by the look an hour on.
+                    assert left[:2] == [1, 0] and box.uid_of("Archive", ann), (case, left)
                 else:
                     assert left[0] == 0, (case, left)
             finally:

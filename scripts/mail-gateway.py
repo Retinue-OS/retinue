@@ -3149,13 +3149,19 @@ def _environment(exc: BaseException) -> bool:
 #       does not answer, every lost id waits (/health says the archive does
 #       not answer, and counts them); an id whose mail is in no folder, or
 #       no more where it was found, leaves the list with a log line and no
-#       "removed" event (there is no record to tombstone); a ledger restored
+#       "removed" event (there is no record to tombstone), so a mail moved
+#       during the last look can be left unmirrored; a ledger restored
 #       from an older backup over a live one can leave two record files for
 #       one id (a record written as the first time takes a name of its own,
 #       and the backup brings back the one it had before); a mail to
-#       oneself whose Sent copy is gone comes back as one that came in; and
-#       so, on a server that stamps a moved mail with a new arrival time,
-#       does an archived sent mail.
+#       oneself whose Sent copy is gone comes back as one that came in; so,
+#       on a server that stamps a moved mail with a new arrival time, does
+#       an archived sent mail; and an arrival time has whole seconds, so a
+#       look-alike under the id, From the same address, delivered in the
+#       same second, cannot be told from the record's own mail — archived,
+#       with the Sent copy gone, it comes back as the user's, and where the
+#       two lie in different folders the folder decides which is read as
+#       the record's (for a mail that came in, INBOX before the archive).
 #
 #   I4  A FAULT DELAYS ONLY THE WORK THAT FAILED. Following the folders —
 #       new mail, vanished mail — keeps the poll interval whatever the rest
@@ -4491,18 +4497,22 @@ class Mirror:
         first time where it lies (_ingest), with one thing more: in the
         archive, From that sender and received when the row said, where the
         row said "out", it is the user's own — a move keeps the arrival
-        time, a look-alike delivered later does not have it (_mirror_one).
-        Never in INBOX, nor in the archive on its From alone. The others are
-        then read as any further copy is: one more place of the record,
-        marked as another mail's, or a placeholder, by their own evidence.
+        time, a look-alike delivered a second or more later does not have it
+        (_mirror_one). Never in INBOX, nor in the archive on its From alone.
+        (An INTERNALDATE has whole seconds: a look-alike delivered in the
+        same second has all the record's own mail has, and where the two
+        lie in different folders, the folder decides.) The others are then
+        read as any further copy is: one more place of the record, marked as
+        another mail's, or a placeholder, by their own evidence.
 
         When the row said the mail arrived is the search's only bound where
         an id cannot be searched for (_find), and a copy received just then
         is read without waiting for the scan to be whole. ``plain``: the id
         was looked for LOST_TRIES times in vain, and nothing more is waited
         for — what is found is read as mail nothing is known of (no hint),
-        and the id leaves `lost`, found or not, or gone since the search
-        (_read_lost)."""
+        and the id leaves `lost`, found or not (_read_lost). Every match
+        gone since the search — a mail the user moved in that moment, it may
+        be — it is looked for so once more, and then leaves all the same."""
         mid = hint["message_id"]
         found, sure = [], True
         for order, role in enumerate(("sent", "inbox", "archive")):
@@ -4529,11 +4539,12 @@ class Mirror:
             # Which one is the record's: where it lies, who it is From, and
             # when it came.
             out, arrived = hint["direction"] == "out", hint["arrived"]
-            ranked, timely = [], False
+            ranked, timely, missed = [], False, False
             for order, role, name, uid in found:
                 got = self._peek(name, uid)
                 if got is None:
                     if plain:
+                        missed = True
                         continue
                     return False   # gone since the search: where to, the next one says
                 try:
@@ -4553,13 +4564,7 @@ class Mirror:
                 ranked.append(((*key, got.date is None, got.date or 0.0, order, uid),
                                (order, role, name, uid), unread, theirs, late))
             if not ranked:
-                # Every match gone since the search, on the last try: not
-                # found, as where the search names none.
-                self.index.run("DELETE FROM lost WHERE message_id = ?", (mid,))
-                print(f"[mail-gateway] the mail {mid!r}, whose record is gone from the "
-                      f"ledger, is no more where it was found: there is no record to "
-                      f"tombstone", flush=True)
-                return True
+                return self._gone_since_search(hint)   # every match, on the last try
             if not sure and not plain and not timely:
                 return False   # the scan reads on: the mail may be among the rest
             ranked.sort(key=lambda entry: entry[0])
@@ -4570,6 +4575,11 @@ class Mirror:
             # write, and a move keeps the arrival time.
             told = (top == "sent" or (top == "archive" and not stranger and not toplate)) \
                 if out else not (stranger or toplate)
+            if missed and not told:
+                # On the last try a match gone since the search may be the
+                # record's, and what is left is not known to be: not read in
+                # its place.
+                return self._gone_since_search(hint)
             if not plain and not told and len(ranked) > 1 \
                     and any(unread for _rank, _where, unread, _theirs, _late in ranked):
                 # A match that did not come back may be the record's, and the
@@ -4584,14 +4594,39 @@ class Mirror:
                              lost=hint if first else None)
             except NotRead:
                 return False   # its header block did not come back: not read (I1)
-            if first and self.index.one(
-                    "SELECT 1 FROM locations l JOIN folders f ON f.role = l.role "
-                    "AND f.gen = l.gen WHERE l.role = ? AND l.uid = ?", (role, uid)) is None:
+            if first and not self._placed(role, uid):
                 # Not read after all: the server holds no such mail there any
                 # more (moved since the search), or not under the UIDs it was
                 # found under. The next look tells where it is.
                 return False
+        if plain and not any(self._placed(role, uid) for _order, role, _name, uid in found):
+            return self._gone_since_search(hint)   # every match, on the last try
         self.index.run("DELETE FROM lost WHERE message_id = ?", (mid,))
+        return True
+
+    def _placed(self, role: str, uid: int) -> bool:
+        """Has the mail at a UID of a folder as it stands a place?"""
+        return self.index.one(
+            "SELECT 1 FROM locations l JOIN folders f ON f.role = l.role "
+            "AND f.gen = l.gen WHERE l.role = ? AND l.uid = ?", (role, uid)) is not None
+
+    def _gone_since_search(self, hint) -> bool:
+        """On the last try (_read_found), every match of a lost id is gone
+        since the search — or one is, and what is left is not known to be
+        the record's: moved, it may be, between the search and the fetch.
+        The id is looked for once more, as plainly, an hour on (its tries,
+        at LOST_TRIES, say that it was); gone again, or named by no search,
+        it leaves `lost` — and a mail moved under both looks can be left
+        unmirrored. True: nothing more is waited for."""
+        mid = hint["message_id"]
+        if hint["tries"] < LOST_TRIES:
+            self.index.run("UPDATE lost SET tries = ?, due = ? WHERE message_id = ?",
+                           (LOST_TRIES, self._clock() + SET_ASIDE_RETRY_SECONDS, mid))
+            return True
+        self.index.run("DELETE FROM lost WHERE message_id = ?", (mid,))
+        print(f"[mail-gateway] the mail {mid!r}, whose record is gone from the "
+              f"ledger, is no more where it was found: there is no record to "
+              f"tombstone", flush=True)
         return True
 
     # -- backfill --------------------------------------------------------------
@@ -4827,18 +4862,21 @@ class Mirror:
             # The mail of a record gone from the ledger (_read_found), From the
             # very sender that record had, which was the user's own, in Sent,
             # or in the archive received when that record said (a move keeps
-            # the arrival time; a look-alike delivered later does not have
-            # it): the user's again, whatever address that is (a plus-address,
-            # an alias nobody listed). Never on the strength of its From alone
-            # — that is its sender's to write, and whoever was sent a mail
-            # knows its id: a look-alike archived, or in an "all mail"
-            # archive, stays a mail that came in, and so do a mail to oneself
-            # whose Sent copy is gone and, on a server that stamps a moved
-            # mail with a new arrival time, an archived sent mail. Any other
-            # is read as a first reading here is. (Under an id the provider
-            # gave it — kept for the lost id, see _prepare — it is the record
-            # under the id the gateway minted again, with that one as
-            # kb:sentAs and the author noted under it.)
+            # the arrival time; a look-alike delivered a second or more later
+            # does not have it): the user's again, whatever address that is (a
+            # plus-address, an alias nobody listed). Never on the strength of
+            # its From alone — that is its sender's to write, and whoever was
+            # sent a mail knows its id: a look-alike archived, or in an "all
+            # mail" archive, stays a mail that came in, and so do a mail to
+            # oneself whose Sent copy is gone and, on a server that stamps a
+            # moved mail with a new arrival time, an archived sent mail. (A
+            # look-alike delivered in the same second as the Sent copy, and
+            # archived, with that copy gone, has all the record's own has: it
+            # comes back as the user's.) Any other is read as a first reading
+            # here is. (Under an id the provider gave it — kept for the lost
+            # id, see _prepare — it is the record under the id the gateway
+            # minted again, with that one as kb:sentAs and the author noted
+            # under it.)
             outbound = True
             if mail.message_id != lost["message_id"]:
                 sent_as = [mail.message_id]
