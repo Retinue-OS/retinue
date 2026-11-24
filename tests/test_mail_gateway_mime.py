@@ -980,13 +980,13 @@ def test_a_mail_whose_record_cannot_be_written_is_a_placeholder_too():
         box.put("INBOX", t.msg("ok@x.org", day=2))
         real = gw._trim.trim
 
-        def trim(plain, html, subject=None):
+        def trim(plain, html, subject=None, **evidence):
             if subject == "poison":
                 raise RecursionError("a fault that this mail brings out, every time")
             if subject == "huge":
                 # Memory is the mail's too: every other mail is mirrored.
                 raise MemoryError()
-            return real(plain, html, subject=subject)
+            return real(plain, html, subject=subject, **evidence)
         gw._trim.trim = trim
         try:
             mirror.poll()
@@ -1114,6 +1114,39 @@ def test_a_mail_above_the_mail_cap_keeps_its_text_only():
         record, _mirror, _box = ingest(gw, raw)
         assert files(gw, record)[0][2] == b"a" * 30_000
     print("ok: a mail above the cap keeps its text parts and says its attachments were left out")
+
+
+def test_the_trim_is_given_its_evidence():
+    """The trim cuts history that carries no ">" only from a mail that cites a
+    parent, and a footer only from mail that says itself it is bulk — so the
+    gateway has to hand it both facts (scripts/mail_trim.py)."""
+    with tempfile.TemporaryDirectory() as tmp:
+        gw = t.load(tmp)
+        history = (b"Yes, noon works.\r\n\r\n-----Original Message-----\r\n"
+                   b"From: Me <me@example.org>\r\nSent: Monday, November 2, 2026 9:00 AM\r\n"
+                   b"To: Ann <a@x.org>\r\nSubject: Lunch\r\n\r\nLunch at noon?\r\n")
+
+        def mail(*headers: bytes):
+            raw = (b"From: Ann <a@x.org>\r\nTo: me@example.org\r\nSubject: Re: Lunch\r\n"
+                   b"Message-ID: <2@x.org>\r\n" + b"".join(h + b"\r\n" for h in headers)
+                   + b"Content-Type: text/plain; charset=utf-8\r\n\r\n" + history)
+            return gw.parse_mail(raw, t.NOW)
+
+        # A reply (it cites its parent): the Outlook-style history goes.
+        reply = mail(b"In-Reply-To: <1@x.org>", b"References: <1@x.org>")
+        assert reply.cited and not reply.bulk
+        assert gw.Mirror._reading_text(reply) == ("Yes, noon works.", "deterministic")
+        # The same words in a mail that cites nothing are not known to be
+        # history: they stay, and the state says a better trim is wanted.
+        alone = mail()
+        text, state = gw.Mirror._reading_text(alone)
+        assert not alone.cited and "Lunch at noon?" in text and state == "wanting"
+        # Bulk is what the mail says of itself, by any of the three headers.
+        assert mail(b"List-Id: <news.x.org>").bulk
+        assert mail(b"List-Unsubscribe: <mailto:leave@x.org>").bulk
+        assert mail(b"Precedence: BULK").bulk
+        assert not mail(b"Precedence: first-class").bulk
+    print("ok: the trim is told whether a mail is a reply and whether it is bulk")
 
 
 def main():

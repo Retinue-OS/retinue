@@ -456,6 +456,7 @@ class Mail:
     references: list = field(default_factory=list)
     cited: list = field(default_factory=list)
     list_id: str = ""                       # the raw List-Id header
+    bulk: bool = False                      # the mail says itself it is list or bulk mail
     date: float | None = None               # the record's time (see parse_mail)
     arrived: float | None = None            # when the server received it; not the sender's to write
     headers: str = ""
@@ -851,6 +852,23 @@ def _read_date(msg, internal_date: float | None) -> float | None:
     return written if written is not None else internal_date
 
 
+# What bulk senders say of their own mail (RFC 2076 and common practice). The
+# value is the sender's to write; it only ever lets the trim cut a footer.
+_BULK_PRECEDENCE = frozenset({"bulk", "list", "junk"})
+
+
+def _is_bulk(msg, list_id: str) -> bool:
+    """Whether a mail declares itself list or bulk mail: a ``List-Id``, a
+    ``List-Unsubscribe``, or a bulk ``Precedence``. Evidence for the trim
+    (an unsubscribe block is a footer only in such mail), nothing else."""
+    try:
+        if list_id.strip() or _raw_header(msg, "List-Unsubscribe").strip():
+            return True
+        return _raw_header(msg, "Precedence").strip().lower() in _BULK_PRECEDENCE
+    except Exception:  # noqa: BLE001 - an unreadable header is no evidence
+        return False
+
+
 def parse_mail(raw: bytes, internal_date: float | None = None) -> Mail:
     """Read one raw mail into what the mirror records.
 
@@ -879,6 +897,7 @@ def parse_mail(raw: bytes, internal_date: float | None = None) -> Mail:
     mail.cc = _addresses(msg, "Cc")
     _read_ids(msg, mail)
     mail.list_id = _clean_line(_UNFOLD_RE.sub("", _raw_header(msg, "List-Id")), 998)
+    mail.bulk = _is_bulk(msg, mail.list_id)
     mail.date = _read_date(msg, internal_date)
     mail.headers = head.decode("utf-8", errors="replace").replace("\r\n", "\n")
     texts: dict = {"text/plain": [], "text/html": []}
@@ -2628,7 +2647,13 @@ class Mirror:
         """``(kb:text, kb:trim)`` of a mail: its trimmed text, capped."""
         if mail.unreadable is not None:
             return UNREADABLE_TEXT, "deterministic"
-        trimmed = _trim.trim(mail.plain, mail.html, subject=mail.subject)
+        # The trim cuts on evidence only (scripts/mail_trim.py): history that
+        # carries no ">" goes only from a mail that cites a parent, an
+        # unsubscribe block or a list footer only from mail that says itself
+        # it is bulk. Without the evidence the text stays and the state says
+        # a better trim is wanted.
+        trimmed = _trim.trim(mail.plain, mail.html, subject=mail.subject,
+                             is_reply=bool(mail.cited), bulk=mail.bulk)
         if len(trimmed.text) <= MAX_RECORD_TEXT_CHARS:
             return trimmed.text, trimmed.state
         # Cut, and said to be: the mark for a reader, the state for whoever
