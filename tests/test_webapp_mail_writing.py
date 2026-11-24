@@ -50,15 +50,25 @@ and pin:
     request_key, the focus going with it); it is kept on the device — in a
     record of its own, which costs the composer's kept words nothing — and
     comes back after a reload until it is accounted for or dismissed, with
-    its words offered back and never in silence; Check again posts the same
+    its words offered back and never in silence — to the clipboard where
+    the chat cannot be written to; two tabs on one chat each keep the
+    other's mails in the record; a time no date can be made of is no
+    record, and a record that cannot be read does not keep the chat from
+    opening; Check again posts the same
     body under the same key, but only after the recipients were asked for
     and still are whom the press's line named; no answer, a 5xx that does
     not say `"sent": false` or a 200 that is no document put the words back
     with the key they went under, so the same press again is the same mail
     — also across a reload and a page left mid-send;
   * a send that certainly failed ends its press: any 4xx and any answer
-    with `"sent": false` is "Not sent", the words stay and the next press
-    mints a new key (the composer and the compose sheet alike);
+    with `"sent": false` is "Not sent" and the words stay; the next press
+    mints a new key where that word is the mail gateway's (`"by":
+    "gateway"`, or no `"by"` on a first press), while the dashboard's own
+    keeps the key, known to have sent nothing; a press made again under a
+    key whose first outcome is unknown, refused by anyone but the mail
+    gateway (the dashboard, a proxy, an older server), keeps its key and
+    says the server could not be asked — on the composer, Check again and
+    the compose sheet alike;
   * the key's life: one per press, dropped as soon as the box holds other
     words (even for a moment), and when the press turns up in the thread —
     a mail like it, or the server's entry under its key (the words then
@@ -85,8 +95,11 @@ and pin:
     mail, Escape and the focus given back, the page behind inert, the unsent
     mail kept per mailbox and never moved to another one unseen — nor
     forgotten once another mailbox is written from: every opening names the
-    mailboxes that hold one, and a mail whose mailbox can send again comes
-    back;
+    mailboxes that hold one (and renews them, so none is dropped for its
+    age), a mail whose mailbox can send again comes back, and one whose
+    mailbox is not offered is shown, to be copied into the mail in the form
+    or discarded; a kept press is asked about again under its key only
+    within twelve hours;
   * the quick-pattern prompts worded for mail.
 
 Standalone like the rest of the suite. Needs `node` on PATH; without it the
@@ -1451,14 +1464,18 @@ await ok('Check again asks about the same press, and never sends a second mail',
   await q.p;
   await quiet(el);
   assert.deepEqual(el._thread.layout(), ['m1', 'm2', 'm3', 'P:q1']);
-  // The gateway's word is that it did not go: now, and only now, the words
-  // come back — after what the box holds. Its word on this press is a 424
-  // (the send failed for certain), or a refusal that names the key.
+  // The mail gateway's word is that it did not go: now, and only now, the
+  // words come back — after what the box holds. Its word on this press is
+  // an answer that says it is its own (`"by": "gateway"`): a 424 (the send
+  // failed for certain), a refusal, a 503 that says nothing was sent.
   for (const [doc, status, note] of [
-    [{ error: 'The mail server refused it.', sent: false }, 424, 'Not sent: The mail server refused it. The text is back in the box.'],
-    [{}, 424, 'Not sent: the server refused it (424). The text is back in the box.'],
-    [{ error: 'This thread has no mail left to reply to.', request_key: 'KEY' }, 409,
+    [{ error: 'The mail server refused it.', sent: false, by: 'gateway' }, 424,
+     'Not sent: The mail server refused it. The text is back in the box.'],
+    [{ by: 'gateway' }, 424, 'Not sent: the server refused it (424). The text is back in the box.'],
+    [{ error: 'This thread has no mail left to reply to.', request_key: 'KEY', by: 'gateway' }, 409,
      'Not sent: This thread has no mail left to reply to. The text is back in the box.'],
+    [{ error: 'the mail gateway is not configured', sent: false, request_key: 'KEY', by: 'gateway' }, 503,
+     'Not sent: the mail gateway is not configured The text is back in the box.'],
   ]) {
     ({ el, first } = await start());
     el._draft = 'typed since';
@@ -1487,16 +1504,25 @@ await ok('Check again asks about the same press, and never sends a second mail',
   assert.deepEqual(el._into, []);
   assert.equal(el._notes.at(-1), 'The server could not be asked about this mail. It is still not confirmed; nothing was sent a second time.');
   // An answer that is about this request, not about the first one, says
-  // nothing of the mail: a gateway that could not be reached now ("sent":
-  // false — nothing was sent NOW), a sign-in that ran out, another site's
-  // request refused, a proxy's error. None of them is "Not sent".
+  // nothing of the mail: the dashboard's own (a gateway that could not be
+  // reached now — "sent": false, nothing was sent NOW —, no gateway for the
+  // mailbox, a sign-in that ran out, another site's request refused), a
+  // proxy's error, and a server too old to say whose word it is — whose
+  // 424 might be the dashboard's as well. None of them is "Not sent".
   for (const [doc, status, why] of [
+    [{ error: 'The mail gateway could not be reached; nothing was sent.', sent: false, request_key: 'KEY', by: 'dashboard' }, 502,
+     ' (The mail gateway could not be reached; nothing was sent.)'],
     [{ error: 'The mail gateway could not be reached; nothing was sent.', sent: false, request_key: 'KEY' }, 502,
      ' (The mail gateway could not be reached; nothing was sent.)'],
     [{ error: 'the mail gateway is not configured', sent: false, request_key: 'KEY' }, 503, ' (the mail gateway is not configured)'],
+    [{ error: 'send failed: refused', sent: false, request_key: 'KEY' }, 424, ' (send failed: refused)'],
+    [{ error: 'no mail gateway serves that mailbox', sent: false, request_key: 'KEY', by: 'dashboard' }, 409,
+     ' (no mail gateway serves that mailbox)'],
+    [{ error: 'This thread has no mail left to reply to.', request_key: 'KEY' }, 409, ' (This thread has no mail left to reply to.)'],
     [{}, 401, ' (it answered 401)'],
-    [{ error: 'cross-site request rejected' }, 403, ' (cross-site request rejected)'],
+    [{ error: 'cross-site request rejected', by: 'dashboard' }, 403, ' (cross-site request rejected)'],
     [{ error: 'no gateway serves this chat' }, 409, ' (no gateway serves this chat)'],
+    [{ error: 'odd', by: 'Gateway' }, 409, ' (odd)'],
     [null, 500, ' (it answered 500)'],
   ]) {
     q = await again(el);
@@ -1687,7 +1713,7 @@ await ok('an unconfirmed mail survives a reload on the device until it is accoun
   let q = take((w) => w.method === 'POST', 'the question');
   assert.equal(q.url, SEND_URL);
   assert.deepEqual(q.body, first.body, 'the very request of the press');
-  q.answer({ error: 'send failed: the mail server refused it', sent: false, request_key: key }, 424);
+  q.answer({ error: 'send failed: the mail server refused it', sent: false, request_key: key, by: 'gateway' }, 424);
   await p;
   await quiet(el);
   assert.deepEqual(el._thread.layout(), ['m1', 'm2', 'm3']);
@@ -1773,6 +1799,27 @@ await ok('an unconfirmed mail survives a reload on the device until it is accoun
   keep('nonsense');
   el = await reload();
   assert.deepEqual(el._thread.layout(), ['m1', 'm2', 'm3']);
+  // A time no date can be made of is none: the chat opens, with the rest.
+  keep([{ ...rec, key: 'a'.repeat(32), at: -1e17 }, { ...rec, key: 'b'.repeat(32), at: 0 },
+        { ...rec, key: 'c'.repeat(32), at: -1 }, rec]);
+  el = await reload();
+  assert.equal(el._state, 'ok');
+  assert.deepEqual(el._thread.layout(), ['m1', 'm2', 'm3', 'local-1']);
+  assert.ok(el._thread.node('local-1').html.includes('kept text'));
+  // And whatever else goes wrong with the record, the chat opens — without
+  // its bubbles, and with the record left for a page that can read it.
+  keep([rec]);
+  const redraw = Page.prototype._redrawUnconfirmed;
+  Page.prototype._redrawUnconfirmed = function () { redraw.call(this); throw new RangeError('bad record'); };
+  try {
+    el = await reload();
+  } finally {
+    Page.prototype._redrawUnconfirmed = redraw;
+  }
+  assert.equal(el._state, 'ok');
+  assert.deepEqual(el._thread.layout(), ['m1', 'm2', 'm3']);
+  assert.deepEqual(el._unconfirmed, []);
+  assert.equal(kept().list.length, 1, 'the words are in no other place: kept');
   // Its text is text: escaped like any bubble's.
   keep([{ ...rec, text: '<img src=x onerror=alert(1)>' }]);
   el = await reload();
@@ -1812,6 +1859,91 @@ await ok('an unconfirmed mail survives a reload on the device until it is accoun
   } finally {
     realKeep = false;
   }
+});
+
+await ok('where the chat cannot be written to, the words of a bubble go to the clipboard', async () => {
+  const KEPT = `retinue-draft:chat-unsure:${ID}`;
+  const rec = { key: 'k'.repeat(32), text: 'kept words', mode: 'all', shown: 'x', at: Date.now() - 1000,
+                messageId: '', echoed: true, files: 0, stale: false };
+  const off = { can_send: false, cannot_send_reason: 'The mail gateway is not connected.' };
+  const copied = [];
+  let works = true;
+  Object.defineProperty(navigator, 'clipboard', { configurable: true, value: {
+    writeText: async (t) => { if (!works) throw new Error('denied'); copied.push(t); } } });
+  try {
+    store.clear();
+    store.set(KEPT, JSON.stringify({ at: Date.now(), v: { list: [rec] } }));
+    let el = await open(off, BASE, [pend('f1', { status: 'failed', error: 'Refused.', text: 'failed words' })], PV(), true);
+    const h = el._thread.node('local-1').html;
+    assert.ok(h.includes('data-unsure-copy') && h.includes('>Copy text</button>') && !h.includes('back to the composer'), h);
+    assert.ok(el._thread.pnode('f1').html.includes('>Copy text</button>'));
+    await el._copyUnconfirmed('local-1');
+    assert.deepEqual(copied, ['kept words']);
+    assert.equal(el._notes.at(-1), 'The text is copied. This chat cannot be written to just now. '
+      + 'If this mail shows up in the thread, do not send it again.');
+    assert.deepEqual(el._thread.layout(), ['m1', 'm2', 'm3', 'local-1', 'P:f1'], 'the bubbles stay');
+    assert.equal(el._draft, '');
+    await el._copyPending('f1');
+    assert.deepEqual(copied, ['kept words', 'failed words']);
+    assert.ok(el._notes.at(-1).startsWith('The text is copied.'), el._notes.at(-1));
+    // A clipboard that refuses: said, and the words stay in the bubble.
+    works = false;
+    await el._copyUnconfirmed('local-1');
+    assert.ok(el._notes.at(-1).startsWith('The text could not be copied here.'), el._notes.at(-1));
+    assert.equal(JSON.parse(store.get(KEPT)).v.list.length, 1);
+    // Where it can be written to, the words go back into the box as before.
+    el = await open({}, BASE, [], PV(), true);
+    el._into = [];
+    el._restoreComposer = (t) => { el._into.push(t); el._draft = t; };
+    assert.ok(el._thread.node('local-1').html.includes('Copy text back to the composer'));
+  } finally {
+    delete navigator.clipboard;
+  }
+});
+
+await ok('two tabs on one chat: neither erases the other\'s unconfirmed mail', async () => {
+  const KEPT = `retinue-draft:chat-unsure:${ID}`;
+  const kept = () => { const r = JSON.parse(store.get(KEPT) || 'null'); return r ? r.v.list.map((x) => x.text) : []; };
+  const press = async (el, text) => {
+    const p = el._sendChat(text);
+    await settle();
+    answerPreview(el, PV(), 'the preview at the press');
+    await settle();
+    const req = take((w) => w.method === 'POST', 'the send');
+    req.answer({ unconfirmed: true, request_key: req.body.request_key }, 202);
+    await p;
+    await quiet(el);
+  };
+  // Both tabs read the record before either pressed.
+  const a = await open();
+  a._restoreComposer = (t) => { a._draft = t; };
+  const b = await open({}, BASE, [], PV(), true);
+  b._restoreComposer = (t) => { b._draft = t; };
+  await press(a, 'from tab A');
+  await press(b, 'from tab B');
+  assert.deepEqual(kept(), ['from tab A', 'from tab B']);
+  // A reload shows both.
+  let c = await open({}, BASE, [], PV(), true);
+  assert.deepEqual(c._unconfirmed.map((u) => u.text), ['from tab A', 'from tab B']);
+  // What a tab lets go of goes; what it never held stays.
+  b._dismissUnconfirmed(b._unconfirmed[0].id);
+  assert.deepEqual(kept(), ['from tab A']);
+  await press(b, 'again from tab B');
+  assert.deepEqual(kept(), ['from tab A', 'again from tab B']);
+  a._dismissUnconfirmed(a._unconfirmed[0].id);
+  assert.deepEqual(kept(), ['again from tab B']);
+  // A tab that held a mail since its load and let it go does not bring it
+  // back either; one it never held is not dropped by its writes.
+  c = await open({}, BASE, [], PV(), true);
+  c._restoreComposer = (t) => { c._draft = t; };
+  assert.deepEqual(c._unconfirmed.map((u) => u.text), ['again from tab B']);
+  c._dismissUnconfirmed(c._unconfirmed[0].id);
+  assert.deepEqual(kept(), []);
+  await press(c, 'from tab C');
+  assert.deepEqual(kept(), ['from tab C']);
+  await press(b, 'third from tab B');
+  assert.deepEqual(kept(), ['again from tab B', 'from tab C', 'third from tab B'],
+    'tab B still holds its own: kept again by its next write, beside the one it never held');
 });
 
 await ok('focus on an unconfirmed bubble goes with what takes its place', async () => {
@@ -1857,7 +1989,7 @@ await ok('focus on an unconfirmed bubble goes with what takes its place', async 
   await settle();
   answerPreview(el, PV(), 'the preview before the question');
   await settle();
-  take((w) => w.method === 'POST', 'the question').answer({ error: 'Refused.', sent: false }, 424);
+  take((w) => w.method === 'POST', 'the question').answer({ error: 'Refused.', sent: false, by: 'gateway' }, 424);
   await p;
   assert.equal(globalThis.focused, box, 'the composer');
   await quiet(el);
@@ -1974,16 +2106,116 @@ await ok('a send that certainly failed ends its press: "sent": false is "Not sen
     assert.notEqual(req.body.request_key, key, String(status));
     assert.deepEqual(el._thread.layout(), ['m1', 'm2', 'm3', 's-after']);
   }
-  // Also where the failed press was itself a repeat of one never answered.
-  const el = await open();
-  el._restoreComposer = (t) => { el._draft = t; };
-  let req = await send(el, 'twice', 'offline');
-  const key = req.body.request_key;
-  req = await send(el, 'twice', { error: 'send failed: refused', sent: false, request_key: key }, 424);
-  assert.equal(req.body.request_key, key, 'the repeat went under the first key');
-  assert.equal(el._retry, null);
-  req = await send(el, 'twice', sentMsg('s-twice', 'twice'));
-  assert.notEqual(req.body.request_key, key);
+  // The same answers with the mail gateway named as the one that said so.
+  for (const [doc, status] of [
+    [{ error: 'send failed: refused', sent: false, request_key: 'KEY', by: 'gateway' }, 424],
+    [{ error: 'no recipient', request_key: 'KEY', by: 'gateway' }, 400],
+    [{ error: 'not configured', sent: false, request_key: 'KEY', by: 'gateway' }, 503],
+  ]) {
+    const el = await open();
+    el._restoreComposer = (t) => { el._draft = t; };
+    let req = await send(el, 'will it go?', doc, status);
+    const key = req.body.request_key;
+    assert.ok(el._notes.at(-1).startsWith('Not sent: '), String(status));
+    assert.equal(el._retry, null, String(status));
+    req = await send(el, 'will it go?', sentMsg('s-after', 'will it go?'));
+    assert.notEqual(req.body.request_key, key, String(status));
+  }
+  // The dashboard's own "not sent" of a first press is "Not sent" too — but
+  // only the mail gateway's word ends a key: this one stays with the words,
+  // which costs nothing (the gateway never saw it, and takes it as new).
+  for (const [doc, status] of [
+    [{ error: 'The mail gateway could not be reached; nothing was sent.', sent: false, request_key: 'KEY', by: 'dashboard' }, 502],
+    [{ error: 'no mail gateway serves that mailbox', sent: false, request_key: 'KEY', by: 'dashboard' }, 409],
+  ]) {
+    const el = await open();
+    el._restoreComposer = (t) => { el._draft = t; };
+    let req = await send(el, 'will it go?', doc, status);
+    const key = req.body.request_key;
+    assert.equal(el._notes.at(-1), `Not sent: ${doc.error}`, String(status));
+    assert.equal(el._retry && el._retry.key, key, 'the key stays with the words');
+    // Pressed again and refused by the dashboard again: it is known that
+    // nothing went out under that key, so this is "Not sent" once more.
+    req = await send(el, 'will it go?', doc, status);
+    assert.equal(req.body.request_key, key);
+    assert.equal(el._notes.at(-1), `Not sent: ${doc.error}`, String(status));
+    assert.ok(!el._notes.some((n) => /not known/i.test(n)), el._notes.join(' | '));
+    req = await send(el, 'will it go?', sentMsg('s-after', 'will it go?'));
+    assert.equal(req.body.request_key, key, 'the gateway takes the key it never saw as a new mail');
+    assert.equal(el._retry, null, 'answered: the key is spent');
+  }
+});
+
+await ok('a press made again whose first outcome is unknown loses its key only on the mail gateway\'s word', async () => {
+  // The first press got no answer (the stack restarted mid-send: the mail
+  // may have left). Pressed again while the mail gateway is still starting,
+  // the dashboard answers for itself — that request was never put to the
+  // gateway, and nothing is learnt of the first. The key stays.
+  for (const [doc, status] of [
+    [{ error: 'The mail gateway could not be reached ([Errno 111] Connection refused); nothing was sent.',
+       sent: false, request_key: 'KEY', by: 'dashboard' }, 502],
+    [{ error: 'no mail gateway serves that mailbox', sent: false, request_key: 'KEY', by: 'dashboard' }, 409],
+    [{ error: 'cross-site request rejected', by: 'dashboard' }, 403],
+    [{ error: 'gone', by: 'dashboard' }, 410],
+    // A server too old to say who answered, and a proxy's own 4xx.
+    [{ error: 'The mail gateway could not be reached; nothing was sent.', sent: false, request_key: 'KEY' }, 502],
+    [{ error: 'send failed: refused', sent: false, request_key: 'KEY' }, 424],
+    [null, 413],
+  ]) {
+    const el = await open();
+    el._restoreComposer = (t) => { el._draft = t; };
+    let req = await send(el, 'twice', 'offline');
+    const key = req.body.request_key;
+    req = await send(el, 'twice', doc && doc.request_key ? { ...doc, request_key: key } : doc, status);
+    assert.equal(req.body.request_key, key, 'the repeat went under the first key');
+    const why = (doc && doc.error) || `it answered ${status}`;
+    assert.equal(el._notes.at(-1), `The server could not be asked about this mail just now (${why}). `
+      + 'It is still not known whether the first attempt went out. It is back in the box &mdash; '
+      + 'if it shows up in the thread, do not send it again.', String(status));
+    assert.ok(!el._notes.some((n) => n.startsWith('Not sent')), el._notes.join(' | '));
+    assert.equal(el._draft, 'twice', 'the words are in the box');
+    assert.equal(el._retry && el._retry.key, key, `${status}: the key stays with them`);
+    assert.equal(el._retry.sure, false);
+    // Asked once the gateway is back: the same key, answered as a repeat.
+    req = await send(el, 'twice', sentMsg('s-twice', 'twice', { repeat: true }));
+    assert.equal(req.body.request_key, key, String(status));
+  }
+  // The mail gateway's own word about the key ends the press.
+  for (const [doc, status] of [
+    [{ error: 'send failed: refused', sent: false, request_key: 'KEY', by: 'gateway' }, 424],
+    [{ error: 'This thread has no mail left to reply to.', request_key: 'KEY', by: 'gateway' }, 409],
+    [{ error: 'the mail gateway is not configured', sent: false, request_key: 'KEY', by: 'gateway' }, 503],
+  ]) {
+    const el = await open();
+    el._restoreComposer = (t) => { el._draft = t; };
+    let req = await send(el, 'twice', 'offline');
+    const key = req.body.request_key;
+    req = await send(el, 'twice', { ...doc, request_key: key }, status);
+    assert.equal(req.body.request_key, key);
+    assert.equal(el._notes.at(-1), `Not sent: ${doc.error}`, String(status));
+    assert.equal(el._retry, null, String(status));
+    req = await send(el, 'twice', sentMsg('s-twice', 'twice'));
+    assert.notEqual(req.body.request_key, key, String(status));
+  }
+  // The key kept across a reload is still the unknown one's.
+  realKeep = true;
+  try {
+    let el = await open();
+    el._restoreComposer = (t) => { el._draft = t; el._keepLocal(); };
+    let req = await send(el, 'across', 'offline');
+    const key = req.body.request_key;
+    req = await send(el, 'across', { error: 'unreached', sent: false, by: 'dashboard' }, 502);
+    el = await open({}, BASE, [], PV(), true);
+    assert.equal(el._draft, 'across');
+    assert.equal(el._retry && el._retry.key, key);
+    assert.equal(el._retry.sure, false);
+    el._restoreComposer = (t) => { el._draft = t; };
+    req = await send(el, 'across', { error: 'unreached', sent: false, by: 'dashboard' }, 502);
+    assert.equal(req.body.request_key, key);
+    assert.ok(el._notes.at(-1).startsWith('The server could not be asked about this mail just now'), el._notes.at(-1));
+  } finally {
+    realKeep = false;
+  }
 });
 
 await ok('one key per press: other words in the box, even for a moment, end the kept press', async () => {
@@ -2275,7 +2507,7 @@ await ok('the key stays with the words across a reload', async () => {
   const key = req.body.request_key;
   const kept = JSON.parse(store.get(`retinue-draft:chat:${ID}`)).v;
   assert.ok(Math.abs(Date.now() - kept.retry.at) < 60000);
-  assert.deepEqual({ ...kept.retry, at: 0 }, { key, text: 'kept words', mode: 'sender', imgs: '[]', at: 0, seen: 0 });
+  assert.deepEqual({ ...kept.retry, at: 0 }, { key, text: 'kept words', mode: 'sender', imgs: '[]', at: 0, seen: 0, sure: false });
   // The words reach the server's draft; the press is kept all the same.
   el._draftSaved = 'kept words';
   el._keepLocal();
@@ -2310,7 +2542,7 @@ await ok('the key stays with the words across a reload', async () => {
   // one from long ago — the same words typed then are a mail of their own,
   // which the gateway must not take for the old one.
   const keep = (retry) => store.set(`retinue-draft:chat:${ID}`, JSON.stringify({ at: Date.now(), v: { text: 'x', version: 0, retry } }));
-  const good = { key: 'k'.repeat(32), text: 'x', mode: 'all', imgs: '[]', at: Date.now() - 60 * 1000, seen: 0 };
+  const good = { key: 'k'.repeat(32), text: 'x', mode: 'all', imgs: '[]', at: Date.now() - 60 * 1000, seen: 0, sure: false };
   keep(good);
   el = await open({}, BASE, [], PV(), true);
   assert.deepEqual(el._retry, good);
@@ -3166,6 +3398,249 @@ await ok('a mail kept for another mailbox is not forgotten once a different one 
   store.set(INDEX, JSON.stringify({ at: Date.now(), v: { account: WORK, waiting: 'me@example.org' } }));
   ({ el, root } = openSheet(ONLY_WORK, true));
   assert.deepEqual(el._parked, []);
+});
+
+await ok('the sheet: a press made again loses its key only on the mail gateway\'s word', async () => {
+  // A first press the dashboard refused for itself: "Not sent", and the key
+  // stays with the mail — nothing went out under it, so the next opening
+  // does not call it unconfirmed, and the next press is "Not sent" again.
+  let { el, root } = openSheet();
+  write(root);
+  let p = el._submit();
+  let req = take((w) => w.method === 'POST', 'the compose');
+  const k0 = req.body.request_key;
+  req.answer({ error: 'The mail gateway could not be reached; nothing was sent.', sent: false, request_key: k0, by: 'dashboard' }, 502);
+  await p;
+  assert.equal(q(root, '[data-err="form"]').textContent, 'Not sent: The mail gateway could not be reached; nothing was sent.');
+  assert.equal(kept().press.key, k0);
+  assert.equal(kept().press.sure, true);
+  el.close();
+  ({ el, root } = openSheet(ONE, true));
+  assert.ok(root.innerHTML.includes('The mail you started earlier is back.</p>'), 'nothing said of a press that sent nothing');
+  p = el._submit();
+  req = take((w) => w.method === 'POST', 'the compose');
+  assert.equal(req.body.request_key, k0);
+  req.answer({ error: 'no mail gateway serves that mailbox', sent: false, request_key: k0, by: 'dashboard' }, 409);
+  await p;
+  assert.equal(q(root, '[data-err="form"]').textContent, 'Not sent: no mail gateway serves that mailbox');
+  // A press whose outcome nobody knows, made again and refused by anyone but
+  // the mail gateway — the dashboard, a proxy, a server too old to say —
+  // was not put to the gateway: the key stays, and it is still not known.
+  for (const [doc, status] of [
+    [{ error: 'The mail gateway could not be reached; nothing was sent.', sent: false, request_key: 'K', by: 'dashboard' }, 502],
+    [{ error: 'no mail gateway serves that mailbox', sent: false, request_key: 'K', by: 'dashboard' }, 409],
+    [{ error: 'the gateway has not said which mailbox it serves', sent: false, by: 'dashboard' }, 502],
+    [{}, 403],
+    [{ error: 'send failed: refused', sent: false, request_key: 'K' }, 424],
+  ]) {
+    ({ el, root } = openSheet());
+    write(root);
+    p = el._submit();
+    req = take((w) => w.method === 'POST', 'the compose');
+    const key = req.body.request_key;
+    req.fail();
+    await p;
+    p = el._submit();
+    req = take((w) => w.method === 'POST', 'the compose again');
+    assert.equal(req.body.request_key, key);
+    req.answer(doc.request_key ? { ...doc, request_key: key } : doc, status);
+    await p;
+    const why = doc.error || `it answered ${status}`;
+    assert.equal(q(root, '[data-err="form"]').textContent, `The server could not be asked about this mail just now (${why}). ` +
+      'It is still not known whether the first attempt went out: look for it in the chat list before you send it again.', String(status));
+    assert.equal(kept().press.key, key, `${status}: the key stays`);
+    assert.equal(kept().press.sure, false);
+    el.close();
+    ({ el, root } = openSheet(ONE, true));
+    assert.ok(root.innerHTML.includes('it is not confirmed whether it went out'), String(status));
+    p = el._submit();
+    req = take((w) => w.method === 'POST', 'the compose once more');
+    assert.equal(req.body.request_key, key, String(status));
+    req.answer({ id: 'email:~me@example.org:r@me.example.org', message: {}, repeat: true });
+    await p;
+  }
+  // The mail gateway's own word ends the press, made again or not.
+  for (const [doc, status] of [
+    [{ error: 'send failed: refused', sent: false, request_key: 'K', by: 'gateway' }, 424],
+    [{ error: 'The address does not exist.', by: 'gateway' }, 400],
+    [{ error: 'the mail gateway is not configured', sent: false, by: 'gateway' }, 503],
+  ]) {
+    ({ el, root } = openSheet());
+    write(root);
+    p = el._submit();
+    req = take((w) => w.method === 'POST', 'the compose');
+    const key = req.body.request_key;
+    req.fail();
+    await p;
+    p = el._submit();
+    req = take((w) => w.method === 'POST', 'the compose again');
+    req.answer(doc, status);
+    await p;
+    assert.equal(q(root, '[data-err="form"]').textContent, `Not sent: ${doc.error}`, String(status));
+    assert.equal(kept().press, null, String(status));
+    p = el._submit();
+    req = take((w) => w.method === 'POST', 'a new press');
+    assert.notEqual(req.body.request_key, key, String(status));
+    req.answer({ error: 'x', by: 'gateway' }, 400);
+    await p;
+  }
+});
+
+await ok('the sheet: a kept press is asked about again only within the hours its key is known', async () => {
+  const HOUR = 3600 * 1000;
+  const slot = (press) => store.set(SLOT(), JSON.stringify({ at: Date.now(), v: {
+    to: [{ address: 'ann@example.com', name: '' }], cc: [], typed: { to: '', cc: '' }, subject: '', text: 'Hello',
+    account: ACCT, press } }));
+  const sig = JSON.stringify({ channel: 'email', to: ['ann@example.com'], cc: [], subject: '', text: 'Hello', account: ACCT });
+  const K = 'k'.repeat(32);
+  // Recent: the same key, and the note that it is not confirmed.
+  store.clear();
+  slot({ key: K, sig, at: Date.now() - 2 * HOUR });
+  let { el, root } = openSheet(ONE, true);
+  assert.ok(root.innerHTML.includes('It was being sent when this sheet was last open'));
+  let p = el._submit();
+  let req = take((w) => w.method === 'POST', 'the compose');
+  assert.equal(req.body.request_key, K);
+  req.fail();
+  await p;
+  // From longer ago — or kept without its time, by an older page: the
+  // gateway may no longer know the key, so the same request would be a
+  // second mail it cannot tell from the first. A new key, and the note says
+  // only to look first.
+  for (const press of [{ key: K, sig, at: Date.now() - 13 * HOUR }, { key: K, sig }, { key: K, sig, at: 'then' }]) {
+    store.clear();
+    slot(press);
+    ({ el, root } = openSheet(ONE, true));
+    assert.equal(el._press, null, JSON.stringify(press));
+    assert.ok(!root.innerHTML.includes('It was being sent when this sheet was last open'));
+    assert.ok(root.innerHTML.includes('It was being sent a while ago, and it is not known whether it went out: look in the ' +
+      'chat list before you send it again — sent now, it is a new mail.'), JSON.stringify(press));
+    p = el._submit();
+    req = take((w) => w.method === 'POST', 'the compose');
+    assert.match(req.body.request_key, KEY_RE);
+    assert.notEqual(req.body.request_key, K, JSON.stringify(press));
+    req.fail();
+    await p;
+    assert.ok(!q(root, '[data-err="form"]').textContent.includes('a while ago'));
+  }
+  // Kept in the open sheet past its hours: the same.
+  store.clear();
+  ({ el, root } = openSheet());
+  write(root);
+  p = el._submit();
+  req = take((w) => w.method === 'POST', 'the compose');
+  const key = req.body.request_key;
+  req.fail();
+  await p;
+  el._press.at = Date.now() - 13 * HOUR;
+  p = el._submit();
+  req = take((w) => w.method === 'POST', 'the compose again');
+  assert.notEqual(req.body.request_key, key);
+  assert.ok(Date.now() - kept().press.at < 60 * 1000, 'the new press is timed anew');
+  req.fail();
+  await p;
+});
+
+await ok('a mail kept for a mailbox that is gone is shown, and can be taken into this mail or discarded', async () => {
+  const A = 'a@x.org';
+  const B = 'b@x.org';
+  const C = 'c@x.org';
+  const ABC = { ...TWO, accounts: [A, B, C] };
+  const AB = { ...TWO, accounts: [A, B] };
+  const INDEX = 'retinue-draft:compose:email';
+  const index = () => (store.has(INDEX) ? JSON.parse(store.get(INDEX)).v : null);
+  const age = (account) => JSON.parse(store.get(SLOT(account))).at;
+  const pick = (root, account) => { const a = q(root, '[data-account]'); a.value = account; root.fire('change', a); };
+  const park = () => {
+    const { el, root } = openSheet(ABC);
+    pick(root, C);
+    write(root, 'Dora <dora@w.org>, eve@w.org,', 'Important words from c\n<b>and a second line</b>');
+    const subj = q(root, '[data-subject]'); subj.value = 'Plans'; root.fire('input', subj);
+    el.close();
+  };
+  // c is removed for good: the sheet names its mail AND shows it — the
+  // words are in no other place.
+  park();
+  let { el, root } = openSheet(AB, true);
+  assert.ok(root.innerHTML.includes('A mail you started from c@x.org is kept. It comes back when that mailbox can send again.'));
+  let h = root.innerHTML;
+  assert.ok(h.includes('<details class="kept" data-kept="c@x.org"><summary>Show the mail from c@x.org</summary>'), h.slice(0, 1500));
+  assert.ok(h.includes('<span class="lbl">To</span> Dora &lt;dora@w.org&gt;, eve@w.org'), h);
+  assert.ok(h.includes('<span class="lbl">Subject</span> Plans'));
+  assert.ok(h.includes('<p class="kept-text">Important words from c\n&lt;b&gt;and a second line&lt;/b&gt;</p>'), 'its words, as text');
+  assert.ok(h.includes('data-kept-copy="c@x.org"') && h.includes('data-kept-discard="c@x.org"'));
+  // A mailbox that is offered is a choice under From, not shown here.
+  el.close();
+  const cSlot = store.get(SLOT(C));
+  store.set(SLOT(A), cSlot);
+  store.set(INDEX, JSON.stringify({ at: Date.now(), v: { account: A, waiting: [C] } }));
+  ({ el, root } = openSheet(ABC, true));
+  assert.equal(el._account, A);
+  assert.ok(root.innerHTML.includes('A mail you started from c@x.org is kept. Choose that mailbox under From to go on with it.'));
+  assert.ok(!root.innerHTML.includes('<details class="kept"'), 'nothing to show where the mailbox is on offer');
+  el._discard();
+  el.close();
+  store.set(INDEX, JSON.stringify({ at: Date.now(), v: { account: C, waiting: [] } }));
+  // The sheet keeps renewing what it speaks of: a mail written once and
+  // spoken of every week since is not dropped at a month.
+  store.set(SLOT(C), JSON.stringify({ at: Date.now() - 29 * 24 * 3600 * 1000, v: JSON.parse(store.get(SLOT(C))).v }));
+  ({ el, root } = openSheet(AB, true));
+  assert.ok(Date.now() - age(C) < 60 * 1000, 'renewed as it is named');
+  // Copied into this mail: after what the form holds, never over it — the
+  // recipients join, the words follow, the subject where there is none —
+  // and the kept one is gone. It leaves from the mailbox under From.
+  write(root, 'bob@builder.example,', 'Mine first');
+  root.fire('click', { closest: (sel) => (sel === '[data-kept-copy]' ? { getAttribute: () => C } : null) });
+  assert.deepEqual(el._chips.to.map((r) => r.address), ['bob@builder.example', 'dora@w.org', 'eve@w.org']);
+  assert.equal(el._text, 'Mine first\n\nImportant words from c\n<b>and a second line</b>');
+  assert.equal(el._subject, 'Plans');
+  assert.equal(store.has(SLOT(C)), false);
+  assert.equal(kept(el._account).text, el._text, 'kept under the mailbox it now leaves from');
+  assert.ok(!index().waiting.includes(C));
+  h = el.shadowRoot.innerHTML;
+  assert.ok(h.includes(`The mail you started from c@x.org is in this one now; it leaves from ${el._account}.`), h.slice(0, 900));
+  assert.ok(!h.includes('A mail you started from c@x.org is kept.'));
+  assert.equal(globalThis.focused, q(el.shadowRoot, '[data-text]'));
+  let p = el._submit();
+  const req = take((w) => w.method === 'POST', 'the compose');
+  assert.equal(req.body.account, el._account);
+  assert.deepEqual(req.body.to, ['bob@builder.example', 'dora@w.org', 'eve@w.org']);
+  req.answer({ id: 'email:~a@x.org:n@x.org', message: {} });
+  await p;
+  // A subject of its own leads the copied words where the form has another.
+  park();
+  ({ el, root } = openSheet(AB, true));
+  const subj = q(root, '[data-subject]'); subj.value = 'Mine'; root.fire('input', subj);
+  el._copyKept(C);
+  assert.equal(el._subject, 'Mine');
+  assert.equal(el._text, 'Plans\n\nImportant words from c\n<b>and a second line</b>');
+  el._discard();
+  el.close();
+  // Discarded: gone, and said; the mailbox written from last stays that one.
+  park();
+  ({ el, root } = openSheet(AB, true));
+  const before = index().account;
+  root.fire('click', { closest: (sel) => (sel === '[data-kept-discard]' ? { getAttribute: () => C } : null) });
+  assert.equal(store.has(SLOT(C)), false);
+  assert.deepEqual(index(), { account: before, waiting: [] });
+  assert.ok(el.shadowRoot.innerHTML.includes('The mail you started from c@x.org is discarded.'));
+  assert.equal(el._text, '');
+  el.close();
+  ({ el, root } = openSheet(AB, true));
+  assert.ok(!root.innerHTML.includes('c@x.org'));
+  // Nothing is done for a mailbox that is not waiting, nor while sending.
+  park();
+  ({ el, root } = openSheet(AB, true));
+  el._copyKept(A);
+  el._discardKept('nobody@x.org');
+  assert.ok(store.has(SLOT(C)));
+  write(root);
+  p = el._submit();
+  el._copyKept(C);
+  el._discardKept(C);
+  assert.ok(store.has(SLOT(C)), 'untouched while a mail is on its way');
+  take((w) => w.method === 'POST', 'the compose').answer({ error: 'x', by: 'gateway' }, 400);
+  await p;
 });
 
 console.log(`${passed} checks passed`);

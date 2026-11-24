@@ -488,26 +488,41 @@ docstring). Pieces:
   one per press — and its answer is read strictly: **200** is the mail;
   **202** `{pending}` a send that waits for approval; **202**
   `{unconfirmed, message_id?, request_key}` a mail handed over whose outcome
-  nobody knows yet (below). The server's word that **nothing went out** —
-  any **4xx** (its own refusal; **424** where the mail server refused the
-  mail) and any answer that carries **`"sent": false`** (a 502 for a mail
-  gateway that was never reached, a 503 for one that cannot send) — is "Not
-  sent: <its sentence>": the words stay in the box, the press is over, and
-  the next press is a new attempt under a new key. Anything else — no
-  answer, a 5xx that does not say `"sent": false` (a proxy, a crash), a 200
-  that is no document — says nothing about whether the mail went out and is
-  never reported as "not sent": the words come back with the key they went
-  under (kept on the device with them, for twelve hours), so the same words
-  sent again are the same mail to the gateway and not a second one; a press
-  made again whose first mail had gone out says so. Messenger sends are as
-  they were.
+  nobody knows yet (below). The server's word that **nothing went out**
+  with this request — any **4xx** (its own refusal; **424** where the mail
+  server refused the mail) and any answer that carries **`"sent": false`**
+  (a 502 for a mail gateway that was never reached, a 503 for one that
+  cannot send) — is "Not sent: <its sentence>", and the words stay in the
+  box. Whose word it is decides what becomes of the key (**`"by"`**):
+  `"gateway"` is the mail gateway's own answer about this request, made
+  after it looked the key up — the press is over, and the next press is a
+  new attempt under a new key; `"dashboard"` is the web gateway answering
+  for itself (the mail gateway never reached, no gateway for the mailbox, a
+  sign-in run out) — the key stays with the words, which costs nothing,
+  since the gateway takes a key it never saw as a new attempt. An answer
+  without `"by"` (an older server, a proxy) counts as the gateway's for a
+  first press. A press **made again** under a kept key whose first outcome
+  nobody knows is told "Not sent" only by the mail gateway: refused by anyone
+  else, the request was never put to it, so the note says the server could
+  not be asked and that it is still not known whether the first attempt went
+  out, and the key stays — dropping it there could send the mail twice.
+  Anything else — no answer, a 5xx that does not say `"sent": false` (a
+  proxy, a crash), a 200 that is no document — says nothing about whether
+  the mail went out and is never reported as "not sent": the words come back
+  with the key they went under (kept on the device with them, for twelve
+  hours), so the same words sent again are the same mail to the gateway and
+  not a second one; a press made again whose first mail had gone out says
+  so. Messenger sends are as they were.
 - **The key's life.** One key per press, never the next mail's. It is kept
-  (`_retry`) only while nobody knows what became of *that* press **and** the
-  box still holds its words as they were sent. It is dropped on `"sent":
-  false` and on any 4xx; as soon as the box holds other words, even for a
-  moment (typed, cleared, dictated, a draft from elsewhere — the same words
-  typed again later are a new mail); and when the press turns up in the
-  thread (`_settleRetry`, on every load and poll): the server lists a send
+  (`_retry`) while the box still holds its words as they were sent — with a
+  mark (`sure`) where it is known that nothing went out under it, so that a
+  press made again under it is not told "not known". It is dropped on the
+  mail gateway's word (`"by": "gateway"` with `"sent": false` or a 4xx;
+  for a first press also an answer without `"by"`); as soon as the box
+  holds other words, even for a moment (typed, cleared, dictated, a draft
+  from elsewhere — the same words typed again later are a new mail); and
+  when the press turns up in the thread (`_settleRetry`, on every load and
+  poll; never for a key marked `sure`): the server lists a send
   under its key, or the thread holds one more of the user's mails with those
   words than at the press. Then the words leave the box too, offered back as
   after a ✕ — left there, one press would send them a second time — unless
@@ -531,17 +546,26 @@ docstring). Pieces:
   still reaches exactly whom the line named then ("Not asked: the thread has
   changed …", and the bubble no longer offers the question). Its answer is
   the mail (200), the pending bubble (202 `{pending}`), still unknown (202
-  `{unconfirmed}`), or the gateway's word on this very press — a 424, or a
-  4xx that names the key — "Not sent: …", with the words back in the box.
-  Any other answer (a gateway that could not be reached *now*, a sign-in
-  that ran out, a proxy) is about the question, not the mail, and leaves it
-  unconfirmed. Check again is offered where the server echoed the key, the
-  body can be rebuilt (no attachments after a reload) and the press is not
-  older than twelve hours. Once asking has settled nothing, or cannot be
-  done, the bubble offers the two ways out a failed send has: **Copy text
-  back to the composer** and **Dismiss** (the page's own bubble; nothing is
-  asked of the server). A mail nobody can account for never ends in
-  silence.
+  `{unconfirmed}`), or the mail gateway's word on this very press (`"by":
+  "gateway"`, with `"sent": false` or a 4xx) — "Not sent: …", with the
+  words back in the box. Any other answer (the dashboard's own — a gateway
+  that could not be reached *now*, a sign-in that ran out —, a proxy, a
+  server too old to say `"by"`) is about the question, not the mail, and
+  leaves it unconfirmed. Check again is offered where the server echoed the
+  key, the body can be rebuilt (no attachments after a reload) and the press
+  is not older than twelve hours. Once asking has settled nothing, or cannot
+  be done, the bubble offers the two ways out a failed send has: **Copy
+  text back to the composer** and **Dismiss** (the page's own bubble;
+  nothing is asked of the server). Where the chat cannot be written to there
+  is no composer: the control reads **Copy text** and puts the words on the
+  clipboard, saying whether that worked; the bubble keeps them until it is
+  dismissed. A mail nobody can account for never ends in silence. The
+  record is shared by every tab on the chat: each tab writes it as it
+  stands, less what that tab let go, with its own mails in it — never its
+  own list alone, which would erase another tab's mail. What it holds is
+  read as data (a key that is none, a time before the epoch or ahead of the
+  clock are not used), and a record that still cannot be read leaves the
+  chat to open without those bubbles, the record kept.
 - **Pending sends.** A mail goes under its account's send policy, and a send
   the policy queues answers **202** `{pending}`: the optimistic bubble gives
   way at once to a **pending bubble** at the thread's end — the words, "You
@@ -566,7 +590,8 @@ docstring). Pieces:
   sent" with the server's reason (`error`, as text), or, with
   `outcome_unknown`, "Not confirmed — this mail may have gone out" — and two
   controls: **Copy text back to the composer** (after what the box holds,
-  never over it) and **Dismiss** (`POST
+  never over it; **Copy text**, to the clipboard, where the chat cannot be
+  written to) and **Dismiss** (`POST
   /chats/<id>/pending/<request id>/dismiss`; a refusal leaves the bubble
   with the reason). Recipients the mail server refused (`refused`) are named
   on the pending bubble and on the sent mail's. An entry marked
@@ -602,11 +627,20 @@ docstring). Pieces:
   send that fails after the sheet was closed opens it again with what
   happened. The server's word that nothing went out — a 4xx, or any answer
   with `"sent": false` — shows as "Not sent: …" with everything still
-  there, and ends the press: the next one is a new attempt under a new key.
-  An answer that leaves open whether the mail went out (202 `{unconfirmed}`
-  without a chat, a 5xx that does not say `"sent": false`, none) says
-  exactly that, and the press stays with the mail, so that sent again
-  unchanged it goes out under the same key. Closing keeps what the sheet
+  there, and ends the press where it is the mail gateway's (`"by":
+  "gateway"`; for a first press also one without `"by"`): the next one is a
+  new attempt under a new key. The dashboard's own keeps the key with the
+  mail, known to have sent nothing. A press made again under a key whose
+  outcome nobody knows, refused by anyone but the mail gateway, says that
+  the server could not be asked and that it is still not known whether the
+  first attempt went out, and keeps the key. An answer that leaves open
+  whether the mail went out (202 `{unconfirmed}` without a chat, a 5xx that
+  does not say `"sent": false`, none) says exactly that, and the press stays
+  with the mail, so that sent again unchanged within twelve hours (the chat
+  page's bound) it goes out under the same key; a press older than that is
+  dropped — the gateway knows a key for a day, and the same request would be
+  a second mail — and the sheet says only to look in the chat list before
+  sending it again, as a new mail. Closing keeps what the sheet
   holds on the device (`compose:<channel>:<mailbox>` in drafts.js, with the
   unanswered press) for the next opening **from that mailbox**: a kept mail
   never comes back into a sheet writing from another one, and changes its
@@ -617,8 +651,15 @@ docstring). Pieces:
   "It comes back when that mailbox can send again" for one that is not
   offered now, "Choose that mailbox under From to go on with it" for one
   that is — and opens on such a mailbox when the one written from last has
-  nothing waiting. Discard empties a mail; a send that went through drops
-  it.
+  nothing waiting. A mail whose mailbox is not offered at all may never be
+  again, so the sheet shows it ("Show the mail from …": its recipients,
+  subject and words, as text) with **Copy into this mail** (into the form,
+  after what it holds — recipients joining the chips, its words after the
+  form's, its subject where the form has none — leaving from the mailbox
+  under From; the kept one goes) and **Discard it**. Every opening renews
+  each kept mail it names, so drafts.js never drops one for its age while
+  the sheet still speaks of it. Discard empties a mail; a send that went
+  through drops it.
 
 The API, as the components consume it:
 
@@ -905,10 +946,13 @@ The API, as the components consume it:
   answers `200` with the Message (sent; `refused: [addresses]` where the
   mail server took only some recipients), `202 {pending: Pending}` (queued)
   or `202 {unconfirmed: true, message_id?, request_key}` (handed over,
-  outcome unknown). An error answer is `{error, sent?, request_key?}`: a
-  **4xx** (424 where the send failed for certain at the mail server) and any
-  status with **`"sent": false`** mean nothing went out; a 5xx without it
-  means nobody knows. `Pending` is `{request_id, approval_url, text, ts,
+  outcome unknown). An error answer is `{error, sent?, request_key?, by?}`:
+  a **4xx** (424 where the send failed for certain at the mail server) and
+  any status with **`"sent": false`** mean nothing went out with this
+  request; a 5xx without it means nobody knows. `by` says whose word that
+  is — `"gateway"` (the mail gateway's own answer, after it looked the key
+  up: the key is over) or `"dashboard"` (the web gateway's, the mail gateway
+  not having spoken: it says nothing about the key). `Pending` is `{request_id, approval_url, text, ts,
   author, agent?, to, cc, subject, message_id?, request_key?, status?,
   error?, outcome_unknown?, refused?, dismissed?}` (`approval_url`
   path-only, `/sends/<slug>/<id>`; `status` `pending` — the default —
