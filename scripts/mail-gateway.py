@@ -115,8 +115,12 @@ user sent through ``email_client.py`` is not recorded as "some mail client",
 its verbs, on the SMS gateway's model, plus ``dismiss`` for a send that
 failed), ``POST /reply-preview`` — whom a reply would be sent to, by the
 function that addresses the send itself, so that what a page shows is what
-goes out — and ``POST /chats/read|archive|delete``, the last behind the
-erase capability as well (``CHAT_ERASE_TOKEN``).
+goes out — ``POST /chats/read|archive|delete``, the last behind the
+erase capability as well (``CHAT_ERASE_TOKEN``), and the model trim's two
+halves: ``POST /messages/trim-source`` (the numbered lines a model may choose
+a ``wanting`` mail's own message from, and their digest) and ``POST
+/messages/trim-result`` (the choice, made the record's text from this
+gateway's own copy of those lines — the caller is never trusted with text).
 
 **A send is made at most once, and a mail that went out has its record** —
 as far as one process can see to that against a mail server it shares no
@@ -3107,6 +3111,193 @@ class Mirror:
             if row is not None:
                 _ibstore.update_message(self._record_path(row["record"]), author=author)
 
+    # -- the model trim (docs/mail-chats.md, "The model trim") -----------------
+    #
+    # Where the deterministic trim left a mail ``wanting``, the web gateway may
+    # spend one model turn on it, on its first view. This side is the two
+    # halves that never trust the caller with text: what the model may choose
+    # from (trim_source) and what its choice makes of the record (trim_result).
+    # Both are built from the record's own parts, which nothing here changes;
+    # the text a choice keeps is assembled from this gateway's copy of the
+    # lines (mail_trim.apply_keep), so an answer can narrow a bubble and never
+    # add a word to it. Only a judgement settles a mail: a choice (valid or
+    # not), the caller's word that the answer was no choice (``failed``), or a
+    # mail too long to hand over. A model that could not be asked changes
+    # nothing here — the caller just does not call.
+
+    _TRIM_PARTS = ("body_part", "html_part", "header_part")
+
+    def _trim_target(self, chat: str, message_id: str) -> tuple:
+        """``(path, fields)`` of the mail a model-trim call names, read off the
+        ledger now. :class:`TrimRefused` with the answer when there is none
+        to trim: 404 for no such mail — or one the call does not name by its
+        chat — and 410 for a mail that is gone from the mailbox.
+
+        The mail is named by its Message-ID (as the record keys it, or as its
+        header has it), and the chat is a check that the caller means this
+        mail: its chat on record, or a chat that has since been merged into
+        that one — a chat key is its root's id, and the thread index knows
+        which chat that id is in now. So a call made before a merge lands on
+        the same record after it, and a mail of another thread is refused
+        whatever its id."""
+        raw = message_id.strip()
+        row = None
+        for mid in dict.fromkeys(m for m in (raw, _fit_id(_threads.normalize_id(raw))) if m):
+            row = self.index.one("SELECT message_id, record, removed FROM mails "
+                                 "WHERE message_id = ? AND record != ''", (mid,))
+            if row is not None:
+                break
+        if row is None:
+            raise TrimRefused(404, {"error": "not found"})
+        path = self._record_path(row["record"])
+        fields = _ibstore.read_record(path)
+        if (fields is None or fields.get("message_id") != row["message_id"]
+                or (fields.get("account") or "").lower() != ACCOUNT):
+            raise TrimRefused(404, {"error": "not found"})
+        current = fields.get("chat") or ""
+        if chat != current and self.threads.chat_of(chat) != current:
+            raise TrimRefused(404, {"error": "not found"})
+        if row["removed"] or fields.get("removed_at"):
+            raise TrimRefused(410, {"error": "the mail is gone from the mailbox"})
+        return path, fields
+
+    @staticmethod
+    def _trim_evidence(fields: dict) -> dict:
+        """What :meth:`_reading_text` gave the trim when the mail was read,
+        from the record: its subject, whether it cites a parent — the record
+        keeps every id it cited (kb:inReplyTo, kb:references, see _read_ids),
+        so either is there exactly when one was — and whether it calls
+        itself bulk, which is the header block's to say again (a List-Id is
+        on the record only as normalised, and List-Unsubscribe and
+        Precedence not at all). A header block that will not read again is
+        read as the ingest read none: by the List-Id on record."""
+        bulk = bool(fields.get("list_id"))
+        media_id = _ibstore.media_id_of(fields.get("header_part") or "")
+        got = _ibstore.load_media(INBOUND_STORE_DIR, media_id) if media_id else None
+        if got is not None:
+            try:
+                msg = _parse_bytes(got[0] + b"\n\n")
+                bulk = _is_bulk(msg, _clean_line(
+                    _UNFOLD_RE.sub("", _raw_header(msg, "List-Id")), 998))
+            except Exception:  # noqa: BLE001 - the record's own List-Id stands
+                pass
+        return {"subject": fields.get("subject_line") or "",
+                "is_reply": bool(fields.get("in_reply_to") or fields.get("references")),
+                "bulk": bulk}
+
+    @staticmethod
+    def _trim_source_of(fields: dict, evidence: dict):
+        """The record's :func:`mail_trim.model_source`, from its stored parts
+        (the very text the ingest trimmed: the parts are that text, stored as
+        UTF-8). :class:`TrimRefused` 503 when a part it references cannot be
+        read — that says nothing about the mail, so nothing is settled."""
+        parts = []
+        for key in ("body_part", "html_part"):
+            ref = fields.get(key)
+            if not ref:
+                parts.append(None)
+                continue
+            media_id = _ibstore.media_id_of(ref)
+            got = _ibstore.load_media(INBOUND_STORE_DIR, media_id) if media_id else None
+            if got is None:
+                raise TrimRefused(503, {"error": "a part of the mail could not be read"})
+            parts.append(got[0].decode("utf-8", "replace"))
+        return _trim.model_source(parts[0], parts[1], evidence["subject"],
+                                  is_reply=evidence["is_reply"], bulk=evidence["bulk"])
+
+    def _settle_trim(self, path: Path, *, state: str, text: str | None = None) -> dict:
+        """Write a trim's outcome onto the record and read it back; the
+        record as it now stands. Under the mirror's lock (the caller's): a
+        record has one writer at a time. ``update_message`` touches the text
+        and the state and nothing else — not a part, not an identity — and
+        says nothing of whether it wrote, so the record is read back."""
+        _ibstore.update_message(path, text=text, trim=state)
+        after = _ibstore.read_record(path)
+        if (after is None or after.get("trim") != state
+                or (text is not None and after.get("text") != text)):
+            raise OSError("the record could not be rewritten")
+        return after
+
+    def trim_source(self, chat: str, message_id: str) -> tuple[int, dict]:
+        """POST /messages/trim-source: what a model may choose this mail's
+        message from — or that there is nothing to do. Read-only, but for a
+        mail too long to hand over, which is settled here and now: asking
+        again would only find it as long."""
+        _path, fields = self._trim_target(chat, message_id)
+        state = fields.get("trim") or "deterministic"
+        if state != "wanting":
+            return 200, {"state": state}
+        evidence = self._trim_evidence(fields)
+        source = self._trim_source_of(fields, evidence)
+        if source is None:
+            with self.exclusive():
+                # Looked at again under the lock: settled or gone meanwhile,
+                # or written anew from other parts (then its own source).
+                path, fields = self._trim_target(chat, message_id)
+                state = fields.get("trim") or "deterministic"
+                if state != "wanting":
+                    return 200, {"state": state}
+                evidence = self._trim_evidence(fields)
+                source = self._trim_source_of(fields, evidence)
+                if source is None:
+                    self._settle_trim(path, state="deterministic")
+                    print(f"[mail-gateway] {fields['message_id']!r} is too long for a model "
+                          f"trim; its text stays as the rules trimmed it", flush=True)
+                    return 200, {"state": "deterministic", "settled": "too_long"}
+        sender = fields.get("sender") or ""
+        return 200, {"state": "wanting", "lines": source.lines, "digest": source.digest,
+                     "subject": evidence["subject"], "sender": sender if "@" in sender else "",
+                     "is_reply": evidence["is_reply"], "bulk": evidence["bulk"]}
+
+    def trim_result(self, chat: str, message_id: str, digest: str, *,
+                    keep=None, failed: str | None = None) -> tuple[int, dict]:
+        """POST /messages/trim-result: a model's choice (``keep``), or the
+        caller's word that its answer was none (``failed``), made of the
+        source whose digest it names.
+
+        Refused (409 ``stale``) unless the mail is still ``wanting`` and its
+        source is still that one — a choice is about the lines it was made
+        from and no others. A valid choice becomes the record's text, capped
+        as every kb:text is, with ``kb:trim "model"``; an invalid one, and
+        ``failed``, settle ``deterministic`` and leave the text as it is.
+
+        Nothing is told on the rail: a mail's text changing on its record is
+        how a better reading has always reached the chat (the life store
+        indexes the rewrite, and a page's poll re-renders a message whose
+        text or trim changed), and the caller — the web gateway — has the
+        new text in this answer."""
+        path, fields = self._trim_target(chat, message_id)
+
+        def stale(state):
+            return 409, {"error": "stale", "state": state or "deterministic"}
+
+        if fields.get("trim") != "wanting":
+            return stale(fields.get("trim"))
+        # Built outside the lock — a trim of a long mail takes a moment, and a
+        # pass over the mailbox waits for whoever holds it — and checked
+        # under it: the same parts give the same source.
+        source = self._trim_source_of(fields, self._trim_evidence(fields))
+        if source is None or source.digest != digest:
+            return stale("wanting")
+        text = None if failed is not None else _trim.apply_keep(source.lines, keep)
+        with self.exclusive():
+            path, now = self._trim_target(chat, message_id)
+            if now.get("trim") != "wanting":
+                return stale(now.get("trim"))
+            if any(now.get(key) != fields.get(key) for key in self._TRIM_PARTS):
+                return stale("wanting")
+            if text is None:
+                after = self._settle_trim(path, state="deterministic")
+                why = (f"no choice ({_clean_line(failed, 120)})" if failed is not None
+                       else "a choice that is none")
+                print(f"[mail-gateway] model trim of {now['message_id']!r}: {why}; its text "
+                      f"stays as the rules trimmed it", flush=True)
+            else:
+                if len(text) > MAX_RECORD_TEXT_CHARS:
+                    text = text[:MAX_RECORD_TEXT_CHARS].rstrip() + "\n…"
+                after = self._settle_trim(path, state="model", text=text)
+        return 200, {"state": after["trim"], "text": after.get("text") or ""}
+
     # -- one pass --------------------------------------------------------------
 
     def poll(self, *, sync: bool = True, backfill_limit: int | None = None) -> bool:
@@ -5654,6 +5845,15 @@ class Busy(Exception):
     """The mirror's lock was not free in time (Mirror.exclusive)."""
 
 
+class TrimRefused(Exception):
+    """A model-trim call that names no mail to trim: the HTTP answer that
+    says so (Mirror._trim_target)."""
+
+    def __init__(self, status: int, body: dict):
+        super().__init__(body.get("error"))
+        self.status, self.body = status, body
+
+
 # ── Sending ───────────────────────────────────────────────────────────────────
 # POST /send takes a reply or a new mail, lets the send policy decide whether
 # it goes now or waits for the user's approval, and either way makes it an
@@ -7516,6 +7716,8 @@ class _Handler(BaseHTTPRequestHandler):
                 self._reply(*_reply_preview(body))
         elif path == "/outbound-note":
             self._outbound_note()
+        elif path in ("/messages/trim-source", "/messages/trim-result"):
+            self._model_trim(path.rsplit("-", 1)[1])
         else:
             self._reply(404, {"error": "not found"})
 
@@ -7657,6 +7859,62 @@ class _Handler(BaseHTTPRequestHandler):
             self._reply(503, {"error": "could not keep the note; retry later"})
             return
         self._reply(200, {"ok": True})
+
+    def _model_trim(self, half: str) -> None:
+        """POST /messages/trim-source | /messages/trim-result — the model
+        trim's two halves (Mirror.trim_source, Mirror.trim_result).
+
+        The mail is named as on the other chat endpoints: its chat key, the
+        account, which must be this gateway's own (else 404), and its
+        Message-ID. A result is either ``keep`` — any value: whether it is a
+        choice is apply_keep's to say, and one that is not settles the mail
+        — or ``failed``, a short reason, never both."""
+        body = self._read_object()
+        if body is None:
+            return
+        chat, message_id = body.get("chat"), body.get("message_id")
+        if (not isinstance(chat, str) or not chat.strip()
+                or not isinstance(message_id, str) or not message_id.strip()):
+            self._reply(400, {"error": "chat (the chat key) and message_id (a Message-ID) "
+                                       "are required"})
+            return
+        if str(body.get("account") or "").strip().lower() != ACCOUNT or not ACCOUNT:
+            self._reply(404, _NOT_OURS)
+            return
+        if half == "result":
+            digest, failed = body.get("digest"), body.get("failed")
+            if not isinstance(digest, str) or not digest:
+                self._reply(400, {"error": "digest (the source's, from trim-source) is required"})
+                return
+            if ("keep" in body) == (failed is not None):
+                self._reply(400, {"error": "exactly one of keep and failed is required"})
+                return
+            if failed is not None and (not isinstance(failed, str) or not failed.strip()):
+                self._reply(400, {"error": "'failed' must be a short reason"})
+                return
+        if MIRROR is None:
+            self._reply(503, {"error": "the mail gateway is not configured"})
+            return
+        try:
+            if half == "source":
+                status, answer = MIRROR.trim_source(chat.strip(), message_id)
+            else:
+                status, answer = MIRROR.trim_result(chat.strip(), message_id, digest,
+                                                    keep=body.get("keep"), failed=failed)
+        except TrimRefused as exc:
+            status, answer = exc.status, exc.body
+        except Busy as exc:
+            status, answer = 503, {"error": str(exc)}
+        except (sqlite3.Error, OSError) as exc:
+            print(f"[mail-gateway] model trim ({half}) of {message_id[:200]!r} failed: {exc}",
+                  flush=True)
+            status, answer = 503, {"error": "the record could not be read or written; "
+                                            "retry later"}
+        except Exception as exc:  # noqa: BLE001 - an answer, never a dropped connection
+            print(f"[mail-gateway] model trim ({half}) of {message_id[:200]!r} failed: {exc}\n"
+                  f"{traceback.format_exc()}", flush=True)
+            status, answer = 500, {"error": f"model trim failed: {_clean_line(exc, 300)}"}
+        self._reply(status, answer)
 
 
 def _serve_http() -> None:
