@@ -61,7 +61,7 @@ nothing new.
   sessions) live in their own containers, so a hostile message cannot read
   them. Nor can it read a mailbox, gateway or service credential out of a
   session's environment: every `claude -p` the framework spawns — dashboard
-  turns, scheduled jobs, triage, Ask-Ara answers — gets its environment from
+  turns, scheduled jobs, messenger triage, Ask-Ara answers — gets its environment from
   the allowlist in `scripts/session_env.py` (capability tokens and the
   framework's own settings) and never inherits the spawning daemon's, so
   mailbox passwords, the LiteLLM master and picker keys, the repo token and
@@ -84,18 +84,21 @@ nothing new.
   (the web gateway's, for one, holds the mailbox credentials for its e-mail
   backend), and the repository token sits in `~/.git-credentials`.
   **The mailbox credentials are now held by two containers**: the `retinue`
-  container (for `email_client.py`'s backend, the e-mail triage and the
-  approval of e-mail drafts, as before) and the `mail-gateway` container,
+  container (for `email_client.py`'s backend and the approval of e-mail
+  drafts, as before) and the `mail-gateway` container,
   which mirrors the mailbox into the chat ledger, sends mail and moves it
   between folders, and is given only the variables it reads, no `.env`
   wholesale — the send policy (`EMAIL_SEND_POLICY`) and the chat-erase token
-  since it sends and erases, but not the news rail's token. Compose hands
+  since it sends and erases, and the two ingest tokens of the rails it offers
+  mail to: `CHATS_INGEST_TOKEN` (the chats rail, where every arriving mail is
+  offered) and `NEWS_INGEST_TOKEN` (the news rail, where it files the mail of
+  a news sender or list itself). Compose hands
   it the credentials whether or not it mirrors; a deployment that wants them
   in one container only gives the service a profile nobody enables
   (`docs/messaging.md`). The mail gateway is the sidecar
   that can close this gap for e-mail, but only once the credentials can leave
-  the `retinue` service (its `email_client.py` backend and e-mail triage still
-  use them); until then it adds a second place that holds them rather than
+  the `retinue` service (its `email_client.py` backend still
+  uses them); until then it adds a second place that holds them rather than
   taking one away. A named account
   mirrored as chats is held by its own mail gateway service as well. The mail
   gateway reaches no session and has no public route. It mirrors nothing and
@@ -124,7 +127,7 @@ nothing new.
   refuses with 503. On the web gateway, marking a mail chat read, archiving it
   and flagging it write to the mailbox, so those endpoints are the user's own
   act like send, compose and delete: same-origin only. Mail sent through the
-  gateway does not add its recipient to the e-mail whitelist — the gateway never writes policy. Closing
+  gateway writes no policy. Closing
   that means holding each secret in its own sidecar or under a separate uid,
   which is a separate roadmap item. An outbound send still has to clear the
   sending identity's policy, but a pending `verify` approval is not bound to
@@ -132,6 +135,24 @@ nothing new.
   as a workflow gate rather than a hard boundary. A hostile message can also
   induce the agent to read across mounted chambers or write to them.
   Reduced-privilege triage is another roadmap item.
+- **A mail's sender is not authenticated.** The mail gateway reads the sender
+  from the `From` header (else `Sender`), and the gate matches that address,
+  or a domain a contact files, against the VIP and instructed senders. Nothing
+  in the mail gateway or the web gateway checks SPF, DKIM, DMARC or an
+  `Authentication-Results` header first, and the mailbox provider's own
+  filtering is the only thing that stands before it. A mail that forges the
+  `From` of a VIP or of an instructed sender therefore gets that sender's
+  treatment: it may ring at once, and a model turn with tools runs on it,
+  briefed by the sender's instruction. The turn reads the mail as data (the
+  mail's text stands in a quoted block, never in a sentence that tells the
+  turn what to do, and the instruction is the user's, not the sender's), but
+  it can act on what the instruction lets it do, and a reply sent by an
+  instructed turn goes out under the mailbox's send policy. An instruction
+  that covers a whole domain is as wide as everyone who can write a `From`
+  at that domain. This is known and not mitigated in code; give an
+  instruction to a sender, and above all to a domain, only where a forged mail
+  from them would do little harm, and keep the mailbox's send policy on
+  `verify` for a mailbox whose instructions send.
 - **Chambers are not compartmentalized from each other within a session.**
 - **The updater's Docker socket is root-equivalent on the host.** This is
   inherent to what the updater does and is documented in `docker-compose.yml`.

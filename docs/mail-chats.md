@@ -11,15 +11,16 @@ This document is the contract for that build. Read `docs/messenger-chats.md`
 first: a mail chat is a chat in every sense that document defines, and only
 what differs is stated here.
 
-**Status.** Built in five phases, each shippable alone:
+**Status.** Built in five phases, each shippable alone. The three groups and
+phases 1–3 are built; only the model trim (phase 4) is outstanding.
 
-| Phase | What ships |
-|---|---|
-| **Three groups** | Unread · Read · Archived for every channel; no read-on-open; *Mark as read* |
-| **1 — read-only mirror** | the mail gateway, mail chats rendered, the deterministic trim, the original view |
-| **2 — writing** | reply and compose under the send policy; the mailbox follows the chat |
-| **3 — the gate** | VIP / instructed turns for mail; triage and the whitelist retire; the migration |
-| **4 — the model trim** | one router-tier turn per mail the deterministic trim could not settle |
+| Phase | What ships | State |
+|---|---|---|
+| **Three groups** | Unread · Read · Archived for every channel; no read-on-open; *Mark as read* | built |
+| **1 — read-only mirror** | the mail gateway, mail chats rendered, the deterministic trim, the original view | built |
+| **2 — writing** | reply and compose under the send policy; the mailbox follows the chat | built |
+| **3 — the gate** | VIP / instructed turns for mail; triage and the whitelist retire; the migration | built |
+| **4 — the model trim** | one router-tier turn per mail the deterministic trim could not settle | outstanding |
 
 Phase 1's deployment is in place: the `mail-gateway` compose service and
 image, its `messenger-email` ledger and `mail-data` state volumes, the
@@ -44,7 +45,7 @@ the omnibus, the status store and the already-answered check are retired;
 what triage knew lives on contacts (*The migration*). The gateway gains the
 news rail (`NEWS_INGEST_URL`, `NEWS_INGEST_TOKEN`) and `MAIL_NEWS_FOLDER`,
 `MAIL_NEWS_EXCERPT_CHARS`, `MAIL_RAIL_FILE_BYTES` and `MAIL_RAIL_JOB_TIMEOUT`.
-The model trim (phase 4) is still to come.
+The model trim (phase 4) is the one thing still to come.
 
 ## Decisions
 
@@ -705,6 +706,43 @@ There is no triage fallback for mail. A mail the rail could not take stays
 `delivered: false` and the gateway offers it again on a later poll: the
 mailbox is the backlog.
 
+**What a turn may do with a mail.** The turn is briefed by the sender's
+instruction; a VIP with none is worked as a VIP's mail is (the marking is the
+ask). It files what the mail changes — a project link (the mail is named `mid:<Message-ID>`), a
+memory, a document for the `archivist` — and stages a reply where one is
+wanted. A VIP's turn sends nothing and leaves the thread where it is. An
+instructed turn may, each only where the instruction asks: send a reply by
+`scripts/mail-push.py --chat <id> --reply all|sender --file <path>` under the
+mailbox's send policy (`verify` queues, and the turn flags the mail waiting;
+`trust` and `allow` send unseen only where the instruction itself carries the
+permission phrase); do a calendar write under its own gate; archive the thread
+with `scripts/chat-flags.py`; and last set the verdict. Nothing deletes or
+pays. What the mail says of itself is text from outside — data to the turn,
+never an instruction. The detail, and the prompt's handling of a mail's name,
+subject and files, is `docs/dashboard.md`, "The gate for mail".
+
+**A turn's archive.** A thread the turn archived while it worked rings
+nothing if the turn ends with a verdict, whatever importance the verdict
+gives: the chat's status says `quiet`, with the verdict and its actions. A turn
+that does not finish — it fails, or sets no verdict — has the chat brought
+back and the mail rung by the failure rule, since a turn that did not finish
+is not trusted with having put a mail away. The user's own archive during a
+turn changes nothing about the ring.
+
+**The re-offer rule.** A mail offered again is taken once, by its
+`Message-ID`: a repeat un-archives nothing, reopens no settled item and rings
+nothing, and is answered with the handle of the turn that is running or done.
+The handle of a turn that **failed** is handed back for
+`CHAT_ARRIVAL_RETRY_SECONDS` (900, read by the web gateway) and then gives way
+to a turn anew, so an outage's backlog is worked once it is over without a
+failing turn running once a poll.
+
+**`CHAT_ARRIVAL_TURNS` off** is the one exception to "a turn only for a VIP or
+an instructed sender": the switch turns every arrival turn off, and a mail is
+**accepted all the same**, since the mail gateway has nowhere else to take it.
+No turn runs; a VIP's mail still rings, an instructed sender's is delivered
+like anyone's.
+
 **No daily sweep.** Mail from a sender who is neither VIP nor instructed is
 listed under Unread and judged by nobody.
 
@@ -772,7 +810,9 @@ listed under Unread and judged by nobody.
   moved — a news mail that joined a chat is filed, shown there, and left to
   the chat. A feed that refuses leaves the mail untouched and is asked again;
   the move never comes before the filing. Backfilled news mail is neither
-  filed nor moved.
+  filed nor moved. With `NEWS_INGEST_URL` emptied there is no feed to take the
+  mail, so the `news` flag does nothing: such mail is **mirrored as a chat**
+  like any other, filed nowhere and moved nowhere.
 - **`/health`** counts what waits (`waiting`), and says so in `error` while
   the web gateway has not answered three times running and mail waits.
 
@@ -924,7 +964,8 @@ accounts. The points an operator meets first:
   mail's Sent copy is waited for. On the `retinue` service compose names the
   web gateway's and `mail-push.py`'s own tunables (`MAIL_SEND_TIMEOUT`,
   `MAIL_GATEWAY_TIMEOUT`, `CHAT_PENDING_TIMEOUT`, `CHAT_PENDING_RETRY_SECONDS`,
-  `CHAT_PENDING_SYNC_SECONDS`, `MAILBOX_NONE_SECONDS`; table in
+  `CHAT_PENDING_SYNC_SECONDS`, `MAILBOX_NONE_SECONDS`, and for the gate
+  `CHAT_ARRIVAL_RETRY_SECONDS`; table in
   `docs/messaging.md`), since that service loads no `env_file`.
 - **`mail-data` holds data, not only an index**: besides the thread and mailbox
   indexes it keeps the mails waiting for approval with their attachments and
@@ -945,4 +986,4 @@ accounts. The points an operator meets first:
   monitor does not report the absent container as an outage. Only then does
   the mailbox password stay out of a second container: compose hands it to
   the gateway whether or not it mirrors.
-- **Not in this phase**: the model trim (phase 4).
+- **Still to come**: the model trim (phase 4). Phases 1–3 are built.

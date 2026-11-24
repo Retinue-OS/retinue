@@ -329,16 +329,31 @@ instruction without VIP and has it ask for a high importance.
   a VIP's would be — the reason line says the turn did not finish, not that
   the sender is a VIP. An instruction can delay a ring by at most that long
   and never prevent one; a draft that finishes later still lands. So does a
-  message whose turn could not be started at all. Besides a muted chat, only
+  message whose turn could not be started at all. The timeout rings; it does
+  not stop the turn. A turn that files a document (the `archivist` takes
+  longer than a reply does) can outlast it: the message rings as a VIP's when
+  the timeout passes, the turn goes on, what it files and stages still lands,
+  and its verdict then only records. An instruction that files documents wants
+  a deployment that raises `CHAT_INSTRUCTION_TIMEOUT`, or its filed messages
+  ring. Besides a muted chat, only
   a message the user has marked read or answered while the turn worked stays
   quiet (opening the chat is neither, and a mark taken back before the ring
   is due does not count): a ring would tell them nothing new, and would
   reopen the item their reply or mark settled. See *Unread · Read · Archived*
   in docs/messenger-chats.md.
-- **No sending.** A reply is only ever staged in the chat's draft; the user's
-  send press is the only way a chat reply leaves in their name. That is how
-  the chat surface works for every agent (docs/messenger-chats.md): the send
-  endpoint takes only the user's own request.
+- **No sending on a messenger.** A reply is only ever staged in the chat's
+  draft; the user's send press is the only way a chat reply leaves in their
+  name. That is how the chat surface works for every agent
+  (docs/messenger-chats.md): the send endpoint takes only the user's own
+  request. **A mail thread is the exception, and only where the instruction
+  says a reply is to be sent:** the turn may send with `scripts/mail-push.py
+  --chat <id> --reply all|sender --file <path>` (the thread's own gateway
+  and nothing else), under the mailbox's send policy — `verify` queues the
+  mail and the turn flags it for the user's approval; `trust` and `allow` send
+  unseen only where the instruction itself carries the permission phrase, and
+  otherwise queue (`trust`) or fall back to the draft (`allow`). A mail's
+  sender is not authenticated (SECURITY.md): instruct a sender, a domain above
+  all, only where a forged mail from them would do little harm.
 - **Gated actions keep their gates.** A calendar write, or anything else a
   send policy gates, goes through `allow`/`trust`/`verify` as always, at the
   gateway: under `verify` nothing the turn asks for happens without the
@@ -538,7 +553,15 @@ The HTTP API behind it, for the dashboard and anything on the edge:
   carries its `domains` beside its `handles`. Add `?q=` to search names,
   e-mail addresses and domains, or `?channel=&handle=` to look up one handle
   on any channel (for an e-mail address nobody holds: the person whose domain
-  covers it, `exact: false`).
+  covers it, `exact: false`). A suggestion found by a domain — here and in the
+  contact card's suggestions — says so: `match: "domain"` with `match_domain`,
+  the domain that covers the address. It tells who the mail is from, never
+  whose address it is; a client that offers it as *This is …* must show that.
+  The people of a mail chat the gateway resolves (the chat summary's
+  `participants` and `peer`) carry the same fact as `by_domain`:
+  `{contact, name, domain}` of the person whose domain covers an address nobody
+  holds, beside the address's own `name` and `contact` (null for such an
+  address) — see docs/dashboard.md, "A name that is a subject".
 - `POST /contacts` with `{chamber, name, handles: [{channel, handle}], sphere?,
   tags?, importance?, permits?, vip?, instruction?, domains?: [domain]}`
   creates a person and answers 201.

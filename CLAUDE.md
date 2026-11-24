@@ -364,6 +364,9 @@ license to skip the skill. Three standing rules:
   their answer on the subject — never reopen it in a new thread on your own.
   The star (`--star`) is theirs too: set or clear it only on their word, and
   never archive a starred thread on your own initiative.
+  A **chat** (a messenger or mail thread) the user tells you to archive is
+  archived the same way, with `scripts/chat-flags.py --chat <id> --archive
+  --mute`; its `--star` is theirs too, and a chat has no delete.
 - Threads of kind `edit` (project command bar) get the change applied to the
   project file plus a one-sentence confirmation.
 - **"Switch off continuous conversation"** — the user asking, in any

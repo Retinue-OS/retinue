@@ -236,7 +236,8 @@ starting one by hand beside the live system, run
 Every `claude -p` the framework spawns — dashboard turns, the transcript
 cleanup and the presentation lint (`scripts/web-gateway.py`), scheduler jobs
 and the sessions the base-job scripts start themselves (`scripts/scheduler.py`,
-`agent-self-review.py`, `news-curate.py`, `triage-gate.py`), Ask-Ara answers
+`agent-self-review.py`, `news-curate.py`, `inbox-sweep.py`,
+`memory-compact.py`, `migrate-triage.py`), Ask-Ara answers
 (`scripts/ara-mcp-server.py`) — gets its environment from
 `scripts/session_env.py`, never from a copy of the spawning daemon's. The
 daemons are forked before the entrypoint's scrub and hold whatever `.env` put
@@ -249,7 +250,10 @@ in the script that reads it.
 What passes: process basics (`PATH`, `HOME`, locale, `TZ`), the egress-proxy
 and CA variables, `ANTHROPIC_*` (the model credential and endpoint —
 gateway-spawned sessions run in API-key mode), `CLAUDE_*`, `RETINUE_*` (minus
-`RETINUE_LITELLM_KEY`), `SPARQL_ENDPOINT_*`, `NEWS_*`, `TRIAGE_*`, the
+`RETINUE_LITELLM_KEY`), `SPARQL_ENDPOINT_*`, `NEWS_*`, the two delivery-gate
+policy locations (`TRIAGE_MESSENGER_DIR`, `TRIAGE_EMAIL_WHITELIST_PATH` — named
+one by one, not by a prefix; the second is the e-mail policy file's path, whose
+variable name predates the whitelist's retirement), the
 capability tokens with their service URLs (`EMAIL_BACKEND_*`,
 `CONVERSATION_BACKEND_*`, `NEWS_INGEST_*`, `CHATS_INGEST_*`, `UPDATER_*`), the
 messenger, mail and calendar gateways' client side (`*_GATEWAY_TOKEN`,

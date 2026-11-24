@@ -737,6 +737,7 @@ and a value in `.env` reaches it:
 | `CHAT_PENDING_TIMEOUT` | `4` | the web gateway | how long one look at a gateway's pending queue may take; it rides on a page's poll |
 | `CHAT_PENDING_RETRY_SECONDS` | `15` | the web gateway | how long a gateway that could not answer is left alone, the chat's copy standing in |
 | `CHAT_PENDING_SYNC_SECONDS` | `20` | the web gateway | how often the chat list has every mail gateway's queue read; `0` never does |
+| `CHAT_ARRIVAL_RETRY_SECONDS` | `900` | the web gateway | how long the job handle of a mail's turn that **failed** is handed back to the mail gateway's next offer of the same mail; after that the offer starts the turn anew, so the work is done once an outage is over without a failing turn running once a poll |
 | `MAILBOX_NONE_SECONDS` | `600` | the web gateway | how long a gateway that answered `404`/`501` to a mailbox call (no mailbox) is not asked again |
 | `MAILBOX_RETRY_SECONDS` | `120` | the web gateway | how often a mailbox call that failed (a read, an archive the mailbox still owes) is tried again |
 | `MAILBOX_OWED_KEEP_SECONDS` | `604800` | the web gateway | how long such an owed call is kept and retried before it is given up and logged |

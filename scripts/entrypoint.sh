@@ -20,7 +20,8 @@ is_letterbox() { [[ "${1%/}" == "${LETTERBOX_DIR%/}" ]]; }
 
 # ── The e-mail policy file, first thing ──────────────────────────────
 # The mail gateway does not start its mirror until the e-mail policy file
-# (whitelist and group flags) is where it reads it, on the mail ledger volume
+# (the group flags; the sender policy is the contacts' projection beside it)
+# is where it reads it, on the mail ledger volume
 # (docs/mail-chats.md, docs/messaging.md "E-mail (the mail gateway)"): a
 # backfill without the `news` flags would turn every newsletter of the window
 # into a chat, for good. So the file is placed — moved from its old place, or
