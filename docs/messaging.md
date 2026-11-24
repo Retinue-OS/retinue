@@ -463,9 +463,17 @@ connection refused, a `401`/`403`/`404`, or no answer and none to a `GET`
 either) nothing is tried for 30 seconds, doubling up to 15 minutes. An answer
 about **one** event — a `408`, `429` or `5xx` for it, or no answer for it while
 the rail answers otherwise — backs off that event alone, offer or not (the
-user's own mail, a held or backfilled one): it keeps its place, only its own
-chat's later events wait behind it, and every other chat's go on — one mail
-never holds back another. Three calls in a row with no answer in time end the
+user's own mail, a held or backfilled one, a merge, a removal): it keeps its
+place, only its own chat's later events wait behind it, and every other chat's
+go on — one mail never holds back another. And not for long: after three of
+its own attempts (`RAIL_HOLD_ATTEMPTS`) the event steps aside — an offer is
+then retried among the re-offers, a told event on its own clock — and its
+chat's later events go on, so a mail the web gateway always fails on cannot
+stall its thread. `/health` counts such events (`waiting.failing`, the oldest
+failure's time in `waiting.failing_since`) and says "N rail event(s) keep
+failing while others are taken". A merge or removal that gets a `404` (an
+older web gateway without the endpoint) waits without holding anything
+back. Three calls in a row with no answer in time end the
 pass as a rail that does not answer would, so a web gateway too slow for every
 event costs a pass three `MAIL_RAIL_TIMEOUT`s. A record that cannot be read at
 that moment is offered again

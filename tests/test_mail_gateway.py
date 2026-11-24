@@ -2354,7 +2354,9 @@ def test_rail_posts_and_their_outcomes():
             for status, kind, outcome in ((400, "inbound", "drop"), (413, "inbound", "drop"),
                                           (500, "inbound", "unanswered"),
                                           (404, "inbound", "down"),
-                                          (404, "merge", "later"), (503, "removed", "later"),
+                                          (404, "merge", "later"), (404, "removed", "later"),
+                                          (503, "removed", "unanswered"),
+                                          (500, "merge", "unanswered"),
                                           (401, "inbound", "down"), (403, "merge", "down")):
                 _RailStub.status = status
                 assert gw._rail_send(kind, {}) == outcome, (status, kind)

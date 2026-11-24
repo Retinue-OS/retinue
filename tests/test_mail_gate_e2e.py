@@ -35,7 +35,12 @@ job a turn runs under is polled by the mail gateway's real job_delivery
   a newer mail arrived meanwhile: the chat stays, only the turn's mail moves;
 - a news-flagged list's mail goes to the feed and makes no chat; a VIP's
   mail in that list gets its chat and its turn, is still filed, and stays in
-  the INBOX.
+  the INBOX;
+- a mail the web gateway answers 5xx for, for ever — one that arrived, and
+  the user's own sent mail — then a VIP's reply in the same thread: the
+  failing mail steps aside after RAIL_HOLD_ATTEMPTS tries, the reply is
+  offered, rings once and gets its turn, and /health counts the one that
+  keeps failing until it is taken.
 
 Standalone:
 
@@ -46,6 +51,8 @@ from __future__ import annotations
 import email
 import functools
 import importlib.util
+import io
+import json
 import os
 import re
 import subprocess
@@ -594,6 +601,81 @@ def test_a_newer_mail_keeps_the_chat(w: World):
     print("PASS test_a_newer_mail_keeps_the_chat")
 
 
+# ── One mail the web gateway always fails on ──────────────────────────────────
+
+def _poisoned(w: World, poison: set):
+    """The web gateway's rail handler fails for these message ids, every
+    time — a fault in its own work, which its catch-all answers with a 500.
+    Returns the undo."""
+    handler = w.wg.Handler
+    real = handler._chats_inbound_event
+
+    def faulty(self):
+        length = int(self.headers.get("Content-Length") or 0)
+        body = self.rfile.read(length)
+        self.rfile = io.BytesIO(body)
+        try:
+            message_id = json.loads(body or b"{}").get("message_id")
+        except ValueError:
+            message_id = None
+        if message_id in poison:
+            raise RuntimeError("a fault in the handler's own work for this mail")
+        return real(self)
+    handler._chats_inbound_event = faulty
+    return lambda: setattr(handler, "_chats_inbound_event", real)
+
+
+def test_a_vips_reply_behind_a_mail_the_rail_always_fails_on(w: World):
+    """A mail the web gateway answers 5xx for, for ever — a first offer, and
+    the user's own sent mail — holds its thread back only while the failure
+    is young: the VIP's reply in it is offered, rings and gets its turn."""
+    holds = w.gw.RAIL_HOLD_ATTEMPTS
+    for first, own in (("big@x.org", False), ("s1@example.org", True)):
+        _reset()
+        undo = _poisoned(w, {first})
+        try:
+            if own:
+                w.box.put("Sent", t.msg(first, sender=t.ME, to="boss@corp.example",
+                                        subject="Contract",
+                                        day=(time.time() - 5 - t.T0) / t.DAY))
+                w.mirror.poll()
+            else:
+                w.arrives(first, sender="Ann <ann@x.org>", subject="Contract")
+            reply = "re-" + first.replace("@", ".") + "@corp.example"
+            w.arrives(reply, sender="Boss <boss@corp.example>", subject="Re: Contract",
+                      irt=first, refs=[first])
+            assert w.rec(reply)["chat"] == w.rec(first)["chat"]
+            assert not PUSHES and not TURNS and w.mirror.health_notice() is None
+            # Held while young; then the mail steps aside and the reply goes.
+            for _ in range(holds + 1):
+                w.later(4000)
+            _wait(lambda: w.delivered(reply), "the VIP's reply delivered")
+            assert len(PUSHES) == 1 and len(TURNS) == 1, (PUSHES, len(TURNS))
+            assert "marked its sender a VIP" in TURNS[0]["prompt"]
+            if own:
+                assert w.mirror.index.one("SELECT attempts FROM outbox")["attempts"] >= holds
+            else:
+                assert not w.delivered(first) and w.owed(first)
+            notice = w.mirror.health_notice()
+            assert notice and notice.startswith(
+                "1 rail event(s) keep failing while others are taken"), notice
+            assert w.gw._health_snapshot()["waiting"]["failing"] == 1
+            # Still tried on its own clock; no second ring, no second turn.
+            w.later(4000)
+            assert len(PUSHES) == 1 and len(TURNS) == 1
+        finally:
+            undo()
+        # The fault is fixed: the mail is taken, /health says nothing more.
+        w.later(4000)
+        _wait(lambda: w.mirror.index.one(
+            "SELECT COUNT(*) AS n FROM outbox")["n"] == 0 and not w.owed(first), "taken")
+        if not own:
+            assert w.delivered(first)
+        assert w.mirror.health_notice() is None
+        assert len(PUSHES) == 1 and len(TURNS) == 1
+    print("PASS test_a_vips_reply_behind_a_mail_the_rail_always_fails_on")
+
+
 # ── The two axes ──────────────────────────────────────────────────────────────
 
 def test_news_and_a_vip_in_the_list(w: World):
@@ -688,6 +770,7 @@ def main():
             test_a_newer_mail_keeps_the_chat(w)
             test_news_and_a_vip_in_the_list(w)
             test_a_turns_mute_is_an_archive(w)
+            test_a_vips_reply_behind_a_mail_the_rail_always_fails_on(w)
         finally:
             TURN_GATE.update(during=None, fail=False)
             if TURN_GATE.get("hold") is not None:

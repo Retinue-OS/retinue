@@ -531,6 +531,11 @@ RAIL_DOWN_NOTICE = 3
 # pass and its backoff: a rail that is up and too slow for every event does
 # not hold the mirror for a timeout per owed mail.
 RAIL_SILENT_MAX = 3
+# A rail event the web gateway fails on (an offer, a told event, a merge or a
+# removal) holds back its chat's later events — keeping the order within the
+# chat — for this many of its own attempts at most. After that it steps
+# aside: one mail the other side always fails on must not stall its thread.
+RAIL_HOLD_ATTEMPTS = 3
 
 # ── The news rail ─────────────────────────────────────────────────────────────
 # A mail of a `news` group is filed to the news feed (news_ingest; the
@@ -705,9 +710,12 @@ def _health_snapshot() -> dict:
         # taken yet (``rail`` — they are offered again, see Mirror._offer),
         # since when the oldest of them has been in the mailbox (``since``),
         # and how many news mails wait for the feed or for their move out of
-        # the INBOX (``news``).
+        # the INBOX (``news``), and how many rail events the web gateway keeps
+        # failing on, which have stepped aside (``failing``), since when the
+        # oldest of them (``failing_since``).
         "waiting": (MIRROR.waiting() if MIRROR is not None
-                    else {"rail": 0, "since": None, "news": 0}),
+                    else {"rail": 0, "since": None, "news": 0, "failing": 0,
+                          "failing_since": None}),
         "last_poll": state["last_poll"],
         "build": _build.build_info(),
     }
@@ -1569,6 +1577,16 @@ def _human_size(count: int) -> str:
     return f"{size / 1000:.1f} GB"
 
 
+def _span(seconds: float) -> str:
+    """A time span as /health words it: minutes, hours or days."""
+    minutes = max(0, int(seconds // 60))
+    if minutes < 120:
+        return f"{minutes} minute(s)"
+    if minutes < 48 * 60:
+        return f"{minutes // 60} hours"
+    return f"{minutes // (24 * 60)} days"
+
+
 def _not_mirrored_note(part: Part) -> tuple[bytes, str]:
     """What stands in for an attachment above the part cap: a small text file
     under the attachment's own name that says so. The bubble shows it like any
@@ -2313,15 +2331,19 @@ class Mailbox:
 #              event is made of the mail's record when its turn comes. A row
 #              the web gateway answered a failure for, or no answer while it
 #              answers otherwise, keeps its place and is tried again once
-#              `due` has passed, `attempts` counting those tries (Mirror.
-#              _flush_rail); meanwhile only its own chat's later rows wait.
+#              `due` has passed, `attempts` counting those tries and `failed`
+#              the first (Mirror._flush_rail); meanwhile only its own chat's
+#              later rows wait — for RAIL_HOLD_ATTEMPTS tries, then it steps
+#              aside (an offer's row goes; a told event's holds nothing). An
+#              offer's row names the chat it was queued in.
 #   offers     the mails the chats rail still owes an answer for: every
 #              inbound record the ledger holds ``delivered: false`` — the
 #              ledger's flag is the queue, and this is its index (rebuilt
 #              from it by Mirror._prepare). `queued` while the mail's first
 #              offer still has its place in the outbox; after that the mail
 #              is offered again once `due` has passed, `attempts` counting
-#              the answers that did not take it.
+#              the answers that did not take it, and `failed` when the first
+#              failure was (for /health).
 #   news       the mails of a `news` group: what the feed is to be given of
 #              each (`item`), whether the mail is then to leave the INBOX
 #              (`consume`), and how far that got — "due" (to be filed),
@@ -2368,11 +2390,11 @@ CREATE TABLE IF NOT EXISTS aliases (
 CREATE INDEX IF NOT EXISTS aliases_mid ON aliases (message_id);
 CREATE TABLE IF NOT EXISTS outbox (
     seq INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL, payload TEXT NOT NULL,
-    attempts INTEGER NOT NULL DEFAULT 0, due REAL NOT NULL DEFAULT 0
+    attempts INTEGER NOT NULL DEFAULT 0, due REAL NOT NULL DEFAULT 0, failed REAL
 );
 CREATE TABLE IF NOT EXISTS offers (
     message_id TEXT PRIMARY KEY, attempts INTEGER NOT NULL DEFAULT 0,
-    due REAL NOT NULL DEFAULT 0, queued INTEGER NOT NULL DEFAULT 0
+    due REAL NOT NULL DEFAULT 0, queued INTEGER NOT NULL DEFAULT 0, failed REAL
 ) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS news (
     message_id TEXT PRIMARY KEY, item TEXT NOT NULL, consume INTEGER NOT NULL,
@@ -2401,17 +2423,20 @@ class MailboxIndex:
             elif version != INDEX_SCHEMA_VERSION:
                 raise RuntimeError(f"mailbox index {path}: schema {version}, "
                                    f"expected {INDEX_SCHEMA_VERSION}")
-            # An index made before `arrived` was kept gains the column, empty.
-            if "arrived" not in {row["name"] for row in
-                                 self._conn.execute("PRAGMA table_info(mails)")}:
-                self._conn.execute("ALTER TABLE mails ADD COLUMN arrived REAL")
-            # And one made before a rail event could wait its own time gains
-            # its clock, with every event due at once.
-            outbox = {row["name"] for row in self._conn.execute("PRAGMA table_info(outbox)")}
-            if "due" not in outbox:
-                self._conn.execute(
-                    "ALTER TABLE outbox ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0")
-                self._conn.execute("ALTER TABLE outbox ADD COLUMN due REAL NOT NULL DEFAULT 0")
+            # An index made before a column was kept gains it: `arrived`
+            # empty; a rail event's clock with every event due at once; the
+            # first failure of an event or offer unknown. Each column on its
+            # own test — every ALTER commits alone, and a stop between two
+            # must not leave an index the next start cannot open.
+            for table, column, kind in (
+                    ("mails", "arrived", "REAL"),
+                    ("outbox", "attempts", "INTEGER NOT NULL DEFAULT 0"),
+                    ("outbox", "due", "REAL NOT NULL DEFAULT 0"),
+                    ("outbox", "failed", "REAL"),
+                    ("offers", "failed", "REAL")):
+                if column not in {row["name"] for row in
+                                  self._conn.execute(f"PRAGMA table_info({table})")}:
+                    self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {kind}")
 
     def close(self) -> None:
         with self._lock:
@@ -2483,10 +2508,11 @@ def _rail_post(kind: str, payload: dict, timeout: float) -> tuple:
     and ``answer`` is the JSON object the web gateway answered with (empty
     when it answered none); ``"drop"`` — refused as malformed, a repeat would
     be refused again; ``"later"`` — this event cannot be taken yet, others
-    may; ``"down"`` — the web gateway is not answering, or refuses every
-    event alike (the token, a URL that is not the rail); ``"unanswered"`` —
-    of a mail (``inbound``): the web gateway answered with a failure of its
-    own (408, 429, 5xx), so it is up and did not take this one; and
+    may (a 404 for a merge or removal: an older web gateway that does not
+    know the endpoint); ``"down"`` — the web gateway is not answering, or
+    refuses every event alike (the token, a URL that is not the rail);
+    ``"unanswered"`` — the web gateway answered with a failure of its own
+    (408, 429, 5xx), so it is up and did not take this event; and
     ``"uncertain"`` — no answer in time, or a connection closed before one:
     whether the event landed is not known, nor whether the web gateway is
     up (:func:`_rail_alive` tells that)."""
@@ -2505,12 +2531,12 @@ def _rail_post(kind: str, payload: dict, timeout: float) -> tuple:
                   flush=True)
             return "down", {}
         if exc.code in (404, 408, 429) or exc.code >= 500:
-            if kind != "inbound":
+            if exc.code == 404 and kind != "inbound":
                 # A merge or removal an older web gateway does not know yet
                 # must not hold the mails behind it back.
                 return "later", {}
             # A URL that is not the rail refuses every mail alike; a failure
-            # the web gateway answered with is about this one.
+            # the web gateway answered with is about this event.
             return ("down" if exc.code == 404 else "unanswered"), {}
         print(f"[mail-gateway] the chats rail refused a {kind} event "
               f"(HTTP {exc.code})", flush=True)
@@ -2865,7 +2891,7 @@ class Mirror:
             if self._owed(by_id[mid][1]):
                 # Written undelivered: a mail that arrived. What the rail is
                 # owed for it is its offer, in its place in the queue.
-                owed += self._owe(mid)
+                owed += self._owe(mid, by_id[mid][1]["chat"])
                 continue
             try:
                 # (A claim with no flags is an older build's: quiet is the
@@ -3058,12 +3084,21 @@ class Mirror:
         mails the chats rail has not taken (each is offered again);
         ``since`` — when the oldest of them reached the mailbox; ``news`` —
         how many news mails wait for the feed, or for their move out of the
-        INBOX."""
+        INBOX; ``failing`` — how many rail events (offers among them) the
+        web gateway failed on RAIL_HOLD_ATTEMPTS times or more, which have
+        stepped aside and hold nothing back (Mirror._flush_rail), and
+        ``failing_since`` — when the oldest of them first failed."""
         rail = self.index.one(
             "SELECT COUNT(*) AS n, MIN(COALESCE(m.arrived, m.ts)) AS since FROM offers o "
             "LEFT JOIN mails m ON m.message_id = o.message_id")
         news = self.index.one("SELECT COUNT(*) AS n FROM news WHERE state != 'done'")
-        return {"rail": rail["n"], "since": rail["since"], "news": news["n"]}
+        failing = self.index.one(
+            "SELECT COUNT(*) AS n, MIN(failed) AS since FROM ("
+            "SELECT failed FROM outbox WHERE attempts >= ? "
+            "UNION ALL SELECT failed FROM offers WHERE queued = 0 AND attempts >= ? "
+            "AND failed IS NOT NULL)", (RAIL_HOLD_ATTEMPTS, RAIL_HOLD_ATTEMPTS))
+        return {"rail": rail["n"], "since": rail["since"], "news": news["n"],
+                "failing": failing["n"], "failing_since": failing["since"]}
 
     def health_notice(self) -> str | None:
         """What an operator should know while the mirror works."""
@@ -3083,6 +3118,15 @@ class Mirror:
                     f"every offer and event of a pass — {owed} mail(s) wait to be taken by "
                     f"their chats, {told} other event(s) to be heard; each is tried again "
                     f"on its own clock, and all of them once one is taken")
+        waiting = self.waiting()
+        if waiting["failing"]:
+            since = waiting["failing_since"]
+            age = (f" — the oldest for {_span(self._clock() - since)}"
+                   if since is not None else "")
+            return (f"{waiting['failing']} rail event(s) keep failing while others are "
+                    f"taken{age}: the web gateway fails on each of them, which is tried "
+                    f"again on its own clock and holds back nothing (the mail gateway's log "
+                    f"names them)")
         if not self.rewritten() or MAIL_CONFIG is None or not MAIL_CONFIG.save_sent:
             return None
         return ("the mail provider files its own copy of every sent mail, under a "
@@ -4407,7 +4451,7 @@ class Mirror:
             if resolution.merged:
                 # Before the mail itself is announced, where it can be.
                 self._apply_merges()
-            announce = self._owe(mail.message_id) if offer else [
+            announce = self._owe(mail.message_id, chat) if offer else [
                 self._event("inbound", self._inbound_event(
                     direction=direction, chat=chat, message_id=mail.message_id, ts=ts,
                     sender=mail.sender or None, sender_name=mail.sender_name,
@@ -4549,9 +4593,15 @@ class Mirror:
         while it answers otherwise, keeps its place and waits its own time
         (:func:`_retry_after`), as a mail not taken does — and only its own
         chat's later events wait behind it, so a reply from a mail client is
-        still never heard before the mail it answers. Every other chat's go
-        on. An event it cannot take yet (``"later"``: a merge an older web
-        gateway does not know) stays queued and holds nothing back."""
+        not heard before the mail it answers — while the failure is young:
+        for RAIL_HOLD_ATTEMPTS of its own attempts. Then it steps aside (a
+        first offer leaves the outbox for :meth:`_offer_again`; a told
+        event keeps its row and its own clock, and holds nothing back) and
+        its chat's later events go on: one mail the other side always fails
+        on must not stall its thread, a VIP's reply in it included. Every
+        other chat's go on throughout. An event it cannot take yet
+        (``"later"``: a merge or removal an older web gateway does not know)
+        stays queued and holds nothing back."""
         if not _chats.chats_enabled():
             return True
         if self._clock() < self._rail_wait_until:
@@ -4573,8 +4623,12 @@ class Mirror:
                 except ValueError:
                     payload = None
                 chats = self._event_chats(row["kind"], payload)
-                if row["due"] > now or chats & held:
-                    held |= chats
+                if chats & held:
+                    held |= chats   # behind an event of its chat: in order
+                    continue
+                if row["due"] > now:
+                    if row["attempts"] < RAIL_HOLD_ATTEMPTS:
+                        held |= chats
                     continue
                 if row["kind"] == "offer":
                     mail = payload.get("message_id") if isinstance(payload, dict) else None
@@ -4593,25 +4647,36 @@ class Mirror:
                         self._rail_took()
                 elif outcome == "unanswered":
                     attempts = row["attempts"] + 1
-                    self.index.run("UPDATE outbox SET attempts = ?, due = ? WHERE seq = ?",
-                                   (attempts, now + _retry_after(attempts), row["seq"]))
-                    held |= chats
+                    self.index.run(
+                        "UPDATE outbox SET attempts = ?, due = ?, failed = COALESCE(failed, ?) "
+                        "WHERE seq = ?", (attempts, now + _retry_after(attempts), now, row["seq"]))
+                    if attempts < RAIL_HOLD_ATTEMPTS:
+                        held |= chats
                     if attempts == 1:
                         print(f"[mail-gateway] the chats rail failed on a {row['kind']} event "
                               f"of chat(s) {sorted(chats)!r}; it keeps its place and is told "
                               f"again later, and only its chat's later events wait for it",
                               flush=True)
+                    elif attempts == RAIL_HOLD_ATTEMPTS:
+                        print(f"[mail-gateway] the chats rail failed on a {row['kind']} event "
+                              f"of chat(s) {sorted(chats)!r} {attempts} times; it steps aside: "
+                              f"told again on its own clock, it holds back nothing any more",
+                              flush=True)
 
     def _event_chats(self, kind: str, payload) -> set:
         """The chats a queued rail event is about — what keeps it in order
         behind another (:meth:`_flush_rail`): a merge is about every chat it
-        joins, the first offer of a mail about the chat the mail is in now."""
+        joins, the first offer of a mail about the chat it was queued in and
+        the one the mail is in now — a merge since must not take it out of
+        its old chat's hold, nor ahead of the merge event itself."""
         if not isinstance(payload, dict):
             return set()
         if kind == "offer":
             row = self.index.one("SELECT chat FROM mails WHERE message_id = ?",
                                  (str(payload.get("message_id") or ""),))
-            return {row["chat"]} if row else set()
+            queued = payload.get("chat")
+            return ({row["chat"]} if row else set()) | (
+                {queued} if isinstance(queued, str) else set())
         if kind == "merge":
             named = list(payload.get("from") or []) + [payload.get("into")]
             return {chat for chat in named if isinstance(chat, str)}
@@ -4716,14 +4781,15 @@ class Mirror:
         return (fields.get("type") == _ibstore.T_INBOUND and not fields.get("delivered")
                 and not fields.get("removed_at"))
 
-    def _owe(self, message_id: str) -> list:
+    def _owe(self, message_id: str, chat: str) -> list:
         """The statements that put a mail that arrived into the rail's queue
         — for the transaction that confirms its record: its row among the
         mails owed, and its place in the outbox, behind every event queued
         before it. In its place, because the order tells: the user's reply
         from a mail client reads the chat up to it, and must not be heard
-        before the mail it answers."""
-        marker = self._event("offer", {"message_id": message_id})
+        before the mail it answers. The place remembers ``chat``, the one
+        the mail is queued in (:meth:`_event_chats`)."""
+        marker = self._event("offer", {"message_id": message_id, "chat": chat})
         return [("INSERT OR REPLACE INTO offers (message_id, attempts, due, queued) "
                  "VALUES (?, 0, 0, ?)", (message_id, int(marker is not None))), marker]
 
@@ -4852,8 +4918,8 @@ class Mirror:
 
         ``seq`` is the mail's marker in the outbox when this is its first
         offer, made in its place among the events; the marker goes with any
-        answer but a failure about this mail (``unanswered``, below), and
-        from then on the mail is offered by :meth:`_offer_again`.
+        answer but a young failure about this mail (``unanswered``, below),
+        and from then on the mail is offered by :meth:`_offer_again`.
 
           * ``accepted`` — the chat has the mail: its record is marked
             delivered, and nothing is owed.
@@ -4878,7 +4944,10 @@ class Mirror:
             failing on must hold back neither the other chats' mails nor
             their events: a first offer that failed keeps its place in the
             outbox, where only its own chat's later events wait for it
-            (:meth:`_flush_rail`), and is tried there again.
+            (:meth:`_flush_rail`), and is tried there again — for
+            RAIL_HOLD_ATTEMPTS tries in all. Then it steps aside: the marker
+            goes, the mail is offered by :meth:`_offer_again` on its own
+            clock, and its chat's later events no longer wait for it.
 
         A mail that is gone by now — tombstoned, erased with its chat,
         recorded anew as the user's own — is offered to nobody: its row
@@ -4893,16 +4962,17 @@ class Mirror:
         if row is not None and fields is None and self._record_path(row["record"]).exists():
             # (EIO, EMFILE, a volume that faltered: the offers row carries
             # the mail from here, and _offer_again comes back to it.)
-            known = self.index.one("SELECT attempts FROM offers WHERE message_id = ?",
+            known = self.index.one("SELECT attempts, failed FROM offers WHERE message_id = ?",
                                    (message_id,))
             attempts = (known["attempts"] if known else 0) + 1
             if attempts == 1:
                 print(f"[mail-gateway] the record of {message_id!r} could not be read; it "
                       f"is offered again later", flush=True)
+            failed = known["failed"] if known and known["failed"] is not None else self._clock()
             self.index.atomic(settle + [
-                ("INSERT OR REPLACE INTO offers (message_id, attempts, due, queued) "
-                 "VALUES (?, ?, ?, 0)",
-                 (message_id, attempts, self._clock() + _retry_after(attempts)))])
+                ("INSERT OR REPLACE INTO offers (message_id, attempts, due, queued, failed) "
+                 "VALUES (?, ?, ?, 0, ?)",
+                 (message_id, attempts, self._clock() + _retry_after(attempts), failed))])
             return True
         if fields is None or not self._owed(fields):
             self.index.atomic(settle + [
@@ -4917,7 +4987,7 @@ class Mirror:
                  (now + RETRY_SECONDS, message_id))])
             return True
         self._jobs.pop(message_id, None)
-        reason = "?"
+        reason, stepped = "?", None
         try:
             event = self._offer_event(row["chat"], fields)
             reason = event["gate"]["reason"]
@@ -4935,16 +5005,24 @@ class Mirror:
                 return False
             if outcome == "unanswered" and seq is not None:
                 # Its first offer: the mail keeps its place, so its chat's
-                # later events still come after it, and waits its own time.
-                marker = self.index.one("SELECT attempts FROM outbox WHERE seq = ?", (seq,))
-                attempts = (marker["attempts"] if marker else 0) + 1
-                self.index.run("UPDATE outbox SET attempts = ?, due = ? WHERE seq = ?",
-                               (attempts, now + _retry_after(attempts), seq))
-                if attempts == 1:
-                    print(f"[mail-gateway] the chats rail did not take {message_id!r} (it "
-                          f"failed on it); it stays undelivered, keeps its place and is "
-                          f"offered again", flush=True)
-                return True
+                # later events still come after it, and waits its own time —
+                # for RAIL_HOLD_ATTEMPTS tries. Then it steps aside, below.
+                marker = self.index.one("SELECT attempts, failed FROM outbox WHERE seq = ?",
+                                        (seq,))
+                tries = (marker["attempts"] if marker else 0) + 1
+                first = marker["failed"] if marker and marker["failed"] is not None else now
+                if tries < RAIL_HOLD_ATTEMPTS:
+                    self.index.run("UPDATE outbox SET attempts = ?, due = ?, failed = ? "
+                                   "WHERE seq = ?", (tries, now + _retry_after(tries), first, seq))
+                    if tries == 1:
+                        print(f"[mail-gateway] the chats rail did not take {message_id!r} (it "
+                              f"failed on it); it stays undelivered, keeps its place and is "
+                              f"offered again", flush=True)
+                    return True
+                stepped = (tries, first)
+                print(f"[mail-gateway] the chats rail failed on {message_id!r} {tries} times; "
+                      f"it steps aside and is offered again on its own clock — its chat's "
+                      f"later events go on", flush=True)
         accepted = outcome == "ok" and answer.get("accepted") is True
         job_url = answer.get("job_url") if accepted else None
         resolved = _job_url(job_url) if job_url is not None else None
@@ -4965,11 +5043,19 @@ class Mirror:
                 return True
             print(f"[mail-gateway] the chat took {message_id!r}, but its record could not "
                   f"be marked delivered; it is offered again", flush=True)
-        known = self.index.one("SELECT attempts FROM offers WHERE message_id = ?", (message_id,))
-        attempts = (known["attempts"] if known else 0) + 1
+        known = self.index.one("SELECT attempts, failed FROM offers WHERE message_id = ?",
+                               (message_id,))
+        # A first offer that stepped aside goes on from its marker's count.
+        attempts = stepped[0] if stepped else (known["attempts"] if known else 0) + 1
+        failed = known["failed"] if known else None
+        if stepped:
+            failed = stepped[1]
+        elif failed is None and not (accepted and job_url):
+            failed = now   # not taken: since when, for /health (waiting)
         self.index.atomic(settle + [
-            ("INSERT OR REPLACE INTO offers (message_id, attempts, due, queued) "
-             "VALUES (?, ?, ?, 0)", (message_id, attempts, now + _retry_after(attempts)))])
+            ("INSERT OR REPLACE INTO offers (message_id, attempts, due, queued, failed) "
+             "VALUES (?, ?, ?, 0, ?)",
+             (message_id, attempts, now + _retry_after(attempts), failed))])
         if accepted and job_url:
             print(f"[mail-gateway] the chat's companion turn took {message_id!r} "
                   f"({reason})", flush=True)

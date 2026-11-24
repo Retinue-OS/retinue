@@ -239,11 +239,12 @@ gateway reads that before it falls back to reading a slug.
 
 `/health` answers `{configured, connected, mode: "inbox", account, error,
 blocked, needs_repair: false, build, backfill: {done, pending, days},
-waiting: {rail, since, news}}` —
+waiting: {rail, since, news, failing, failing_since}}` —
 `backfill.days` is the window fixed at the first run; `waiting` says how many
 mirrored mails the chats rail has not taken yet (and since when the oldest of
-them has been in the mailbox) and how many news mails wait for the feed or for
-their move out of the INBOX. `blocked` names what
+them has been in the mailbox), how many news mails wait for the feed or for
+their move out of the INBOX, and how many rail events the web gateway keeps
+failing on (*The gate*, "One queue, in order"). `blocked` names what
 holds the mirror when that is not the mailbox: `"policy"` (below) or
 `"mirror"` — it stopped on a fault of its own, and `error` says on what.
 An unconfigured gateway (`configured: false`) idles and is not an outage; so
@@ -974,8 +975,19 @@ listed under Unread and judged by nobody.
   rail answers otherwise — backs off that event alone. It keeps its place in
   the outbox and waits its own time (one minute, doubling to an hour), and
   only its own chat's later events wait behind it — so the order within a
-  chat holds — while every other chat's go on. A merge or removal an older
-  web gateway does not know yet waits without holding anything back. **A pass
+  chat holds — while every other chat's go on. **A held event steps aside**:
+  it holds its chat back only while the failure is young, for three of its
+  own attempts (`RAIL_HOLD_ATTEMPTS`). Then a first offer leaves the outbox
+  for the re-offers below, and a told event keeps retrying on its own clock
+  without holding anything — and the chat's later events go on, so one mail
+  the web gateway always fails on cannot stall its thread (a VIP's reply in
+  it is offered, rings and is worked). The order within a chat is kept for a
+  young failure, not for one that persists. A first offer's place names the
+  chat it was queued in as well as the one its mail is in now, so a merge
+  meanwhile does not take it out of its old chat's hold. This holds for a
+  merge or a removal too: a 408, 429 or 5xx for one is a failure about it;
+  only a 404 — an older web gateway that does not know the endpoint — makes
+  it wait without holding anything back. **A pass
   is bounded**: a call that gets no answer in time costs `MAIL_RAIL_TIMEOUT`,
   and after three of them in a row the rail counts as not answering for the
   rest of the pass and its backoff, so a web gateway that is up and too slow
@@ -1030,9 +1042,13 @@ listed under Unread and judged by nobody.
   while it answers and takes no mail: when every offer and event of a pass
   (three at least) was answered with a failure, or with none, the notice says
   "the chats rail answers but takes no mail" until a mail is taken. One mail
-  failing alone says nothing of the rail. When a mail is taken again, what
-  waited over the fault — each wait grown up to an hour meanwhile — is
-  offered and told again at once.
+  failing alone says nothing of the rail, but of itself once it has stepped
+  aside: `waiting.failing` counts the rail events (offers among them) the web
+  gateway failed on three times or more, `waiting.failing_since` says when
+  the oldest first failed, and the notice says "N rail event(s) keep failing
+  while others are taken — the oldest for …" (the log names them). When a
+  mail is taken again, what waited over the fault — each wait grown up to an
+  hour meanwhile — is offered and told again at once.
 
 ### What retires
 
