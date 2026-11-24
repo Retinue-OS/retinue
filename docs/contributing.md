@@ -384,9 +384,12 @@ beforehand.
   it is never added twice. It is known by its exact text (as a line of its
   own, or at the very end whatever stands before it), and, on a person the
   migration's journal records it placed the line on, by that opening at the
-  start of any line however you edit or move it (there, a paragraph of
-  yours that begins with those words is taken for the line too; of several,
-  the exact one, then the last); on anyone else a paragraph of yours that
+  start of any line however you edit or move it (there, a line of yours
+  that begins with those words, also inside a paragraph, is taken for the
+  line too — a later note goes in front of it; of several, the exact one,
+  then the last; a marker moved aside forgets on whom the line was placed,
+  and an edited line is then no longer known: a later filing note adds the
+  line again); on anyone else a paragraph of yours that
   begins with those words is yours — notes go after it, and a filing note
   adds the real line. A line you delete stays deleted: a later filing note
   for that person adds its own words alone. Nothing the model writes

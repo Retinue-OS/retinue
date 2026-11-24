@@ -9993,8 +9993,9 @@ _INSTRUCTED_RINGS: dict[str, dict] = {}
 #               ``epoch``) — also where the unarchive lands while the turn
 #               wraps up, off this registry, where _turn_flags_overruled no
 #               longer finds its record. (A merge landing in that window
-#               finds no record to carry the note along either, and the
-#               ask is then noted as none too: the thread stays in view);
+#               finds no record to carry the note along either: the ask is
+#               then dropped where the merged chat's epoch differs from the
+#               one noted, and kept where neither half was brought back);
 #   flags       {"archived"} where the turn archived the chat itself
 #               (POST /internal/chats/<id>/flags) and the user has not set
 #               the flag since — "file the document, then archive the mail".
@@ -19601,9 +19602,10 @@ class Handler(BaseHTTPRequestHandler):
             elif action == "reopen":
                 if item.get("kind") == "chat" and item.get("done_how") == "expired":
                     # The expiry archived the chat (_attention_expire); an
-                    # archived chat is no item, so putting it back undoes that.
-                    _CHAT_STATE.set_flags(item["source_id"], archived=False)
-                    _chats_cache_invalidate()
+                    # archived chat is no item, so putting it back undoes that
+                    # — the user's own unarchive, with all that follows from
+                    # one (what turns asked for is forgotten).
+                    _set_chat_flags(item["source_id"], {"archived": False}, user=True)
                 attention_policy.reopen(item)
             elif action == "expiry":
                 # The sender's expiry, from the sheet: {id, expiry: minutes or

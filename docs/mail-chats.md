@@ -1585,9 +1585,14 @@ text is a digest of a topic, not a rule).
     — by its opening: a line beginning *"Unless the note above says
     otherwise:"*, however the user edited the rest of it and wherever they
     moved it, at the start of any line (no blank line needed before it; a
-    lone CR ends a line too) — there, a paragraph of the user's own that
-    begins with those words is taken for the line too. Where several lines
-    qualify, the exact one wins, then the last. On anyone else a paragraph of the user's own that
+    lone CR ends a line too) — there, a line of the user's own that begins
+    with those words, also inside a paragraph, is taken for the line too: a
+    later note goes in front of that line and enters its "note above". Where
+    several lines qualify, the exact one wins, then the last. Only the
+    journal knows on whom the line was placed: a marker moved aside forgets
+    it (as does a stop between a filing note's write and its journal entry),
+    and where the user has edited the line since, a later filing note then
+    adds the line a second time. On anyone else a paragraph of the user's own that
     happens to begin with those words is their text: a note goes after it,
     and a filing note adds the real line. A later note for a person who has
     the line — a second filing note, a rule — goes in front of it, in its

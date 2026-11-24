@@ -275,8 +275,10 @@ services:
       # in the thread's companion.
       - MAIL_ARRIVAL_TURN_ATTEMPTS
       # Which TCP peers count as "arrived through the reverse proxy" for the
-      # endpoints that act with the user's own authority: the chat send press,
-      # a chat's flags and delete, and approving a pending send. Defence in
+      # endpoints that act with the user's own authority: a chat's send, flags
+      # and delete, a new mail, a thread's delete, a shell action's outcome,
+      # approving a pending send — and for marking a dashboard message as the
+      # user's own (which decides whether its turn may type). Defence in
       # depth only — no send skips an account's policy any more, whoever
       # calls. Unset (the default) refuses only a loopback peer and a peer
       # that is the very address the caller dialled: Traefik in its own
