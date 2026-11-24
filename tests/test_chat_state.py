@@ -13,8 +13,10 @@ count per message, however often its event is delivered), the reach of a
 read to a message stamped by a fast clock, path-safe state filenames, and
 the overlay's merge/dedup/expiry contract — an entry is keyed by its chat as
 well as its message id. And what a mailbox adds: an arrival that is gone is
-no unread one, a merge keeps every arrival's place in the count true, and
-the id of a chat that was folded into another says where it went.
+no unread one, a merge keeps every arrival's place in the count true, the id
+of a chat that was folded into another says where it went, and the copy of a
+chat's queued sends — kept as data, its one link a path of this origin —
+follows its gateway's queue.
 
 Standalone, no third-party deps:
 
@@ -1093,6 +1095,117 @@ def test_a_merged_chats_id_says_where_it_went():
     print("PASS test_a_merged_chats_id_says_where_it_went")
 
 
+def _pending(rid, **over):
+    """One queued send as the web gateway hands it to the store."""
+    entry = {"request_id": rid, "approval_url": f"/sends/mail-gateway/{rid}", "text": "Dear Ann",
+             "ts": 1790000000, "author": "user", "to": ["ann@x.org"], "cc": [],
+             "subject": "Re: Numbers", "message_id": f"{rid}@example.org"}
+    entry.update(over)
+    return entry
+
+
+def test_a_queued_send_is_kept_as_data():
+    rid = "a" * 32
+    clean = cs.clean_pending(_pending(rid))
+    assert clean["request_id"] == rid and clean["approval_url"] == f"/sends/mail-gateway/{rid}"
+    assert clean["ts"] == "2026-09-21T14:13:20Z" and clean["author"] == "user"
+    assert clean["message_id"] == f"{rid}@example.org" and isinstance(clean["noted"], float)
+    # The one link a queued send carries is the path of its own approval
+    # page on this origin. Anything else is no queued send of ours.
+    for url in (f"https://evil.example/sends/mail-gateway/{rid}", f"//evil.example/sends/x/{rid}",
+                f"/sends/mail-gateway/{rid}?next=//evil.example", f"/sends/mail-gateway/{rid}/approve",
+                f"/chats/x/{rid}", f"/sends/mail gateway/{rid}", f"/sends/mail-gateway/{'b' * 32}",
+                "javascript:alert(1)", "", None, 7):
+        assert cs.clean_pending(_pending(rid, approval_url=url)) is None, url
+    for bad in ("", "a/b", "../x", "a" * 65, None, 5):
+        assert cs.clean_pending(_pending(bad)) is None, bad
+    assert cs.clean_pending("nonsense") is None and cs.clean_pending(None) is None
+    # Text from a mail — an address, a subject — is one line, bounded; an
+    # author that is none of the three is an agent's.
+    odd = cs.clean_pending(_pending(
+        rid, to=["Ann <ann@x.org>\r\nBcc: evil@x.org", "", 7, "b@y.org"], cc="c@z.org",
+        subject="Re: x\nX-Injected: 1 y", author="root", text="a\x00b" + "c" * 70000,
+        message_id="m1@x.org\r\nx", ts="not a time"))
+    assert odd["to"] == ["Ann <ann@x.org> Bcc: evil@x.org", "b@y.org"] and odd["cc"] == []
+    assert odd["subject"] == "Re: x X-Injected: 1 y" and odd["author"] == "agent"
+    assert odd["message_id"] == "m1@x.org x" and "\x00" not in odd["text"]
+    assert len(odd["text"]) <= 64 * 1024 + 1 and odd["text"].endswith("…")
+    assert "message_id" not in cs.clean_pending(_pending(rid, message_id=None))
+    print("PASS test_a_queued_send_is_kept_as_data")
+
+
+def test_the_copy_follows_the_gateways_queue():
+    with tempfile.TemporaryDirectory() as tmp:
+        st = cs.ChatStateStore(tmp)
+        cid = cs.make_chat_id("email", "root@x.org", "me@example.org")
+        a, b, c = "a" * 32, "b" * 32, "c" * 32
+        # Asking about a chat must not create its state.
+        doc, changed = st.set_pending(cid, [])
+        assert changed is False and doc["pending"] == [] and not st.exists(cid)
+        # Oldest first, one per request, whatever order they are handed in.
+        doc, changed = st.set_pending(cid, [_pending(b, ts=1790000200), _pending(a),
+                                            _pending(a, text="again"), "junk",
+                                            _pending(c, approval_url="https://evil.example/x")])
+        assert changed is True and [p["request_id"] for p in doc["pending"]] == [a, b]
+        assert doc["pending"][0]["text"] == "Dear Ann"
+        # The same answer again writes nothing: a poll costs no write.
+        path = st._path(cid)
+        before = path.stat().st_mtime_ns
+        doc, changed = st.set_pending(cid, [_pending(a), _pending(b, ts=1790000200)])
+        assert changed is False and path.stat().st_mtime_ns == before
+        # Nor does an answer that does not date its entries: each keeps the
+        # time it has, and its place.
+        doc, changed = st.set_pending(cid, [_pending(a, ts=None), _pending(b, ts=None)])
+        assert changed is False and [p["request_id"] for p in doc["pending"]] == [a, b]
+        assert doc["pending"][1]["ts"] == "2026-09-21T14:16:40Z"
+        # An entry the queue no longer lists is gone — sent, denied, retracted.
+        doc, changed = st.set_pending(cid, [_pending(b, ts=1790000200)])
+        assert changed is True and [p["request_id"] for p in doc["pending"]] == [b]
+        # ... unless this side learned of it after the gateway was asked: a
+        # send queued while that answer was on its way stays in view.
+        asked = time.time()
+        time.sleep(0.01)
+        st.add_pending(cid, _pending(c, ts=1790000300))
+        doc, changed = st.set_pending(cid, [_pending(b, ts=1790000200)], since=asked)
+        assert [p["request_id"] for p in doc["pending"]] == [b, c] and changed is False
+        # The next answer, asked after it was noted, decides.
+        doc, changed = st.set_pending(cid, [_pending(b, ts=1790000200)], since=time.time() + 1)
+        assert [p["request_id"] for p in doc["pending"]] == [b]
+        # add_pending replaces by request id and stores nothing that is none.
+        doc = st.add_pending(cid, _pending(b, ts=1790000200, text="edited"))
+        assert [p["text"] for p in doc["pending"]] == ["edited"]
+        assert st.add_pending(cid, {"request_id": "x"})["pending"] == doc["pending"]
+        # Dropped by request id (a decision) or by Message-ID (the mail went
+        # out); a chat that holds no such entry is not written.
+        st.add_pending(cid, _pending(a))
+        doc, dropped = st.drop_pending(cid, request_id=a)
+        assert dropped and [p["request_id"] for p in doc["pending"]] == [b]
+        doc, dropped = st.drop_pending(cid, message_id=f"{b}@example.org")
+        assert dropped and doc["pending"] == []
+        before = path.stat().st_mtime_ns
+        assert st.drop_pending(cid, message_id="nothing@x.org")[1] is False
+        assert st.drop_pending(cid)[1] is False and path.stat().st_mtime_ns == before
+        other = cs.make_chat_id("email", "never@x.org", "me@example.org")
+        assert st.drop_pending(other, request_id=a)[1] is False and not st.exists(other)
+        # Bounded: the newest are kept.
+        was, cs.PENDING_MAX = cs.PENDING_MAX, 3
+        try:
+            many = [_pending(f"{n:032x}", ts=1790000000 + n) for n in range(5)]
+            doc, _ = st.set_pending(cid, many)
+            assert [p["request_id"] for p in doc["pending"]] == [f"{n:032x}" for n in (2, 3, 4)]
+        finally:
+            cs.PENDING_MAX = was
+        # A merge keeps both chats' queued sends, oldest first.
+        st.set_pending(cid, [_pending(b, ts=1790000200)])
+        st.add_pending(other, _pending(a))
+        doc, gone = st.merge(other, cid)
+        assert gone is not None and [p["request_id"] for p in doc["pending"]] == [a, b]
+        # And a delete forgets them with the chat.
+        st.delete(cid)
+        assert st.get(cid)["pending"] == []
+    print("PASS test_the_copy_follows_the_gateways_queue")
+
+
 if __name__ == "__main__":
     test_split_and_filename_safety()
     test_account_is_half_the_identity()
@@ -1119,4 +1232,6 @@ if __name__ == "__main__":
     test_an_arrival_that_is_gone_is_not_unread()
     test_merge_keeps_the_arrivals_places_true()
     test_a_merged_chats_id_says_where_it_went()
+    test_a_queued_send_is_kept_as_data()
+    test_the_copy_follows_the_gateways_queue()
     print("all chat-state tests passed")
