@@ -515,20 +515,37 @@ the mail server; it was not sent") and is listed in its chat, instead of being
 dropped; everything between the mark and the server's answer is *unknown*, and
 is never sent again by anything. `"repeat": true` says the answer tells of an
 earlier request — **a repeat is not a reply**: the web gateway then only hands
-back the Message or the Pending and clears nothing, marks nothing read, settles
-no attention item and calls no mailbox hook (the rail did all of that when the
-mail went out), and `mail-push.py` prints that it was a repeat. A fault nobody
-planned for is answered from what stands under the request's key, or — with no
-key to look under after an entry was made — as `unconfirmed`; never "failed"
-off the fault alone.
+back the Message or the Pending, marks nothing read, settles no attention item
+and calls no mailbox hook (the rail did all of that when the mail went out),
+and `mail-push.py` prints that it was a repeat. The one thing a repeat clears
+is the draft it repeats: the chat's shared draft goes exactly when it still
+holds this press's own words (a page whose answer never came saved them there
+again), and a draft written since stays. A fault nobody planned for is
+answered from what stands under the request's key, or — with no key to look
+under after an entry was made — as `unconfirmed`; never "failed" off the fault
+alone.
 
 Towards the browser the web gateway answers its certain "nothing was sent" as
 `424 {error, "sent": false, request_key}`; `502` remains "the gateway was never
 reached" and `503` "cannot send / could not queue", each with `"sent": false`
 when nothing was handed over; whatever is open is `202 {unconfirmed: true}`.
-The pages read any answer with `"sent": false`, and any 4xx, as *Not sent:
-<sentence>* — the words stay in the box, the key is dropped, the next press is
-a new one — and a 5xx without `"sent": false` as unknown, keeping the key.
+A 5xx from the mail gateway counts as failed only on its explicit `"sent":
+false` — one without it, a body cut short and a body that is no JSON are
+*unconfirmed*. Every "not sent" answer names its speaker: `"by": "gateway"`
+where it hands on the mail gateway's own word about this request, `"by":
+"dashboard"` where the web gateway answers without the mail gateway having
+spoken (never reached, no gateway for that mailbox, validation, `403`/`410`).
+**A kept key is dropped only on the mail gateway's own word about it**: the
+pages drop it on a `"by": "gateway"` answer with `"sent": false` or a 4xx, on
+a change of the words, or when the press's mail shows — and keep it with the
+words on any other answer, since keeping a key costs nothing (a key the
+gateway never saw, or whose send failed for certain, is a new attempt) and
+dropping one of unknown outcome can send the mail twice. A first press (a
+fresh key) answered `"sent": false` or a 4xx reads *Not sent: <sentence>*; a
+press made again under a kept key and answered by the dashboard reads that the
+gateway could not be asked, and that it is still not known whether the first
+attempt went out. A 5xx without
+`"sent": false` is unknown, and keeps the key.
 
 **A send that failed, or was partly refused, does not disappear.** `GET
 /pending-sends` (and `?chat=<key>`) lists entries with status `pending`,

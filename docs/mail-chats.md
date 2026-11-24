@@ -555,8 +555,11 @@ reverse").
     new `message_id`, and under `verify` a new approval. A key whose entry is
     `pending`, `sending`, sent, or `error` with `outcome_unknown: true` is
     answered from the entry and sends nothing, for as long as the key is
-    remembered: dismissed or not, before a restart and after one. An `error`
-    entry that does not say `outcome_unknown` either way is read as unknown.
+    remembered, dismissed or not. Across a restart the entry is first what
+    the start makes of it (the table below): a direct send a stop caught
+    before the hand-over ends as a certain failure there, and its repeat is a
+    new attempt. An `error` entry that does not say `outcome_unknown` either
+    way is read as unknown.
     `"sent": false` is also on the gateway's `503`s (not configured, no SMTP
     server, the send could not be written down) — which come only after the
     key was looked up, so it is never said over a mail that went out — and a
@@ -568,11 +571,33 @@ reverse").
     and `503` "cannot send / could not queue"; both carry `"sent": false` when
     the web gateway knows nothing was handed over (it never wrote the request).
     Anything whose outcome is open is `202 {unconfirmed: true, …}`, never a
-    4xx or 5xx.
-  - *The webapp.* An answer carrying `"sent": false`, and any 4xx, is *Not
-    sent: <sentence>*: the words stay in the box, the press's key is dropped
-    and the next press mints a new one. A 5xx without `"sent": false` (a
-    proxy, a crash) is unknown and keeps the key.
+    4xx or 5xx. A 5xx from the mail gateway is a failure **only on its
+    explicit `"sent": false`**: a `502`/`503` without it, a body cut short of
+    its `Content-Length`, and a body that is no JSON are all *unconfirmed*
+    (`202`), never `424`.
+  - *Who said it.* Every "not sent" answer to the browser names its speaker:
+    `"by": "gateway"` where it hands on the mail gateway's own word about this
+    request (its certain failure, the `424`; its refusals, each a 4xx; its
+    `503`s), `"by": "dashboard"` where the web gateway answers
+    without the mail gateway having spoken (never reached, no gateway serves
+    that mailbox, validation, `403`/`410`). Only the first is a word about the
+    key; the second is about this request alone.
+  - *The webapp* (the chat page and the compose sheet). **A kept key is
+    dropped only on the mail gateway's own word about that key**: an answer
+    with `"by": "gateway"` and `"sent": false` or a 4xx, a change of the
+    words, or the press's mail showing up. Any other "not sent" answer keeps
+    the key with the words. Keeping a key is harmless — the mail gateway takes
+    a key it never saw, or one whose send failed for certain, for a new
+    attempt — while dropping one whose earlier outcome is unknown can send the
+    mail twice. What the user is told depends on the press: a first press (a
+    fresh key) answered `"sent": false` or a 4xx reads *Not sent:
+    <sentence>*, the words in the box and the next press a new one; a press
+    made *again* under a kept key and answered by the dashboard reads that the
+    gateway could not be asked just now, and that it is still not known
+    whether the first attempt went out. An answer with no `by` (an older
+    server) is read as the gateway's for a first press and as the dashboard's
+    for an again press. A 5xx without `"sent": false` (a proxy, a crash) is
+    unknown and keeps the key.
 
   What a start finds under a key, and what the same request made again then
   does (`tests/test_mail_gateway_send.py` walks a stop after every write):
@@ -594,10 +619,16 @@ reverse").
   send that was rejected or retracted). The
   mail went out — or was queued — *before*; this request did none of it. The
   web gateway then only reconciles: it returns the Message or the Pending and
-  drops its pending copy, and does nothing a reply does — no draft cleared, no
-  read mark advanced, no attention item settled, no mailbox read hook. The
-  rail did all of that when the mail went out. `mail-push.py` prints that the
-  answer was a repeat. A new attempt after a certain failure is no repeat.
+  drops its pending copy, and does nothing a reply does — no read mark
+  advanced, no attention item settled, no mailbox read hook. The rail did all
+  of that when the mail went out. **A repeat clears the draft it repeats, and
+  no other**: the chat's shared draft is cleared exactly when it still holds
+  this press's own words, and a draft written since stays. (A press whose
+  answer never reached the page puts its words back in the box, and the box
+  saves them as the shared draft; the repeat that finds the mail sent takes
+  them out again, or every device and every session would get a sent mail
+  back as the draft, and one more press would send it twice.) `mail-push.py`
+  prints that the answer was a repeat. A new attempt after a certain failure is no repeat.
 - **A failed or partly refused send leaves a trace.** `GET /pending-sends`
   (and `?chat=`) lists entries with status `pending`, `sending` and `error`;
   an `error` entry carries a sentence `error` and `outcome_unknown` (the hand-over

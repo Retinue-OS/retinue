@@ -4098,13 +4098,26 @@ class Mirror:
         folder) and wrong here, where None lets a thread be erased. A folder
         the server has and the mirror has not read under that name — the
         archive an Archive just made, a role that names another folder since
-        the last poll — is UNSURE: its mails are where no index says."""
+        the last poll — is UNSURE: its mails are where no index says.
+
+        A copy the gateway moved on and the server kept (``moved``: flagged
+        \\Deleted, on a server without MOVE or UIDPLUS — this very delete's,
+        or an earlier archive's) is no place of the mail: the search finds
+        it all the same, and taken for one it would be moved to the Trash a
+        second time. It is answered as not held. (A real copy that came back
+        to the folder since has the higher UID, and the search's newest
+        match is that one.)"""
         name, folder = self._folders.get(role), self._folder(role)
         if not name:
             return None     # the mailbox has no such folder: nothing is in it
         if folder is None or folder["name"] != name:
             return UNSURE
-        return self._find(role, message_id, ts, arrived)
+        uid = self._find(role, message_id, ts, arrived)
+        if uid is not None and uid is not UNSURE and self.index.one(
+                "SELECT 1 FROM locations WHERE role = ? AND gen = ? AND uid = ? "
+                "AND skipped = 'moved'", (role, folder["gen"], uid)):
+            return None
+        return uid
 
     def delete_chat(self, chat: str) -> dict:
         """The user's delete: every mail of the thread, in every mirrored

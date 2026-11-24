@@ -2507,6 +2507,52 @@ def test_one_message_in_two_folders_is_read_archived_and_deleted_as_one():
         assert t.records(gw) == [], "no copy was left behind to bring the chat back"
     finally:
         done(w)
+
+    # A server with neither MOVE nor UIDPLUS: a move leaves its original in
+    # the folder, flagged \Deleted, and its place marked as moved on. The
+    # search for a mail missing from its other place finds that copy — and
+    # it is not moved to the Trash again: one mail, one copy in the Trash.
+    w = world()
+    try:
+        gw, box, mirror = w.gw, w.box, w.mirror
+        box.can_expunge = False
+        raw = t.msg("y@x.org", day=1)
+        box.put("INBOX", raw)
+        mirror.poll()
+        # A second real copy in the archive, which the mirror knows of; a
+        # client removes it again before the next poll.
+        uid = box.put("Archive", raw)
+        mirror._locate("archive", uid, "y@x.org")
+        box.remove("Archive", uid)
+        result = mirror.delete_chat("y@x.org")
+        assert result["errors"] == 0 and result["trashed"] == 1, result
+        assert held_in(box, "Trash") == ["y@x.org"]
+        assert "\\Deleted" in flags(box, "INBOX", "y@x.org")
+        assert t.records(gw) == [] and mirror.thread("y@x.org") is None
+        moves = [write for write in box.writes if write[0] == "move"]
+        assert moves.count(("move", "INBOX", (1,), "Trash")) == 1, moves
+    finally:
+        done(w)
+    # …and the copy an earlier Archive left in the INBOX, once the archive's
+    # copy has gone (a client took it away): the mail is in no mirrored
+    # folder, and the leftover is not "found" there and trashed.
+    w = world()
+    try:
+        gw, box, mirror = w.gw, w.box, w.mirror
+        box.can_expunge = False
+        box.put("INBOX", t.msg("z@x.org", day=1))
+        mirror.poll()
+        assert mirror.archive("z@x.org")["moved"] == 1
+        box.remove("Archive", box.uid_of("Archive", "z@x.org"))
+        box.writes.clear()
+        result = mirror.delete_chat("z@x.org")
+        assert result["errors"] == 0 and result["trashed"] == 0, result
+        assert held_in(box, "Trash") == []
+        assert [write for write in box.writes if write[0] == "move"] == [
+            ("move", "Archive", (1,), "Trash")]
+        assert t.records(gw) == [] and mirror.thread("z@x.org") is None
+    finally:
+        done(w)
     print("ok: one message in two folders is flagged, archived and deleted as the one mail "
           "it is")
 
@@ -2925,6 +2971,116 @@ def test_without_an_smtp_server_nothing_is_sent_and_the_mirror_runs():
     finally:
         done(w)
     print("ok: with no SMTP server the mailbox is mirrored and followed, and a send says why not")
+
+
+# The functions a /send is answered by (_Handler._send), and the one whose
+# refusals they hand on.
+_SEND_ANSWERERS = ("_accept_send", "_repeat_send", "_send_answer", "_send_unplanned")
+
+
+def _says_which(answer) -> bool:
+    return answer.get("sent") is False or answer.get("unconfirmed") is True
+
+
+def test_every_5xx_of_a_send_says_whether_the_mail_may_be_out():
+    """A 5xx to /send is read by its caller as "the outcome is open" unless
+    it says otherwise — so every one says which it is: ``"sent": false``
+    (nothing left), or ``"unconfirmed": true`` (it may have). Walked twice:
+    in the source, every answer site of the four functions a /send is
+    answered by, so that a new one cannot come without it; and by driving
+    each of them."""
+    import ast
+    source = (Path(__file__).resolve().parent.parent / "scripts" / "mail-gateway.py").read_text()
+    functions = {node.name: node for node in ast.walk(ast.parse(source))
+                 if isinstance(node, ast.FunctionDef)}
+    sites = 0
+    for name in _SEND_ANSWERERS:
+        # Names bound to another answerer's answer: ``status, answer =
+        # _send_answer(…)``.
+        relayed = {tuple(map(ast.unparse, target.elts)) for node in ast.walk(functions[name])
+                   if isinstance(node, ast.Assign) and isinstance(node.value, ast.Call)
+                   and isinstance(node.value.func, ast.Name)
+                   and node.value.func.id in _SEND_ANSWERERS
+                   for target in node.targets if isinstance(target, ast.Tuple)}
+        for node in ast.walk(functions[name]):
+            if not isinstance(node, ast.Return) or node.value is None:
+                continue
+            value = node.value
+            if isinstance(value, ast.Call):
+                # Handed on to another answerer — nothing else.
+                assert isinstance(value.func, ast.Name) and \
+                    value.func.id in _SEND_ANSWERERS, (name, node.lineno)
+                continue
+            assert isinstance(value, ast.Tuple) and len(value.elts) == 2, (name, node.lineno)
+            status, body = value.elts
+            spreads = [ast.unparse(spread) for key, spread in zip(body.keys, body.values)
+                       if key is None] if isinstance(body, ast.Dict) else [ast.unparse(body)]
+            if any((ast.unparse(status), spread) in relayed for spread in spreads):
+                continue    # that answer (a field added, perhaps): walked where it is made
+            if not isinstance(status, ast.Constant):
+                # Only a refusal's own status: SendRefused, never a 5xx
+                # (checked below, where each is raised).
+                assert ast.unparse(status) == "exc.status", (name, node.lineno)
+                continue
+            if status.value < 500:
+                continue
+            sites += 1
+            assert isinstance(body, ast.Dict), (name, node.lineno)
+            said = {key.value: val for key, val in zip(body.keys, body.values)
+                    if isinstance(key, ast.Constant)}
+            assert any(isinstance(said.get(field), ast.Constant) and said[field].value is want
+                       for field, want in (("sent", False), ("unconfirmed", True))), \
+                f"{name}, line {node.lineno}: a {status.value} that does not say whether " \
+                f"the mail may be out"
+    assert sites >= 8, sites
+    # A refusal is a 4xx wherever one is raised.
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and \
+                node.func.id in ("SendRefused", "refuse"):
+            statuses = [arg for arg in node.args if isinstance(arg, ast.Constant)
+                        and isinstance(arg.value, int)]
+            assert all(400 <= arg.value < 500 for arg in statuses), node.lineno
+
+    # Driven: each 5xx a /send can be answered with.
+    w = world()
+    try:
+        gw = w.gw
+        seen = []
+
+        def check(status, answer):
+            assert status < 500 or _says_which(answer), (status, answer)
+            seen.append(status)
+            return status, answer
+        mirror = gw.MIRROR
+        gw.MIRROR = None
+        assert check(*w.send(to=["ann@x.org"]))[0] == 503
+        gw.MIRROR = mirror
+        real_build = gw._build_outgoing
+
+        def broken(*args, **kwargs):
+            raise RuntimeError("the mail could not be built")
+        gw._build_outgoing = broken
+        status, answer = check(*w.send(to=["ann@x.org"], request_key="built-1"))
+        gw._build_outgoing = real_build
+        assert status == 502 and answer["sent"] is False
+        ids = {"id": "f" * 32, "message_id": "m@example.org", "chat": "m@example.org"}
+        for entry, field in (({"status": "sending", "direct": True}, "unconfirmed"),
+                             ({"status": "error", "outcome_unknown": True}, "unconfirmed"),
+                             ({"status": "error"}, "unconfirmed"),
+                             ({"status": "error", "outcome_unknown": False}, "sent")):
+            status, answer = check(*gw._send_answer({**ids, **entry}, HOST))
+            assert status == 502 and field in answer, (entry, answer)
+        fault = RuntimeError("boom")
+        assert check(*gw._send_unplanned({"request_key": "never-1"}, HOST, fault))[1][
+            "sent"] is False
+        assert check(*gw._send_unplanned({}, HOST, fault))[1]["unconfirmed"] is True
+        status, answer = w.send(to=["ann@x.org"], request_key="out-9")
+        assert status == 200
+        assert check(*gw._send_unplanned({"request_key": "out-9"}, HOST, fault))[0] == 200
+        assert seen.count(502) >= 6 and 503 in seen
+    finally:
+        done(w)
+    print("ok: every 5xx of a send says whether the mail may be out")
 
 
 def test_the_loop_is_woken_for_the_rail_and_leaves_the_mailbox_alone():
