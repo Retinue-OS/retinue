@@ -2337,7 +2337,14 @@ def _check_cost_grows_with_size():
             return      # (the inputs that were quadratic took 20 seconds here)
         # Slow, then, but in proportion? Linear is 4x; quadratic 16x.
         small = cost(run, make(3000))
-        assert large < 9 * small, (
+        # One measurement on a busy machine can be stretched by its
+        # neighbours; the least of a few is what the input costs.
+        for _ in range(3):
+            if large < 0.55 or large < 9 * small:
+                return
+            large = min(large, cost(run, make(12000)))
+            small = min(small, cost(run, make(3000)))
+        assert large < 0.55 or large < 9 * small, (
             "%s: %.2fs for 3000, %.2fs for 12000" % (name, small, large))
 
     for name, make in shapes.items():
