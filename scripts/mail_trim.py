@@ -2035,10 +2035,11 @@ _TAG_ATTRIBUTES_RE = re.compile(
     r"(?:[{b}/]+|[^{b}/>][^{b}/>=]*"
     r"""(?:[{b}]*=[{b}]*(?:"[^"]*"?|'[^']*'?|[^{b}>]*))?)*""".format(
         b=r"\t\n\f\r "))
-# … one of them at a time, a value in quotes (its quotes with it) in group 1.
+# … one of them at a time, a value in quotes (its quotes with it) in group 1,
+# one without in group 2.
 _TAG_ATTRIBUTE_RE = re.compile(
     r"[{b}/]+|[^{b}/>][^{b}/>=]*"
-    r"""(?:[{b}]*=[{b}]*(?:("[^"]*"?|'[^']*'?)|[^{b}>]*))?""".format(
+    r"""(?:[{b}]*=[{b}]*(?:("[^"]*"?|'[^']*'?)|([^{b}>]*)))?""".format(
         b=r"\t\n\f\r "))
 _RAW_TEXT_ENDS = {tag: re.compile(r"</%s[\t\n\f\r />]" % tag, re.I) for tag in (
     "style", "script", "xmp", "iframe", "noembed", "noframes", "textarea",
@@ -2150,16 +2151,25 @@ class _TagWalk:
         self.at = _TAG_NAME_RE.match(html, name).end()
         self.attribute = None       # the first that does not end before
 
-    def quotes(self, start: int, end: int) -> bool:
-        """Is html[start:end] inside one value in quotes: opened by a quote
-        (an entity opens none) before it, and not closed before its end?"""
+    def holds(self, start: int, end: int, quoted: bool) -> bool:
+        """Is html[start:end] inside one attribute value: one in quotes —
+        opened by a quote (an entity opens none) before it and closed by
+        that quote after its end — or, unless `quoted` is asked, one without
+        quotes, which a blank would end? (Not where a browser begins an attribute's
+        NAME with it: there its own "/" and "=" divide it.)"""
         while self.attribute is None or self.attribute.end() <= start:
             attribute = _TAG_ATTRIBUTE_RE.match(self.html, self.at, self.end)
             if attribute is None:
                 return False            # the tag's ">", or its end
             self.attribute, self.at = attribute, attribute.end()
         opened, closed = self.attribute.span(1)
-        return opened < start and end < closed
+        if opened < 0 and not quoted:
+            opened, closed = self.attribute.span(2)
+            return 0 <= opened <= start and end <= closed
+        # (A quote nothing closes takes the rest of the mail in a browser,
+        # and not in every reader of markup: what stands in one counts.)
+        return (opened < start and end < closed
+                and self.html[closed - 1] == self.html[opened])
 
 
 def _markup_read(html: str) -> tuple:
@@ -2200,7 +2210,7 @@ def _markup_read(html: str) -> tuple:
     size = done = at = 0
     spans = _markup_spans(html)
     span = (0, 0, False)    # the first that does not end before a candidate
-    walk = None             # of the tag the last folded one stood in
+    walk = None             # of the tag the last one stood in
     for _ in range(_MAX_DATA_URLS):
         # (Looked for from where the last payload, or what looked like one,
         # ended: what stands in one is not searched for more of them.)
@@ -2240,14 +2250,15 @@ def _markup_read(html: str) -> tuple:
                 or not html.startswith(_DATA_URL_CLOSERS[opener], end)
                 or (blank and not _folded(html[comma + 1:end]))):
             continue
-        # Folded in a tag, it is a value in quotes as a browser reads the
-        # tag — or a browser read no such value, and it counts. (In a style
+        # In a tag, it is all in one value as a browser reads the tag —
+        # folded, a value in quotes — or a browser read no such value (it
+        # began an attribute's name there, say), and it counts. (In a style
         # sheet nothing but its end tag ends anything. A tag is walked once,
         # on from where the last candidate in it was.)
-        if blank and span[2] is True:
+        if span[2] is True:
             if walk is None or walk.start != span[0]:
                 walk = _TagWalk(html, span[0], span[1])
-            if not walk.quotes(start, end):
+            if not walk.holds(start, end, bool(blank)):
                 continue
         # (One blank stays for its blanks: in quotes it splits nothing.)
         kept.append(html[done:start + 5] + blank)
