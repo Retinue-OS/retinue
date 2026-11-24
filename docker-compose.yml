@@ -530,6 +530,16 @@ services:
       - CONVERSATION_PUSH
       - TRIAGE_MESSENGER_DIR
       - TRIAGE_EMAIL_WHITELIST_PATH
+      # The one-time migration of e-mail triage onto contacts
+      # (scripts/migrate-triage.py, docs/mail-chats.md): where its marker and
+      # the retired status store live (default /root/.retinue/triage), the
+      # user's own addresses (they get no contact; the same value the mail
+      # gateway reads), a switch that holds the boot run, and how long its
+      # one model turn may take.
+      - TRIAGE_STATE_DIR
+      - MAIL_OWN_ADDRESSES
+      - RETINUE_TRIAGE_MIGRATION
+      - MIGRATE_TRIAGE_MODEL_TIMEOUT
       - WEBAPP_DIR
       - DASHBOARD_DATA_DIR
       - DOCS_DIR
