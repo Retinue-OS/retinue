@@ -1276,7 +1276,11 @@ listed under Unread and judged by nobody.
   that `kb:gateSender` and is written owed, its offer due once
   `MAIL_UNREAD_OFFER_WAIT` (600 seconds) is over and no sooner — the index's
   offers row is the wait, and survives a restart — and it is read again
-  once half that wait is over rather than with the next hourly round. Read
+  once half that wait is over rather than with the next hourly round (those
+  early readings have a pass's share of the mirror's time and no more; one
+  not got to is offered at its bound). While it waits it has not been shown
+  to anyone, so a delete of its thread is refused until it has been offered
+  (`errors`, "not shown yet"). Read
   by then, the record written in its place is still owed and is offered
   once, under its real gate sender: one ring, one turn, on the real text.
   Not read by then, the placeholder is offered under the gate sender its

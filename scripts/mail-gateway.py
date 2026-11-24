@@ -4060,9 +4060,11 @@ class Mirror:
         But for a placeholder whose offer waits for its reading (_write): its
         first reading again comes once half its wait is over, not with the
         next round — read then, it is offered as the mail it is. Its offers
-        row says when (a restart reads every placeholder at once anyway)."""
+        row says when (a restart reads every placeholder at once anyway).
+        These early readings have SET_ASIDE_ROUND_SECONDS of a pass too: one
+        that is not got to is offered at its bound, as a placeholder."""
         now = self._clock()
-        done = 0
+        done, early = 0, 0.0
         for row in self.index.rows(
                 "SELECT message_id FROM offers WHERE queued = 0 AND attempts = 0 "
                 "AND due > 0 AND due <= ? ORDER BY due, message_id",
@@ -4071,7 +4073,16 @@ class Mirror:
             if mid not in self._placeholders or mid in self._retried \
                     or mid in self._retry_queue or (limit is not None and done >= limit):
                 continue
-            self._read_again(mid, policy)
+            if early > SET_ASIDE_ROUND_SECONDS:
+                # These readings have a pass's share of the mirror's time and
+                # no more, as a round has: what is not read early is offered
+                # at its bound, as the placeholder it is.
+                break
+            began = time.monotonic()
+            try:
+                self._read_again(mid, policy)
+            finally:
+                early += time.monotonic() - began
             done += 1
         if not self._retry_queue and now >= self._retry_at:
             self._retry_at = now + SET_ASIDE_RETRY_SECONDS
@@ -7190,12 +7201,14 @@ class Mirror:
     def _file_news(self, limit: int) -> None:
         """File what is queued for the feed, the oldest first, and take out
         of the INBOX what is to leave it once filed. One refusal ends the
-        pass (a feed that is away is asked once a pass, not once a mail);
+        pass (a feed that is away is asked once a pass, not once a mail — and
+        so is a mailbox that does not answer: what is filed goes on being
+        filed, and leaves the INBOX in a later pass);
         the refused mail waits its own, growing, time, so one item the feed
         will never take does not hold the others back."""
         if not _news.news_enabled():
             return
-        now, settled = self._clock(), False
+        now, settled, away = self._clock(), False, False
         for row in self.index.rows(
                 "SELECT message_id, item, consume, state, attempts FROM news "
                 "WHERE state != 'done' AND due <= ? ORDER BY created, rowid LIMIT ?",
@@ -7220,11 +7233,16 @@ class Mirror:
                 if isinstance(item, dict):
                     print(f"[mail-gateway] news: filed {message_id!r} to the feed", flush=True)
             if state == "filed":
+                if away:
+                    # The mailbox did not answer this pass: it is not asked
+                    # again for every mail (each asking is a login), and the
+                    # filed mail is taken out of the INBOX in a later pass.
+                    continue
                 try:
                     done = self._consume_news(message_id)
                     said = None
                 except MailboxError as exc:
-                    done, said = False, str(exc)
+                    done, said, away = False, str(exc), True
                 if said != self._news_said.get(message_id):
                     self._news_said[message_id] = said
                     if said:
@@ -7686,6 +7704,23 @@ class Mirror:
             # stop cut short is put right before its places are moved.)
             self._folders = self.mailbox.folders()
             self._recover_move()
+            # A mail of the thread that waits for its reading before it is
+            # offered (_write: a VIP's or an instructed sender's, unreadable
+            # so far) has not been shown to anyone yet. Deleting the thread
+            # now would take it to the Trash unseen and unrung: the delete
+            # waits until it has been offered — its bound at the latest.
+            unshown = self.index.one(
+                "SELECT COUNT(*) AS n FROM offers o JOIN mails m ON m.message_id = o.message_id "
+                "WHERE m.chat = ? AND m.removed = 0 AND o.queued = 0 AND o.attempts = 0 "
+                "AND o.due > ?", (chat, self._clock()))["n"]
+            if unshown:
+                print(f"[mail-gateway] chat {chat!r} is not deleted: {unshown} mail(s) of it "
+                      f"have arrived and are not shown yet", flush=True)
+                result["errors"] = unshown
+                result["error"] = (
+                    f"{unshown} mail(s) of this thread have just arrived and are not shown "
+                    f"yet; nothing was deleted — try again in a few minutes")
+                return result
             # A mail of the thread the index has no place for right now may
             # be in a mirrored folder all the same — moved there by a client
             # since the last poll, or in a folder renumbered and not read

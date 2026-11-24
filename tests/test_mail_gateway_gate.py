@@ -2727,6 +2727,13 @@ def test_a_placeholder_buys_no_turn_and_its_reading_is_offered_only_if_owed():
                 assert offers(mirror)[mid]["due"] == clock[0] + wait, offers(mirror)[mid]
             assert jobs.asked == [] and sorted(offers(mirror)) == [
                 "boss-read@x.org", "boss-unread@x.org", "owed@x.org"]
+            # A delete of its thread meanwhile waits: the mail has not been
+            # shown yet, and would go to the Trash unseen and unrung.
+            said = mirror.delete_chat("boss-read@x.org")
+            assert said["errors"] == 1 and "not shown yet" in said["error"], said
+            assert "boss-read@x.org" in t.by_id(gw)
+            assert not (box.boxes.get("Trash") or {}).get("mails")
+            assert offers(mirror)["boss-read@x.org"]["queued"] == 0
             # Half the wait on: the VIP's are read again, before their offers
             # are due. The one that reads now is offered as the mail it is —
             # by its gate sender, one ring and one turn on its real text.
@@ -3153,6 +3160,41 @@ def test_news_is_filed_whatever_became_of_the_rest():
         else:
             raise AssertionError("the rest's fault was not raised")
     print("ok: news is filed whatever became of the rest of the work, whose fault is raised")
+
+
+def test_a_mailbox_that_does_not_answer_is_asked_once_a_pass_for_news():
+    """Filing news goes on whatever became of the rest of the pass — also
+    where the rest ended because the mailbox went away. Taking the filed
+    mails out of the INBOX then asks the mailbox once, not once a mail
+    (each asking is a login): the others wait for a later pass."""
+    with tempfile.TemporaryDirectory() as tmp:
+        gw = t.load(tmp)
+        flags(gw, news={"news@shop.example"}, ignored={"news@shop.example"})
+        t.rail(gw)
+        mirror, box, clock = begin(gw)
+        for n in range(4):
+            box.put("INBOX", msg(f"n{n}@shop.example", sender="news@shop.example",
+                                 subject=f"Sale {n}", body="x\n", day=39))
+        clock[0] += 3600
+        mirror.poll(sync=True, work=False)
+        asked = []
+        consume = mirror._consume_news
+
+        def away(message_id):
+            asked.append(message_id)
+            raise gw.MailboxError("the IMAP connection failed: timed out")
+        mirror._consume_news = away
+        mirror.poll(sync=False)
+        assert len(gw.filed) == 4, gw.filed          # all filed to the feed …
+        assert len(asked) == 1, asked                # … the mailbox asked once
+        # It answers again: every one leaves the INBOX, none filed twice.
+        mirror._consume_news = consume
+        for _ in range(3):
+            clock[0] += 3600
+            mirror.poll()
+        assert len(gw.filed) == 4 and mirror.waiting()["news"] == 0
+        assert not box.boxes["INBOX"]["mails"], box.boxes["INBOX"]
+    print("ok: a mailbox that does not answer is asked once a pass for the news it holds")
 
 
 def test_a_news_move_stopped_after_the_server_leaves_one_archive_copy():
