@@ -1438,16 +1438,24 @@ def test_a_turns_archive_reaches_only_its_mail(base, wg):
         _verdict(base, chat, 0, actions=["filed the invoice"])(prompt)
 
     TURN_GATE["during"] = files_after_a_reply
+    said = []
+    wg.print = lambda *args, **kwargs: (said.append(" ".join(map(str, args))),
+                                        print(*args, **kwargs))
     try:
         status, body, mid, _t = _arrive(base, key, billing, gate=INSTRUCTED, text="Invoice 7")
         assert status == 202, body
         assert _await_job(base, body["job_url"])["status"] == "done"
     finally:
         TURN_GATE["during"] = None
+        del wg.print
     wg._mailbox_wait()
     status, out = answers["flags"]
     assert status == 200 and out["archived"] is False, out
     assert out["reason"] == "newer mail arrived", out
+    # The log says what was done, and what was asked and not done.
+    assert any(line.endswith(": flags set by its turn — archived=false (asked "
+                             "archived=true; not done: newer mail arrived)")
+               for line in said), [line for line in said if "flags set" in line]
     assert "was not archived (newer mail arrived)" in answers["note"], answers["note"]
     assert _hooks("/chats/archive") == [
         {"chat": key, "account": ACCOUNT, "message_ids": [mid]}], GW["requests"]

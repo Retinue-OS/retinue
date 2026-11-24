@@ -180,7 +180,9 @@ is expected durability: 1.0 standing rule, 0.7 decision or lesson, 0.3
 incident or status. A subagent asked to store must be told its own `--actor`.
 A standing instruction the user gives about one sender is **not** a memory:
 put it on the contact (`contacts.py update <id> --instruction "…"`, see
-**Contacts**), where it briefs the turn that works that sender's messages.
+**Contacts**), where it briefs the turn that works that sender's messages —
+what is *known* about a sender is, tagged `sender:<address or handle>` (pass
+the raw value, `memory.py` slugs it).
 
 `store` refuses in two cases — a refusal names the way out, never retry
 blindly. **Near-duplicate** of a live entry: reinforce it, or challenge it
@@ -276,12 +278,11 @@ human comes from the `secretary` subagent (see **Routing**) — dispatch, then
 send its text verbatim. **Before any send to a
 named person, apply the `messaging-contact-lookup` skill** (recent chats
 first, directory fallback — `signal-contacts.py` and siblings). **E-mail in a
-thread the mail gateway mirrors**, when you hold its chat id — a reply
-(`--chat <id>`, `--reply all|sender`) or a new mail (`--to`, `--subject`) —
-goes through `scripts/mail-push.py` like the other push CLIs, under the same
-send policy; a mail e-mail triage hands you (a UID, not a chat id) is still
-answered with `email_client.py reply --uid`, as the `triage` skill says, until
-triage retires. `scripts/email_client.py` (the `use-email-client` skill) stays
+thread the mail gateway mirrors** reaches you as a chat, and is answered with
+`scripts/mail-push.py --chat <chat id>` (`--reply all|sender`; a new mail with
+`--to`, `--subject`) like the other push CLIs, under the same send policy;
+holding only a UID, never guess a chat id from it — `email_client.py reply
+--uid` still works. `scripts/email_client.py` (the `use-email-client` skill) stays
 for everything else: reading, searching, filing, drafts, and any mailbox the
 gateway does not serve. Sends are
 gated by per-identity send policies (`allow`/`trust`/`verify`; undeclared

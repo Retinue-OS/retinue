@@ -380,7 +380,18 @@ def test_a_mail_from_nobody(w: World):
         assert w.listed(mid), mid
         block = w.doc(mid).get("attention") or {}
         assert not block.get("vip"), (mid, block)
+        # Nor is the thread filed under the VIP's card by the address it is
+        # shown as from — on its arrival, or by the sweep.
+        assert not w.doc(mid).get("contact"), (mid, w.doc(mid))
+    assert w.wg._chats_autolink() == 0
     assert not TURNS and not PUSHES, (TURNS, PUSHES)
+    # A mail the gate takes for the VIP, in one of those threads: now the
+    # card is the thread's.
+    w.arrives("sndr-re@corp.example", sender="Boss <boss@corp.example>", subject="Re: On behalf",
+              irt="sndr@corp.example", refs=["sndr@corp.example"])
+    assert (w.doc("sndr@corp.example").get("contact") or {}).get("name") == "The Boss"
+    _wait(lambda: len(PUSHES) == 1, "the VIP's ring")
+    _wait(lambda: len(TURNS) == 1, "the VIP's turn")
     print("PASS test_a_mail_from_nobody")
 
 

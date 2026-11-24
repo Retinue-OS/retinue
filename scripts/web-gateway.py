@@ -14367,9 +14367,14 @@ _chat_autolink_state = {"at": 0.0}
 
 def _chat_autolink(chat_id: str, doc: dict | None = None, *, profile: dict | None = None) -> dict | None:
     """Link a card-less 1:1 chat to the person who owns its handle. Returns
-    the chat document as it now stands, or None when nothing changed."""
+    the chat document as it now stands, or None when nothing changed.
+
+    Not a mail thread whose peer only a mail without a gate sender names
+    (``peer_vouched`` false): that address is what the mail is shown as
+    from, which anyone can write — the card is linked once a mail the gate
+    took for the address arrives."""
     doc = doc if doc is not None else _CHAT_STATE.get(chat_id)
-    if not doc or doc.get("contact"):
+    if not doc or doc.get("contact") or doc.get("peer_vouched") is False:
         return None
     handle = _chat_handle(chat_id, doc)
     if handle is None:
@@ -16929,9 +16934,12 @@ class Handler(BaseHTTPRequestHandler):
             doc, extra = _turn_flags(record, flags)
         else:
             doc = _set_chat_flags(chat_id, flags)
+        # What was done, which a turn's archive refused (``reason``) is not.
         print(f"[web-gateway] chat {doc.get('id', chat_id)}: flags set by "
               f"{'its turn' if record is not None else 'an agent'} — "
-              + ", ".join(f"{k}={str(v).lower()}" for k, v in sorted(flags.items())),
+              + ", ".join(f"{k}={str(bool(doc.get(k))).lower()}" for k in sorted(flags))
+              + (f" (asked {', '.join(f'{k}={str(v).lower()}' for k, v in sorted(flags.items()))}"
+                 f"; not done: {extra['reason']})" if extra.get("reason") else ""),
               flush=True)
         self._send_json(200, {"id": doc.get("id", chat_id),
                               "archived": bool(doc.get("archived")),
@@ -18428,6 +18436,20 @@ class Handler(BaseHTTPRequestHandler):
             chat_name = " ".join(chat_name.split())  # a subject is one line
         elif not chat_name and not group and direction == "in":
             chat_name = entry["sender_name"]
+        # Whether a mail with a gate sender stands behind the thread's peer —
+        # the address the autolink files a card by (_chat_autolink). An
+        # arrival from the peer says: yes where the gate took it for that
+        # address, no where it took it for nobody, whose sender is only
+        # shown; one that is not the peer's (a delayed mail) says nothing.
+        peer_vouched = None
+        if mail and direction == "in" and isinstance(payload.get("peer"), dict):
+            peer = (chat_state_mod.clean_party(payload["peer"]) or {}).get("address")
+            shown = (chat_state_mod.clean_party({"address": entry["sender"] or ""})
+                     or {}).get("address")
+            if peer and peer == entry["gate_sender"]:
+                peer_vouched = True
+            elif peer and peer == shown:
+                peer_vouched = False
         doc = _CHAT_STATE.note_message(
             chat_id,
             name=chat_name or None,
@@ -18442,6 +18464,7 @@ class Handler(BaseHTTPRequestHandler):
                            if isinstance(payload.get("participants"), list) else [])
                           if mail else None),
             peer=payload.get("peer") if mail and isinstance(payload.get("peer"), dict) else None,
+            peer_vouched=peer_vouched,
             # A mail of the chat exists: it is no chat of one unsent mail
             # (_forget_unsent_chat), if it ever was.
             unsent=False if mail else None)

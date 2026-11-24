@@ -686,6 +686,12 @@ class ChatStateStore:
             # has said; an empty list is an answer, None is not knowing.
             "participants": None,
             "peer": None,
+            # Whether a mail with a gate sender stands behind ``peer``: False
+            # where the latest arrival that named it was a mail the gate took
+            # for nobody (no From, several, only a Sender header), whose
+            # sender is shown and links no contact card; None where no
+            # arrival has said (a thread the user started, a messenger chat).
+            "peer_vouched": None,
             # The sends of this chat that wait in its gateway's queue for the
             # user's approval, oldest first (clean_pending). A copy: the
             # gateway's queue is the truth and this follows it (set_pending).
@@ -957,6 +963,7 @@ class ChatStateStore:
                      sender_name: str | None = None,
                      unknown_sender: bool | None = None,
                      participants=None, peer=None,
+                     peer_vouched: bool | None = None,
                      unsent: bool | None = None) -> dict:
         """Cache display metadata learned from a message event (the rail).
 
@@ -968,6 +975,8 @@ class ChatStateStore:
         its gateway states them (see MAIL_CHANNEL); each replaces what was
         kept, cleaned (:func:`clean_parties`). None leaves them as they are,
         and a ``peer`` that does not read as one is not stored.
+        ``peer_vouched`` says whether a mail with a gate sender names that
+        peer (None leaves it).
 
         ``unsent`` says whether the chat is, so far, only a mail of the
         user's own that has not gone out (True — a queued new mail), or
@@ -981,6 +990,8 @@ class ChatStateStore:
                 doc["participants"] = clean_parties(participants)
             if peer is not None:
                 doc["peer"] = clean_party(peer) or doc.get("peer")
+            if peer_vouched is not None:
+                doc["peer_vouched"] = bool(peer_vouched)
             if name:
                 doc["name"] = name
             if group is not None:
@@ -1229,6 +1240,9 @@ class ChatStateStore:
             for key in ("instructed", "name", "peer", "contact"):
                 if not doc.get(key) and gone.get(key):
                     doc[key] = gone[key]
+                    if key == "peer":
+                        # What stands behind a peer travels with it.
+                        doc["peer_vouched"] = gone.get("peer_vouched")
             if not doc.get("gateway") and gone.get("gateway"):
                 # Slug and provenance travel as one, as everywhere.
                 doc["gateway"] = gone["gateway"]

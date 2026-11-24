@@ -134,6 +134,17 @@ class Rig:
             self.rail.append((kind, payload.get("direction"), payload.get("message_id"), status))
             return "ok" if status < 300 else "drop"
         gw._rail_send = rail_send
+        # A mail that arrived is offered, not told (the gate): through the
+        # gateway's own post, with the token it presents — never the World's
+        # stand-in, which takes every offer without the web gateway seeing it.
+        gw.RAIL_TOKEN = "agent-token"
+
+        def rail_offer(payload):
+            outcome, answer = gw._rail_post("inbound", payload, gw.MAIL_RAIL_TIMEOUT)
+            self.rail.append(("offer", payload.get("direction"), payload.get("message_id"),
+                              outcome))
+            return outcome, answer
+        gw._rail_offer = rail_offer
         self.account = gw.ACCOUNT
 
     def close(self) -> None:
@@ -835,6 +846,68 @@ def test_an_allowed_mail_whose_answer_was_lost_is_not_worded_as_failed(r: Rig):
             "POST", f"/chats/{mail._quote(r.chat('f@x.org'))}/pending/{request_id}/dismiss", {})
         assert status == 200, out
     assert r.messages("f@x.org")["pending"] == []
+
+
+# ── Writing across the gate ──────────────────────────────────────────────────
+
+def test_a_reply_settles_an_arrival_the_user_was_never_told_of(r: Rig):
+    """A mail counted and owed (its first offer died before it was told,
+    docs/mail-chats.md, "The gate"), then answered from the composer: the
+    reply reads it, here and in the mailbox, and the mail offered again is
+    the repeat it now is — no arrival for the model, nothing reopened."""
+    root = "u@x.org"
+    real, failed = r.wg._attention_arrive_chat, []
+
+    def dies_once(*args, **kwargs):
+        if not failed:
+            failed.append(True)
+            raise OSError("No space left on device")
+        return real(*args, **kwargs)
+    r.wg._attention_arrive_chat = dies_once
+    try:
+        r.arrives(root, day=1)
+    finally:
+        r.wg._attention_arrive_chat = real
+    doc = r.wg._CHAT_STATE.get(r.chat(root))
+    assert failed and mail.cs.owes(doc, root), doc
+    assert ("offer", "in", root, "unanswered") in r.rail, r.rail
+    r.draft(root, "On it")
+    status, msg = r.send(root, {"text": "On it", "request_key": KEY.format(20)})
+    assert status == 200, msg
+    r.settle()
+    assert r.seen(root) and r.listed(root)["unread"] == 0
+    before = r.wg._CHAT_STATE.get(r.chat(root)).get("attention")
+    arrived = []
+    r.wg._attention_arrive_chat = lambda *a, **k: arrived.append(a) or real(*a, **k)
+    try:
+        assert r.w.mirror._offer(root)
+    finally:
+        r.wg._attention_arrive_chat = real
+    assert r.rail[-1] == ("offer", "in", root, "ok"), r.rail
+    assert arrived == [], "a mail the user answered is no arrival"
+    after = r.wg._CHAT_STATE.get(r.chat(root))
+    assert after.get("attention") == before and r.listed(root)["unread"] == 0, after
+
+
+def test_an_agents_mail_reads_nothing(r: Rig):
+    """An instructed turn answers with scripts/mail-push.py --chat: a keyed
+    /send without an author. It goes out once — its repeat is answered as
+    one — and, the agent's and not the user's, it reads nothing: the mails
+    stay unread here and unseen in the mailbox."""
+    root = "v@x.org"
+    r.arrives(root, day=1)
+    r.arrives("late-" + root, irt=root, refs=[root], day=2, subject="Re: Quarterly numbers")
+    press = {"recipient": root, "account": r.account, "message": "Filed, thanks.",
+             "user_approved": True, "request_key": KEY.format(21)}
+    status, answer = r.gateway("POST", "/send", press)
+    assert status == 200 and answer["status"] == "sent", answer
+    status, again = r.gateway("POST", "/send", press)
+    assert status == 200 and again.get("repeat") is True, again
+    r.loop()
+    r.settle()
+    assert ("inbound", "out", answer["message_id"], 200) in r.rail, r.rail
+    assert r.listed(root)["unread"] == 2 and r.wg._CHAT_STATE.get(r.chat(root))["last_read"] is None
+    assert not r.seen(root) and not r.seen("late-" + root)
 
 
 # ── Delete ───────────────────────────────────────────────────────────────────

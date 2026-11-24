@@ -885,7 +885,7 @@ def test_merge_folds_one_chat_into_another():
         # The absorbed: read later, two arrivals of which one came after.
         store.note_message(MAIL_B, name="Re: Offer", group=False,
                            participants=[{"address": "b@y.org", "name": "B"}],
-                           peer={"address": "b@y.org", "name": "B"},
+                           peer={"address": "b@y.org", "name": "B"}, peer_vouched=False,
                            sender="b@y.org", sender_name="B", unknown_sender=True)
         store.mark_unread(MAIL_B, cs.iso_z(200.0))
         store.advance_last_read(MAIL_B, cs.iso_z(300.0))
@@ -917,6 +917,7 @@ def test_merge_folds_one_chat_into_another():
         assert doc["attention"] == {"state": "open", "importance": 4.0}
         # Its own name and peer; the absorbed chat's where it had none.
         assert doc["name"] == "Offer" and doc["peer"] == {"address": "a@x.org", "name": None}
+        assert doc["peer_vouched"] is None, "what stood behind the other peer stays with it"
         assert doc["contact"]["name"] == "B Person" and doc["unknown_sender"] is True
         assert doc["participants"] == [{"address": "a@x.org", "name": None},
                                        {"address": "b@y.org", "name": "B"}]
@@ -959,6 +960,13 @@ def test_merge_folds_one_chat_into_another():
         doc, _gone = store.merge(e, f)
         assert doc["last_read"] == cs.iso_z(500.0) and cs.arrived_since_read(doc) == 2
         assert doc["unread_since"] is None or doc["unread_since"] > doc["last_read"]
+        # A survivor without a peer takes the other's, and with it whether a
+        # mail with a gate sender stands behind it.
+        g, h = "email:~me@example.org:g@x.org", "email:~me@example.org:h@x.org"
+        store.note_message(g, name="G")
+        store.note_message(h, peer={"address": "boss@corp.example"}, peer_vouched=False)
+        doc, _gone = store.merge(h, g)
+        assert doc["peer"]["address"] == "boss@corp.example" and doc["peer_vouched"] is False
     print("PASS test_merge_folds_one_chat_into_another")
 
 

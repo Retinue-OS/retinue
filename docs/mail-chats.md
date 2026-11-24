@@ -843,8 +843,10 @@ gateway's own address grammar reads it, lowercased by its ASCII letters alone
 and refused outright where a character of it folds into ASCII on some reading
 (a Kelvin sign, a fullwidth letter). A mail with no `From`, an empty one, a
 group, two addresses, two `From` headers, or an address the grammar rejects
-has **no gate sender**: it reaches its chat, buys no turn, and rings as
-nobody's. The `Sender` header never stands in for it — it is only what the
+has **no gate sender**: it reaches its chat, buys no turn, rings as
+nobody's, and links the thread to no contact card by the address it is shown
+as from (`peer_vouched` false on the chat's state, until a mail the gate takes
+for that address arrives). The `Sender` header never stands in for it — it is only what the
 chat shows (`kb:sender`) when the `From` names nobody. Both axes are keyed on
 the gate sender (the group axis on the `List-Id` first), and the web gateway
 judges an arrival — its class, prior and permits — by the gate sender the
