@@ -895,7 +895,13 @@ archive covers only the mail the turn was started for: where another mail
 arrived in the chat after it, the chat is not archived (the answer says so),
 and the mailbox is told only of the mails the turn worked. A turn cannot
 mute: a mute it asks for is taken as that same archive, and the answer says so
-(`a turn cannot mute; archived instead`) — muting stays the user's. A turn
+(`a turn cannot mute; archived instead`) — muting stays the user's. Archiving
+is all a turn can do with a chat's flags: its unmute, unarchive and star
+change nothing, and the answer says so. A flags call counts as the turn's
+only when it carries the token its session was handed
+(`RETINUE_ARRIVAL_TURN`, which `scripts/chat-flags.py` sends) for a turn
+running on that chat; a call without one is an agent acting on the user's
+word and has the user's meaning, a mute included, even while a turn runs. A turn
 that does not finish — it fails, runs past `MAIL_INSTRUCTION_TIMEOUT`, or sets
 no verdict — has the chat brought back (un-archived) and the mail rung by the
 failure rule, since a turn that did not finish is not trusted with having put
