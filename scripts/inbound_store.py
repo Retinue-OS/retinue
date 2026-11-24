@@ -933,6 +933,7 @@ def write_outbound(
     reply_to: list[str] | None = None,
     refused: list[str] | None = None,
     replace: str | Path | None = None,
+    sent_as: list[str] | None = None,
 ) -> tuple[str, Path]:
     """Persist one successfully sent outbound message as its own N-Triples file.
 
@@ -963,7 +964,9 @@ def write_outbound(
     and its record is what it always was. So does ``replace``
     (see :func:`_replacing`). ``refused`` is a sent mail's alone: the
     addresses the SMTP server would not take it for (see :data:`P_REFUSED`)
-    — ``recipients`` and ``cc`` are then the others.
+    — ``recipients`` and ``cc`` are then the others. ``sent_as`` too: the
+    ids a provider gave the mail (see :data:`P_SENT_AS`) — for a record
+    that replaces one which had them, so that they are not lost with it.
     """
     if author not in AUTHORS:
         raise ValueError(f"author must be one of {'|'.join(AUTHORS)}, got {author!r}")
@@ -988,6 +991,7 @@ def write_outbound(
         "sent_at": _iso(ts),
         "attachments": [u for u in (attachment_urls or []) if u],
     }
+    fields["sent_as"] = _many(sent_as)
     fields["attachment_meta"] = _record_blob_meta(store_dir, fields, content_ids)
     _atomic_write(_render(fields), path)
     return urn, path

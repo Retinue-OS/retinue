@@ -33,7 +33,11 @@ message, byte for byte.
     nothing else; a ``request_key`` that makes a repeat answer the first
     one's outcome; a failed send listed with its reason until dismissed;
     refused recipients said everywhere; ``/reply-preview``;
-  * a provider that files the Sent copy under a Message-ID of its own.
+  * a provider that files the Sent copy under a Message-ID of its own;
+  * all of it on the mirror's own mechanisms: every mail under an id looked
+    at, a placeholder's own copy told by its header block, header blocks
+    read as guarded as mail, a record written again in its own place, a
+    record lost from the ledger looked for under every id it had.
 
     python3 tests/test_mail_gateway_send.py
 """
@@ -4423,6 +4427,268 @@ def test_the_own_id_header_alone_proves_nothing():
     finally:
         done(w)
     print("ok: the gateway's own header names its send only with the rest of the evidence")
+
+
+# --------------------------------------------------------------------------
+# The write half on the mirror's mechanisms (phase 1's later rounds): every
+# mail under an id, a placed UID handed out by no search, header blocks read
+# as guarded as mail, a record replaced in its own place, the `lost` list
+# --------------------------------------------------------------------------
+
+def _unreadable(gw):
+    """Every mail with an ``X-Unreadable`` header is one the reader cannot
+    read (a placeholder under its own id: its header block reads). Returns
+    the undo."""
+    real = gw.read_mail
+
+    def read_mail(raw, date, *args, **kwargs):
+        if b"X-Unreadable: yes" in raw:
+            raise gw.UnreadableMail("too much work", "work")
+        return real(raw, date, *args, **kwargs)
+    gw.read_mail = read_mail
+    return lambda: setattr(gw, "read_mail", real)
+
+
+def _places_of(mirror, role, message_id) -> dict:
+    return {row["uid"]: row["skipped"] for row in mirror.index.rows(
+        "SELECT l.uid, l.skipped FROM locations l JOIN folders f ON f.role = l.role "
+        "AND f.gen = l.gen WHERE l.role = ? AND l.message_id = ?", (role, message_id))}
+
+
+def _stalled(gw):
+    """What the writing half asks of a header block does not come back
+    (read_send_facts). Returns the undo."""
+    real = gw._send_facts
+
+    def stalls(head):
+        raise gw.TookTooLong("a reading that does not come back")
+    gw._send_facts = stalls
+    return lambda: setattr(gw, "_send_facts", real)
+
+
+def test_a_move_whose_new_uid_is_not_said_finds_the_placeholders_own_copy():
+    """_follow_move looks for a moved mail as the mirror looks (_adopt): of
+    every mail the archive holds under a placeholder's id, only the copy its
+    record keeps the header block of is its place — not the newest one, which
+    may be anybody's."""
+    w = world()
+    try:
+        gw, box, mirror = w.gw, w.box, w.mirror
+        undo = _unreadable(gw)
+        box.names_uids = False
+        box.put("INBOX", t.msg("p@x.org", headers=[("X-Unreadable", "yes")], day=1))
+        mirror.poll()
+        assert t.by_id(gw)["p@x.org"]["text"] == gw.UNREADABLE_TEXT
+        real_move = box.move
+
+        def move(folder, uids, to_folder, *, validity=None):
+            moved = real_move(folder, uids, to_folder, validity=validity)
+            # Another mail under the same id reaches the archive meanwhile.
+            box.put("Archive", t.msg("p@x.org", sender="Mallory <m@evil.org>",
+                                     body="Not the mail.\n", day=2))
+            return moved
+        box.move = move
+        assert mirror.archive("p@x.org")["moved"] == 1
+        other, own = box.uids_of("Archive", "p@x.org")
+        assert _places_of(mirror, "archive", "p@x.org") == {own: None, other: "other"}
+        assert settling(mirror, "p@x.org") is None
+        undo()
+    finally:
+        done(w)
+    print("ok: a move whose new UID is not said finds the placeholder's own copy, "
+          "not the newest mail under its id")
+
+
+def test_a_deleted_placeholder_leaves_the_other_mail_under_its_id_to_be_read():
+    """A delete moves a placeholder's own copy, never another mail under its
+    id (_places, _whereabouts); erased with its chat (_forget_chat), what was
+    set apart as that other mail's is mirrored as the mail it is — as when a
+    placeholder is buried (_bury)."""
+    w = world()
+    try:
+        gw, box, mirror = w.gw, w.box, w.mirror
+        undo = _unreadable(gw)
+        box.put("INBOX", t.msg("p@x.org", headers=[("X-Unreadable", "yes")], day=1))
+        mirror.poll()
+        other = box.put("INBOX", t.msg("p@x.org", sender="Mallory <m@evil.org>",
+                                       body="Not the mail.\n", day=2))
+        mirror.poll()
+        assert _places_of(mirror, "inbox", "p@x.org")[other] == "other"
+        result = mirror.delete_chat("p@x.org")
+        assert result["errors"] == 0 and result["trashed"] == 1, result
+        assert held_in(box, "Trash") == ["p@x.org"]
+        assert box.uids_of("INBOX", "p@x.org") == (other,)
+        assert t.records(gw) == []
+        undo()
+        mirror.poll()
+        (record,) = t.records(gw)
+        assert record["sender"] == "m@evil.org" and record["text"] == "Not the mail.", record
+        assert _places_of(mirror, "inbox", "p@x.org") == {other: None}
+    finally:
+        done(w)
+    print("ok: a deleted placeholder takes only its own copy to the Trash, and the other "
+          "mail under its id is mirrored as what it is")
+
+
+def test_a_reply_is_not_addressed_off_a_header_block_that_did_not_come_back():
+    """reply_draft reads Reply-To off the header block an older record keeps
+    as guarded as any header block is read (read_send_facts), and not under
+    the mirror's lock: a reading that does not come back is no answer —
+    /reply-preview says "try again", /send says nothing was sent, and
+    nothing is."""
+    w = world()
+    try:
+        gw, box, mirror, smtp = w.gw, w.box, w.mirror, w.smtp
+        box.put("INBOX", t.msg("a@x.org", headers=[("Reply-To", "desk@x.org")], day=1))
+        mirror.poll()
+        # (An older record: the header block alone says whom to answer.)
+        path = mirror._record_path(mirror.index.one(
+            "SELECT record FROM mails WHERE message_id = 'a@x.org'")["record"])
+        text = path.read_text(encoding="utf-8")
+        path.write_text("".join(line for line in text.splitlines(keepends=True)
+                                if "replyTo" not in line), encoding="utf-8")
+        assert t.by_id(gw)["a@x.org"]["reply_to"] == []
+        status, preview = gw._reply_preview({"chat": "a@x.org", "account": ACCOUNT})
+        assert status == 200 and preview["all"]["to"][0]["address"] == "desk@x.org", preview
+        undo = _stalled(gw)
+        try:
+            status, preview = gw._reply_preview({"chat": "a@x.org", "account": ACCOUNT})
+            assert status == 503 and "try again" in preview["error"], (status, preview)
+            status, answer = w.send(recipient="a@x.org")
+            assert status == 502 and answer["sent"] is False and smtp.mails == [], answer
+        finally:
+            undo()
+        status, answer = w.send(recipient="a@x.org")
+        assert status == 200 and smtp.mails[0]["rcpt"] == ["desk@x.org"], answer
+    finally:
+        done(w)
+    print("ok: a reply is not addressed off a header block whose reading did not come back")
+
+
+def test_a_sent_copy_whose_send_cannot_be_told_is_not_recorded_twice():
+    """_sent_like reads the header blocks it compares as guarded as any
+    (read_send_facts): where a reading does not come back, the copy in Sent
+    is not mirrored as a mail of its own beside the gateway's send — the
+    pass ends on it (I1), and the next one matches it."""
+    w = world(save_sent=False)
+    try:
+        gw, box, mirror, smtp = w.gw, w.box, w.mirror, w.smtp
+        _status, answer = w.send(to=["ann@x.org"], subject="Plans", message="Hello.")
+        M, P = answer["message_id"], "p@provider.example"
+        w.told()
+        # A provider that rewrites the id and keeps no header of ours.
+        raw = as_the_provider_files_it(smtp.mails[0]["data"], P)
+        raw = b"\r\n".join(line for line in raw.split(b"\r\n")
+                           if not line.lower().startswith(b"x-retinue-message-id"))
+        box.put("Sent", raw, date=NOW + 5)
+        undo = _stalled(gw)
+        try:
+            try:
+                mirror.poll()
+                raise AssertionError("the pass went on")
+            except gw.MirrorFault as exc:
+                assert "could not be read" in str(exc), exc
+            assert [r["message_id"] for r in t.records(gw)] == [M]
+        finally:
+            undo()
+        mirror.poll()
+        (record,) = t.records(gw)
+        assert record["message_id"] == M and record["sent_as"] == [P], record
+    finally:
+        done(w)
+    print("ok: a Sent copy whose send cannot be told yet is not recorded beside it")
+
+
+def test_a_record_written_again_keeps_its_author_and_its_providers_ids():
+    """A tombstone whose mail is back is written again in its own place
+    (Mirror._write, replace=): a record of the gateway's own send keeps the
+    author it was written with — its note may be pruned by then — and the
+    ids its provider gave it (kb:sentAs), which its answers cite."""
+    w = world()
+    try:
+        gw, box, mirror = w.gw, w.box, w.mirror
+        _status, answer = w.send(to=["ann@x.org"], subject="Plans", author="user")
+        M = answer["message_id"]
+        w.told()
+        (uid,) = w.sent_copies(M)
+        path = mirror._record_path(mirror.index.one(
+            "SELECT record FROM mails WHERE message_id = ?", (M,))["record"])
+        gw._ibstore.update_message(path, sent_as="p@provider.example")
+        copy = box.remove("Sent", uid)
+        mirror.poll()
+        assert t.by_id(gw)[M]["removed_at"], "the copy left: a tombstone"
+        mirror.index.run("DELETE FROM notes")
+        box.put("Sent", copy["raw"], flags=copy["flags"], date=copy["date"])
+        mirror.poll()
+        record = t.by_id(gw)[M]
+        assert not record["removed_at"] and len(t.records(gw)) == 1
+        assert record["author"] == "user" and record["sent_as"] == ["p@provider.example"], record
+        assert path.is_file(), "written again in its own place"
+    finally:
+        done(w)
+    print("ok: a record written again keeps its author and the ids its provider gave it")
+
+
+def test_a_lost_record_of_a_rewritten_send_is_found_under_the_providers_id():
+    """A record of the gateway's own send whose provider filed it under an
+    id of its own, lost from the ledger: its mail is looked for (`lost`)
+    under that id too — the aliases of a lost id are kept while it is — and
+    read again from its Sent copy."""
+    w = world(save_sent=False)
+    try:
+        gw, box, mirror, smtp = w.gw, w.box, w.mirror, w.smtp
+        _status, answer = w.send(to=["ann@x.org"], subject="Plans", message="Hello.")
+        M, P = answer["message_id"], "p@provider.example"
+        w.told()
+        box.put("Sent", as_the_provider_files_it(smtp.mails[0]["data"], P), date=NOW + 5)
+        mirror.poll()
+        assert mirror._known_as(M) == [M, P]
+        path = mirror._record_path(mirror.index.one(
+            "SELECT record FROM mails WHERE message_id = ?", (M,))["record"])
+        path.unlink()
+        mirror = w.restart()
+        assert mirror.lost() == 1 and mirror._known_as(M) == [M, P]
+        for _ in range(3):
+            mirror.poll()
+        assert mirror.lost() == 0
+        (record,) = t.records(gw)
+        assert record["type"] == gw._ibstore.T_OUTBOUND and record["text"] == "Hello.", record
+    finally:
+        done(w)
+    print("ok: a lost record of a rewritten send is found again under its provider's id")
+
+
+def test_a_delete_looks_for_a_placeholder_whose_only_place_is_another_mails():
+    """A place marked as another mail's is no place of a placeholder (I2):
+    a delete looks for the placeholder's own copy as for any mail the index
+    has no place for, finds it where a client moved it, and takes it to the
+    Trash — it does not erase the chat while that copy is in the archive."""
+    w = world()
+    try:
+        gw, box, mirror = w.gw, w.box, w.mirror
+        undo = _unreadable(gw)
+        own = box.put("INBOX", t.msg("p@x.org", headers=[("X-Unreadable", "yes")], day=1))
+        mirror.poll()
+        other = box.put("INBOX", t.msg("p@x.org", sender="Mallory <m@evil.org>",
+                                       body="Not the mail.\n", day=2))
+        # A client moves the placeholder's own copy to the archive, while the
+        # archive will not answer: the poll that sees it leave cannot look.
+        box.move_mail("INBOX", own, "Archive")
+        box.refused = {"Archive"}
+        mirror.poll()
+        box.refused = set()
+        assert _places_of(mirror, "inbox", "p@x.org") == {other: "other"}
+        assert _places_of(mirror, "archive", "p@x.org") == {}
+        result = mirror.delete_chat("p@x.org")
+        assert result["errors"] == 0 and result["trashed"] == 1, result
+        (trashed,) = box.boxes["Trash"]["mails"].values()
+        assert b"X-Unreadable: yes" in trashed["raw"]
+        assert box.uids_of("INBOX", "p@x.org") == (other,) and box.uids_of("Archive", "p@x.org") == ()
+        undo()
+    finally:
+        done(w)
+    print("ok: a delete looks for a placeholder whose only place is another mail's, and "
+          "takes its own copy to the Trash")
 
 
 def main():

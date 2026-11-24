@@ -229,8 +229,11 @@ gateway reads that before it falls back to reading a slug.
 
 `/health` answers `{configured, connected, mode: "inbox", account, error,
 blocked, needs_repair: false, build, backfill: {done, pending, days},
-placeholders: {standing, made, why}, lost}` — `backfill.days` is the window fixed
-at the first run. `blocked` names what holds the mirror when that is not the
+placeholders: {standing, made, why}, lost, can_send, cannot_send_reason,
+rewritten_message_ids}` — `backfill.days` is the window fixed at the first
+run; `can_send` is false, with the reason, where no SMTP server is set, and
+`rewritten_message_ids` counts the gateway's own sends its provider was seen
+to file under a `Message-ID` of its own (see *Writing*). `blocked` names what holds the mirror when that is not the
 mailbox: `"policy"` (below) or `"mirror"` — it stopped on a fault of its own,
 and `error` says on what. `placeholders` counts the mail that could not be
 read (below): how many placeholders stand, how many were `made` since this
@@ -384,7 +387,10 @@ to the mail its record keeps the header block of; a UID is taken to be the
 mail the index has there only while its folder's `UIDVALIDITY` is the one it
 was recorded under. (A record whose file is gone when it is to be written
 again is written as the first time, and the index is matched with the
-ledger again.)
+ledger again.) A record of the user's own that is written again keeps who
+wrote the mail and every id its provider gave it (`kb:sentAs`): the
+gateway's own send is on record with its author from the start, and stays
+so when its Sent copy comes back from the Trash.
 
 A mail whose record is gone from the ledger (restored from an older backup,
 a file lost) is known no more: its row and its places go, and what the row
@@ -392,7 +398,9 @@ said — the id, the sender, the direction, the chat, when the mail arrived —
 is kept as hints for finding the mail, never as knowledge of it (the
 `lost` list; nothing in it is a record, a place or a claim). The rest of
 the work looks for each such id by its `Message-ID` in Sent, INBOX and the
-archive — every mail under it in every folder, so a move or a renumbered
+archive (and, for a mail of the gateway's own whose provider filed it under
+an id of its own, by that one too — the ids stay known while it is looked
+for) — every mail under it in every folder, so a move or a renumbered
 folder makes no difference — at most `LOST_BATCH` ids a pass, the one
 tried least recently first, before the backfill and never in the way of
 new mail. Of what is found, ONE mail is read as the record's: for a row
@@ -888,7 +896,16 @@ the call made again finishes).
 IMAP writes are `UID STORE` and `UID MOVE`, with `UID COPY` + `\Deleted` +
 `UID EXPUNGE` of exactly those UIDs as the fallback where `UIDPLUS` allows
 (else the `\Deleted` copy is left flagged and reported) — never a whole-folder
-`EXPUNGE`.
+`EXPUNGE`. Such a leftover is no place of the mail for a later read or
+archive, and keeps it from being called gone; a delete asks after it, and
+one a client has undeleted since is the mail's place again, moved to the
+Trash with the rest. And where a mail is looked for in
+a folder — after a move whose new UID the server did not name, or by a
+delete — every mail there under its id is looked at, as the mirror looks:
+the mail of a placeholder is only the copy its record keeps the header block
+of, and another mail under the same id is neither moved nor flagged; once
+the placeholder is erased with its chat, that other mail is mirrored as the
+mail it is.
 
 **Folders.** The gateway never invents a **Trash**: it is the folder the server
 marks `\Trash`, else the one `MAIL_TRASH_FOLDER` names, and with neither,

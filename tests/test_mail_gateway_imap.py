@@ -769,7 +769,18 @@ def test_seen_is_set_with_the_folder_open_for_that_one_command():
                 assert "NOPERM" in str(exc) and not isinstance(exc, gw.FolderChanged)
             assert server.opened[-1] == ("EXAMINE", "INBOX")
             # Reading goes on as before.
-            assert box.find("INBOX", "b@x.org") == b
+            assert box.find("INBOX", "b@x.org").uids == (b,)
+            # And a fetch after a write says the UIDVALIDITY of the folder the
+            # write left open — not the one opened before it, which a mail
+            # read there would be refused under (Mirror._ingest).
+            del server.refuse["STORE"]
+            server.folders["Sent"]["validity"] = 31
+            server.put("Sent", t.msg("s@example.org"))
+            assert box.fetch("Sent", 1).uidvalidity == 31
+            assert box.set_seen("INBOX", [a], validity=validity) == 1
+            mark = len(server.commands)
+            assert box.fetch("INBOX", a).uidvalidity == validity == 7
+            assert not [x for x in server.commands[mark:] if "EXAMINE" in x or "SELECT" in x]
             assert not _never(server.commands)
     print("ok: \\Seen is stored with the folder opened read-write for that command alone")
 
@@ -843,7 +854,7 @@ def test_a_move_by_move_by_copy_and_expunge_or_by_copy_alone():
             # and where to is the caller's to find.
             server.names_uids = False
             assert box.move("INBOX", [a], "Archive") == gw.Moved({a: None}, {}, ())
-            assert box.find("Archive", "a@x.org") == 1
+            assert box.find("Archive", "a@x.org").uids == (1,)
     print("ok: a move is MOVE, or COPY and UID EXPUNGE of those UIDs, or COPY alone — "
           "never an EXPUNGE of the folder")
 
@@ -862,7 +873,7 @@ def test_append_and_create():
             mail = server.folders["Sent"]["mails"][1]
             assert mail["raw"] == wire and mail["flags"] == ("\\Seen",)
             assert len(server.opened) == opened, "an append selects nothing"
-            assert box.find("Sent", "s@example.org") == 1
+            assert box.find("Sent", "s@example.org").uids == (1,)
             # No APPENDUID: the caller finds the mail by its id.
             server.names_uids = False
             assert box.append("Sent", raw) == (None, None)
@@ -935,14 +946,15 @@ def test_a_write_is_made_once_whatever_happens_to_the_connection():
                 assert "connection" in str(exc)
             assert count("UID MOVE") == 1 and _ids(server, "Archive") == ["a@x.org"]
             # The adapter goes on, and the caller finds what the write left.
-            assert box.find("Archive", "a@x.org") == 1 and box.find("INBOX", "a@x.org") is None
+            assert box.find("Archive", "a@x.org").uids == (1,)
+            assert box.find("INBOX", "a@x.org") == gw.Matches((), True)
             server.drop_after = "APPEND"
             try:
                 box.append("Sent", raw)
                 raise AssertionError("no error")
             except gw.MailboxError:
                 pass
-            assert count("APPEND") == 1 and box.find("Sent", "s@example.org") == 1
+            assert count("APPEND") == 1 and box.find("Sent", "s@example.org").uids == (1,)
     print("ok: a write is not sent a second time over a dropped connection")
 
 
