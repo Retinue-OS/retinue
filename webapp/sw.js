@@ -33,6 +33,7 @@ const SHELL_ASSETS = [
   '/contacts.html',
   '/viewer.html',
   '/sync-health',
+  '/apps.html',
   '/styles.css',
   '/layout.js',
   '/viewport.js',
@@ -73,6 +74,7 @@ const SHELL_ASSETS = [
   '/components/viewer-page.js',
   '/components/settings-page.js',
   '/components/sync-health-page.js',
+  '/components/apps.js',
   '/icons/icon-192.png',
   '/icons/icon-512.png'
 ];
@@ -445,7 +447,7 @@ self.addEventListener('push', (e) => {
     payload = { body: e.data ? e.data.text() : '' };
   }
   const title = payload.title || 'Retinue';
-  e.waitUntil(self.registration.showNotification(title, {
+  const options = {
     body: payload.body || '',
     // Tagging by thread collapses repeated pushes about the same conversation
     // into one notification instead of stacking them up.
@@ -454,12 +456,40 @@ self.addEventListener('push', (e) => {
     icon: '/icons/icon-192.png',
     badge: '/icons/icon-192.png',
     data: { url: payload.url || '/' }
-  }));
+  };
+  // A chamber app's reminder (docs/chamber-apps.md, "Reminders") carries
+  // its two actions and the API path they post to; the tap opens the app.
+  const api = reminderApi(payload.api);
+  if (payload.kind === 'reminder' && api) {
+    options.data.api = api;
+    options.data.occurrence = payload.occurrence || null;
+    options.actions = (Array.isArray(payload.actions) ? payload.actions : [])
+      .filter((a) => a && (a.action === 'snooze' || a.action === 'skip'))
+      .map((a) => ({ action: a.action, title: String(a.title || a.action).slice(0, 40) }));
+  }
+  e.waitUntil(self.registration.showNotification(title, options));
 });
+
+// Only a reminder's own API path on this origin, never anything else a
+// payload names: /apps/api/schedule/<chamber>/<app>/<id>.
+function reminderApi(value) {
+  return typeof value === 'string' && /^\/apps\/api\/schedule\/[A-Za-z0-9_-]+\/[A-Za-z0-9_-]+\/[A-Za-z0-9._-]+$/.test(value)
+    ? value : null;
+}
 
 self.addEventListener('notificationclick', (e) => {
   e.notification.close();
-  const target = (e.notification.data && e.notification.data.url) || '/';
+  const data = e.notification.data || {};
+  // A reminder's actions: In 15 min (snooze) and Skip today. Posted as the
+  // dashboard's own request; nothing opens.
+  if ((e.action === 'snooze' || e.action === 'skip') && reminderApi(data.api)) {
+    e.waitUntil(fetch(`${data.api}/${e.action}`, {
+      method: 'POST', credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json' }, body: '{}'
+    }).catch(() => {}));
+    return;
+  }
+  const target = data.url || '/';
   e.waitUntil(
     self.clients.matchAll({ type: 'window', includeUncontrolled: true }).then((wins) => {
       // Reuse an already-open dashboard window when there is one: navigating it
@@ -509,6 +539,12 @@ self.addEventListener('fetch', (e) => {
   // Push config carries the server's current VAPID key; a stale cached copy
   // would silently produce subscriptions this server cannot send to.
   if (url.pathname.startsWith('/push/')) return;
+
+  // Chamber apps (/apps/<chamber>/<app>/, their list and their API) are the
+  // chambers' own, not the dashboard's shell: each app caches itself with a
+  // worker of its own scope, and its API is live. The Apps page itself
+  // (/apps.html) is a shell page, cached above.
+  if (url.pathname === '/apps' || url.pathname.startsWith('/apps/')) return;
 
   // The letterbox's WebDAV share is files in flight, not the app.
   if (url.pathname === '/inbox' || url.pathname.startsWith('/inbox/')) return;
