@@ -119,14 +119,22 @@ key.
    chats were started before the mail that links them arrived.
 5. `M` and every cited id are then mapped to the surviving key.
 
+`References` is the sender's to write, so what one mail can do with it is
+bounded. "Oldest" goes by when the mailbox server received a mail, never by
+its `Date` header: a backdated mail cannot make itself the root of someone
+else's thread. A mail may cite 100 ids (the first and the nearest parents) and
+merge at most four chats; one that cites more merges none, joins its nearest
+known parent, and the refusal is logged.
+
 ```python
 def normalize_id(raw) -> str                 # "<a@b>" → "a@b"; "" for junk
 def cited_ids(references, in_reply_to, message_id="") -> list[str]
 def base_subject(subject) -> str             # strips Re:/Fwd:/Fw:/AW:/WG:/… repeatedly
 class ThreadIndex:                           # sqlite3, one file per account
     def resolve(self, message_id, cited, date=None, subject=None) -> Resolution
-    #   Resolution(chat, merged, new, repeat) — records M and the cited ids;
-    #   `merged` lists the keys absorbed into `chat`, `repeat` a mail seen before
+    #   Resolution(chat, merged, new, repeat, unmerged) — records M and the
+    #   cited ids; `merged` lists the keys absorbed into `chat`, `repeat` a mail
+    #   seen before, `unmerged` the chats a mail cited too many of to merge
     def chat_of(self, message_id) -> str | None
     def members(self, chat) -> list[str]     # the chat's mails, oldest first
     def subject_of(self, chat) -> str        # base subject of its earliest mail
@@ -209,7 +217,9 @@ gateway's name can differ: each entry carries its `channel`, and the web
 gateway reads that before it falls back to reading a slug.
 
 `/health` answers `{configured, connected, mode: "inbox", account, error,
-needs_repair: false, build, backfill: {done, pending}}`. An unconfigured
+needs_repair: false, build, backfill: {done, pending, days}, unmirrored}` —
+`backfill.days` is the window fixed at the first run, `unmirrored` the number
+of mails that could not be given even a placeholder. An unconfigured
 gateway (`configured: false`) idles and is not an outage; so does one not
 opted in — no `MAIL_GATEWAY_TOKEN`, or the default account where
 `MESSENGER_BUILTIN_CHANNELS` is set without `email` — and `error` says which.
@@ -230,12 +240,17 @@ gateway polls (`MAIL_POLL_SECONDS`, 60) the mirrored folders — **INBOX**,
   the **own-device echo** (`author: device`) unless an outbound note names its
   author (see *Writing*).
 - **The archive folder is only followed, never read for new mail**: a mail
-  that moves there from INBOX is still that mail.
+  that moves there from INBOX is still that mail. One case is read: a mail
+  that passed through INBOX or Sent between two polls — a filter, or a quick
+  hand in a client — shows as a UID that was handed out and is gone, and what
+  the archive gained since is then mirrored like any arrival.
 - **A mail that is in none of the mirrored folders any more** — deleted or
   moved away in a client — is removed from the mirror on that poll and leaves
   a **tombstone**: the record keeps its identity (chat, sender, time,
   `Message-ID`), loses its text, parts and attachments, and gains
-  `kb:removedAt`.
+  `kb:removedAt`. Only an answer counts: a mail is gone once every mirrored
+  folder has *said* it does not hold it. A folder the server will not open, a
+  refused search, a dropped connection tombstone nothing; the pass is repeated.
 - **A client's `\Seen` changes are ignored.**
 - **Backfill**: on first run, INBOX and Sent for `MAIL_BACKFILL_DAYS` (90),
   merged and ingested **oldest first**, so parents arrive before replies.
@@ -258,16 +273,27 @@ messenger gateway keeps a photo. Tracking pixels are not attachments: a remote
 image is never fetched, and an inline image of two pixels or fewer a side is
 dropped.
 
-Two limits keep one mail from filling the volume. An attachment larger than
-`MAIL_MAX_PART_BYTES` is not stored; a small text attachment named
-`<name>.not-mirrored.txt` stands in for it and says what it was. A mail larger
-than `MAIL_MAX_MAIL_BYTES` keeps its text parts and one such note for all its
-attachments. The text of a mail is always kept.
+**What one mail may ask for is bounded**, since anyone can send one. An
+attachment larger than `MAIL_MAX_PART_BYTES` is not stored; a small text
+attachment named `<name>.not-mirrored.txt` stands in for it and says what it
+was. A mail larger than `MAIL_MAX_MAIL_BYTES` keeps its text parts and one
+such note for all its attachments. Beyond 200 attachments one note names the
+rest. `kb:text` holds at most 256,000 characters (cut with a mark, trim state
+`wanting`; the whole text stays in the body part). Header fields, address
+lists and ids have their own caps, and a mail is decoded only under real
+character sets — never under a codec the sender names. The text of a mail is
+always kept.
+
+**A mail that cannot be read is still there.** One mail's failure never stops
+the folder: a mail the gateway cannot parse or store is mirrored as a
+placeholder that says so (with its sender, its time and its header block,
+unchanged in the mailbox) and is read again at every start; the rare mail
+that cannot even be that is logged and counted on `/health` (`unmirrored`).
 
 A record's time is the earlier of the mail's `Date` and the server's arrival
 time, never the future, so a forged date cannot pin a mail to the head of its
-chat. A mail with no usable `Message-ID` gets a stable one derived from its
-headers.
+chat; the arrival time itself is kept as `kb:arrivedAt`. A mail with no usable
+`Message-ID` gets a stable one derived from its headers.
 
 ### The record
 
@@ -282,7 +308,8 @@ channels:
 | `kb:recipient` (multi) | `To` addresses |
 | `kb:cc` (multi) | `Cc` addresses |
 | `kb:inReplyTo` | the parent's id |
-| `kb:references` | the `References` ids, space-separated, in header order |
+| `kb:references` | the `References` ids, space-separated, in header order (then any further `In-Reply-To` id) |
+| `kb:arrivedAt` | when the mailbox server received the mail (IMAP `INTERNALDATE`); kept on a tombstone |
 | `kb:listId` | the normalised `List-Id` |
 | `kb:bodyPart`, `kb:htmlPart`, `kb:headerPart` | media IRIs (see above) |
 | `kb:contentId` (on an attachment IRI) | the part's `Content-ID` |
@@ -299,7 +326,11 @@ New store operations: `update_message` learns `chat` and `trim`;
 threading ids, so an index rebuilt from the ledger still knows what the gone
 mail cited) and unlinks its blobs; `delete_chat` also unlinks the part blobs;
 `iter_records(store)` reads the ledger back for an index rebuild. A triple the
-parser does not know is kept verbatim through every rewrite.
+parser does not know is kept verbatim through every rewrite. A caller that is
+the only writer of its blobs and knows its chat's records says so
+(`tombstone_message(own_blobs=True)`, `rekey_chat(paths=…)`) and is spared a
+scan of the whole ledger; the defaults keep the scan, which is what the
+messenger gateways sharing this module rely on.
 
 ## Trimmed bubbles, the original one tap away
 
@@ -313,28 +344,41 @@ needed — "wrote", "From:", "Sent from my" — the lists are multilingual by
 design and extended as data).
 
 ```python
-def trim(plain, html, subject=None) -> TrimResult
+def trim(plain, html, subject=None, *, is_reply=None, bulk=None) -> TrimResult
 #   TrimResult(text, state: "deterministic" | "wanting", removed: dict)
 def html_to_text(html) -> str
 def sanitize_html(html, cid_map=None) -> str   # a whole document, for the Original view
 def is_tracking_pixel(width=None, height=None, attrs=None) -> bool
 ```
 
-The subject matters for one case: a forward that carries no marker of its own
-(Outlook) looks exactly like a reply, and only its `Fwd:` prefix says the
-history below *is* the content.
+**The rule above every other: never cut what the author wrote.** So the trim
+cuts on evidence, and where it sees a shape but lacks the evidence it leaves
+the text in and says so:
 
-It removes, in this order: quoted history (`>` blocks and their attribution
-line, "On … wrote:" in its common forms, Outlook's `-----Original Message-----`
-and `From:/Sent:/To:/Subject:` header blocks, `gmail_quote` / `blockquote` /
-`#divRplyFwdMsg` in HTML), signatures (the `-- ` delimiter, "Sent from my …"),
-footers and disclaimers (confidentiality notices, unsubscribe blocks),
-and tracking pixels. Inline images that belong to the text stay, as media.
+- **Quoted history** written with `>` goes, with its attribution line.
+  History that carries no `>` — Outlook's `-----Original Message-----` and its
+  `From:/Sent:/To:/Subject:` block, `#divRplyFwdMsg`, an attribution above
+  bare text — goes only from a mail that **cites a parent** (`is_reply`) and
+  whose subject says it is a reply. Under a forward prefix the same history
+  *is* the content and is kept. A `From/Date/Subject` block in a mail that is
+  no reply is a notification or a memo, and stays.
+- **Signatures**: the single standard `-- ` delimiter near the end, and a
+  phone line that holds names only ("Sent from my …" with nothing said).
+- **Footers and disclaimers**: an unsubscribe block or a list footer only in
+  mail that says itself it is **bulk** (`bulk`: a `List-Id`, a
+  `List-Unsubscribe`, a bulk `Precedence`) — "unsubscribe me please" from a
+  person is their message; a legal notice only where the mail ends on one
+  that is whole.
+- **Tracking pixels.** Inline images that belong to the text stay, as media.
 
-The state is `wanting` when the mail is HTML-only, or when what is left is
-still long and looks unsettled (more than `MAIL_TRIM_WANTING_CHARS` after the
-trim, or a quote marker survived). An empty result falls back to the untrimmed
-text: a bubble is never blank because the trim was greedy.
+The gateway passes both facts. Where a word table decides (attribution verbs,
+forward prefixes), a language the table lacks fails safe: the text stays.
+
+The state is `wanting` when the mail is HTML-only, when what is left is still
+long (more than `MAIL_TRIM_WANTING_CHARS`), when a quote marker survived, or
+when a rule saw its shape and held back for want of evidence. An empty result
+falls back to the untrimmed text: a bubble is never blank because the trim was
+greedy. Cost is linear in the size of the mail, for hostile mail too.
 
 ### The model trim (phase 4)
 
