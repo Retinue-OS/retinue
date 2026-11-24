@@ -667,8 +667,12 @@ def test_a_forged_from_in_inbox_never_makes_a_lost_record_the_users():
     the Sent copy deleted or appended later than the look-alike came in.
     The hint's "out" counts in Sent and the archive only, and a Sent copy
     comes first whenever it came. So a mail to oneself whose Sent copy is
-    gone comes back as one that came in: the stated limit."""
-    for variant in ("deleted", "appended late"):
+    gone comes back as one that came in: the stated limit. And in the
+    archive it counted on the From alone: the look-alike archived, or in an
+    "all mail" archive, the Sent copy deleted, became the user's again. An
+    archive copy counts only when it was received when the record said (a
+    move keeps the arrival time; the look-alike came later)."""
+    for variant in ("deleted", "appended late", "archived", "all mail"):
         with tempfile.TemporaryDirectory() as tmp:
             gw = load(tmp)
             _write_policy(gw)
@@ -686,11 +690,16 @@ def test_a_forged_from_in_inbox_never_makes_a_lost_record_the_users():
             _turns(gw, mirror, clock, loop, 2)
             # Mallory, who was sent it, sends a mail under its id From the
             # user's own address.
-            box.put("INBOX", msg("own@example.org", sender=ME, to=ME, subject="Re",
-                                 body="I agree to pay Mallory 5000.\n", day=39.95), date=forged)
+            look = msg("own@example.org", sender=ME, to=ME, subject="Re",
+                       body="I agree to pay Mallory 5000.\n", day=39.95)
+            uid = box.put("INBOX", look, date=forged)
             _turns(gw, mirror, clock, loop, 2)
             assert by_id(gw)["own@example.org"]["text"] == "My offer: 100.", variant
-            if variant == "deleted":
+            if variant == "archived":
+                box.move_mail("INBOX", uid, "Archive")
+            elif variant == "all mail":
+                box.put("Archive", look, date=forged)
+            if variant != "appended late":
                 box.remove("Sent", box.uid_of("Sent", "own@example.org"))
                 _turns(gw, mirror, clock, loop, 2)
             told = len(events)
@@ -698,8 +707,9 @@ def test_a_forged_from_in_inbox_never_makes_a_lost_record_the_users():
             snap = _turns(gw, mirror, clock, loop, 4)
             record = by_id(gw)["own@example.org"]
             got = [(p["direction"], p["text"]) for p in inbound(events[told:])]
-            if variant == "deleted":
-                # Nothing but its From says the user wrote what lies in INBOX.
+            if variant != "appended late":
+                # Nothing but its From says the user wrote what lies in INBOX,
+                # or its copy in the archive.
                 assert record["type"] == gw._ibstore.T_INBOUND and not record.get("author")
                 assert got == [("in", "I agree to pay Mallory 5000.")], got
             else:
@@ -709,8 +719,8 @@ def test_a_forged_from_in_inbox_never_makes_a_lost_record_the_users():
                     "SELECT role FROM locations WHERE message_id = 'own@example.org' "
                     "AND skipped IS NULL")) == ["inbox", "sent"]
             assert snap["lost"] == 0, snap
-    print("ok: a forged From in INBOX never makes a lost record the user's own mail — a "
-          "Sent copy comes first, whenever it was appended")
+    print("ok: a forged From in INBOX, archived or not, never makes a lost record the "
+          "user's own mail — a Sent copy comes first, whenever it was appended")
 
 
 def _hanging(gw):
