@@ -691,7 +691,7 @@ Tier-3 across both the framework and the gateway services:
   mail gateway, below). What stays are the two paths `TRIAGE_MESSENGER_DIR`
   and `TRIAGE_EMAIL_WHITELIST_PATH`, and the one-time migration's settings
   (`scripts/migrate-triage.py`, [mail-chats.md](mail-chats.md), "The
-  migration"): `TRIAGE_STATE_DIR` (its marker, snapshot and journal, and the
+  migration"): `TRIAGE_STATE_DIR` (its marker, cutoff file, snapshot and journal, and the
   retired status store it reports on; keep it set wherever a deployment moved
   it), `MAIL_OWN_ADDRESSES`, `RETINUE_TRIAGE_MIGRATION`,
   `MIGRATE_TRIAGE_MODEL_TIMEOUT` and `MIGRATE_TRIAGE_MIRROR_WAIT`.

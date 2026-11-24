@@ -892,11 +892,13 @@ nothing if the turn ends with a verdict, whatever importance the verdict
 gives: the chat's status says `quiet`, with the verdict and its actions. The
 archive covers only the mail the turn was started for: where another mail
 arrived in the chat after it, the chat is not archived (the answer says so),
-and the mailbox is told only of the mails the turn worked. A turn's mute is
-treated as its archive is. A turn that does not finish — it fails, times out,
-or sets no verdict — has the chat brought back (un-archived and un-muted) and
-the mail rung by the failure rule, since a turn that did not finish is not
-trusted with having put a mail away. The user's own archive during a turn
+and the mailbox is told only of the mails the turn worked. A turn cannot
+mute: a mute it asks for is taken as that same archive, and the answer says so
+(`a turn cannot mute; archived instead`) — muting stays the user's. A turn
+that does not finish — it fails, runs past `MAIL_INSTRUCTION_TIMEOUT`, or sets
+no verdict — has the chat brought back (un-archived) and the mail rung by the
+failure rule, since a turn that did not finish is not trusted with having put
+a mail away. The user's own archive during a turn
 changes nothing about the ring.
 
 **The re-offer rule.** A mail offered again is taken once, by its
