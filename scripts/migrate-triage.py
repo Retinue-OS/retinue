@@ -85,8 +85,10 @@ prompt's:
   (``FILING_DEFAULT``, "Unless the note above says otherwise: …") only when
   that text passes a deterministic check — it names a kind of document and
   filing it (``FILING_TERMS``, a multilingual table). The line stands once
-  per person, known by its opening however the user edited or moved it, and
-  a later note goes in front of it; where words and line together would not
+  per person, known by its exact text — and by its opening, however the
+  user edited or moved it, only on a person the journal records it was
+  placed on (place) — and a later note goes in front of it; a line the user
+  deleted is never added again; where words and line together would not
   fit the instruction they go on, the words go on alone;
 * ``fact`` and ``unclear`` leave the memory alone.
 
@@ -94,7 +96,8 @@ So the most a steered or wrong answer can do is put a note triage held, in
 that note's own words, on the contact that note's own tags name — what
 ``--no-model`` does with every note — and, after a note that names filing
 its sender's documents, add the one yielding line. It can never put words
-in front of the user's, or in their place.
+in front of the user's, or in their place, but in front of the filing line,
+where every later note goes.
 ``--no-model`` skips the turn and carries every rule over
 verbatim; nothing then judges whether a text was the user's instruction, so
 read the report.
@@ -185,8 +188,9 @@ GENERIC_INSTRUCTION = ("See whether this belongs to a project and link it; extra
                        "keeping; determine importance and urgency.")
 # The filing default follows the user's own words and yields to them: it is
 # placed as the last paragraph of an instruction, so "the note above" is true.
-# A paragraph is the default by its opening, however the user edited the rest
-# of it and wherever they moved it (place).
+# A line is the default by its exact text, and — on a person this migration
+# placed it on — by its opening, however the user edited the rest of it and
+# wherever they moved it (_filing_line).
 FILING_OPENING = "Unless the note above says otherwise:"
 FILING_DEFAULT = (f"{FILING_OPENING} file the document with the Archivist, "
                   "book it, then archive the mail.")
@@ -1656,44 +1660,73 @@ def add_rule(instruction: str | None, rule: str) -> tuple[str, bool] | None:
     return (joined, True) if len(joined) <= contacts.INSTRUCTION_MAX else None
 
 
-def _filing_line(text: str) -> int | None:
-    """Where the person's filing default starts in an instruction: the first
-    paragraph that opens with ``FILING_OPENING`` (whitespace and case aside),
-    however the user edited the rest of it and wherever it stands; None for
-    none."""
-    opening = _flat(FILING_OPENING).casefold()
-    for start in re.finditer(r"(?:\A|\n[ \t]*\n)\s*", text):
-        paragraph = re.split(r"\n[ \t]*\n", text[start.end():], maxsplit=1)[0]
-        if _flat(paragraph).casefold().startswith(opening):
-            return start.end()
-    return None
+def _filing_line(text: str, ours: bool = False) -> int | None:
+    """Where the person's filing default starts in an instruction; None for
+    none. A lone CR ends a line too. The exact ``FILING_DEFAULT`` is the line
+    where it stands as a line of its own, and at the very end of the text
+    whatever stands before it. A line is taken for the default by its opening
+    alone (``FILING_OPENING``, whitespace and case aside, however the user
+    edited the rest of it and wherever they moved it) only where this
+    migration placed the line on the person (``ours``, the journal's word,
+    _filed_on): on anyone else such a line is the user's own text. Where
+    several lines qualify, an exact one wins, then the last."""
+    if text.endswith(FILING_DEFAULT):
+        return len(text) - len(FILING_DEFAULT)
+    lines = text.replace("\r", "\n")   # length kept: a position in it is one in text
+    exact = [m.start(1) for m in re.finditer(
+        r"(?:\A|\n)[ \t]*(" + re.escape(FILING_DEFAULT) + r")[ \t]*(?=\n|\Z)", lines)]
+    if exact:
+        return exact[-1]
+    if not ours:
+        return None
+    opening = r"\s+".join(re.escape(word) for word in FILING_OPENING.split())
+    found = [m.start(1) for m in re.finditer(r"(?:\A|\n)[ \t]*(" + opening + ")", lines, re.IGNORECASE)]
+    return found[-1] if found else None
 
 
-def place(instruction: str | None, decision: dict) -> tuple[str, bool] | None:
+def place(instruction: str | None, decision: dict, ours: bool = False) -> tuple[str, bool] | None:
     """An instruction with a decision placed on it, as add_rule: (text,
     whether it changed), or None when it would not fit. The memory's own
     words always go on, after what stands — except where the person has the
-    filing default (a paragraph that opens with it, _filing_line): the words
-    of any kind go in front of that paragraph, alone, wherever it stands, so
-    whatever "the note above" covers keeps it last. A ``filing`` adds the
-    default after its words where the person has none, and where words and
-    default together would not fit this instruction, the words go on alone.
-    The default stands once: a person whose text holds it elsewhere gets
-    the words alone."""
+    filing default (_filing_line; by its opening only where this migration
+    placed it, ``ours``): the words of any kind go in front of that line,
+    alone, wherever it stands, so whatever "the note above" covers keeps it
+    last. A ``filing`` adds the default after its words where the person has
+    none and never had it from this migration — a line the user deleted is
+    never added again — and where words and default together would not fit
+    this instruction, the words go on alone. The default stands once: a
+    person whose text holds it elsewhere gets the words alone."""
     current = str(instruction or "").replace("\r\n", "\n").strip()
     words = decision["instruction"]
     if _flat(words) in _flat(current):
         return current, False
-    at = _filing_line(current)
+    at = _filing_line(current, ours)
     if at is not None:
         head = current[:at].rstrip()
         joined = f"{head}\n\n{words}\n\n{current[at:]}" if head else f"{words}\n\n{current}"
         return (joined, True) if len(joined) <= contacts.INSTRUCTION_MAX else None
-    if decision.get("kind") == "filing" and _flat(FILING_DEFAULT) not in _flat(current):
+    if decision.get("kind") == "filing" and not ours and _flat(FILING_DEFAULT) not in _flat(current):
         defaulted = add_rule(current, f"{words}\n\n{FILING_DEFAULT}")
         if defaulted is not None:
             return defaulted
     return add_rule(current, words)
+
+
+def _filing_stands(instruction: str | None, ours: bool) -> bool:
+    """Whether the filing default stands in an instruction: as a line
+    (_filing_line), or its exact text anywhere in it."""
+    text = str(instruction or "").replace("\r\n", "\n").strip()
+    return _filing_line(text, ours) is not None or _flat(FILING_DEFAULT) in _flat(text)
+
+
+def _filed_on(journal: dict) -> set[str]:
+    """The contacts this migration placed the filing default on, by its
+    journal: a written or migrated entry that records the line as standing
+    on them after its write. Only on these is a line the default by its
+    opening, and only to these is it never added again."""
+    return {ref.get("contact") for entry in journal.values()
+            if entry.get("state") in ("written", "migrated") and entry.get("kind") == "filing"
+            for ref in entry.get("contacts") or [] if ref.get("filing") is True}
 
 
 def _components(entries: list[dict]) -> list[list[dict]]:
@@ -1928,12 +1961,13 @@ def step_memories(run: Run, *, again: bool) -> tuple[bool, bool, str]:
     texts: dict[str, str | None] = {}
     changed: set[str] = set()
     placed: list[dict] = []
+    filed_on = _filed_on(journal)
     for entry in work:
         trial = {}
         for key in entry["targets"]:
             if key not in texts:
                 texts[key] = (run.contact(key) or {}).get("instruction")
-            trial[key] = place(texts[key], entry["decision"])
+            trial[key] = place(texts[key], entry["decision"], key in filed_on)
         full = [key for key, fit in trial.items() if fit is None]
         if full:
             names = ", ".join(repr(t["name"]) for t in entry["described"] if t["key"] in full)
@@ -2014,10 +2048,11 @@ def step_memories(run: Run, *, again: bool) -> tuple[bool, bool, str]:
             names.append({"contact": record.get("key") or target["key"],
                           "name": record.get("name") or target["name"]})
             if entry["decision"].get("kind") == "filing":
-                # Whether the filing default stands on them, for the report:
-                # where it would not fit, the words went on alone.
-                text = texts.get(target["key"]) or ""
-                names[-1]["filing"] = _filing_line(text) is not None or _flat(FILING_DEFAULT) in _flat(text)
+                # Whether the filing default stands on them after this
+                # write — what the next run's placing reads (_filed_on):
+                # where it would not fit, or the user deleted
+                # it, the words went on alone.
+                names[-1]["filing"] = _filing_stands(texts.get(target["key"]), target["key"] in filed_on)
         journal[entry["id"]] = {"state": "written", "tags": entry["tags"], "contacts": names,
                                 "by": entry["by"], "at": _now(), **entry["decision"],
                                 **({"said": entry["said"]} if entry.get("said") else {})}
@@ -2276,12 +2311,17 @@ def build_report(run: Run) -> dict:
     beyond = [p for p in briefed if p["channels"]]
     filing = [e for e in report["memories"]["moved"] + report["memories"]["waiting"]
               if e.get("kind") == "filing"]
+    # Whether the default stands on a person is read from the contact as it
+    # stands, as briefed_people reads it: a line the user deleted is not
+    # counted, whatever the journal recorded at the write.
+    filed_on = _filed_on(memories)
+    stands = sum(1 for key in sorted({c.get("contact") for e in filing for c in e.get("contacts") or []})
+                 if _filing_stands((run.contact(key) or {}).get("instruction"), key in filed_on))
     mail_wait = _timeout("MAIL_INSTRUCTION_TIMEOUT", 600)
     chat_wait = _timeout("CHAT_INSTRUCTION_TIMEOUT", 60)
     report["briefed"] = {"contacts": len(briefed) + len(edited), "beyond_mail": beyond,
                          "edited": edited, "extended": extended,
-                         "filing": len({c.get("contact") for e in filing for c in e.get("contacts") or []
-                                        if c.get("filing", True)}),
+                         "filing": stands,
                          "mail_timeout": mail_wait, "chat_timeout": chat_wait}
     by_hand = []
     if not report["mail_gateway"]:

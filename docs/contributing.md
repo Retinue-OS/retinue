@@ -380,10 +380,18 @@ beforehand.
   memory's own, first — for a filing memory whose text names a document and
   filing it, followed by one fixed line that yields to those words
   ("Unless the note above says otherwise: file the document …"), placed as
-  the instruction's last paragraph and known by that opening however you
-  edit or move it — a later note goes in front of it, and it is never added
-  twice; nothing the model writes reaches a contact,
-  and nothing is ever put in front of the user's words or in their place.
+  the instruction's last paragraph — a later note goes in front of it, and
+  it is never added twice. It is known by its exact text (as a line of its
+  own, or at the very end whatever stands before it), and, on a person the
+  migration's journal records it placed the line on, by that opening at the
+  start of any line however you edit or move it (there, a paragraph of
+  yours that begins with those words is taken for the line too; of several,
+  the exact one, then the last); on anyone else a paragraph of yours that
+  begins with those words is yours — notes go after it, and a filing note
+  adds the real line. A line you delete stays deleted: a later filing note
+  for that person adds its own words alone. Nothing the model writes
+  reaches a contact, and nothing but a later note in front of that line is
+  ever put in front of the user's words or in their place.
 - **`--no-model`** carries every sender rule over verbatim. Nothing then
   judges whether a memory's text was the user's instruction or something a
   message said: read the instructions it wrote (the report lists them).

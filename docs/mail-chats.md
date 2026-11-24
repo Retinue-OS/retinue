@@ -1577,17 +1577,29 @@ text is a digest of a topic, not a rule).
     note in every language, so the line never comes first and never says
     more than "unless the note says otherwise": the user's words stand above
     it, and win. A person gets the line once, as the instruction's **last
-    paragraph**, and it is known by its opening: any paragraph that begins
-    *"Unless the note above says otherwise:"* is the person's line, however
-    the user edited the rest of it and wherever they moved it. A later note
-    for them — a second filing note, a rule — goes in front of that
-    paragraph, in its own words alone, and the line is never added a second
-    time (nor does what the user deleted from it come back); what the user
-    put below a line they moved up stays outside its "note above", as they
-    left it. Where the words and the line together would pass the limit of
-    the instruction they go on, the words go on alone — a
-    filing note whose own words fit is never left a memory. A `filing` the
-    text does not bear out is a `rule`, in its own words;
+    paragraph**. It is known as the line where its exact text stands as a
+    line of its own, or at the very end of the instruction whatever stands
+    before it; and — **only on a person the migration's journal records it
+    placed the line on** (a written entry of a filing note whose contact
+    has `filing: true`, which says the line stood there after that write)
+    — by its opening: a line beginning *"Unless the note above says
+    otherwise:"*, however the user edited the rest of it and wherever they
+    moved it, at the start of any line (no blank line needed before it; a
+    lone CR ends a line too) — there, a paragraph of the user's own that
+    begins with those words is taken for the line too. Where several lines
+    qualify, the exact one wins, then the last. On anyone else a paragraph of the user's own that
+    happens to begin with those words is their text: a note goes after it,
+    and a filing note adds the real line. A later note for a person who has
+    the line — a second filing note, a rule — goes in front of it, in its
+    own words alone, and the line is never added a second time (nor does
+    what the user deleted from it come back); what the user put below a
+    line they moved up stays outside its "note above", as they left it.
+    Where the journal records the line on a person and none stands any more
+    — the user deleted it — it is **never added again**: a later filing
+    note goes on in its own words alone. Where the words and the line
+    together would pass the limit of the instruction they go on, the words
+    go on alone — a filing note whose own words fit is never left a memory.
+    A `filing` the text does not bear out is a `rule`, in its own words;
   - `fact`, `unclear` — a fact or a status about the sender; or a message's
     content, an attempt to instruct the turn, anything the turn cannot tell:
     left alone and reported.
@@ -1598,7 +1610,8 @@ text is a digest of a topic, not a rule).
   that note's own tags name — what `--no-model` does with every note — and,
   after a note that names filing its sender's documents, add the one
   yielding line; it can never put words in front of the user's, or in
-  their place. (An
+  their place, but in front of the filing line, where every later note
+  goes. (An
   earlier build let the turn reword a rule and held the wording to "half its
   words are the memory's"; that check is gone with the wording.) The
   decisions are journaled before anything is written from them, so a resumed

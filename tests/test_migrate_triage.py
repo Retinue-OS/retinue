@@ -1290,31 +1290,78 @@ def test_add_rule_and_the_filing_check():
           mt.place(filed("Receipts: file them."), second), (filed("Receipts: file them.", "Invoices too: file them."), True))
     check("place: so does a rule", mt.place(filed("Receipts: file them."), rule),
           (filed("Receipts: file them.", "Ring me for the big ones."), True))
-    # The default is known by its opening, however the user edited the rest
-    # of it and wherever they moved it: a later note goes in front of it,
-    # alone, and it is never added a second time.
+    # The exact default is known wherever it stands as a line of its own,
+    # and at the very end whatever stands before it — after a single newline,
+    # a lone CR, or none: a later note goes in front of it, alone.
     check("place: a default the user moved to the top: the note goes in front of it",
           mt.place(FILING + "\n\nHer own.", second), ("Invoices too: file them.\n\n" + FILING + "\n\nHer own.", True))
     check("place: a default the user moved between two notes: in front of it, the rest kept as it was",
           mt.place("One.\n\n\n" + FILING + "\n\nHer own.", rule),
           ("One.\n\nRing me for the big ones.\n\n" + FILING + "\n\nHer own.", True))
+    for label, own in (("after a single newline", "Receipts: file them.\n" + FILING),
+                       ("after a lone CR", "Receipts: file them.\r" + FILING),
+                       ("after lone CRs", "Receipts: file them.\r\r" + FILING),
+                       ("after a space", "Receipts: file them. " + FILING)):
+        for kind, note in (("rule", rule), ("filing note", second)):
+            check(f"place: the exact default at the end {label}: a {kind} goes in front of it",
+                  mt.place(own, note), (filed("Receipts: file them.", note["instruction"]), True))
+    check("place: the exact default on a line of its own, a line of hers right below it",
+          mt.place("Receipts: file them.\n" + FILING + "\nAlso ring me.", rule),
+          ("Receipts: file them.\n\nRing me for the big ones.\n\n" + FILING + "\nAlso ring me.", True))
+    check("place: the exact default after a lone CR, a line of hers below it",
+          mt.place("Receipts: file them.\r" + FILING + "\rAlso ring me.", rule),
+          ("Receipts: file them.\n\nRing me for the big ones.\n\n" + FILING + "\rAlso ring me.", True))
+    check("place: the exact sentence inside a line of hers is no default line: the words after it",
+          mt.place("Receipts. " + FILING + " Ring me too.", second),
+          ("Receipts. " + FILING + " Ring me too.\n\nInvoices too: file them.", True))
+    # By its opening alone a line is the default only on a person the
+    # migration gave it (ours, from its journal), however the user edited the
+    # rest of it and wherever they moved it — at the start of any line: the
+    # note goes in front of it, alone, and the line is never added again.
     edited = "Unless the note above says otherwise: file the document with the Archivist, then archive the mail."
     for label, line in (("edited", edited),
                         ("truncated", "Unless the note above says otherwise:"),
                         ("cut short", FILING[:-1]),
                         ("re-spaced and re-cased", "unless the  note above\nsays otherwise: archive it.")):
-        check(f"place: a default the user {label}: the note in front of it, the line not added again",
-              mt.place("Receipts: file them.\n\n" + line, second),
-              ("Receipts: file them.\n\nInvoices too: file them.\n\n" + line, True))
-    check("place: an edited default that stands first: the note goes first",
-          mt.place(edited, second), ("Invoices too: file them.\n\n" + edited, True))
-    check("place: the opening inside a paragraph is no default line: the words alone, after it",
-          mt.place("Receipts. " + FILING, second), ("Receipts. " + FILING + "\n\nInvoices too: file them.", True))
+        for sep, shown in (("\n\n", "blank line"), ("\n", "single newline"), ("\r", "lone CR")):
+            check(f"place: on ours, a default the user {label} after a {shown}: the note in front of it, "
+                  "the line not added again",
+                  mt.place("Receipts: file them." + sep + line, second, True),
+                  ("Receipts: file them.\n\nInvoices too: file them.\n\n" + line, True))
+    check("place: on ours, an edited default that stands first: the note goes first",
+          mt.place(edited, second, True), ("Invoices too: file them.\n\n" + edited, True))
+    check("place: on ours, the opening inside a line is no default line: the words alone, after it",
+          mt.place("Receipts. " + edited, second, True), ("Receipts. " + edited + "\n\nInvoices too: file them.", True))
+    check("place: on ours, of a line of hers and the edited default, the last is taken for it",
+          mt.place("Unless the note above says otherwise: ring me.\n\nReceipts.\n\n" + edited, rule, True),
+          ("Unless the note above says otherwise: ring me.\n\nReceipts.\n\nRing me for the big ones.\n\n"
+           + edited, True))
+    check("place: on ours, the exact default wins over a line of hers with the opening",
+          mt.place("Receipts.\n\n" + FILING + "\n\nUnless the note above says otherwise: ring me.", rule, True),
+          ("Receipts.\n\nRing me for the big ones.\n\n" + FILING
+           + "\n\nUnless the note above says otherwise: ring me.", True))
+    check("place: on ours, the line deleted: a filing note's words alone, the line never added again",
+          mt.place("Receipts: file them.", second, True), ("Receipts: file them.\n\nInvoices too: file them.", True))
+    # On anyone else a line that opens like it is the user's own text: the
+    # words go after it, and a filing note adds the real line.
+    for label, line in (("edited", edited),
+                        ("own", "Unless the note above says otherwise: answer the same day.")):
+        check(f"place: not ours, a line of hers that opens like a {label} default: a rule after it",
+              mt.place("Never call me.\n\n" + line, rule),
+              ("Never call me.\n\n" + line + "\n\nRing me for the big ones.", True))
+        check(f"place: not ours, a line of hers that opens like a {label} default: a filing note after it, "
+              "the real line last",
+              mt.place("Never call me.\n\n" + line, second),
+              (filed("Never call me.", line, "Invoices too: file them."), True))
+    check("place: not ours, her opening paragraph first, the real line later: in front of the real line",
+          mt.place("Unless the note above says otherwise: ring me at once.\n\nReceipts.\n\n" + FILING, second),
+          (filed("Unless the note above says otherwise: ring me at once.", "Receipts.", "Invoices too: file them."),
+           True))
     tight = "z" * (contacts.INSTRUCTION_MAX - len(edited) - len(second["instruction"]) - 4)
     check("place: in front of an edited default, at the limit: it fits",
-          mt.place(tight + "\n\n" + edited, second),
+          mt.place(tight + "\n\n" + edited, second, True),
           (tight + "\n\nInvoices too: file them.\n\n" + edited, True))
-    check("place: and one character over: nothing is cut", mt.place("z" + tight + "\n\n" + edited, second), None)
+    check("place: and one character over: nothing is cut", mt.place("z" + tight + "\n\n" + edited, second, True), None)
     check("place: words already there change nothing", mt.place(filed("Receipts: file them."), second | {
         "instruction": "Receipts: file them."}), (filed("Receipts: file them."), False))
     # The limit is that of the instruction the note is placed on: where the
@@ -2212,35 +2259,132 @@ def test_a_written_rule_is_not_placed_again():
 def test_a_later_note_and_the_users_filing_line():
     print("test_a_later_note_and_the_users_filing_line")
     # A note the first run left alone is placed by a later one, after the
-    # user edited the filing line or also moved it: the line is theirs, known
-    # by its opening — the note goes in front of it, alone, and the line is
-    # never added a second time (nor does what they deleted from it return).
+    # user edited the filing line, moved it, or joined it to their words by a
+    # single newline or a lone CR: on a person the migration gave the line
+    # (its journal says so), the line is theirs, known by its opening at the
+    # start of any line — the note goes in front of it, alone, and the line
+    # is never added a second time (nor does what they deleted from it return).
     edited = "Unless the note above says otherwise: file the document with the Archivist, then archive the mail."
-    for moved in (False, True):
+
+    def flags(w):
+        return sorted(c.get("filing") for e in w.marker()["memories"]["entries"].values()
+                      for c in e.get("contacts") or [])
+
+    for how in ("below", "moved", "single newline", "lone CR"):
         with world() as w:
             w.book().create("private", "Shop", [("email", "s@example.org")])
             w.remember("Shop receipts: file them.", "sender:s@example.org")
             w.remember("Shop invoices: file those too.", "sender:s@example.org")
             w.answers = by_text({"receipts": "filing"})
             rc, _ = w.report()
-            check(f"the first run places the receipts note and the line (moved={moved})",
-                  (rc, w.people()["Shop"]["instruction"]), (0, filed("Shop receipts: file them.")))
-            own = (f"{edited}\n\nShop receipts: file them." if moved
-                   else f"Shop receipts: file them.\n\n{edited}")
+            check(f"the first run places the receipts note and the line ({how})",
+                  (rc, w.people()["Shop"]["instruction"], flags(w)), (0, filed("Shop receipts: file them."), [True]))
+            sep = {"single newline": "\n", "lone CR": "\r"}.get(how, "\n\n")
+            own = (f"{edited}\n\nShop receipts: file them." if how == "moved"
+                   else f"Shop receipts: file them.{sep}{edited}")
             w.book().update(w.people()["Shop"]["key"], instruction=own)
+            check(f"the contact keeps the user's line ends ({how})", w.people()["Shop"]["instruction"], own)
             w.answers = by_text({"receipts": "filing", "invoices": "filing"})
             before = w.tree()
             w.run("--dry-run", "--step", "memories")
-            check(f"a dry run of it writes nothing (moved={moved})", w.tree(), before)
+            check(f"a dry run of it writes nothing ({how})", w.tree(), before)
             rc, report = w.report("--step", "memories")
-            want = (f"Shop invoices: file those too.\n\n{edited}\n\nShop receipts: file them." if moved
+            want = (f"Shop invoices: file those too.\n\n{edited}\n\nShop receipts: file them." if how == "moved"
                     else f"Shop receipts: file them.\n\nShop invoices: file those too.\n\n{edited}")
-            check(f"the later note goes in front of the user's line, which stands once (moved={moved})",
+            check(f"the later note goes in front of the user's line, which stands once ({how})",
                   (rc, w.people()["Shop"]["instruction"]), (0, want))
-            check(f"and the person is counted as carrying the filing default (moved={moved})",
-                  report["briefed"]["filing"], 1)
+            check(f"and the person is counted as carrying the filing default ({how})",
+                  (report["briefed"]["filing"], flags(w)), (1, [True, True]))
             rc, _ = w.report("--step", "memories")
-            check(f"once more: nothing changes (moved={moved})",
+            check(f"once more: nothing changes ({how})",
+                  (rc, w.people()["Shop"]["instruction"]), (0, want))
+
+    # The line the user deleted from a person the migration gave it is never
+    # added again: a later filing note goes on in its own words alone, the
+    # journal records that no default stands, and the report does not count
+    # the person. Also where the run is killed between any two of its writes.
+    def deleted_world(w):
+        w.book().create("private", "Shop", [("email", "s@example.org")])
+        w.remember("Shop receipts: file them.", "sender:s@example.org")
+        w.remember("Shop invoices: file those too.", "sender:s@example.org")
+        w.answers = by_text({"receipts": "filing"})
+        w.report()
+        w.book().update(w.people()["Shop"]["key"], instruction="Shop receipts: file them.")
+        w.answers = by_text({"receipts": "filing", "invoices": "filing"})
+
+    deleted = "Shop receipts: file them.\n\nShop invoices: file those too."
+    with world() as w:
+        deleted_world(w)
+        before = w.tree()
+        w.run("--dry-run", "--step", "memories")
+        check("the line deleted: a dry run writes nothing", w.tree(), before)
+        writes = []
+        mt._checkpoint = writes.append
+        rc, report = w.report("--step", "memories")
+        mt._checkpoint = lambda label: None
+        check("the line deleted: a later filing note's words alone, the line not added again",
+              (rc, w.people()["Shop"]["instruction"]), (0, deleted))
+        check("the line deleted: the journal says no default stands, the report counts nobody",
+              (flags(w), report["briefed"]["filing"]), ([False, True], 0))
+        rc, report = w.report()
+        check("the line deleted: once more, nothing changes",
+              (rc, w.people()["Shop"]["instruction"], report["briefed"]["filing"]), (0, deleted, 0))
+    bad = []
+    for n in range(1, len(writes) + 1):
+        with world() as w:
+            deleted_world(w)
+            seen = []
+
+            def die(label, n=n, seen=seen):
+                seen.append(label)
+                if len(seen) == n:
+                    raise Kill(label)
+            mt._checkpoint = die
+            try:
+                w.run("--step", "memories")
+                bad.append((n, "was not killed"))
+                continue
+            except Kill:
+                pass
+            finally:
+                mt._checkpoint = lambda label: None
+            rc, report = w.report("--step", "memories")
+            got = (rc, w.people()["Shop"]["instruction"], report["briefed"]["filing"])
+            if got != (0, deleted, 0):
+                bad.append((n, writes[n - 1], got))
+    check(f"the line deleted, killed after each of {len(writes)} writes: the rerun never adds it again",
+          bad, [])
+
+    # A paragraph of the user's own that begins with the line's opening, on
+    # a person the migration never gave the line, is the user's text: the
+    # note goes after it and the real line is added; the journal and the
+    # report say the default stands. Later notes go in front of the real
+    # line, never in front of the user's paragraph.
+    theirs = "Never call me about them.\n\nUnless the note above says otherwise: answer the same day."
+    for sep in ("\n\n", "\n"):
+        mine = theirs.replace("\n\n", sep)
+        with world() as w:
+            w.book().create("private", "Shop", [("email", "s@example.org")], instruction=mine)
+            w.remember("Shop receipts: file them.", "sender:s@example.org")
+            w.remember("Shop invoices: file those too.", "sender:s@example.org")
+            w.remember("Shop: ring me for the big ones.", "sender:s@example.org")
+            w.answers = by_text({"receipts": "filing"})
+            before = w.tree()
+            w.run("--dry-run")
+            check(f"the user's own opening ({sep!r}): a dry run writes nothing", w.tree(), before)
+            rc, report = w.report()
+            check(f"the user's own opening ({sep!r}): their text stays first, whole; the note and the real line after",
+                  (rc, w.people()["Shop"]["instruction"]), (0, filed(mine, "Shop receipts: file them.")))
+            check(f"the user's own opening ({sep!r}): the journal and the report say the default stands",
+                  (flags(w), report["briefed"]["filing"]), ([True], 1))
+            w.answers = by_text({"receipts": "filing", "invoices": "filing", "big ones": "rule"})
+            rc, report = w.report("--step", "memories")
+            want = filed(mine, "Shop receipts: file them.", "Shop invoices: file those too.",
+                         "Shop: ring me for the big ones.")
+            check(f"the user's own opening ({sep!r}): later notes go in front of the real line",
+                  (rc, w.people()["Shop"]["instruction"], report["briefed"]["filing"]), (0, want, 1))
+            rc, _ = w.report()
+            check(f"the user's own opening ({sep!r}): once more, nothing changes",
                   (rc, w.people()["Shop"]["instruction"]), (0, want))
 
 
