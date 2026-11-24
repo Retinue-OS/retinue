@@ -381,7 +381,8 @@ minutes, and what it does not get to waits for the next — a mail that took
 too long to read takes that long again), and takes its placeholder's place
 when it reads — that mail, and no other: the placeholder's record keeps the
 header block of the copy it was made from, and only a mail with that very
-header block replaces it, wherever it lies by then. A mail that merely
+header block replaces it, wherever it lies by then (and is owed the rail
+what the placeholder was: *The gate*, "As built"). A mail that merely
 arrives under a placeholder's `Message-ID` replaces nothing, whether it can
 be read or not; ids are their sender's to choose. While the placeholder
 stands it is set apart as another mail's: the placeholder is never read
@@ -465,7 +466,8 @@ not have it). A match whose header block does not come back counts as From
 nobody and comes last; it holds up nothing where the first is known to be
 the record's — a Sent copy, or one From the row's sender received when the
 row said (in the archive, for a row that said the mail was the user's).
-That one mail is read as any mail is read the first time where it lies —
+That one mail is read as old mail — told to the rail, never offered: it was
+heard of before — and as any mail is read the first time where it lies —
 what a Sent copy holds is the user's, what is in the archive the user's when
 it is from one of the user's own addresses and left Sent unseen — with one
 difference: in the archive, From that very sender and received when the row
@@ -561,7 +563,7 @@ channels:
 |---|---|
 | `kb:subject` | the mail's own subject, decoded |
 | `kb:senderName` | the display name on `From` |
-| `kb:gateSender` | inbound: the address the gate takes the mail to be from (*The gate*, "Who the sender is") — absent when it has none, a header block cut at its bound included |
+| `kb:gateSender` | inbound: the address the gate takes the mail to be from (*The gate*, "Who the sender is") — absent when it has none, a header block cut at its bound included, and on a placeholder (*The gate*, "As built") |
 | `kb:recipient` (multi) | `To` addresses |
 | `kb:cc` (multi) | `Cc` addresses |
 | `kb:inReplyTo` | the parent's id |
@@ -1235,7 +1237,21 @@ listed under Unread and judged by nobody.
   the rail had taken it — one that left while still owed keeps that on its
   tombstone and is offered when it comes back — and the user's own mail is
   never owed. With no chats rail configured every mail is written delivered:
-  nobody is there to take it.
+  nobody is there to take it. **A record written again** (*The mirror*: a
+  placeholder that reads, under its own id or under the one of its bytes it
+  was on record by) is owed what the record it replaces was owed, and no
+  more: offered, with its gate sender, if the chat had not taken the
+  placeholder yet; told once, as old mail, if it had — never offered twice.
+  **A placeholder is from nobody** (no `kb:gateSender`, `gate_sender` empty on
+  the rail, whatever its header block names): it reaches its chat and buys no
+  turn — a turn would work a mail it cannot read, and its done would deliver
+  the mail. So a VIP's mail that arrived unreadable is worked once it reads
+  only if its placeholder was still owed then. **The mail of a lost record**
+  (one the ledger lost, found again by its `Message-ID`) is told as old mail,
+  never offered: it was heard of before. A copy of the user's own send under
+  the id its provider gave it is that send, told under the id the gateway
+  minted; a stranger's mail under that id is a mail of its own, offered like
+  any that arrives.
 - **The verdict** is asked when the offer is made, not when the mail arrived,
   so a mail that waited is judged by the policy as it stands: `gate =
   {"forward": not (quieted or ignored), "vip", "instructed", "reason"}`. The

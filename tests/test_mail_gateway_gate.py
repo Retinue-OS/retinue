@@ -2376,7 +2376,8 @@ def test_an_older_index_is_upgraded_column_by_column():
             ", queued INTEGER NOT NULL DEFAULT 0\n)", 1).replace(
             ", removed INTEGER NOT NULL DEFAULT 0, arrived REAL\n)",
             ", removed INTEGER NOT NULL DEFAULT 0\n)", 1)
-        assert older.count("failed") == 0 and "arrived" not in older
+        mails_table = older.split("CREATE TABLE IF NOT EXISTS mails (", 1)[1].split(";", 1)[0]
+        assert older.count("failed") == 0 and "arrived" not in mails_table
         # An index made before the columns, and one whose upgrade stopped
         # after each of them (every ALTER commits by itself).
         for done in range(len(columns) + 1):
@@ -2397,7 +2398,38 @@ def test_an_older_index_is_upgraded_column_by_column():
                 assert index.one("SELECT failed FROM offers")["failed"] is None
                 assert "arrived" in {r["name"] for r in index.rows("PRAGMA table_info(mails)")}
                 index.close()
-    print("ok: an older index gains each column on its own test, also after a stop between two")
+        # And the index of the mirror without the gate (the writing phase,
+        # with the reader's `lost` hints, the aliases, the settling and the
+        # note of a move under way): no offers, no news, an outbox of three
+        # columns — opened as it is, its rows kept, and with no take on
+        # record (what it took is not known: Mirror.health_notice).
+        cut = gw._INDEX_SCHEMA.split("CREATE TABLE IF NOT EXISTS outbox (", 1)[0]
+        writing = cut + ("CREATE TABLE IF NOT EXISTS outbox (\n    seq INTEGER PRIMARY KEY "
+                         "AUTOINCREMENT, kind TEXT NOT NULL, payload TEXT NOT NULL\n);\n")
+        assert "offers" not in writing and "news" not in writing and "lost" in writing
+        path = Path(tmp) / "writing.sqlite"
+        conn = gw.sqlite3.connect(str(path), isolation_level=None)
+        conn.executescript(writing)
+        conn.execute("PRAGMA user_version = 1")
+        conn.execute("INSERT INTO mails (message_id, record, direction, chat, ts, arrived) "
+                     "VALUES ('a@x.org', 'r.nt', 'in', 'a@x.org', 1.0, 1.0)")
+        conn.execute("INSERT INTO lost (message_id, chat, noticed) VALUES ('b@x.org', 'a@x.org', 1)")
+        conn.execute("INSERT INTO aliases VALUES ('p@provider.example', 'm@x.org')")
+        conn.execute("INSERT INTO meta VALUES ('moving', '{}')")
+        conn.execute("INSERT INTO outbox (kind, payload) VALUES ('removed', '{}')")
+        conn.close()
+        for _start in range(2):
+            index = gw.MailboxIndex(path)
+            assert index.one("SELECT COUNT(*) AS n FROM offers")["n"] == 0
+            assert index.one("SELECT COUNT(*) AS n FROM news")["n"] == 0
+            assert [dict(r) for r in index.rows("SELECT kind, attempts, due, failed FROM outbox")] \
+                == [{"kind": "removed", "attempts": 0, "due": 0.0, "failed": None}]
+            assert index.one("SELECT chat FROM lost")["chat"] == "a@x.org"
+            assert index.get("moving") == "{}" and index.get("rail_took") is None
+            assert index.one("SELECT message_id FROM aliases")["message_id"] == "m@x.org"
+            index.close()
+    print("ok: an older index gains each column on its own test, also after a stop between "
+          "two — and one of the mirror before the gate opens as it is")
 
 
 def test_a_rail_that_takes_no_mail_says_so_and_is_bounded():
@@ -2616,6 +2648,254 @@ def test_the_retired_news_names_are_read_as_fallbacks():
         assert gw.MAIL_NEWS_FOLDER == "New" and gw.MAIL_NEWS_EXCERPT_CHARS == 300
     print("ok: TRIAGE_NEWS_FOLDER / TRIAGE_NEWS_EXCERPT_CHARS are read where the new "
           "names are not set")
+
+
+# --------------------------------------------------------------------------
+# The gate on the mirror's own mechanisms: a record written again in its
+# place, a record lost from the ledger, a provider's id, a move followed
+# --------------------------------------------------------------------------
+
+def _vip_turns(payload):
+    """What the rail answers a mail the test lets the chat take: a VIP's is
+    taken by a turn (a job), anyone else's plainly."""
+    if payload["gate"]["vip"]:
+        return {"accepted": True, "job_url": f"/jobs/{payload['message_id']}"}
+    return {"accepted": True}
+
+
+def test_a_placeholder_buys_no_turn_and_its_reading_is_offered_only_if_owed():
+    with tempfile.TemporaryDirectory() as tmp:
+        gw = t.load(tmp)
+        flags(gw)
+        senders(gw, vip={"boss@corp.example"})
+        jobs = FakeJobs(gw)
+        take = {"taken@x.org"}
+        events = t.rail(gw, answer=lambda p: _vip_turns(p) if p["message_id"] in take else {})
+        mirror, box, clock = begin(gw)
+        real_trim = gw._trim.trim
+        broken = {"owed", "taken"}
+
+        def trim(plain, html, subject=None, **evidence):
+            if subject in broken:
+                raise RecursionError("this mail, for now")
+            return real_trim(plain, html, subject=subject, **evidence)
+        gw._trim.trim = trim
+        try:
+            box.put("INBOX", msg("owed@x.org", sender="boss@corp.example", subject="owed",
+                                 body="The real words.\n", day=39))
+            box.put("INBOX", msg("taken@x.org", sender="boss@corp.example", subject="taken",
+                                 body="Other words.\n", day=39))
+            mirror.poll()
+            # Two placeholders, each offered as it arrived — from nobody: a
+            # turn would work a mail it cannot read, and its done would
+            # deliver it. The chat takes one of them, plainly.
+            first = {p["message_id"]: p for _k, p in events}
+            for mid in ("owed@x.org", "taken@x.org"):
+                assert first[mid]["handover"] is True and first[mid]["gate"] == OPEN, first[mid]
+                assert first[mid]["gate_sender"] == "" and "files" not in first[mid]
+                assert t.by_id(gw)[mid]["gate_sender"] is None
+            assert jobs.asked == [] and sorted(offers(mirror)) == ["owed@x.org"]
+            # Read at last, each record written in its placeholder's place:
+            # the one still owed is offered — by its gate sender now, so a
+            # turn works it — and the one the chat took is told, once, as
+            # old mail: no second offer, no turn.
+            broken.clear()
+            events.clear()
+            take.add("owed@x.org")
+            clock[0] += gw.SET_ASIDE_RETRY_SECONDS
+            mirror.poll()
+            assert offered(events) == ["owed@x.org"], events
+            told = [p for _k, p in events if p["message_id"] == "taken@x.org"]
+            assert len(told) == 1 and told[0].get("backfill") is True
+            assert "handover" not in told[0] and told[0]["text"] == "Other words."
+            owed = [p for _k, p in events if p["message_id"] == "owed@x.org"][-1]
+            assert owed["gate"]["vip"] is True and owed["gate_sender"] == "boss@corp.example"
+            assert [job.url for job in jobs.asked] == ["http://rail.invalid/jobs/owed@x.org"]
+            assert t.by_id(gw)["owed@x.org"]["delivered"] is False
+            jobs.asked[0].done()
+            assert t.by_id(gw)["owed@x.org"]["delivered"] is True and offers(mirror) == {}
+            for _ in range(3):
+                clock[0] += gw.SET_ASIDE_RETRY_SECONDS
+                mirror.poll()
+            assert offered(events) == ["owed@x.org"] and len(jobs.asked) == 1
+            assert [r["text"] for r in t.records(gw)].count(gw.UNREADABLE_TEXT) == 0
+        finally:
+            gw._trim.trim = real_trim
+            jobs.restore()
+    print("ok: a placeholder is offered from nobody; its reading is offered, and worked, only "
+          "if it was still owed — else told once")
+
+
+def test_a_placeholder_read_under_another_id_is_owed_what_it_was():
+    with tempfile.TemporaryDirectory() as tmp:
+        gw = t.load(tmp)
+        flags(gw)
+        senders(gw, vip={"boss@corp.example"})
+        take = {"taken@x.org"}
+        events = t.rail(gw, answer=lambda p: {"accepted": True} if p["message_id"] in take
+                        else {})
+        mirror, box, clock = begin(gw)
+        raws = {mid: msg(mid, sender="boss@corp.example", subject=mid, day=39)
+                for mid in ("owed@x.org", "taken@x.org")}
+        bare = {mid: gw._bare_id(gw._head_of(raw)) for mid, raw in raws.items()}
+        take.add(bare["taken@x.org"])
+        real_reading, real_stub = gw._reading, gw.stub_mail
+
+        def reading(data, date):
+            if b"boss@corp.example" in data:
+                raise ValueError("not this moment")
+            return real_reading(data, date)
+
+        def stub(head, date, reason):
+            if b"boss@corp.example" in head:
+                raise ValueError("not even its header block")
+            return real_stub(head, date, reason)
+        gw._reading, gw.stub_mail = reading, stub
+        try:
+            for raw in raws.values():
+                box.put("INBOX", raw)
+            mirror.poll()
+        finally:
+            gw._reading, gw.stub_mail = real_reading, real_stub
+        # Not even the header blocks read: each a placeholder under an id of
+        # its bytes, offered from nobody. The chat takes the one, not the
+        # other.
+        assert sorted(r["message_id"] for r in t.records(gw)) == sorted(bare.values())
+        assert sorted(offers(mirror)) == [bare["owed@x.org"]]
+        assert all(p["gate_sender"] == "" for _k, p in events)
+        events.clear()
+        take = {"owed@x.org", "taken@x.org"}
+        clock[0] += gw.SET_ASIDE_RETRY_SECONDS
+        mirror.poll()
+        # Read at last, under their own ids, each in its placeholder's
+        # stead (which is buried): the one still owed is offered under its
+        # own id, by the gate; the one the chat took is told, not offered.
+        records = {mid: r for mid, r in t.by_id(gw).items() if not r["removed_at"]}
+        assert sorted(records) == ["owed@x.org", "taken@x.org"], sorted(records)
+        assert offered(events) == ["owed@x.org"], events
+        owed = [p for _k, p in events if p.get("message_id") == "owed@x.org"][-1]
+        assert owed["gate"]["vip"] is True and owed["gate_sender"] == "boss@corp.example"
+        taken = [p for _k, p in events if p.get("message_id") == "taken@x.org"]
+        assert len(taken) == 1 and "handover" not in taken[0], taken
+        assert sorted(p["message_ids"][0] for k, p in events if k == "removed") \
+            == sorted(bare.values())
+        assert all(r["delivered"] is True for r in records.values()) and offers(mirror) == {}
+    print("ok: a placeholder under an id of its bytes, read under its own, is owed what it was")
+
+
+def test_a_lost_records_mail_comes_back_told_and_rings_no_second_time():
+    with tempfile.TemporaryDirectory() as tmp:
+        gw = t.load(tmp)
+        flags(gw)
+        senders(gw, vip={"boss@corp.example"})
+        events = t.rail(gw)
+        mirror, box, clock = begin(gw)
+        box.put("INBOX", msg("v@x.org", sender="boss@corp.example", day=39))
+        mirror.poll()
+        assert offered(events) == ["v@x.org"] and t.by_id(gw)["v@x.org"]["delivered"] is True
+        # The ledger restored from a backup without the record: the index
+        # keeps what the row said as hints, and the mail is looked for by
+        # its Message-ID — found, it is the mail it was, already heard of.
+        for path, fields in list(gw._ibstore.iter_records(gw.INBOUND_STORE_DIR)):
+            path.unlink()
+        mirror.index.close()
+        mirror.threads.close()
+        mirror = again(gw, box, clock)
+        assert mirror.lost() == 1
+        events.clear()
+        for _ in range(3):
+            clock[0] += 61
+            mirror.poll()
+        assert mirror.lost() == 0 and t.by_id(gw)["v@x.org"]["delivered"] is True
+        assert offered(events) == [], events
+        told = [p for kind, p in events if kind == "inbound"]
+        assert len(told) == 1 and told[0]["backfill"] is True and told[0]["gate"] == HELD
+        assert offers(mirror) == {}
+    print("ok: a lost record's mail found again is told as old mail, not offered a second time")
+
+
+def test_a_strangers_mail_under_a_sends_provider_id_is_an_ordinary_arrival():
+    spec = importlib.util.spec_from_file_location("mail_gateway_send_helpers",
+                                                  HERE / "test_mail_gateway_send.py")
+    s = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(s)
+    for how in ("a stranger's mail", "the copy moved out and back"):
+        w = s.world(save_sent=False)
+        try:
+            gw, box, mirror = w.gw, w.box, w.mirror
+            M, P, _raw, uid = s._rewritten_send(w)
+            before = len(w.events)
+            if how == "a stranger's mail":
+                box.put("INBOX", t.msg(P, sender="Mallory <m@evil.org>", subject="Re: Plans",
+                                       body="Not the user's.\n", day=s.later(60)))
+            else:
+                uid = box.move_mail("Sent", uid, "Archive")
+                mirror.poll()
+                mirror.poll()
+                box.move_mail("Archive", uid, "Sent")
+            for _ in range(3):
+                mirror.poll()
+            after = w.events[before:]
+            if how == "a stranger's mail":
+                # Its own record under the provider's id, offered as any mail
+                # that arrives — by its own From.
+                assert offered(after) == [P], after
+                offer = [p for _k, p in after if p.get("handover")][0]
+                assert offer["direction"] == "in" and offer["gate_sender"] == "m@evil.org"
+                assert t.by_id(gw)[P]["delivered"] is True
+            else:
+                # The send's own copy: one more place of the send, under the id
+                # the gateway minted — nothing offered, nothing under P.
+                assert offered(after) == [] and P not in t.by_id(gw)
+                assert all(p["message_id"] == M for k, p in after if k == "inbound"), after
+            assert t.by_id(gw)[M]["author"] == "user" and offers(mirror) == {}
+        finally:
+            s.done(w)
+    print("ok: a stranger's mail under a send's provider id is offered as its own; the send's "
+          "copy is offered nothing")
+
+
+def test_a_mail_whose_move_is_not_told_stays_owed_and_is_buried_once():
+    with tempfile.TemporaryDirectory() as tmp:
+        gw = t.load(tmp)
+        flags(gw)
+        events = t.rail(gw, answer={})
+        mirror, box, clock = begin(gw)
+        box.can_expunge, box.names_uids = False, False
+        box.put("INBOX", msg("a@x.org", day=39))
+        mirror.poll()
+        assert sorted(offers(mirror)) == ["a@x.org"]
+        # Archived on a server with neither MOVE nor UIDPLUS, which names no
+        # UID — and whose archive cannot say just then where the copy is:
+        # its only place is the leftover, and it settles.
+        real_find = box.find
+        box.find = lambda folder, message_id: gw.Matches((), False)
+        try:
+            assert mirror.archive("a@x.org") == {"moved": 1, "flagged": 1}
+        finally:
+            box.find = real_find
+        assert mirror.index.one("SELECT 1 FROM settling WHERE message_id = 'a@x.org'")
+        events.clear()
+        for _ in range(3):
+            clock[0] += gw.RETRY_MAX_SECONDS
+            mirror.poll()
+        # Looked for, found — and all the while no removal is told, and the
+        # mail is still owed, and offered again.
+        assert [k for k, _p in events if k == "removed"] == []
+        assert not t.by_id(gw)["a@x.org"]["removed_at"] and sorted(offers(mirror)) == ["a@x.org"]
+        assert offered(events) and set(offered(events)) == {"a@x.org"}
+        # Gone from every folder: buried, told once, and owed to nobody.
+        box.remove("Archive", box.uid_of("Archive", "a@x.org"))
+        box.remove("INBOX", box.uid_of("INBOX", "a@x.org"))
+        events.clear()
+        for _ in range(3):
+            clock[0] += gw.RETRY_MAX_SECONDS
+            mirror.poll()
+        removed = [p for k, p in events if k == "removed"]
+        assert [p["message_ids"] for p in removed] == [["a@x.org"]], removed
+        assert offers(mirror) == {} and offered(events) == []
+        assert t.by_id(gw)["a@x.org"]["removed_at"]
+    print("ok: a mail whose move was not told is looked for, owed, and told gone once buried")
 
 
 def main():

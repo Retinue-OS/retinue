@@ -2337,6 +2337,13 @@ def read_stub(raw: bytes, internal_date: float | None, reason: str, *,
         mail = _read_guarded(lambda seconds: READER.stub(head, internal_date, seconds),
                              lambda: stub_mail(head, internal_date, reason))
         mail.unreadable = reason
+        # The block was cut to its bound before it was handed on: whether it
+        # had to be is known only here, and a cut block names nobody for the
+        # gate (_gate_sender) — on the group axis either, which is all a
+        # placeholder's gate sender is asked for (Mirror._write).
+        end = _HEADER_END_RE.search(raw)
+        if (end.start() if end else len(raw)) > MAX_HEADER_BYTES:
+            mail.gate_sender = ""
         return mail
     except (UnreadableMail, NotRead) as exc:
         if isinstance(exc, NotRead) and not go_on:
@@ -3121,7 +3128,9 @@ class Mailbox:
 #              has no record of its own ("news"; "draft", in the archive;
 #              "other" for a mail that came under the id of a placeholder
 #              and is not the copy that was made from — Mirror._mirror_one),
-#              so it is not read again. "moved" marks a copy the gateway
+#              so it is not read again — but for "news-unread", a news mail
+#              that could not be read, which the placeholders' reading again
+#              comes back to (Mirror._retry_set_aside). "moved" marks a copy the gateway
 #              moved on and the server kept (flagged \Deleted, no way to
 #              expunge exactly it): still a place of the mail, never one to
 #              move or flag again. "again" is the opposite of the first
@@ -3568,7 +3577,11 @@ def _environment(exc: BaseException) -> bool:
 #       whose Sent copy shows, a tombstone whose mail is back) is written in
 #       its own place, in one rename (Mirror._write): wherever that stops
 #       or fails, the mail is the record it was, followed and tombstoned
-#       like any, and read again later. Nothing is dropped first, so no row
+#       like any, and read again later. (What the rail is owed goes with
+#       the record: the one written again is owed what the one it replaces
+#       was — offered if that was still owed, told if its chat had taken it
+#       — and a placeholder is offered from nobody, so no turn works it;
+#       Mirror._mirror_one, Mirror._write.) Nothing is dropped first, so no row
 #       ever stands for a mail in a record's stead — and what a row knows
 #       without a record is no knowledge: a row whose record is gone from
 #       the ledger goes, with its places, and what it said (id, sender,
@@ -3586,7 +3599,8 @@ def _environment(exc: BaseException) -> bool:
 #       when the record said (Mirror._read_lost, Mirror._read_found). A
 #       mail that cannot be told yet stays looked for, and /health counts
 #       it — LOST_TRIES times at most; then what is found is read as mail
-#       nothing is known of. Nothing else is carried over to whatever mail
+#       nothing is known of. (Read as old mail, either way: told to the
+#       rail, never offered — it was heard of before its record was lost.) Nothing else is carried over to whatever mail
 #       is found under its id. The limits, as they stand: while the archive
 #       does not answer, every lost id waits (/health says the archive does
 #       not answer, and counts them); an id whose mail is in no folder, or
@@ -3638,7 +3652,8 @@ def _environment(exc: BaseException) -> bool:
 # mail's place again, Mirror._whereabouts; a mail whose only place it is
 # while it settles is looked for again, Mirror._settle_unlocated); a UID
 # with no record of its own ("news", "draft", and "other" beside a
-# placeholder); a UID to be read with nothing known of it ("again": what lay
+# placeholder — and "news-unread": a news mail that did not read, read again
+# with the placeholders, Mirror._retry_set_aside); a UID to be read with nothing known of it ("again": what lay
 # beside a placeholder that is gone, an older build's "unreadable"). An id in
 # `lost` is no state of a row or of a UID: it is a mail to be looked for.
 
@@ -4332,7 +4347,10 @@ class Mirror:
                 more = (self._read_noted(policy, backfill_limit)
                         or self._retry_set_aside(policy, backfill_limit)
                         or self._backfill(policy, backfill_limit))
-            if self._read:
+            if work and self._read:
+                # (With the rest of the work: filing and moving news is not
+                # following the folders, and a fault in it must not hold
+                # that back — I4.)
                 self._file_news(NEWS_BATCH)
             if rail_up and self._flush_rail():
                 # And the mails that were offered before and not taken.
