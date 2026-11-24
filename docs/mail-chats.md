@@ -911,10 +911,11 @@ decided by the web gateway, not by the turn's cooperation:
 - a call carrying the token the turn's session was handed
   (`RETINUE_ARRIVAL_TURN`, which `scripts/chat-flags.py` sends) is the turn's
   where that turn runs on the chat named, and is refused (403) anywhere else;
-- a call carrying the proof a dashboard thread's turn is handed — the user's
-  own conversation with Ara (`RETINUE_USER_TURN`, sent too; valid while that
-  turn runs) — has the user's meaning, a mute included, even while a turn
-  runs on the thread;
+- a call carrying the proof a dashboard thread's turn is handed — a turn the
+  user started by a message sent from the dashboard itself, not one a message
+  posted from inside the container started (`RETINUE_USER_TURN`, sent too;
+  valid while that turn runs) — has the user's meaning, a mute included, even
+  while a turn runs on the thread;
 - a call carrying neither, on a mail thread while a mail's turn runs on it,
   is taken as that turn's, and the answer says why (`a turn is running on
   this chat; …`), so that a scheduled job or another session asks again once

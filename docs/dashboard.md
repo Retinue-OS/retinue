@@ -1457,9 +1457,12 @@ adopts). What the web gateway does with the event, by who sent the mail:
 - **Who is asking** is the web gateway's to decide, not the turn's
   cooperation. It hands each arrival turn's session a token of its own
   (`RETINUE_ARRIVAL_TURN`, one of the turn's unguessable job ids), and each
-  session of a dashboard thread's turn — the user's own conversation with
-  Ara, never an arrival's or a scheduled job's — a proof of that
-  (`RETINUE_USER_TURN`, minted per turn and valid while it runs); both are
+  session of a dashboard thread's turn the user started — by a message
+  sent from the dashboard itself (`via_edge`, the rule that decides who may
+  type), never an arrival's or a scheduled job's turn, and never one a
+  "user" message posted from inside the container started — a proof of that
+  (`RETINUE_USER_TURN`, minted per turn and valid while it runs and answers
+  the user's own message); both are
   set per spawn by `scripts/session_env.py` and never inherited, so a
   session another one spawns carries neither. `scripts/chat-flags.py` sends
   them as `X-Arrival-Turn` and `X-User-Turn`. In this order:

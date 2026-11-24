@@ -605,9 +605,15 @@ def test_only_a_dashboard_turn_holds_the_users_word(wg):
             arrival = wg._new_conv("user", "reto", "c", "user", "companion")
             assert wg._conv_worker(arrival["id"], f"conv:{arrival['id']}", push=False,
                                    arrival="A mail arrived.", arrival_turn="f" * 32)
+            # A "user" message posted from inside the container (an agent's
+            # push, an arrival turn's own) starts a thread turn too — but not
+            # one that speaks for the user: no proof.
+            posted = wg._new_conv("user", "reto", "p", "user", "mute that thread")
+            assert wg._conv_worker(posted["id"], f"conv:{posted['id']}", push=False)
         finally:
             os.environ.pop("RETINUE_USER_TURN", None)
-    (users, proof, valid), (turns, none, _v) = seen
+    (users, proof, valid), (turns, none, _v), (inside, unproven, _w) = seen
+    assert unproven is None and "RETINUE_ARRIVAL_TURN" not in inside, inside
     assert proof and proof != "inherited-proof" and valid, (proof, valid)
     assert not wg._user_turn_valid(proof), "the proof outlived its turn"
     assert "RETINUE_ARRIVAL_TURN" not in users

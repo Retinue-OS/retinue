@@ -5142,12 +5142,17 @@ def _conv_worker(cid: str, session_key: str, *, arrival: str | None = None,
             # longer type, though the dashboard message it started for is
             # still covered (and answered, without typing).
             typing_ok[0] = typing_ok[0] and _conv_turn_may_type(msgs, arrival)
+            if not typing_ok[0]:
+                # Nor does it speak for the user any more (decision AK).
+                _user_turn_end(user_turn)
             return _conv_engage_prompt(current, fresh_now, arrival)
 
-        # A dashboard thread's turn — never an arrival's — carries the proof
+        # A turn the user started from the dashboard — never an arrival's, and
+        # never one a "user" message posted from inside the container started
+        # (the rule that decides who may type, `may_type`) — carries the proof
         # that a flags call of its sessions is on the user's word, for as
-        # long as it runs.
-        user_turn = None if arrival or arrival_turn else _user_turn_begin()
+        # long as it runs and answers the user's own message.
+        user_turn = _user_turn_begin() if may_type and not arrival_turn else None
         try:
             result = send_message(prompt, display_question=latest, session_key=session_key,
                                   model=chosen, restart_message=None,
