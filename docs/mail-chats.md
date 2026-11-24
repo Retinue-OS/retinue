@@ -499,14 +499,22 @@ falls back to the untrimmed text: a bubble is never blank because the trim was
 greedy.
 
 **What one mail may cost is bounded**, like everything else it controls — the
-mirror has one thread for all of them. The trim works on at most 10,000 lines
-and 500,000 characters of text, and runs over them a fixed number of times
-(four passes a reading, four readings a mail); a longer text is not trimmed
-and is recorded as it came, `wanting`. Of an HTML part the first 1,000,000
-characters of markup are parsed: beside a plain part a longer one is not
-consulted, and where it is the mail's only text the bubble ends where the
-reading did, on a line `[…]` — *Original* shows all of it. Within those
-bounds the cost is linear in the size of the mail, for hostile mail too.
+mirror has one thread for all of them. The bounds are on the work, not on how
+long a mail may be: a short reply above megabytes of thread, a log sent in
+answer, a digest are ordinary mail and are trimmed to their own text. The
+trim runs over a text a fixed number of times (four passes a reading, four
+readings a mail). Lines it finds to be quoted history it skips, at next to no
+cost; every other line it reads closely, and one reading reads at most 50,000
+of them and 4,000,000 characters, counted once per pass — all four passes for
+12,500 lines of the author's own, the two an ordinary mail takes for 25,000.
+A mail that would take more is not trimmed and is recorded as it came,
+`wanting`, as is one of more than 200,000 lines or 5,000,000 characters,
+which is not read at all. Of an HTML part the first 1,000,000 characters of
+markup are parsed, not counting inline `data:` images: beside a plain part a
+longer one is not consulted, and where it is the mail's only text the bubble
+ends where the reading did, on a line `[…]` — *Original* shows all of it.
+Within those bounds the cost is linear in the size of the mail, for hostile
+mail too.
 
 ### The model trim (phase 4)
 
