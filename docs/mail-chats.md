@@ -988,10 +988,28 @@ listed under Unread and judged by nobody.
   without holding anything — and the chat's later events go on, so one mail
   the web gateway always fails on cannot stall its thread (a VIP's reply in
   it is offered, rings and is worked). The order within a chat is kept for a
-  young failure, not for one that persists. A first offer's place names the
-  chat it was queued in as well as the one its mail is in now, so a merge
-  meanwhile does not take it out of its old chat's hold. This holds for a
-  merge or a removal too: a 408, 429 or 5xx for one is a failure about it;
+  young failure, not for one that persists. So a mail that stepped aside may
+  be offered after the user's answer to it from a mail client has been
+  heard: it is offered late, as an arrival — its turn's prompt shows the
+  user's answer, and it may ring once. That is the accepted cost of not
+  stalling the thread. **A late event says what is true when it is sent**:
+  a told event that stepped aside is checked against the mirror's index
+  when it goes, not sent as it was queued — a removal names only the mails
+  that are still gone, with the chat's `live` count as it is then, and is
+  dropped when none is; a told mail that is gone by then (or erased with
+  its chat) is not told at all; one that is there is told as its record
+  says then, under the chat it is in then. A young held event keeps what
+  it was queued with, since the hold keeps its chat's order. **A removal
+  waits for the merge of its chat**: while a merge that joins its chat (on
+  either side) is still queued, whatever that merge's attempts, a removal
+  is not sent — in the web gateway the mail may still be under the chat the
+  merge folds away, with the arrival it brings along — and nothing else
+  waits with it: its chat's later events go on, so it is marked as
+  overtaken and, once the merge is taken, sent as a late event is. A first
+  offer's place names the chat it was queued in as well as the one its mail
+  is in now, so a merge meanwhile does not take it out of its old chat's
+  hold. This holds for a merge or a removal too: a 408, 429 or 5xx for one
+  is a failure about it;
   only a 404 — an older web gateway that does not know the endpoint — makes
   it wait without holding anything back. **A pass
   is bounded**: a call that gets no answer in time costs `MAIL_RAIL_TIMEOUT`,
@@ -1047,12 +1065,18 @@ listed under Unread and judged by nobody.
   the web gateway has not answered three times running and mail waits — and
   while it answers and takes no mail: when every offer and event of a pass
   (three at least) was answered with a failure, or with none, the notice says
-  "the chats rail answers but takes no mail" until a mail is taken. One mail
-  failing alone says nothing of the rail, but of itself once it has stepped
-  aside: `waiting.failing` counts the rail events (offers among them) the web
-  gateway failed on three times or more, `waiting.failing_since` says when
-  the oldest first failed, and the notice says "N rail event(s) keep failing
-  while others are taken — the oldest for …" (the log names them). When a
+  "the chats rail answers but takes no mail" until a mail is taken. Events
+  that have stepped aside are counted as well: `waiting.failing` counts the
+  rail events (offers among them) the web gateway failed on three times or
+  more, and `waiting.failing_since` says when the oldest first failed. The
+  notice for them is worded from whether the rail has taken any event since
+  then (the gateway keeps when it last took one, across a restart): if it
+  has, "N rail event(s) keep failing while others are taken — the oldest for
+  …" is about those mails; if it has not — a quiet mailbox or a short outage
+  can fail on every call without a pass of three — it says "N rail event(s)
+  keep failing and the rail has taken nothing since the oldest of them first
+  failed, … ago", which points at the web gateway, not at one mail (the log
+  names them either way). When a
   mail is taken again, what waited over the fault — each wait grown up to an
   hour meanwhile — is offered and told again at once.
 

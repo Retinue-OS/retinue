@@ -691,6 +691,141 @@ def test_a_vips_reply_behind_a_mail_the_rail_always_fails_on(w: World):
     print("PASS test_a_vips_reply_behind_a_mail_the_rail_always_fails_on")
 
 
+def _failing(w: World, name: str):
+    """The web gateway's handler of one rail endpoint fails (its catch-all
+    answers 500) until healed. Returns ``(state, undo)``; ``state["heal"]``
+    heals it."""
+    handler = w.wg.Handler
+    real = getattr(handler, name)
+    state = {"heal": False}
+
+    def faulty(self):
+        if not state["heal"]:
+            raise RuntimeError("a fault in the handler's own work")
+        return real(self)
+    setattr(handler, name, faulty)
+    return state, lambda: setattr(handler, name, real)
+
+
+def test_a_late_removal_of_a_mail_that_came_back(w: World):
+    """A removal the web gateway fails on until it has stepped aside; the
+    user moves the mail back into the INBOX, which is heard at once; then
+    the fault heals. The late removal says what is true when it is sent —
+    nothing: the chat is not archived, and its mail is there."""
+    _reset()
+    key = "late-rm@x.org"
+    state, undo = _failing(w, "_handle_chats_removed")
+    try:
+        raw = t.msg(key, sender="Dora <dora@x.org>", subject="Invoice",
+                    day=(time.time() + w.offset - 5 - t.T0) / t.DAY)
+        uid = w.box.put("INBOX", raw)
+        w.mirror.poll()
+        assert w.exists(key) and not w.doc(key).get("archived")
+        w.box.remove("INBOX", uid)
+        w.mirror.poll()
+        for _ in range(w.gw.RAIL_HOLD_ATTEMPTS + 1):
+            w.later(4000)
+        row = w.mirror.index.one("SELECT attempts FROM outbox WHERE kind = 'removed'")
+        assert row and row["attempts"] >= w.gw.RAIL_HOLD_ATTEMPTS, row
+        w.box.put("INBOX", raw)
+        w.mirror.poll()
+        assert not w.doc(key).get("archived") and w.listed(key)
+        state["heal"] = True
+        w.later(4000)
+        _wait(lambda: w.mirror.index.one("SELECT COUNT(*) AS n FROM outbox")["n"] == 0,
+              "the outbox empty")
+    finally:
+        undo()
+    doc = w.doc(key)
+    assert not doc.get("archived") and w.listed(key), doc
+    assert (doc.get("attention") or {}).get("done_how") != "archived", doc.get("attention")
+    seq = [s for mid, s in doc.get("inbound_recent") or [] if mid == key]
+    assert seq and seq[-1] not in mail.cs.gone_arrivals(doc), doc
+    assert w.in_folder("INBOX", key) and w.rec(key).get("removed_at") is None
+    print("PASS test_a_late_removal_of_a_mail_that_came_back")
+
+
+def test_a_late_told_mail_that_is_gone(w: World):
+    """The user's own sent mail, which the web gateway fails on until it has
+    stepped aside; the user deletes it in a client, and its removal is
+    taken. When the fault heals, the told event is not heard: the chat does
+    not show a mail that is gone."""
+    _reset()
+    day = (time.time() + w.offset - 5 - t.T0) / t.DAY
+    w.box.put("Sent", t.msg("late-out-root@example.org", sender=t.ME, to="erin@x.org",
+                            subject="Lunch", day=day))
+    w.mirror.poll()
+    gone = "late-out@x.org"
+    undo = _poisoned(w, {gone})
+    try:
+        uid = w.box.put("Sent", t.msg(gone, sender=t.ME, to="erin@x.org", subject="Re: Lunch",
+                                      irt="late-out-root@example.org",
+                                      refs=["late-out-root@example.org"], day=day))
+        w.mirror.poll()
+        for _ in range(w.gw.RAIL_HOLD_ATTEMPTS + 1):
+            w.later(4000)
+        row = w.mirror.index.one("SELECT attempts FROM outbox WHERE kind = 'inbound'")
+        assert row and row["attempts"] >= w.gw.RAIL_HOLD_ATTEMPTS, row
+        w.box.remove("Sent", uid)
+        w.later(10)
+        assert w.rec(gone).get("removed_at")
+    finally:
+        undo()
+    w.later(4000)
+    _wait(lambda: w.mirror.index.one("SELECT COUNT(*) AS n FROM outbox")["n"] == 0,
+          "the outbox empty")
+    key = w.rec(gone)["chat"]
+    shown = [entry.get("message_id") for entry in w.wg._CHAT_OVERLAY.entries(w.chat(key))]
+    assert "late-out-root@example.org" in shown and gone not in shown, shown
+    print("PASS test_a_late_told_mail_that_is_gone")
+
+
+def test_a_removal_waits_for_the_merge_of_its_chat(w: World):
+    """Two chats, and a mail that joins them: the web gateway fails on the
+    merge until it has stepped aside. The user deletes a mail of the chat
+    the merge folds away; its removal names the surviving chat, where the
+    web gateway does not have that mail yet. It waits for the merge, so once
+    the merge is taken the mail is gone from the chat it was folded into."""
+    _reset()
+    day = lambda: (time.time() + w.offset - 5 - t.T0) / t.DAY  # noqa: E731
+    state, undo = _failing(w, "_handle_chats_merge")
+    try:
+        w.box.put("INBOX", t.msg("wm-root@x.org", sender="Fay <fay@x.org>", subject="Trip",
+                                 day=day()))
+        w.mirror.poll()
+        w.offset += 10
+        uid = w.box.put("INBOX", t.msg("wm-m@x.org", sender="Gus <gus@x.org>",
+                                       subject="Re: Trip", irt="wm-lost@x.org",
+                                       refs=["wm-lost@x.org"], day=day()))
+        w.mirror.poll()
+        absorbed = w.rec("wm-m@x.org")["chat"]
+        w.offset += 10
+        w.box.put("INBOX", t.msg("wm-c@x.org", sender="Fay <fay@x.org>", subject="Re: Trip",
+                                 irt="wm-root@x.org", refs=["wm-root@x.org", "wm-lost@x.org"],
+                                 day=day()))
+        w.mirror.poll()
+        survivor = w.rec("wm-c@x.org")["chat"]
+        assert survivor != absorbed and w.rec("wm-m@x.org")["chat"] == survivor
+        for _ in range(w.gw.RAIL_HOLD_ATTEMPTS + 1):
+            w.later(4000)
+        row = w.mirror.index.one("SELECT attempts FROM outbox WHERE kind = 'merge'")
+        assert row and row["attempts"] >= w.gw.RAIL_HOLD_ATTEMPTS, row
+        w.box.remove("INBOX", uid)
+        w.later(10)
+        assert w.rec("wm-m@x.org").get("removed_at")
+        state["heal"] = True
+        w.later(4000)
+        w.later(4000)
+        _wait(lambda: w.mirror.index.one("SELECT COUNT(*) AS n FROM outbox")["n"] == 0,
+              "the outbox empty")
+    finally:
+        undo()
+    doc = w.wg._CHAT_STATE.get(w.chat(survivor))
+    seq = [s for mid, s in doc.get("inbound_recent") or [] if mid == "wm-m@x.org"]
+    assert seq and seq[-1] in mail.cs.gone_arrivals(doc), doc
+    print("PASS test_a_removal_waits_for_the_merge_of_its_chat")
+
+
 # ── The two axes ──────────────────────────────────────────────────────────────
 
 def test_news_and_a_vip_in_the_list(w: World):
@@ -786,6 +921,9 @@ def main():
             test_news_and_a_vip_in_the_list(w)
             test_a_turns_mute_is_an_archive(w)
             test_a_vips_reply_behind_a_mail_the_rail_always_fails_on(w)
+            test_a_late_removal_of_a_mail_that_came_back(w)
+            test_a_late_told_mail_that_is_gone(w)
+            test_a_removal_waits_for_the_merge_of_its_chat(w)
         finally:
             TURN_GATE.update(during=None, fail=False)
             if TURN_GATE.get("hold") is not None:

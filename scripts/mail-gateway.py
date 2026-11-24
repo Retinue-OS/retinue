@@ -536,6 +536,9 @@ RAIL_SILENT_MAX = 3
 # chat — for this many of its own attempts at most. After that it steps
 # aside: one mail the other side always fails on must not stall its thread.
 RAIL_HOLD_ATTEMPTS = 3
+# The mark on a queued removal that has let its chat's later events go ahead
+# of it — it waits for a merge (Mirror._overtaken). Never sent.
+OVERTAKEN = "overtaken"
 
 # ── The news rail ─────────────────────────────────────────────────────────────
 # A mail of a `news` group is filed to the news feed (news_ingest; the
@@ -2334,8 +2337,11 @@ class Mailbox:
 #              `due` has passed, `attempts` counting those tries and `failed`
 #              the first (Mirror._flush_rail); meanwhile only its own chat's
 #              later rows wait — for RAIL_HOLD_ATTEMPTS tries, then it steps
-#              aside (an offer's row goes; a told event's holds nothing). An
-#              offer's row names the chat it was queued in.
+#              aside (an offer's row goes; a told event's holds nothing, and
+#              is sent as the index has its mail then). A removal waits for
+#              every merge queued that joins its chat, and is then marked
+#              `overtaken` in its payload. An offer's row names the chat it
+#              was queued in.
 #   offers     the mails the chats rail still owes an answer for: every
 #              inbound record the ledger holds ``delivered: false`` — the
 #              ledger's flag is the queue, and this is its index (rebuilt
@@ -3123,6 +3129,19 @@ class Mirror:
             since = waiting["failing_since"]
             age = (f" — the oldest for {_span(self._clock() - since)}"
                    if since is not None else "")
+            try:
+                took = float(self.index.get("rail_took"))
+            except (TypeError, ValueError):
+                took = None
+            if took is None or (since is not None and took < since):
+                # Nothing was taken since the oldest began to fail: that says
+                # nothing of one mail — the rail may take none at all (a pass
+                # with too few calls to tell does not get to the notice above).
+                ago = f", {_span(self._clock() - since)} ago" if since is not None else ""
+                return (f"{waiting['failing']} rail event(s) keep failing and the rail has "
+                        f"taken nothing since the oldest of them first failed{ago}: look at "
+                        f"the web gateway, not at one mail; each is tried again on its own "
+                        f"clock (the mail gateway's log names them)")
             return (f"{waiting['failing']} rail event(s) keep failing while others are "
                     f"taken{age}: the web gateway fails on each of them, which is tried "
                     f"again on its own clock and holds back nothing (the mail gateway's log "
@@ -4601,7 +4620,19 @@ class Mirror:
         on must not stall its thread, a VIP's reply in it included. Every
         other chat's go on throughout. An event it cannot take yet
         (``"later"``: a merge or removal an older web gateway does not know)
-        stays queued and holds nothing back."""
+        stays queued and holds nothing back.
+
+        **A late event says what is true when it is sent.** One that has
+        stepped aside is out of its chat's order — what was heard of its
+        mail since may have gone ahead of it — so it is not sent as it was
+        queued but as the index has its mail now (:meth:`_as_now`); a young
+        held event keeps its payload — the hold keeps its chat's order. And
+        a removal waits for every merge still queued that joins its chat,
+        whatever that merge's attempts: in the web gateway its mail may
+        still be under the other chat, which the merge folds in with its
+        arrivals. While it waits its chat's later events go on — nothing
+        else waits for a merge that stepped aside — so it is marked as out
+        of order (:meth:`_overtaken`), and sent as a late event is."""
         if not _chats.chats_enabled():
             return True
         if self._clock() < self._rail_wait_until:
@@ -4609,6 +4640,12 @@ class Mirror:
         self._flags = None
         now = self._clock()
         held: set = set()     # chats with an event that waits: their later ones wait too
+        merging: dict = {}    # each merge still queued → the chats it joins
+        for row in self.index.rows("SELECT seq, payload FROM outbox WHERE kind = 'merge'"):
+            try:
+                merging[row["seq"]] = self._event_chats("merge", json.loads(row["payload"]))
+            except ValueError:
+                pass
         after = 0
         while True:
             batch = self.index.rows(
@@ -4626,6 +4663,13 @@ class Mirror:
                 if chats & held:
                     held |= chats   # behind an event of its chat: in order
                     continue
+                if row["kind"] == "removed" and any(
+                        chats & joined for joined in merging.values()):
+                    # It waits for the merge, and holds nothing back: marked
+                    # first, so whatever of its chat goes ahead of it now, it
+                    # is sent as the index has its mails then.
+                    self._overtaken(row["seq"], payload)
+                    continue
                 if row["due"] > now:
                     if row["attempts"] < RAIL_HOLD_ATTEMPTS:
                         held |= chats
@@ -4637,12 +4681,20 @@ class Mirror:
                     if self.index.one("SELECT seq FROM outbox WHERE seq = ?", (row["seq"],)):
                         held |= chats   # its first offer failed, and keeps its place
                     continue
+                if isinstance(payload, dict) and (row["attempts"] >= RAIL_HOLD_ATTEMPTS
+                                                  or payload.get(OVERTAKEN)):
+                    payload = self._as_now(row["kind"], payload)
+                    if payload is None:
+                        print(f"[mail-gateway] a late {row['kind']} event of chat(s) "
+                              f"{sorted(chats)!r} is not true any more; it is dropped",
+                              flush=True)
                 outcome = "drop" if payload is None else self._rail_heard(
                     _rail_send(row["kind"], payload), f"a {row['kind']} event")
                 if outcome == "down":
                     return False
                 if outcome in ("ok", "drop"):
                     self.index.run("DELETE FROM outbox WHERE seq = ?", (row["seq"],))
+                    merging.pop(row["seq"], None)
                     if outcome == "ok":
                         self._rail_took()
                 elif outcome == "unanswered":
@@ -4662,6 +4714,75 @@ class Mirror:
                               f"of chat(s) {sorted(chats)!r} {attempts} times; it steps aside: "
                               f"told again on its own clock, it holds back nothing any more",
                               flush=True)
+
+    def _overtaken(self, seq: int, payload) -> None:
+        """Mark a queued removal that lets its chat's later events go ahead
+        of it (it waits for a merge): it is sent as the index has its mails
+        when it goes (:meth:`_as_now`), as a removal that stepped aside is.
+        Written before anything goes ahead of it — one statement, so a stop
+        leaves the row marked or as it was, and nothing overtook it then."""
+        if not isinstance(payload, dict) or payload.get(OVERTAKEN):
+            return
+        text = json.dumps({**payload, OVERTAKEN: True}, ensure_ascii=False)
+        self.index.run("UPDATE outbox SET payload = ? WHERE seq = ?", (text, seq))
+
+    def _as_now(self, kind: str, payload: dict) -> dict | None:
+        """A queued rail event as the index has its mail now, for one that
+        may be sent out of its chat's order (:meth:`_flush_rail`); None when
+        nothing of it is true any more, and it is dropped.
+
+        A removal names only the mails that are still gone — one that came
+        back since was announced so, and is not taken away again — and the
+        chat's ``live`` as it is now. A told mail that is gone now, or no
+        longer known here (its chat erased), is not told: its removal was or
+        will be heard, and the chat must not show it again. One that is
+        there is told as its record says now, under the chat it is in now,
+        with what only the event knew kept (old mail's ``backfill`` and
+        ``seen``, the press a send came of). A merge is sent as it was."""
+        payload = {key: value for key, value in payload.items() if key != OVERTAKEN}
+        if kind == "removed":
+            chat, ids = payload.get("chat"), payload.get("message_ids")
+            if not isinstance(chat, str) or not isinstance(ids, list):
+                return payload
+            ids = [str(mid) for mid in ids]
+            back: set = set()
+            for start in range(0, len(ids), 500):
+                batch = tuple(ids[start:start + 500])
+                marks = ",".join("?" * len(batch))
+                back.update(row["message_id"] for row in self.index.rows(
+                    f"SELECT message_id FROM mails WHERE removed = 0 "
+                    f"AND message_id IN ({marks})", batch))
+            gone = [mid for mid in ids if mid not in back]
+            if not gone:
+                return None
+            live = self.index.one(
+                "SELECT COUNT(*) AS n FROM mails WHERE chat = ? AND removed = 0 "
+                "AND record != ''", (chat,))["n"]
+            return {**payload, "message_ids": gone, "live": live}
+        if kind != "inbound":
+            return payload
+        mid = str(payload.get("message_id") or "")
+        row = self.index.one("SELECT record, chat, removed FROM mails WHERE message_id = ?",
+                             (mid,))
+        if row is None or row["removed"]:
+            return None
+        fields = _ibstore.read_record(self._record_path(row["record"])) \
+            if row["record"] else None
+        as_queued = {**payload, "chat": row["chat"]}
+        if fields is None or fields.get("message_id") != mid or not fields.get("chat"):
+            # Being recorded anew, or not readable just now: what the event
+            # says of the mail is still the mail — under its chat of now.
+            return as_queued
+        try:
+            event = self._event_of_record(fields, backfill=bool(payload.get("backfill")),
+                                          seen=bool(payload.get("seen")))
+        except Exception as exc:  # noqa: BLE001 - one event, told as it was queued
+            if _environment(exc):
+                raise
+            return as_queued
+        if payload.get("request_key"):
+            event["request_key"] = payload["request_key"]
+        return event
 
     def _event_chats(self, kind: str, payload) -> set:
         """The chats a queued rail event is about — what keeps it in order
@@ -4757,7 +4878,10 @@ class Mirror:
         """The rail took a mail. If it had failed on every one of a pass,
         what waited over that is due again at once — each such mail's own
         wait grew while the fault lasted, up to an hour — and /health stops
-        saying it takes none."""
+        saying it takes none. When it took one is kept, for /health: an
+        event that keeps failing while others are taken is about itself,
+        one while nothing is taken about the rail (:meth:`health_notice`)."""
+        self.index.set("rail_took", self._clock())
         if not self._rail_refusing:
             return
         self._rail_refusing = False

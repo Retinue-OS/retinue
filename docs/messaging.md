@@ -469,9 +469,14 @@ go on — one mail never holds back another. And not for long: after three of
 its own attempts (`RAIL_HOLD_ATTEMPTS`) the event steps aside — an offer is
 then retried among the re-offers, a told event on its own clock — and its
 chat's later events go on, so a mail the web gateway always fails on cannot
-stall its thread. `/health` counts such events (`waiting.failing`, the oldest
-failure's time in `waiting.failing_since`) and says "N rail event(s) keep
-failing while others are taken". A merge or removal that gets a `404` (an
+stall its thread. Such an event is sent, when it goes, as the mirror has its
+mail then: a removal names only the mails still gone (none: it is dropped), a
+told mail that is gone by then is not told. A removal also waits while a merge
+of its chat is queued, and holds nothing back meanwhile. `/health` counts the
+events that stepped aside (`waiting.failing`, the oldest failure's time in
+`waiting.failing_since`) and says "N rail event(s) keep failing while others
+are taken" when the rail took an event since that time, and that it "has taken
+nothing since" when it took none. A merge or removal that gets a `404` (an
 older web gateway without the endpoint) waits without holding anything
 back. Three calls in a row with no answer in time end the
 pass as a rail that does not answer would, so a web gateway too slow for every
