@@ -101,8 +101,9 @@ def test_the_service_names_what_it_reads_and_nothing_else():
                 "MAIL_DATA_DIR", "MAIL_GATEWAY_HTTP_PORT", "MAIL_GATEWAY_TOKEN",
                 "MAIL_POLICY_WAIT_SECONDS", "MAIL_RECENT_CHATS_MAX", "MAIL_RAIL_TIMEOUT",
                 # The gate: what travels with an offer, how long a turn's
-                # job is waited for, and what becomes of consumed news mail.
-                "MAIL_RAIL_FILE_BYTES", "MAIL_RAIL_JOB_TIMEOUT",
+                # job is waited for, how long an unreadable VIP's mail waits
+                # for its reading, and what becomes of consumed news mail.
+                "MAIL_RAIL_FILE_BYTES", "MAIL_RAIL_JOB_TIMEOUT", "MAIL_UNREAD_OFFER_WAIT",
                 "MAIL_NEWS_FOLDER", "MAIL_NEWS_EXCERPT_CHARS",
                 # Writing: how long its own send waits for the Sent copy.
                 "MAIL_SENT_GRACE_SECONDS",

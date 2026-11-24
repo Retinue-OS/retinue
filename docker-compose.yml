@@ -1250,9 +1250,11 @@ services:
       # answers, the timeout of the chats rail's POSTs, the size up to which
       # one attachment travels with the offer of a VIP's or an instructed
       # sender's mail (MAIL_RAIL_FILE_BYTES; the web gateway's own per-file
-      # cap is CONVERSATION_MAX_ATTACHMENT_BYTES), and how long the job of a
+      # cap is CONVERSATION_MAX_ATTACHMENT_BYTES), how long the job of a
       # turn that works a mail is waited for before the mail is offered again
-      # (MAIL_RAIL_JOB_TIMEOUT).
+      # (MAIL_RAIL_JOB_TIMEOUT), and how long a VIP's or an instructed
+      # sender's mail that arrived unreadable waits for its reading before
+      # it is offered as the placeholder it is (MAIL_UNREAD_OFFER_WAIT).
       - MAIL_ARCHIVE_FOLDER
       - MAIL_TRASH_FOLDER
       - MAIL_SENT_GRACE_SECONDS
@@ -1270,6 +1272,7 @@ services:
       - MAIL_RAIL_TIMEOUT
       - MAIL_RAIL_FILE_BYTES
       - MAIL_RAIL_JOB_TIMEOUT
+      - MAIL_UNREAD_OFFER_WAIT
       # News mail: where a mail of a group that is both `news` and `ignored`
       # is moved once the feed has it. Unset: the archive folder. Set and
       # EMPTY (MAIL_NEWS_FOLDER= in .env): marked read, left in the INBOX —
