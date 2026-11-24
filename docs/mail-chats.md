@@ -1257,9 +1257,11 @@ the chat, never the reverse").
 | **Archive** | the thread's INBOX mails move to the archive folder (created if absent); *unarchive does not move them back*, and a restore calls nothing |
 | an instructed turn files a document and archives | the same move |
 | **Delete** (two taps, the erase capability, same-origin only) | every mail of the thread, in every mirrored folder, moves to the account's **Trash** (`MAIL_TRASH_FOLDER`), **then** the mirror is erased — nothing is expunged |
+| **Spam** (mail chats only; a 15 s Undo before anything is sent; same-origin and through the reverse proxy only) | the thread's **inbound** mails in INBOX or the archive folder — never Sent, never the user's own — move to the account's **Junk** folder (`MAIL_JUNK_FOLDER`), **then** the chat is muted and archived; Restore or Unmute bring the chat back and *move nothing out of Junk* |
 
 The web gateway calls the chat's gateway for each (`POST /chats/read`,
-`POST /chats/archive`, `POST /chats/delete`, all `{chat, account}`; the account
+`POST /chats/archive`, `POST /chats/spam`, `POST /chats/delete`, all `{chat,
+account}`; the account
 must be the gateway's own, else 404, and an unknown chat answers zero). The
 first two run after the chat state changed, best-effort: a 404 or 501 means the
 channel has no mailbox and is not an error, any other failure is logged and
@@ -1287,6 +1289,29 @@ server keeps flagged `\Deleted` is kept as any other is, below), and while a
 folder cannot say where it is, nothing is erased. The answer is
 `delete_chat`'s shape plus `trashed`; a mail that turns up again later in a
 mirrored folder (restored from the Trash) starts the chat anew.
+
+**Spam** is no hook either: like Delete, it must reach the gateway before
+anything changes here. `POST /chats/<id>/spam` on the web gateway (no body;
+same-origin and through the reverse proxy, like delete; 400 for a messenger
+chat, which has no Junk folder — it is muted instead) asks the thread's
+gateway — `POST /chats/spam {chat, account, message_ids}`, authenticated with
+the gateway's token as /chats/archive is, the ids those the chat holds now —
+and only on its success mutes and archives the chat on the user's word
+(settling its attention item, as a mute does). On any failure (no gateway for
+the mailbox, the store unable to name the mails, the gateway's refusal) the
+chat is left as it was and the answer's `error` is one sentence saying why;
+the dashboard shows it on the row. The gateway moves the mails with the same
+machinery as the Trash move: the move is noted before the server is asked,
+so a stop between the server's move and the index is put right at the next
+start (one copy in Junk, a leftover flagged `\Deleted` known as moved), and
+`message_ids` scopes it to the mails the user acted on. Its answer is
+`{ok, moved, flagged}` like archive's. **The mailbox follows the chat, never
+the reverse**: Junk is not a mirrored folder, so the next pass finds the
+moved mails in no mirrored folder and tombstones them, as for a mail a client
+moved to its junk; restoring the chat (Restore, Unmute) moves nothing back.
+A mail the user takes out of Junk in a mail client comes back to the chat
+like any mail that returns. The dashboard defers the call by the Undo window
+(15 s; a page hidden or left sends it at once with `keepalive`).
 
 **One message in two folders.** A mailbox whose folders are labels (Gmail: the
 archive is `\All`) shows one message in INBOX and in the archive at once, and
@@ -1326,7 +1351,9 @@ mail it is.
 
 **Folders.** The gateway never invents a **Trash**: it is the folder the server
 marks `\Trash`, else the one `MAIL_TRASH_FOLDER` names, and with neither,
-Delete is refused with `errors > 0` and nothing is erased. The archive folder
+Delete is refused with `errors > 0` and nothing is erased. Nor a **Junk**
+folder: the server's `\Junk`, else `MAIL_JUNK_FOLDER` (default `Junk`), and
+with neither Spam is refused with a sentence naming `MAIL_JUNK_FOLDER`. The archive folder
 is created when it is missing, and a folder the gateway creates is
 **subscribed**, so a mail client lists it. A name set explicitly
 (`MAIL_ARCHIVE_FOLDER`, `MAIL_TRASH_FOLDER`) wins over the server's SPECIAL-USE
@@ -2015,8 +2042,8 @@ accounts. The points an operator meets first:
   `EMAIL_SEND_POLICY` (the same `.env` value `email_client.py` reads; unset,
   every send queues), `SEND_APPROVAL_BASE_URL` for the approval link and
   `CHAT_ERASE_TOKEN` (unset, deleting a mail chat is refused). Both are
-  named on the service in compose; `MAIL_TRASH_FOLDER` and
-  `MAIL_SENT_GRACE_SECONDS` tune where Delete moves mail and how long a sent
+  named on the service in compose; `MAIL_TRASH_FOLDER`, `MAIL_JUNK_FOLDER`
+  and `MAIL_SENT_GRACE_SECONDS` tune where Delete and Spam move mail and how long a sent
   mail's Sent copy is waited for. On the `retinue` service compose names the
   web gateway's and `mail-push.py`'s own tunables (`MAIL_SEND_TIMEOUT`,
   `MAIL_GATEWAY_TIMEOUT`, `CHAT_PENDING_TIMEOUT`, `CHAT_PENDING_RETRY_SECONDS`,

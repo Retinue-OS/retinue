@@ -170,8 +170,9 @@ dedicated page that lists every thread with an Active/Archived/Edits/Cowork
 filter (the same `retinue-conversations` element with the `full` attribute).
 Its tiles swipe with the chats page's rows' gesture — one implementation,
 `components/swipe-rows.js`, so the two lists cannot drift apart; the chats
-page's Unread and Read tabs opt into a committing swipe left as well (a
-row's `data-quick-left`), which threads do not:
+page's Unread and Read tabs opt into a full swipe left that commits beyond the
+one that reveals the tray (a row's `data-quick-left`), and into selection by
+long press, which threads do not:
 
 | Tab | Swipe right | Swipe left (tray) |
 |---|---|---|
@@ -186,7 +187,8 @@ list until something new is filed into it), **Mute** keeps it out
 (`{archived, muted}` together), **Unmute** lets the next message bring it
 back, **Restore** brings it back and clears the mute — and so does the thread
 bar's *Unarchive*. A commit that takes a row out of view offers **Undo** for
-6 s (the home list's toast), writing back exactly the flags the row had.
+15 s (`UNDO_MS`; the toast stays while a finger or the pointer is on it),
+writing back exactly the flags the row had.
 **Delete** asks for a second tap and cannot be undone. **Star** keeps a thread
 at the top of whichever list it is in — `starredFirst` in `base.js` sorts the
 client side, starred first, each group still newest first — and does nothing
@@ -269,22 +271,51 @@ docstring). Pieces:
 
   | Tab | Swipe right | Swipe left |
   |---|---|---|
-  | Unread | mark read at once | archive at once |
-  | Read | nothing (the row does not move) | archive at once |
+  | Unread | mark read at once | uncover the tray; a full swipe (or a fling) archives at once |
+  | Read | nothing (the row does not move) | uncover the tray; a full swipe (or a fling) archives at once |
   | Archived | restore at once | uncover the tray |
 
-  The tray — **Star**, on *Unread* **Mark read**, **Archive** (out of the list
-  until it speaks again) and **Mute** (out of the list, and the next message
-  does not bring it back), all `POST /chats/<id>/flags` but the read — opens
-  on *Unread* and *Read* by a long press, a right-click or the context-menu
-  key; that is also how a keyboard reaches what a swipe does. Muting
-  archives — the server's rule — so both land under *Archived*, whose tray
-  holds **Star**, **Restore**, **Mute** / **Unmute** (stays archived) and
-  **Delete** (`POST /chats/<id>/delete`, armed by a first tap, done by a
-  second; the armed button reads "Delete for good?", and on a mail thread
-  "Move mails to Trash?" — its mails go to the mailbox's Trash before the
-  chat is erased, and its title says so). What takes a row out of view offers Undo for a few seconds — Mark
-  read's puts the previous read mark back (`POST /chats/<id>/read`, below).
+  The tray offers the same actions on every tab and every channel — **Star**,
+  on *Unread* **Mark read**, **Archive** (out of the list until it speaks
+  again) and **Mute** (out of the list, and the next message does not bring
+  it back), on *Archived* **Restore** and **Mute** / **Unmute** (stays
+  archived) in their place, then **Spam** and **Delete**. Spam is the one
+  exception: mail threads only (`POST /chats/<id>/spam`: the mailbox moves the
+  thread's inbound mails to its Junk folder, then the chat is muted and
+  archived; a messenger chat has no junk folder and is muted instead). A
+  right-click or the context-menu key opens the tray too, which is how a
+  keyboard reaches what a swipe does. Muting archives — the server's rule —
+  so both land under *Archived*. **Delete** (`POST /chats/<id>/delete`) is
+  armed by a first tap and done by a second; the armed button reads "Delete
+  for good?", and on a mail thread "Move mails to Trash?" — its mails go to
+  the mailbox's Trash before the chat is erased, and its title says so.
+  Everything else that takes a row out of view offers Undo for 15 s
+  (`UNDO_MS`, the toast staying while a finger is on it): Mark read, Archive
+  and Mute are made at once and Undo writes the previous state back (Mark
+  read's the previous read mark, `POST /chats/<id>/read`, below); **Spam** is
+  deferred — the row leaves, nothing is sent until the window ends, Undo
+  sends nothing, and a page hidden or left sends it at once (`fetch`
+  `keepalive`). An action that fails brings the row back, marked failed,
+  with the server's one-sentence `error` in place of its preview (and for
+  Delete and Spam a Retry in its opened tray; a 503 on Delete reads "Delete
+  not set up").
+
+  **Multi-select**: a long press on a row (or the list's *Select*) starts
+  selection mode with that row selected — the long press no longer opens
+  the tray. A tap (Space on a focused row) toggles a row, Shift-click on a
+  wide screen selects a range, and a bar counts the selection and offers the
+  tab's actions for all of it: Mark read, Archive, Mute, Restore / Unmute,
+  Star / Unstar, Spam (only when every selected chat is a mail thread) and
+  Delete. Esc, Cancel, the back gesture and a tab switch end the mode; a row
+  that leaves the tab leaves the selection. One request per chat, four at a
+  time (no bulk endpoint), and one Undo for the batch ("Archived 7 · Undo")
+  that writes every chat's previous state back; failures are counted
+  ("Archived 5 of 7 — 2 failed") and each failed row says why. A bulk Delete
+  takes two taps ("Delete 7 chats? Mails move to the Trash"); a bulk Spam is
+  deferred like a single one. The chat page's ⋮ has **Spam** (mail only:
+  handed to the list, which carries it out with its Undo) and **Delete** (two
+  taps; the page leaves for the list once the chat is erased, and shows the
+  reason where it is not).
   A Mark read is about the row as shown: it names the row's `inbound_seq`,
   and where a message has landed that the list has not fetched yet (it
   refreshes every 15 s) the server marks nothing — the row slides back and
@@ -767,6 +798,16 @@ The API, as the components consume it:
   loopback and from the address the caller dialled, so a caller coming in
   from another of the container's addresses, or through a sibling that
   relays, passes. An agent uses `scripts/chat-flags.py`.
+
+  `POST /chats/<id>/spam` (no body; mail chats only, 400 for a messenger
+  chat) asks the thread's mail gateway to move the thread's inbound mails in
+  INBOX and the archive to the account's Junk folder (`POST /chats/spam`
+  `{chat, account, message_ids}`) and, only once it has, mutes and archives
+  the chat on the user's word: `{id, spam: true, moved, archived, muted,
+  starred}`. On any failure nothing changes and the answer is `{error}` —
+  one sentence (no Junk folder: it names `MAIL_JUNK_FOLDER`), 502 or 503.
+  Same-origin and through the reverse proxy only, like delete. The mails
+  stay in Junk when the chat is restored.
 
   `POST /chats/<id>/delete` (no body) is not a flag but an erasure: every
   inbox gateway of the channel is asked to erase the chat (its own

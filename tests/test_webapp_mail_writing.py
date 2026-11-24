@@ -2706,7 +2706,7 @@ await ok('Delete on a mail thread says the mails go to the Trash; a messenger ch
     return (/<button type="button" class="delete"[^>]*>Delete<\/button>/.exec(li) || [''])[0];
   };
   const m = delOf('email:~me@example.org:r1');
-  assert.ok(m.includes('title="Move this thread&#39;s mails to the Trash of me@example.org, then erase the chat here"'), m);
+  assert.ok(m.includes('title="Moves the thread&#39;s mails to the Trash of me@example.org, then erases the chat here"'), m);
   assert.ok(m.includes('data-confirm="Move mails to Trash?"'), m);
   const s = delOf('signal:~+41000:+41999');
   assert.ok(s.includes('title="Erase this chat and all its messages from the system"') && !s.includes('data-confirm'), s);

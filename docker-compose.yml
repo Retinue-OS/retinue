@@ -1269,6 +1269,7 @@ services:
       # it is offered as the placeholder it is (MAIL_UNREAD_OFFER_WAIT).
       - MAIL_ARCHIVE_FOLDER
       - MAIL_TRASH_FOLDER
+      - MAIL_JUNK_FOLDER
       - MAIL_SENT_GRACE_SECONDS
       - MAIL_POLL_SECONDS
       - MAIL_BACKFILL_DAYS

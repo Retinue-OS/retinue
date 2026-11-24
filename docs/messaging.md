@@ -822,7 +822,12 @@ on another site cannot mark mail read or archive it.
 **Folders.** The account's Trash is **never invented**: it is the folder the
 server marks `\Trash`, else the one `MAIL_TRASH_FOLDER` names; where neither
 exists Delete is refused (`errors > 0`, nothing erased) and `MAIL_TRASH_FOLDER`
-is the setting to fix. The archive folder is created when it is missing, and
+is the setting to fix. The **Junk** folder Spam moves a thread's inbound mails
+to is found the same way (`\Junk`, else `MAIL_JUNK_FOLDER`, default `Junk`)
+and is never invented either: without one, `POST /chats/spam` answers 502 with
+a sentence naming `MAIL_JUNK_FOLDER`, and the web gateway leaves the chat as it
+was. Spam exists for mail chats only — a messenger has no junk folder; mute
+the chat instead. The archive folder is created when it is missing, and
 a folder the gateway creates is **subscribed**, so a mail client lists it. A
 name set explicitly wins over the server's SPECIAL-USE marks: with
 `MAIL_ARCHIVE_FOLDER` or `MAIL_TRASH_FOLDER` set, that name is the folder; left
@@ -865,6 +870,7 @@ gate", above).
 | `MAIL_OWN_ADDRESSES` | *(empty)* | every address of the user's that may appear on this mailbox's mail, comma-separated: its aliases **and** the addresses of the user's other mirrored accounts. Never a participant, never a chat's peer; one value listing all of them serves every mail gateway |
 | `MAIL_ARCHIVE_FOLDER` | `Archive` | the archive folder the mirror follows, and where Archive moves a chat's INBOX mails. Unset: the server's `\Archive` (else `\All`) folder, else this name; set: always this name (created and subscribed if absent) |
 | `MAIL_TRASH_FOLDER` | `Trash` | where Delete moves a chat's mails. Unset: the server's `\Trash` folder, else this name; set: always this name. Never created: with neither, Delete is refused |
+| `MAIL_JUNK_FOLDER` | `Junk` | where Spam moves a chat's inbound mails (INBOX and the archive; never Sent, never the user's own). Unset: the server's `\Junk` folder, else this name; set: always this name. Never created: with neither, Spam is refused with a sentence naming this variable, and the chat stays as it was |
 | `MAIL_SENT_GRACE_SECONDS` | `600` | how long a record the gateway wrote for its own send waits for its Sent copy before it counts as gone from the mailbox |
 | `EMAIL_SEND_POLICY` | *(unset: `verify`)* | the send policy, keyed by the account's address — as `email_client.py` reads it, and the same `.env` value |
 | `SEND_APPROVAL_BASE_URL` | | public base of the approval links a queued send returns; unset, a relative path |
