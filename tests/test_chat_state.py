@@ -195,6 +195,41 @@ def test_undo_clear_is_refused_once_it_is_stale_or_moot():
     print("PASS test_undo_clear_is_refused_once_it_is_stale_or_moot")
 
 
+def test_a_repeat_clears_only_its_own_words():
+    """``clear_draft(only_text=…)``: the repeat of a send clears the draft
+    while it still holds that send's words (the page put them back when the
+    answer was lost), and leaves one written since — decision I."""
+    with tempfile.TemporaryDirectory() as tmp:
+        store = cs.ChatStateStore(tmp)
+        cid = "email:~me@example.org:root@x.org"
+        store.set_draft(cid, " Thanks, see you Tuesday. ", author="user")
+        doc = store.clear_draft(cid, only_text="Thanks, see you Tuesday.")
+        assert doc["draft"] is None and doc["cleared"] is None, doc
+        assert store.undo_clear(cid)[0] is False, "a sent mail is not offered back"
+        # Other words: written since, and kept as they are.
+        store.set_draft(cid, "typed since", author="user")
+        version = store.get(cid)["draft_version"]
+        doc = store.clear_draft(cid, only_text="Thanks, see you Tuesday.")
+        assert doc["draft"]["text"] == "typed since" and doc["draft_version"] == version
+        # Nothing to clear: nothing is written.
+        other = "email:~me@example.org:other@x.org"
+        store.clear_draft(other, only_text="")
+        store.clear_draft(other, only_text="words")
+        assert not store.exists(other)
+        # A save that lands between the look and the clear wins.
+        real = store.set_draft
+
+        def racing(chat_id, text, **kwargs):
+            if kwargs.get("base_version") is not None and not text:
+                real(chat_id, "written meanwhile", author="user")
+            return real(chat_id, text, **kwargs)
+        store.set_draft = racing
+        store.set_draft(cid, "Again", author="user")
+        store.clear_draft(cid, only_text="Again")
+        assert store.get(cid)["draft"]["text"] == "written meanwhile", store.get(cid)
+    print("PASS test_a_repeat_clears_only_its_own_words")
+
+
 def test_agent_staging_never_clobbers_user_text():
     with tempfile.TemporaryDirectory() as tmp:
         store = cs.ChatStateStore(tmp)
@@ -715,8 +750,22 @@ def test_overlay_merge_dedup_expiry():
                "ts": cs.iso_z(150.0), "message_id": "m2"})
     got = ov.entries(cid)
     assert [e["text"] for e in got] == ["a (edited)", "b"], got
-    assert all("_inserted" not in e for e in got)
+    assert all("_inserted" not in e and "_first" not in e for e in got)
     assert len(ov.entries()) == 3
+    # When a message was first seen outlasts its re-delivery (what tells a
+    # mail the chat already had from one that arrived a moment ago), and is
+    # asked by chat and message id: none for another chat, an unknown id, an
+    # entry without an id.
+    first = ov.first_seen(cid, "m1")
+    assert isinstance(first, float) and first <= time.time()
+    with ov._lock:
+        ov._entries[("id", cid, "m1")]["_first"] = first - 500.0
+    ov.insert({"chat_id": cid, "direction": "in", "text": "a (edited)",
+               "ts": cs.iso_z(100.0), "message_id": "m1"})
+    assert ov.first_seen(cid, "m1") == first - 500.0, "a re-delivery is not a first sight"
+    assert ov.first_seen("telegram:1", "m1") is None and ov.first_seen(cid, "m2") is None
+    assert ov.first_seen(cid, None) is None and ov.first_seen(cid, "") is None
+    assert ov.first_seen("telegram:1", "m2") is not None
     # Expiry: a stale entry drops out (backdated directly, as the RecentSends
     # test does — the clock is the contract, not a sleep).
     with ov._lock:
@@ -724,6 +773,7 @@ def test_overlay_merge_dedup_expiry():
             if ov._entries[key].get("message_id") == "m1":
                 ov._entries[key]["_inserted"] = time.time() - 120.0
     assert [e["text"] for e in ov.entries(cid)] == ["b"]
+    assert ov.first_seen(cid, "m1") is None, "an expired entry was never seen, as far as this knows"
     print("PASS test_overlay_merge_dedup_expiry")
 
 
@@ -1415,6 +1465,7 @@ if __name__ == "__main__":
     test_draft_version_guard()
     test_undo_clear_restores_the_draft_with_its_author()
     test_undo_clear_is_refused_once_it_is_stale_or_moot()
+    test_a_repeat_clears_only_its_own_words()
     test_agent_staging_never_clobbers_user_text()
     test_last_read_forward_only_and_unread_modes()
     test_mark_read_and_its_guarded_restore()

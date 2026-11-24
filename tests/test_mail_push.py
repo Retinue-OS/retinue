@@ -16,7 +16,10 @@ server, so the flags the companion's note names are known to do what it says:
     made absolute; --retract takes it back;
   * a refusal is the gateway's own sentence, and a failure exit;
   * one run is one mail: every request carries a key, a run that got no
-    answer asks again under it, and one that still does not know says so.
+    answer asks again under it, and one that still does not know says so —
+    also when the gateway took the request and was gone by the second ask;
+  * a repeat is said to be one; a send that failed for certain is said to
+    have sent nothing, and the same request again is a new attempt.
 
     python3 tests/test_mail_push.py
 """
@@ -26,6 +29,7 @@ import importlib.util
 import io
 import json
 import os
+import socket
 import sys
 import tempfile
 import threading
@@ -325,6 +329,34 @@ def test_one_run_is_one_mail():
         stub.answer = (502, {"error": "send failed: 554 rejected"})
         code, out, err = push("--to", "ann@x.org", "x", env=env)
         assert code == 1 and "554" in err and "NOT KNOWN" not in err
+        assert "nothing was sent" not in err, "only the gateway's own word says that"
+        # A failure the gateway knows to be one: nothing left it, said so.
+        stub.answer = (502, {"error": "send failed: 554 rejected", "sent": False})
+        code, out, err = push("--to", "ann@x.org", "x", env=env)
+        assert code == 1 and out == "" and "554" in err and "NOT KNOWN" not in err
+        assert "nothing was sent" in err and "new attempt" in err
+        # A repeat is said to be one: what the answer tells of happened
+        # before this run — sent, queued, or not confirmed.
+        sent = {"status": "sent", "message_id": "m5@example.org", "chat": "a@x.org",
+                "ts": 1.0, "attachments": []}
+        stub.answer = (200, sent)
+        code, out, err = push("--to", "ann@x.org", "x", env=env)
+        assert code == 0 and "mail-push: sent" in out and "repeat" not in out + err
+        stub.answer = (200, {**sent, "repeat": True})
+        code, out, err = push("--to", "ann@x.org", "x", "--request-key", key, env=env)
+        assert code == 0 and "mail-push: sent" in out and "this is a repeat" in out
+        assert "nothing was sent or queued a second time" in out
+        stub.answer = (202, {"status": "pending_approval", "request_id": RID,
+                             "approval_url": f"/sends/mail-gateway/{RID}", "repeat": True})
+        code, out, err = push("--to", "ann@x.org", "x", "--request-key", key, env=env)
+        assert code == 0 and "queued for approval" in out and "this is a repeat" in out
+        stub.answer = (202, {"status": "sending", "request_id": RID, "repeat": True})
+        code, out, err = push("--to", "ann@x.org", "x", "--request-key", key, env=env)
+        assert code == 0 and "being sent" in out and "this is a repeat" in out
+        stub.answer = (502, {"error": "send not confirmed", "unconfirmed": True,
+                             "outcome_unknown": True, "repeat": True})
+        code, out, err = push("--to", "ann@x.org", "x", "--request-key", key, env=env)
+        assert code == 1 and "NOT KNOWN" in err and "this is a repeat" in err and out == ""
         # A reply that leaves an address of the answered mail out says so.
         stub.answer = (200, {"status": "sent", "message_id": "m4@example.org", "chat": "a@x.org",
                              "ts": 1.0, "attachments": [], "skipped": ["p\u00f6st@evil.org"]})
@@ -333,6 +365,52 @@ def test_one_run_is_one_mail():
     finally:
         stub.server.shutdown()
     print("ok: every run carries a request key; no answer is asked about again, never resent")
+
+
+def test_a_gateway_that_took_the_request_and_went_away():
+    """The first request is taken whole — the gateway may be sending the
+    mail — and no answer comes; by the second ask the gateway is gone
+    (restarted, killed). That the second could not be delivered says nothing
+    of the first: not known, with the key — never "could not reach"."""
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    port = listener.getsockname()[1]
+    got = {}
+
+    def serve():
+        conn, _peer = listener.accept()
+        conn.settimeout(5)
+        data = b""
+        try:
+            while b"\r\n\r\n" not in data:
+                data += conn.recv(65536)
+            head, _sep, rest = data.partition(b"\r\n\r\n")
+            length = next(int(line.split(b":")[1]) for line in head.split(b"\r\n")
+                          if line.lower().startswith(b"content-length"))
+            while len(rest) < length:
+                rest += conn.recv(65536)
+            got["body"] = json.loads(rest)
+        finally:
+            listener.close()    # nothing listens any more…
+            conn.close()        # …and the request it took is never answered
+    server = threading.Thread(target=serve, daemon=True)
+    server.start()
+    code, out, err = push("--to", "ann@x.org", "--subject", "Minutes", "Hello", "--timeout",
+                          "5", env={"MAIL_GATEWAY_SEND_URL": f"http://127.0.0.1:{port}/send"})
+    server.join(10)
+    key = got["body"]["request_key"]
+    assert got["body"]["to"] == ["ann@x.org"], "the gateway had the whole request"
+    assert code == 1 and out == "", (code, out, err)
+    assert "asking again" in err and "NOT KNOWN whether this mail was sent" in err, err
+    assert f"--request-key {key}" in err and "Do not send it again" in err
+    assert "could not reach gateway" not in err, err
+    assert "cannot be reached any more" in err
+    # A gateway that was never there is another matter: nothing was asked.
+    code, _out, err = push("--to", "ann@x.org", "x", "--timeout", "2",
+                           env={"MAIL_GATEWAY_SEND_URL": f"http://127.0.0.1:{port}/send"})
+    assert code == 1 and "could not reach gateway" in err and "NOT KNOWN" not in err
+    print("ok: a gateway that took the request and then went away leaves the send unknown")
 
 
 def test_against_the_gateway_itself():
@@ -369,6 +447,7 @@ def test_against_the_gateway_itself():
                 code, out, err = push("--chat", chat_id, "--reply", "sender", "--file",
                                       str(text), "--user-approved", env=env)
                 assert code == 0 and "mail-push: sent" in out, (out, err)
+                assert "this is a repeat" not in out, "the run that sent it"
                 assert smtp.mails[-1]["rcpt"] == ["ann@x.org"]
                 assert smtp.parsed().get_content().strip() == "Count me in."
                 # Too late to take back; and a thread of another mailbox is
@@ -393,9 +472,45 @@ def test_against_the_gateway_itself():
                                       str(pdf), "--user-approved", "Attached.",
                                       "--request-key", key, env=env)
                 assert code == 0 and "mail-push: sent" in out and len(smtp.mails) == 2, err
+                assert "this is a repeat" in out, out
                 code, _out, err = push("--to", "dora@w.org", "--subject", "Another",
                                        "--user-approved", "Else.", "--request-key", key, env=env)
                 assert code == 1 and "409" in err and len(smtp.mails) == 2
+                # A send that failed for certain: said so — and the same
+                # request again is a new attempt, which sends the mail.
+                smtp.reject_data = "554 5.7.1 content rejected"
+                again = ("--to", "eve@v.org", "--subject", "Try", "--user-approved",
+                         "Once more.", "--request-key", "retry-1")
+                code, out, err = push(*again, env=env)
+                # (The gateway runs in this process: its log is in ``out``.)
+                assert code == 1 and "mail-push" not in out, (out, err)
+                assert "send failed" in err and "554" in err
+                assert "nothing was sent" in err and "NOT KNOWN" not in err
+                assert len(smtp.mails) == 2 and gw.SENDS.listed() == []
+                smtp.reject_data = None
+                code, out, err = push(*again, env=env)
+                assert code == 0 and "mail-push: sent" in out, err
+                assert "this is a repeat" not in out, "a new attempt, and it sent the mail"
+                assert len(smtp.mails) == 3 and smtp.mails[-1]["rcpt"] == ["eve@v.org"]
+                code, out, err = push(*again, env=env)
+                assert code == 0 and "this is a repeat" in out and len(smtp.mails) == 3
+                # One of unknown outcome is never such a one: asked about
+                # again, it is still not known, and nothing is sent.
+                smtp.drop = "dot"
+                maybe = ("--to", "fay@u.org", "--subject", "Maybe", "--user-approved",
+                         "Perhaps.", "--request-key", "maybe-1")
+                code, out, err = push(*maybe, env=env)
+                smtp.drop = None
+                assert code == 1 and "NOT KNOWN" in err and "nothing was sent" not in err
+                sessions = smtp.sessions
+                code, out, err = push(*maybe, env=env)
+                assert code == 1 and "NOT KNOWN" in err and "this is a repeat" in err
+                assert smtp.sessions == sessions and len(smtp.mails) == 4
+                # Taking it back is too late — and is not told "failed".
+                (unknown,) = gw.SENDS.listed()
+                code, out, err = push("--retract", unknown["id"], env=env)
+                assert code == 1 and "NOT KNOWN whether it went out" in err, (out, err)
+                assert "failed" not in err and "Do not send it again" in err
             finally:
                 server.shutdown()
     finally:

@@ -292,13 +292,17 @@ persistent volume — high-churn disposable data, the news-store precedent):
   the mail may have gone out all the same — until the user dismisses it.
   The gateway's queue is the truth and the copy follows it; it is what the
   chat list counts from and what the chat page shows while the gateway is
-  away;
+  away. An entry its gateway answers for as dismissed, or no longer holds
+  (a send that failed for certain is removed when it is dismissed), is
+  over and leaves the copy, whatever else it says;
 - `refused` — whom a mail of the user's did not reach: the recipients the
   mail server refused while it took the mail for the others, by the mail's
   `Message-ID` (a mail chat's only);
 - `unsent` — true for a chat that so far is nothing but a mail of the user's
   own that has not gone out (a queued new mail). Such a chat is forgotten
-  when that send is denied, retracted or dismissed;
+  when that send is denied, retracted, dismissed or gone — a new mail that
+  failed for certain, its chat made by a poll while its SMTP session
+  lasted, included;
 - display metadata (resolved name, group flag) cached from the gateway.
 
 Beside the documents sit two small files of their own. `mailbox/owed.json`
@@ -343,7 +347,10 @@ gateway ([mail-chats.md](mail-chats.md), "The mailbox follows the chat"):
 the thread's mails are moved to the mailbox's Trash — nothing is expunged —
 and only then is the mirror erased, the thread's queued sends with it; a
 move that failed is reported like a file that could not be erased, and
-nothing is. Only the gateway that serves the thread's mailbox is asked: a
+nothing is — with the gateway's own sentence as the reason where it gives
+one (a mailbox without a Trash folder, and which variable names one),
+passed on as one bounded line of text. Only the gateway that serves the
+thread's mailbox is asked: a
 mail ledger, its mailbox and its queue are per account. The order is the
 same on both sides — the web-gateway erases its state, its copy of the
 queued sends and the companion only after that gateway has answered that all
@@ -924,7 +931,7 @@ messenger chat's, has a send path that is the thread's own:
 there — its note names the thread's gateway where that is not the default
 one, and the mailbox's policy with the rule that goes with it.
 
-Three rules hold for a mail send that a messenger's does not need
+These rules hold for a mail send that a messenger's does not need
 ([dashboard.md](dashboard.md), "Writing mail", has the endpoints):
 
 - **The recipients a user sees are the recipients the gateway will use.**
@@ -937,10 +944,37 @@ Three rules hold for a mail send that a messenger's does not need
   the browser `202 {unconfirmed: true}` — never an error that hands the
   words back for a second send. Every press carries an idempotency key
   (`request_key`), so the same press can be retried and sends nothing twice.
+  The gateway's answer is read whole before it is judged: its "it may have
+  gone out" carries two `Message-ID`s and is longer than any cut made for
+  display.
+- **A kept key is dropped only on the mail gateway's own word about that
+  key.** A mail that did not go is answered with `"sent": false`, a
+  sentence, and who said so: `"by": "gateway"` where the mail gateway
+  answered this request itself — `424` where it took the request and the
+  mail server would not have the mail, its `400`/`409`/`413` refusals, its
+  `503` where it cannot send — and `"by": "dashboard"` where the web
+  gateway answered without it: never reached (`502`), no gateway for that
+  mailbox, a request that does not validate. The page keeps the words; it
+  drops the key on the gateway's word only, since a "not sent" of this
+  request says nothing of an earlier one under the same key. A `5xx` is
+  "not sent" only with `"sent": false`; one without it, or a body cut
+  short, is not confirmed.
+- **A repeat is not a reply.** A press answered again from the mail it sent
+  earlier (the gateway says `"repeat": true`) is only reconciled: the
+  Message is returned and the chat's copy of the queue brought in line.
+  Nothing is marked read, no attention item is settled and the mailbox is
+  told nothing — the rail did that when the mail went out, and what arrived
+  since has not been answered. The shared draft is cleared only where it
+  still holds this press's words (the page put them back when the first
+  answer was lost); a draft written since stays.
 - **Nothing the user queued or sent disappears without a word.** An allowed
   send that then fails stays in its chat as failed, with the gateway's
   reason, until the user dismisses it; recipients the mail server refused
-  are named on the sent message.
+  are named on the sent message. A dismissed entry is over — the gateway
+  removes one that failed for certain, and answers for one of unknown
+  outcome by id as dismissed — and one whose outcome is unknown is never
+  worded as "failed": not in the chat, the list, the companion's note, on
+  `/sends`, or in the note to the thread that queued it.
 
 ## What this replaces, what it keeps
 

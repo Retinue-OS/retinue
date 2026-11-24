@@ -218,7 +218,14 @@ their attention settings, the VIP flag and
 the instruction their messages are worked by, mail included — over the live `/contacts` API
 (`tests/test_webapp_contacts.py`). The outbox icon opens the gateway's `/sends`
 page, the queue of messages waiting for approval: a queue that wants action,
-one tap away from every page.
+one tap away from every page. Those pages are the gateway's own; their one
+script is `gateway/sends.js`, which on the status page of a decided send
+polls `GET /sends/<account>/<id>/status` (`{status, error?,
+outcome_unknown?, note?, next?}`) and says how it ended. An `error` with
+`outcome_unknown: true` is no failure — the mail server was handed the mail
+and its answer was lost — and reads "Not confirmed — it may have gone out"
+with a question mark, never the cross and never "could not deliver"; the
+gateway's own sentence (`note`) is shown where it sends one.
 
 Shell updates apply themselves (`components/update.js`): when a new service
 worker activates, controlled pages reload once — never while a thread or the
@@ -484,19 +491,84 @@ docstring). Pieces:
   one per press — and its answer is read strictly: **200** is the mail;
   **202** `{pending}` a send that waits for approval; **202**
   `{unconfirmed, message_id?, request_key}` a mail handed over whose outcome
-  nobody knows yet — its bubble stays, "Sending — not confirmed yet", the
-  words are **never** put back in the box, and it gives way to the mail when
-  that shows (by `message_id`), to the server's pending entry (by
-  `message_id` or `request_key`), or to the answer of **Check again**, which
-  posts the very same body under the same key (offered where the server
-  echoed the key). A **4xx** is the server's refusal: "Not sent: <its
-  sentence>", words back. Anything else — no answer, a 5xx, a 200 that is no
-  document — says nothing about whether the mail went out and is never
-  reported as "not sent": the words come back with the key they went under
-  (kept on the device with them, for twelve hours), so the same words sent
-  again are the same mail to the gateway and not a second one; a press made
-  again whose first mail had gone out says so. Messenger sends are as they
-  were.
+  nobody knows yet (below). The server's word that **nothing went out**
+  with this request — any **4xx** (its own refusal; **424** where the mail
+  server refused the mail) and any answer that carries **`"sent": false`**
+  (a 502 for a mail gateway that was never reached, a 503 for one that
+  cannot send) — is "Not sent: <its sentence>", and the words stay in the
+  box. Whose word it is decides what becomes of the key (**`"by"`**):
+  `"gateway"` is the mail gateway's own answer about this request, made
+  after it looked the key up — the press is over, and the next press is a
+  new attempt under a new key; `"dashboard"` is the web gateway answering
+  for itself (the mail gateway never reached, no gateway for the mailbox, a
+  sign-in run out) — the key stays with the words, which costs nothing,
+  since the gateway takes a key it never saw as a new attempt. An answer
+  without `"by"` (an older server, a proxy) counts as the gateway's for a
+  first press. A press **made again** under a kept key whose first outcome
+  nobody knows is told "Not sent" only by the mail gateway: refused by anyone
+  else, the request was never put to it, so the note says the server could
+  not be asked and that it is still not known whether the first attempt went
+  out, and the key stays — dropping it there could send the mail twice.
+  Anything else — no answer, a 5xx that does not say `"sent": false` (a
+  proxy, a crash), a 200 that is no document — says nothing about whether
+  the mail went out and is never reported as "not sent": the words come back
+  with the key they went under (kept on the device with them, for twelve
+  hours), so the same words sent again are the same mail to the gateway and
+  not a second one; a press made again whose first mail had gone out says
+  so. Messenger sends are as they were.
+- **The key's life.** One key per press, never the next mail's. It is kept
+  (`_retry`) while the box still holds its words as they were sent — with a
+  mark (`sure`) where it is known that nothing went out under it, so that a
+  press made again under it is not told "not known". It is dropped on the
+  mail gateway's word (`"by": "gateway"` with `"sent": false` or a 4xx;
+  for a first press also an answer without `"by"`); as soon as the box
+  holds other words, even for a moment (typed, cleared, dictated, a draft
+  from elsewhere — the same words typed again later are a new mail); and
+  when the press turns up in the thread (`_settleRetry`, on every load and
+  poll; never for a key marked `sure`): the server lists a send
+  under its key, or the thread holds one more of the user's mails with those
+  words than at the press. Then the words leave the box too, offered back as
+  after a ✕ — left there, one press would send them a second time — unless
+  the listed send failed for certain, which is the server's word that the
+  press did *not* go: the key is dropped and the words stay. While a press
+  is on its way, a poll that lists it (`sending`, under its `request_key`)
+  draws no second bubble beside the optimistic one.
+- **A mail that was never confirmed** (202 `{unconfirmed}`). Its bubble
+  stays, "Sending — not confirmed yet"; the words are **never** put back in
+  the box unasked. They are then in no box and no draft, so the press is
+  kept on the device (`chat-unsure:<chat id>` in drafts.js: its words, reply
+  mode, the recipients its line named, its key and Message-ID) and the
+  bubble **comes back after a reload**, in its place by time, until it is
+  accounted for: the mail shows in the thread (by `message_id`), the server
+  lists the send (by `message_id` or `request_key` — being sent, or failed
+  with its reason — and that bubble takes over, with the focus the old one
+  had), or the user asks. **Check again** posts the very same body under the
+  same key — but since a gateway that never had the key would *send* on that
+  request, it is held to what the press was held to: the recipients are
+  asked for first, and nothing is posted unless a reply in the press's mode
+  still reaches exactly whom the line named then ("Not asked: the thread has
+  changed …", and the bubble no longer offers the question). Its answer is
+  the mail (200), the pending bubble (202 `{pending}`), still unknown (202
+  `{unconfirmed}`), or the mail gateway's word on this very press (`"by":
+  "gateway"`, with `"sent": false` or a 4xx) — "Not sent: …", with the
+  words back in the box. Any other answer (the dashboard's own — a gateway
+  that could not be reached *now*, a sign-in that ran out —, a proxy, a
+  server too old to say `"by"`) is about the question, not the mail, and
+  leaves it unconfirmed. Check again is offered where the server echoed the
+  key, the body can be rebuilt (no attachments after a reload) and the press
+  is not older than twelve hours. Once asking has settled nothing, or cannot
+  be done, the bubble offers the two ways out a failed send has: **Copy
+  text back to the composer** and **Dismiss** (the page's own bubble;
+  nothing is asked of the server). Where the chat cannot be written to there
+  is no composer: the control reads **Copy text** and puts the words on the
+  clipboard, saying whether that worked; the bubble keeps them until it is
+  dismissed. A mail nobody can account for never ends in silence. The
+  record is shared by every tab on the chat: each tab writes it as it
+  stands, less what that tab let go, with its own mails in it — never its
+  own list alone, which would erase another tab's mail. What it holds is
+  read as data (a key that is none, a time before the epoch or ahead of the
+  clock are not used), and a record that still cannot be read leaves the
+  chat to open without those bubbles, the record kept.
 - **Pending sends.** A mail goes under its account's send policy, and a send
   the policy queues answers **202** `{pending}`: the optimistic bubble gives
   way at once to a **pending bubble** at the thread's end — the words, "You
@@ -521,11 +593,15 @@ docstring). Pieces:
   sent" with the server's reason (`error`, as text), or, with
   `outcome_unknown`, "Not confirmed — this mail may have gone out" — and two
   controls: **Copy text back to the composer** (after what the box holds,
-  never over it) and **Dismiss** (`POST
+  never over it; **Copy text**, to the clipboard, where the chat cannot be
+  written to) and **Dismiss** (`POST
   /chats/<id>/pending/<request id>/dismiss`; a refusal leaves the bubble
   with the reason). Recipients the mail server refused (`refused`) are named
-  on the pending bubble and on the sent mail's. A page left while a send was
-  on its way does not put a mail that was queued back into the box. A chat
+  on the pending bubble and on the sent mail's. An entry marked
+  `dismissed` is over — the gateway keeps one for a day so that its key
+  stays known — and is never drawn, whoever passes it on. A page left while
+  a send was on its way does not put a mail that was queued back into the
+  box. A chat
   in the list whose latest entry is a queued send previews it as "Waiting
   for approval: …" (or "Sending:", "Not sent:", "Not confirmed:" where
   `last.status` says so).
@@ -552,17 +628,41 @@ docstring). Pieces:
   the request is on its way nothing starts a second one — closing the sheet
   and opening it again brings back the same sheet, still sending — and a
   send that fails after the sheet was closed opens it again with what
-  happened. A refusal (4xx) shows as "Not sent: …" with everything still
-  there; an answer that leaves open whether the mail went out (202
-  `{unconfirmed}` without a chat, a 5xx, none) says exactly that, and the
-  press stays with the mail, so that sent again unchanged it goes out under
-  the same key. Closing keeps what the sheet holds on the device
-  (`compose:<channel>:<mailbox>` in drafts.js, with the unanswered press)
-  for the next opening **from that mailbox**: a kept mail never comes back
-  into a sheet writing from another one (a mailbox that is not offered at
-  the moment keeps its mail, and the sheet says so), and changes its sender
-  only where the user picks another mailbox under From. Discard empties it;
-  a send that went through drops it.
+  happened. The server's word that nothing went out — a 4xx, or any answer
+  with `"sent": false` — shows as "Not sent: …" with everything still
+  there, and ends the press where it is the mail gateway's (`"by":
+  "gateway"`; for a first press also one without `"by"`): the next one is a
+  new attempt under a new key. The dashboard's own keeps the key with the
+  mail, known to have sent nothing. A press made again under a key whose
+  outcome nobody knows, refused by anyone but the mail gateway, says that
+  the server could not be asked and that it is still not known whether the
+  first attempt went out, and keeps the key. An answer that leaves open
+  whether the mail went out (202 `{unconfirmed}` without a chat, a 5xx that
+  does not say `"sent": false`, none) says exactly that, and the press stays
+  with the mail, so that sent again unchanged within twelve hours (the chat
+  page's bound) it goes out under the same key; a press older than that is
+  dropped — the gateway knows a key for a day, and the same request would be
+  a second mail — and the sheet says only to look in the chat list before
+  sending it again, as a new mail. Closing keeps what the sheet
+  holds on the device (`compose:<channel>:<mailbox>` in drafts.js, with the
+  unanswered press) for the next opening **from that mailbox**: a kept mail
+  never comes back into a sheet writing from another one, and changes its
+  sender only where the user picks another mailbox under From. A mail kept
+  for another mailbox is not forgotten either: the index
+  (`compose:<channel>`: `{account, waiting}`) remembers which mailboxes hold
+  one beside the mailbox written from last, and every opening names each —
+  "It comes back when that mailbox can send again" for one that is not
+  offered now, "Choose that mailbox under From to go on with it" for one
+  that is — and opens on such a mailbox when the one written from last has
+  nothing waiting. A mail whose mailbox is not offered at all may never be
+  again, so the sheet shows it ("Show the mail from …": its recipients,
+  subject and words, as text) with **Copy into this mail** (into the form,
+  after what it holds — recipients joining the chips, its words after the
+  form's, its subject where the form has none — leaving from the mailbox
+  under From; the kept one goes) and **Discard it**. Every opening renews
+  each kept mail it names, so drafts.js never drops one for its age while
+  the sheet still speaks of it. Discard empties a mail; a send that went
+  through drops it.
 
 The API, as the components consume it:
 
@@ -834,11 +934,15 @@ The API, as the components consume it:
 
   Writing: `GET /chats/<id>/reply-preview` → `{all: Addressing, sender:
   Addressing, choice, subject}`, `Addressing` being `{to: [Party], cc:
-  [Party]}` and `Party` `{address, name, contact}` — exactly what a reply
-  would be addressed to right now in either mode, `name` the display name on
-  record or null, `contact` the address book's **name** for the person who
-  holds the address (a string, or `{name}`; a string that reads as an
-  identifier is not shown as a name), `choice` whether the two modes differ;
+  [Party]}` and `Party` `{address, name, contact, contact_id}` — exactly what
+  a reply would be addressed to right now in either mode, `name` the display
+  name on record or null, `contact` the address book's **name** for the
+  person who holds the address (a string, or `{name}`) and `contact_id` that
+  person's id (null for nobody's address: then there is no address-book
+  name). With `contact_id` in the answer the name is shown as it is filed,
+  also a lowercase one-word one ("mum"); only an answer without the field
+  can carry an id in `contact`, and a string that reads as an identifier is
+  then not shown as a name. `choice` is whether the two modes differ;
   `409`/`400` `{error}` where no reply is possible, and a `404` is taken as
   a server that cannot say (the page then sends no reply). `POST
   /chats/<id>/send` takes `reply: "all" | "sender"` and `request_key` (an
@@ -846,11 +950,18 @@ The API, as the components consume it:
   answers `200` with the Message (sent; `refused: [addresses]` where the
   mail server took only some recipients), `202 {pending: Pending}` (queued)
   or `202 {unconfirmed: true, message_id?, request_key}` (handed over,
-  outcome unknown), where `Pending` is `{request_id, approval_url, text, ts,
+  outcome unknown). An error answer is `{error, sent?, request_key?, by?}`:
+  a **4xx** (424 where the send failed for certain at the mail server) and
+  any status with **`"sent": false`** mean nothing went out with this
+  request; a 5xx without it means nobody knows. `by` says whose word that
+  is — `"gateway"` (the mail gateway's own answer, after it looked the key
+  up: the key is over) or `"dashboard"` (the web gateway's, the mail gateway
+  not having spoken: it says nothing about the key). `Pending` is `{request_id, approval_url, text, ts,
   author, agent?, to, cc, subject, message_id?, request_key?, status?,
-  error?, outcome_unknown?, refused?}` (`approval_url` path-only,
-  `/sends/<slug>/<id>`; `status` `pending` — the default — `sending` or
-  `failed`). `POST /chats/<id>/pending/<request id>/dismiss` takes a failed
+  error?, outcome_unknown?, refused?, dismissed?}` (`approval_url`
+  path-only, `/sends/<slug>/<id>`; `status` `pending` — the default —
+  `sending` or `failed`; an entry with `dismissed: true` is over and is not
+  drawn). `POST /chats/<id>/pending/<request id>/dismiss` takes a failed
   one off the list. `GET /chats/<id>/messages` carries top-level `pending:
   [Pending]` (oldest first; `[]` on other channels, and a document without
   the field leaves what the page shows), every mail Message `reply_to:
@@ -860,7 +971,7 @@ The API, as the components consume it:
   taken as nothing); `POST /chats/compose` `{channel, account?, to, cc,
   subject, text, request_key}` → `200 {id, message}`, `202 {id, pending}` or
   `202 {unconfirmed: true, id?, message_id?, request_key}`, an error
-  `{error}` with a 4xx otherwise. Mark as read, Archive and Delete on a mail
+  `{error, sent?, request_key?}` read as on a reply otherwise. Mark as read, Archive and Delete on a mail
   chat are the same calls as on every chat; the server carries them into the
   mailbox.
 
@@ -948,7 +1059,9 @@ load of this device and browser:
 - **Drafts** (`components/drafts.js`). Every composer, command bar and editor
   writes what it holds to `localStorage` as it changes (`retinue-draft:<key>`:
   `conv:<thread id | new | new:<project>>` for the conversation composer,
-  `chat:<chat id>` for a messenger chat's composer, `project-cmd:<id>` and
+  `chat:<chat id>` for a chat's composer, `chat-unsure:<chat id>` for a mail
+  chat's unconfirmed sends, `compose:<channel>[:<mailbox>]` for the new-mail
+  sheet, `project-cmd:<id>` and
   `project-edit:<id>` for a project's command bar and raw editor), and reads
   it back when its place opens again. Synchronous storage, so a write made as
   the page unloads (`pagehide`) is not lost; written on every change, so a page

@@ -28,9 +28,18 @@ One run is one mail. Each run names its request to the gateway with a key of
 its own, and the gateway answers a second request under the same key with
 what became of the first, sending nothing. So when no answer comes back (a
 timeout, a dropped connection) this asks once more, safely; and when it still
-does not know, it says so — "NOT KNOWN whether this mail was sent" — and
-prints the key: run the same command again with `--request-key <key>` to
-learn the outcome. Never send the mail anew to find out.
+does not know — also when the gateway can no longer be reached by then — it
+says so: "NOT KNOWN whether this mail was sent", with the key. Run the same
+command again with `--request-key <key>` to learn the outcome. Never send the
+mail anew to find out.
+
+What the answer to such a second request tells of happened earlier — the
+mail went out then, or was queued then — and this prints that it was a
+repeat: the run that asked sent nothing. Only a mail that went out, waits, or
+may have gone out keeps its key that way. A send that failed for certain is
+over (the gateway says nothing left it, and this prints "nothing was sent"):
+the same command again, with that key or without one, is a new attempt, and
+sends the mail.
 
 Examples:
     mail-push.py --chat 'email:~me@example.org:abc@x.org' --file /tmp/reply.txt
@@ -225,29 +234,47 @@ def main() -> int:
 
     try:
         answer = ask()
-        if answer is None:
-            # The gateway may be sending the mail right now. Asking again
-            # under the same key sends nothing a second time: it is told
-            # what became of the first request, or waits for it.
-            print("mail-push: no answer from the gateway yet; asking again about this "
-                  "same send (it is not sent twice)", file=sys.stderr)
-            answer = ask()
     except urllib.error.URLError as exc:
+        # The first request, and it never reached the gateway: nothing was
+        # asked, nothing sent.
         print(f"mail-push: could not reach gateway at {args.url}: {exc}", file=sys.stderr)
         return 1
+    gone = None
+    if answer is None:
+        # The gateway may be sending the mail right now. Asking again
+        # under the same key sends nothing a second time: it is told
+        # what became of the first request, or waits for it.
+        print("mail-push: no answer from the gateway yet; asking again about this "
+              "same send (it is not sent twice)", file=sys.stderr)
+        try:
+            answer = ask()
+        except urllib.error.URLError as exc:
+            # Not reachable NOW. That says nothing of the first request,
+            # which the gateway may have taken — and sent — before it went
+            # away: this is "not known", never "could not reach".
+            gone = exc
     unknown = (f"mail-push: it is NOT KNOWN whether this mail was sent. Do not send it "
                f"again as a new mail. Ask about this same send with the same arguments "
                f"plus --request-key {key} (that never sends a second time), or look in "
                f"the thread.")
     if answer is None:
-        print(f"mail-push: the gateway at {args.url} did not answer.", file=sys.stderr)
+        print(f"mail-push: the gateway at {args.url} did not answer"
+              + (f", and cannot be reached any more ({gone})." if gone is not None else "."),
+              file=sys.stderr)
         print(unknown, file=sys.stderr)
         return 1
     status, body = answer
+    # The gateway had this request before (the key it carries) and answers
+    # with what became of it then: nothing was sent, or queued, a second time.
+    repeat = ("mail-push: this is a repeat: the gateway had this request before, under "
+              "the same key, and answers with what became of it then — nothing was sent "
+              "or queued a second time" if body.get("repeat") is True else "")
     if 200 <= status < 300 and body.get("status") == "sending":
         # (Asked about again after the user allowed it: on its way.)
         print(f"mail-push: send {body.get('request_id', '?')} was approved and is "
               f"being sent")
+        if repeat:
+            print(repeat)
         return 0
     if 200 <= status < 300 and body.get("status") == "pending_approval":
         print(f"mail-push: send queued for approval (id={body.get('request_id', '?')})")
@@ -266,6 +293,8 @@ def main() -> int:
         if note:
             print(f"mail-push: {note}")
         _say_skipped(body)
+        if repeat:
+            print(repeat)
         return 0
     if 200 <= status < 300:
         print(f"mail-push: sent (message id {body.get('message_id', '?')}, "
@@ -275,10 +304,20 @@ def main() -> int:
             print(f"mail-push: the mail server refused {', '.join(map(str, refused))}; "
                   f"the mail went to the others")
         _say_skipped(body)
+        if repeat:
+            print(repeat)
         return 0
     print(f"mail-push: gateway returned {status}: {body.get('error', '')}", file=sys.stderr)
     if body.get("unconfirmed"):
         print(unknown, file=sys.stderr)
+    elif body.get("sent") is False:
+        # The gateway's word that nothing left it: this send is over, and
+        # the command run again — with this key or a new one — is a new
+        # attempt, not a second mail.
+        print("mail-push: nothing was sent. Running the command again is a new attempt.",
+              file=sys.stderr)
+    if repeat:
+        print(repeat, file=sys.stderr)
     return 1
 
 

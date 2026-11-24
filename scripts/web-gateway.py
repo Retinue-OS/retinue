@@ -204,8 +204,10 @@ Messenger chats (the deterministic chat mirror; see scripts/chat_state.py):
                                          channel. A ChatSummary carries
                                          their count as `pending`, and a
                                          new mail that is only queued is
-                                         listed by it (`last.pending`, and
-                                         `last.failed` where it failed).
+                                         listed by it (`last.pending`, with
+                                         that send's `last.status`; where it
+                                         failed, `last.failed` and
+                                         `last.outcome_unknown`).
   GET  /chats/<id>/reply-preview      -> to whom a reply in a mail thread
                                          goes right now, as its gateway
                                          addresses it: {all, sender: {to,
@@ -229,9 +231,13 @@ Messenger chats (the deterministic chat mirror; see scripts/chat_state.py):
                                          request_key, id?, message_id?}
                                          when the outcome is not known —
                                          never an error for a mail that may
-                                         have gone out. Gated like a send
-                                         (same-origin, through the reverse
-                                         proxy).
+                                         have gone out — and {error, sent:
+                                         false, by, request_key} (424, 502,
+                                         503 or the gateway's 4xx) for one
+                                         that certainly did not; every
+                                         refusal carries `by`, as a reply's.
+                                         Gated like a send (same-origin,
+                                         through the reverse proxy).
   GET  /chats/<id>/messages/<mid>/original
                                       -> a mail's original: {id, headers,
                                          header_block, text, html_url,
@@ -340,10 +346,25 @@ Messenger chats (the deterministic chat mirror; see scripts/chat_state.py):
                                          or lost answer of its gateway, an
                                          SMTP answer nobody saw) is 202
                                          {unconfirmed: true, request_key,
-                                         message_id?, since}, never a 5xx.
+                                         message_id?, since}, never a 4xx
+                                         or 5xx. A mail that certainly did
+                                         not go is {error, sent: false, by,
+                                         request_key}: 424 where its
+                                         gateway took the request and the
+                                         mail server would not have the
+                                         mail, 502 where the gateway was
+                                         never reached, 503 where it cannot
+                                         send. `by` says who said so —
+                                         "gateway" (the mail gateway's own
+                                         word, which ends what the key
+                                         names) or "dashboard" (this side,
+                                         which says nothing of the key).
                                          `request_key` (body) is the
                                          press's idempotency key: a repeat
-                                         of it sends nothing twice.
+                                         of it sends nothing twice, and is
+                                         only reconciled (nothing read; the
+                                         draft cleared only where it still
+                                         holds that press's words).
   POST /chats/<id>/companion          -> {"id"} the chat's companion thread —
                                          the conversation where the user works
                                          out a reply with Ara. Creates it on
@@ -443,9 +464,11 @@ import email.utils
 import fnmatch
 import hashlib
 import html
+import http.client
 import hmac
 import ipaddress
 import json
+import math
 import mimetypes
 import os
 import re
@@ -4584,17 +4607,27 @@ def _conv_mail_send_note(chat_id: str, doc: dict) -> list[str]:
             f"{sending} send{'s' if sending != 1 else ''} of this thread "
             f"{'are' if sending != 1 else 'is'} on the way out right now, the "
             "outcome not known yet. Do not send the same text again.")
-    failed = [q for q in queue if q.get("status") == "failed"]
+    # A send that ended without going out for certain is one of two things,
+    # and they are never one sentence: told "it failed", a session sends a
+    # mail again that the recipients may already hold.
+    ended = [q for q in queue if q.get("status") == "failed"]
+    unknown = sum(1 for q in ended if q.get("outcome_unknown") is True)
+    failed = len(ended) - unknown
     if failed:
-        unknown = any(q.get("outcome_unknown") for q in failed)
         lines.append(
-            f"{len(failed)} send{'s' if len(failed) != 1 else ''} of this thread "
+            f"{failed} send{'s' if failed != 1 else ''} of this thread "
             "failed (the thread shows each with the reason, until the user "
-            "dismisses it)"
-            + (" — and for at least one it is not known whether the mail went "
-               "out all the same" if unknown else "")
-            + ". Do not send such a text again unless the user asks for it, "
-            "knowing that.")
+            "dismisses it). Do not send such a text again unless the user asks "
+            "for it, knowing that.")
+    if unknown:
+        lines.append(
+            f"{unknown} send{'s' if unknown != 1 else ''} of this thread "
+            f"{'were' if unknown != 1 else 'was'} handed to the mail server and "
+            "never confirmed: it is not known whether "
+            f"{'they' if unknown != 1 else 'it'} went out (the thread shows "
+            "each, until the user dismisses it). That is not a send that did "
+            "not go: do not send such a text again unless the user, having "
+            "checked with the recipient or in the Sent folder, asks for it.")
     return lines
 
 
@@ -5986,13 +6019,36 @@ _MESSAGE_SEND_NOTES = {
     "rejected": "The message was discarded without sending.",
     "retracted": "The agent retracted this message before approval; nothing was sent.",
     "error": "The gateway could not deliver the message: ",
+    # An entry that ended as "error" and says its outcome is not known
+    # (`outcome_unknown`, _send_outcome_unknown): it may have gone out.
+    "unknown": "Not confirmed — it is not known whether this went out, so do not "
+               "send it again unchecked: ",
 }
+
+
+def _send_outcome_unknown(entry) -> bool:
+    """Whether a gateway's pending-send entry says that nobody knows whether
+    the send went out: status "error" with ``outcome_unknown`` true — the
+    mail gateway's "the mail server was handed this mail and its answer was
+    never seen". Every reader of an entry asks this before it words an
+    "error" as a failure (the chat's Pending, the approval page and its
+    status JSON, the note into the thread that queued the send): told "it
+    failed", a person or an agent sends the mail again, and the recipients
+    may then hold it twice."""
+    return (isinstance(entry, dict) and entry.get("status") == "error"
+            and entry.get("outcome_unknown") is True)
+
+
+def _send_unknown_note(notes: dict, error) -> str:
+    """The status page's sentence for a send whose outcome is not known."""
+    return (notes.get("unknown") or _MESSAGE_SEND_NOTES["unknown"]) + (
+        _one_line(error) or "the gateway could not say")
 
 
 def _render_send_status_html(*, title: str, heading: str, meta_rows: list[str],
                              body_html: str, status: str, notes: dict, error: str,
                              next_url: str | None, poll_url: str | None,
-                             thread: str | None = None) -> str:
+                             thread: str | None = None, unknown: bool = False) -> str:
     """Render the status page of a decided send — every channel, e-mail included,
     so all of them end the same way once the user has decided.
 
@@ -6008,8 +6064,15 @@ def _render_send_status_html(*, title: str, heading: str, meta_rows: list[str],
     request actually exists; a failure shows the gateway's real error and
     stays put so the user can read it.
 
+    `unknown` says an "error" entry is one whose outcome nobody knows
+    (_send_outcome_unknown): it is not shown as a failure — a question mark,
+    and the sentence that it may have gone out and is not to be sent again
+    unchecked — because "could not deliver" is what makes someone send it
+    a second time.
+
     `title` and `heading` come HTML-escaped; `notes` holds the pending, done,
-    rejected, retracted and error texts in the request's own terms.
+    rejected, retracted and error texts in the request's own terms (and
+    `unknown`, where they have one of their own).
     """
     if status == "sending":
         icon = '<div class="spin" role="status" aria-label="sending"></div>'
@@ -6023,6 +6086,12 @@ def _render_send_status_html(*, title: str, heading: str, meta_rows: list[str],
     elif status == "retracted":
         icon = '<div class="cross">✕</div>'
         note = notes["retracted"]
+    elif unknown:  # "error", and nobody knows whether it went out
+        # (A neutral disc, as sends.js draws it once a poll learns the same:
+        # never the cross, the mark of a send that did not go.)
+        icon = ('<div class="unsure" role="img" aria-label="not confirmed" '
+                'title="outcome not known">?</div>')
+        note = _send_unknown_note(notes, error)
     else:  # "error"
         icon = '<div class="cross">✕</div>'
         note = notes["error"] + (error or "unknown error")
@@ -6038,10 +6107,11 @@ def _render_send_status_html(*, title: str, heading: str, meta_rows: list[str],
           "  .spin{width:34px;height:34px;border:4px solid var(--line);"
           "border-top-color:var(--accent);border-radius:50%;animation:st-spin 1s linear infinite}\n"
           "  @keyframes st-spin{to{transform:rotate(360deg)}}\n"
-          "  .check,.cross{width:38px;height:38px;border-radius:50%;display:flex;"
+          "  .check,.cross,.unsure{width:38px;height:38px;border-radius:50%;display:flex;"
           "align-items:center;justify-content:center;font-size:1.35rem;font-weight:700}\n"
           "  .check{background:var(--ok);color:#0b0d12}\n"
           "  .cross{background:var(--high);color:#0b0d12}\n"
+          "  .unsure{border:2px solid var(--muted);box-sizing:border-box}\n"
           "</style>\n"
         + "<body>\n"
         + f"<h1>{heading}</h1>\n"
@@ -6058,7 +6128,12 @@ def _render_send_status_html(*, title: str, heading: str, meta_rows: list[str],
                                       ("data-note-done", notes["done"]),
                                       ("data-note-rejected", notes["rejected"]),
                                       ("data-note-retracted", notes["retracted"]),
-                                      ("data-note-error", notes["error"]))
+                                      ("data-note-error", notes["error"]),
+                                      # For an entry the status endpoint
+                                      # reports with `outcome_unknown`.
+                                      ("data-note-unknown",
+                                       notes.get("unknown") or _MESSAGE_SEND_NOTES["unknown"]),
+                                      ("data-unknown", "1" if unknown else None))
                   if value)
         + f'><div id="st-icon">{icon}</div>'
         + f'<p id="st-note" class="meta">{html.escape(note)}</p></div>\n'
@@ -6219,7 +6294,8 @@ def _render_channel_send_html(detail: dict, channel: str, request_id: str, next_
             title=f"{label_e} {noun} {rid}", heading=f"{label_e} {noun.lower()}",
             meta_rows=meta_rows, body_html=body_html, status=status, notes=notes,
             error=detail.get("error") or "", next_url=next_url,
-            poll_url=f"/sends/{channel}/{request_id}/status", thread=detail.get("thread"))
+            poll_url=f"/sends/{channel}/{request_id}/status", thread=detail.get("thread"),
+            unknown=_send_outcome_unknown(detail))
     return (
         _HTML_HEAD
         + f"<title>Retinue — Approve {label_e} {noun} {rid}</title>\n"
@@ -9481,16 +9557,22 @@ def _chats_payload() -> dict:
         queued = _chat_pending(doc) if mail else []
         if last is None and queued:
             # Nothing but a queued send: the chat is listed by it, and says
-            # that what it shows has not gone out — or, `failed`, that it
-            # did not: a new mail that failed stays listed until dismissed.
+            # that what it shows has not gone out and where it stands — the
+            # Pending's own `status`, and for one that ended without going
+            # out for certain (`failed`) whether it may have gone out all
+            # the same (`outcome_unknown`: "not confirmed", never "not
+            # sent"). A new mail that failed stays listed until dismissed.
             newest = queued[-1]
+            status = (newest.get("status")
+                      if newest.get("status") in chat_state_mod.PENDING_STATUSES else "pending")
             last = {"ts": newest.get("ts") or "", "direction": "out", "kind": "text",
                     "text": _preview_text(newest.get("text")),
                     "author": (newest.get("author")
                                if newest.get("author") in chat_state_mod.AUTHORS else "agent"),
-                    "removed": False, "pending": True}
-            if newest.get("status") == "failed":
+                    "removed": False, "pending": True, "status": status}
+            if status == "failed":
                 last["failed"] = True
+                last["outcome_unknown"] = newest.get("outcome_unknown") is True
         if last is None:
             continue
         # By arrival order as well: whatever has landed since the newest read
@@ -11168,7 +11250,19 @@ def _gateway_hop(gw: dict, path: str, payload: dict | None = None,
     timeout, a dropped connection, a body cut short — only once it has been
     and the answer was awaited. A caller for whom that difference is "nothing
     was asked" against "it may have been done" reads it there
-    (_mail_send)."""
+    (_mail_send).
+
+    An error answer is parsed **whole**, like any other: what a gateway says
+    with a 4xx or 5xx is fields a caller reads — a mail gateway's 502
+    {unconfirmed, outcome_unknown, message_id, chat} is the difference
+    between "it may have gone out" and "not sent", and with two real
+    Message-IDs in it that body is longer than any cut made for display.
+    Only a body that is no JSON at all (a proxy's page, a traceback) is
+    handed on as ``{"error": <its first characters>}``. A body that ended
+    before its ``Content-Length`` is no answer at all: it raises
+    (``http.client.IncompleteRead``, as a success's body does), and is not
+    handed on as a sentence — what was cut off may have been the very field
+    that said "it may have gone out"."""
     data = json.dumps(payload).encode("utf-8") if payload is not None else None
     headers = {"Content-Type": "application/json"} if data else {}
     headers.update(extra_headers or {})
@@ -11180,11 +11274,22 @@ def _gateway_hop(gw: dict, path: str, payload: dict | None = None,
         with urllib.request.urlopen(req, timeout=timeout or CHAT_SEND_TIMEOUT) as resp:
             return resp.status, json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
-        raw = exc.read().decode("utf-8", errors="replace")[:500]
+        body = exc.read(_GATEWAY_ERROR_BODY_MAX)
+        # read() with an amount returns what came, also where the body ended
+        # short of what its header promised — without raising.
+        length = str((exc.headers or {}).get("Content-Length") or "").strip()
+        if length.isdigit() and len(body) < min(int(length), _GATEWAY_ERROR_BODY_MAX):
+            raise http.client.IncompleteRead(body, int(length) - len(body)) from None
+        raw = body.decode("utf-8", errors="replace")
         try:
             return exc.code, json.loads(raw)
         except ValueError:
-            return exc.code, {"error": raw}
+            return exc.code, {"error": raw[:500]}
+
+
+# How much of a gateway's error answer is read before it is parsed: far more
+# than any JSON a gateway states, and a bound all the same.
+_GATEWAY_ERROR_BODY_MAX = 1 << 20
 
 
 # ── Send decisions reported back into the thread that queued them ─────────
@@ -11263,13 +11368,21 @@ def _report_send_decision(channel: str, request_id: str, entry: dict,
                           error: str | None = None) -> None:
     """Note the user's decision on a queued send in the thread that queued it.
 
-    `outcome` is "sent", "failed", "unconfirmed" (allowed, still sending when
-    the wait ran out) or "denied". A send without a (live) thread is not
-    reported — it was queued outside a dashboard turn. The user made this
-    decision themselves, so the note is a record, not news: it neither badges
-    nor wakes the thread, except a failed send, which the user has not seen
-    the end of — and a mail the server took for only some of its recipients,
-    which names those it refused.
+    `outcome` is "sent", "failed", "unknown" (allowed, handed over, and
+    nobody knows whether it went out), "unconfirmed" (allowed, still sending
+    when the wait ran out) or "denied". A send without a (live) thread is
+    not reported — it was queued outside a dashboard turn. The user made
+    this decision themselves, so the note is a record, not news: it neither
+    badges nor wakes the thread, except a failed send or one of unknown
+    outcome, which the user has not seen the end of — and a mail the server
+    took for only some of its recipients, which names those it refused.
+
+    **"unknown" is never worded as "failed"**: the note is replayed to the
+    session that queued the send, and an agent told that sending failed
+    queues it again — to recipients who may already hold it. It says what
+    is known (handed over, never confirmed) and what not to do. The
+    gateway's own sentence goes into the turn context only, as one bounded
+    line.
     """
     cid = send_origin.valid_thread(entry.get("thread"))
     if not cid or _load_conv(cid) is None:
@@ -11290,6 +11403,12 @@ def _report_send_decision(channel: str, request_id: str, entry: dict,
         text = (f"⚠️ You allowed {subject}, but "
                 + ("writing it" if noun == "event" else "sending it")
                 + f" failed: {error or 'unknown error'}")
+    elif outcome == "unknown":
+        text = (f"⚠️ You allowed {subject}. It was handed over and never confirmed: "
+                "it is not known whether it went out. Do not send it again before "
+                "checking — "
+                + ("the calendar shows whether it is there." if noun == "event" else
+                   "ask the recipient, or look for it in the Sent folder."))
     elif outcome == "unconfirmed":
         # The dashboard renderer links only absolute URLs.
         page = (f"[its approval page]({CONVERSATION_BASE_URL}/sends/{channel}/"
@@ -11301,14 +11420,19 @@ def _report_send_decision(channel: str, request_id: str, entry: dict,
     else:
         text = f"🚫 You denied {subject} — nothing was " + (
             "written." if noun == "event" else "sent.")
-    status = {"sent": "approved", "failed": "error",
+    status = {"sent": "approved", "failed": "error", "unknown": "error",
               "unconfirmed": "sending"}.get(outcome, "rejected")
     context = (f"Send decision on /sends: {channel}/{request_id} is {status}"
-               + (f" ({error})" if error else "")
+               + (" with its outcome unknown — it may have gone out; this is NOT a "
+                  "failed send and it must not be sent again unless the user, "
+                  "having checked, asks for that" if outcome == "unknown" else "")
+               + (f" ({_one_line(error, 300) if outcome == 'unknown' else error})"
+                  if error else "")
                + ". The user decided this on the approval page; nothing "
                "further is needed for it unless they ask.")
     # ... nor one that did not reach everyone it was for.
-    noticed = outcome == "failed" or (outcome == "sent" and text.startswith("⚠️"))
+    noticed = outcome in ("failed", "unknown") or (
+        outcome == "sent" and text.startswith("⚠️"))
     _conv_add_message(cid, "agent", text, unread=True if noticed else None,
                       wake=noticed, context=context)
     print(f"[web-gateway] send decision {channel}/{request_id} ({outcome}) "
@@ -11355,8 +11479,12 @@ def _await_channel_send_outcome(channel: str, gw: dict, request_id: str,
         if current.get("status") == "approved":
             _report_send_decision(channel, request_id, current, label, "sent")
         else:
-            _report_send_decision(channel, request_id, current, label, "failed",
-                                  error=str(current.get("error") or "") or None)
+            # "error" — which is a failure, or a send nobody knows the
+            # outcome of (_send_outcome_unknown): two different notes.
+            _report_send_decision(
+                channel, request_id, current, label,
+                "unknown" if _send_outcome_unknown(current) else "failed",
+                error=str(current.get("error") or "") or None)
     except Exception as exc:  # noqa: BLE001 - a report must never take the gateway down
         print(f"[web-gateway] reporting send decision {channel}/{request_id} "
               f"failed: {exc!r}", flush=True)
@@ -11511,6 +11639,10 @@ def _delete_conversation(cid: str, *, by_user: bool = False) -> bool:
     return existed
 
 
+# How much of a gateway's own sentence on a refused delete is passed on.
+CHAT_DELETE_REASON_MAX = 300
+
+
 def _delete_chat(chat_id: str) -> tuple[dict, str | None]:
     """Erase a chat from the whole system; ``(report, error)``.
 
@@ -11538,6 +11670,15 @@ def _delete_chat(chat_id: str) -> tuple[dict, str | None]:
     (`errors`), and the order holds here for the same reason it does there:
     this side erases nothing until the gateway has answered that all of it
     is done. `trashed` in the report says how many mails went.
+
+    A gateway that erased nothing says why, in a sentence of its own
+    (`error` beside `errors`: the mailbox has no Trash folder and which
+    variable names one; mails moved since the mirror last looked, try again
+    in a minute), and that sentence is the reason the user is given — the
+    remedy is in it, and "1 file(s) could not be erased" sends them to
+    retry what cannot succeed. It is a gateway's text and may repeat a
+    mail server's: one line, bounded (_one_line), and text — the answer is
+    JSON, and a page shows it as such, never as markup.
     """
     ref = chat_state_mod.split_chat_ref(chat_id)
     if ref is None:
@@ -11584,8 +11725,11 @@ def _delete_chat(chat_id: str) -> tuple[dict, str | None]:
         message_ids.update(str(x) for x in answer.get("message_ids") or [])
         errors = answer.get("errors")
         if not isinstance(errors, int) or errors:
-            # A 200 that says something stayed behind is not an erasure.
-            incomplete.append(f"{slug}: {errors!r} file(s) could not be erased")
+            # A 200 that says something stayed behind is not an erasure —
+            # for the gateway's own reason, where it gave one.
+            incomplete.append(f"{slug}: " + (
+                _one_line(answer.get("error"), CHAT_DELETE_REASON_MAX)
+                or f"{errors!r} file(s) could not be erased"))
         else:
             erased = True
     if incomplete or not erased:
@@ -11858,13 +12002,55 @@ def _chat_send_via_gateway(gw: dict, send_payload: dict) -> tuple[dict, str]:
 #     connection after the request was written, the gateway's own "handed to
 #     the mail server, answer never seen" (502 {unconfirmed: true}), and any
 #     answer nobody planned for. The browser is told 202 {unconfirmed}, never
-#     a 5xx.
+#     a 4xx or 5xx.
+#
+# **A send that certainly failed ends its press; only an unknown outcome
+# keeps its key.** What the browser is told for *failed* says so in two ways
+# a page can read without knowing this table — the body carries
+# ``"sent": false``, and the status is the one that fits:
+#
+#   400 / 409 / 413   the gateway's own word on what was typed, on a thread
+#                     that cannot be answered, on a mail too large;
+#   424               the gateway took the request and the mail did not go:
+#                     the SMTP server refused it, the login failed, the
+#                     gateway would not have it for a reason of its own —
+#                     its sentence is the error;
+#   503               the gateway cannot send, or could not queue;
+#   502               the gateway was never reached: nothing was asked.
+#
+# A page takes the words back for all of them and forgets the press's key:
+# the next press is a new one, with a new key, and is tried afresh. (The
+# mail gateway, for its part, treats a key whose send failed for certain as
+# unused; a page that kept the key would be answered just the same.) A 5xx
+# that does NOT carry ``"sent": false`` did not come from here — a proxy, a
+# crash — and proves nothing: the page keeps the key for it.
 #
 # Every send carries the idempotency key of the press that made it
 # (`request_key`, minted by the browser, or here for a caller that has none):
-# the gateway answers a repeat of a key it has seen with what it answered the
-# first time and sends nothing, so the same press can be retried safely.
+# the gateway answers a repeat of a key whose mail went out, waits or may
+# have gone out with what became of the first, and sends nothing — so the
+# same press can be retried safely.
+#
+# **A repeat is not a reply.** An answer the gateway gave from an earlier
+# entry ("this went out before") says so — ``"repeat": true`` — and is only
+# reconciled here: the Message or the Pending is returned and the chat's
+# copy of the queue brought in line, and nothing else is done. No draft is
+# cleared (the words of that press left the composer when it was made; what
+# stands there now was typed since), no read mark is advanced, no attention
+# item settled and the mailbox is told nothing: the mail went out earlier,
+# the rail did all of that then, and what has arrived since has not been
+# answered by anyone. A gateway built before it said "repeat" is read by
+# what its answer proves (_mail_repeated): the chat knew that Message-ID
+# before this request began, or the instant the gateway gives for the mail
+# lies before it.
 MAIL_SEND_TIMEOUT = float(os.environ.get("MAIL_SEND_TIMEOUT", "120"))
+# The status a mail that certainly did not go is answered with, where the
+# gateway took the request and the send then failed (see the table above).
+MAIL_SEND_FAILED_STATUS = 424
+# How far before the moment a /send was asked the instant a gateway gives
+# for the mail must lie, for the answer to be read as a repeat's: the two
+# clocks are one machine's, and an entry's time is kept to the second.
+MAIL_REPEAT_SLACK_SECONDS = 2.0
 
 
 def _one_line(value, limit: int = 500) -> str | None:
@@ -11893,9 +12079,25 @@ def _mail_send(gw: dict, send_payload: dict) -> dict:
     - ``{"outcome": "pending", "answer": <its 202>}`` — queued, and left so
     - ``{"outcome": "unconfirmed", "message_id", "chat", "note"}`` — it may
       have gone out; the id and the chat key where the gateway named them
-    - ``{"outcome": "failed", "status", "error"}`` — nothing left; the
-      status to answer with and one sentence, the gateway's own where it
-      gave one
+    - ``{"outcome": "failed", "status", "error", "by"}`` — nothing left;
+      the status to answer with, one sentence — the gateway's own where it
+      gave one — and who said so (``by``): ``"gateway"`` where the mail
+      gateway answered this send itself, which it does only once it has
+      looked up the key (a refusal, 400/409/413, or a 5xx that says
+      ``"sent": false``) — its word on the key as well; ``"dashboard"``
+      where it said nothing about the send: never reached, or a status it
+      answers before it reads one (401, a route it does not have) or that
+      something in front of it gave. Only the first ends what the key
+      names: the outcome of an earlier request under that key is as open
+      as it was (docs/mail-chats.md, "Writing").
+
+    A 5xx is "failed" **only** on the gateway's explicit ``"sent": false``:
+    its 502 is also the answer of a mail handed over and not confirmed, so
+    one without that word — a proxy's, a body cut short or no JSON, an
+    older gateway's — is "unconfirmed", never told apart by its wording.
+
+    The first three carry ``repeat``: the gateway's word that it answered
+    from an earlier send of the same key and made none now.
 
     Never raises."""
     def unconfirmed(answer: dict | None = None, why: str = "") -> dict:
@@ -11907,13 +12109,14 @@ def _mail_send(gw: dict, send_payload: dict) -> dict:
         return {"outcome": "unconfirmed",
                 "message_id": mid.strip() or None if isinstance(mid, str) else None,
                 "chat": chat.strip() or None if isinstance(chat, str) else None,
-                "note": _one_line(answer.get("error"))}
+                "note": _one_line(answer.get("error")),
+                "repeat": answer.get("repeat") is True}
 
     try:
         status, answer = _gateway_hop(gw, "/send", send_payload, timeout=MAIL_SEND_TIMEOUT)
     except urllib.error.URLError as exc:
         # Before the request was written: the gateway was asked nothing.
-        return {"outcome": "failed", "status": 502,
+        return {"outcome": "failed", "status": 502, "by": "dashboard",
                 "error": f"The mail gateway could not be reached ({exc.reason}); "
                          "nothing was sent."}
     except Exception as exc:  # noqa: BLE001 - after it was written: nobody knows
@@ -11921,21 +12124,133 @@ def _mail_send(gw: dict, send_payload: dict) -> dict:
     if not isinstance(answer, dict):
         answer = {}
     state = answer.get("status")
+    repeat = answer.get("repeat") is True
     if status == 200 and state == "sent":
-        return {"outcome": "sent", "answer": answer}
+        return {"outcome": "sent", "answer": answer, "repeat": repeat}
     if state == "pending_approval":
-        return {"outcome": "pending", "answer": answer}
+        return {"outcome": "pending", "answer": answer, "repeat": repeat}
     if answer.get("unconfirmed") is True or answer.get("outcome_unknown") is True:
         return unconfirmed(answer, f"the gateway said so, HTTP {status}")
+    if status == 202 and state == "sending":
+        # A queued mail the user has allowed, asked for again while it is
+        # being sent: on its way, by the gateway's own word.
+        return unconfirmed(answer, "allowed and being sent")
     said = _one_line(answer.get("error"))
-    if 400 <= status < 500 or status == 503 or (status == 502 and said):
+    if status in (400, 409, 413) or (status >= 500 and answer.get("sent") is False):
         # The gateway's own refusal, in its own sentence. Its status where
         # that is the user's to read (what they typed, a thread that cannot
-        # be answered, a gateway that cannot send); a 502 for the rest.
-        return {"outcome": "failed",
-                "status": status if status in (400, 409, 413, 503) else 502,
+        # be answered, a gateway that cannot send); for the rest — the SMTP
+        # server's no, a send that failed before anything was handed over —
+        # the one status that says "taken, and it did not go".
+        return {"outcome": "failed", "by": "gateway",
+                "status": status if status in (400, 409, 413, 503)
+                else MAIL_SEND_FAILED_STATUS,
                 "error": said or f"The mail gateway refused the mail (HTTP {status})."}
+    if 400 <= status < 500:
+        # Not sent by this request — and nothing said about the send: a
+        # status the gateway answers before it reads one (its token, a
+        # route it does not have), or one from whatever stands in front
+        # of it. As far as the key goes, it was not asked.
+        return {"outcome": "failed", "by": "dashboard", "status": 502,
+                "error": f"The mail gateway did not take the request (HTTP {status}"
+                         + (f": {said}" if said else "") + "); nothing was sent."}
     return unconfirmed(answer, f"an answer nobody planned for, HTTP {status}")
+
+
+def _mail_not_sent(sent: dict, request_key: str | None) -> dict:
+    """The body a mail that certainly did not go is answered with (_mail_send's
+    "failed"): the sentence, ``"sent": false``, who said so (``by``) and the
+    key it was made under. ``"sent": false`` says that this request sent
+    nothing; ``"by": "gateway"`` alone says the same of the key — that the
+    press is over and its key with it (decision H, docs/mail-chats.md)."""
+    return {"error": sent["error"], "sent": False, "by": sent["by"],
+            "request_key": request_key}
+
+
+# Who answered a mail send "not sent" without the mail gateway's word on it
+# (_mail_send's ``by``): the web gateway itself — the request was refused
+# here, or never reached the mail gateway. Merged into every such answer of
+# POST /chats/<id>/send (for a mail chat) and POST /chats/compose.
+_BY_DASHBOARD = {"by": "dashboard"}
+
+
+def _clear_pressed_draft(chat_id: str, text: str, repeat: bool) -> None:
+    """The shared draft, once a press's mail is with its gateway (sent,
+    queued, or on its way): cleared — the words left the composer.
+
+    On a repeat, only where the draft still holds this press's words
+    (decision I). A page whose answer to the first request was lost put the
+    words back into the box, and its autosave made them the shared draft
+    again; left there, the next opening, another device or an agent would
+    be handed a mail that has gone out, to send a second time. A draft
+    that holds other words was written since, and stays.
+
+    A repeat of the press, that is — not only of its mail: ``repeat`` is
+    also a request under a key the chat knew before it (_press_known),
+    whatever the gateway made of it. "Check again" on a send that failed
+    for certain since is a new attempt there, and goes out now; the draft
+    typed in the meantime is no part of it. A first press clears the
+    draft whatever it holds: the box may have been sent before its last
+    words were saved."""
+    _CHAT_STATE.clear_draft(chat_id, only_text=text if repeat else None)
+
+
+def _press_known(chat_id: str, request_key: str | None) -> bool:
+    """Whether the chat's copy of the queue holds a send under this press's
+    key — made by an earlier request of the same press, whatever became of
+    it. Asked before the request goes to the gateway, which may note the
+    send anew."""
+    return bool(request_key) and any(p.get("request_key") == request_key
+                                     for p in _chat_pending(_CHAT_STATE.get(chat_id)))
+
+
+def _epoch(value) -> float | None:
+    """An instant a gateway stated — seconds since the epoch, or ISO 8601 —
+    as seconds; None for what names none."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value) if math.isfinite(value) and value > 0 else None
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        when = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    return when.timestamp()
+
+
+def _mail_repeated(chat_id: str | None, sent: dict, asked_at: float, *,
+                   message_id=None, instant=None) -> bool:
+    """Whether a /send asked at ``asked_at`` was answered from an earlier
+    send of the same key — a repeat, which is reconciled and nothing more
+    (see above) — and not by a mail made for this request.
+
+    The gateway's own word where it gives it (``repeat``). For one that
+    does not, what its answer proves:
+
+    - ``instant``, the time it gives for the mail — when it was sent, or
+      when its entry was made — lies before this request began;
+    - the chat knew ``message_id`` before this request began: as a mail (the
+      overlay, by the first time it saw it) or as a send in its copy of the
+      queue (by when that was noted). *Before* is the point: the rail may
+      announce a mail, and a page's poll may list its send, while the
+      request that made it is still waiting for its answer."""
+    if sent.get("repeat") is True:
+        return True
+    when = _epoch(instant)
+    if when is not None and when < asked_at - MAIL_REPEAT_SLACK_SECONDS:
+        return True
+    if not chat_id or not isinstance(message_id, str) or not message_id.strip():
+        return False
+    first = _CHAT_OVERLAY.first_seen(chat_id, message_id)
+    if first is not None and first < asked_at:
+        return True
+    return any(p.get("message_id") == message_id
+               and isinstance(p.get("noted"), (int, float)) and p["noted"] < asked_at
+               for p in _chat_pending(_CHAT_STATE.get(chat_id)))
 
 
 # ── Queued sends in the chat (docs/mail-chats.md, "Writing") ─────────────────
@@ -12027,6 +12342,7 @@ def _pending_from_entry(slug: str, entry: dict, **known) -> dict:
     # "error" is a send that failed — with its sentence, and whether the mail
     # may have gone out all the same.
     failed = entry.get("status") == "error"
+    unknown = _send_outcome_unknown(entry)
     pending = {
         "request_id": request_id,
         "approval_url": f"/sends/{slug}/{request_id}",
@@ -12042,9 +12358,12 @@ def _pending_from_entry(slug: str, entry: dict, **known) -> dict:
         "request_key": entry.get("request_key"),
         "status": "failed" if failed else (
             "sending" if entry.get("status") == "sending" else "pending"),
+        # (An entry that gives no sentence is given one here — and never
+        # "failed", of a mail that may have gone out.)
         "error": (entry.get("error") if isinstance(entry.get("error"), str) and entry["error"].strip()
+                  else "it is not known whether the mail went out" if unknown
                   else "the send failed") if failed else None,
-        "outcome_unknown": failed and entry.get("outcome_unknown") is True,
+        "outcome_unknown": unknown,
         "refused": addresses("refused"),
     }
     pending.update(known)
@@ -12082,10 +12401,12 @@ def _gateway_queue(slug: str, gw: dict, chat_key: str | None = None) -> list[dic
         _pending_scan_failed.pop(slug, None)
     entries = body.get("pending") if isinstance(body, dict) else None
     # Only what is not over, and — asked about one chat — only that chat's,
-    # whatever a gateway that does not know the filter answers.
+    # whatever a gateway that does not know the filter answers. A dismissed
+    # entry is over (_pending_ended), also on a list that still names it.
     return [e for e in entries or []
             if isinstance(e, dict)
             and (e.get("status") or "pending") in ("pending", "sending", "error")
+            and e.get("dismissed") is not True
             and (chat_key is None or e.get("chat") == chat_key)]
 
 
@@ -12150,7 +12471,19 @@ def _pending_ended(slug: str, gw: dict, chat_id: str, held: dict) -> tuple[dict 
     chat — _note_refused), denied, retracted or dismissed. It is asked after
     all the same, because the other answers must not be lost on a list that
     left the entry out: one still being sent, or failed, stays in the chat
-    as that. A gateway that cannot say leaves the entry as it is."""
+    as that. A gateway that cannot say leaves the entry as it is.
+
+    **A dismissed entry is over**, whichever way the gateway says so. A
+    send that failed for certain is removed when it is dismissed — by the
+    user, or by the gateway itself when a direct send failed for certain
+    and its caller has that as the answer — and so is one a new attempt
+    under its `request_key` replaced: asked by id, it answers 404
+    ("gone"). Only a send of unknown outcome that named its request is
+    kept, marked, for as long as its key is remembered — not listed, and
+    still answered by id as status "error", ``dismissed: true``
+    ("dismissed"), whatever else it says. Read as a failure, such an entry
+    would stand in the chat as a failed bubble the user had already put
+    away, and come back with every poll."""
     request_id = str(held.get("request_id") or "")
     try:
         with _gateway_request(gw, "/pending-sends/" + urllib.parse.quote(request_id, safe=""),
@@ -12163,6 +12496,8 @@ def _pending_ended(slug: str, gw: dict, chat_id: str, held: dict) -> tuple[dict 
     if not isinstance(entry, dict):
         return held, "unknown"
     status = str(entry.get("status") or "")
+    if entry.get("dismissed") is True:
+        return None, "dismissed"
     if status in ("pending", "sending", "error"):
         return _pending_from_entry(slug, {**entry, "request_id": request_id}), status
     if status == "approved":
@@ -12177,7 +12512,8 @@ def _pending_unlisted(slug: str, gw: dict, chat_id: str, listed: list[dict],
                       asked: float, budget: list[int]) -> tuple[list[dict], bool]:
     """The entries of a chat's copy that its gateway's queue, asked at
     ``asked``, did not list, each as _pending_ended found it: ``(those the
-    copy keeps, whether one was denied or retracted)``. An entry noted since
+    copy keeps, whether one was denied, retracted, dismissed or is gone)``.
+    An entry noted since
     the queue was asked is not looked at (ChatStateStore.set_pending keeps
     it), and at most ``budget[0]`` are asked after — the rest stand until
     the next look."""
@@ -12195,7 +12531,13 @@ def _pending_unlisted(slug: str, gw: dict, chat_id: str, listed: list[dict],
         entry, how = _pending_ended(slug, gw, chat_id, held)
         if entry is not None:
             kept.append(entry)
-        ended = ended or how in ("rejected", "retracted")
+        # (Each of these can be the end of a chat that was nothing but that
+        # mail: _forget_unsent_chat, which looks for itself. "gone" too: the
+        # gateway removes a send that failed for certain when it is
+        # dismissed — by the user, or by itself, the failure being the
+        # answer its caller has — and one a new attempt under its key
+        # replaced.)
+        ended = ended or how in ("rejected", "retracted", "dismissed", "gone")
     return kept, ended
 
 
@@ -12252,6 +12594,49 @@ def _reconcile_chat_pending(chat_id: str) -> list[dict]:
             if ended and _forget_unsent_chat(chat_id):
                 doc = _CHAT_STATE.get(chat_id)
     return [_pending_public(p) for p in _chat_pending(doc)]
+
+
+def _settle_failed_press(chat_id: str, request_key: str | None) -> None:
+    """A press's mail failed for certain, by its gateway's own answer: the
+    chat does not go on showing that send as under way.
+
+    A direct send is listed in the gateway's queue while its SMTP session
+    lasts, so a page's poll during it has put the entry into the chat's copy
+    as *sending*. The answer to the press is the word on it — the composer
+    has the words back — and the gateway has removed the entry (its own
+    dismissal of a send that failed for certain: asked by id, it is
+    "gone"). The copy is brought in line at once (the next poll would
+    find the same: _pending_ended), by asking the gateway — never by taking
+    out whatever carries the key: an earlier send under it that may have
+    gone out stays, as the gateway has it."""
+    if request_key and any(p.get("request_key") == request_key
+                           for p in _chat_pending(_CHAT_STATE.get(chat_id))):
+        try:
+            _reconcile_chat_pending(chat_id)
+        except Exception as exc:  # noqa: BLE001 - the answer to the press stands
+            print(f"[web-gateway] pending sends of {chat_id} not reconciled after a "
+                  f"failed send ({exc})", flush=True)
+
+
+def _settle_failed_new_mail(account: str, request_key: str | None) -> None:
+    """A new mail failed for certain, by its gateway's own answer: as
+    _settle_failed_press, for the chat the press would have made.
+
+    That chat is named by the Message-ID the gateway minted, which the
+    answer of a failure does not carry; but where a poll of the chat list
+    noted the send while its SMTP session lasted, that chat exists — made of
+    nothing but this send (``unsent``) — and its copy of the queue holds the
+    press's key. Brought in line, it is forgotten with the send
+    (_forget_unsent_chat): no list would show it again, and its state would
+    keep the subject and every recipient for good."""
+    if not request_key or not account:
+        return
+    own = account.lower()
+    for chat_id, doc in _CHAT_STATE.all().items():
+        ref = chat_state_mod.split_chat_ref(chat_id)
+        if (ref and _is_mail(ref[0]) and (ref[1] or "").lower() == own
+                and any(p.get("request_key") == request_key for p in _chat_pending(doc))):
+            _settle_failed_press(chat_id, request_key)
 
 
 def _sync_pending_sends() -> int:
@@ -16183,16 +16568,18 @@ class Handler(BaseHTTPRequestHandler):
                   f"user press send.", flush=True)
         return ok, reason
 
-    def _chat_id_or_404(self, raw: str) -> str | None:
+    def _chat_id_or_404(self, raw: str, said: dict | None = None) -> str | None:
+        """The chat id a path names, or None once a 404 (no chat id) or a
+        410 (a merged chat) was answered — each with ``said`` merged in."""
         chat_id = _chat_id_from_path(raw)
         if chat_id is None:
-            self._send_json(404, {"error": "not a chat id"})
+            self._send_json(404, {"error": "not a chat id", **(said or {})})
             return None
-        if self._answered_merged(chat_id):
+        if self._answered_merged(chat_id, said):
             return None
         return chat_id
 
-    def _answered_merged(self, chat_id: str) -> bool:
+    def _answered_merged(self, chat_id: str, said: dict | None = None) -> bool:
         """Answer 410 for the id of a chat that was folded into another (two
         mail threads a later mail linked — _merge_chats): ``{error, id,
         merged_into, messages}``, the surviving chat's id and where its
@@ -16215,7 +16602,7 @@ class Handler(BaseHTTPRequestHandler):
             return False
         self._send_json(410, {"error": "this chat is part of another one now",
                               "id": chat_id, "merged_into": into,
-                              "messages": _chat_messages_url(into)})
+                              "messages": _chat_messages_url(into), **(said or {})})
         return True
 
     def _handle_chats_list(self) -> None:
@@ -17198,16 +17585,39 @@ class Handler(BaseHTTPRequestHandler):
         (_answer_unconfirmed_mail); nothing is marked read, since no reply
         is known to have been made — the rail says so when it was. `request_key` is the
         press's idempotency key (body `request_key`, minted by the page):
-        the same press, retried with it, sends nothing twice."""
-        chat_id = self._chat_id_or_404(raw_id)
+        the same press, retried with it, sends nothing twice.
+
+        A mail that certainly did not go answers **{"error", "sent": false,
+        "by", "request_key"}** — 424 where the gateway took the request and
+        the mail was not sent, the gateway's own 400/409/413/503, 502 where
+        it was never reached (_mail_send): the draft stays. ``by`` says who
+        said so, and with it whether the press is over: ``"gateway"`` — the
+        mail gateway's own word, which ends what the key names too — or
+        ``"dashboard"``, this side's, which says nothing of an earlier
+        request under the key; every refusal this handler makes itself for
+        a mail chat carries the latter. And **a repeat is not a reply**: the
+        same press answered again from the mail it sent earlier
+        (_mail_repeated) returns that Message and brings the chat's copy of
+        the queue in line — nothing is marked read, no attention item is
+        settled and the mailbox is told nothing; the draft is cleared only
+        where it still holds this press's words (_clear_pressed_draft) — as
+        it is on any answer to a press made before (_press_known), a new
+        attempt at the gateway included."""
+        # (Every "not sent" this side answers a mail chat by itself says so:
+        # "by": "dashboard" — _mail_send. A messenger's answers are as they
+        # were.)
+        chat_id = self._chat_id_or_404(raw_id, _BY_DASHBOARD)
         if chat_id is None:
             return
+        channel, account, key = chat_state_mod.split_chat_ref(chat_id)
+        mail = _is_mail(channel)
+        by = _BY_DASHBOARD if mail else {}
         # Another site's page can make the browser POST here through the proxy
         # with the user's credentials (a text/plain form body that is valid
         # JSON needs no preflight), and its peer is then the proxy's: the edge
         # gate below cannot tell it from the send press.
         if not self._claude_auth_same_origin():
-            self._send_json(403, {"error": "cross-site request rejected"})
+            self._send_json(403, {"error": "cross-site request rejected", **by})
             return
         ok, reason = self._request_from_edge(f"chat send to {chat_id}")
         if not ok:
@@ -17218,30 +17628,29 @@ class Handler(BaseHTTPRequestHandler):
                 "remedy": "To propose a message, stage it as the chat's shared "
                           "draft (scripts/chat-draft.py) and let the user press "
                           "send.",
+                **by,
             })
             return
         payload = self._read_json_body()
         if payload is None:
-            self._send_json(400, {"error": "invalid JSON"})
+            self._send_json(400, {"error": "invalid JSON", **by})
             return
         text = (payload.get("text") or "").strip()
-        images = self._read_send_attachments(payload)
+        images = self._read_send_attachments(payload, by)
         if images is None:
             return
         if not text and not images:
-            self._send_json(400, {"error": "empty text"})
+            self._send_json(400, {"error": "empty text", **by})
             return
-        channel, account, key = chat_state_mod.split_chat_ref(chat_id)
-        mail = _is_mail(channel)
         reply = payload.get("reply")
         if mail and reply is not None and reply not in ("all", "sender"):
-            self._send_json(400, {"error": "reply must be \"all\" or \"sender\""})
+            self._send_json(400, {"error": "reply must be \"all\" or \"sender\"", **by})
             return
         request_key = None
         if mail:
             request_key, key_error = _mail_request_key(payload)
             if key_error:
-                self._send_json(400, {"error": key_error})
+                self._send_json(400, {"error": key_error, **by})
                 return
         doc = _CHAT_STATE.get(chat_id)
         slug, gw, route_error = _chat_gateway(doc, channel, account)
@@ -17250,7 +17659,7 @@ class Handler(BaseHTTPRequestHandler):
             # worse than not sending at all — see _chat_gateway.
             print(f"[web-gateway] refusing chat send to {chat_id}: {route_error}",
                   flush=True)
-            self._send_json(409, {"error": route_error})
+            self._send_json(409, {"error": route_error, **by})
             return
         send_payload = {
             "recipient": key,
@@ -17279,42 +17688,65 @@ class Handler(BaseHTTPRequestHandler):
         asked_at = time.time()
         since = chat_state_mod.iso_z(asked_at - CHAT_UNCONFIRMED_SKEW_SECONDS)
         if mail:
+            # (Whether this press was made before, for the draft: asked now,
+            # before the send is noted anew.)
+            again = _press_known(chat_id, request_key)
             sent = _mail_send(gw, send_payload)
             if sent["outcome"] == "failed":
                 # Nothing left (_mail_send): the gateway's own refusal — the
-                # thread has no mail left to reply to, it cannot send — in
-                # its own sentence, or a gateway that was never reached. The
-                # draft stays in the composer.
-                if sent["status"] >= 500:
+                # thread has no mail left to reply to, it cannot send, the
+                # SMTP server would not take the mail — in its own sentence,
+                # or a gateway that was never reached. The draft stays in
+                # the composer: "sent": false, and who said so ("by").
+                if sent["status"] >= 500 or sent["status"] == MAIL_SEND_FAILED_STATUS:
                     # What the chat says of its gateway (`can_send`) is from
                     # its last report; a send that failed is a reason to ask
                     # again.
                     _gateway_identity(slug, gw, refresh=True)
-                self._send_json(sent["status"], {"error": sent["error"],
-                                                 "request_key": request_key})
+                if sent["status"] == MAIL_SEND_FAILED_STATUS:
+                    _settle_failed_press(chat_id, request_key)
+                self._send_json(sent["status"], _mail_not_sent(sent, request_key))
                 return
             if sent["outcome"] == "pending":
                 # Queued under the mailbox's send policy, and left queued.
                 # The words are in the queue now — the composer lets go of
                 # them — but no reply has been made: the read mark and the
                 # attention item stay as they are until the mail goes out.
+                # (Whether the chat knew this send before, asked before it
+                # is noted anew.)
+                repeat = _mail_repeated(chat_id, sent, asked_at,
+                                        message_id=sent["answer"].get("message_id"))
                 pending = self._note_queued_send(chat_id, slug, gw, sent["answer"], text)
                 if pending is None:
                     self._send_json(502, {"error": "the gateway queued the send but "
                                                    "named no usable request id"})
                     return
-                _CHAT_STATE.clear_draft(chat_id)
+                repeat = repeat or _mail_repeated(chat_id, sent, asked_at,
+                                                  instant=pending.get("ts"))
+                # (A repeat: the mail was queued by an earlier request of
+                # this press — but where that answer was lost, the page put
+                # the words back into the box and saved them as the draft
+                # again. A draft that still holds them goes; one written
+                # since stays: _clear_pressed_draft.)
+                _clear_pressed_draft(chat_id, text, repeat or again)
                 print(f"[web-gateway] chat send to {chat_id} via {slug} waits for "
-                      f"approval ({pending['request_id']})", flush=True)
+                      f"approval ({pending['request_id']})"
+                      + (" — a repeat, answered from its entry" if repeat else ""), flush=True)
                 self._send_json(202, {"pending": pending})
                 return
             if sent["outcome"] == "unconfirmed":
                 self._answer_unconfirmed_mail(chat_id, slug, gw, sent, text=text,
-                                              request_key=request_key, since=since)
+                                              request_key=request_key, since=since,
+                                              asked_at=asked_at, again=again)
                 return
             result = {"message_id": sent["answer"].get("message_id"),
                       "ts": sent["answer"].get("ts"),
                       "attachments": sent["answer"].get("attachments") or []}
+            # A repeat is not a reply (_mail_repeated) — asked before the
+            # chat's copy of this send is dropped, which is one of the things
+            # that say so.
+            repeat = _mail_repeated(chat_id, sent, asked_at,
+                                    message_id=result["message_id"], instant=result["ts"])
             _note_refused(chat_id, sent["answer"])
             # The same press, answered again after an answer nobody saw (its
             # key): what the chat held as being sent is this mail.
@@ -17329,6 +17761,7 @@ class Handler(BaseHTTPRequestHandler):
             if send_error:
                 self._send_json(502, {"error": send_error})
                 return
+            repeat = again = False
         message_id = (str(result.get("message_id") or "").strip() or None)
         unconfirmed = bool(result.get("unconfirmed"))
         # With no confirmation there is no channel instant either, so this is
@@ -17371,6 +17804,24 @@ class Handler(BaseHTTPRequestHandler):
             refused = (_CHAT_STATE.get(chat_id).get("refused") or {}).get(message_id or "")
             if refused:
                 msg["refused"] = list(refused)
+        if repeat:
+            # The same press, answered again from the mail it sent earlier:
+            # reconciled, and nothing more. The page gets its Message and
+            # the chat shows it (the overlay, unless it has the mail — the
+            # rail's fuller word of it is not written over). The read mark,
+            # the attention item and the mailbox are as they are: the rail
+            # saw to them when the mail went out, and nobody has answered
+            # what arrived since. The draft goes only where it still holds
+            # this mail's words (_clear_pressed_draft).
+            if _CHAT_OVERLAY.first_seen(chat_id, message_id) is None:
+                _CHAT_OVERLAY.insert(entry)
+            _clear_pressed_draft(chat_id, text, repeat)
+            _chats_cache_invalidate()
+            print(f"[web-gateway] chat send to {chat_id} via {slug}: a repeat of a press "
+                  f"whose mail went out before ({message_id}); nothing was sent",
+                  flush=True)
+            self._send_json(200, msg)
+            return
         if unconfirmed:
             # The client keeps its optimistic bubble rather than trusting this
             # id, and reconciles it against the first outbound record from
@@ -17389,7 +17840,9 @@ class Handler(BaseHTTPRequestHandler):
         # on under the account that actually holds it.
         _CHAT_OVERLAY.insert({**entry, "unconfirmed": unconfirmed,
                               "since": since if unconfirmed else None})
-        _CHAT_STATE.clear_draft(chat_id)
+        # (A messenger's draft: cleared, as ever. A mail's: as on a repeat,
+        # where an earlier request of this press was made — _press_known.)
+        _clear_pressed_draft(chat_id, text, again)
         # Written here and now, in answer to everything the chat held —
         # whatever instant the channel stamps the send with.
         _CHAT_STATE.advance_last_read(chat_id, ts, everything=True)
@@ -17411,7 +17864,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def _answer_unconfirmed_mail(self, chat_id: str | None, slug: str, gw: dict,
                                  sent: dict, *, text: str, request_key: str,
-                                 since: str) -> None:
+                                 since: str, asked_at: float, again: bool = False) -> None:
         """Answer a mail send whose outcome nobody knows (_mail_send):
         **202 {"unconfirmed": true, "request_key", "since", "message_id"?,
         "id"?, "note"?}** — never an error, which would hand the words back
@@ -17433,19 +17886,28 @@ class Handler(BaseHTTPRequestHandler):
 
         **No message is made of it**: a mail that is not known to have gone
         out is no entry of the thread, and showing one would tell the page
-        it had. The draft is cleared — the words are with the gateway.
-        Nothing is marked read and no reply is noted: the rail does both
-        when the mail goes out, and neither if it never did."""
+        it had. The draft is cleared — the words are with the gateway; on a
+        repeat (``asked_at`` is when the /send was asked; _mail_repeated) —
+        or where an earlier request of the press was made (``again``:
+        _press_known) — only where it still holds this press's words, and a
+        draft written since stays (_clear_pressed_draft). Nothing is marked
+        read and no reply is noted: the rail does both when the mail goes
+        out, and neither if it never did."""
         message_id = sent.get("message_id")
         body = {"unconfirmed": True, "request_key": request_key, "since": since}
         if sent.get("note"):
             body["note"] = sent["note"]
         if chat_id is not None:
             key = chat_state_mod.split_chat_ref(chat_id)[2]
+            # (Asked before the entry is noted anew below.)
+            repeat = _mail_repeated(chat_id, sent, asked_at, message_id=message_id)
             mine = next((e for e in _gateway_queue(slug, gw, key) or []
                          if e.get("request_key") == request_key
                          or (message_id and e.get("message_id") == message_id)), None)
             if mine is not None:
+                repeat = repeat or _mail_repeated(
+                    chat_id, sent, asked_at, message_id=mine.get("message_id"),
+                    instant=mine.get("created"))
                 pending = _pending_from_entry(slug, mine, text=text, author="user")
                 if pending["status"] == "pending":
                     # Handed over, by the gateway's own word, whatever an
@@ -17454,7 +17916,7 @@ class Handler(BaseHTTPRequestHandler):
                 _CHAT_STATE.add_pending(chat_id, pending)
                 if isinstance(mine.get("message_id"), str):
                     message_id = message_id or mine["message_id"]
-            _CHAT_STATE.clear_draft(chat_id)
+            _clear_pressed_draft(chat_id, text, repeat or again)
             _chats_cache_invalidate()
             body["id"] = chat_id
         if message_id:
@@ -17463,9 +17925,9 @@ class Handler(BaseHTTPRequestHandler):
               f"known (request key {request_key}); answered as unconfirmed", flush=True)
         self._send_json(202, body)
 
-    def _read_send_attachments(self, payload: dict) -> list | None:
+    def _read_send_attachments(self, payload: dict, said: dict | None = None) -> list | None:
         """The attachments of a send, as the gateways' /send takes them, or
-        None when a 400 was answered.
+        None when a 400 was answered (with ``said`` merged in).
 
         Optional, and files of any type — a photo, a video, a PDF — in the
         gateways' own /send shape, under that shape's historical key
@@ -17473,35 +17935,37 @@ class Handler(BaseHTTPRequestHandler):
         upload fails fast with a 400 instead of a gateway round trip; the
         gateway persists the bytes into its ledger media store and reports
         the stored references back."""
+        said = said or {}
         raw_images = payload.get("images") or []
         if not isinstance(raw_images, list):
-            self._send_json(400, {"error": "'images' must be a list"})
+            self._send_json(400, {"error": "'images' must be a list", **said})
             return None
         if len(raw_images) > CHAT_SEND_MAX_IMAGES:
-            self._send_json(400, {"error": f"at most {CHAT_SEND_MAX_IMAGES} attachments per send"})
+            self._send_json(400, {"error": f"at most {CHAT_SEND_MAX_IMAGES} attachments per send",
+                                  **said})
             return None
         images = []
         total = 0
         for img in raw_images:
             if not isinstance(img, dict) or not isinstance(img.get("data"), str):
-                self._send_json(400, {"error": "each attachment needs base64 'data'"})
+                self._send_json(400, {"error": "each attachment needs base64 'data'", **said})
                 return None
             ctype = img.get("content_type")
             if ctype is not None and not isinstance(ctype, str):
-                self._send_json(400, {"error": "attachment content_type must be a string"})
+                self._send_json(400, {"error": "attachment content_type must be a string", **said})
                 return None
             fname = img.get("filename")
             if fname is not None and not isinstance(fname, str):
-                self._send_json(400, {"error": "attachment filename must be a string"})
+                self._send_json(400, {"error": "attachment filename must be a string", **said})
                 return None
             try:
                 raw = base64.b64decode(img["data"], validate=True)
             except (ValueError, binascii.Error):
-                self._send_json(400, {"error": "invalid base64 attachment data"})
+                self._send_json(400, {"error": "invalid base64 attachment data", **said})
                 return None
             total += len(raw)
             if len(raw) > MAX_ATTACHMENT_BYTES or total > CHAT_SEND_MAX_BYTES:
-                self._send_json(400, {"error": "attachment too large"})
+                self._send_json(400, {"error": "attachment too large", **said})
                 return None
             item = {"content_type": (ctype or "").strip(), "data": img["data"]}
             # The name the file goes out under — what the recipient sees on a
@@ -17577,27 +18041,32 @@ class Handler(BaseHTTPRequestHandler):
 
         What the user typed is passed on as data: recipients as a list of
         strings the gateway parses (it answers 400 for one that is no
-        address), the subject as one line."""
+        address), the subject as one line.
+
+        Every answer that nothing was sent says who said so (``by``): the
+        mail gateway's own word (_mail_send), or this side's — every refusal
+        here, made before the mail gateway was asked."""
+        def refuse(status: int, error: str, **more) -> None:
+            self._send_json(status, {"error": error, **more, **_BY_DASHBOARD})
+
         if not self._claude_auth_same_origin():
-            self._send_json(403, {"error": "cross-site request rejected"})
+            refuse(403, "cross-site request rejected")
             return
         ok, reason = self._request_from_edge("chat compose")
         if not ok:
-            self._send_json(403, {
-                "error": "starting a conversation is the user's own action and is "
-                         "accepted only from the dashboard through the reverse proxy",
-                "detail": reason,
-                "remedy": "An agent writes a new mail with scripts/mail-push.py, "
-                          "under the mailbox's send policy.",
-            })
+            refuse(403, "starting a conversation is the user's own action and is "
+                        "accepted only from the dashboard through the reverse proxy",
+                   detail=reason,
+                   remedy="An agent writes a new mail with scripts/mail-push.py, "
+                          "under the mailbox's send policy.")
             return
         payload = self._read_json_body()
         if payload is None:
-            self._send_json(400, {"error": "invalid JSON"})
+            refuse(400, "invalid JSON")
             return
         channel = payload.get("channel")
         if not _is_mail(channel):
-            self._send_json(400, {"error": "channel must be one GET /chats/compose offers"})
+            refuse(400, "channel must be one GET /chats/compose offers")
             return
 
         def addresses(field):
@@ -17610,47 +18079,46 @@ class Handler(BaseHTTPRequestHandler):
 
         to, cc = addresses("to"), addresses("cc")
         if to is None or cc is None:
-            self._send_json(400, {"error": "to and cc are lists of addresses, one line each"})
+            refuse(400, "to and cc are lists of addresses, one line each")
             return
         if not to:
-            self._send_json(400, {"error": "to needs at least one address"})
+            refuse(400, "to needs at least one address")
             return
         subject = payload.get("subject") or ""
         if not isinstance(subject, str) or len(subject) > 998:
-            self._send_json(400, {"error": "subject must be a string of at most 998 characters"})
+            refuse(400, "subject must be a string of at most 998 characters")
             return
         # One line, whatever was typed or pasted: it becomes a header at the
         # gateway, which folds and encodes it — and is handed no line break.
         subject = " ".join(_CONTROL_CHARS_RE.sub(" ", subject).split())
         text = payload.get("text")
         text = text.strip() if isinstance(text, str) else ""
-        images = self._read_send_attachments(payload)
+        images = self._read_send_attachments(payload, _BY_DASHBOARD)
         if images is None:
             return
         if not text and not images:
-            self._send_json(400, {"error": "empty text"})
+            refuse(400, "empty text")
             return
         wanted = payload.get("account")
         if wanted is not None and not (isinstance(wanted, str) and wanted.strip()):
-            self._send_json(400, {"error": "account must be a mailbox address"})
+            refuse(400, "account must be a mailbox address")
             return
         request_key, key_error = _mail_request_key(payload)
         if key_error:
-            self._send_json(400, {"error": key_error})
+            refuse(400, key_error)
             return
         if wanted:
             slug = _slug_for_account(MAIL_CHANNEL, wanted.strip())
             canonical, gw = _channel_gateway(slug) if slug else (None, None)
             if gw is None or not _gateway_is_inbox(canonical, gw):
-                self._send_json(409, {"error": "no mail gateway serves that mailbox"})
+                refuse(409, "no mail gateway serves that mailbox")
                 return
             slug = canonical
         else:
             candidates = _inbox_gateways(MAIL_CHANNEL)
             if len(candidates) != 1:
-                self._send_json(409, {"error": (
-                    "no mail gateway is set up" if not candidates else
-                    "several mailboxes are mirrored: say which account the mail leaves from")})
+                refuse(409, "no mail gateway is set up" if not candidates else
+                       "several mailboxes are mirrored: say which account the mail leaves from")
                 return
             slug, gw = candidates[0]
         # The mailbox the mail leaves from is half the new chat's id, and it
@@ -17658,7 +18126,10 @@ class Handler(BaseHTTPRequestHandler):
         # its rail events will carry.
         account = _gateway_identity(slug, gw).get("account")
         if not account:
-            self._send_json(502, {"error": "the mail gateway has not said which mailbox it serves"})
+            # Nothing was handed to anyone: this request sent nothing — and
+            # says nothing of an earlier one under its key.
+            refuse(502, "the mail gateway has not said which mailbox it serves; "
+                        "nothing was sent", sent=False, request_key=request_key)
             return
         send_payload = {"to": to, "cc": cc, "subject": subject, "message": text,
                         "author": "user", "user_approved": True,
@@ -17670,11 +18141,14 @@ class Handler(BaseHTTPRequestHandler):
         if sent["outcome"] == "failed":
             # Nothing left, and no chat appears: the gateway's word on what
             # was typed (an address that does not parse, no recipient left),
-            # that it cannot send, or a gateway that was never reached.
-            if sent["status"] >= 500:
+            # that it cannot send or that the mail server would not take the
+            # mail, or a gateway that was never reached: "sent": false, and
+            # who said so (_mail_send).
+            if sent["status"] >= 500 or sent["status"] == MAIL_SEND_FAILED_STATUS:
                 _gateway_identity(slug, gw, refresh=True)
-            self._send_json(sent["status"], {"error": sent["error"],
-                                             "request_key": request_key})
+            if sent["status"] == MAIL_SEND_FAILED_STATUS:
+                _settle_failed_new_mail(account, request_key)
+            self._send_json(sent["status"], _mail_not_sent(sent, request_key))
             return
         answer = sent.get("answer") or {}
         key = sent.get("chat") if sent["outcome"] == "unconfirmed" else answer.get("chat")
@@ -17692,7 +18166,8 @@ class Handler(BaseHTTPRequestHandler):
         if not key:
             if sent["outcome"] == "unconfirmed":
                 self._answer_unconfirmed_mail(None, slug, gw, sent, text=text,
-                                              request_key=request_key, since=since)
+                                              request_key=request_key, since=since,
+                                              asked_at=asked_at)
                 return
             # Sent or queued, and the gateway did not say as which chat: it
             # is out of this side's hands, and shows when the rail says so.
@@ -17703,6 +18178,11 @@ class Handler(BaseHTTPRequestHandler):
                                           "when it has gone out."})
             return
         chat_id = chat_state_mod.make_chat_id(MAIL_CHANNEL, key, account)
+        # A repeat is not a new mail (_mail_repeated): asked before the
+        # chat's copy of this send is touched.
+        repeat = sent["outcome"] == "sent" and _mail_repeated(
+            chat_id, sent, asked_at, message_id=answer.get("message_id"),
+            instant=answer.get("ts"))
         noted = _note_written_chat(chat_id, slug, subject, to, cc,
                                    unsent=sent["outcome"] != "sent")
         if sent["outcome"] == "sent" and noted.get("unsent"):
@@ -17713,7 +18193,8 @@ class Handler(BaseHTTPRequestHandler):
                 _CHAT_STATE.drop_pending(chat_id, message_id=answer["message_id"])
         if sent["outcome"] == "unconfirmed":
             self._answer_unconfirmed_mail(chat_id, slug, gw, sent, text=text,
-                                          request_key=request_key, since=since)
+                                          request_key=request_key, since=since,
+                                          asked_at=asked_at)
             return
         if sent["outcome"] == "pending":
             pending = self._note_queued_send(chat_id, slug, gw, answer, text,
@@ -17746,12 +18227,21 @@ class Handler(BaseHTTPRequestHandler):
         refused = (_CHAT_STATE.get(chat_id).get("refused") or {}).get(message_id or "")
         if refused:
             msg["refused"] = list(refused)
-        _CHAT_OVERLAY.insert(entry)
-        # The gateway announces this mail on the rail in a moment; there is
-        # no thread yet for the mailbox to be told a reply of.
-        _mailbox_reply_noted(chat_id, message_id)
+        if repeat:
+            # The same press, answered again from the mail it sent earlier:
+            # the chat is shown it, and nothing else is noted (the rail has
+            # announced that mail, or will; its fuller word of it stands).
+            if _CHAT_OVERLAY.first_seen(chat_id, message_id) is None:
+                _CHAT_OVERLAY.insert(entry)
+        else:
+            _CHAT_OVERLAY.insert(entry)
+            # The gateway announces this mail on the rail in a moment; there
+            # is no thread yet for the mailbox to be told a reply of.
+            _mailbox_reply_noted(chat_id, message_id)
         _chats_cache_invalidate()
-        print(f"[web-gateway] new mail {chat_id} via {slug}", flush=True)
+        print(f"[web-gateway] new mail {chat_id} via {slug}"
+              + (" — a repeat of a press whose mail went out before; nothing was sent"
+                 if repeat else ""), flush=True)
         self._send_json(200, {"id": chat_id, "message": msg})
 
     def _handle_chats_inbound(self) -> None:
@@ -19999,6 +20489,12 @@ class Handler(BaseHTTPRequestHandler):
         send is terminal the body also carries `next` — the URL of the next
         still-pending request, or null — so the page can auto-advance without
         a second lookup.
+
+        `outcome_unknown` is always stated: true for an "error" entry of
+        which nobody knows whether it went out (_send_outcome_unknown). Such
+        an answer carries `note`, the whole sentence the page shows in
+        place of its "could not deliver: …" — as does a mail that was sent
+        but not to everyone (`refused`).
         """
         channel, gw = _channel_gateway(account)
         if not gw:
@@ -20018,7 +20514,14 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as exc:  # noqa: BLE001 - poller retries on its own
             self._send_json(502, {"error": f"gateway unreachable: {exc}"})
             return
-        body = {"status": detail.get("status"), "error": detail.get("error")}
+        if not isinstance(detail, dict):
+            detail = {}
+        body = {"status": detail.get("status"), "error": detail.get("error"),
+                "outcome_unknown": _send_outcome_unknown(detail)}
+        if body["outcome_unknown"]:
+            # Not a failure: it may have gone out. (The notes are the
+            # message kind's; an event's entry never says this.)
+            body["note"] = _send_unknown_note(_MESSAGE_SEND_NOTES, detail.get("error"))
         refused = _refused_line(detail) if _is_mail(_slug_channel(channel)) else ""
         if refused and body["status"] == "approved":
             # Sent, and not to everyone: who was refused, and the sentence

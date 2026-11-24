@@ -1876,12 +1876,30 @@ class ChatStateStore:
             self._write(doc)
             return True, doc
 
-    def clear_draft(self, chat_id: str) -> dict:
+    def clear_draft(self, chat_id: str, *, only_text: str | None = None) -> dict:
         """Unconditional clear — the send path, where the draft just went out.
 
         A draft that has just been sent is not something to offer back, so this
-        leaves nothing to undo."""
-        _, doc = self.set_draft(chat_id, "", author="user")
+        leaves nothing to undo.
+
+        With ``only_text``, the clear is made only while the draft still holds
+        exactly those words (compared trimmed) — the repeat of a send, whose
+        words went out with its first request: a draft that still holds them
+        is that mail, put back into the box when its answer was lost, and one
+        written since is left as it is. Guarded by the draft's version, so a
+        save that lands between the look and the clear is never lost."""
+        if only_text is not None:
+            with self._lock:
+                doc = self._read(chat_id)
+                held = ((doc.get("draft") or {}).get("text") or "").strip()
+                version = int(doc.get("draft_version") or 0)
+            if not held or held != only_text.strip():
+                return doc
+            accepted, doc = self.set_draft(chat_id, "", author="user", base_version=version)
+            if not accepted:
+                return doc
+        else:
+            _, doc = self.set_draft(chat_id, "", author="user")
         with self._lock:
             doc = self._read(chat_id)
             if doc.get("cleared"):
@@ -2081,7 +2099,7 @@ class ChatOverlay:
         self._ttl = float(ttl)
         self._maxlen = int(maxlen)
         self._lock = threading.Lock()
-        self._entries: dict[tuple, dict] = {}  # dedup key -> entry (+_inserted)
+        self._entries: dict[tuple, dict] = {}  # dedup key -> entry (+_inserted, _first)
 
     @staticmethod
     def entry_key(entry: dict) -> tuple:
@@ -2091,16 +2109,34 @@ class ChatOverlay:
         return ("txt", entry.get("chat_id"), entry.get("ts"), entry.get("text"))
 
     def insert(self, entry: dict) -> None:
-        """Add one message event; a re-delivery of the same key replaces it."""
+        """Add one message event; a re-delivery of the same key replaces it
+        (and keeps the instant the message was first seen: ``first_seen``)."""
         now = time.time()
         stored = dict(entry)
         stored["_inserted"] = now
         with self._lock:
             self._prune(now)
-            self._entries[self.entry_key(entry)] = stored
+            key = self.entry_key(entry)
+            stored["_first"] = (self._entries.get(key) or {}).get("_first", now)
+            self._entries[key] = stored
             while len(self._entries) > self._maxlen:
                 oldest = min(self._entries, key=lambda k: self._entries[k]["_inserted"])
                 self._entries.pop(oldest)
+
+    def first_seen(self, chat_id: str, message_id: str | None) -> float | None:
+        """When a live entry of this chat with this message id was first
+        inserted (this process's clock), or None where there is none. What
+        tells a message the chat already had from one that arrived while
+        something was waiting for it — a send answered again long after its
+        mail went out, against the rail announcing a mail a moment before
+        the request that sent it gets its answer."""
+        if not message_id:
+            return None
+        now = time.time()
+        with self._lock:
+            self._prune(now)
+            entry = self._entries.get(("id", chat_id, str(message_id)))
+            return entry.get("_first") if entry else None
 
     def _prune(self, now: float) -> None:
         expired = [k for k, e in self._entries.items()
@@ -2155,4 +2191,5 @@ class ChatOverlay:
         items.sort(key=lambda e: (e.get("ts") or "", e.get("_inserted") or 0.0))
         for e in items:
             e.pop("_inserted", None)
+            e.pop("_first", None)
         return items

@@ -550,20 +550,113 @@ reverse").
   answers as soon as the SMTP server has taken the mail; the Sent copy is filed
   afterwards by the mirror loop. A `/send` may carry a `request_key` (an opaque
   token of at most 64 characters, minted per press): a repeat with a key seen
-  within 24 hours answers what the first answered, with the same `message_id`,
-  and sends nothing. The web gateway's hop waits `MAIL_SEND_TIMEOUT` (120 s) and
+  within 24 hours answers what became of the first, with the same `message_id`,
+  and sends nothing — unless the first failed for certain (the next point). The web gateway's hop waits `MAIL_SEND_TIMEOUT` (120 s) and
   passes the browser's `request_key`; a timeout, a connection dropped after the
   request was written and the gateway's `502 {unconfirmed: true}` all answer the
   browser `202 {unconfirmed: true, message_id (when known), request_key}`, never
   a 5xx that reads as "not sent". The chat page keeps the bubble as *Sending —
   not confirmed yet*, never puts the words back into the composer, and
   reconciles the bubble by message id when the mail shows. One press of Send
-  (reply or compose) has one `request_key`, reused if that press is retried.
+  (reply or compose) has one `request_key`, reused while the outcome of that
+  press is not known.
+- **A send that certainly failed ends its press; only an unknown outcome keeps
+  its key.** Three layers, each right on its own:
+  - *The mail gateway.* A send failed **for certain** when nothing left the
+    gateway: the SMTP server refused the mail, or the send ended before the
+    hand-over. (The mark `data` is written to the entry before any of the
+    message is on the wire, so an entry without it was never handed over.) Its
+    entry is `status: "error", outcome_unknown: false`, and `/send` answers
+    `502 {error: "send failed: …", "sent": false}`. A `/send` under the
+    `request_key` of such an entry is a **new attempt**: the old entry is
+    removed, and the mail is composed, put to the policy and sent afresh — a
+    new `message_id`, and under `verify` a new approval. A key whose entry is
+    `pending`, `sending`, sent, or `error` with `outcome_unknown: true` is
+    answered from the entry and sends nothing, for as long as the key is
+    remembered, dismissed or not. Across a restart the entry is first what
+    the start makes of it (the table below): a direct send a stop caught
+    before the hand-over ends as a certain failure there, and its repeat is a
+    new attempt. An `error` entry that does not say `outcome_unknown` either
+    way is read as unknown.
+    `"sent": false` is also on the gateway's `503`s (not configured, no SMTP
+    server, the send could not be written down) — which come only after the
+    key was looked up, so it is never said over a mail that went out — and a
+    fault nobody planned for is answered from what stands under the key, else
+    as `unconfirmed`; never as "failed" by guesswork.
+  - *The web gateway.* Its certain "nothing was sent" for a mail — the
+    gateway's definite failure — answers the browser `424 {error: <sentence>,
+    "sent": false, request_key}`. `502` stays "the gateway was never reached"
+    and `503` "cannot send / could not queue"; both carry `"sent": false` when
+    the web gateway knows nothing was handed over (it never wrote the request).
+    Anything whose outcome is open is `202 {unconfirmed: true, …}`, never a
+    4xx or 5xx. A 5xx from the mail gateway is a failure **only on its
+    explicit `"sent": false`**: a `502`/`503` without it, a body cut short of
+    its `Content-Length`, and a body that is no JSON are all *unconfirmed*
+    (`202`), never `424`.
+  - *Who said it.* Every "not sent" answer to the browser names its speaker:
+    `"by": "gateway"` where it hands on the mail gateway's own word about this
+    request (its certain failure, the `424`; its refusals, each a 4xx; its
+    `503`s), `"by": "dashboard"` where the web gateway answers
+    without the mail gateway having spoken (never reached, no gateway serves
+    that mailbox, validation, `403`/`410`). Only the first is a word about the
+    key; the second is about this request alone.
+  - *The webapp* (the chat page and the compose sheet). **A kept key is
+    dropped only on the mail gateway's own word about that key**: an answer
+    with `"by": "gateway"` and `"sent": false` or a 4xx, a change of the
+    words, or the press's mail showing up. Any other "not sent" answer keeps
+    the key with the words. Keeping a key is harmless — the mail gateway takes
+    a key it never saw, or one whose send failed for certain, for a new
+    attempt — while dropping one whose earlier outcome is unknown can send the
+    mail twice. What the user is told depends on the press: a first press (a
+    fresh key) answered `"sent": false` or a 4xx reads *Not sent:
+    <sentence>*, the words in the box and the next press a new one; a press
+    made *again* under a kept key and answered by the dashboard reads that the
+    gateway could not be asked just now, and that it is still not known
+    whether the first attempt went out. An answer with no `by` (an older
+    server) is read as the gateway's for a first press and as the dashboard's
+    for an again press. A 5xx without `"sent": false` (a proxy, a crash) is
+    unknown and keeps the key.
+
+  What a start finds under a key, and what the same request made again then
+  does (`tests/test_mail_gateway_send.py` walks a stop after every write):
+
+  | The entry on disk | At a start | A repeat of the request |
+  |---|---|---|
+  | none (the stop came before it stood) | — | the first send: carried out |
+  | `pending` | stays | `202`, the same pending send; sends nothing |
+  | `sending`, no mark, approved | the approval is carried out, once | `202 sending` or `200 sent`; sends nothing |
+  | `sending`, no mark, direct | ends as `error`, `outcome_unknown: false` ("stopped before this mail was handed to the mail server; it was not sent") and is listed as failed — one that named no `request_key` is dropped | a **new attempt**: nothing had left |
+  | `sending`, mark `data` | Sent is asked: found, it went out; not found, `error` with `outcome_unknown: true` | until Sent has said, `502 unconfirmed` (a queued send: `202 sending`); then as the row it became — never sent again |
+  | sent (`approved`) | record and Sent copy finished if owed | `200 sent`, the same `message_id` |
+  | `error`, `outcome_unknown: true` | stays (listed until dismissed) | `502 {unconfirmed, outcome_unknown}`; never sent again |
+  | `error`, `outcome_unknown: false` | stays (listed until dismissed) | a **new attempt** |
+  | `rejected` / `retracted` | stays | `409`; sends nothing |
+- **A repeat is not a reply.** When a `/send` under a known key is answered
+  from an earlier entry, the gateway says so: `"repeat": true` in the answer
+  (the `200` sent, the `202` pending, the `502` unconfirmed, the `409` of a
+  send that was rejected or retracted). The
+  mail went out — or was queued — *before*; this request did none of it. The
+  web gateway then only reconciles: it returns the Message or the Pending and
+  drops its pending copy, and does nothing a reply does — no read mark
+  advanced, no attention item settled, no mailbox read hook. The rail did all
+  of that when the mail went out. **A repeat clears the draft it repeats, and
+  no other**: the chat's shared draft is cleared exactly when it still holds
+  this press's own words, and a draft written since stays — on every answer
+  to a press made before, a new attempt under its kept key included. (A
+  press whose answer never reached the page puts its words back in the box,
+  and the box saves them as the shared draft; the repeat that finds the mail
+  sent takes them out again, or every device and every session would get a
+  sent mail back as the draft, and one more press would send it twice.)
+  `mail-push.py` prints that the answer was a repeat. A new attempt after a certain failure is no repeat.
 - **A failed or partly refused send leaves a trace.** `GET /pending-sends`
   (and `?chat=`) lists entries with status `pending`, `sending` and `error`;
   an `error` entry carries a sentence `error` and `outcome_unknown` (the hand-over
-  may have happened), and `POST /pending-sends/<id>/dismiss` removes it. Nothing
-  re-sends an `error` entry. Addresses the SMTP server refused while taking the
+  may have happened), and stays listed until `POST /pending-sends/<id>/dismiss`.
+  Nothing re-sends an `error` entry by itself; only a new request under the key
+  of one that failed for certain does, as a new attempt. A direct send whose
+  caller was still on the line has the failure as its answer and leaves no
+  entry; one whose caller had gone, or that a restart caught before the
+  hand-over, is listed as failed. Addresses the SMTP server refused while taking the
   rest are on the entry and in the `200` answer as `refused: [addresses]`, and the
   record's recipients are those the server took. In the chat the pending entry
   gains `status` (`pending`, `sending`, `failed`), `error`, `outcome_unknown` and
@@ -572,6 +665,17 @@ reverse").
   A failed bubble says so with its reason, offers *Copy text back to the
   composer* and *Dismiss*, says the mail may have gone out where
   `outcome_unknown`, and names refused recipients.
+- **A dismissed entry is over, and `outcome_unknown` is read by every
+  reader.** Dismissing removes an entry that failed for certain. One of
+  unknown outcome that named a `request_key` is kept for the 24 hours its key
+  is remembered — so that a repeat is still told the mail may have gone out —
+  and is no longer listed; `GET /pending-sends/<id>` then answers `{status:
+  "error", dismissed: true, …}`, which every reader treats as ended, not as a
+  failed bubble. And an `error` with `outcome_unknown: true` is never worded
+  as "failed": the chat, the `/sends` approval page and its status JSON, the
+  note written back into the thread that queued the send, and `mail-push.py
+  --retract` (`scripts/pending_retract.py`) all say that it is not known
+  whether the mail went out, and that it must not be sent again.
 - **What a send writes.** SMTP through `email_client`'s helpers, a Sent copy
   (filed by the mirror loop) unless `SMTP_SAVE_SENT=false`, and the outbound record (`kb:OutboundMessage`,
   the given `author`, the trimmed text the message itself, `kb:bodyPart`) at
@@ -593,7 +697,12 @@ reverse").
 - **Agents** send a mail they hold as a chat through the thin
   `scripts/mail-push.py` (the sibling of `sms-push.py`: `--to`/`--cc`/`--subject`,
   or `--chat <id>` with `--reply all|sender`, `--attach`, `--user-approved`,
-  `--thread`, `--retract`), under the same policy. (`--reply-to <token>` is
+  `--thread`, `--retract`), under the same policy. Each run names its request
+  with a key of its own; a run that got no answer says "NOT KNOWN whether this
+  mail was sent" and prints the key, and `--request-key <key>` with the same
+  arguments asks about that send again — answered as a repeat where the mail
+  went out or waits, and carried out as a new attempt where nothing had left.
+  (`--reply-to <token>` is
   there for a gateway prompt that carries a token; no reply token exists for
   mail — the gateway forwards no mail to a session — and agent-facing texts
   do not point at it.) A mail reaches an agent as a chat, and the turn the
@@ -641,9 +750,22 @@ now, so they are the user's own act like send, compose and delete:
 (`CHAT_ERASE_TOKEN`; 503 while unset, 403 on a mismatch), and the gateway must
 succeed before the web gateway erases its own state — if any move fails, or a
 mail of the thread cannot be placed, nothing is erased and the answer reports
-`errors > 0`. The answer is
+`errors > 0`, with the reason as one sentence in `error`. The answer is
 `delete_chat`'s shape plus `trashed`; a mail that turns up again later in a
 mirrored folder (restored from the Trash) starts the chat anew.
+
+**One message in two folders.** A mailbox whose folders are labels (Gmail: the
+archive is `\All`) shows one message in INBOX and in the archive at once, and
+the mirror gives such a mail both places. It is still one mail. *Read* flags
+it in each place (the count is of places). *Archive* takes it out of the INBOX
+and keeps the place it already has in the archive — no second copy. *Delete*
+moves it to the Trash from the first place, which empties the second by the
+gateway's own act: a mail that is no longer where the index had it is not an
+error by itself. Once every place was tried it is looked for in every
+mirrored folder within the same call — found, it goes to the Trash from
+there; in none, it is gone, and the delete completes in that one call. Only a
+folder that cannot say leaves the mail open (`errors > 0`, nothing erased,
+the call made again finishes).
 
 IMAP writes are `UID STORE` and `UID MOVE`, with `UID COPY` + `\Deleted` +
 `UID EXPUNGE` of exactly those UIDs as the fallback where `UIDPLUS` allows
