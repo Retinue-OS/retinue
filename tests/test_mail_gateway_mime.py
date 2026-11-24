@@ -1147,8 +1147,9 @@ def test_one_unreadable_mail_does_not_stop_the_folder():
         recs = t.by_id(gw)
         assert sorted(recs) == ["first@x.org", "last@x.org", "p@x.org"]
         assert recs["p@x.org"]["text"] == gw.UNREADABLE_TEXT
+        # Marked to be read again: nothing of it could be filed yet.
         assert sorted(row["message_id"] for row in mirror.index.rows(
-            "SELECT message_id FROM locations WHERE skipped = 'news'")) == [
+            "SELECT message_id FROM locations WHERE skipped = 'news-unread'")) == [
                 "l@x.org", "s@shop.example"]
         assert mirror._folder("inbox")["hwm"] == 5
     print("ok: a mail the reader chokes on is mirrored as a placeholder, and read again "

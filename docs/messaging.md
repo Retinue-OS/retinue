@@ -409,6 +409,15 @@ arrives in INBOX:
      addresses, and a person's e-mail domain as a wildcard. Set it on the
      contact (`contacts.py update <id> --vip` / `--instruction "…"` /
      `--add-domain example.org`, or the Contacts page); nothing is set here.
+
+   "Its sender" is the **gate sender** (`kb:gateSender` on the record,
+   `gate_sender` on the rail): the one address of a mail with exactly one
+   `From` header holding exactly one address — the only form the provider's
+   DMARC check of the `From` domain is sure to have looked at — lowercased by
+   its ASCII letters, and none where a character of it folds into ASCII. A
+   mail with none (no `From`, a group, two addresses, two `From` headers) is
+   from nobody: it reaches its chat and buys no turn. The `Sender` header is
+   for display only (`docs/mail-chats.md`, "Who the sender is").
 3. **Offer the chats rail** the mail, with the verdict (`gate: {forward, vip,
    instructed, reason}`) and `handover: true`. The web gateway decides what the
    arrival does: **a mail pushes nothing by default; a contact can say
@@ -420,27 +429,41 @@ arrives in INBOX:
 4. **Deliver on acceptance.** `{"accepted": true}` marks the record delivered.
    With a `job_url` beside it a model turn is working the mail: the gateway
    polls that job (`job_delivery.py`, up to `MAIL_RAIL_JOB_TIMEOUT`) and marks
-   the record delivered only when it reports done.
+   the record delivered only when it reports done. A `job_url` that is not a
+   path on the rail's own host — checked as it is parsed, and the joined URL
+   again — is no acceptance.
+
+**The rail takes mail only with a token.** The gateway posts every event
+with `CHATS_INGEST_TOKEN` where `.env` sets one (it must then be set for the
+`retinue` service too, as compose does), else with `MAIL_GATEWAY_TOKEN`, which
+both sides hold already; the web gateway refuses an e-mail event without it.
 
 **There is no triage forward for mail, and no daily sweep.** A mail the rail
-did not take — no acceptance, a refusal, no answer in time, a job that failed
-or never finished, a web gateway that is away — stays `delivered: false` and is
+did not take — no acceptance, a refusal, no answer, a job that failed or never
+finished, a web gateway that is away — stays `delivered: false` and is
 offered again: the ledger's flag is the queue, so the wait survives a restart
 and a lost state volume. Offers leave in order with the other rail events
 (the user's reply from a mail client is never heard before the mail it
 answers); a mail that was answered for and not taken is retried after one
-minute, then twice as long each time, up to an hour, at most 20 such mails a
-poll, the oldest first; while the web gateway does not answer at all, nothing
-is tried for 30 seconds, doubling up to 15 minutes. The web gateway takes a
-repeated offer once, by its message id. Mail from a sender who is neither VIP
-nor instructed is listed under Unread and judged by nobody.
+minute, then twice as long each time, up to an hour, at most 20 offers a
+poll, the oldest first — a mail whose turn is still at work is passed over
+and takes none of them. While the web gateway does not answer at all (the
+connection refused, a `401`/`403`/`404`, or no answer and none to a `GET`
+either) nothing is tried for 30 seconds, doubling up to 15 minutes. An answer
+about **one** mail — a `408`, `429` or `5xx` for it, or no answer for it while
+the rail answers otherwise — backs off that mail alone: one mail never holds
+back another. A record that cannot be read at that moment is offered again
+later, and a mailbox that does not answer holds back only new mail: what has
+arrived is offered all the same. The web gateway takes a repeated offer once,
+by its message id. Mail from a sender who is neither VIP nor instructed is
+listed under Unread and judged by nobody.
 
 What is **never offered**: backfilled mail (written delivered, told to the
 rail as history — it pushes nothing and starts no turn, whoever sent it), the
-user's own mail, and a mail that left the mailbox and came back. A mail that
-is gone before the rail took it is offered to nobody (its tombstone is
-delivered); one whose thread was merged meanwhile is offered under the chat it
-is in now.
+user's own mail, and a mail that left the mailbox after the rail took it and
+came back. A mail that is gone before the rail took it is offered to nobody —
+its tombstone keeps `delivered: false`, so it is offered when it comes back;
+one whose thread was merged meanwhile is offered under the chat it is in now.
 
 **The policy unreadable.** The group flags unreadable: no flags — the mail is
 offered like any other (fail open). The sender policy unreadable: nobody is
@@ -452,10 +475,15 @@ never switched off for mail: there is no `INBOUND_GATE` on this service.
 (`news_ingest.py` → the web gateway's `POST /internal/news`; `NEWS_INGEST_URL`,
 `NEWS_INGEST_TOKEN`): its sender as the source (`email:<address>`), its
 subject as the title, the first `MAIL_NEWS_EXCERPT_CHARS` of its trimmed text,
-and the link the mail **declares for itself** — `Archived-At`, else
-`List-Archive`, http(s) only — never one picked out of the body. It starts no
-chat (a news mail that continues a thread already mirrored is filed *and*
-shown in that chat). Where the group is also `ignored` and the feed took the
+and the link the mail **declares for itself** — its `Archived-At` alone,
+http(s) only; never `List-Archive`, which is the list's and the same on every
+issue (the feed keys an item on its link), and never one picked out of the
+body. It starts no chat — except that a news mail that continues a thread
+already mirrored, or whose sender is a VIP or instructed, is filed *and* in
+its chat (written, offered and worked like any of that sender's mail, and
+never moved by the news rail). A news mail the reader could not read is read
+again with the placeholders, and filed once it reads. Where the group is also
+`ignored` and the feed took the
 item, the mail is marked `\Seen` and moved to `MAIL_NEWS_FOLDER` — the archive
 folder by default, by the folder rules below; set and empty, it is marked read
 and left in the INBOX — and the mirror follows its own move. Only a mail that
@@ -688,8 +716,9 @@ part is kept as a blob in the ledger's media store — plain text, HTML, the
 header block, attachments and inline images — and served only through the
 gateway's token-gated `GET /media/<id>`, which the web gateway proxies. A
 remote image is never fetched; a tracking pixel is dropped. A mail of a `news`
-sender or list (`triage_policy.py email-news-add`) starts no chat: the gateway
-files it to the news feed ("The gate", above).
+sender or list (`triage_policy.py email-news-add`) starts no chat, unless its
+sender is a VIP or instructed: the gateway files it to the news feed ("The
+gate", above).
 
 **Configuration** — on the `mail-gateway` service, all named in
 `docker-compose.yml` (it loads no `env_file`):
@@ -720,9 +749,9 @@ files it to the news feed ("The gate", above).
 | `MAIL_RAIL_TIMEOUT` | `10` | timeout of the chats rail's POSTs, seconds (an offer that carries files is given at least 30) |
 | `MAIL_RAIL_FILE_BYTES` | 25 MiB | up to which size one attachment travels with the offer of a VIP's or an instructed sender's mail; keep it at or below the web gateway's `CONVERSATION_MAX_ATTACHMENT_BYTES` |
 | `MAIL_RAIL_JOB_TIMEOUT` | `3600` | how long the job of a turn that works a mail is waited for before the mail counts as not taken and is offered again |
-| `MAIL_NEWS_FOLDER` | *(unset: the archive folder)* | where a mail of a group that is both `news` and `ignored` is moved once the feed has it. Set and **empty**: marked read and left in the INBOX. A name: that folder (created and subscribed if absent) |
-| `MAIL_NEWS_EXCERPT_CHARS` | `600` | how much of a news mail's text its feed item carries beside the subject |
-| `CHATS_INGEST_URL`, `CHATS_INGEST_TOKEN` | set by compose | the chats rail: where every arriving mail is offered, and (same host) where a turn's job is polled. Emptied, mail is mirrored and offered to nobody — written delivered, nothing rings, no turn |
+| `MAIL_NEWS_FOLDER` | *(unset: the archive folder)* | where a mail of a group that is both `news` and `ignored` is moved once the feed has it. Set and **empty**: marked read and left in the INBOX. A name: that folder (created and subscribed if absent). Was `TRIAGE_NEWS_FOLDER`, still read where this is not set |
+| `MAIL_NEWS_EXCERPT_CHARS` | `600` | how much of a news mail's text its feed item carries beside the subject. Was `TRIAGE_NEWS_EXCERPT_CHARS`, still read where this is not set |
+| `CHATS_INGEST_URL`, `CHATS_INGEST_TOKEN` | set by compose | the chats rail: where every arriving mail is offered, and (same host) where a turn's job is polled. Emptied, mail is mirrored and offered to nobody — written delivered, nothing rings, no turn. The token the rail is posted with is `CHATS_INGEST_TOKEN` where set (on both services), else `MAIL_GATEWAY_TOKEN` |
 | `NEWS_INGEST_URL`, `NEWS_INGEST_TOKEN` | set by compose | the news rail. Emptied, the `news` flag does nothing here and such mail is mirrored like any other |
 | `MAIL_GATEWAY_TOKEN` | | **required** — the opt-in (above) and the bearer token of its HTTP API; compose passes the one `.env` value to `retinue` too |
 
@@ -737,6 +766,7 @@ and a value in `.env` reaches it:
 | `CHAT_PENDING_TIMEOUT` | `4` | the web gateway | how long one look at a gateway's pending queue may take; it rides on a page's poll |
 | `CHAT_PENDING_RETRY_SECONDS` | `15` | the web gateway | how long a gateway that could not answer is left alone, the chat's copy standing in |
 | `CHAT_PENDING_SYNC_SECONDS` | `20` | the web gateway | how often the chat list has every mail gateway's queue read; `0` never does |
+| `MAIL_INSTRUCTION_TIMEOUT` | `600` | the web gateway | how long the ring of an instructed sender's **mail** waits for the verdict of the turn that works it (a messenger message waits `CHAT_INSTRUCTION_TIMEOUT`, 60): a turn that files a document needs minutes, and ten are a ring in time. Past it the mail rings by the failure rule |
 | `CHAT_ARRIVAL_RETRY_SECONDS` | `900` | the web gateway | how long the job handle of a mail's turn that **failed** is handed back to the mail gateway's next offer of the same mail; after that the offer starts the turn anew, so the work is done once an outage is over without a failing turn running once a poll |
 | `MAILBOX_NONE_SECONDS` | `600` | the web gateway | how long a gateway that answered `404`/`501` to a mailbox call (no mailbox) is not asked again |
 | `MAILBOX_RETRY_SECONDS` | `120` | the web gateway | how often a mailbox call that failed (a read, an archive the mailbox still owes) is tried again |

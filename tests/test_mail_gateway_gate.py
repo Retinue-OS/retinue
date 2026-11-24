@@ -754,8 +754,9 @@ def test_a_mail_that_came_back_is_not_offered_again():
 
 def test_a_mail_gone_or_merged_while_owed():
     with tempfile.TemporaryDirectory() as tmp:
-        # Gone: tombstoned before the rail ever took it. Nothing is owed for
-        # a mail that no longer exists, and it is offered to nobody.
+        # Gone: tombstoned before the rail ever took it. A mail that no
+        # longer exists is offered to nobody — its tombstone keeps saying it
+        # was owed, for the day it comes back (see the next test).
         gw = t.load(tmp)
         state = {"answer": "down"}
         events = t.rail(gw, lambda kind, payload: state["answer"])
@@ -765,7 +766,7 @@ def test_a_mail_gone_or_merged_while_owed():
         box.remove("INBOX", uid)
         mirror.poll()
         record = t.by_id(gw)["a@x.org"]
-        assert record["removed_at"] and record["delivered"] is True
+        assert record["removed_at"] and record["delivered"] is False
         assert offers(mirror) == {}
         events.clear()
         state["answer"] = "ok"
@@ -941,7 +942,9 @@ def test_news_is_filed_with_the_link_the_mail_declares():
         assert gw.filed == [
             {"source": "The Shop", "title": "Spring sale", "url": "https://shop.example/letters/42",
              "source_id": "email:news@shop.example", "text": gw.filed[0]["text"]},
-            {"source": "Dee", "title": "[dev] Release", "url": "https://lists.x.org/dev/",
+            # List-Archive names the list, not the mail: no link (the feed
+            # keys an item on its link).
+            {"source": "Dee", "title": "[dev] Release", "url": None,
              "source_id": "email:dee@x.org", "text": "[dev] Release\n\nOut now."},
             {"source": "weekly@letters.example", "title": "Weekly", "url": None,
              "source_id": "email:weekly@letters.example",
@@ -1187,6 +1190,11 @@ class _Rail(BaseHTTPRequestHandler):
         payload = self.rfile.read(int(self.headers.get("Content-Length", "0")))
         type(self).seen.append((self.path, json.loads(payload)))
         time.sleep(type(self).delay)
+        if type(self).status == 0:
+            # A handler that died on the event: the connection closes with
+            # no answer at all.
+            self.close_connection = True
+            return
         self.send_response(type(self).status)
         self.send_header("Content-Length", str(len(type(self).body)))
         self.end_headers()
@@ -1220,8 +1228,11 @@ def test_an_offer_on_the_wire_and_what_each_answer_reads_as():
                     (200, b"", ("ok", {})), (200, b"not json", ("ok", {})),
                     (200, b'["accepted"]', ("ok", {})),
                     (400, b"{}", ("drop", {})), (413, b"{}", ("drop", {})),
-                    (500, b"{}", ("down", {})), (404, b"{}", ("down", {})),
-                    (403, b"{}", ("down", {}))):
+                    # A failure the web gateway answered with is about this
+                    # mail; a URL that is not the rail, or the token, is not.
+                    (500, b"{}", ("unanswered", {})), (503, b"{}", ("unanswered", {})),
+                    (429, b"{}", ("unanswered", {})),
+                    (404, b"{}", ("down", {})), (403, b"{}", ("down", {}))):
                 _Rail.status, _Rail.body = status, body
                 assert gw._rail_offer({"chat": "a", "handover": True}) == expected, (status, body)
             assert _Rail.seen[0] == ("/internal/chats/inbound", {"chat": "a", "handover": True})
@@ -1231,10 +1242,19 @@ def test_an_offer_on_the_wire_and_what_each_answer_reads_as():
             # An event that is only told reads that as "not answering".
             gw.MAIL_RAIL_TIMEOUT = 0.2
             assert gw._rail_send("merge", {}) == "down"
+            # A connection closed with no answer: as unknown as a timeout —
+            # and the rail, asked something that takes nothing, answers.
+            _Rail.status, _Rail.delay = 0, 0.0
+            assert gw._rail_post("inbound", {}, 2.0) == ("uncertain", {})
+            assert gw._rail_send("inbound", {}) == "down"
+            assert gw._rail_alive() is True
+            assert _Rail.seen[-1] == ("/internal/chats/inbound", None)
         finally:
             server.shutdown()
         gw._chats.CHATS_INGEST_URL = "http://127.0.0.1:9/internal/chats/inbound"
         assert gw._rail_offer({}) == ("down", {})
+        # Nobody there: down, and the look finds nobody either.
+        assert gw._rail_alive() is False
     with tempfile.TemporaryDirectory() as tmp:
         # Nothing that is not text leaves by an offer either.
         gw = t.load(tmp)
@@ -1329,6 +1349,358 @@ def test_health_says_what_waits():
         assert gw._health_snapshot()["waiting"] == {"rail": 0, "since": None, "news": 0}
         json.dumps(gw._health_snapshot())
     print("ok: /health counts the mails waiting for the rail and for the feed")
+
+
+# --------------------------------------------------------------------------
+# Who the gate takes for the sender; one mail never holds back another
+# --------------------------------------------------------------------------
+
+def raw(headers: str, mid: str = "m@x.org", body: str = "Hello.\n") -> bytes:
+    """A mail written by hand, header by header — for the forms a library
+    would not write (two From headers, a group)."""
+    return (f"Message-ID: <{mid}>\r\nTo: {ACCOUNT}\r\nSubject: S {mid}\r\n"
+            f"Date: {t.email.utils.formatdate(T0 + 39 * DAY)}\r\n{headers}"
+            f"\r\n{body}").encode("utf-8")
+
+
+def test_the_gate_sender_is_the_one_address_of_the_one_from():
+    with tempfile.TemporaryDirectory() as tmp:
+        gw = t.load(tmp)
+        cases = {
+            "From: The Boss <Boss@Corp.Example>\r\n": "boss@corp.example",
+            "From: =?utf-8?q?Boss=2C_The?= <boss@corp.example>\r\n": "boss@corp.example",
+            # The Sender header never stands in for the From.
+            "From: Payroll:;\r\nSender: boss@corp.example\r\n": "",
+            "From:\r\nSender: boss@corp.example\r\n": "",
+            "Sender: boss@corp.example\r\n": "",
+            "From: =?utf-8?q?nobody?=\r\nSender: boss@corp.example\r\n": "",
+            "From: \"attacker\"@evil.example\r\nSender: boss@corp.example\r\n": "",
+            "From: Eve <\"e v e\"@evil.example>\r\nSender: boss@corp.example\r\n": "",
+            "From: Attacker\r\nSender: boss@corp.example\r\n": "",
+            # Nor the first of several, nor the one of two headers, nor the
+            # one a rejected entry left, nor a group's one member.
+            "From: boss@corp.example, Mallory <mallory@evil.example>\r\n": "",
+            "From: boss@corp.example\r\nFrom: mallory@evil.example\r\n": "",
+            "From: boss@corp.example, \"x y\"@evil.example\r\n": "",
+            "From: Staff: boss@corp.example;\r\n": "",
+            # A lookalike that folds into ASCII on some reading names nobody.
+            "From: boss@corK.example\r\n": "",
+            "From: boss@corp．example\r\n": "",
+        }
+        for headers, expected in cases.items():
+            mail = gw.parse_mail(raw(headers))
+            assert mail.gate_sender == expected, (headers, mail.gate_sender)
+            # A placeholder is gated by the same rule.
+            assert gw.stub_mail(raw(headers), None, "test").gate_sender == expected, headers
+        # What the chat shows may still come from the Sender header.
+        assert gw.parse_mail(raw("Sender: boss@corp.example\r\n")).sender == "boss@corp.example"
+        # Mirrored: the record and the rail carry both, and only the gate
+        # sender decides.
+        senders(gw, vip={"boss@corp.example"}, instructed={"*@corp.example"})
+        events = t.rail(gw)
+        mirror, box, _clock = begin(gw)
+        box.put("INBOX", raw("From: Payroll:;\r\nSender: boss@corp.example\r\n", "spoof@x.org"))
+        box.put("INBOX", raw("From: boss@corp.example, m@evil.example\r\n", "two@x.org"))
+        box.put("INBOX", raw("From: The Boss <boss@corp.example>\r\n", "real@x.org"))
+        mirror.poll()
+        got = {p["message_id"]: p for _k, p in events}
+        records = t.by_id(gw)
+        for mid in ("spoof@x.org", "two@x.org"):
+            assert got[mid]["gate"] == OPEN and got[mid]["gate_sender"] == "", got[mid]
+            assert got[mid]["sender"] == "boss@corp.example" and "files" not in got[mid]
+            assert records[mid]["gate_sender"] is None and records[mid]["delivered"] is True
+        assert got["real@x.org"]["gate"]["vip"] is True
+        assert got["real@x.org"]["gate_sender"] == "boss@corp.example"
+        assert records["real@x.org"]["gate_sender"] == "boss@corp.example"
+        # A record written without the field (before it existed) is from
+        # nobody: no turn on a guess.
+        fields = dict(records["real@x.org"], gate_sender=None)
+        assert mirror._offer_event("real@x.org", fields)["gate"]["vip"] is False
+    print("ok: the gate goes by the one address of the one From alone — never the Sender "
+          "header, the first of several, or a lookalike")
+
+
+def test_news_is_linked_by_archived_at_alone():
+    with tempfile.TemporaryDirectory() as tmp:
+        gw = t.load(tmp)
+        flags(gw, news={"weekly.lists.example"}, ignored={"weekly.lists.example"})
+        t.rail(gw)
+        mirror, box, clock = begin(gw)
+        # Every issue of the list carries the list's archive: two issues are
+        # two items, each filed and each taken out of the INBOX.
+        for n in (1, 2):
+            box.put("INBOX", msg(f"issue{n}@x.org", sender="weekly@letters.example",
+                                 subject=f"Issue {n}", body=f"Issue {n} text.\n",
+                                 list_id="<weekly.lists.example>", day=38 + n,
+                                 headers=[("List-Archive", "<https://weekly.example/archive>")]))
+            mirror.poll()
+        assert [(item["title"], item["url"]) for item in gw.filed] == [
+            ("Issue 1", None), ("Issue 2", None)]
+        assert gw.filed[0]["text"] != gw.filed[1]["text"]
+        assert sorted(held_in(box, "Archive")) == ["issue1@x.org", "issue2@x.org"]
+    print("ok: a news item is linked only by the mail's own Archived-At, never by the "
+          "list's archive")
+
+
+def test_the_two_axes_stay_independent_for_news():
+    with tempfile.TemporaryDirectory() as tmp:
+        gw = t.load(tmp)
+        senders(gw, vip={"boss@corp.example"}, instructed={"clerk@corp.example"})
+        flags(gw, news_wildcards={"*@corp.example"}, ignored={"letters.lists.example"},
+              news={"letters.lists.example"})
+        events = t.rail(gw)
+        mirror, box, _clock = begin(gw)
+        box.put("INBOX", msg("vip@x.org", sender="boss@corp.example", subject="Call me",
+                             day=39))
+        box.put("INBOX", msg("clerk@x.org", sender="clerk@corp.example", subject="Invoice",
+                             day=39))
+        box.put("INBOX", msg("viplist@x.org", sender="boss@corp.example", subject="Letter",
+                             list_id="<letters.lists.example>", day=39))
+        box.put("INBOX", msg("promo@x.org", sender="promo@corp.example", subject="Sale",
+                             day=39))
+        mirror.poll()
+        got = {p["message_id"]: p for _k, p in events}
+        # A VIP's and an instructed sender's mail get their chat, offer and
+        # turn — and are filed as well. Anyone else of the news group is
+        # news alone.
+        assert sorted(got) == ["clerk@x.org", "vip@x.org", "viplist@x.org"]
+        assert got["vip@x.org"]["gate"]["vip"] is True and got["vip@x.org"]["handover"]
+        assert got["clerk@x.org"]["gate"]["instructed"] is True
+        assert got["viplist@x.org"]["gate"] == {
+            "forward": False, "vip": True, "instructed": False, "reason": "vip+group-ignored"}
+        assert sorted(item["title"] for item in gw.filed) == [
+            "Call me", "Invoice", "Letter", "Sale"]
+        # In a chat, so never taken out of the INBOX by the news rail — even
+        # where the group is ignored.
+        assert "viplist@x.org" in held_in(box, "INBOX") and held_in(box, "Archive") == []
+        assert not seen(box, "INBOX", "viplist@x.org")
+        assert sorted(t.by_id(gw)) == ["clerk@x.org", "vip@x.org", "viplist@x.org"]
+    print("ok: a news group never swallows a VIP's or an instructed sender's mail")
+
+
+def test_a_record_not_read_for_a_moment_is_not_gone():
+    with tempfile.TemporaryDirectory() as tmp:
+        gw = t.load(tmp)
+        senders(gw, vip={"boss@corp.example"})
+        events = t.rail(gw)
+        mirror, box, clock = begin(gw)
+        real, calls = gw._ibstore.read_record, []
+
+        def flaky(path):
+            calls.append(path)
+            return None if len(calls) == 1 else real(path)   # EIO, EMFILE, ...
+        gw._ibstore.read_record = flaky
+        try:
+            box.put("INBOX", msg("v@x.org", sender="boss@corp.example", day=39))
+            mirror.poll()
+        finally:
+            gw._ibstore.read_record = real
+        assert calls and offered(events) == [] and "v@x.org" in offers(mirror)
+        assert t.by_id(gw)["v@x.org"]["delivered"] is False
+        clock[0] += gw.RETRY_SECONDS
+        mirror.poll()
+        assert offered(events) == ["v@x.org"] and events[-1][1]["gate"]["vip"] is True
+        assert t.by_id(gw)["v@x.org"]["delivered"] is True and offers(mirror) == {}
+    print("ok: a record that could not be read just now is offered again, not dropped")
+
+
+def test_turns_at_work_take_no_slot_of_the_re_offers():
+    with tempfile.TemporaryDirectory() as tmp:
+        gw = t.load(tmp)
+        senders(gw, instructed={"*@bills.example"})
+        jobs = FakeJobs(gw)
+        try:
+            state = {"plain": False}
+
+            def answer(payload):
+                if payload["gate"]["instructed"]:
+                    return {"accepted": True, "job_url": "/jobs/" + payload["message_id"]}
+                return {"accepted": state["plain"]}
+            events = t.rail(gw, "ok", answer)
+            mirror, box, clock = begin(gw)
+            for n in range(gw.OFFER_BATCH + 5):
+                box.put("INBOX", msg(f"r{n:02d}@x.org", sender=f"b{n}@bills.example",
+                                     subject=f"Receipt {n}", day=30))
+            box.put("INBOX", msg("plain@x.org", sender="ann@x.org", subject="Lunch?", day=31))
+            mirror.poll()
+            assert len(jobs.asked) == gw.OFFER_BATCH + 5
+            state["plain"] = True
+            clock[0] += gw.RETRY_SECONDS
+            mirror.poll()
+            assert offered(events)[-1] == "plain@x.org"
+            assert t.by_id(gw)["plain@x.org"]["delivered"] is True
+            # The turns at work were not offered again meanwhile.
+            assert offered(events).count("r00@x.org") == 1
+        finally:
+            jobs.restore()
+    print("ok: mails whose turns are at work take no slot of a pass's re-offers")
+
+
+def test_one_mail_the_rail_fails_on_holds_back_no_other():
+    for failing in ("unanswered", "uncertain"):
+        with tempfile.TemporaryDirectory() as tmp:
+            gw = t.load(tmp)
+            senders(gw, vip={"boss@corp.example"})
+            # The web gateway fails on one mail (a 5xx; a handler that died
+            # on it and closed the connection) and takes every other — and
+            # answers when it is asked whether it is up.
+            events = t.rail(gw, lambda kind, payload: failing if payload.get(
+                "message_id") == "poison@x.org" else "ok", alive=True)
+            mirror, box, clock = begin(gw)
+            box.put("INBOX", msg("poison@x.org", sender="mallory@evil.example", day=30))
+            mirror.poll()
+            for n in range(3):
+                box.put("INBOX", msg(f"vip{n}@x.org", sender="boss@corp.example",
+                                     subject=f"Urgent {n}", day=31 + n))
+            clock[0] += 1
+            mirror.poll()
+            assert offered(events) == ["poison@x.org"] + [f"vip{n}@x.org" for n in range(3)], \
+                (failing, offered(events))
+            records = t.by_id(gw)
+            assert all(records[f"vip{n}@x.org"]["delivered"] for n in range(3))
+            # The one it fails on waits its own, growing, time — and keeps
+            # its place in nothing.
+            assert records["poison@x.org"]["delivered"] is False
+            assert offers(mirror)["poison@x.org"]["attempts"] == 1
+            assert mirror.index.one("SELECT COUNT(*) AS n FROM outbox")["n"] == 0
+            assert mirror.waiting()["rail"] == 1 and mirror._rail_down == 0
+    with tempfile.TemporaryDirectory() as tmp:
+        # A rail that answers nothing at all is down: the order holds, and
+        # nothing behind the mail goes.
+        gw = t.load(tmp)
+        events = t.rail(gw, "uncertain", alive=False)
+        mirror, box, clock = begin(gw)
+        box.put("INBOX", msg("a@x.org", day=30))
+        box.put("INBOX", msg("b@x.org", subject="Other", day=31))
+        mirror.poll()
+        assert offered(events) == ["a@x.org"] and mirror._rail_down == 1
+        assert mirror.index.one("SELECT COUNT(*) AS n FROM outbox")["n"] == 2
+    print("ok: one mail the rail fails on waits its own time; only a rail that answers "
+          "nothing holds every mail back")
+
+
+def test_what_has_arrived_is_offered_while_the_mailbox_is_away():
+    with tempfile.TemporaryDirectory() as tmp:
+        gw = t.load(tmp)
+        flags(gw)
+        senders(gw, vip={"boss@corp.example"})
+        state = {"answer": "down"}
+        events = t.rail(gw, lambda kind, payload: state["answer"])
+        mirror, box, clock = begin(gw)
+        box.put("INBOX", msg("v@x.org", sender="boss@corp.example", day=39))
+        mirror.poll()
+        assert t.by_id(gw)["v@x.org"]["delivered"] is False
+        # The web gateway is back; the mailbox is not.
+        state["answer"] = "ok"
+        box.fail = gw.MailboxError("IMAP login failed")
+        mirror._rail_wait_until = 0.0
+        loop: dict = {}
+        assert gw._loop_step(mirror, loop) == gw.MAIL_POLL_SECONDS
+        assert offered(events)[-1] == "v@x.org" and events[-1][1]["gate"]["vip"] is True
+        assert t.by_id(gw)["v@x.org"]["delivered"] is True
+        assert gw._health_snapshot()["connected"] is False
+    print("ok: a mailbox that does not answer holds back what arrives, not what has")
+
+
+def test_a_mail_that_left_while_owed_is_owed_when_it_comes_back():
+    with tempfile.TemporaryDirectory() as tmp:
+        gw = t.load(tmp)
+        senders(gw, vip={"boss@corp.example"})
+        state = {"answer": "down"}
+        events = t.rail(gw, lambda kind, payload: state["answer"])
+        mirror, box, clock = begin(gw)
+        mail = msg("v@x.org", sender="boss@corp.example", subject="Urgent", day=39)
+        box.put("INBOX", mail)
+        mirror.poll()
+        # Moved out of the INBOX while the web gateway is away (a junk
+        # filter), and back once it answers again.
+        box.remove("INBOX", box.uid_of("INBOX", "v@x.org"))
+        clock[0] += 120
+        mirror.poll()
+        assert t.by_id(gw)["v@x.org"]["removed_at"] and offers(mirror) == {}
+        state["answer"] = "ok"
+        box.put("INBOX", mail)
+        clock[0] += gw.RAIL_RETRY_MAX_SECONDS
+        mirror.poll()
+        record = t.by_id(gw)["v@x.org"]
+        assert record["removed_at"] is None and record["delivered"] is True
+        last = [p for _k, p in events if p.get("message_id") == "v@x.org"][-1]
+        assert last.get("handover") is True and last["gate"]["vip"] is True
+    print("ok: a mail that left the mailbox while owed is offered when it comes back")
+
+
+def test_a_news_mail_that_could_not_be_read_is_read_again():
+    with tempfile.TemporaryDirectory() as tmp:
+        gw = t.load(tmp)
+        flags(gw, news={"news.lists.example"})
+        events = t.rail(gw)
+        mirror, box, clock = begin(gw)
+        real = gw._reading
+
+        def reading(data, date):
+            if b"issue1@" in data:
+                raise ValueError("a moment the reader was in")
+            return real(data, date)
+        gw._reading = reading
+        try:
+            box.put("INBOX", msg("issue1@x.org", sender="news@pub.example", subject="Issue 1",
+                                 list_id="<news.lists.example>", day=39))
+            mirror.poll()
+        finally:
+            gw._reading = real
+        # Not read: nothing filed, and no chat — an unreadable newsletter is
+        # still none.
+        assert gw.filed == [] and t.records(gw) == [] and events == []
+        clock[0] += gw.SET_ASIDE_RETRY_SECONDS + 1
+        mirror.poll()
+        assert [item["title"] for item in gw.filed] == ["Issue 1"]
+        assert t.records(gw) == [] and events == []
+        assert mirror.index.one("SELECT skipped FROM locations WHERE message_id = ?",
+                                ("issue1@x.org",))["skipped"] == "news"
+    print("ok: a news mail that could not be read is read again, and filed once it reads")
+
+
+def test_a_job_is_polled_on_the_rail_and_nowhere_else():
+    with tempfile.TemporaryDirectory() as tmp:
+        gw = t.load(tmp)
+        base = "http://rail.invalid"
+        assert gw._job_url("/jobs/ab12") == f"{base}/jobs/ab12"
+        assert gw._job_url("/jobs/ab12?x=1") == f"{base}/jobs/ab12?x=1"
+        for bad in ("/\t/evil.example/x", "/\n/evil.example/x", "/\r/evil.example/x",
+                    "//evil.example/x", "http://evil.example/jobs/1", "jobs/1",
+                    "/jobs/\x00", "/jobs/ 1", "/\\evil.example/x", "/jobs/é", "",
+                    None, 7, "/" + "a" * 2000):
+            assert gw._job_url(bad) is None, bad
+        # On the rail: such an answer is no acceptance, and nothing is polled.
+        jobs = FakeJobs(gw)
+        try:
+            senders(gw, vip={"boss@corp.example"})
+            events = t.rail(gw, answer={"accepted": True, "job_url": "/\t/evil.example/x"})
+            mirror, box, _clock = begin(gw)
+            box.put("INBOX", msg("v@x.org", sender="boss@corp.example", day=39))
+            mirror.poll()
+            assert offered(events) == ["v@x.org"] and jobs.asked == []
+            assert t.by_id(gw)["v@x.org"]["delivered"] is False
+        finally:
+            jobs.restore()
+    print("ok: a job is polled where the rail is, checked as the URL is parsed")
+
+
+def test_the_retired_news_names_are_read_as_fallbacks():
+    with tempfile.TemporaryDirectory() as tmp:
+        gw = t.load(tmp)
+        assert gw.MAIL_NEWS_FOLDER is None and gw.MAIL_NEWS_EXCERPT_CHARS == 600
+        # An empty folder keeps news in the INBOX — and stays apart from unset.
+        gw = t.load(tmp, TRIAGE_NEWS_FOLDER="", TRIAGE_NEWS_EXCERPT_CHARS="120")
+        assert gw.MAIL_NEWS_FOLDER == "" and gw.MAIL_NEWS_EXCERPT_CHARS == 120
+        gw = t.load(tmp, TRIAGE_NEWS_FOLDER="Newsletters")
+        assert gw.MAIL_NEWS_FOLDER == "Newsletters"
+        # The new name wins where both are set.
+        gw = t.load(tmp, TRIAGE_NEWS_FOLDER="Old", MAIL_NEWS_FOLDER="New",
+                    TRIAGE_NEWS_EXCERPT_CHARS="120", MAIL_NEWS_EXCERPT_CHARS="300")
+        assert gw.MAIL_NEWS_FOLDER == "New" and gw.MAIL_NEWS_EXCERPT_CHARS == 300
+    print("ok: TRIAGE_NEWS_FOLDER / TRIAGE_NEWS_EXCERPT_CHARS are read where the new "
+          "names are not set")
 
 
 def main():

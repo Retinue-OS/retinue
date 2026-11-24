@@ -156,10 +156,14 @@ filed.
 **Newsletters (e-mail)** are the automatic version of that ad-hoc path. A
 mailing list (its `List-Id`), an address or a `*@domain` flagged **`news`** in
 the e-mail policy is filed by the **mail gateway** on arrival — Subject as the
-title, an excerpt of the text as the summary, the mail's own
-`Archived-At`/`List-Archive` as the link. Such a mail starts no chat, and
-where the group is also flagged `ignored` it is marked seen and moved out of
-the INBOX once the feed has it. No model turn is spent, and the item reaches
+title, an excerpt of the text as the summary, the mail's own `Archived-At`
+as the link (never `List-Archive`: it names the list's archive, the same on
+every issue, and the feed keys an item on its link — a mail without
+`Archived-At` is filed with no link, keyed on its text). Such a mail starts
+no chat, and where the group is also flagged `ignored` it is marked seen and
+moved out of the INBOX once the feed has it — unless its sender is a VIP or
+instructed: then it is filed *and* in its chat, worked like any of their
+mail, and left in the INBOX. No model turn is spent on news, and the item reaches
 the Herald on the next curation tick like any other. The e-mail twin of the
 messenger `news` group flag:
 

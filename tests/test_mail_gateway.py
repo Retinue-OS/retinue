@@ -45,7 +45,8 @@ RAIL_URL = "http://rail.invalid/internal/chats/inbound"
 NEWS_URL = "http://rail.invalid/internal/news"
 
 _ENV_PREFIXES = ("MAIL_", "EMAIL_", "IMAP_", "SMTP_", "TRIAGE_")
-_ENV_NAMES = ("SENT_FOLDER", "DRAFTS_FOLDER", "INBOUND_STORE_DIR", "MESSENGER_BUILTIN_CHANNELS")
+_ENV_NAMES = ("SENT_FOLDER", "DRAFTS_FOLDER", "INBOUND_STORE_DIR", "MESSENGER_BUILTIN_CHANNELS",
+              "CHATS_INGEST_TOKEN")
 TOKEN = "gateway-token"
 
 
@@ -85,17 +86,21 @@ def load(tmp, *, token=TOKEN, days=90, configured=True, rail=True, news=True, **
     return gw
 
 
-def rail(gw, outcome="ok", answer=None):
+def rail(gw, outcome="ok", answer=None, alive=False):
     """Capture what the gateway tells and offers the rail; returns the list
     it fills, ``(kind, payload)`` in the order sent — an offer (a mail that
     arrived, with its handover) as ``"inbound"``, like every mail.
 
     ``outcome`` is how the web gateway takes each event ("ok", "drop",
-    "later", "down", and for an offer "uncertain"), or a function of
-    ``(kind, payload)`` saying so. ``answer`` is what it answers an offer it
-    took: by default ``{"accepted": True}`` — the chat has the mail — else a
-    dict, or a function of the payload returning one."""
+    "later", "down", and for an offer "uncertain" and "unanswered"), or a
+    function of ``(kind, payload)`` saying so. ``answer`` is what it answers
+    an offer it took: by default ``{"accepted": True}`` — the chat has the
+    mail — else a dict, or a function of the payload returning one.
+    ``alive`` is what a look at the rail after an "uncertain" offer finds
+    (``_rail_alive``): by default that it is away, as "uncertain" was ever
+    tested; a bool, or a function of nothing."""
     events = []
+    gw._rail_alive = alive if callable(alive) else (lambda: bool(alive))
 
     def send(kind, payload):
         events.append((kind, payload))
@@ -2307,6 +2312,7 @@ def test_no_rail_configured_queues_nothing():
 
 class _RailStub(BaseHTTPRequestHandler):
     seen: list = []
+    bearer: list = []
     status = 200
 
     def log_message(self, fmt, *args):
@@ -2316,6 +2322,7 @@ class _RailStub(BaseHTTPRequestHandler):
         body = self.rfile.read(int(self.headers.get("Content-Length", "0")))
         type(self).seen.append((self.path, self.headers.get("X-Conversation-Backend-Token"),
                                 json.loads(body)))
+        type(self).bearer.append(self.headers.get("Authorization"))
         self.send_response(type(self).status)
         self.send_header("Content-Length", "2")
         self.end_headers()
@@ -2329,17 +2336,21 @@ def test_rail_posts_and_their_outcomes():
         threading.Thread(target=server.serve_forever, daemon=True).start()
         base = f"http://127.0.0.1:{server.server_address[1]}"
         gw._chats.CHATS_INGEST_URL = f"{base}/internal/chats/inbound"
-        _RailStub.seen = []
+        _RailStub.seen, _RailStub.bearer = [], []
         try:
             _RailStub.status = 200
             assert gw._rail_send("inbound", {"chat": "a"}) == "ok"
             assert gw._rail_send("merge", {"into": "a"}) == "ok"
             assert gw._rail_send("removed", {"chat": "a"}) == "ok"
-            # The two new endpoints are the inbound URL with its last segment replaced.
+            # The two new endpoints are the inbound URL with its last segment
+            # replaced. The token: the web gateway takes an e-mail event only
+            # with one, and with no CHATS_INGEST_TOKEN set it is the
+            # MAIL_GATEWAY_TOKEN both sides hold — never chat_ingest's value.
             assert [(path, token) for path, token, _b in _RailStub.seen] == [
-                ("/internal/chats/inbound", "rail-token"),
-                ("/internal/chats/merge", "rail-token"),
-                ("/internal/chats/removed", "rail-token")]
+                ("/internal/chats/inbound", TOKEN),
+                ("/internal/chats/merge", TOKEN),
+                ("/internal/chats/removed", TOKEN)]
+            assert _RailStub.bearer == [f"Bearer {TOKEN}"] * 3
             assert _RailStub.seen[0][2] == {"chat": "a"}
             for status, kind, outcome in ((400, "inbound", "drop"), (413, "inbound", "drop"),
                                           (500, "inbound", "down"), (404, "inbound", "down"),
@@ -2351,6 +2362,21 @@ def test_rail_posts_and_their_outcomes():
             server.shutdown()
         gw._chats.CHATS_INGEST_URL = "http://127.0.0.1:9/internal/chats/inbound"
         assert gw._rail_send("inbound", {}) == "down"
+    with tempfile.TemporaryDirectory() as tmp:
+        # A CHATS_INGEST_TOKEN the deployment set is the one sent.
+        gw = load(tmp, CHATS_INGEST_TOKEN=" own-rail-token ")
+        assert gw.RAIL_TOKEN == "own-rail-token"
+        server = ThreadingHTTPServer(("127.0.0.1", 0), _RailStub)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        port = server.server_address[1]
+        gw._chats.CHATS_INGEST_URL = f"http://127.0.0.1:{port}/internal/chats/inbound"
+        _RailStub.seen, _RailStub.bearer, _RailStub.status = [], [], 200
+        try:
+            assert gw._rail_send("inbound", {"chat": "a"}) == "ok"
+            assert _RailStub.seen[0][1] == "own-rail-token"
+            assert _RailStub.bearer == ["Bearer own-rail-token"]
+        finally:
+            server.shutdown()
     with tempfile.TemporaryDirectory() as tmp:
         # Nothing that is not text leaves by the rail, whatever got into an
         # event: the receiver writes what it is sent into files.

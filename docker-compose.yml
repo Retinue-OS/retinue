@@ -1245,9 +1245,13 @@ services:
       # is moved once the feed has it. Unset: the archive folder. Set and
       # EMPTY (MAIL_NEWS_FOLDER= in .env): marked read, left in the INBOX —
       # which is why this one is passed only when .env names it. And how
-      # much of a mail's text its feed item carries.
+      # much of a mail's text its feed item carries. The retired triage
+      # gate's names for the two, passed the same way: read where the new
+      # name is not set (an upgrade keeps an operator's value; rename it).
       - MAIL_NEWS_FOLDER
       - MAIL_NEWS_EXCERPT_CHARS
+      - TRIAGE_NEWS_FOLDER
+      - TRIAGE_NEWS_EXCERPT_CHARS
       - MAIL_DATA_DIR=/root/.local/share/mail
       - MAIL_GATEWAY_HTTP_PORT=8096
       # The operator's opt-in: unset, the gateway neither mirrors nor serves.
@@ -1257,10 +1261,15 @@ services:
       # offered here, and the job of a turn that works one is polled on the
       # same host. The merge and removal rails are derived from
       # CHATS_INGEST_URL. Emptied, mail is mirrored and offered to nobody.
+      # The rail takes mail only with a token: CHATS_INGEST_TOKEN where .env
+      # sets one (then on the retinue service too), else MAIL_GATEWAY_TOKEN
+      # above, which both sides already hold.
       - CHATS_INGEST_URL=http://retinue:8080/internal/chats/inbound
       - CHATS_INGEST_TOKEN
       # News rail — as on telegram-gateway above: a mail of a `news` sender or
-      # list is filed to the feed (and starts no chat). The endpoint is open
+      # list is filed to the feed, and starts no chat unless it joins one or
+      # its sender is a VIP or instructed (then it is in its chat as well,
+      # and stays in the INBOX). The endpoint is open
       # unless NEWS_INGEST_TOKEN is set on both sides. Emptied, the `news`
       # flag does nothing here and such mail is mirrored like any other.
       - NEWS_INGEST_URL=http://retinue:8080/internal/news

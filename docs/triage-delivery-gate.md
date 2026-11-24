@@ -143,7 +143,7 @@ one, so the three flags apply to it with no second mechanism.
 
 | Group flag | What it does to a mail |
 |---|---|
-| `news` | filed into the news feed for the Herald; the mail **starts no chat** (it joins one only when it continues a thread that is already mirrored) |
+| `news` | filed into the news feed for the Herald; the mail **starts no chat** (it joins one only when it continues a thread that is already mirrored, or when its sender is a VIP or instructed) |
 | `quieted` | the chat shows the mail silently |
 | `ignored` | the same; and where the group is also `news`, the mail is consumed once the feed has it — marked seen and moved out of the INBOX |
 | none | as the sender axis says |
@@ -156,9 +156,10 @@ combines with either. The canonical pairs:
 - a list one both reads and answers on → **`news` + `quieted`** (in the feed,
   and the mail stays where it arrived).
 
-The two axes stay **independent**: neither flag stops a VIP's or an
-instructed sender's turn, declaring a group `news` makes nobody a VIP, and a
-VIP is not turned into a feed source.
+The two axes stay **independent**: no group flag stops a VIP's or an
+instructed sender's turn — a `news` group included: their mail is filed, and
+is also in its chat, offered and worked, and never taken out of the INBOX by
+the news rail — and declaring a group `news` makes nobody a VIP.
 
 Group entries take two shapes — an exact id, or a `*@domain` wildcard. On a
 group the wildcard also covers ids **beneath** the domain, because a `List-Id`
@@ -353,12 +354,18 @@ the messengers' inbound flow ([messenger-chats.md](messenger-chats.md),
 2. **Gate**: the group axis by `triage_policy.email_gate_decision(sender,
    list_id)` — which answers `{group, news, quieted, ignored}` and nothing
    else — and the sender axis by `triage_policy.gate_decision("email", sender,
-   group)`, read for `vip` and `instructed`. An unreadable policy fails
-   **open** on the group axis (no flags) and **closed** on the sender axis:
-   nobody is a VIP or instructed, because a mail must not buy a model turn
-   for want of a readable file.
+   group)`, read for `vip` and `instructed`. The sender on both is the
+   **gate sender**: the one address of a mail with exactly one `From` header
+   holding exactly one address, lowercased by its ASCII letters (none where a
+   character folds into ASCII) — never the `Sender` header, never the first
+   of several addresses; a mail without one is from nobody and buys no turn
+   ([mail-chats.md](mail-chats.md), "Who the sender is"). An unreadable
+   policy fails **open** on the group axis (no flags) and **closed** on the
+   sender axis: nobody is a VIP or instructed, because a mail must not buy a
+   model turn for want of a readable file.
 3. **News**: a `news` group is filed to the feed (*The news rail on e-mail*
-   below) and starts no chat.
+   below) and starts no chat — unless the sender is a VIP or instructed, whose
+   mail goes on to the next step as well.
 4. **Notify the chat rail** with a handover. The rail's acceptance marks the
    record delivered; for a VIP or an instructed sender it also starts the
    turn in the chat's companion and the gateway waits on that job, exactly as
@@ -610,17 +617,24 @@ whose bare sender address — is `news`:
    excerpt of the mail's text as the summary, `email:<addr>` as the source id —
    and hand it to `news_ingest.forward_news(channel="email", …)`, like a
    messenger gateway (`NEWS_INGEST_URL`, optional `NEWS_INGEST_TOKEN`).
-2. The link is the newsletter's **own declared** web version: `Archived-At`
-   (RFC 5064) or `List-Archive` (RFC 2369). Nothing is scraped from the body —
+2. The link is the newsletter's **own declared** web version: its
+   `Archived-At` (RFC 5064), which names this one mail. Not `List-Archive`
+   (RFC 2369): that names the list's archive, the same on every issue, and the
+   feed item's id is keyed off the URL — every issue after the first would be
+   taken for the first and dropped. Nothing is scraped from the body either —
    the first URL in a newsletter is as often a tracking pixel as the article,
-   and the feed item's id is keyed off the URL, so a wrong link is worse than
-   none.
+   so a wrong link is worse than none. A mail without `Archived-At` is filed
+   with no link, its item keyed on its text.
 3. The mail starts no chat. It joins one only when its `References` reach a
    thread that is already mirrored — normally because the user wrote in it —
-   and is then in the feed *and* in that chat.
+   or when its sender is a VIP or instructed, and is then in the feed *and*
+   in that chat. A news mail the reader could not read is neither filed nor a
+   chat; it is read again with the placeholders, and filed once it reads.
 4. Where the group is also `ignored` and the feed took the item, the mail is
    consumed: `\Seen`, and a move to `MAIL_NEWS_FOLDER` (default: the archive
-   folder; empty leaves it in the INBOX). The feed holds a *reference*, so the
+   folder; empty leaves it in the INBOX; the retired `TRIAGE_NEWS_FOLDER` is
+   read where it is not set). Only a mail in no chat is consumed. The feed
+   holds a *reference*, so the
    mail is archived, never deleted. A `news` + `quieted` mail is filed and
    otherwise left where it arrived.
 
@@ -668,9 +682,10 @@ Tier-3 across both the framework and the gateway services:
   `retinue` service carries no triage tunable: the retired e-mail triage's
   `TRIAGE_STATE_DIR`, `TRIAGE_INBOX_SCAN_*`, `TRIAGE_PROMPT_LIST_LIMIT`,
   `TRIAGE_STALL_DAYS`, `TRIAGE_SENT_DERIVE_LIMIT`, `TRIAGE_BATCH_SIZE`,
-  `TRIAGE_SENT_RECONCILE`, `TRIAGE_ANSWERED_FOLDER`, `TRIAGE_NEWS_FOLDER`,
-  `TRIAGE_NEWS_EXCERPT_CHARS`, `EMAIL_PROCESSING_INTERVAL` and
-  `RETINUE_TRIAGE_MODEL` are no longer read by anything. What stays are the
+  `TRIAGE_SENT_RECONCILE`, `TRIAGE_ANSWERED_FOLDER`,
+  `EMAIL_PROCESSING_INTERVAL` and `RETINUE_TRIAGE_MODEL` are no longer read by
+  anything (`TRIAGE_NEWS_FOLDER` and `TRIAGE_NEWS_EXCERPT_CHARS` only by the
+  mail gateway, below). What stays are the
   two paths `TRIAGE_MESSENGER_DIR` and `TRIAGE_EMAIL_WHITELIST_PATH`.
 - **gateways:** `signal-gateway` / `whatsapp-gateway` / `telegram-gateway` /
   `sms-gateway` each
@@ -679,7 +694,10 @@ Tier-3 across both the framework and the gateway services:
   rail they also carry `scripts/news_ingest.py` and forward news-flagged messages
   to the web-gateway (guarded by `NEWS_INGEST_URL`). The `mail-gateway` gates
   the same way, with no `/undelivered`; its news rail has two tunables of its
-  own, `MAIL_NEWS_FOLDER` and `MAIL_NEWS_EXCERPT_CHARS`.
+  own, `MAIL_NEWS_FOLDER` and `MAIL_NEWS_EXCERPT_CHARS` — the retired triage
+  gate's `TRIAGE_NEWS_FOLDER` and `TRIAGE_NEWS_EXCERPT_CHARS`, which it still
+  reads where the new name is not set (an empty value included: an upgrade
+  keeps an operator's setting), saying so at start.
 - **web-gateway:** the `POST /internal/news` endpoint that shapes a forwarded
   message into a feed item via `news_store` — open unless `NEWS_INGEST_TOKEN` is
   set (`_news_ingest_authorized`).
