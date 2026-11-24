@@ -27,6 +27,42 @@ below. Avoid `--env-file` / `EMAIL_ENV_FILE`: a file loaded that way is readable
 by the agent and bypasses the isolation, giving it direct SMTP/IMAP access and
 allowing it to circumvent the send-control policy.
 
+## Mirrored threads: send with `mail-push.py`
+
+Where the **mail gateway** mirrors the mailbox (docs/messaging.md, "E-mail (the
+mail gateway)"), each mail thread is a chat. **A mail you reach as a chat** —
+you hold its chat id (a mail chat's companion thread names it, and the command
+to send with) — is answered, and a new mail from the account the gateway
+serves is written, with `scripts/mail-push.py`, the sibling of the messenger
+push CLIs, not with this client:
+
+```bash
+python3 /workspace/scripts/mail-push.py --chat <chat id or key> --reply all "..."   # or --reply sender
+python3 /workspace/scripts/mail-push.py --to a@b.ch --subject "..." --attach /tmp/x.pdf "..."
+python3 /workspace/scripts/mail-push.py --retract <id>
+```
+
+(`--reply-to <token>` also exists, for a gateway prompt that carries a token;
+nothing issues one for mail yet, so do not look for one.) It goes through the
+same `EMAIL_SEND_POLICY` (below) but a different queue: a `verify` send waits
+in the gateway's own pending store, shows in the chat as a pending bubble and
+is taken back with `mail-push.py --retract`, whereas a `send`/`reply` of this
+client waits as an IMAP draft and is taken back with `retract --request-id`.
+Both are approved on `/sends`.
+
+**A mail triage hands you** — a UID or Message-ID from e-mail triage, not a
+chat id — keeps using `email_client.py reply --uid <UID>` (the `triage` skill),
+because triage's status store records the `sent_uid` and the draft queue that
+`reply` returns and `mail-push.py` does not. Do not guess a chat id from a UID.
+This holds until triage retires in the gate phase.
+
+Use this client for everything else too — reading, searching, flags, moving,
+drafts, attachments of a mail you have a UID for, and an account the gateway
+does not serve. A mail sent with it from a mirrored account still lands in its
+chat once it is in the Sent folder. The gateway never writes policy: a mail
+sent with `mail-push.py` does not add its recipient to the e-mail whitelist,
+one sent with this client does.
+
 ---
 
 ## Command reference

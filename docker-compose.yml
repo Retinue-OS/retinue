@@ -161,8 +161,9 @@ services:
       # unconfigured mail gateway reports configured: false and idles. The
       # token is the operator's opt-in: until MAIL_GATEWAY_TOKEN is set in
       # .env (compose passes the one value to both sides) the gateway
-      # mirrors and serves nothing. The send URL is for the send path of a
-      # later phase; the mirror is read-only and answers 501 there.
+      # mirrors and serves nothing. The send URL is scripts/mail-push.py's;
+      # the base URL is also where email_client.py tells the gateway whose
+      # mail it just sent (POST /outbound-note).
       - MAIL_GATEWAY_SEND_URL=http://mail-gateway:8096/send
       - MAIL_GATEWAY_BASE_URL=http://mail-gateway:8096
       - MAIL_GATEWAY_TOKEN
@@ -444,6 +445,21 @@ services:
       - CHAT_SEND_CONFIRM_TIMEOUT
       - CHAT_SEND_MAX_IMAGES
       - CHAT_SEND_TIMEOUT
+      # Mail chats (scripts/web-gateway.py): the hop to the mail gateway's
+      # /send (MAIL_SEND_TIMEOUT, long enough for an SMTP hand-over), the queue
+      # reads (CHAT_PENDING_*), how long a gateway with no mailbox is left
+      # alone (MAILBOX_NONE_SECONDS) and the caps on the original view.
+      - MAIL_SEND_TIMEOUT
+      - CHAT_PENDING_TIMEOUT
+      - CHAT_PENDING_RETRY_SECONDS
+      - CHAT_PENDING_SYNC_SECONDS
+      - MAILBOX_NONE_SECONDS
+      # A mailbox call that failed is owed: kept on disk, tried again on this
+      # timer, and given up after this long.
+      - MAILBOX_RETRY_SECONDS
+      - MAILBOX_OWED_KEEP_SECONDS
+      - MAIL_ORIGINAL_MAX_BYTES
+      - MAIL_ORIGINAL_INLINE_MAX_BYTES
       - GATEWAY_HEALTH_TIMEOUT
       # Gateway auth (scripts/gateway_auth.py) beyond the three above.
       - GATEWAY_BASIC_AUTH_USERS
@@ -465,6 +481,7 @@ services:
       - TELEGRAM_GATEWAY_TIMEOUT
       - SMS_DEFAULT_RECIPIENT
       - SMS_GATEWAY_TIMEOUT
+      - MAIL_GATEWAY_TIMEOUT
       - MESSENGER_GATEWAYS
       - MESSENGER_BUILTIN_CHANNELS
       - GATEWAY_MONITOR_IGNORE
@@ -1121,9 +1138,11 @@ services:
   # docs/messaging.md, "E-mail (the mail gateway)"). Polls INBOX, Sent and the
   # archive folder over IMAP, writes one ledger record per mail with every MIME
   # part kept as a blob, and serves /health, /recent-chats, /threads and the
-  # token-gated /media/<id>. In this phase it is read-only: it changes nothing
-  # in the mailbox, sends nothing (its /send answers 501), pushes nothing and
-  # starts no model turn — e-mail triage runs beside it unchanged, and still
+  # token-gated /media/<id>. It also writes: /send (a reply, a new mail, an
+  # agent's mail) under EMAIL_SEND_POLICY, with its own pending sends on
+  # /sends, and the mailbox follows the chat (read, archive, delete to the
+  # Trash). It pushes nothing and starts no model turn for an arriving mail
+  # (the gate phase) — e-mail triage runs beside it unchanged, and still
   # files news mail to the feed.
   #
   # Not behind a profile, but opt-in: it mirrors nothing and serves nothing
@@ -1160,10 +1179,17 @@ services:
       - SENT_FOLDER
       - DRAFTS_FOLDER
       - SMTP_SAVE_SENT
-      # The send policy (EMAIL_SEND_POLICY) and the erase capability
-      # (CHAT_ERASE_TOKEN) are NOT given: this phase sends and erases nothing,
-      # and the container that parses mail from strangers holds no credential
-      # it has no use for. The phases that send and erase add them.
+      # The send policy, keyed by this account's address as email_client.py
+      # reads it, and the approval links a queued send returns (the slug
+      # defaults to this service's name, as on the other gateways).
+      - EMAIL_SEND_POLICY
+      - SEND_APPROVAL_BASE_URL
+      - SEND_APPROVAL_SLUG
+      # The erase capability: the user's delete presents it before the gateway
+      # moves a chat's mails to the Trash and erases the mirror. Never handed
+      # to a session (scripts/session_env.py). Unset, /chats/delete answers
+      # 503.
+      - CHAT_ERASE_TOKEN
       # Empty: the default account. A name: read the _<NAME>-suffixed set.
       - MAIL_ACCOUNT_NAME
       # The built-in channel set, as on the retinue service: the default
@@ -1178,7 +1204,9 @@ services:
       # every mail gateway (each also knows its own account).
       - MAIL_OWN_ADDRESSES
       # Optional tunables (defaults in scripts/mail-gateway.py and
-      # docs/messaging.md): the archive and trash folders, the poll interval,
+      # docs/messaging.md): the archive and trash folders, how long a mail the
+      # gateway sent waits for its Sent copy before it counts as gone
+      # (MAIL_SENT_GRACE_SECONDS), the poll interval,
       # the backfill window in days (0 mirrors only new mail), the backfill's
       # batch size and the pause between batches, the IMAP socket timeout,
       # the size caps for one part and one mail, the seconds reading one
@@ -1188,6 +1216,7 @@ services:
       # answers, and the timeout of the chats rail's POSTs.
       - MAIL_ARCHIVE_FOLDER
       - MAIL_TRASH_FOLDER
+      - MAIL_SENT_GRACE_SECONDS
       - MAIL_POLL_SECONDS
       - MAIL_BACKFILL_DAYS
       - MAIL_BACKFILL_BATCH

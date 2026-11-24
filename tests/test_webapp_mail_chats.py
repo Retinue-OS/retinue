@@ -47,7 +47,11 @@ and pin:
     re-renders;
   * messenger chats render as before;
   * the reference documents (webapp/data/chats*) carry a mail thread that
-    renders: a group thread with an inline image, an HTML mail, a tombstone.
+    renders: a group thread with an inline image, an HTML mail, a tombstone,
+    a composer addressed as the server's reply preview says, and a reply
+    waiting for approval (writing itself: tests/test_webapp_mail_writing.py);
+  * a mail removed in a mail client makes the page ask the server again
+    where a reply would go.
 
 Standalone like the rest of the suite. Needs `node` on PATH; without it the
 test reports a skip and passes (the static checks still run).
@@ -66,6 +70,7 @@ CHAT_PAGE = os.path.join(COMPONENTS, "chat-page.js")
 DATA = os.path.join(HERE, "..", "webapp", "data")
 FIXTURE = os.path.join(DATA, "chats", "email-quarterly.json")
 ORIGINAL_FIXTURE = os.path.join(DATA, "chats", "email-quarterly.original.json")
+PREVIEW_FIXTURE = os.path.join(DATA, "chats", "email-quarterly.reply-preview.json")
 
 HARNESS = r"""
 import assert from 'node:assert/strict';
@@ -724,6 +729,25 @@ await ok('a failed original says so and retries; hostile header values are text'
   assert.ok(wire.some((w) => w.url === orig('tm1')), 'refetched after an error');
 });
 
+await ok('a mail removed in a mail client makes the page ask again where a reply goes', async () => {
+  // The mail a reply would have answered may be the one that went; the page
+  // does not work out whom the reply reaches now — it asks the server.
+  const can = { can_send: true, cannot_send_reason: undefined };
+  const el = await open(can);
+  const asks = () => wire.filter((w) => /\/reply-preview$/.test(w.url)).length;
+  assert.equal(asks(), 1, 'asked on load');
+  await poll(el, can, BASE);
+  assert.equal(asks(), 1, 'nothing changed, nothing asked');
+  await poll(el, can, BASE.map((m) => (m.id === 'm4'
+    ? { ...m, removed: true, removed_at: '2026-11-20T11:00:00Z', text: '', original: undefined, attachments: [] } : m)));
+  assert.ok(bubble(el, 'm4').includes('tomb'));
+  assert.equal(asks(), 2, 'asked again');
+  // No composer, no question.
+  wire.length = 0;
+  await open();
+  assert.equal(asks(), 0);
+});
+
 await ok('a tombstone: quiet, who and when, no Original, no attachments', async () => {
   const gone = mail('g1', 'in', '2026-11-20T09:45:00Z', {
     removed: true, removed_at: '2026-11-21T07:00:00Z', text: '', original: orig('tg1'), sender_name: 'Bob Builder',
@@ -791,7 +815,7 @@ await ok('can_send false: the server\'s reason in place of composer, chips and d
   assert.equal(renders, n + 1);
   assert.ok(el._chatComposerHtml().includes('data-composer="chat"'));
   assert.ok(el._gripHtml().includes('data-grip'));
-  assert.ok(el._chatComposerHtml().includes('placeholder="Reply to Ann Example, Bob Builder …"'));
+  assert.ok(el._chatComposerHtml().includes('placeholder="Write your reply …"'));
 });
 
 await ok('messenger chats are unchanged', async () => {
@@ -1125,6 +1149,7 @@ await ok('the reference documents carry a mail thread that renders', async () =>
   const doc = JSON.parse(readFileSync(process.env.MAIL_FIXTURE, 'utf-8'));
   const orig0 = JSON.parse(readFileSync(process.env.MAIL_ORIGINAL_FIXTURE, 'utf-8'));
   const list = JSON.parse(readFileSync(process.env.CHATS_FIXTURE, 'utf-8'));
+  const preview = JSON.parse(readFileSync(process.env.MAIL_PREVIEW_FIXTURE, 'utf-8'));
   const sum = list.chats.find((c) => c.channel === 'email');
   assert.ok(sum, 'the list carries the mail chat');
   assert.equal(sum.messages, '/data/chats/email-quarterly.json');
@@ -1156,7 +1181,25 @@ await ok('the reference documents carry a mail thread that renders', async () =>
   assert.ok(html(3).includes('tomb') && html(3).includes('carla@example.net'));
   for (const i of [0, 1, 2, 4]) assert.ok(html(i).includes('data-orig-toggle'), `Original on ${ids[i]}`);
   assert.ok(!html(3).includes('data-orig-toggle'));
-  assert.ok(el._chatComposerHtml().includes('cannot-send'));
+  // The writing phase: a composer addressed as the server says the reply
+  // would go (its reply preview, a reference document of its own) — until
+  // that answer is in, to nobody — and the reply the user queued, waiting
+  // for approval at the thread's end.
+  assert.ok(el._chatComposerHtml().includes('Checking where a reply would go'));
+  take((w) => w.url === `/chats/${encodeURIComponent(doc.chat.id)}/reply-preview`, 'the reply preview').answer(preview);
+  await settle();
+  const comp = el._chatComposerHtml();
+  assert.ok(comp.includes('data-composer="chat"') && !comp.includes('cannot-send'), comp);
+  assert.ok(comp.includes('To <span class="rcp"><b>Ann Example</b> <span class="addr">&lt;ann@example.com&gt;</span></span> ' +
+    '&middot; Cc <span class="rcp"><b>Bob Builder</b> <span class="addr">&lt;bob@builder.example&gt;</span></span>, ' +
+    '<span class="rcp"><b>carla@example.net</b></span></div>'), comp);
+  assert.ok(comp.includes('value="sender"'), 'the preview says there is a choice: Sender only is offered');
+  // Every mail of the reference thread says where it asks replies to go.
+  for (const m of doc.messages.filter((x) => !x.removed)) assert.ok(Array.isArray(m.reply_to), `reply_to on ${m.id}`);
+  assert.equal(sum.pending, 1, 'the list counts the queued send');
+  assert.deepEqual(el._pending.map((x) => x.p.request_id), [doc.pending[0].request_id]);
+  assert.ok(el._chatThreadHtml().endsWith(el._pendingHtml(doc.pending[0])), 'the pending bubble comes last');
+  assert.equal(doc.pending[0].approval_url, `/sends/mail-gateway/${doc.pending[0].request_id}`);
   // The original's reference document belongs to the HTML mail.
   const bob = doc.messages.find((m) => m.id === orig0.id);
   assert.equal(orig0.html_url, `${bob.original}.html`);
@@ -1224,6 +1267,7 @@ def main() -> int:
         env = dict(os.environ,
                    MAIL_FIXTURE=os.path.abspath(FIXTURE),
                    MAIL_ORIGINAL_FIXTURE=os.path.abspath(ORIGINAL_FIXTURE),
+                   MAIL_PREVIEW_FIXTURE=os.path.abspath(PREVIEW_FIXTURE),
                    CHATS_FIXTURE=os.path.abspath(os.path.join(DATA, "chats.json")))
         proc = subprocess.run([node, "harness.mjs"], cwd=tmp, capture_output=True,
                               text=True, timeout=120, env=env)

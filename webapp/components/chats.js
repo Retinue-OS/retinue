@@ -41,6 +41,11 @@
 //   Archived tab  swipe right  restore at once
 //                 swipe left   reveal Star · Restore · Mute (Unmute) · Delete
 //
+// The full page's **＋** starts a new conversation: a short menu of what GET
+// /chats/compose offers (today *New e-mail*, where a mail gateway runs), each
+// opening the compose sheet (components/compose-sheet.js), which goes to the
+// new chat once it is sent or queued. With nothing offered there is no ＋.
+//
 // On Unread and Read the tray — Star · (Mark read) · Archive · Mute — opens by
 // a long press, a right-click or the context-menu key; on every tab that is
 // also how the keyboard reaches what a swipe does. **Star** keeps a chat at
@@ -49,7 +54,9 @@
 // read's puts the previous read mark back. **Delete** erases the chat from the
 // whole system — every message and file in the ledger, its companion thread —
 // and a later message from the peer starts a new chat; it asks for a second
-// tap, and cannot be undone.
+// tap, and cannot be undone. On a mail thread it first moves the thread's
+// mails to the mailbox's Trash (nothing is expunged there), and its armed
+// button says so ("Move mails to Trash?") rather than "Delete for good?".
 //
 // The list comes from the gateway's GET /chats (the default `src`, still
 // overridable by attribute) — SPARQL over the message ledgers merged with the
@@ -59,11 +66,17 @@
 // cadence and keeps its last rendered state over a failed fetch (a store blip
 // must not blank the list).
 
-import { RetinueCard, esc, fmtAge, isWideFrame, onFrameChange, starredFirst } from './base.js';
+import {
+  RetinueCard, esc, fmtAge, isWideFrame, onFrameChange, starredFirst, deepActiveElement, onPressOutside,
+} from './base.js';
 import { shelf } from './shelf-store.js';
 import { SwipeRows, SWIPE_CSS, STAR_MARK, offerUndo, starButtonHtml } from './swipe-rows.js';
+import { openComposeSheet } from './compose-sheet.js';
 
 const LIST_URL = '/chats';
+// What the full page's ＋ can start (docs/mail-chats.md, "Writing"): the
+// channels whose gateway takes a new conversation, with their accounts.
+const COMPOSE_URL = '/chats/compose';
 // Rows shown on the dashboard card before "All chats →" takes over — the same
 // cap logic as the conversations card: only the phone layout, where each row
 // lengthens the page, caps the list.
@@ -178,6 +191,19 @@ export function participantsText(chat) {
 // subject and says nothing else about who wrote. An image message shows a
 // camera mark before any caption; a mail removed in a mail client says so in
 // place of the text it no longer has.
+// What ＋ can start, from GET /chats/compose: `{channel, label, accounts}` per
+// channel whose gateway takes a new conversation.
+function composeOffers(doc) {
+  return (Array.isArray(doc && doc.channels) ? doc.channels : [])
+    .filter((c) => c && typeof c.channel === 'string' && c.channel)
+    .map((c) => ({
+      channel: c.channel,
+      label: typeof c.label === 'string' && c.label.trim() ? c.label.trim()
+        : (CHANNELS[c.channel] || { label: c.channel }).label,
+      accounts: Array.isArray(c.accounts) ? c.accounts.filter((a) => typeof a === 'string' && a) : [],
+    }));
+}
+
 export function previewHtml(chat) {
   const last = chat.last || {};
   const mail = isMail(chat);
@@ -190,6 +216,14 @@ export function previewHtml(chat) {
   }
   const lead = who ? `<span class="pv-who">${esc(who)}:</span> ` : '';
   if (last.removed) return `${lead}<span class="pv-removed">Removed in a mail client</span>`;
+  // A send that waits for approval (a new mail that exists only as one, so
+  // far) says so before its words: it has not gone out. Where the server
+  // says what became of one that was let go (`status`), that is said instead.
+  if (last.pending) {
+    const state = last.status === 'failed' ? (last.outcome_unknown === true ? 'Not confirmed:' : 'Not sent:')
+      : (last.status === 'sending' ? 'Sending:' : 'Waiting for approval:');
+    return `${lead}<span class="pv-pending">${state}</span> ${esc(last.text || '')}`;
+  }
   const img = last.kind === 'image' ? '<span class="pv-img" aria-label="Image">&#128247;</span> ' : '';
   const text = last.text || (last.kind === 'image' ? 'Photo' : '');
   return lead + img + esc(text);
@@ -243,11 +277,17 @@ class RetinueChats extends RetinueCard {
     this._offFrame = onFrameChange(() => {
       if (this._data) this.renderState({ state: 'ok', data: this._data });
     });
+    // What ＋ offers (null: not known yet) and whether its menu is open —
+    // on the element, so a render of the list keeps the menu as it was.
+    this._compose = null;
+    this._newOpen = false;
     super.connectedCallback();
     this._timer = setInterval(() => this.load(), REFRESH_MS);
   }
 
   disconnectedCallback() {
+    if (this._newAway) this._newAway();
+    this._newAway = null;
     if (this._offFrame) this._offFrame();
     this._offFrame = null;
     if (this._timer) clearInterval(this._timer);
@@ -263,6 +303,7 @@ class RetinueChats extends RetinueCard {
   // state.
   async load() {
     const epoch = this._epoch;
+    if (this._full && this._compose === null) this._loadCompose();
     try {
       const res = await fetch(this.dataUrl, { cache: 'no-store' });
       if (!res.ok) throw new Error(String(res.status));
@@ -275,9 +316,10 @@ class RetinueChats extends RetinueCard {
       // the region's scroll and the filter wiring for nothing.
       const sig = JSON.stringify([data.chats || [], data.counts || null]);
       if (sig === this._sig) { this._data = data; this._dirty = false; return; }
-      // A rebuild under a finger mid-swipe would drop the row it is dragging;
-      // the next tick picks the change up.
-      if (this._swipe.dragging) return;
+      // A rebuild under a finger mid-swipe would drop the row it is dragging,
+      // and one under the open ＋ menu the item about to be pressed; the
+      // next tick picks the change up.
+      if (this._swipe.dragging || this._newOpen) return;
       this._sig = sig;
       this._dirty = false;
       this.renderState({ state: 'ok', data });
@@ -316,6 +358,128 @@ class RetinueChats extends RetinueCard {
         else this._setFlags(id, action);
       }));
     if (this._full) this._swipe.wire(this.shadowRoot);
+    this._wireNew();
+  }
+
+  // ── ＋: a new conversation ─────────────────────────────────────────────────
+  // What it can start is the server's answer (GET /chats/compose), asked
+  // once; a failed ask is made again with the next refresh, and an endpoint
+  // that is not there (a gateway older than it) is an answer: nothing.
+  async _loadCompose() {
+    if (this._composeBusy || this._compose !== null) return;
+    this._composeBusy = true;
+    try {
+      const res = await fetch(COMPOSE_URL, { cache: 'no-store' });
+      if (res.status === 404) {
+        this._compose = [];
+        return;
+      }
+      if (!res.ok) throw new Error(String(res.status));
+      this._compose = composeOffers(await res.json());
+      if (this._compose.length && this._data) this.renderState({ state: 'ok', data: this._data });
+    } catch (_err) {
+      // No ＋ for now; the next refresh asks again.
+    } finally {
+      this._composeBusy = false;
+    }
+  }
+
+  // The mailboxes an offer names are the ones that can send at the moment it
+  // was asked for. As the ＋ is opened they are asked for again, so a mailbox
+  // that was away when the page loaded and has come back can be written from
+  // — a mail the compose sheet kept for it waits for exactly that. Only the
+  // mailboxes of the offers on the menu are taken, in place: the menu under
+  // the user's finger keeps its entries.
+  async _refreshCompose() {
+    if (this._composeBusy || !Array.isArray(this._compose) || !this._compose.length) return;
+    this._composeBusy = true;
+    try {
+      const res = await fetch(COMPOSE_URL, { cache: 'no-store' });
+      if (!res.ok) return;
+      const fresh = composeOffers(await res.json());
+      for (const offer of this._compose) {
+        const now = fresh.find((f) => f.channel === offer.channel);
+        if (now) offer.accounts = now.accounts;
+      }
+    } catch (_err) {
+      // What the page was told before stands.
+    } finally {
+      this._composeBusy = false;
+    }
+  }
+
+  // The ＋ and its menu: a disclosure (a button that shows and hides a short
+  // list of ordinary buttons, as the chat page's ⋮ is), beside the tabs.
+  _newHtml() {
+    const offers = this._full && Array.isArray(this._compose) ? this._compose : [];
+    if (!offers.length) return '';
+    const open = !!this._newOpen;
+    const what = (o) => (/^e-mail$/i.test(o.label) ? 'e-mail' : o.label);
+    return `<div class="new-wrap" data-new-wrap>` +
+      `<button type="button" class="new-btn" data-new aria-expanded="${open}" aria-controls="chats-new" ` +
+      `title="Start a new conversation" aria-label="Start a new conversation">&#65291;</button>` +
+      `<div class="new-menu" id="chats-new" data-new-menu${open ? '' : ' hidden'}>` +
+      offers.map((o, i) => `<button type="button" class="new-item" data-new-offer="${i}">` +
+        `New ${esc(what(o))}</button>`).join('') +
+      `</div></div>`;
+  }
+
+  _wireNew() {
+    const root = this.shadowRoot;
+    // The listeners of a menu open before this render watched nodes that are
+    // gone: set up again around the new ones.
+    if (this._newAway) { this._newAway(); this._newAway = null; }
+    const btn = root.querySelector('[data-new]');
+    if (!btn) { this._newOpen = false; return; }
+    btn.addEventListener('click', () => {
+      this._toggleNew();
+      if (this._newOpen) this._refreshCompose();
+    });
+    root.querySelectorAll('[data-new-offer]').forEach((el) =>
+      el.addEventListener('click', () => this._startNew(Number(el.getAttribute('data-new-offer')))));
+    if (this._newOpen) this._toggleNew(true);
+  }
+
+  _toggleNew(open) {
+    const root = this.shadowRoot;
+    const menu = root && root.querySelector('[data-new-menu]');
+    const btn = root && root.querySelector('[data-new]');
+    const show = menu && btn ? (open === undefined ? menu.hidden : !!open) : false;
+    if (menu && btn) {
+      // Hiding the item that has focus would drop it to the document.
+      if (!show && !menu.hidden && menu.contains(deepActiveElement())) btn.focus();
+      menu.hidden = !show;
+      btn.setAttribute('aria-expanded', String(show));
+    }
+    this._newOpen = show;
+    if (show && !this._newAway) {
+      // Any press outside the menu, or Esc, shuts it.
+      const wrap = root.querySelector('[data-new-wrap]');
+      const onKey = (e) => {
+        if (e.key !== 'Escape') return;
+        this._toggleNew(false);
+        const b = this.shadowRoot.querySelector('[data-new]');
+        if (b) b.focus();
+      };
+      const offPress = onPressOutside(wrap, () => this._toggleNew(false), { capture: true });
+      document.addEventListener('keydown', onKey);
+      this._newAway = () => { offPress(); document.removeEventListener('keydown', onKey); };
+    } else if (!show && this._newAway) {
+      this._newAway();
+      this._newAway = null;
+    }
+  }
+
+  // One of ＋'s offers picked: the compose sheet for it, and the focus back on
+  // the ＋ (as this list now renders it) when the sheet closes.
+  _startNew(i) {
+    const offer = Array.isArray(this._compose) ? this._compose[i] : null;
+    this._toggleNew(false);
+    if (!offer) return;
+    openComposeSheet(offer, () => {
+      const b = this.shadowRoot && this.shadowRoot.querySelector('[data-new]');
+      if (b) b.focus();
+    });
   }
 
   // Switch the full page's tab; the list is already here, so no fetch.
@@ -361,7 +525,7 @@ class RetinueChats extends RetinueCard {
           btn.classList.remove('confirm');
           const off = err && err.message === 'unconfigured';
           btn.textContent = off ? 'Delete not set up' : 'Retry delete';
-          if (off) btn.title = 'Chat deletion needs CHAT_ERASE_TOKEN on retinue and the messenger gateways';
+          if (off) btn.title = "Chat deletion needs CHAT_ERASE_TOKEN on retinue and on the chat's gateway";
         }
       }
     } finally {
@@ -575,6 +739,7 @@ class RetinueChats extends RetinueCard {
       .prev .pv-who { color: var(--fg, #e7ebf2); opacity: .75; }
       .prev .pv-draft { color: var(--accent, #6ea8fe); font-style: italic; }
       .prev .pv-removed { font-style: italic; }
+      .prev .pv-pending { color: var(--outbound, #f0b45e); }
       /* A mail thread's participants, between its subject and the preview:
          the row grows a third line, and the avatar spans all three. */
       .row.has-people { grid-template-rows: auto auto auto; }
@@ -610,6 +775,22 @@ class RetinueChats extends RetinueCard {
                    background: var(--accent, #6ea8fe); color: #0b0d12; font-size: .68rem;
                    font-weight: 700; display: inline-flex; align-items: center; justify-content: center; }
       .filter-tab.on .tab-count { background: #0b0d12; color: var(--accent, #6ea8fe); }
+      /* The tabs and the ＋ share a row; the menu drops from the ＋. */
+      .list-head { display: flex; align-items: flex-start; gap: 8px; }
+      .list-head .filter { flex: 1; min-width: 0; }
+      .new-wrap { position: relative; flex: none; }
+      .new-btn { width: 38px; height: 38px; border-radius: 12px; border: 0; cursor: pointer;
+                 background: var(--outbound, #f0b45e); color: #0b0d12; font-size: 1.1rem; font-weight: 700;
+                 display: inline-flex; align-items: center; justify-content: center; }
+      .new-btn:focus-visible, .new-item:focus-visible { outline: 2px solid var(--fg, #e7ebf2); outline-offset: 2px; }
+      .new-menu { position: absolute; right: 0; top: calc(100% + 6px); z-index: 5; min-width: 160px;
+                  display: flex; flex-direction: column; padding: 4px; border-radius: 12px;
+                  background: var(--card-2, #1c2230); border: 1px solid var(--line, rgba(231, 235, 242, .12));
+                  box-shadow: 0 8px 24px rgba(0, 0, 0, .4); }
+      .new-menu[hidden] { display: none; }
+      .new-item { background: transparent; border: 0; border-radius: 8px; padding: 8px 10px; text-align: left;
+                  color: var(--fg, #e7ebf2); cursor: pointer; font: inherit; font-size: .88rem; }
+      .new-item:hover { background: rgba(110, 168, 254, .14); }
     `;
   }
 
@@ -667,7 +848,10 @@ class RetinueChats extends RetinueCard {
     const inScope = (c) => (scope ? listGroup(c) === scope : listGroup(c) !== 'archived');
     // Starred chats first, each group still by last activity.
     const chats = starredFirst(all.filter(inScope));
-    const tabs = this._filterHtml(this._full ? this._counts(d, all) : null);
+    // The tabs, and beside them the ＋ where there is something to start.
+    const filter = this._filterHtml(this._full ? this._counts(d, all) : null);
+    const plus = this._newHtml();
+    const tabs = plus ? `<div class="list-head">${filter}${plus}</div>` : filter;
     // The tabs' panel: what the selected tab shows, rows or its empty line.
     const panel = (inner) => (this._full
       ? `<div role="tabpanel" id="chats-panel" aria-labelledby="chats-tab-${scope}">${inner}</div>`
@@ -710,9 +894,17 @@ class RetinueChats extends RetinueCard {
       // The actions sit UNDER the row, never inside it: a row is a link, and
       // a button within a link is not a button. Only on the full page — the
       // dashboard card is a glance, not a place to curate.
-      const act = (label, set, title) =>
+      const act = (label, set, title, confirm = '') =>
         `<button type="button" class="${set}" data-flag="${esc(c.id)}" data-set="${set}" ` +
-        `title="${title}">${label}</button>`;
+        `title="${esc(title)}"${confirm ? ` data-confirm="${esc(confirm)}"` : ''}>${label}</button>`;
+      // Deleting a mail thread does something in the mailbox too, and the
+      // button says what before the second tap: the mails move to the
+      // mailbox's Trash (nothing is expunged), then the chat is erased here.
+      const del = isMail(c)
+        ? act('Delete', 'delete',
+            `Move this thread's mails to the Trash of ${c.account || 'the mailbox'}, then erase the chat here`,
+            'Move mails to Trash?')
+        : act('Delete', 'delete', 'Erase this chat and all its messages from the system');
       const star = starButtonHtml(!!c.starred,
         (set) => `data-flag="${esc(c.id)}" data-set="${set}"`);
       // What a swipe does is in the tray too — Mark read and Archive beside
@@ -723,8 +915,7 @@ class RetinueChats extends RetinueCard {
           (c.muted
             ? act('Unmute', 'unmute', 'Stay archived, but come back when it speaks')
             : act('Mute', 'mute', 'Keep it out of the list, even when it speaks')) +
-          act('Delete', 'delete',
-              'Erase this chat and all its messages from the system')
+          del
         : (scope === 'unread'
           ? act('Mark read', 'read', 'Mark everything in this chat as read') : '') +
           act('Archive', 'archive', 'Out of the list until the next message') +

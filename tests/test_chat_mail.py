@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""Mail threads as chats, as the web gateway serves them (docs/mail-chats.md,
-the read-only mirror).
+"""Mail threads as chats, as the web gateway serves them (docs/mail-chats.md):
+the mirror — what a mail chat is and how it is read. Writing (reply, compose,
+queued sends, the mailbox following the chat) is tests/test_chat_mail_send.py.
 
 Runs the REAL web-gateway handler on a local port. The mails are real ledger
 records — written by scripts/inbound_store.py, tombstoned by it — and a tiny
@@ -30,10 +31,11 @@ and its recent threads. Covers:
 - the original, as JSON and as HTML: only for a mail of that chat, the HTML
   sanitised with its own inline images embedded, under exactly the sandbox
   policy and never the dashboard's;
-- the read-only phase: `can_send: false`, and send, draft and delete
-  answering 409;
+- `can_send`, and the shared draft of a mail chat: the user's, its undo, an
+  agent's staging;
 - the companion note for a mail thread: the subject and the names as data,
-  the trimmed texts, no draft and no send, and no messenger push script;
+  the trimmed texts, the draft, mail-push.py as the one way an agent sends,
+  and no messenger push script;
 - a messenger chat beside all this, unchanged;
 - what the review of the phase found: a tombstone is not unread and no
   attention item; the home list follows a mail chat's unread mail whether or
@@ -321,8 +323,10 @@ class _MockSparql(BaseHTTPRequestHandler):
 
 
 class _MockMailGateway(BaseHTTPRequestHandler):
-    """The mail gateway's HTTP API of the read-only phase: /health, the blobs
-    of its ledger, its recent threads, and 501 for everything that writes."""
+    """The mail gateway's HTTP API as far as reading a mirror needs it:
+    /health, the blobs of its ledger, its recent threads, an empty queue,
+    and the two mailbox hooks, which find nothing to do. (What writes is
+    mocked in tests/test_chat_mail_send.py.)"""
 
     def log_message(self, fmt, *args):
         pass
@@ -331,13 +335,15 @@ class _MockMailGateway(BaseHTTPRequestHandler):
         STATE["gw_requests"].append(("GET", self.path, self.headers.get("Authorization", "")))
         if self.path.rstrip("/") in ("", "/health"):
             return self._json(200, {"status": "ok", "configured": True, "connected": True,
-                                    "mode": "inbox", "account": ACCOUNT, "read_only": True})
+                                    "mode": "inbox", "account": ACCOUNT})
         if self.headers.get("Authorization", "") != "Bearer mail-secret":
             return self._json(401, {"error": "unauthorized"})
         if self.path == "/recent-chats":
             return self._json(200, {"recent_chats": STATE["threads"]})
-        if self.path == "/pending-sends":
-            return self._json(501, {"error": "the mail mirror is read-only"})
+        if self.path.split("?", 1)[0] == "/pending-sends":
+            if STATE.get("gw_read_only"):
+                return self._json(501, {"error": "the mail mirror is read-only"})
+            return self._json(200, {"pending": []})
         if self.path.startswith("/media/"):
             if STATE["gw_down"]:
                 return self._json(503, {"error": "mailbox unreachable"})
@@ -357,7 +363,11 @@ class _MockMailGateway(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", 0))
         self.rfile.read(length)
         STATE["gw_requests"].append(("POST", self.path, self.headers.get("Authorization", "")))
-        self._json(501, {"error": "the mail mirror is read-only"})
+        if self.path == "/chats/read":
+            return self._json(200, {"ok": True, "seen": 0})
+        if self.path == "/chats/archive":
+            return self._json(200, {"ok": True, "moved": 0})
+        return self._json(404, {"error": "not found"})
 
     def _json(self, status, body):
         data = json.dumps(body).encode("utf-8")
@@ -386,8 +396,10 @@ def _load_gateway(tmp: Path, sparql_port: int):
     os.environ["EDGE_PROXY_PEERS"] = "127.0.0.1"
     os.environ["CHAT_STATE_DIR"] = str(tmp / "chat-state")
     os.environ["CHAT_LIST_CACHE_SECONDS"] = "0"
-    # The name backfill is called by hand here, never by a list build.
+    # The name backfill is called by hand here, never by a list build — and
+    # so is the sync of the gateways' pending sends.
     os.environ["CHAT_NAME_BACKFILL_SECONDS"] = "0"
+    os.environ["CHAT_PENDING_SYNC_SECONDS"] = "0"
     os.environ["CONVERSATION_BACKEND_TOKEN"] = "agent-token"
     os.environ["CONVERSATIONS_DIR"] = str(tmp / "convs")
     os.environ["CONVERSATION_DIR"] = str(tmp / "convlog")
@@ -904,6 +916,7 @@ def test_attention_is_about_the_person(base, wg):
 def test_list_contract(base, wg):
     wg._CHAT_OVERLAY.forget(CHAT_A)
     wg._CHAT_OVERLAY.forget(CHAT_B)
+    wg._mailbox_wait()      # a hook under way asks the store too
     STATE["queries"].clear()
     chats = _chats(base)
     a, b, s = chats[CHAT_A], chats[CHAT_B], chats[CHAT_S]
@@ -918,7 +931,8 @@ def test_list_contract(base, wg):
     assert a["last"] == {"ts": _iso(T0 + 120), "direction": "in", "kind": "text",
                          "text": "One more thing", "sender_name": "Ann Meier",
                          "removed": False}, a["last"]
-    assert a["can_send"] is False and "read-only" in a["cannot_send_reason"]
+    assert a["can_send"] is True and "cannot_send_reason" not in a
+    assert a["pending"] == 0 and s["pending"] == 0, "nothing waits for approval"
     assert a["list_group"] in ("unread", "read", "archived") and isinstance(a["unread"], int)
     assert a["messages"] == "/chats/" + _quote(CHAT_A) + "/messages"
     # The group: nobody in the address book — the name the mail carried, else
@@ -955,6 +969,7 @@ def test_list_contract(base, wg):
 
 
 def test_messages_contract(base, wg):
+    wg._mailbox_wait()
     STATE["queries"].clear()
     body = _messages(base, CHAT_A)
     a1, a2, a3 = body["messages"]
@@ -986,10 +1001,12 @@ def test_messages_contract(base, wg):
     assert a2["subject"] == "Re: Quarterly numbers" and a2["recipients"] == [ANN]
     assert "attachments" not in a2 and a2["original"].endswith("/original")
     assert a3["trim"] == "wanting" and a3["text"] == "One more thing"
-    # The summary of a mail chat: who, and that it cannot be written to yet.
+    # The summary of a mail chat: who, and that it can be written to; and
+    # nothing of it waits for approval.
     chat = body["chat"]
-    assert chat["can_send"] is False and chat["cannot_send_reason"] == wg.MAIL_READ_ONLY_REASON
+    assert chat["can_send"] is True and "cannot_send_reason" not in chat
     assert chat["name"] == "Quarterly numbers" and chat["peer"]["address"] == ANN
+    assert body["pending"] == [] and chat["pending"] == 0
     # Read like the list: a lean page of IRIs and their records, not the
     # messenger query with its chain of OPTIONALs.
     assert not [q for q in STATE["queries"] if "GROUP_CONCAT" in q]
@@ -1029,7 +1046,7 @@ def test_messages_contract(base, wg):
     assert not [q for q in STATE["queries"] if "SELECT ?m ?ts WHERE" in q]
     message = next(m for m in sig["messages"] if m["id"] == "901")
     assert set(message) == {"id", "chat", "direction", "text", "ts", "sender", "sender_name"}, message
-    assert "can_send" not in sig["chat"]
+    assert "can_send" not in sig["chat"] and sig["pending"] == []
     print("PASS test_messages_contract")
 
 
@@ -1211,48 +1228,58 @@ def test_original_html(base, wg):
     print("PASS test_original_html")
 
 
-# ── Read-only ─────────────────────────────────────────────────────────────────
+# ── The draft ─────────────────────────────────────────────────────────────────
 
-def test_read_only_409s(base, wg):
-    reason = wg.MAIL_READ_ONLY_REASON
+def test_draft_is_shared(base, wg):
+    """A mail chat has the shared draft every chat has: the user's, its
+    undo, and an agent's staging (chat-draft.py's endpoint). Nothing of it
+    reaches the gateway — a draft is state, and sends nothing."""
     STATE["gw_requests"].clear()
     quoted = "/chats/" + _quote(CHAT_A)
-    for path, body, headers in (
-            ("/send", {"text": "hi"}, None),
-            ("/draft", {"text": "hi", "version": 0}, None),
-            ("/draft/undo", None, None),
-            ("/delete", None, None)):
-        status, out = _http(base, "POST", quoted + path, body, headers)
-        assert status == 409 and out["error"] == reason and out["read_only"] is True, (path, out)
-    status, out = _http(base, "POST", "/internal/chats/" + _quote(CHAT_A) + "/draft",
-                        {"text": "staged", "agent": "Ara"},
-                        {"X-Conversation-Backend-Token": "agent-token"})
-    assert status == 409 and out["error"] == reason, out
-    # The agent endpoint still asks for its token first.
+    assert not hasattr(wg, "MAIL_READ_ONLY_REASON"), "the read-only switch is gone"
+    status, out = _http(base, "POST", quoted + "/draft", {"text": "Dear Ann,\n\nyes.", "version": 0})
+    assert status == 200 and out["draft"]["text"] == "Dear Ann,\n\nyes.", out
+    assert out["draft"]["author"] == "user" and out["version"] == 1
+    assert _chats(base)[CHAT_A]["draft"]["text"] == "Dear Ann,\n\nyes."
+    # A stale version is refused, as on every chat.
+    status, out = _http(base, "POST", quoted + "/draft", {"text": "x", "version": 0})
+    assert status == 409 and out["draft"]["text"] == "Dear Ann,\n\nyes.", out
+    # The composer's ✕, and its undo.
+    status, out = _http(base, "POST", quoted + "/draft", {"text": "", "version": 1})
+    assert status == 200 and out["draft"] is None
+    status, out = _http(base, "POST", quoted + "/draft/undo")
+    assert status == 200 and out["draft"]["text"] == "Dear Ann,\n\nyes.", out
+    # An agent stages only over a free draft, and with its token.
     status, out = _http(base, "POST", "/internal/chats/" + _quote(CHAT_A) + "/draft",
                         {"text": "staged"})
     assert status in (401, 403), (status, out)
-    # Nothing was written and nothing reached the gateway.
-    doc = wg._CHAT_STATE.get(CHAT_A)
-    assert doc["draft"] is None and doc["draft_version"] == 0
+    agent = {"X-Conversation-Backend-Token": "agent-token"}
+    status, out = _http(base, "POST", "/internal/chats/" + _quote(CHAT_A) + "/draft",
+                        {"text": "staged", "agent": "Ara"}, agent)
+    assert status == 409, "the user's words are not overwritten"
+    wg._CHAT_STATE.clear_draft(CHAT_A)
+    status, out = _http(base, "POST", "/internal/chats/" + _quote(CHAT_A) + "/draft",
+                        {"text": "staged", "agent": "Ara"}, agent)
+    assert status == 200 and out["draft"]["author"] == "agent" and out["draft"]["agent"] == "Ara"
+    wg._CHAT_STATE.clear_draft(CHAT_A)
     assert not [r for r in STATE["gw_requests"] if r[0] == "POST"], STATE["gw_requests"]
-    assert _chats(base)[CHAT_A]["name"] == "Quarterly numbers", "and the chat is still there"
-    # /sends asks every registry gateway for its queue; a mirror that sends
-    # nothing answers 501, which is an empty queue and no failure.
-    assert wg._channel_pending_sends(MAIL_SLUG, wg._CHANNEL_GATEWAYS[MAIL_SLUG]) == []
-    # What is state alone still works for a mail chat: read, flags, companion.
+    # /sends asks every registry gateway for its queue. One built as the
+    # read-only mirror answers 501: an empty queue and no failure — here,
+    # and where a chat asks what waits in it.
+    STATE["gw_read_only"] = True
+    try:
+        assert wg._channel_pending_sends(MAIL_SLUG, wg._CHANNEL_GATEWAYS[MAIL_SLUG]) == []
+        assert wg._gateway_queue(MAIL_SLUG, wg._CHANNEL_GATEWAYS[MAIL_SLUG], ROOT_A) == []
+    finally:
+        STATE["gw_read_only"] = False
+    # What is state alone works as ever: flags and the read mark.
     status, out = _http(base, "POST", quoted + "/flags", {"starred": True})
     assert status == 200 and out["starred"] is True
     wg._CHAT_STATE.set_flags(CHAT_A, starred=False)
     status, out = _http(base, "POST", quoted + "/read", {})
     assert status == 200 and out["unread"] == 0 and out["list_group"] == "read", out
-    # A messenger chat is not read-only: its draft is written.
-    assert wg._chat_read_only(CHAT_S) is None and wg._chat_read_only(CHAT_A) == reason
-    status, out = _http(base, "POST", "/chats/" + _quote(CHAT_S) + "/draft",
-                        {"text": "hoi zäme", "version": 0})
-    assert status == 200 and out["draft"]["text"] == "hoi zäme", out
-    wg._CHAT_STATE.clear_draft(CHAT_S)
-    print("PASS test_read_only_409s")
+    wg._mailbox_wait()
+    print("PASS test_draft_is_shared")
 
 
 # ── The companion ─────────────────────────────────────────────────────────────
@@ -1265,7 +1292,8 @@ def test_companion_note(base, wg):
         conv = wg._load_conv(out["id"])
         assert conv["kind"] == "companion" and conv["chat"] == CHAT_B
         opening = conv["messages"][0]["text"]
-        assert "read-only" in opening and "Street party" not in opening, opening
+        assert "put a draft in its composer" in opening and "send policy" in opening
+        assert "Street party" not in opening and "read-only" not in opening, opening
         assert conv["title"].startswith("Companion: Street party")
         note = wg._conv_chat_note(conv)
         intro, facts = note.split("\n\n")[1:3]
@@ -1282,30 +1310,67 @@ def test_companion_note(base, wg):
         assert "Each mail is shown as its own new text" in note
         assert f"Bob <{BOB}>: Saturday?" in note
         assert f"Cat <{CAT}>: (this mail has since been removed from the mailbox)" in note
-        # Read, discuss, fork — not stage, not send; and no push script.
-        assert "mirrored read-only" in note and "conversation-push.py" in note
-        assert "You cannot stage a draft" in note and "you do not send" in note
+        # The draft is every chat's: what it holds, who writes the words,
+        # and the one command that stages them.
+        assert "The chat's shared draft is empty." in note
+        assert "`secretary`" in note
+        assert "python3 /workspace/scripts/chat-draft.py --chat " + wg.shlex.quote(CHAT_B) in note
+        # Sending: only when the user asks, only through mail-push.py, under
+        # the policy; a queued send is relayed, not sent again. The words of
+        # the quick patterns ("the last message", "the composer") are said
+        # to mean the thread's mails and its draft.
+        # The command names the thread's own gateway where that is not the
+        # one mail-push.py posts to by default (as here: the registry's is
+        # the mock's), and the note says which policy the mailbox sends
+        # under, with the rule that goes with it — unset, that is `verify`.
+        # (Both in full: tests/test_chat_mail_send.py.)
+        send_url = wg._CHANNEL_GATEWAYS[MAIL_SLUG]["base_url"] + "/send"
+        assert ("python3 /workspace/scripts/mail-push.py --chat " + wg.shlex.quote(CHAT_B)
+                + " --url " + send_url + " --reply all --file <that file>") in note
+        assert "You send only when the user asks you to, here" in note
+        assert "send policy is `verify`: every send is queued" in note
+        assert "without `--user-approved`" in note
+        assert "approval link" in note and f"mail-push.py --url {send_url} --retract <id>" in note
+        assert "they mean this thread's mails and its shared draft" in note
+        assert "`email_client.py send` or `reply`" in note
+        # The messenger note's "you do not send, under any circumstances"
+        # is not true of a mail thread, and no messenger script is named.
         for absent in ("signal-push.py", "whatsapp-push.py", "telegram-push.py",
-                       "shared draft currently holds", "The chat's shared draft is empty",
-                       "python3 /workspace/scripts/chat-draft.py --chat"):
+                       "You do not send, under any circumstances", "read-only"):
             assert absent not in note, absent
+        assert "wait for the user's approval" not in note, "nothing is queued"
+        # A send that waits is said, so a turn does not queue it twice.
+        rid = "c" * 32
+        wg._CHAT_STATE.add_pending(CHAT_B, {
+            "request_id": rid, "approval_url": f"/sends/{MAIL_SLUG}/{rid}", "text": "I am in.",
+            "ts": T0 + 600, "author": "agent", "to": [BOB], "cc": [CAT],
+            "subject": "Re: Street party"})
+        note = wg._conv_chat_note(conv)
+        assert "1 send of this thread waits for the user's approval right now" in note
+        assert "Do not send the same text again." in note
+        wg._CHAT_STATE.set_pending(CHAT_B, [])
     finally:
         wg._CHAT_STATE.note_message(CHAT_B, name="Street party")
-    # The 1:1 thread: attachments by type, the user's own mail by its origin.
+    # The 1:1 thread: attachments by type, the user's own mail by its origin,
+    # and a draft that is there.
+    wg._CHAT_STATE.set_draft(CHAT_A, "Thanks, Ann.", author="agent", agent="Ara")
     status, out = _http(base, "POST", "/chats/" + _quote(CHAT_A) + "/companion")
     note = wg._conv_chat_note(wg._load_conv(out["id"]))
+    wg._CHAT_STATE.clear_draft(CHAT_A)
     assert "This thread is the companion to an e-mail thread — chat id" in note
     assert f"Ann Meier <{ANN}>: the numbers [2 attachments: application/pdf, image/png]" in note
     assert "The user (sent from a mail client): Thanks!" in note
     assert '  Subject: "Quarterly numbers"' in note
+    assert 'shared draft currently holds, written by Ara: "Thanks, Ann."' in note
     # The history hint speaks of mails.
     hint = wg._companion_history_hint(CHAT_A)
     assert "kb:subject" in hint and f'kb:chat "{ROOT_A}"' in hint and "trimmed" in hint
-    # A messenger chat's note is the one it was.
+    # A messenger chat's note is the one it was: the draft, and no send.
     status, out = _http(base, "POST", "/chats/" + _quote(CHAT_S) + "/companion")
     note = wg._conv_chat_note(wg._load_conv(out["id"]))
     assert 'the signal chat "Sig Nal"' in note and "signal-push.py" in note
-    assert "chat-draft.py --chat" in note and "read-only" not in note
+    assert "chat-draft.py --chat" in note and "mail-push.py" not in note
+    assert "You do not send, under any circumstances" in note
     assert "work out what to say" in wg._load_conv(out["id"])["messages"][0]["text"]
     print("PASS test_companion_note")
 
@@ -1560,7 +1625,9 @@ def test_tombstones_are_not_unread(base, wg):
     assert (wg._CHAT_STATE.get(chat_id)["attention"] or {}).get("state") == "open"
 
     # The list's discipline, measured where it can be: the exclusion rides in
-    # the one unread query — no further query, no second VALUES table.
+    # the one unread query — no further query, no second VALUES table. (A
+    # mailbox hook still under way lists its thread's mails: not the list's.)
+    wg._mailbox_wait()
     STATE["queries"].clear()
     _chats(base)
     counting = [q for q in STATE["queries"] if "VALUES (?chat ?account ?cut)" in q]
@@ -2288,7 +2355,7 @@ def main():
         test_messages_contract(base, wg)
         test_original_json(base, wg)
         test_original_html(base, wg)
-        test_read_only_409s(base, wg)
+        test_draft_is_shared(base, wg)
         test_companion_note(base, wg)
         test_merge(base, wg)
         test_removed(base, wg)

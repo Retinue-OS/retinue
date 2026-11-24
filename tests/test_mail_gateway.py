@@ -135,6 +135,13 @@ class FakeMailbox:
         self.listed = []      # (folder, since, first_uid, dates) of every listing
         self.fail = None      # raised by the next adapter call, once
         self.refused = set()  # folders the server will not open (see _check)
+        # The write half (tests/test_mail_gateway_send.py). What the server
+        # can do: remove exactly the mails a move copied (MOVE, or UIDPLUS's
+        # UID EXPUNGE), and name the UIDs it gave (COPYUID / APPENDUID).
+        self.writes = []      # every write asked for, in order
+        self.can_expunge = True
+        self.names_uids = True
+        self.no_writes = set()   # folders (or ("append", folder)) the server refuses to change
 
     # -- what happens to the mailbox ------------------------------------------
 
@@ -237,6 +244,66 @@ class FakeMailbox:
         if folder not in self.boxes:
             return self.gw.Matches((), True)
         return self.gw.Matches(self.uids_of(folder, message_id), True)
+
+    # -- the adapter's write half ---------------------------------------------
+
+    def _writable(self, folder, validity=None, what=None):
+        """The box a write is for, or None when the server has no such
+        folder; raises as the adapter does for one it will not change, or
+        whose UIDs are not the ones the caller read."""
+        self._check(folder)
+        if folder in self.no_writes or (what, folder) in self.no_writes:
+            raise self.gw.MailboxError(f"the IMAP server refused to change {folder!r}")
+        box = self.boxes.get(folder)
+        if box is not None and validity is not None and box["validity"] != validity:
+            raise self.gw.FolderChanged(f"{folder!r} was renumbered")
+        return box
+
+    def set_seen(self, folder, uids, *, validity=None):
+        self.writes.append(("seen", folder, tuple(sorted(uids))))
+        box = self._writable(folder, validity)
+        if box is None:
+            return None
+        present = [uid for uid in uids if uid in box["mails"]]
+        for uid in present:
+            box["mails"][uid]["flags"] = box["mails"][uid]["flags"] | {"\\Seen"}
+        return len(present)
+
+    def move(self, folder, uids, to_folder, *, validity=None):
+        self.writes.append(("move", folder, tuple(sorted(uids)), to_folder))
+        box = self._writable(folder, validity)
+        if box is None:
+            return None
+        if to_folder not in self.boxes:
+            raise self.gw.MailboxError(f"the IMAP server refused to move mail to "
+                                       f"{to_folder!r}: [TRYCREATE] no such mailbox")
+        self._writable(to_folder, what="into")
+        moved, left = {}, {}
+        for uid in sorted(uid for uid in uids if uid in box["mails"]):
+            mail = box["mails"][uid]
+            new = self.put(to_folder, mail["raw"], flags=mail["flags"], date=mail["date"])
+            if self.can_expunge:
+                del box["mails"][uid]
+                moved[uid] = new if self.names_uids else None
+            else:
+                mail["flags"] = mail["flags"] | {"\\Deleted"}
+                left[uid] = new if self.names_uids else None
+        absent = tuple(sorted(uid for uid in uids if uid not in moved and uid not in left))
+        return self.gw.Moved(moved, left, absent)
+
+    def append(self, folder, raw, *, when=None):
+        self.writes.append(("append", folder))
+        box = self._writable(folder, what="append")
+        if box is None:
+            raise self.gw.MailboxError(f"the IMAP server refused to append to {folder!r}: "
+                                       f"[TRYCREATE] no such mailbox")
+        uid = self.put(folder, raw, flags=("\\Seen",), date=NOW if when is None else when)
+        return (box["validity"], uid) if self.names_uids else (None, None)
+
+    def create(self, folder):
+        self.writes.append(("create", folder))
+        self._check()
+        self.boxes.setdefault(folder, {"validity": 900 + len(self.boxes), "next": 1, "mails": {}})
 
 
 def records(gw) -> list:
@@ -2658,7 +2725,10 @@ def test_health_states():
         assert snap["connected"] is False and snap["account"] is None
         assert "EMAIL_USER" in snap["error"] and snap["needs_repair"] is False
         assert snap["blocked"] is None
-        assert snap["mode"] == "inbox" and snap["read_only"] is True
+        # No mirror, so nothing to send from — and no reason of the SMTP
+        # server's to give. The read-only phase's field is gone.
+        assert snap["mode"] == "inbox" and "read_only" not in snap
+        assert snap["can_send"] is False and snap["cannot_send_reason"] is None
         json.dumps(snap)
     with tempfile.TemporaryDirectory() as tmp:
         # A named account reads its own suffixed variables and no others.
@@ -2676,6 +2746,24 @@ def test_health_states():
         snap = gw._health_snapshot()
         assert snap["configured"] is True and snap["connected"] is False
         assert "EMAIL_PASS" in snap["error"], snap
+        assert snap["can_send"] is False
+    with tempfile.TemporaryDirectory() as tmp:
+        # But for the SMTP server alone: a mailbox is mirrored without one,
+        # and /health says that nothing can be sent from it, and why.
+        gw = load(tmp, configured=False, EMAIL_USER="me@example.org", EMAIL_PASS="x",
+                  IMAP_HOST="imap.example.org")
+        snap = gw._health_snapshot()
+        assert gw.MAIL_CONFIG is not None and gw.MAIL_CONFIG.smtp_host == ""
+        assert snap["configured"] is True and snap["account"] == ACCOUNT
+        assert snap["can_send"] is False and "SMTP_HOST" in snap["cannot_send_reason"]
+        assert "SMTP_HOST" not in os.environ, "the stand-in must not stay in the environment"
+        gw = load(tmp, configured=False, MAIL_ACCOUNT_NAME="work", EMAIL_USER_WORK="w@x.org",
+                  EMAIL_PASS_WORK="x", IMAP_HOST_WORK="imap.example.org", SMTP_HOST_WORK=" ")
+        assert "SMTP_HOST_WORK" in gw._health_snapshot()["cannot_send_reason"]
+        assert os.environ["SMTP_HOST_WORK"] == " "
+        # With one, it can.
+        snap = load(tmp)._health_snapshot()
+        assert snap["can_send"] is True and snap["cannot_send_reason"] is None
     with tempfile.TemporaryDirectory() as tmp:
         # A deployment that pinned its built-in channels without e-mail runs
         # no mirror: the retinue side has no entry for this gateway then.
@@ -3091,18 +3179,24 @@ def test_http_api():
             assert call(f"{base}/media/{'f' * 32}", token=token)[0] == 404
             assert call(f"{base}/media/..%2F..%2Fetc%2Fpasswd", token=token)[0] == 404
 
-            # Present, and saying why: the mirror is read-only.
-            reason = {"error": "the mail mirror is read-only"}
-            for path in ("/send", "/chats/delete", "/chats/read", "/chats/archive",
-                         "/pending-sends/" + "a" * 32 + "/approve",
-                         "/pending-sends/" + "a" * 32 + "/retract"):
-                status, _h, body = call(base + path, body=b'{"chat": "a@x.org"}', token=token)
-                assert (status, json.loads(body)) == (501, reason), path
-            for path in ("/pending-sends", "/pending-sends/" + "a" * 32):
-                status, _h, body = call(base + path, token=token)
-                assert (status, json.loads(body)) == (501, reason), path
+            # The write half answers too (tests/test_mail_gateway_send.py has
+            # what it does): nothing waits, no such send, and a body that
+            # names no chat or no mail is refused before anything is touched.
+            status, _h, body = call(f"{base}/pending-sends", token=token)
+            assert (status, json.loads(body)) == (200, {"pending": []})
+            assert call(f"{base}/pending-sends/{'a' * 32}", token=token)[0] == 404
+            for verb in ("approve", "reject", "retract"):
+                assert call(f"{base}/pending-sends/{'a' * 32}/{verb}", body=b"{}",
+                            token=token)[0] == 404, verb
+            assert call(f"{base}/pending-sends/nope/approve", body=b"{}", token=token)[0] == 404
+            for path in ("/send", "/chats/read", "/chats/archive"):
+                assert call(base + path, body=b"{}", token=token)[0] == 400, path
+                assert call(base + path, body=b"[]", token=token)[0] == 400, path
+            # No erase capability is configured here: deleting is refused.
+            assert call(f"{base}/chats/delete", body=b'{"chat": "a/b+c@x.org"}',
+                        token=token)[0] == 503
             assert call(f"{base}/nope", body=b"{}", token=token)[0] == 404
-            assert len(records(gw)) == 2
+            assert len(records(gw)) == 2 and box.writes == []
 
             # /outbound-note
             def note(payload):
@@ -3118,12 +3212,22 @@ def test_http_api():
             assert note({"author": "agent"})[0] == 400
             assert note(b"[1]")[0] == 400 and note(b"not json")[0] == 400
             assert note(b" " * (gw.MAX_BODY_BYTES + 1))[0] == 400
+            # email_client.py names the mailbox the mail left from: another
+            # account's is not this gateway's to note (404), its own is,
+            # however the address is cased.
+            assert note({"message_id": "s@example.org", "author": "user",
+                         "account": "other@example.org"}) == (
+                404, {"error": "not this gateway's account"})
+            assert by_id(gw)["s@example.org"]["author"] == "agent"
+            assert note({"message_id": "s@example.org", "author": "user",
+                         "account": "Me@Example.ORG"}) == (200, {"ok": True})
+            assert by_id(gw)["s@example.org"]["author"] == "user"
             gw.MIRROR = None
             assert note({"message_id": "x@example.org", "author": "user"})[0] == 503
             assert json.loads(call(f"{base}/recent-chats", token=token)[2]) == {"recent_chats": []}
         finally:
             server.shutdown()
-    print("ok: the HTTP API is token-gated, serves threads and media, and refuses to write")
+    print("ok: the HTTP API is token-gated, serves threads and media, and takes outbound notes")
 
 
 def test_without_a_token_nothing_is_mirrored_or_served():

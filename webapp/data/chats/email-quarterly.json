@@ -23,8 +23,8 @@
   "starred": false,
   "companion": null,
   "instructed": null,
-  "can_send": false,
-  "cannot_send_reason": "Mail is mirrored read-only for now: reply from your mail client.",
+  "can_send": true,
+  "pending": 1,
   "last": {
    "ts": "2026-08-27T08:58:00+02:00",
    "direction": "in",
@@ -46,6 +46,7 @@
    "subject": "Quarterly numbers",
    "recipients": ["me@example.org", "bob@builder.example"],
    "cc": ["carla@example.net"],
+   "reply_to": [],
    "text": "Hi both,\n\nhere are the Q3 numbers as a chart; the table is in the attached sheet. Could you check the third column before Thursday?\n\nAnn",
    "trim": "deterministic",
    "removed": false,
@@ -69,6 +70,7 @@
    "subject": "Re: Quarterly numbers",
    "recipients": ["ann@example.com", "bob@builder.example"],
    "cc": ["carla@example.net"],
+   "reply_to": [],
    "text": "Looks right to me except row 4 — Bob, wasn't that the revised figure?",
    "trim": "deterministic",
    "removed": false,
@@ -85,6 +87,7 @@
    "subject": "Re: Quarterly numbers (revised table)",
    "recipients": ["me@example.org", "ann@example.com"],
    "cc": ["carla@example.net"],
+   "reply_to": [],
    "text": "Yes — revised table below, row 4 now shows the corrected figure.\n\nRegion | Q2 | Q3\nNorth | 120 | 134\nSouth | 98 | 112",
    "trim": "wanting",
    "removed": false,
@@ -115,12 +118,26 @@
    "subject": "Re: Quarterly numbers (revised table)",
    "recipients": ["me@example.org", "bob@builder.example"],
    "cc": ["carla@example.net"],
+   "reply_to": [],
    "text": "Thanks Bob, the revised table works for me. Let's freeze it on Friday.",
    "trim": "deterministic",
    "removed": false,
    "removed_at": null,
    "ts": "2026-08-27T08:58:00+02:00",
    "original": "/chats/email%3A~me%40example.org%3ACAJx8kQ2v7Lr3n%40mail.example.com/messages/9e8d7c6b5a4f3e2d1c0b9a8f7e6d5c4b/original"
+  }
+ ],
+ "pending": [
+  {
+   "request_id": "7c1e0b6a9d2f4e3c8b5a6d7e8f901234",
+   "approval_url": "/sends/mail-gateway/7c1e0b6a9d2f4e3c8b5a6d7e8f901234",
+   "message_id": "20260827091500.7C1E@me.example.org",
+   "text": "Friday works. I'll freeze the table then and send the final numbers round.\n\nThanks both!",
+   "ts": "2026-08-27T09:15:00+02:00",
+   "author": "user",
+   "to": ["ann@example.com"],
+   "cc": ["bob@builder.example", "carla@example.net"],
+   "subject": "Re: Quarterly numbers"
   }
  ]
 }

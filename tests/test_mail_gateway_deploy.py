@@ -8,9 +8,10 @@ qlever-life container cannot mount, a module the image does not carry, a
 policy file the two sides look for under different names. What these pin:
 
 - the service names every variable it reads and loads no env_file (it holds a
-  mailbox password; .env holds every other secret too), names no setting or
-  credential it does not read in this phase (the send policy, the erase
-  token, the news rail), runs without a profile, and mounts its ledger and
+  mailbox password; .env holds every other secret too), names the send policy
+  and the erase capability it needs to write (and the approval-link variables
+  a queued send builds its URL from) but no setting or credential it does not
+  read (the news rail's), runs without a profile, and mounts its ledger and
   its state volume;
 - the retinue entrypoint places the e-mail policy file before anything slow,
   since the mirror does not start without it;
@@ -98,25 +99,29 @@ def test_the_service_names_what_it_reads_and_nothing_else():
                 "MAIL_TRIM_WANTING_CHARS",
                 "MAIL_DATA_DIR", "MAIL_GATEWAY_HTTP_PORT", "MAIL_GATEWAY_TOKEN",
                 "MAIL_POLICY_WAIT_SECONDS", "MAIL_RECENT_CHATS_MAX", "MAIL_RAIL_TIMEOUT",
+                # Writing: how long its own send waits for the Sent copy.
+                "MAIL_SENT_GRACE_SECONDS",
                 # The default account idles where the channel set leaves out email.
                 "MESSENGER_BUILTIN_CHANNELS"}
     rails = {"CHATS_INGEST_URL", "CHATS_INGEST_TOKEN",
              "INBOUND_STORE_DIR", "TRIAGE_EMAIL_WHITELIST_PATH"}
-    missing = (mailbox | tunables | rails) - names
+    # The send policy it applies, the approval link a queued send returns, and
+    # the capability the user's delete presents.
+    writing = {"EMAIL_SEND_POLICY", "SEND_APPROVAL_BASE_URL", "SEND_APPROVAL_SLUG",
+               "CHAT_ERASE_TOKEN"}
+    missing = (mailbox | tunables | rails | writing) - names
     assert not missing, f"mail-gateway does not name {sorted(missing)}"
     entries = _entries(block)
     for fixed in ("MAIL_GATEWAY_HTTP_PORT=8096", "INBOUND_STORE_DIR=/inbound",
                   "CHATS_INGEST_URL=http://retinue:8080/internal/chats/inbound",
                   "mail-data:/root/.local/share/mail", "messenger-email:/inbound"):
         assert fixed in entries, f"mail-gateway: expected `{fixed}`"
-    # Secrets it has no use for stay out — and so do the ones a later phase
-    # reads: the read-only mirror sends nothing (EMAIL_SEND_POLICY), erases
-    # nothing (CHAT_ERASE_TOKEN, the messengers' /chats/delete capability) and
-    # files no news (e-mail triage still does). The container that parses
-    # mail from strangers holds no credential it has no use for.
+    # Secrets it has no use for stay out — and so does the one a later phase
+    # reads: it files no news yet (e-mail triage still does). The container
+    # that parses mail from strangers holds no credential it has no use for.
     for foreign in ("LITELLM_MASTER_KEY", "OPENROUTER_API_KEY", "CALDAV_PASSWORD",
-                    "SMS_SERVER_PASSWORD", "TELEGRAM_API_HASH", "EMAIL_SEND_POLICY",
-                    "CHAT_ERASE_TOKEN", "NEWS_INGEST_URL", "NEWS_INGEST_TOKEN"):
+                    "SMS_SERVER_PASSWORD", "TELEGRAM_API_HASH",
+                    "NEWS_INGEST_URL", "NEWS_INGEST_TOKEN"):
         assert foreign not in names, foreign
     # Both ways for the gateway's own settings: every MAIL_* it names is one
     # the gateway's code reads (a value-less name the code ignores would be a
@@ -168,6 +173,10 @@ def test_the_retinue_side_enrols_it_and_keeps_its_own_credentials():
     # email_client.py's backend still runs in this container.
     for name in ("EMAIL_USER", "EMAIL_PASS", "IMAP_HOST", "SMTP_HOST"):
         assert name in entries, f"retinue lost {name}; its e-mail backend needs it"
+    # The user's delete presents the erase capability to the gateway, and the
+    # e-mail backend applies the same send policy the gateway does.
+    for name in ("CHAT_ERASE_TOKEN", "EMAIL_SEND_POLICY", "SEND_APPROVAL_BASE_URL"):
+        assert name in entries, f"retinue does not name {name}"
     # The base URL the registry enrols, and the port the gateway listens on.
     sys.path.insert(0, str(SCRIPTS_DIR))
     mg = _load("messenger_gateways_deploy_under_test", SCRIPTS_DIR / "messenger_gateways.py")
@@ -185,6 +194,42 @@ def test_the_retinue_side_enrols_it_and_keeps_its_own_credentials():
                 os.environ[key] = value
     assert registry["mail-gateway"]["channel"] == "email", registry
     print("PASS test_the_retinue_side_enrols_it_and_keeps_its_own_credentials")
+
+
+# What the retinue-side code reads for the mail channel: the web gateway's
+# hop, queue reads and hook memory, mail-push.py's timeout. The retinue service
+# has no env_file, so a variable it does not name never reaches those
+# processes — a value in .env would do nothing.
+_RETINUE_SIDE_MAIL = {"MAIL_SEND_TIMEOUT", "CHAT_PENDING_TIMEOUT",
+                      "CHAT_PENDING_RETRY_SECONDS", "CHAT_PENDING_SYNC_SECONDS",
+                      "MAILBOX_NONE_SECONDS", "MAIL_GATEWAY_TIMEOUT",
+                      "MAIL_ORIGINAL_MAX_BYTES", "MAIL_ORIGINAL_INLINE_MAX_BYTES"}
+
+
+def test_the_retinue_service_passes_the_mail_tunables_its_code_reads():
+    names = _env_names(_service_block("retinue"))
+    missing = _RETINUE_SIDE_MAIL - names
+    assert not missing, f"retinue does not name {sorted(missing)}"
+    # Whatever else the retinue-side mail code reads is named too: a new
+    # tunable cannot be documented without being wired.
+    pattern = re.compile(
+        r"(?:os\.environ\.get|os\.getenv)\(\s*\"((?:MAIL_|MAILBOX_|CHAT_PENDING_)[A-Z0-9_]*)\"")
+    read = set()
+    for name in ("web-gateway.py", "mail-push.py", "email_client.py"):
+        read |= set(pattern.findall((SCRIPTS_DIR / name).read_text(encoding="utf-8")))
+    unwired = {n for n in read if n not in names}
+    assert not unwired, f"the retinue side reads {sorted(unwired)}, which compose does not pass"
+    # A session may need the push CLI's timeout; the web gateway's own knobs
+    # stay out of sessions (scripts/session_env.py).
+    sys.path.insert(0, str(SCRIPTS_DIR))
+    se = _load("session_env_deploy_under_test", SCRIPTS_DIR / "session_env.py")
+    built = se.build({"PATH": "/usr/bin", "MAIL_GATEWAY_TIMEOUT": "300",
+                      "MAIL_SEND_TIMEOUT": "300", "CHAT_PENDING_SYNC_SECONDS": "5",
+                      "MAILBOX_NONE_SECONDS": "5"})
+    assert built.get("MAIL_GATEWAY_TIMEOUT") == "300", built
+    for daemon_only in ("MAIL_SEND_TIMEOUT", "CHAT_PENDING_SYNC_SECONDS", "MAILBOX_NONE_SECONDS"):
+        assert daemon_only not in built, daemon_only
+    print("PASS test_the_retinue_service_passes_the_mail_tunables_its_code_reads")
 
 
 def test_both_sides_name_the_same_policy_file():
@@ -290,6 +335,7 @@ def main() -> int:
     test_the_entrypoint_places_the_policy_file_before_anything_slow()
     test_the_ledger_volume_is_shared_three_ways()
     test_the_retinue_side_enrols_it_and_keeps_its_own_credentials()
+    test_the_retinue_service_passes_the_mail_tunables_its_code_reads()
     test_both_sides_name_the_same_policy_file()
     test_the_image_carries_every_module_it_imports()
     print("all mail-gateway deployment tests passed")

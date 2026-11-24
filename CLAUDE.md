@@ -266,13 +266,21 @@ tab of the navigation row) write the same files. Vocabulary and file format:
 Outbound pushes go through the thin CLIs — `scripts/signal-push.py`,
 `whatsapp-push.py`, `telegram-push.py` (text, `--attach` for a file of any
 type — image, video, PDF; Signal also speaks a
-voice rendering; `--url` picks the account's gateway) and, where the opt-in
-SMS channel runs, `sms-push.py` (text only). The message text for a
+voice rendering; `--url` picks the account's gateway), where the opt-in
+SMS channel runs `sms-push.py` (text only), and for e-mail in a mailbox the
+mail gateway mirrors `mail-push.py` (below). The message text for a
 human comes from the `secretary` subagent (see **Routing**) — dispatch, then
 send its text verbatim. **Before any send to a
 named person, apply the `messaging-contact-lookup` skill** (recent chats
-first, directory fallback — `signal-contacts.py` and siblings). E-mail goes
-through `scripts/email_client.py` — the `use-email-client` skill. Sends are
+first, directory fallback — `signal-contacts.py` and siblings). **E-mail in a
+thread the mail gateway mirrors**, when you hold its chat id — a reply
+(`--chat <id>`, `--reply all|sender`) or a new mail (`--to`, `--subject`) —
+goes through `scripts/mail-push.py` like the other push CLIs, under the same
+send policy; a mail e-mail triage hands you (a UID, not a chat id) is still
+answered with `email_client.py reply --uid`, as the `triage` skill says, until
+triage retires. `scripts/email_client.py` (the `use-email-client` skill) stays
+for everything else: reading, searching, filing, drafts, and any mailbox the
+gateway does not serve. Sends are
 gated by per-identity send policies (`allow`/`trust`/`verify`; undeclared
 defaults to `verify`, queued for approval on the dashboard's `/sends` page) —
 a queued send is not a failure, but it is **not done either**: the push script
@@ -280,7 +288,8 @@ prints that send's own approval URL, and your reply relays it as a labeled
 link, so the user can approve without hunting for the page. Reporting a queue
 without the link leaves the message stuck. A queued send you no longer want is
 taken back before approval with `--retract <id>` on any push CLI
-(`email_client.py retract` for e-mail) — never left for the user to deny.
+(`mail-push.py`'s own queue; `email_client.py retract` for an e-mail draft) —
+never left for the user to deny.
 A send queued in a dashboard-thread turn is linked to that thread
 (`RETINUE_THREAD_ID`; from elsewhere `--thread <id>` on a push CLI, or
 `RETINUE_THREAD_ID=<id>` for `email_client.py`), and the user's Allow/Deny is

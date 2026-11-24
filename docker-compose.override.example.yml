@@ -277,6 +277,14 @@ services:
   # it mirrors nothing) and MAIL_OWN_ADDRESSES: let that one .env value list
   # every address of the user's — every mirrored account and its aliases — so
   # neither gateway counts the user's other account as a correspondent.
+  # It also inherits EMAIL_SEND_POLICY (one JSON array, keyed by each
+  # account's own address), the approval-link base and CHAT_ERASE_TOKEN, so it
+  # sends under the same policy, and its approval links are
+  # /sends/mail-gateway-ari/<id> (the service name). Leave SEND_APPROVAL_SLUG
+  # unset: one slug shared by two gateways would address both accounts'
+  # pending sends as one. The account's SMTP settings are the suffixed set
+  # below too (add SMTP_PORT_ARI, IMAP_PORT_ARI, … where they are not the
+  # defaults); a sent mail's From name is EMAIL_FROM_NAME_ARI.
   # retinue:
   #   environment:
   #     - 'MESSENGER_GATEWAYS=[{"base_url":"http://mail-gateway-ari:8096","token":"${MAIL_GATEWAY_TOKEN}","label":"E-mail (Ari)","channel":"email"}]'
@@ -291,10 +299,17 @@ services:
   #     - EMAIL_PASS=
   #     - EMAIL_USER_ARI
   #     - EMAIL_PASS_ARI
+  #     - EMAIL_FROM_NAME_ARI
   #     - IMAP_HOST_ARI
   #     - SMTP_HOST_ARI
   #     - SENT_FOLDER_ARI
   #     - SMTP_SAVE_SENT_ARI
+  #     # Folder names are inherited from .env too; an account whose archive
+  #     # or trash folder is named differently sets its own here (an explicit
+  #     # name wins over the server's SPECIAL-USE marks; a Trash is never
+  #     # created, so without one Delete in a chat is refused):
+  #     # - MAIL_ARCHIVE_FOLDER=Archiv
+  #     # - MAIL_TRASH_FOLDER=Deleted Items
   #   volumes:
   #     - mail-data-ari:/root/.local/share/mail   # its OWN volume
   #     - messenger-email:/inbound

@@ -183,6 +183,24 @@ P_SENDER_NAME = KB + "senderName"
 # is one literal instead.
 P_RECIPIENT = KB + "recipient"
 P_CC = KB + "cc"
+# The Reply-To addresses, one triple each, where the mail carried the header:
+# whom an answer goes to instead of the sender. The mail gateway builds a
+# reply from its records of the thread (docs/mail-chats.md, "Writing"), so the
+# record has to say it. Addresses, like To and Cc: gone from a tombstone.
+P_REPLY_TO = KB + "replyTo"
+# On a mail the gateway sent: the To/Cc addresses the SMTP server would not
+# take, one triple each. The mail went to the others — who are the record's
+# kb:recipient and kb:cc — and to none of these. Addresses, gone from a
+# tombstone like the rest.
+P_REFUSED = KB + "refused"
+# On a mail the gateway sent through a submission service that replaced its
+# Message-ID: the id the mail has in the mailbox and at its recipients — the
+# one their answers cite — one triple each (kb:messageId stays the id the
+# gateway minted, which is what the record, the chat and every index are
+# keyed by). Identity, not content: kept on a tombstone, where a thread index
+# rebuilt from the ledger still needs every id a mail was ever known by — and
+# on a record written in its place, inbound-shaped ones included.
+P_SENT_AS = KB + "sentAs"
 # Threading, as the headers carried it: the parent's id, and the References
 # ids space-separated in header order (followed by any further id the
 # In-Reply-To header named beside the parent, so the two together are every
@@ -225,7 +243,10 @@ TRIMS = ("deterministic", "wanting", "model")
 _MAIL_LITERALS = (("subject_line", P_SUBJECT), ("sender_name", P_SENDER_NAME),
                   ("in_reply_to", P_IN_REPLY_TO), ("references", P_REFERENCES),
                   ("list_id", P_LIST_ID), ("trim", P_TRIM))
-_MAIL_LISTS = (("recipients", P_RECIPIENT), ("cc", P_CC))
+_MAIL_LISTS = (("recipients", P_RECIPIENT), ("cc", P_CC), ("reply_to", P_REPLY_TO),
+               ("refused", P_REFUSED))
+# Lists a tombstone keeps (see P_SENT_AS).
+_MAIL_ID_LISTS = (("sent_as", P_SENT_AS),)
 _PARTS = (("body_part", P_BODY_PART), ("html_part", P_HTML_PART),
           ("header_part", P_HEADER_PART))
 
@@ -447,7 +468,7 @@ def _render(fields: dict) -> str:
     for key, pred in _MAIL_LITERALS:
         if fields.get(key):
             lines.append(_lit(subj, pred, fields[key]))
-    for key, pred in _MAIL_LISTS:
+    for key, pred in _MAIL_LISTS + _MAIL_ID_LISTS:
         for value in dict.fromkeys(fields.get(key) or []):
             if value:
                 lines.append(_lit(subj, pred, value))
@@ -518,7 +539,8 @@ def _parse(text: str) -> dict | None:
     :func:`_render`, so no rewrite here ever drops a newer writer's facts.
 
     The mail fields (see :data:`P_SUBJECT`) read as ``subject_line``,
-    ``sender_name``, ``recipients`` and ``cc`` (lists), ``in_reply_to``,
+    ``sender_name``, ``recipients``, ``cc``, ``reply_to``, ``refused`` and
+    ``sent_as`` (lists), ``in_reply_to``,
     ``references`` (the space-separated literal as stored), ``list_id``,
     ``body_part``/``html_part``/``header_part`` (media IRIs), ``trim``,
     ``removed_at`` and ``arrived_at`` (ISO-8601); an inline part's Content-ID is
@@ -532,10 +554,10 @@ def _parse(text: str) -> dict | None:
                     "removed_at": None, "arrived_at": None, "extra": []}
     for key, _pred in _MAIL_LITERALS + _PARTS:
         fields[key] = None
-    for key, _pred in _MAIL_LISTS:
+    for key, _pred in _MAIL_LISTS + _MAIL_ID_LISTS:
         fields[key] = []
     literals = {pred: key for key, pred in _MAIL_LITERALS}
-    lists = {pred: key for key, pred in _MAIL_LISTS}
+    lists = {pred: key for key, pred in _MAIL_LISTS + _MAIL_ID_LISTS}
     parts = {pred: key for key, pred in _PARTS}
     triples = []
     # Lines are what the writer ends with "\n", and nothing else: a character
@@ -709,7 +731,8 @@ def _check_trim(trim) -> str | None:
 
 def _mail_fields(*, subject=None, sender_name=None, recipients=None, cc=None,
                  in_reply_to=None, references=None, list_id=None, body_part=None,
-                 html_part=None, header_part=None, trim=None, arrived_at=None) -> dict:
+                 html_part=None, header_part=None, trim=None, arrived_at=None,
+                 reply_to=None, refused=None) -> dict:
     """The mail fields of a new record, normalised (see :data:`P_SUBJECT`).
 
     ``references`` is the References header's ids in header order, as one
@@ -725,6 +748,9 @@ def _mail_fields(*, subject=None, sender_name=None, recipients=None, cc=None,
         "sender_name": _one(sender_name),
         "recipients": _many(recipients),
         "cc": _many(cc),
+        "reply_to": _many(reply_to),
+        "refused": _many(refused),
+        "sent_as": [],
         "in_reply_to": _one(in_reply_to),
         "references": " ".join(str(references or "").split()) or None,
         "list_id": _one(list_id),
@@ -803,7 +829,9 @@ def write_message(
     trim: str | None = None,
     content_ids: dict | None = None,
     arrived_at: float | None = None,
+    reply_to: list[str] | None = None,
     replace: str | Path | None = None,
+    sent_as: list[str] | None = None,
 ) -> tuple[str, Path]:
     """Persist one inbound message as a deterministic N-Triples file.
 
@@ -836,6 +864,7 @@ def write_message(
     The remaining arguments are a mail's (see :data:`P_SUBJECT` and
     docs/mail-chats.md, "The record"): ``subject`` its Subject, ``sender_name``
     the display name on From, ``recipients``/``cc`` the To/Cc addresses,
+    ``reply_to`` the Reply-To addresses (see :data:`P_REPLY_TO`),
     ``in_reply_to``/``references`` its threading headers, ``list_id``,
     ``body_part``/``html_part``/``header_part`` the media references of its
     parts (stored with :func:`store_media` first, like attachments, so their
@@ -848,7 +877,9 @@ def write_message(
     absent one writes no triple.
 
     ``replace`` is a record of this store that the new one takes the place
-    of (see :func:`_replacing`).
+    of (see :func:`_replacing`). ``sent_as`` as for :func:`write_outbound`:
+    a record written in the place of a mail the gateway sent keeps the ids
+    a provider gave that mail, whichever way it is written.
     """
     ts = time.time() if timestamp is None else float(timestamp)
     token, path = _replacing(store_dir, replace, ts)
@@ -857,7 +888,8 @@ def write_message(
         **_mail_fields(subject=subject, sender_name=sender_name, recipients=recipients,
                        cc=cc, in_reply_to=in_reply_to, references=references,
                        list_id=list_id, body_part=body_part, html_part=html_part,
-                       header_part=header_part, trim=trim, arrived_at=arrived_at),
+                       header_part=header_part, trim=trim, arrived_at=arrived_at,
+                       reply_to=reply_to),
         "type": T_INBOUND,
         "subject": urn,
         "channel": channel,
@@ -872,6 +904,7 @@ def write_message(
         "attachments": [u for u in (attachment_urls or []) if u],
         "media": media or None,
     }
+    fields["sent_as"] = _many(sent_as)
     fields["attachment_meta"] = _record_blob_meta(store_dir, fields, content_ids)
     _atomic_write(_render(fields), path)
     return urn, path
@@ -902,7 +935,10 @@ def write_outbound(
     trim: str | None = None,
     content_ids: dict | None = None,
     arrived_at: float | None = None,
+    reply_to: list[str] | None = None,
+    refused: list[str] | None = None,
     replace: str | Path | None = None,
+    sent_as: list[str] | None = None,
 ) -> tuple[str, Path]:
     """Persist one successfully sent outbound message as its own N-Triples file.
 
@@ -931,7 +967,11 @@ def write_outbound(
     the alias it went out as) and ``sender_name`` — and takes the same mail
     arguments as :func:`write_message`; a messenger send passes none of them
     and its record is what it always was. So does ``replace``
-    (see :func:`_replacing`).
+    (see :func:`_replacing`). ``refused`` is a sent mail's alone: the
+    addresses the SMTP server would not take it for (see :data:`P_REFUSED`)
+    — ``recipients`` and ``cc`` are then the others. ``sent_as`` too: the
+    ids a provider gave the mail (see :data:`P_SENT_AS`) — for a record
+    that replaces one which had them, so that they are not lost with it.
     """
     if author not in AUTHORS:
         raise ValueError(f"author must be one of {'|'.join(AUTHORS)}, got {author!r}")
@@ -942,7 +982,8 @@ def write_outbound(
         **_mail_fields(subject=subject, sender_name=sender_name, recipients=recipients,
                        cc=cc, in_reply_to=in_reply_to, references=references,
                        list_id=list_id, body_part=body_part, html_part=html_part,
-                       header_part=header_part, trim=trim, arrived_at=arrived_at),
+                       header_part=header_part, trim=trim, arrived_at=arrived_at,
+                       reply_to=reply_to, refused=refused),
         "type": T_OUTBOUND,
         "subject": urn,
         "channel": channel,
@@ -955,6 +996,7 @@ def write_outbound(
         "sent_at": _iso(ts),
         "attachments": [u for u in (attachment_urls or []) if u],
     }
+    fields["sent_as"] = _many(sent_as)
     fields["attachment_meta"] = _record_blob_meta(store_dir, fields, content_ids)
     _atomic_write(_render(fields), path)
     return urn, path
@@ -1439,7 +1481,8 @@ def mark_delivered(path: str | Path) -> bool:
 
 def update_message(path: str | Path, *, text: str | None = None,
                    clear_media: bool = False, chat: str | None = None,
-                   trim: str | None = None, author: str | None = None) -> str | None:
+                   trim: str | None = None, author: str | None = None,
+                   sent_as: str | list[str] | None = None) -> str | None:
     """Rewrite a persisted message's mutable fields in place; never raises
     on file trouble.
 
@@ -1463,6 +1506,13 @@ def update_message(path: str | Path, *, text: str | None = None,
     folder is recorded as the own-device echo until it is told otherwise, and
     the telling can come after the finding (``POST /outbound-note``). It is
     ignored on an inbound record, which has no author to correct.
+
+    ``sent_as=`` adds an id (or several) a sent mail turned out to be known
+    by beside its own (see :data:`P_SENT_AS`): the mail gateway learns it
+    when the provider's copy of the mail shows in the Sent folder, after the
+    record was written. Added to what is there, never replacing it; ignored
+    on an inbound record. A caller that must know the id is on record reads
+    the record back — the return value says nothing about it.
 
     Returns the ``media`` value present *before* the call — so a caller clearing
     it knows which file to unlink — or ``None`` if there was none or the rewrite
@@ -1491,6 +1541,8 @@ def update_message(path: str | Path, *, text: str | None = None,
         fields["chat"] = chat
     if author is not None and fields.get("type") == T_OUTBOUND:
         fields["author"] = author
+    if sent_as and fields.get("type") == T_OUTBOUND:
+        fields["sent_as"] = _many([*(fields.get("sent_as") or []), *_many(sent_as)])
     if clear_media:
         fields["media"] = None
     try:
@@ -1634,13 +1686,14 @@ def tombstone_message(path: str | Path, removed_at: str | float | None = None, *
     (docs/mail-chats.md, "The mirror"). The record stays — a chat whose mails
     are all gone is archived, not erased — and keeps who, where and when:
     type, channel, chat, account, group, sender and sender name, author,
-    message id, subject, the threading ids and the list id (a thread index
+    message id (and any id a provider gave it instead, ``kb:sentAs``),
+    subject, the threading ids and the list id (a thread index
     rebuilt from the ledger needs every id a mail cited), its timestamps,
     and on an inbound record ``delivered`` — set true, since nothing is owed
     for a mail that no longer exists. It loses what the mail said and to
     whom: ``kb:text`` becomes the empty string (the triple stays: the parser
     and the web gateway's chat query require it), and the recipients, the Cc,
-    the trim, the parts, the attachments with what was stated about them, a
+    the Reply-To and the refused addresses, the trim, the parts, the attachments with what was stated about them, a
     retained voice-note spool, and any triple this version does not know (it
     cannot tell identity from content there, and a tombstone keeps only what
     it knows to be identity). ``kb:removedAt`` is set — ``removed_at`` as
@@ -1666,8 +1719,8 @@ def tombstone_message(path: str | Path, removed_at: str | float | None = None, *
         fields = _parse(p.read_text(encoding="utf-8"))
         if not fields:
             return False
-        stripped = {key for key in ("recipients", "cc", "attachments", "extra")
-                    if fields.get(key)}
+        gone = [key for key, _pred in _MAIL_LISTS] + ["attachments", "extra"]
+        stripped = {key for key in gone if fields.get(key)}
         stripped |= {key for key, _pred in _PARTS if fields.get(key)}
         stripped |= {key for key in ("text", "trim", "media", "attachment_meta")
                      if fields.get(key)}
@@ -1695,7 +1748,7 @@ def tombstone_message(path: str | Path, removed_at: str | float | None = None, *
             when = _parse_since(removed_at)
             fields["removed_at"] = _iso(time.time() if when is None else when)
         fields["text"] = ""
-        for key in ("recipients", "cc", "attachments", "extra"):
+        for key in gone:
             fields[key] = []
         for key, _pred in _PARTS:
             fields[key] = None

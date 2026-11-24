@@ -1,8 +1,10 @@
 # Mail gateway — the channel gateway for e-mail (see scripts/mail-gateway.py and
 # docs/mail-chats.md). Mirrors one mailbox over IMAP into the per-message
-# ledger the messenger gateways write, so its threads show as chats, and serves
-# the stored parts token-gated. The mailbox credentials it reads are the ones
-# scripts/email_client.py reads; email_client.py is its IMAP/MIME library.
+# ledger the messenger gateways write, so its threads show as chats, serves the
+# stored parts token-gated, and sends: replies and new mail under the e-mail
+# send policy, with the mailbox following what is done to a chat. The mailbox
+# credentials it reads are the ones scripts/email_client.py reads;
+# email_client.py is its IMAP/MIME/SMTP library.
 FROM python:3.12-slim
 
 ENV DEBIAN_FRONTEND=noninteractive \
@@ -16,8 +18,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # services. IMAP, SMTP and MIME are the standard library's.
 RUN pip install --no-cache-dir requests
 
-# Thread index, mailbox index and outbound notes persist on the mail-data
-# volume (see docker-compose.yml).
+# Thread index, mailbox index, outbound notes and pending sends persist on the
+# mail-data volume (see docker-compose.yml).
 RUN mkdir -p /root/.local/share/mail
 
 WORKDIR /app
@@ -32,6 +34,7 @@ COPY scripts/inbound_store.py /app/inbound_store.py
 COPY scripts/job_delivery.py /app/job_delivery.py
 COPY scripts/news_ingest.py /app/news_ingest.py
 COPY scripts/chat_ingest.py /app/chat_ingest.py
+COPY scripts/send_origin.py /app/send_origin.py
 COPY scripts/build_stamp.py /app/build_stamp.py
 
 # Last, deliberately: see telegram-gateway/Dockerfile and scripts/build_stamp.py.

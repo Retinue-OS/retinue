@@ -154,6 +154,9 @@ async function mount(doc) {
   el.connectedCallback();
   clearInterval(el._timer);  // the test drives every refresh itself
   takeList().answer(doc);
+  // What ＋ offers is asked once with the first list; nothing, here
+  // (tests/test_webapp_mail_writing.py covers ＋).
+  take((w) => w.method === 'GET' && w.url === '/chats/compose', 'GET /chats/compose').answer({ channels: [] });
   await settle();
   return el;
 }
