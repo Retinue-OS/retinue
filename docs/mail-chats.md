@@ -576,9 +576,10 @@ of them and 4,000,000 characters, counted once per pass — all four passes for
 A mail that would take more is not trimmed and is recorded as it came,
 `wanting`, as is one of more than 200,000 lines or 5,000,000 characters,
 which is not read at all. Of an HTML part the first 1,000,000 characters of
-markup are parsed, not counting inline `data:` images (but one folded into
-lines where a browser does not read it as a value in quotes, and any after
-a CDATA section, which mail almost never has): beside a plain part a longer
+markup are parsed, not counting inline `data:` images (but one that a
+browser does not read as all in one attribute value — folded into lines, in
+a value in quotes that close — and any after a CDATA section, which mail
+almost never has): beside a plain part a longer
 one is not consulted, and where it is the mail's only text the bubble ends
 where the reading did, on a line `[…]` — *Original* shows all of it.
 Within those bounds the cost is linear in the size of the mail, for hostile
