@@ -1290,8 +1290,31 @@ def test_add_rule_and_the_filing_check():
           mt.place(filed("Receipts: file them."), second), (filed("Receipts: file them.", "Invoices too: file them."), True))
     check("place: so does a rule", mt.place(filed("Receipts: file them."), rule),
           (filed("Receipts: file them.", "Ring me for the big ones."), True))
-    check("place: a default the user moved is not added twice",
-          mt.place(FILING + "\n\nHer own.", second), (FILING + "\n\nHer own.\n\nInvoices too: file them.", True))
+    # The default is known by its opening, however the user edited the rest
+    # of it and wherever they moved it: a later note goes in front of it,
+    # alone, and it is never added a second time.
+    check("place: a default the user moved to the top: the note goes in front of it",
+          mt.place(FILING + "\n\nHer own.", second), ("Invoices too: file them.\n\n" + FILING + "\n\nHer own.", True))
+    check("place: a default the user moved between two notes: in front of it, the rest kept as it was",
+          mt.place("One.\n\n\n" + FILING + "\n\nHer own.", rule),
+          ("One.\n\nRing me for the big ones.\n\n" + FILING + "\n\nHer own.", True))
+    edited = "Unless the note above says otherwise: file the document with the Archivist, then archive the mail."
+    for label, line in (("edited", edited),
+                        ("truncated", "Unless the note above says otherwise:"),
+                        ("cut short", FILING[:-1]),
+                        ("re-spaced and re-cased", "unless the  note above\nsays otherwise: archive it.")):
+        check(f"place: a default the user {label}: the note in front of it, the line not added again",
+              mt.place("Receipts: file them.\n\n" + line, second),
+              ("Receipts: file them.\n\nInvoices too: file them.\n\n" + line, True))
+    check("place: an edited default that stands first: the note goes first",
+          mt.place(edited, second), ("Invoices too: file them.\n\n" + edited, True))
+    check("place: the opening inside a paragraph is no default line: the words alone, after it",
+          mt.place("Receipts. " + FILING, second), ("Receipts. " + FILING + "\n\nInvoices too: file them.", True))
+    tight = "z" * (contacts.INSTRUCTION_MAX - len(edited) - len(second["instruction"]) - 4)
+    check("place: in front of an edited default, at the limit: it fits",
+          mt.place(tight + "\n\n" + edited, second),
+          (tight + "\n\nInvoices too: file them.\n\n" + edited, True))
+    check("place: and one character over: nothing is cut", mt.place("z" + tight + "\n\n" + edited, second), None)
     check("place: words already there change nothing", mt.place(filed("Receipts: file them."), second | {
         "instruction": "Receipts: file them."}), (filed("Receipts: file them."), False))
     # The limit is that of the instruction the note is placed on: where the
@@ -1639,6 +1662,68 @@ def test_killed_between_any_two_writes():
             check(f"the contact's own key carries the finding of the first write ({name})",
                   {k.startswith("new:"): v["before"] for k, v in w.marker()["memories"]["instructed"].items()},
                   {True: False, False: False})
+
+    # Killed at the marker save that journals "nothing stood before" under
+    # the ``new:`` key, before the create ran. Where the user then files the
+    # person by hand, with words of their own, the stale entry does not stand
+    # for that contact: the resumed run reads "before" from it, so the person
+    # is extended, not briefed — also after a reload. Where nobody does, the
+    # resumed run creates the contact with the creation time the entry
+    # journaled, and the person is briefed. A dry run in between writes nothing.
+    for domain in (False, True):
+        for by_hand in (True, False):
+            with world() as w:
+                if domain:
+                    tag, name, handles, spec = "sender:corp.example", "corp.example", [], ["corp.example"]
+                    w.mail("a@corp.example", "Corp")
+                else:
+                    tag, name, handles, spec = "sender:new@example.org", "Nina New", [("email", "new@example.org")], []
+                    w.mail("new@example.org", "Nina New")
+                w.remember("Signal: answer the same day.", tag)
+                w.answers = by_text({"same day": "rule"})
+
+                def before_create(label):
+                    if label == "marker" and any(
+                            k.startswith("new:") for k in w.marker()["memories"].get("instructed") or {}):
+                        raise Kill(label)
+                mt._checkpoint = before_create
+                try:
+                    w.run()
+                    check(f"killed at the marker save before the create ({name})", "not killed", "killed")
+                except Kill:
+                    pass
+                mt._checkpoint = lambda label: None
+                case = f"{name}, {'filed by hand' if by_hand else 'nobody filed'}"
+                check(f"no contact yet; the stale entry under the new: key ({case})",
+                      (list(w.people()), [k.startswith("new:") for k in w.marker()["memories"]["instructed"]]),
+                      ([], [True]))
+                if by_hand:
+                    w.book().create("private", name, handles, domains=spec,
+                                    instruction="My own words, call me.")
+                tree = w.tree()
+                w.run("--dry-run")
+                check(f"a dry run writes nothing ({case})", w.tree(), tree)
+                rc, report = w.report()
+                check(f"the resumed run places the rule ({case})", (rc, w.people()[name]["instruction"]),
+                      (0, ("My own words, call me.\n\n" if by_hand else "") + "Signal: answer the same day."))
+                for run in ("the resumed run", "a report after a reload"):
+                    if run != "the resumed run":
+                        rc, report = w.report("--step", "report")
+                    briefed = report["briefed"]
+                    check(f"{run}: {'extended, not briefed' if by_hand else 'briefed'} ({case})",
+                          (briefed["contacts"], [p["name"] for p in briefed["edited"]],
+                           [p["name"] for p in briefed["extended"]]),
+                          (0, [], [name]) if by_hand else (1, [], []))
+                if not by_hand:
+                    person = w.people()[name]
+                    check(f"the contact carries the creation time the entry journaled, under its own key ({case})",
+                          (person["created"], list(w.marker()["memories"]["instructed"])),
+                          (w.marker()["memories"]["instructed"][person["key"]]["created"], [person["key"]]))
+                rc, _ = w.run()
+                check(f"and a further run changes nothing ({case})",
+                      (rc, w.people()[name]["instruction"], w.report("--step", "report")[1]["briefed"]["contacts"]),
+                      (0, ("My own words, call me.\n\n" if by_hand else "") + "Signal: answer the same day.",
+                       0 if by_hand else 1))
 
 
 def test_nothing_is_deleted():
@@ -2124,6 +2209,41 @@ def test_a_written_rule_is_not_placed_again():
               w.marker()["memories"]["entries"][rule]["state"], "migrated")
 
 
+def test_a_later_note_and_the_users_filing_line():
+    print("test_a_later_note_and_the_users_filing_line")
+    # A note the first run left alone is placed by a later one, after the
+    # user edited the filing line or also moved it: the line is theirs, known
+    # by its opening — the note goes in front of it, alone, and the line is
+    # never added a second time (nor does what they deleted from it return).
+    edited = "Unless the note above says otherwise: file the document with the Archivist, then archive the mail."
+    for moved in (False, True):
+        with world() as w:
+            w.book().create("private", "Shop", [("email", "s@example.org")])
+            w.remember("Shop receipts: file them.", "sender:s@example.org")
+            w.remember("Shop invoices: file those too.", "sender:s@example.org")
+            w.answers = by_text({"receipts": "filing"})
+            rc, _ = w.report()
+            check(f"the first run places the receipts note and the line (moved={moved})",
+                  (rc, w.people()["Shop"]["instruction"]), (0, filed("Shop receipts: file them.")))
+            own = (f"{edited}\n\nShop receipts: file them." if moved
+                   else f"Shop receipts: file them.\n\n{edited}")
+            w.book().update(w.people()["Shop"]["key"], instruction=own)
+            w.answers = by_text({"receipts": "filing", "invoices": "filing"})
+            before = w.tree()
+            w.run("--dry-run", "--step", "memories")
+            check(f"a dry run of it writes nothing (moved={moved})", w.tree(), before)
+            rc, report = w.report("--step", "memories")
+            want = (f"Shop invoices: file those too.\n\n{edited}\n\nShop receipts: file them." if moved
+                    else f"Shop receipts: file them.\n\nShop invoices: file those too.\n\n{edited}")
+            check(f"the later note goes in front of the user's line, which stands once (moved={moved})",
+                  (rc, w.people()["Shop"]["instruction"]), (0, want))
+            check(f"and the person is counted as carrying the filing default (moved={moved})",
+                  report["briefed"]["filing"], 1)
+            rc, _ = w.report("--step", "memories")
+            check(f"once more: nothing changes (moved={moved})",
+                  (rc, w.people()["Shop"]["instruction"]), (0, want))
+
+
 # ── The mail gateway and its mirror ──────────────────────────────────────────
 
 def _triage_world(w):
@@ -2497,7 +2617,7 @@ def main():
                      test_report_names_what_only_a_person_can_do, test_the_thread, test_boot_run,
                      test_one_run_at_a_time_and_a_broken_marker, test_the_entrypoint_hook,
                      test_the_cutoff, test_an_unreadable_policy_file_waits,
-                     test_a_written_rule_is_not_placed_again,
+                     test_a_written_rule_is_not_placed_again, test_a_later_note_and_the_users_filing_line,
                      test_without_the_mail_gateway_nothing_moves_and_it_is_said,
                      test_the_mirror_is_waited_for, test_the_thread_is_not_settled_on_nothing_known,
                      test_the_report_says_what_an_instruction_costs,

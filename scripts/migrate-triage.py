@@ -85,9 +85,9 @@ prompt's:
   (``FILING_DEFAULT``, "Unless the note above says otherwise: …") only when
   that text passes a deterministic check — it names a kind of document and
   filing it (``FILING_TERMS``, a multilingual table). The line stands once
-  per person and stays the instruction's last paragraph; where words and
-  line together would not fit the instruction they go on, the words go on
-  alone;
+  per person, known by its opening however the user edited or moved it, and
+  a later note goes in front of it; where words and line together would not
+  fit the instruction they go on, the words go on alone;
 * ``fact`` and ``unclear`` leave the memory alone.
 
 So the most a steered or wrong answer can do is put a note triage held, in
@@ -184,8 +184,11 @@ import triage_policy  # noqa: E402
 GENERIC_INSTRUCTION = ("See whether this belongs to a project and link it; extract the facts worth "
                        "keeping; determine importance and urgency.")
 # The filing default follows the user's own words and yields to them: it is
-# always the last paragraph of an instruction, so "the note above" is true.
-FILING_DEFAULT = ("Unless the note above says otherwise: file the document with the Archivist, "
+# placed as the last paragraph of an instruction, so "the note above" is true.
+# A paragraph is the default by its opening, however the user edited the rest
+# of it and wherever they moved it (place).
+FILING_OPENING = "Unless the note above says otherwise:"
+FILING_DEFAULT = (f"{FILING_OPENING} file the document with the Archivist, "
                   "book it, then archive the mail.")
 
 KB = "https://w3id.org/retinue/kb#"
@@ -259,6 +262,13 @@ def log(msg: str) -> None:
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _created_stamp() -> str:
+    """The creation time the memories step gives a contact it creates, to
+    the microsecond: journaled before the create, it tells that contact
+    from one made by hand (the address book stamps whole seconds)."""
+    return _utcnow().astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
 
 def _iso(when: datetime) -> str:
@@ -649,13 +659,13 @@ class Run:
             self.marker.save()
 
     def create(self, section: str, name: str, *, address: str | None = None,
-               domains=(), instruction: str) -> dict:
+               domains=(), instruction: str, created: str | None = None) -> dict:
         chamber = self.chamber()
         what = address or ", ".join(domains)
         if self.dry_run:
             self.would(f"create the contact {name!r} in chamber {chamber!r} for {what}")
             record = {"key": f"new:{'email' if address else 'domain'}:{address or sorted(domains)[0]}",
-                      "name": name, "chamber": chamber, "instruction": instruction,
+                      "name": name, "chamber": chamber, "instruction": instruction, "created": created,
                       "emails": [address] if address else [], "domains": sorted(domains), "virtual": True}
             if address:
                 self._virtual[("email", address)] = record
@@ -664,7 +674,7 @@ class Run:
             return record
         self._will_commit(section, chamber)
         record = self.book.create(chamber, name, [(contacts.EMAIL, address)] if address else (),
-                                  instruction=instruction, domains=domains)
+                                  instruction=instruction, domains=domains, created=created)
         _checkpoint("contact")
         return record
 
@@ -1646,25 +1656,39 @@ def add_rule(instruction: str | None, rule: str) -> tuple[str, bool] | None:
     return (joined, True) if len(joined) <= contacts.INSTRUCTION_MAX else None
 
 
+def _filing_line(text: str) -> int | None:
+    """Where the person's filing default starts in an instruction: the first
+    paragraph that opens with ``FILING_OPENING`` (whitespace and case aside),
+    however the user edited the rest of it and wherever it stands; None for
+    none."""
+    opening = _flat(FILING_OPENING).casefold()
+    for start in re.finditer(r"(?:\A|\n[ \t]*\n)\s*", text):
+        paragraph = re.split(r"\n[ \t]*\n", text[start.end():], maxsplit=1)[0]
+        if _flat(paragraph).casefold().startswith(opening):
+            return start.end()
+    return None
+
+
 def place(instruction: str | None, decision: dict) -> tuple[str, bool] | None:
     """An instruction with a decision placed on it, as add_rule: (text,
     whether it changed), or None when it would not fit. The memory's own
-    words always go on, after what stands — except the filing default, which
-    stays the last paragraph: where an instruction ends with it, the words
-    of any kind go in front of it (the tail is rewritten). A ``filing`` adds
-    the default after its words where the person has none, and where words
-    and default together would not fit this instruction, the words go on
-    alone. The default stands once: a person whose text holds it elsewhere
-    gets the words alone."""
+    words always go on, after what stands — except where the person has the
+    filing default (a paragraph that opens with it, _filing_line): the words
+    of any kind go in front of that paragraph, alone, wherever it stands, so
+    whatever "the note above" covers keeps it last. A ``filing`` adds the
+    default after its words where the person has none, and where words and
+    default together would not fit this instruction, the words go on alone.
+    The default stands once: a person whose text holds it elsewhere gets
+    the words alone."""
     current = str(instruction or "").replace("\r\n", "\n").strip()
     words = decision["instruction"]
     if _flat(words) in _flat(current):
         return current, False
-    if current.endswith(FILING_DEFAULT):
-        joined = add_rule(current[:-len(FILING_DEFAULT)].rstrip(), words)
-        if joined is None:
-            return None
-        return add_rule(joined[0], FILING_DEFAULT)
+    at = _filing_line(current)
+    if at is not None:
+        head = current[:at].rstrip()
+        joined = f"{head}\n\n{words}\n\n{current[at:]}" if head else f"{words}\n\n{current}"
+        return (joined, True) if len(joined) <= contacts.INSTRUCTION_MAX else None
     if decision.get("kind") == "filing" and _flat(FILING_DEFAULT) not in _flat(current):
         defaulted = add_rule(current, f"{words}\n\n{FILING_DEFAULT}")
         if defaulted is not None:
@@ -1930,7 +1954,10 @@ def step_memories(run: Run, *, again: bool) -> tuple[bool, bool, str]:
     # instruction it wrote, and a run killed between the write and the
     # entry's journal must not take what it wrote for what stood before.
     # The first write's finding stands for every later one — also one a
-    # killed run left under the ``new:`` key of the contact it created.
+    # killed run left under the ``new:`` key of the contact it created. A
+    # contact about to be created is journaled with the creation time it is
+    # given, so that the entry stands for that contact alone — never for
+    # one the user made by hand after a kill before the create.
     instructed = section.setdefault("instructed", {})
     earlier = _instructed_by_memories(run, section) if changed else {}
     failed: dict[str, str] = {}
@@ -1939,7 +1966,9 @@ def step_memories(run: Run, *, again: bool) -> tuple[bool, bool, str]:
         target = next(t for e in placed for t in e["described"] if t["key"] == key)
         record = run.contact(key)
         was = earlier.get(key)
-        instructed[key] = was or {"before": bool(record and record.get("instruction")), "at": _now()}
+        instructed[key] = dict(was or {"before": bool(record and record.get("instruction")), "at": _now()})
+        if not record:
+            instructed[key].setdefault("created", _created_stamp())
         run.marker.save()
         try:
             if record:
@@ -1948,10 +1977,10 @@ def step_memories(run: Run, *, again: bool) -> tuple[bool, bool, str]:
                 failed[key] = "no chamber keeps contacts"
             elif "address" in target:
                 written[key] = run.create("memories", target["name"], address=target["address"],
-                                          instruction=texts[key])
+                                          instruction=texts[key], created=instructed[key]["created"])
             else:
                 written[key] = run.create("memories", target["name"], domains=[target["domain"]],
-                                          instruction=texts[key])
+                                          instruction=texts[key], created=instructed[key]["created"])
         except contacts.ContactError as exc:
             failed[key] = str(exc)
         except OSError as exc:
@@ -1987,7 +2016,8 @@ def step_memories(run: Run, *, again: bool) -> tuple[bool, bool, str]:
             if entry["decision"].get("kind") == "filing":
                 # Whether the filing default stands on them, for the report:
                 # where it would not fit, the words went on alone.
-                names[-1]["filing"] = _flat(FILING_DEFAULT) in _flat(texts.get(target["key"]))
+                text = texts.get(target["key"]) or ""
+                names[-1]["filing"] = _filing_line(text) is not None or _flat(FILING_DEFAULT) in _flat(text)
         journal[entry["id"]] = {"state": "written", "tags": entry["tags"], "contacts": names,
                                 "by": entry["by"], "at": _now(), **entry["decision"],
                                 **({"said": entry["said"]} if entry.get("said") else {})}
@@ -2109,18 +2139,25 @@ def _timeout(name: str, default: float) -> str:
 def _instructed_by_memories(run: Run, section: dict) -> dict[str, dict]:
     """The memories step's journal of the contacts it wrote (step_memories),
     by contact key: a contact it created and was killed before re-keying is
-    found by the address or domain it was created for. One person under
-    several keys is one entry, and "no instruction stood before" wins —
-    whatever the keys' spelling or order: the first write's finding is the
-    one that counts, and only a write where none stood finds that."""
+    found by the address or domain it was created for — only once that
+    create happened: the contact carries the creation time the entry
+    journaled (an entry of an earlier build, which journaled none, is taken
+    as it was), so a killed run's entry never stands for a contact the user
+    made by hand. One person under several keys is one entry, and "no
+    instruction stood before" wins — whatever the keys' spelling or order:
+    the first write's finding is the one that counts, and only a write where
+    none stood finds that."""
+    def made(record: dict, entry: dict) -> bool:
+        return "created" not in entry or record.get("created") == entry["created"]
+
     out: dict[str, dict] = {}
     for key, entry in (section.get("instructed") or {}).items():
         if key.startswith("new:email:"):
             holder = run.holder(key[len("new:email:"):])
-            key = holder["key"] if holder else key
+            key = holder["key"] if holder and made(holder, entry) else key
         elif key.startswith("new:domain:"):
             owners = run.domain_owners(key[len("new:domain:"):].removeprefix("*."))
-            key = owners[0]["key"] if len(owners) == 1 else key
+            key = owners[0]["key"] if len(owners) == 1 and made(owners[0], entry) else key
         if key not in out or (out[key].get("before") and not entry.get("before")):
             out[key] = entry
     return out

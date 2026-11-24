@@ -1234,6 +1234,10 @@ instruction it set, as its journal knows it — never as a contact's text
 happens to read: the whitelist step created or instructed them, or the
 memories step wrote where no instruction stood (it reads the contact and
 journals that *before* the write, so a run killed in between still knows).
+A contact the step is about to create is journaled with the creation time
+it then gives it, to the microsecond: the entry stands only for that
+contact, so where a run was killed before the create and the user filed the
+person by hand meanwhile, "before" is read from the contact they made.
 One of them whose instruction the user has added words to since is reported
 as **briefed and edited since** — still briefed, so their messages buy a
 turn because of the migration, but kept apart from the people the thread's
@@ -1277,11 +1281,16 @@ text is a digest of a topic, not a rule).
     tell a negation, a condition or a second request from a plain filing
     note in every language, so the line never comes first and never says
     more than "unless the note says otherwise": the user's words stand above
-    it, and win. A person gets the line once, and it stays the instruction's
-    **last paragraph**: a later note for them — a second filing note, a
-    rule — is placed in front of it (the tail is rewritten, so "the note
-    above" stays true). Where the words and the line together would pass
-    the limit of the instruction they go on, the words go on alone — a
+    it, and win. A person gets the line once, as the instruction's **last
+    paragraph**, and it is known by its opening: any paragraph that begins
+    *"Unless the note above says otherwise:"* is the person's line, however
+    the user edited the rest of it and wherever they moved it. A later note
+    for them — a second filing note, a rule — goes in front of that
+    paragraph, in its own words alone, and the line is never added a second
+    time (nor does what the user deleted from it come back); what the user
+    put below a line they moved up stays outside its "note above", as they
+    left it. Where the words and the line together would pass the limit of
+    the instruction they go on, the words go on alone — a
     filing note whose own words fit is never left a memory. A `filing` the
     text does not bear out is a `rule`, in its own words;
   - `fact`, `unclear` — a fact or a status about the sender; or a message's

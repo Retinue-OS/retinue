@@ -379,8 +379,10 @@ beforehand.
 - **The model only classifies.** Either way an instruction's text is the
   memory's own, first — for a filing memory whose text names a document and
   filing it, followed by one fixed line that yields to those words
-  ("Unless the note above says otherwise: file the document …"), kept the
-  instruction's last paragraph; nothing the model writes reaches a contact,
+  ("Unless the note above says otherwise: file the document …"), placed as
+  the instruction's last paragraph and known by that opening however you
+  edit or move it — a later note goes in front of it, and it is never added
+  twice; nothing the model writes reaches a contact,
   and nothing is ever put in front of the user's words or in their place.
 - **`--no-model`** carries every sender rule over verbatim. Nothing then
   judges whether a memory's text was the user's instruction or something a
@@ -392,7 +394,9 @@ beforehand.
   `CHAT_INSTRUCTION_TIMEOUT`; a mail's ring waits up to
   `MAIL_INSTRUCTION_TIMEOUT` (600 s by default; raise it where filing turns
   run longer). Briefed means the migration set the person's first
-  instruction, as its journal recorded at the write. The report names the
+  instruction, as its journal recorded at the write (a contact it created
+  by the creation time it journaled: one you file by hand after a kill is
+  read as it stands). The report names the
   briefed people who hold messenger handles or a phone, and lists apart
   those of them whose instruction the user has edited since (taking it off
   would take those edits too). A person who already carried an instruction
