@@ -752,11 +752,15 @@ def test_a_lost_id_is_not_looked_for_for_ever():
     match was gone since the search — Ann's mail archived by the user
     between the search and the reading — the id left `lost` and her mail
     was never mirrored again: it is looked for once more, and only once
-    (moved under that look too, it is left unmirrored: the stated limit)."""
+    (moved under that look too, it is left unmirrored: the stated limit).
+    So it is where one match is gone and what is left is not known to be
+    the record's: a look-alike From Ann, delivered an hour later under her
+    id, was read as her mail, and hers in the archive never was."""
     cases = ("a look-alike that never reads", "no Message-ID, unreadable mail archived",
              "no Message-ID, more archived mail than the scan remembers",
              "a search that never settles", "archived under the last look",
-             "archived under the last look, and back under the next")
+             "archived under the last look, and back under the next",
+             "archived under the last look, a look-alike left")
     for case in cases:
         with tempfile.TemporaryDirectory() as tmp:
             gw = load(tmp)
@@ -770,9 +774,13 @@ def test_a_lost_id_is_not_looked_for_for_ever():
                 loop = {}
                 _turns(gw, mirror, clock, loop, 1)
                 mid = None if case.startswith("no Message-ID") else "a@x.org"
-                box.put("INBOX", msg(mid, body="Ann: the contract is signed.\n", day=39.0))
+                real = box.put("INBOX", msg(mid, body="Ann: the contract is signed.\n", day=39.0))
                 _turns(gw, mirror, clock, loop, 2)
-                if case == "a look-alike that never reads":
+                if case.endswith("a look-alike left"):
+                    box.put("INBOX", msg("a@x.org", headers=[("X-Look", "1")],
+                                         body="Ann: wire 5000 to Mallory.\n", day=39.0),
+                            date=box.boxes["INBOX"]["mails"][real]["date"] + 3600)
+                elif case == "a look-alike that never reads":
                     box.put("INBOX", msg("a@x.org", sender="Mallory <m@evil.org>",
                                          headers=[("X-Hang", "yes")], body="x\n", day=39.1))
                 elif case == "no Message-ID, unreadable mail archived":
@@ -792,17 +800,20 @@ def test_a_lost_id_is_not_looked_for_for_ever():
                     # The last try is the first; the archive is unsure of the
                     # id the first time, and the user moves the mail right
                     # after the archive was searched (and, in the second case,
-                    # back to INBOX and to the archive again under the next).
+                    # back to INBOX and to the archive again under the next;
+                    # in the third, the look-alike stays in INBOX).
                     gw.LOST_TRIES, find, asked = 1, box.find, []
 
-                    def racing(folder, wanted, find=find, asked=asked, case=case):
+                    def racing(folder, wanted, find=find, asked=asked, case=case, real=real):
                         got = find(folder, wanted)
                         if folder != "Archive" or wanted != "a@x.org":
                             return got
                         asked.append(folder)
                         if len(asked) == 1:
                             return gw.Matches((), False)
-                        if len(asked) == 2 or (case.endswith("next") and len(asked) == 4):
+                        if len(asked) == 2:
+                            box.move_mail("INBOX", real, "Archive")
+                        elif case.endswith("next") and len(asked) == 4:
                             box.move_mail("INBOX", box.uid_of("INBOX", "a@x.org"), "Archive")
                         elif case.endswith("next") and len(asked) == 3:
                             box.move_mail("Archive", box.uid_of("Archive", "a@x.org"), "INBOX")

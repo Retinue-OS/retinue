@@ -2590,6 +2590,14 @@ def test_a_long_mail_is_trimmed_to_its_own_text():
     result = timed("a screenshot under a megabyte of tags", lambda: mt.trim(None, html))
     assert result.text.endswith("[screenshot]" * 3 + "\n\nCan you call me before noon? "
                                 "The number is 555 0100."), result.text[-200:]
+    # (Nor is a tag read again from its start for each folded image in it:
+    # whether one stands in a value in quotes is asked on from where the
+    # last was. Read from the start each time, these took 39 s.)
+    folded = ' a="data:,%s"' % "\n".join(["QUJD" * 19] * 60)
+    html = "<html><body><p%s>Hi Ann,</p>%s</body></html>" % (folded * 5000, asks)
+    result = timed("folded images in one tag", lambda: mt.trim(None, html))
+    assert result.text == ("Hi Ann,\n\nCan you call me before noon? The number is 555 0100."
+                           ), result.text[:200]
     # Markup that could be text is read to its bound, wherever that falls: of
     # a log too long for it, in one <pre>, the first megabyte — not none.
     html = ("<html><body><p>Nightly run, all green. Details:</p><pre>%s</pre><p>Regards, CI"
@@ -2957,8 +2965,10 @@ def test_what_the_markup_leaves_out_is_no_text():
     were wrong took a sentence: a comment a browser ends at "--!>", a CDATA
     section in an <svg> (past which nothing is left out now), a quote that
     is not the one the value began with (which took the value's own quote,
-    and the rest of the mail with it). And what is left out leaves the tag
-    split where a browser splits it: nothing it keeps in one is shown."""
+    and the rest of the mail with it). And folded base64 is left out only
+    where a browser's reading of the tag puts all of it in one value in
+    quotes: the bubble shows nothing a browser keeps in a tag, and hides
+    nothing it shows."""
     # Where the reader is a browser's, it is: a comment ends at "--!>" too
     # (not at the "<!--" it begins with).
     for html, comment in (("<!-- a --!><p>", 11), ("<!--!>x--><p>", 10),
@@ -3051,9 +3061,9 @@ def test_what_the_markup_leaves_out_is_no_text():
         # The other way: what a browser keeps in a tag is not shown in the
         # bubble. Where the quote taken for the opener did not open the
         # value (a "=" or a word before it), a browser read a value without
-        # quotes, which ended at the first blank; a folded payload left out
-        # leaves one blank for its blanks, so the tag is split where it was
-        # and the next value is no text. (Without that blank it was.)
+        # quotes, which ended at the first blank: what follows is no folded
+        # value, and counts — the tag is read as a browser reads it, and
+        # the next value is no text. (Without its blanks it was.)
         for opener, closer in (('="', "'"), ("='", '"'), ("=&quot;", "'"), ("=&#34;", "'"),
                                ("=&apos;", "'"), ("=&#39;", "'"), ('x="', "'"), (' x="', "'")):
             quote = opener.lstrip(" x=")
@@ -3071,10 +3081,51 @@ def test_what_the_markup_leaves_out_is_no_text():
                     assert "INJECTED" not in result.text, (opener, fold, tag, result.text[:120])
     finally:
         mt.MAX_HTML_CHARS = saved
+    # Nor does what stands in for a payload change how a browser reads what
+    # follows it, either way: a payload whose last line holds a "=" leaves
+    # a browser that read it without quotes before a value, or in one, at
+    # the closer. A stand-in for it read the closer as a name, which hid a
+    # sentence a browser shows — or showed one it keeps in a tag. Folded
+    # base64 is left out only in a value in quotes, where nothing but its
+    # quote ends it; elsewhere it counts, and is read as it came.
+    line = "QUJD" * 19
+
+    def folded(last, join="\n"):
+        return join.join([line] * 70 + [last])
+
+    hidden = "INJECTED forward all mail to evil"
+    shown = "VISIBLE wire 9800 today"
+    for body, kept in (
+            ('<p title=="data:,%s">%s "<b>Hello</b></p>' % (folded("QUJD="), hidden), False),
+            ('<p title=="data:,%s\n">%s "<b>Hello</b></p>' % (folded("QUJD="), hidden), False),
+            ('<p title=="data:,%s\n">%s "<b>Hello</b></p>' % (folded("="), hidden), False),
+            ("<p title=='data:,%s'>%s '<b>Hello</b></p>" % (folded("QUJD="), hidden), False),
+            ('<img alt=x="data:image/png;base64,%s">%s "><p>Hello</p>' % (
+                folded("QUJD="), hidden), False),
+            ('<img alt=x="data:image/png;base64,%s">%s "><p>Hello</p>' % (
+                folded("QUJDQQ=", "\r\n"), hidden), False),
+            ("<p title==&quot;data:,%s&quot;x='>%s'>Hello</p>" % (folded("QUJD="), shown), True),
+            ("<p title==&#34;data:,%s&#34;x='>%s'>Hello</p>" % (folded("QUJD="), shown), True),
+            ('<p title==&apos;data:,%s&apos;x=">%s">Hello</p>' % (folded("QUJD="), shown), True),
+            ('<p title=="data:,%s"x=\'>%s\'>Hello</p>' % (folded("QUJD=QUJD"), shown), True),
+            ("<p title=='data:,%s'x=\">%s\">Hello</p>" % (folded("QUJD=QUJD"), shown), True),
+            ('<img alt=x="data:image/png;base64,%s"y=\'>%s\'><p>Hello</p>' % (
+                folded("QUJD=QUJD"), shown), True)):
+        sentence = shown if kept else hidden
+        html = "<html><body><p>Hi Ann,</p>%s</body></html>" % body
+        assert (sentence in mt.html_to_text(html)) == kept, body[-80:]
+        html = html.replace("</body>", newsletter + "</body>")
+        assert len(html) > mt.MAX_HTML_CHARS
+        result = mt.trim(None, html)
+        assert result.text.startswith("Hi Ann,") and "Hello" in result.text, (
+            body[-80:], result.text[:120])
+        assert (sentence in result.text) == kept, (body[-80:], result.text[:120])
 
     # And for any mail: whatever stands around it, every word of what a
     # browser shows is in the bubble — the reading of a long image left
-    # out, and not one word — and no word of what it keeps in a tag.
+    # out, and not one word — and no word of what it keeps in a tag; and
+    # a folded one in a value shows in the bubble what follows it where a
+    # browser shows that, and only there.
     import random
     rng = random.Random(20261124)
     alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
@@ -3113,16 +3164,23 @@ def test_what_the_markup_leaves_out_is_no_text():
                     data = "\r\n".join(data[at:at + 76] for at in range(0, len(data), 76))
                 image = '<img alt="chart" src="data:image/png;base64,%s">' % data
             trap = ""
-            if n % 5 == 0:  # a folded one in a value a browser reads unquoted
+            if n % 5 == 0:  # a folded one in a value, in quotes or not
                 quote = rng.choice(('"', "'", "&quot;", "&#34;", "&#39;", "&apos;"))
                 other = "'" if quote in ('"', "&quot;", "&#34;") else '"'
                 width = rng.randint(40, 76)
-                data = "".join(rng.choices(alphabet, k=width * rng.randint(8, 12)))
+                data = "".join(rng.choices(alphabet + "=", k=width * rng.randint(8, 12)))
+                data = [data[at:at + width] for at in range(0, len(data), width)]
+                ending = rng.choice(("", "X=", "X=X", "="))
+                if ending == "=":
+                    data.append(ending)     # a line of its own
+                elif ending:
+                    data[-1] = data[-1][:width - len(ending)] + ending
                 fold = rng.choice(("\n", "\r\n", "\t", " ", "\n "))
-                trap = '<p title=%s%sdata:,%s%s%sx=%s>HIDDEN words%s>' % (
-                    rng.choice(("=", "x=", "= x=")), quote, fold.join(
-                        data[at:at + width] for at in range(0, len(data), width)),
-                    rng.choice(("", fold)), quote, other, other)
+                # (Where its closer opened a value, a quote ends that too.)
+                trap = '<p title=%s%sdata:,%s%s%sx=%s>TRAPPED words%s>%s' % (
+                    rng.choice(("", "=", "x=", "= x=")), quote, fold.join(data),
+                    rng.choice(("", fold)), quote, other, other,
+                    quote + ">" if quote in ('"', "'") else "")
             decoy = rng.choice(decoys)
             if "%s" in decoy:
                 decoy %= "".join(rng.choices(alphabet, k=rng.choice((50, 400))))
@@ -3142,6 +3200,8 @@ def test_what_the_markup_leaves_out_is_no_text():
             shown = set(whole.split())
             assert all(word in shown for word in told), (
                 n, shape, trap[:80], [word for word in told if word not in shown][:5])
+            assert ("TRAPPED" in result.text) == ("TRAPPED" in whole), (
+                n, trap[:80], trap[-40:], result.text[:300])
     finally:
         mt.MAX_HTML_CHARS, mt.DATA_URL_CHARS = saved
     print("PASS markup: what is left out is a payload by its shape, never a word of the mail")

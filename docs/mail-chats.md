@@ -415,13 +415,15 @@ headers, and the copy received when the row said is read without waiting for
 that reading to cover the whole window. After `LOST_TRIES` (8) tries in
 vain, what was found is read as mail nothing is known of, a log line says
 so, and the id is looked for no more — but where every match is gone between
-the search and the reading, it is looked for so once more, an hour on.
+the search and the reading, or one is and what is left is not known to be the
+record's, it is looked for so once more, an hour on.
 
 What this leaves, plainly: while the archive does not answer, every lost id
 waits (`/health` says the archive does not answer, and counts them); an id
 whose mail is in no folder, or no more where the search found it, leaves
 the list with a log line and no `removed` event — there is no record to
-tombstone — so a mail moved during the last look can be left unmirrored;
+tombstone — so a mail moved under both of the last looks can be left
+unmirrored, and a look-alike under its id read in its place;
 a ledger restored from an older backup over a live one can leave two
 record files for one id (a record written as the first time takes a name
 of its own, and the backup brings back the one it had before); a mail to
@@ -574,10 +576,11 @@ of them and 4,000,000 characters, counted once per pass — all four passes for
 A mail that would take more is not trimmed and is recorded as it came,
 `wanting`, as is one of more than 200,000 lines or 5,000,000 characters,
 which is not read at all. Of an HTML part the first 1,000,000 characters of
-markup are parsed, not counting inline `data:` images (but after a CDATA
-section, which mail almost never has): beside a plain part a longer one is
-not consulted, and where it is the mail's only text the bubble ends where
-the reading did, on a line `[…]` — *Original* shows all of it.
+markup are parsed, not counting inline `data:` images (but one folded into
+lines where a browser does not read it as a value in quotes, and any after
+a CDATA section, which mail almost never has): beside a plain part a longer
+one is not consulted, and where it is the mail's only text the bubble ends
+where the reading did, on a line `[…]` — *Original* shows all of it.
 Within those bounds the cost is linear in the size of the mail, for hostile
 mail too.
 

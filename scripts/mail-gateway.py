@@ -3898,11 +3898,12 @@ class Mirror:
             # Which one is the record's: where it lies, who it is From, and
             # when it came.
             out, arrived = hint["direction"] == "out", hint["arrived"]
-            ranked, timely = [], False
+            ranked, timely, missed = [], False, False
             for order, role, name, uid in found:
                 got = self._peek(name, uid)
                 if got is None:
                     if plain:
+                        missed = True
                         continue
                     return False   # gone since the search: where to, the next one says
                 try:
@@ -3933,6 +3934,11 @@ class Mirror:
             # write, and a move keeps the arrival time.
             told = (top == "sent" or (top == "archive" and not stranger and not toplate)) \
                 if out else not (stranger or toplate)
+            if missed and not told:
+                # On the last try a match gone since the search may be the
+                # record's, and what is left is not known to be: not read in
+                # its place.
+                return self._gone_since_search(hint)
             if not plain and not told and len(ranked) > 1 \
                     and any(unread for _rank, _where, unread, _theirs, _late in ranked):
                 # A match that did not come back may be the record's, and the
@@ -3965,11 +3971,12 @@ class Mirror:
 
     def _gone_since_search(self, hint) -> bool:
         """On the last try (_read_found), every match of a lost id is gone
-        since the search: moved, it may be, between the search and the
-        fetch. The id is looked for once more, as plainly, an hour on (its
-        tries, at LOST_TRIES, say that it was); gone again, or named by no
-        search, it leaves `lost` — and a mail moved during the last look
-        can be left unmirrored. True: nothing more is waited for."""
+        since the search — or one is, and what is left is not known to be
+        the record's: moved, it may be, between the search and the fetch.
+        The id is looked for once more, as plainly, an hour on (its tries,
+        at LOST_TRIES, say that it was); gone again, or named by no search,
+        it leaves `lost` — and a mail moved under both looks can be left
+        unmirrored. True: nothing more is waited for."""
         mid = hint["message_id"]
         if hint["tries"] < LOST_TRIES:
             self.index.run("UPDATE lost SET tries = ?, due = ? WHERE message_id = ?",
