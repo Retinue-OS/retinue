@@ -451,7 +451,39 @@ docstring). Pieces:
   attachment. The poll **reconciles**: a message already on screen whose
   removal, text, trim, attachments, subject or original changed is
   re-rendered in its place, the rest of the thread, the scroll position and
-  an Original that still applies left as they are. And a chat whose summary
+  an Original that still applies left as they are. **The model trim**
+  (`docs/mail-chats.md`, "The model trim (phase 4)"): a mail whose `trim` is
+  `wanting` is asked for on first view — its bubble watched by an
+  IntersectionObserver (the viewport as root, so a phone's pane scrolled
+  aside does not count) and asked for once it has been at least half
+  visible (half the thread's view, for a bubble taller than that) for
+  600 ms without a break — never while the page is hidden, the companion's
+  pane is the one on a phone, or one of the page's full-screen layers (the
+  image lightbox, the attention sheet, a modal) covers the thread, and the
+  time starts again whenever the page comes back (shown again, restored
+  from the back-forward cache, or thawed from a freeze, which a look that
+  comes far too late betrays). One `POST` per
+  mail per page life to the sibling of its accepted `original` URL
+  (`…/<token>/trim`, never built from parts); an answer `wanting` names
+  when it may be asked again (`retry_after`, held to 30 s – 24 h, ten
+  minutes where it names none), no answer at all (offline, a 5xx) a minute.
+  A settled answer replaces the text in place like a poll's change — held
+  over a poll whose document predates it — and a `202` (`queued`/`running`)
+  shows a quiet "Tidying up…" under the text, the page's own words, until a
+  poll shows the record settled or for two minutes at most — put into the
+  bubble's own node and taken out of it, never a bubble drawn anew (a
+  selection, the focus and every frame stay), and nothing at all while the
+  bubble's Original is open, which shows no such line. A server without the
+  endpoint — `405`, `501`, or a `404` that is not the endpoint's own (the
+  route fallback's `{error: "not found"}`, or no JSON) — switches the
+  feature off for the page's life, quietly; the endpoint's own `404` (a
+  token that names nothing in this chat) and `410` (a mail gone from the
+  mailbox) end that one mail, and the others stay watched. Nothing is watched on a messenger chat, a settled mail, a
+  tombstone or a page that stopped polling; the observer lets go of a
+  bubble re-rendered or removed and of everything on a chat switch, and an
+  answer that comes back after one touches nothing. The Original of a mail
+  whose `trim` is `model` is headed by one line, "Shortened by a model —
+  this is the full mail."; nothing else marks it. And a chat whose summary
   says `can_send: false` (its gateway unknown or not connected) shows
   `cannot_send_reason` in one line where the composer, its chips, the draft
   and the grip would be; nothing is loaded into, adopted by or saved from a
@@ -935,7 +967,16 @@ The API, as the components consume it:
   text, and `html_url` either null or the original URL plus `.html`, which
   serves the sanitised HTML part as a document of its own under a policy
   that lets nothing load or run (the chat page's own policy gains
-  `frame-src 'self'` for it).
+  `frame-src 'self'` for it). `POST /chats/<id>/messages/<token>/trim`
+  (same-origin, and only through the reverse proxy like a chat's flags; the
+  original URL with `/trim` for `/original`) asks for a
+  `wanting` mail's model trim: `200 {state: model | deterministic, text}`
+  (settled), `202 {state: queued | running}` (a turn on its way; asking
+  again never queues twice) or `200 {state: wanting, retry_after}` (nothing
+  started; not asked again before `retry_after` seconds); `404 {error: "no
+  such mail in this chat"}` for a token that names nothing and `410` for a
+  mail gone from the mailbox (a tombstone, an erased record), or for a chat
+  merged away (`merged_into`).
 
   Writing: `GET /chats/<id>/reply-preview` → `{all: Addressing, sender:
   Addressing, choice, subject}`, `Addressing` being `{to: [Party], cc:

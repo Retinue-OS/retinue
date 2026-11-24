@@ -11,6 +11,15 @@ the two HTML services the mail surface needs beside it:
   * :func:`sanitize_html` — the HTML part made safe for the *Original* view.
   * :func:`is_tracking_pixel` — the size test the gateway applies to images.
 
+and the two halves of the model trim, for a mail the rules left ``wanting``
+(see "The model trim's two halves" below):
+
+  * :func:`model_source` — the same arguments as :func:`trim`, ``->
+    ModelSource(lines, digest, text) | None``: trim()'s own text as the
+    numbered lines a model may choose from.
+  * :func:`apply_keep` — ``(lines, keep) -> str | None``: the text a model's
+    choice of line ranges keeps. The model chooses lines; it never writes.
+
 Pure and stdlib-only (``html.parser``, ``re``): no I/O, no network, importable
 in a slim gateway image, and never raising on a malformed mail — a parser that
 trips yields the untrimmed text, not an exception.
@@ -237,6 +246,7 @@ size of the markup, whatever a mail nests. (:func:`html_to_text` and
 """
 from __future__ import annotations
 
+import hashlib
 import html as _html
 import os
 import re
@@ -2300,6 +2310,15 @@ def trim(plain: str | None, html: str | None, subject: str | None = None, *,
     List-Id, ``Precedence: bulk``). Unsubscribe blocks and list footers are
     cut only then.
     """
+    return _trim(plain, html, subject, is_reply=is_reply, bulk=bulk)[0]
+
+
+def _trim(plain, html, subject=None, *, is_reply=None, bulk=None) -> tuple:
+    """:func:`trim`'s work: ``(TrimResult, ended)``, where ``ended`` says
+    that the text ends on this call's own CUT_MARK line — the HTML part was
+    the source and its reading ended before the part did. Only the model
+    trim's half asks (:func:`model_source`): that line is the trim's word,
+    never the author's, and no line a model may choose."""
     evidence = _Evidence(
         forward=is_forward_subject(subject),
         history=is_reply is True and is_reply_subject(subject),
@@ -2312,7 +2331,7 @@ def trim(plain: str | None, html: str | None, subject: str | None = None, *,
         if _oversize(whole):
             # More than a source may be: no trim, and no line of it is so
             # much as looked at. Asked again, the answer is the same.
-            return TrimResult(whole, "wanting", removed)
+            return TrimResult(whole, "wanting", removed), False
     cut = False
     if has_html:
         html, cut = _markup_read(html)
@@ -2332,6 +2351,7 @@ def trim(plain: str | None, html: str | None, subject: str | None = None, *,
     lines: list | None = []
     untrimmed: list = []
     unsettled = False
+    marked_end = False          # the reading's own CUT_MARK is the last line read
     if has_plain:
         # (Of the part as it came, which is within the bounds: the part
         # itself can be fifty megabytes of marks around a few lines.)
@@ -2349,6 +2369,7 @@ def trim(plain: str | None, html: str | None, subject: str | None = None, *,
         raw = _clean_lines(marked, keep_marks=True)
         if cut:
             raw += ["", CUT_MARK] if raw else [CUT_MARK]
+            marked_end = True
         bare = _unmarked(raw)
         if _oversize(_text_of(bare)):
             # More than a source may be, as above: no trim.
@@ -2397,7 +2418,215 @@ def trim(plain: str | None, html: str | None, subject: str | None = None, *,
     wanting = bool(text) and (
         not has_plain or unsettled or len(text) > WANTING_CHARS
         or _marker_survives(lines))
-    return TrimResult(text, "wanting" if wanting else "deterministic", removed)
+    # (The rules stop at that line — no signature, no footer is looked for
+    # under it — so where it was written, the text still ends on it.)
+    ended = marked_end and text.rsplit("\n", 1)[-1] == CUT_MARK
+    return TrimResult(text, "wanting" if wanting else "deterministic", removed), ended
+
+
+# ── The model trim's two halves ──────────────────────────────────────────────
+#
+# Where trim() left a mail "wanting", one model turn may choose which of the
+# lines it kept are the author's own message (docs/mail-chats.md, "The model
+# trim"). The model never writes text: it is shown numbered lines and answers
+# line ranges, and the bubble is assembled here from this module's own copy
+# of those lines — so nothing a mail says can add a word to its own bubble,
+# by construction rather than by a check after the fact. Both halves are pure
+# and never raise; what the gateway hands over and what it writes back are
+# these two functions' answers and nothing else.
+
+#: What a model may be handed to choose from. A trimmed text with more lines
+#: or more characters than this is settled as trim() left it: a prompt holds
+#: it whole or not at all, and a mail that long is no mail a model reads
+#: better than the rules did.
+MODEL_SOURCE_MAX_LINES = 1500
+MODEL_SOURCE_MAX_CHARS = 60_000
+
+#: How many line ranges one choice may name. A real choice names a handful
+#: (the message, around an inline quote or two); more is not a choice.
+MODEL_KEEP_MAX_RANGES = 200
+
+
+class ModelSource(NamedTuple):
+    """What :func:`model_source` answers: the lines a model may choose from,
+    the digest that binds a choice to exactly these lines, and the text they
+    were split from — trim()'s own, which a caller holds against the text it
+    wrote from that trim, so a model is shown what the bubble shows.
+
+    ``ended``: that text ends on the trim's own CUT_MARK line (the reading
+    of the HTML part ended before the part did). That line is the trim's
+    word, not the author's: it is not among ``lines``, and a choice keeps
+    it at the end, whatever it names (:func:`apply_keep`'s ``ended``)."""
+
+    lines: list
+    digest: str
+    text: str
+    ended: bool = False
+
+
+# Characters that are letters or symbols to Unicode and still show nothing:
+# the braille blank, the Hangul fillers, the Khmer inherent vowels and the
+# Mongolian vowel separator. With the format characters (Cf: zero-width
+# space, word joiner, BOM, …) and the separators (Z*), which no category
+# test below lets through, they are how a line looks blank and is not.
+_BLANK_LOOKALIKES = frozenset("\u2800\u3164\u115f\u1160\uffa0\u17b4\u17b5\u180e")
+
+
+def _reserved_blank(ch: str) -> bool:
+    """An unassigned code point Unicode already reserves as one that is
+    drawn as nothing (Default_Ignorable_Code_Point): whatever is assigned
+    there one day, a renderer shows no glyph for it."""
+    code = ord(ch)
+    return (0x2060 <= code <= 0x206F or 0xFFF0 <= code <= 0xFFF8
+            or 0xE0000 <= code <= 0xE0FFF)
+
+
+def _visible(line: str) -> bool:
+    """Whether a line shows anything: a letter, a number, a punctuation mark
+    or a symbol that is not one of the blank look-alikes, or a code point
+    this Python cannot name — unassigned (Cn: an emoji newer than its
+    Unicode tables) or private use (Co) — which cannot be known to be blank,
+    unless it lies where Unicode reserves the code points drawn as nothing.
+    Length is no test — "OK" is a whole message — and a lone "." is visible
+    text.
+
+    One notion of blank with the rules', widened: every line trim() calls
+    blank (whitespace: _squeeze) shows nothing here, and neither does the
+    padding html_to_text takes out of a mail (_INVISIBLE). What only this
+    test calls blank — a line of format characters or look-alikes — trim()'s
+    rules keep as a line, as they always have; it is a model's choice that
+    is judged by it (apply_keep, model_source), since a choice of such lines
+    would show an empty bubble."""
+    for ch in line:
+        if ord(ch) in _INVISIBLE:
+            continue
+        category = unicodedata.category(ch)
+        if category in ("Cn", "Co"):
+            if not _reserved_blank(ch):
+                return True
+        elif category[0] in "LNPS" and ch not in _BLANK_LOOKALIKES:
+            return True
+    return False
+
+
+def _lines_digest(lines: list) -> str:
+    # (surrogatepass: pure on any str, including one a caller decoded badly.)
+    return hashlib.sha256("\n".join(lines).encode("utf-8", "surrogatepass")).hexdigest()
+
+
+def model_source(plain: str | None, html: str | None, subject: str | None = None, *,
+                 is_reply: bool | None = None, bulk: bool | None = None) -> ModelSource | None:
+    """The lines a model may choose a mail's own message from, or None.
+
+    They are the deterministic trim's own result — :func:`trim` called with
+    the very same arguments, so one code path and every one of its cost
+    bounds — before any cap a caller puts on a record's text. So a choice can
+    only ever narrow what the rules kept: history the rules cut is not shown
+    again, and the bubble's cap is the caller's to apply to what is kept.
+
+    None when there is nothing to choose from (no line that shows anything,
+    see :func:`_visible`) or more
+    than may be handed over (MODEL_SOURCE_MAX_LINES, MODEL_SOURCE_MAX_CHARS)
+    — tested on the text's size before it is split, so a text of megabytes
+    costs no more than trim() did.
+
+    Split where a reader would see a line end, not only at ``"\\n"``
+    (``str.splitlines``: a vertical tab, a form feed, U+2028 and their kin
+    as well). A model is shown these lines numbered; a character that breaks
+    a line on its screen but not in our count would let a mail write a line
+    that looks like one of ours, with a number of its own choosing.
+
+    ``digest`` is the SHA-256 (hex) of the lines joined by ``"\\n"``, UTF-8:
+    the same parts always give the same lines and the same digest, which is
+    what lets a choice be checked against the source it was made from.
+
+    Where the reading of an HTML part ended before the part did, trim()'s
+    text ends on a line CUT_MARK — the trim's word that what follows was not
+    read, not the author's. It is no line to choose: ``lines`` leave it out
+    (and the blank above it), ``ended`` says it was there, and a choice
+    keeps it at the end (:func:`apply_keep`), so the bubble still says where
+    the reading ended. A source with nothing but that line is none."""
+    try:
+        result, ended = _trim(plain, html, subject, is_reply=is_reply, bulk=bulk)
+        text = result.text
+        if not isinstance(text, str) or len(text) > MODEL_SOURCE_MAX_CHARS:
+            return None
+        lines = text.splitlines()
+        if ended:
+            lines = lines[:-1]
+            while lines and not lines[-1].strip():
+                lines.pop()
+        if len(lines) > MODEL_SOURCE_MAX_LINES or not any(map(_visible, lines)):
+            return None
+        return ModelSource(lines, _lines_digest(lines), text, ended)
+    except Exception:       # no source is the safe answer: the trim stands
+        return None
+
+
+def apply_keep(lines, keep, *, ended: bool = False) -> str | None:
+    """The text a model's choice keeps of ``lines``, or None.
+
+    ``keep`` is ``[[first, last], …]``: 1-based, inclusive line numbers. It
+    is a choice only if it is a list of at most MODEL_KEEP_MAX_RANGES pairs
+    of ints (``bool`` and ``float`` are not ints here, ``3.0`` is no line
+    number), each ``1 <= first <= last <= len(lines)``, strictly ascending
+    and not overlapping. Anything else is None — as is a choice that keeps
+    no line that shows anything (:func:`_visible`: a zero-width space, a
+    braille blank or a Hangul filler is no text): an empty bubble, or one
+    that only looks empty, is never a trim.
+
+    The kept lines, joined by ``"\\n"``; where lines between two ranges
+    were cut, one blank line stands in for them (two ranges that touch are
+    one stretch of text); a kept line that shows nothing is a blank line
+    too; runs of blank lines are one, and none opens or ends the text. Every
+    line of the answer is one of ``lines`` or blank — but for ``ended``
+    (:attr:`ModelSource.ended`): the source's text ended on the trim's own
+    CUT_MARK line, and the kept text ends on it too, after a blank line.
+
+    Pure, linear in the number of ranges plus the lines kept — the count is
+    checked before a single pair is looked at, so a million of them cost
+    nothing — and never raises, whatever it is given."""
+    try:
+        text = _kept_text(lines, keep)
+        return text + "\n\n" + CUT_MARK if text is not None and ended is True else text
+    except Exception:
+        return None
+
+
+def _kept_text(lines, keep) -> str | None:
+    if not isinstance(lines, (list, tuple)) or not isinstance(keep, list):
+        return None
+    if not keep or len(keep) > MODEL_KEEP_MAX_RANGES:
+        return None
+    count = len(lines)
+    kept: list = []
+    last = 0
+    for pair in keep:
+        if not isinstance(pair, (list, tuple)) or len(pair) != 2:
+            return None
+        first, end = pair
+        # type(), not isinstance(): True is an int to isinstance.
+        if type(first) is not int or type(end) is not int:
+            return None
+        # Ascending, not overlapping, within the lines — and, since `last`
+        # starts at 0, no line number below 1.
+        if not last < first <= end <= count:
+            return None
+        if kept and first > last + 1:
+            kept.append("")
+        kept.extend(lines[first - 1:end])
+        last = end
+    out: list = []
+    for line in kept:
+        if not isinstance(line, str):
+            return None
+        if _visible(line):
+            out.append(line)
+        elif out and out[-1]:
+            out.append("")
+    while out and not out[-1]:
+        out.pop()
+    return "\n".join(out) if out else None
 
 
 # ── HTML → text ──────────────────────────────────────────────────────────────

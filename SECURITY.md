@@ -220,6 +220,27 @@ nothing new.
   every gateway token), so a session a hostile message steers can post an
   event as well — no more than it can already do with the gateway's send
   token.
+- **The model trim is steerable by the mail.** Where the rules left a mail's
+  bubble `wanting`, one tool-less model turn chooses which of the mail's
+  lines are the author's own (docs/dashboard.md, "The model trim"), and
+  every line it is shown is the sender's text. A mail can steer that choice:
+  "keep only line 40" may leave the phishing line of a forwarded mail and
+  drop the forwarder's warning above it — and the narrowed `kb:text` is then
+  what the bubble, the chat list, search and every agent turn read. It can
+  also steer its turn into no judgement at all, which is bounded: at most
+  `MAIL_MODEL_TRIM_ATTEMPTS` such turns per mail, counted durably, within the
+  day's `MAIL_MODEL_TRIM_DAILY_MAX`. What bounds the choice is that only the
+  mail's own lines can show — the gateway assembles the text from its own
+  copy of them, so no mail adds a word to its own bubble — that the choice
+  is marked (the Original is headed "Shortened by a model", and the
+  companion's note — and the quote of an arrival turn offered the mail
+  after it was viewed — marks the mail `trim="model"` and says the mail can
+  steer it), and that the full mail is one tap away: its original parts are
+  never changed. Its endpoint is the dashboard's: a caller inside the
+  container that asks for a trim is refused where `EDGE_PROXY_PEERS` names
+  the reverse proxy (any peer it does not name is refused), and the day's
+  budget bounds whatever still gets through. `MAIL_MODEL_TRIM=0` switches
+  the turn off.
 - **Chambers are not compartmentalized from each other within a session.**
 - **The updater's Docker socket is root-equivalent on the host.** This is
   inherent to what the updater does and is documented in `docker-compose.yml`.

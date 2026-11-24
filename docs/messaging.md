@@ -769,6 +769,30 @@ draft — the backend tells the gateway whose mail it was
 so the bubble says *Ara* rather than *mail client*. A retraction of the wrong
 kind finds nothing: the id says which queue.
 
+### The model trim
+
+A mail the deterministic trim left `wanting` gets one router-tier turn the
+first time its bubble is viewed (`docs/mail-chats.md`, "The model trim"). The
+web gateway runs the turn; the gateway hands out what the model may choose
+from and writes back what the choice keeps, and is never handed text:
+
+| Gateway endpoint | Body | Answers |
+|---|---|---|
+| `POST /messages/trim-source` | `{chat, account, message_id}` | `200 {state: "wanting", lines, digest, subject, sender, is_reply, bulk}` — the trim's own lines, which must be the record's own text; `200 {state}` for a mail already settled; `200 {state: "deterministic", settled: "too_long" \| "source_differs"}` for one too long to hand over, or whose parts no longer give its text, settled there and then; `200 {state: "unread"}` for a placeholder (a mail not read yet: nothing to choose from, nothing settled) |
+| `POST /messages/trim-result` | `{chat, account, message_id, digest, keep: [[first, last], …]}` or `{…, digest, failed: "<reason>"}` (`unparseable`, `too_long`, `gave_up`: any reason settles alike) | `200 {state: "model" \| "deterministic", text}` — a valid choice is the text now, anything else settles the mail with its text unchanged; `409 {error: "stale", state}` when the mail is settled, the digest is not its source's, or the record was written again since (`state: "unread"` where it is a placeholder now) |
+
+Both take the bearer token and answer `404` for another account's mail, an
+unknown one or one not named by its chat (a chat merged into the mail's since
+counts as its own), `410` for a mail removed from the mailbox, and `503` when
+a part cannot be read (a body part or the header part) or the record lock is
+held past `EXCLUSIVE_SECONDS`. A result is written under the record lock, not
+the mirror's — a pass over the mailbox takes the record lock only around each
+record it writes (a record written again in its own place included), so a
+judgement never waits out a pass — with the record read again, and only the
+record's text and its trim change; its parts never do. The gateway reads no
+tunable of the feature: those are the web gateway's (`MAIL_MODEL_TRIM*`, on
+the `retinue` service).
+
 ### The mailbox follows the chat
 
 | In the chat | In the mailbox | Gateway endpoint |

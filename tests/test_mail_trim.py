@@ -4272,6 +4272,310 @@ def test_sanitize_keeps_a_real_mail_readable():
     print("PASS sanitize: a real mail keeps its structure and its links")
 
 
+# ── The model trim's two halves: model_source and apply_keep ────────────────
+
+def _digest(lines):
+    import hashlib
+    return hashlib.sha256("\n".join(lines).encode("utf-8")).hexdigest()
+
+
+def test_model_source_is_the_trims_own_text():
+    """One code path: the lines are trim()'s text, for every corpus mail, with
+    the same evidence — and the digest is over exactly those lines."""
+    offered = 0
+    for c in CASES:
+        args = dict(is_reply=c["is_reply"], bulk=c["bulk"])
+        result = mt.trim(c["plain"], c["html"], c["subject"], **args)
+        source = mt.model_source(c["plain"], c["html"], c["subject"], **args)
+        if not result.text.strip():
+            assert source is None, c["name"]
+            continue
+        offered += 1
+        assert source is not None, c["name"]
+        assert source.lines == result.text.splitlines(), c["name"]
+        assert source.text == result.text, c["name"]
+        assert source.digest == _digest(source.lines), c["name"]
+        # Deterministic: the same parts, the same lines, the same digest.
+        again = mt.model_source(c["plain"], c["html"], c["subject"], **args)
+        assert again == source, c["name"]
+        # Keeping everything is the trim's text again.
+        assert mt.apply_keep(source.lines, [[1, len(source.lines)]]) == result.text, c["name"]
+    assert offered >= 40, offered
+    # The evidence counts as it does for trim(): without it, the history stays.
+    reply = "Fine by me.\n\n-----Original Message-----\nFrom: Ann\nSent: Monday\n" \
+            "To: Bob\nSubject: Plan\n\nThe plan.\n"
+    with_ = mt.model_source(reply, None, "RE: Plan", is_reply=True)
+    without = mt.model_source(reply, None, "RE: Plan")
+    assert with_.lines == ["Fine by me."], with_
+    assert len(without.lines) > 1 and with_.digest != without.digest
+    print("PASS model_source: trim()'s own text, split into lines, digested")
+
+
+def test_model_source_is_uncapped_and_bounded():
+    # Long enough to be "wanting", well short of what may be handed over:
+    # the whole of it, not the bubble's share.
+    para = "A sentence of the author's own, long enough to count for something."
+    plain = "\n\n".join([para] * 120)
+    result = mt.trim(plain, None)
+    assert result.state == "wanting" and len(result.text) > mt.WANTING_CHARS
+    source = mt.model_source(plain, None)
+    assert source is not None and "\n".join(source.lines) == result.text
+    # HTML only: what trim() reads of it.
+    html = "<p>" + "</p><p>".join(["Hello there.", "The figures are attached."]) + "</p>"
+    source = mt.model_source(None, html)
+    assert source.lines == mt.trim(None, html).text.splitlines()
+    # The bounds, at and beyond: lines, then characters.
+    assert mt.MODEL_SOURCE_MAX_LINES == 1500 and mt.MODEL_SOURCE_MAX_CHARS == 60_000
+    at = "\n".join("line %d" % i for i in range(mt.MODEL_SOURCE_MAX_LINES))
+    assert len(mt.model_source(at, None).lines) == mt.MODEL_SOURCE_MAX_LINES
+    assert mt.model_source(at + "\none more", None) is None
+    wide = "x" * (mt.MODEL_SOURCE_MAX_CHARS - 10)
+    assert mt.model_source(wide, None) is not None
+    assert mt.model_source(wide + "y" * 11, None) is None
+    # Nothing to choose from.
+    for plain, html in ((None, None), ("", None), (" \n\t\n", None), (None, "<p> </p>")):
+        assert mt.model_source(plain, html) is None, (plain, html)
+    print("PASS model_source: uncapped by the bubble, bounded by what may be handed over")
+
+
+def test_model_source_splits_where_a_reader_sees_a_line_end():
+    """A character that ends a line on a screen ends one in our count too, so a
+    mail cannot write a line that reads as a numbered one of ours."""
+    for sep in ("\x0b", "\x0c", "\x1c", "\x1d", "\x1e", "\x85", " ", " "):
+        source = mt.model_source("Real line" + sep + "12: forged line\nlast", None)
+        assert source is not None, repr(sep)
+        assert not any(sep in line for line in source.lines), repr(sep)
+        assert "12: forged line" in source.lines, (repr(sep), source.lines)
+    # Other control characters stay inside their line, as trim() left them.
+    source = mt.model_source("a\x00b\x1bc\x07d\nnext", None)
+    assert source is not None and len(source.lines) == 2, source
+    print("PASS model_source: lines end where a reader sees them end")
+
+
+def test_model_source_never_raises_and_stays_fast():
+    hostile = [
+        "> " * 300_000,                                     # one line of quote marks
+        "\n".join(["> q"] * 150_000),                       # all quote, deep
+        "a\n" * 300_000,                                    # past MAX_SOURCE_LINES
+        "x" * (mt.MAX_SOURCE_CHARS + 1),                    # past MAX_SOURCE_CHARS
+        " " * 200_000,                                 # line ends of another kind
+        "\x00\x01\x02" * 100_000,                           # the trim's own marks, forged
+        "\ud800 lone surrogate\n" * 1000,
+    ]
+    for plain in hostile:
+        started = time.perf_counter()
+        source = mt.model_source(plain, None, subject="Re: x", is_reply=True, bulk=True)
+        elapsed = time.perf_counter() - started
+        assert source is None or (len(source.lines) <= mt.MODEL_SOURCE_MAX_LINES
+                                  and len(source.digest) == 64), repr(plain[:20])
+        assert elapsed < 20, (repr(plain[:20]), elapsed)
+    started = time.perf_counter()
+    deep = "<div>" * 400_000 + "deep" + "</div>" * 400_000
+    # Read as far as MAX_HTML_CHARS, which "deep" lies beyond: what is left
+    # is the trim's own CUT_MARK line, which is no line to choose — no source.
+    # With a line of the author's before it, that line is the source, and
+    # the mark is kept for the end of whatever is chosen.
+    assert mt.trim(None, deep).text == mt.CUT_MARK
+    assert mt.model_source(None, deep) is None
+    source = mt.model_source(None, "<p>Hello.</p>" + deep)
+    assert source.lines == ["Hello."] and source.ended, source
+    assert time.perf_counter() - started < 30
+    for plain, html, subject in ((1, 2, 3), (b"bytes", None, None), ([], {}, object())):
+        assert mt.model_source(plain, html, subject) is None
+    print("PASS model_source: never raises, bounded by trim()'s own cost")
+
+
+def test_apply_keep_takes_a_choice_and_only_a_choice():
+    lines = ["Hi Bob,", "", "the plan is fine.", "", "", "Ann", "--", "Ann Example",
+             "> quoted", "   ", "Tail"]
+    keep = mt.apply_keep
+    assert keep(lines, [[1, 3]]) == "Hi Bob,\n\nthe plan is fine."
+    # A cut gap is one blank line; ranges that touch are one stretch.
+    assert keep(lines, [[1, 1], [3, 3]]) == "Hi Bob,\n\nthe plan is fine."
+    assert keep(lines, [[1, 1], [2, 3]]) == "Hi Bob,\n\nthe plan is fine."
+    assert keep(lines, [[3, 3], [6, 6]]) == "the plan is fine.\n\nAnn"
+    assert keep(lines, [[6, 6], [7, 7]]) == "Ann\n--"
+    # Runs of blank lines (whitespace-only ones too) are one; none at the ends.
+    assert keep(lines, [[2, 6]]) == "the plan is fine.\n\nAnn"
+    assert keep(lines, [[3, 4], [5, 6]]) == "the plan is fine.\n\nAnn"
+    assert keep(lines, [[9, 11]]) == "> quoted\n\nTail"
+    assert keep(lines, [[1, len(lines)]]) == (
+        "Hi Bob,\n\nthe plan is fine.\n\nAnn\n--\nAnn Example\n> quoted\n\nTail")
+    # Indentation is the author's: kept, at the start too.
+    assert keep(["    code", "", "text"], [[1, 3]]) == "    code\n\ntext"
+    # A tuple pair is a pair.
+    assert keep(lines, [(1, 1)]) == "Hi Bob,"
+    n = len(lines)
+    invalid = [
+        None, "1-3", 3, {"1": 3}, (), [], (1, 3), ((1, 3),),        # not a list of pairs
+        [[]], [[1]], [[1, 2, 3]], [1, 3], [["1", "3"]], [[None, 1]],
+        [[True, 2]], [[1, True]], [[False, 1]],                     # bools are no ints
+        [[1.0, 2]], [[1, 2.0]], [[1, float("inf")]], [[1, float("nan")]],
+        [[0, 1]], [[-1, 2]], [[2, 1]], [[1, n + 1]], [[n + 1, n + 1]],
+        [[10 ** 100, 10 ** 100]], [[-10 ** 100, 1]],
+        [[1, 3], [3, 5]], [[1, 5], [2, 3]], [[4, 5], [1, 2]], [[2, 2], [2, 2]],
+        [[1, 1], [3, 3], [2, 2]],
+        [[2, 2]], [[4, 5]], [[10, 10]], [[2, 2], [4, 5], [10, 10]],  # keeps nothing
+    ]
+    for choice in invalid:
+        assert keep(lines, choice) is None, choice
+    # The number of ranges.
+    many = [[i, i] for i in range(1, mt.MODEL_KEEP_MAX_RANGES + 2)]
+    long_lines = ["line %d" % i for i in range(1, 1000)]
+    assert keep(long_lines, many[:mt.MODEL_KEEP_MAX_RANGES]) is not None
+    assert keep(long_lines, many) is None
+    # Lines that are no lines.
+    assert keep(["a", 1, "c"], [[1, 3]]) is None
+    assert keep(["a", None], [[1, 2]]) is None
+    assert keep("abc", [[1, 1]]) is None and keep(None, [[1, 1]]) is None
+    assert keep([], [[1, 1]]) is None
+    print("PASS apply_keep: every validity rule, and the text it assembles")
+
+
+def test_a_choice_must_show_something():
+    """A line counts as text only if it shows something: a choice of lines
+    that only look blank — a zero-width space, a word joiner, a BOM, the
+    braille blank, a Hangul or Khmer filler — is no choice, and a source of
+    nothing else is no source. A short message and a lone mark are text."""
+    blanks = ["\u200b", "\u2060", "\ufeff", "\u2800", "\u3164", "\u115f", "\u1160",
+              "\uffa0", "\u180e", "\u200b \u2800\t\u3164", "\u3000", "\u00a0",
+              # Unassigned, and reserved by Unicode as drawn as nothing.
+              "\u2065", "\ufff0", "\U000e0080", "\u200b\u2065"]
+    for blank in blanks:
+        lines = ["Hi Bob,", "the plan is fine.", blank, "Ann"]
+        assert mt.apply_keep(lines, [[3, 3]]) is None, repr(blank)
+        # Within a kept stretch it is a blank line, as a line of spaces is.
+        assert mt.apply_keep(lines, [[2, 4]]) == "the plan is fine.\n\nAnn", repr(blank)
+        assert mt.apply_keep(lines, [[3, 4]]) == "Ann", repr(blank)
+        assert mt.model_source(blank + "\n" + blank, None) is None, repr(blank)
+    # Short is not blank: "OK" is a whole message, and so is a mark or a sign.
+    for short in ("OK", "Ja", ".", "?", "👍", "５", "\u200bOK"):
+        assert mt.apply_keep(["Hi", short], [[2, 2]]) == short, repr(short)
+    print("PASS apply_keep: a choice of lines that show nothing is no choice")
+
+
+def test_the_rules_keep_a_line_this_python_cannot_name():
+    """What a choice is judged by never changes trim()'s own rules: a line of
+    code points this Python does not know (an emoji newer than its Unicode
+    tables is unassigned to it), of private-use characters, or one that only
+    looks blank is kept as the rules always kept it — and to a choice, an
+    unknown or private-use code point shows something: what this Python
+    cannot name cannot be known to be blank."""
+    new_emoji, private = "\U0001FAE9", ""
+    for odd in (new_emoji, private):
+        result = mt.trim(odd, None)
+        assert (result.text, result.state) == (odd, "deterministic"), repr(odd)
+        result = mt.trim("Sounds good\n\n" + odd + odd, None)
+        assert result.text == "Sounds good\n\n" + odd + odd, repr(odd)
+        result = mt.trim(None, "<p>%s</p>" % odd)
+        assert (result.text, result.state) == (odd, "wanting"), repr(odd)
+        assert mt.apply_keep(["Hi", odd], [[2, 2]]) == odd, repr(odd)
+        assert mt.apply_keep(["Hi", odd, "Ann"], [[1, 3]]) == "Hi\n%s\nAnn" % odd, repr(odd)
+        source = mt.model_source(odd, None)
+        assert source is not None and source.lines == [odd], repr(odd)
+    # A line that only looks blank is the rules' to keep as they always did;
+    # only a model's choice reads it as no text.
+    text = "Hi,\n​\nthe venue moved\n\nAnn"
+    assert mt.trim(text, None).text == text
+    for blank in ("​", "⠀", "ㅤ", "ᅟ", "ᅠ", "ﾠ"):
+        assert mt.trim("Sounds good\n" + blank, None).text == "Sounds good\n" + blank, repr(blank)
+        assert mt.apply_keep(["Hi", blank], [[2, 2]]) is None, repr(blank)
+    print("PASS trim: the rules keep a line this Python cannot name, and so does a choice")
+
+
+def test_apply_keep_is_cheap_and_invents_nothing():
+    import random
+    lines = ["line %d" % i for i in range(1, 1501)]
+    # A million pairs are refused on their count, before one is looked at.
+    for choice in ([[1, 1]] * 10 ** 6, [[i, i] for i in range(1, 10 ** 6)],
+                   [[1, 1500]] + [None] * 10 ** 6):
+        started = time.perf_counter()
+        assert mt.apply_keep(lines, choice) is None
+        assert time.perf_counter() - started < 0.5
+    # Linear in what is kept: all of a long source, at once.
+    big = ["word " * 20] * 100_000
+    started = time.perf_counter()
+    assert mt.apply_keep(big, [[1, len(big)]]) is not None
+    assert time.perf_counter() - started < 5
+    # Whatever the choice, every line of the answer is one of the lines or
+    # blank: the model chooses lines, it never writes.
+    rng = random.Random(7)
+    pool = ["", "  ", "Hello.", "> quote", "\x00\x1b control", " ", "Ann", "--"]
+    for _ in range(3000):
+        source = [rng.choice(pool) for _ in range(rng.randint(0, 30))]
+        cuts = sorted(rng.sample(range(1, 40), rng.randint(0, 8)))
+        choice = [[cuts[i], cuts[i + 1]] for i in range(0, len(cuts) - 1, 2)]
+        if rng.random() < 0.2:
+            choice = [[rng.randint(-2, 40), rng.randint(-2, 40)] for _ in range(3)]
+        text = mt.apply_keep(source, choice)
+        if text is None:
+            continue
+        assert text == text.strip("\n") and text.strip(), (source, choice, text)
+        assert "\n\n\n" not in text
+        for line in text.split("\n"):
+            assert line == "" or line in source, (line, source, choice)
+    print("PASS apply_keep: linear, refuses a million pairs at once, invents nothing")
+
+
+# ── The model trim on phase 1's reading (the phase 3 merge) ──────────────────
+
+def test_the_reading_ends_on_a_line_that_is_no_choice():
+    """Phase 1's reading of an HTML part ends, past MAX_HTML_CHARS, on the
+    trim's own line CUT_MARK. The line-choosing half was written beside a
+    reading that never ended early: that line is the trim's word that the
+    rest was not read, never a line of the author's — not handed out, kept
+    at the end of whatever is chosen, and no source where it is all there
+    is. A "[…]" the author wrote is an ordinary line; a plain part beside
+    the HTML one is the source and is not cut."""
+    html = ("<p>Hello Ann,</p><p>the plan is fine.</p>"
+            + "<span></span>" * (mt.MAX_HTML_CHARS // 13 + 10) + "<p>Not read.</p>")
+    trimmed = mt.trim(None, html)
+    assert trimmed.state == "wanting" and trimmed.text.endswith("\n\n" + mt.CUT_MARK)
+    source = mt.model_source(None, html)
+    assert source.ended and mt.CUT_MARK not in source.lines and source.text == trimmed.text
+    assert source.lines[:3] == ["Hello Ann,", "", "the plan is fine."]
+    assert source.digest == _digest(source.lines)
+    assert mt.apply_keep(source.lines, [[1, 3]], ended=source.ended) == (
+        "Hello Ann,\n\nthe plan is fine.\n\n" + mt.CUT_MARK)
+    # The whole of what was read, chosen: the trim's own text again.
+    assert mt.apply_keep(source.lines, [[1, len(source.lines)]], ended=True) == trimmed.text
+    # No choice is still no choice; the mark makes none.
+    assert mt.apply_keep(source.lines, [], ended=True) is None
+    assert mt.apply_keep(["\u200b"], [[1, 1]], ended=True) is None
+    # All that was read is the mark: nothing to choose from.
+    deep = "<div>" * (mt.MAX_HTML_CHARS // 5 + 10) + "late" + "</div>" * 10
+    assert mt.trim(None, deep).text == mt.CUT_MARK and mt.model_source(None, deep) is None
+    # The author's own "[…]" is a line like any other, and a plain part is
+    # read whole.
+    own = mt.model_source("Hi,\n\nmore below\n\n" + mt.CUT_MARK, None)
+    assert not own.ended and own.lines[-1] == mt.CUT_MARK
+    beside = mt.model_source("Hello Ann,\n\nthe plan is fine.\n", html)
+    assert not beside.ended and mt.CUT_MARK not in beside.text
+    print("PASS model trim: where the reading ended is the trim's line, never a choice")
+
+
+def test_one_notion_of_a_line_that_shows_nothing():
+    """The model's choice is judged by _visible; the rules call a line blank
+    when it is whitespace (_squeeze), and html_to_text takes the padding a
+    sender hides (_INVISIBLE) out of the text. One notion, widened for the
+    choice only: whatever the rules or the converter call nothing, the
+    choice calls nothing too — over every line of the corpus as trimmed."""
+    for ch in [chr(c) for c in mt._INVISIBLE] + [" ", "\t", "\u00a0", "\u3000", "\u2028"]:
+        assert not mt._visible(ch * 3), repr(ch)
+        assert not mt._visible(" " + ch + " "), repr(ch)
+    for case in CASES:
+        args = {k: case[k] for k in ("is_reply", "bulk") if k in case}
+        text = mt.trim(case.get("plain"), case.get("html"), case.get("subject"), **args).text
+        for line in text.split("\n"):
+            if not line.strip():
+                assert not mt._visible(line), (case.get("name"), repr(line))
+        if case.get("html"):
+            for line in mt.html_to_text(case["html"]).split("\n"):
+                if not line.translate(mt._INVISIBLE).strip():
+                    assert not mt._visible(line), (case.get("name"), repr(line))
+    print("PASS model trim: one notion of a line that shows nothing, with the rules'")
+
+
 def test_module_is_standalone():
     """Importable in a slim gateway image: stdlib only, no sibling modules."""
     code = ("import sys; before = set(sys.modules); import mail_trim; "
@@ -4331,6 +4635,16 @@ def main():
     test_sanitize_malformed_markup()
     test_sanitize_writes_the_end_tags_a_mail_leaves_out()
     test_sanitize_keeps_a_real_mail_readable()
+    test_model_source_is_the_trims_own_text()
+    test_model_source_is_uncapped_and_bounded()
+    test_model_source_splits_where_a_reader_sees_a_line_end()
+    test_model_source_never_raises_and_stays_fast()
+    test_apply_keep_takes_a_choice_and_only_a_choice()
+    test_a_choice_must_show_something()
+    test_the_rules_keep_a_line_this_python_cannot_name()
+    test_apply_keep_is_cheap_and_invents_nothing()
+    test_the_reading_ends_on_a_line_that_is_no_choice()
+    test_one_notion_of_a_line_that_shows_nothing()
     test_module_is_standalone()
     print("all mail-trim tests passed")
     return 0

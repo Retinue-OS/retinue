@@ -86,7 +86,13 @@
 // message names and only when that URL is this chat's own (ownOriginal). A
 // mail removed in a mail client stays as a quiet tombstone. The poll does not
 // only append: a message on screen whose removal, text, trim or attachments
-// changed is re-rendered in its place (_reconcileChanged). And a chat the
+// changed is re-rendered in its place (_reconcileChanged). A mail the
+// deterministic trim left `wanting` is tidied by a model on first view: once
+// its bubble has been on screen long enough to be read, the page asks the
+// server once (POST <the Original's sibling>/trim, _askTrim), shows "Tidying
+// up…" under the text while a turn is on its way, and takes the settled text
+// from the answer or a later poll; the Original of a mail a model shortened
+// says so. And a chat the
 // server says cannot be written to (`can_send: false`: its gateway is unknown
 // or not connected) shows the server's reason where the composer would be —
 // one switch, _canSend.
@@ -269,6 +275,51 @@ function ownOriginalHtml(doc, original) {
   const url = doc && doc.html_url;
   return original && typeof url === 'string' && url === `${original}.html` ? url : '';
 }
+
+// A mail's model trim (docs/mail-chats.md, "The model trim (phase 4)"): where
+// the deterministic trim left a mail `wanting`, the page asks the server to
+// have it tidied — POST /chats/<id>/messages/<token>/trim, the sibling of the
+// Original's own URL. The token is never built: the URL is the one
+// ownOriginal accepted with its last segment named again, so it can point
+// nowhere the Original could not.
+const ORIGINAL_TAIL = '/original';
+
+function trimUrl(original) {
+  return original && original.endsWith(ORIGINAL_TAIL)
+    ? `${original.slice(0, -ORIGINAL_TAIL.length)}/trim` : '';
+}
+
+// When a bubble counts as seen, and what the page does with the answers.
+// A bubble is asked for once it has been at least half visible — half of
+// itself, or half of the thread where it is taller than that — for
+// TRIM_DWELL_MS without a break: a list scrolled through spends no turns. It
+// is looked at every TRIM_TICK_MS while it is on screen at all, and not at
+// all while it is not (an IntersectionObserver says when it comes and goes).
+// A queued or running turn shows a status line under the text for at most
+// TRIM_STATUS_MS — the poll brings the settled text whenever it comes; a turn
+// that failed without a word must not leave the line there for good. An
+// answer "wanting" names when to ask again (`retry_after`, seconds, held to
+// TRIM_RETRY_MIN_S..TRIM_RETRY_MAX_S, TRIM_RETRY_DEFAULT_S where it names
+// none); no answer at all (offline, a 5xx) may be asked again after
+// TRIM_ERROR_RETRY_MS — nothing was queued then, so nothing is spent twice.
+const TRIM_DWELL_MS = 600;
+const TRIM_TICK_MS = 200;
+const TRIM_STATUS_MS = 120000;
+const TRIM_RETRY_MIN_S = 30;
+const TRIM_RETRY_MAX_S = 86400;
+const TRIM_RETRY_DEFAULT_S = 600;
+const TRIM_ERROR_RETRY_MS = 60000;
+// The two ways a mail can be settled, and the two a turn can be on its way.
+const TRIM_SETTLED = new Set(['model', 'deterministic']);
+const TRIM_BUSY = new Set(['queued', 'running']);
+// The status line of a turn on its way: the page's own words, never the
+// server's. Drawn with the bubble, and put into or taken out of a bubble
+// already on screen (_trimRedraw) — before what follows the text there.
+const TRIM_STATE_HTML = '<div class="trim-state" role="status">Tidying up&#8230;</div>';
+const TRIM_STATE_BEFORE = '.pend-state, .msg-refused, .orig-bar';
+// The full-screen layers over the whole document a bubble under which is not
+// seen: the attention sheet the page opens, and any open modal dialog.
+const TRIM_LAYERS = 'retinue-attention-sheet:not([hidden]), dialog[open]';
 
 // Whether a mail's own subject says something the thread's name does not —
 // then the bubble shows it. Reply and forward markers do not count, and they
@@ -858,6 +909,24 @@ class RetinueChatPage extends HTMLElement {
     this._origOpen = new Set();
     this._origCache = new Map();
     this._origRawOpen = new Set();
+    // The model trim, asked for on first view (_trimSweep): what was asked
+    // of each mail ({state: asking | busy | retry | done, retryAt, timer} —
+    // one request per mail for the page's life unless an answer named when
+    // to ask again), the settled text an answer brought, held over a poll
+    // that left before it (_trimHold), the bubbles being watched ({node, on,
+    // since, last, timer} by message id), the observer that watches them and
+    // the listener that hears the page come back (_trimOnShow). An epoch
+    // that a chat switch or a release moves on, so an answer that comes back
+    // afterwards touches nothing; and the switch an older server throws for
+    // the page's life (no such endpoint: _askTrim).
+    this._trimAsked = new Map();
+    this._trimHeld = new Map();
+    this._trimWatch = new Map();
+    this._trimObs = null;
+    this._trimLife = 0;
+    this._trimChat = '';
+    this._trimOff = false;
+    this._trimOnShow = null;
     // Voice dictation: this element is a host of voice.js's presentation
     // contract — the third one, after conversations.js and project-page.js.
     // The host owns the MediaRecorder state machine and what ✓/➤ mean;
@@ -1052,6 +1121,7 @@ class RetinueChatPage extends HTMLElement {
     if (this._onVis) document.removeEventListener('visibilitychange', this._onVis);
     this._onVis = null;
     this._clearReadUndo();
+    this._trimReset();
     this._toggleMenu(false);
     this._stopRecording();
     this._wave.stop();
@@ -1064,6 +1134,12 @@ class RetinueChatPage extends HTMLElement {
       this._error = 'No chat id in the address.';
       this.render();
       return;
+    }
+    // Another chat than the one the trim state is about: nothing asked of
+    // that one carries over, and no answer to it lands here.
+    if (this._trimChat !== this._id) {
+      this._trimReset();
+      this._trimChat = this._id;
     }
     try {
       // Two hops, both part of the contract: the list names each chat's
@@ -1273,6 +1349,8 @@ class RetinueChatPage extends HTMLElement {
     this._pollDone = true;
     if (this._pollTimer) clearInterval(this._pollTimer);
     this._pollTimer = null;
+    // Nor is a trim asked for any more, and none on its way lands.
+    this._trimReset(true);
   }
 
   async _poll() {
@@ -1297,7 +1375,9 @@ class RetinueChatPage extends HTMLElement {
         throw new Error(String(res.status));
       }
       const doc = await res.json();
-      const msgs = Array.isArray(doc.messages) ? doc.messages : [];
+      // A mail whose trim an answer here settled after this poll's document
+      // was read keeps the settled text (_trimHold).
+      const msgs = Array.isArray(doc.messages) ? doc.messages.map((m) => this._trimHold(m)) : [];
       const stick = this._atBottom();
       // Never a full re-render, which would fight the composer (focus, IME,
       // dictation) and the reader's place. First the messages on screen that
@@ -1603,6 +1683,9 @@ class RetinueChatPage extends HTMLElement {
       return false;
     }
     this._messages[i] = m;
+    // A model trim on its way is over once the record shows it settled, or
+    // its text changed under it: the status line goes with this re-render.
+    this._trimSettled(old, m);
     const original = m.removed ? '' : ownOriginal(m.original, this._id);
     if (!original) {
       this._origOpen.delete(m.id);
@@ -1664,6 +1747,7 @@ class RetinueChatPage extends HTMLElement {
     this._reflowSeparators(thread);
     if (stick) thread.scrollTop = thread.scrollHeight;
     else this._scrollMirrorTo(loc);
+    this._trimSweep();
   }
 
   // The separators before the message at index `i` of `_messages`, the one
@@ -1757,6 +1841,8 @@ class RetinueChatPage extends HTMLElement {
     const next = tpl.content.firstElementChild;
     node.replaceWith(next);
     this._mountFrame(next, m);
+    // The old node is watched no more; the new one is, if it still wants.
+    this._trimSweep();
     if (!kind) return next;
     const pick = (sel) => (FOCUS_KINDS.includes(sel) ? next.querySelector(sel) : null);
     const target = (kind === 'self' && next) || pick(prefer) || pick(kind)
@@ -1851,6 +1937,361 @@ class RetinueChatPage extends HTMLElement {
       const m = this._messages.find((x) => x && x.id === id);
       if (m) this._mountFrame(this._bubbleNode(id), m);
     }
+  }
+
+  // ── The model trim, asked for on first view ────────────────────────────────
+  // (docs/mail-chats.md, "The model trim (phase 4)".) A mail the deterministic
+  // trim left `wanting` is tidied by one turn on a model — when the user first
+  // looks at it, never because a page of the thread was fetched: its bubble is
+  // watched, and once it has been on screen long enough to be read
+  // (_trimSeen, TRIM_DWELL_MS) the page asks, once (_askTrim). The settled
+  // text comes back in the answer or with a later poll and replaces the
+  // bubble's in place (_reconcileChanged: the reader's place, an open
+  // Original and the focus kept). A messenger chat has no trim to ask for: no
+  // observer, no request. Neither has a page whose server has no such
+  // endpoint (an older one), which is then left alone for good.
+
+  // Whether a mail wants asking for: still `wanting` on the page, there (not a
+  // tombstone, not a bubble of the page's own), with its Original's URL —
+  // whose sibling the request goes to — and not asked yet, or asked with an
+  // answer that named a time to ask again (the watch then waits for it).
+  _trimDue(m) {
+    if (this._trimOff || !isMail(this._chat)) return false;
+    if (!m || m.removed || m.trim !== 'wanting' || String(m.id || '').startsWith('local-')) return false;
+    if (!trimUrl(ownOriginal(m.original, this._id))) return false;
+    const a = this._trimAsked.get(m.id);
+    return !a || a.state === 'retry';
+  }
+
+  _trimBusy(id) {
+    const a = this._trimAsked.get(id);
+    return !!a && a.state === 'busy';
+  }
+
+  // The watch made to fit the thread as it now is: every bubble on screen that
+  // is due is observed, by the node it is now (a re-render or a full render
+  // made a new one), and every watched node that is not such a bubble any
+  // more — re-rendered, removed, settled, asked — is let go with its timer.
+  // Run wherever bubbles are made or replaced (render, _replaceBubble, an
+  // arrival); nothing at all is watched on a chat that is not mail, on a page
+  // that has stopped (_pollDone), switched the feature off or has no
+  // IntersectionObserver.
+  _trimSweep() {
+    const thread = this.shadowRoot && this.shadowRoot.querySelector('[data-chat-thread]');
+    if (this._trimOff || this._pollDone || this._state !== 'ok' || !thread || !isMail(this._chat)
+        || typeof IntersectionObserver !== 'function') {
+      this._trimRelease();
+      return;
+    }
+    const byId = new Map(this._messages.map((m) => [m && m.id, m]));
+    const due = new Map();
+    for (const n of thread.querySelectorAll('[data-mid]')) {
+      const id = n.getAttribute('data-mid');
+      if (this._trimDue(byId.get(id))) due.set(id, n);
+    }
+    for (const [id, w] of [...this._trimWatch]) if (due.get(id) !== w.node) this._trimForget(id);
+    if (!due.size) return;
+    // The viewport is the root, not the thread: on a phone the thread's pane
+    // can be scrolled aside for the companion's, and only the viewport's
+    // clip says the bubble is then nowhere to be seen. The observer says only
+    // whether a bubble is on screen at all; how much of it is, _trimSeen
+    // measures (a ratio says nothing useful of a bubble taller than the view).
+    if (!this._trimObs) {
+      this._trimObs = new IntersectionObserver((entries) => this._trimSeenChange(entries), { threshold: 0 });
+      // The page hidden or shown again — and shown again from the
+      // back-forward cache, which says nothing to visibilitychange — is a
+      // break: every bubble's time in view starts again, from now.
+      this._trimOnShow = (e) => {
+        if (e && e.type === 'pageshow' && !e.persisted) return;
+        const since = document.hidden ? 0 : Date.now();
+        for (const w of this._trimWatch.values()) w.since = since;
+      };
+      document.addEventListener('visibilitychange', this._trimOnShow);
+      window.addEventListener('pageshow', this._trimOnShow);
+    }
+    for (const [id, node] of due) {
+      if (this._trimWatch.has(id)) continue;
+      this._trimWatch.set(id, { node, on: false, since: 0, last: 0, timer: null });
+      this._trimObs.observe(node);
+    }
+  }
+
+  // One bubble watched no more.
+  _trimForget(id) {
+    const w = this._trimWatch.get(id);
+    if (!w) return;
+    this._trimWatch.delete(id);
+    if (w.timer) clearTimeout(w.timer);
+    if (this._trimObs) this._trimObs.unobserve(w.node);
+  }
+
+  // Every bubble watched no more, the observer let go. What was asked stays.
+  _trimRelease() {
+    for (const id of [...this._trimWatch.keys()]) this._trimForget(id);
+    if (this._trimObs) this._trimObs.disconnect();
+    this._trimObs = null;
+    if (this._trimOnShow) {
+      document.removeEventListener('visibilitychange', this._trimOnShow);
+      window.removeEventListener('pageshow', this._trimOnShow);
+    }
+    this._trimOnShow = null;
+  }
+
+  // For good, for this chat: the watch released, every answer still on its
+  // way dropped (the epoch moves on), what was asked forgotten. With
+  // `redraw`, a bubble that showed a turn on its way loses its line.
+  _trimReset(redraw = false) {
+    this._trimRelease();
+    this._trimLife += 1;
+    const busy = [];
+    for (const [id, a] of this._trimAsked) {
+      if (a.timer) clearTimeout(a.timer);
+      if (a.state === 'busy') busy.push(id);
+    }
+    this._trimAsked = new Map();
+    this._trimHeld = new Map();
+    if (!redraw) return;
+    for (const id of busy) this._trimRedraw(id);
+  }
+
+  // The observer's word: which watched bubbles are on screen at all. One that
+  // is starts being looked at (_trimTick); one that left stops, and its time
+  // in view starts again from nothing when it returns.
+  _trimSeenChange(entries) {
+    for (const e of entries) {
+      const id = [...this._trimWatch.keys()].find((k) => this._trimWatch.get(k).node === e.target);
+      const w = id === undefined ? null : this._trimWatch.get(id);
+      const on = !!e.isIntersecting;
+      if (!w || on === w.on) continue;
+      w.on = on;
+      if (w.timer) clearTimeout(w.timer);
+      w.timer = null;
+      w.since = 0;
+      if (w.on) this._trimTick(id);
+    }
+  }
+
+  // A watched bubble on screen, looked at: once it has been seen without a
+  // break for TRIM_DWELL_MS, its trim is asked for. Not before an answer's
+  // `retry_after` has passed (the look waits for it), and never while the
+  // page is hidden — the look goes on, and the time counts from when the page
+  // is shown again. A look that comes much later than the last is a break
+  // too: a page frozen in the background or in the back-forward cache runs
+  // no timer, so no look saw it hidden, and the one overdue on its return
+  // may come before the event that says it was away (_trimOnShow).
+  _trimTick(id) {
+    const w = this._trimWatch.get(id);
+    if (!w) return;
+    w.timer = null;
+    if (!w.on) return;
+    const now = Date.now();
+    const a = this._trimAsked.get(id);
+    const wait = a && a.retryAt > now ? a.retryAt - now : 0;
+    if (wait) {
+      w.since = 0;
+      w.timer = setTimeout(() => this._trimTick(id), wait);
+      return;
+    }
+    const gap = now - w.last > TRIM_DWELL_MS;
+    w.last = now;
+    if (this._trimSeen(w.node)) {
+      if (!w.since || gap) w.since = now;
+      if (now - w.since >= TRIM_DWELL_MS) {
+        this._askTrim(id);
+        return;
+      }
+    } else {
+      w.since = 0;
+    }
+    w.timer = setTimeout(() => this._trimTick(id), TRIM_TICK_MS);
+  }
+
+  // Whether the user can see the bubble `node` now: the page shown, the
+  // thread on screen (not the draft's expanded pane, not the companion's pane
+  // on a phone, not under a full-screen layer of the page's — the image
+  // lightbox, the attention sheet, any modal dialog of its own: the observer
+  // knows nothing of what covers a bubble), and at least half of the bubble
+  // in the thread's view — or, for a bubble taller than the view, half the
+  // view taken by it.
+  _trimSeen(node) {
+    if (document.hidden || this.hasAttribute('draft-expanded')) return false;
+    if (!this._wide.matches && this._pane !== 'chat') return false;
+    if (this._lightbox || (this.shadowRoot && this.shadowRoot.querySelector('[aria-modal="true"]'))) return false;
+    if (document.querySelector(TRIM_LAYERS)) return false;
+    const thread = this.shadowRoot && this.shadowRoot.querySelector('[data-chat-thread]');
+    if (!thread || !node || !node.getBoundingClientRect) return false;
+    const v = thread.getBoundingClientRect();
+    const r = node.getBoundingClientRect();
+    const shown = Math.min(r.bottom, v.bottom) - Math.max(r.top, v.top);
+    const need = Math.min(r.bottom - r.top, v.bottom - v.top) / 2;
+    return need > 0 && shown >= need;
+  }
+
+  // POST <the mail's trim URL>: ask for one mail's model trim, and take the
+  // answer (interface: 200 {state: model | deterministic, text}, 202 {state:
+  // queued | running}, 200 {state: wanting, retry_after}). Asked once; the
+  // bubble is watched no more from the moment the request leaves. An answer
+  // that comes back after a chat switch, a release or the chat's end (the
+  // epoch moved) does nothing. Every word of the answer is data: the state
+  // picks among the page's own lines, and a settled text is shown like any
+  // mail's text, escaped.
+  async _askTrim(id) {
+    const m = this._messages.find((x) => x && x.id === id);
+    if (!this._trimDue(m)) return;
+    const url = trimUrl(ownOriginal(m.original, this._id));
+    const life = this._trimLife;
+    const prev = this._trimAsked.get(id);
+    if (prev && prev.timer) clearTimeout(prev.timer);
+    this._trimAsked.set(id, { state: 'asking', retryAt: 0, timer: null });
+    this._trimForget(id);
+    let res = null;
+    let doc = null;
+    try {
+      res = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: '{}',
+      });
+      try { doc = await res.json(); } catch (_e) { doc = null; }
+    } catch (_e) {
+      res = null;
+    }
+    if (life !== this._trimLife) return;
+    const status = res ? res.status : 0;
+    const state = doc && typeof doc === 'object' && typeof doc.state === 'string' ? doc.state : '';
+    const err = doc && typeof doc === 'object' && typeof doc.error === 'string' ? doc.error : '';
+    // An older server: no such endpoint — a method it does not take, or a
+    // 404 that is not this endpoint's (the route fallback's {error: "not
+    // found"}, or no JSON at all). Quietly off for the page's life — the
+    // bubbles keep the deterministic text, which is a whole message.
+    if (status === 405 || status === 501 || (status === 404 && (!err || err === 'not found'))) {
+      this._trimOff = true;
+      this._trimAsked.set(id, { state: 'done', retryAt: 0, timer: null });
+      this._trimRelease();
+      return;
+    }
+    // The endpoint's own 404 is about this one mail — a token that names
+    // nothing here: it is not asked again, and the others stay watched.
+    if (status === 404) {
+      this._trimAsked.set(id, { state: 'done', retryAt: 0, timer: null });
+      return;
+    }
+    // The chat merged into another meanwhile: the page follows it there. A
+    // mail gone from the mailbox (a tombstone, an erased record) has nothing
+    // to trim, and the others stay watched; the poll brings its tombstone.
+    if (status === 410) {
+      // The body is read already; _whereGone is handed what it said.
+      const said = { status, json: async () => doc };
+      if ((await this._whereGone(said)) === 'moved' || life !== this._trimLife) return;
+      this._trimAsked.set(id, { state: 'done', retryAt: 0, timer: null });
+      return;
+    }
+    if (status === 200 && TRIM_SETTLED.has(state)) {
+      this._trimAsked.set(id, { state: 'done', retryAt: 0, timer: null });
+      this._trimApply(id, state, doc.text);
+      return;
+    }
+    if (status === 202 && TRIM_BUSY.has(state)) {
+      // A poll that came first may have brought the settled record already:
+      // then there is nothing on its way to show.
+      const cur = this._messages.find((x) => x && x.id === id);
+      if (!cur || cur.removed || cur.trim !== 'wanting') {
+        this._trimAsked.set(id, { state: 'done', retryAt: 0, timer: null });
+        return;
+      }
+      // The line goes when the text settles (a poll, _trimSettled) or, at
+      // the latest, after TRIM_STATUS_MS: a turn that failed without a word
+      // leaves the mail as it is, and the line must not say otherwise.
+      const a = { state: 'busy', retryAt: 0, timer: null };
+      a.timer = setTimeout(() => {
+        if (this._trimAsked.get(id) !== a) return;
+        a.state = 'done';
+        a.timer = null;
+        this._trimRedraw(id);
+      }, TRIM_STATUS_MS);
+      this._trimAsked.set(id, a);
+      this._trimRedraw(id);
+      return;
+    }
+    if (status === 200 && state === 'wanting') {
+      const s = Number(doc.retry_after);
+      const secs = Number.isFinite(s) && s >= 0
+        ? Math.min(TRIM_RETRY_MAX_S, Math.max(TRIM_RETRY_MIN_S, s)) : TRIM_RETRY_DEFAULT_S;
+      this._trimAsked.set(id, { state: 'retry', retryAt: Date.now() + secs * 1000, timer: null });
+      this._trimSweep();
+      return;
+    }
+    // No answer (offline, a 5xx): nothing was queued, and the mail may be
+    // asked for again in a while. Any other answer is the server's word that
+    // there is nothing to do here.
+    if (!res || status >= 500) {
+      this._trimAsked.set(id, { state: 'retry', retryAt: Date.now() + TRIM_ERROR_RETRY_MS, timer: null });
+      this._trimSweep();
+      return;
+    }
+    this._trimAsked.set(id, { state: 'done', retryAt: 0, timer: null });
+  }
+
+  // A settled trim from the request's own answer onto the bubble, as the
+  // poll would bring it: in place, by _reconcileChanged. Only over a bubble
+  // that is still `wanting` — a poll that came first already brought the
+  // record — and held over a poll that left before the settle (_trimHold).
+  _trimApply(id, state, text) {
+    const cur = this._messages.find((x) => x && x.id === id);
+    if (!cur || cur.removed || cur.trim !== 'wanting') return;
+    const next = { ...cur, trim: state, text: typeof text === 'string' ? text : (cur.text || '') };
+    this._trimHeld.set(id, { from: cur.text || '', text: next.text, trim: state });
+    this._reconcileChanged(next, this._atBottom());
+  }
+
+  // One polled message against a settle this page learned first: the record
+  // the poll read can be older than the answer, still `wanting` with the text
+  // the settle replaced — then the settled text stands. Any other record (it
+  // settled, or changed in some other way) is the server's newer word, and
+  // the hold ends.
+  _trimHold(m) {
+    const held = m && this._trimHeld.get(m.id);
+    if (!held) return m;
+    if (m.trim === 'wanting' && !m.removed && (m.text || '') === held.from) {
+      return { ...m, text: held.text, trim: held.trim };
+    }
+    this._trimHeld.delete(m.id);
+    return m;
+  }
+
+  // A changed record of a mail whose trim is on its way (_reconcileChanged,
+  // before the bubble is drawn again): settled, or its text changed, the
+  // turn is over as far as the page is concerned.
+  _trimSettled(old, m) {
+    const a = this._trimAsked.get(m.id);
+    if (!a || a.state !== 'busy') return;
+    if (m.trim === 'wanting' && !m.removed && (m.text || '') === (old.text || '')) return;
+    if (a.timer) clearTimeout(a.timer);
+    a.timer = null;
+    a.state = 'done';
+  }
+
+  // The status line put into the bubble on screen, or taken out of it, as
+  // _trimBusy now says — the bubble's own node, never one drawn anew: a
+  // selection in it, the focus and every frame stay as they are, and the
+  // reader keeps their place (the bottom, or the message they look at).
+  // Nothing at all while its Original is open, which shows no status line;
+  // _toggleOriginal draws the bubble from _trimBusy when it closes.
+  _trimRedraw(id) {
+    if (this._state !== 'ok' || this._origOpen.has(id)) return;
+    const thread = this.shadowRoot && this.shadowRoot.querySelector('[data-chat-thread]');
+    const node = this._bubbleNode(id);
+    if (!thread || !node) return;
+    const line = node.querySelector('.trim-state');
+    const busy = this._trimBusy(id);
+    if (!!line === busy) return;
+    const at = busy ? node.querySelector(TRIM_STATE_BEFORE) : null;
+    if (busy && !at) return;
+    const loc = this._atBottom() ? null : this._mirrorLocation();
+    if (line) line.remove();
+    else at.insertAdjacentHTML('beforebegin', TRIM_STATE_HTML);
+    if (!loc) thread.scrollTop = thread.scrollHeight;
+    else this._scrollMirrorTo(loc);
   }
 
   // ── Read state: the server's, followed; Mark as read ───────────────────────
@@ -2699,6 +3140,9 @@ class RetinueChatPage extends HTMLElement {
       this._scrollThread('[data-chat-thread]');
       this._setPane(this._pane, 'instant');
     }
+    // Every bubble is a new node now (or there is no thread at all): the
+    // watched ones are the ones that still want a trim (_trimSweep).
+    this._trimSweep();
     // A full render replaces the shadow DOM wholesale; an open lightbox (its
     // node lives beside .page) survives by being re-appended.
     if (this._lightbox) this._renderLightbox();
@@ -3340,7 +3784,10 @@ class RetinueChatPage extends HTMLElement {
     } else {
       const media = (m.attachments || []).map((a) => this._attachmentHtml(a)).join('');
       const text = m.text ? `<span class="txt">${linkify(m.text)}</span>` : '';
-      body = media + text;
+      // A model trim on its way (_askTrim): one quiet line of the page's own
+      // words under the text — nothing of the server's answer is shown.
+      const tidy = mail && this._trimBusy(m.id) ? TRIM_STATE_HTML : '';
+      body = media + text + tidy;
     }
     // The control says what a press does now: show the whole mail, or give
     // the trimmed text back.
@@ -3444,7 +3891,11 @@ class RetinueChatPage extends HTMLElement {
     const atts = Array.isArray(doc.attachments)
       ? doc.attachments.filter((a) => a && typeof a === 'object').map((a) => this._attachmentHtml(a)).join('')
       : '';
-    return `<div class="orig">` +
+    // A bubble a model shortened says so here, where the user looks for the
+    // whole mail, and nowhere else.
+    const note = m.trim === 'model'
+      ? '<p class="orig-note">Shortened by a model &mdash; this is the full mail.</p>' : '';
+    return `<div class="orig">${note}` +
       (heads ? `<dl class="orig-heads">${heads}</dl>` : '') + raw + body +
       (atts ? `<div class="orig-atts">${atts}</div>` : '') + `</div>`;
   }
@@ -5619,6 +6070,7 @@ class RetinueChatPage extends HTMLElement {
     if (pend) pend.insertAdjacentHTML('beforebegin', html);
     else thread.insertAdjacentHTML('beforeend', html);
     thread.scrollTop = stick ? thread.scrollHeight : keep;
+    this._trimSweep();
   }
 
   // A transient line above the chat composer. The companion reports its own
@@ -5912,6 +6364,10 @@ const CSS = `
   .orig-html { display: block; width: 100%; height: 100%; border: 0; background: #fff; }
   .orig-text, .orig-none { overflow-wrap: anywhere; }
   .orig-none { margin: 0; font-style: italic; opacity: .8; }
+  /* A model's trim: the Original's one line saying the bubble was shortened
+     by one, and the quiet line under a text a turn is tidying. */
+  .orig-note { margin: 0; font-size: .74rem; font-style: italic; opacity: .8; }
+  .trim-state { margin-top: 3px; font-size: .72rem; font-style: italic; opacity: .7; }
   /* A mail removed in a mail client: an outline where the bubble was. */
   .msg.tomb .bubble, .msg.out.tomb .bubble {
     background: transparent; color: var(--muted, #8b93a3); font-size: .8rem;

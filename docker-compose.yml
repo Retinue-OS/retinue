@@ -484,6 +484,18 @@ services:
       - MAILBOX_OWED_KEEP_SECONDS
       - MAIL_ORIGINAL_MAX_BYTES
       - MAIL_ORIGINAL_INLINE_MAX_BYTES
+      # The model trim of a mail the deterministic trim left wanting
+      # (docs/dashboard.md, "The model trim"): on/off, its model (else the
+      # router tier), its timeout, turns a local day, the queue, the
+      # per-mail wait after a turn without a judgement and how many such
+      # turns a mail gets.
+      - MAIL_MODEL_TRIM
+      - MAIL_MODEL_TRIM_MODEL
+      - MAIL_MODEL_TRIM_TIMEOUT
+      - MAIL_MODEL_TRIM_DAILY_MAX
+      - MAIL_MODEL_TRIM_QUEUE
+      - MAIL_MODEL_TRIM_RETRY_SECONDS
+      - MAIL_MODEL_TRIM_ATTEMPTS
       - GATEWAY_HEALTH_TIMEOUT
       # Gateway auth (scripts/gateway_auth.py) beyond the three above.
       - GATEWAY_BASIC_AUTH_USERS
