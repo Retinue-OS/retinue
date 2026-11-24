@@ -1950,8 +1950,10 @@ def _finish_own_device_record(chat: str, text: str, msg_id: str | None,
     _record_outbound(chat, text, "device", message_id=msg_id, timestamp=ts,
                      attachment_urls=refs)
     if WHATSAPP_GATEWAY_MODE == "inbox":
-        # Chats rail: an own-device send advances the chat's read watermark on
-        # the dashboard (the user was visibly in that chat on their phone).
+        # Chats rail: an own-device send is the user's reply, and a reply
+        # reads the chat — so it advances the chat's read mark on the
+        # dashboard. (Opening or viewing a chat, here or on the phone, reads
+        # nothing.)
         _chats.notify_chat_event_async(
             direction="out", channel=INBOUND_CHANNEL, chat=chat,
             account=WHATSAPP_ACCOUNT, author="device", message_id=msg_id,

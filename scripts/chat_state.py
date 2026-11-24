@@ -22,8 +22,24 @@ The message history itself lives in the gateways' ledgers and is served over
 SPARQL; everything about a chat that is *not* a channel message lives here, in
 one JSON document per chat under ``CHAT_STATE_DIR``:
 
-- ``last_read`` — the user's read watermark (ISO-8601), from which unread
-  badges derive; only ever advances.
+- ``last_read`` — the user's read mark (ISO-8601): everything up to it has
+  been dealt with. It is set by a reply and by the explicit *Mark as read*,
+  never by opening the chat, and unread counts derive from it. It only ever
+  advances — with one guarded exception, the undo of a *Mark as read*
+  (:meth:`ChatStateStore.restore_last_read`).
+- ``inbound_seq`` / ``read_inbound`` — how many inbound messages have landed,
+  and how many of them the newest read covered. A timestamp says when a
+  message was stamped, by whichever clock stamped it; these two say in which
+  order things happened here, which is what decides whether a message came
+  after the user last dealt with the chat (:func:`arrived_since_read`). An
+  arrival is counted once: ``inbound_recent`` remembers the message ids of
+  the newest ones, so a rail event repeated for the same message is no second
+  arrival (:meth:`ChatStateStore.mark_unread`).
+- ``inbound_ahead`` / ``read_ahead`` — the latest stamp an arrival carried
+  from a little ahead of this clock, and how far past ``last_read`` the
+  newest read reaches by it: a message stamped by a clock running fast lies
+  beyond a mark made after it landed, and a read of the chat as it stands
+  covers it all the same (:func:`read_cut`).
 - ``draft`` — the shared text area both the user and an agent compose into:
   ``{text, author, agent?, ts, version}``. Writes are version-guarded (the
   project-file sha-guard precedent): a writer names the version it based its
@@ -90,6 +106,22 @@ GATEWAY_SOURCE_ACCOUNT = "account"
 # cannot resurface long after the user has moved on.
 UNDO_CLEAR_MAX_AGE = 300.0
 
+# How far ahead of this clock a stamp may lie and still be a clock's error
+# rather than an instant nothing can vouch for: a phone running a little
+# fast. An arrival stamped within this reach is remembered by its stamp, so
+# that a read of the chat as it stands covers it (ChatStateStore.mark_unread,
+# _read_up_to), and a client may name its "now" from as far (the web
+# gateway's read endpoint).
+READ_SKEW_SECONDS = 120.0
+
+# How many of a chat's newest arrivals are remembered by message id, to tell
+# a repeated rail event from a new message (ChatStateStore.mark_unread). A
+# repeat follows its original within seconds (a gateway's one retry on a
+# timeout) or, where a gateway redelivers what it was never told was taken,
+# a few messages later; this is far more than either needs, and small enough
+# to ride in every state write.
+INBOUND_RECENT_MAX = 64
+
 _ISO_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$")
 
 
@@ -111,6 +143,49 @@ def iso_z(ts: float | str | None = None) -> str:
                 .isoformat(timespec="seconds").replace("+00:00", "Z"))
     except ValueError:
         return iso_z(None)
+
+
+def arrived_since_read(doc: dict | None) -> int:
+    """How many inbound messages have landed since the chat's newest read (a
+    reply, or *Mark as read*) — unread ones, every one of them, whatever their
+    timestamps say.
+
+    The read mark is an instant and unread counts are taken by comparing
+    stamps with it, which goes wrong exactly when a message's stamp is not
+    when it landed: a delayed webhook delivers one stamped minutes ago, a
+    sender's clock runs slow, or the message lands in the mark's own second.
+    All of those are stamped at or before a mark they arrived after, and no
+    count by timestamp finds them. The arrival count does, so a caller takes
+    the larger of the two (the web gateway's _chats_payload).
+
+    0 for a chat never read, and for a document from before ``read_inbound``
+    existed: with nothing recorded there the timestamps alone decide."""
+    covered = (doc or {}).get("read_inbound")
+    if covered is None:
+        return 0
+    return max(0, int((doc or {}).get("inbound_seq") or 0) - int(covered))
+
+
+def arrival_seq(doc: dict | None, message_id: str | None) -> int:
+    """The place in the chat's arrival count of the message with this id, as
+    :meth:`ChatStateStore.mark_unread` counted it: its own, also when the
+    event that asks is a repeat and newer messages have been counted since.
+    For a message that carries no id, or one no longer remembered, the count
+    as it stands — every such event is an arrival of its own."""
+    if message_id:
+        for pair in reversed((doc or {}).get("inbound_recent") or []):
+            if isinstance(pair, list) and len(pair) == 2 and pair[0] == message_id:
+                return int(pair[1])
+    return int((doc or {}).get("inbound_seq") or 0)
+
+
+def read_cut(doc: dict | None) -> str:
+    """The stamp up to which the chat's own reads cover its messages, "" for
+    a chat never read: the read mark, or — where the newest read reached past
+    it to a message stamped ahead of this clock — that stamp (``read_ahead``).
+    What a count by timestamp compares with; ``last_read`` itself stays the
+    instant the read happened at."""
+    return max((doc or {}).get("last_read") or "", (doc or {}).get("read_ahead") or "")
 
 
 # Marker opening an id's optional account segment. A chat id is
@@ -245,12 +320,35 @@ class ChatStateStore:
             # state document is readable on its own; the id stays the truth.
             "account": parts[1],
             "key": parts[2],
+            # The read mark: the user replied, or said "read", up to here.
+            # Looking at a chat moves nothing — see advance_last_read.
             "last_read": None,
             # How many reads advance_last_read has taken, whether or not the
-            # watermark moved: a read is an event even when its whole-second
+            # mark moved: a read is an event even when its whole-second
             # mark equals the one held (see the web gateway's
             # _instructed_read_since).
             "read_seq": 0,
+            # The arrival count (``inbound_seq``) the newest read covered:
+            # whatever has been counted since landed after it and is unread
+            # (see arrived_since_read). None until the chat is first read.
+            "read_inbound": None,
+            # How far past ``last_read`` the newest read reaches, by the
+            # stamps of the messages it covered: ``inbound_ahead`` as a read
+            # of the chat as it stands found it, where that lies later than
+            # the mark. None otherwise — nearly always. See _read_up_to and
+            # read_cut.
+            "read_ahead": None,
+            # What the newest *Mark as read* replaced beside the mark, as
+            # ``{"read_inbound": …, "read_ahead": …}``, so that its undo puts
+            # both back; None when there is nothing to undo — never marked,
+            # the mark undone already, or a reply since (which no undo
+            # reaches behind). See restore_last_read.
+            "read_undo": None,
+            # What the newest *Mark as read* settled: the ``done_at`` of the
+            # attention item it marked done, or None when it settled nothing.
+            # Kept so that undoing that mark reopens exactly the item it
+            # closed and no other (see set_read_settled).
+            "read_settled": None,
             "draft": None,
             # What the newest clear removed, kept so it can be put back exactly
             # — see set_draft and undo_clear. None when nothing is recoverable.
@@ -287,6 +385,19 @@ class ChatStateStore:
             # archive_unless_arrived).
             "inbound_seq": 0,
             "attended_seq": 0,
+            # The newest counted arrivals that carried a message id, oldest
+            # first, each as ``[message id, its inbound_seq]`` — at most
+            # INBOUND_RECENT_MAX. What makes a repeated rail event for one
+            # message a repeat and not a second arrival, also across a
+            # restart of the web gateway (see mark_unread, arrival_seq).
+            "inbound_recent": [],
+            # The latest stamp a counted arrival carried from ahead of this
+            # clock, no further than READ_SKEW_SECONDS: a sender's clock, or
+            # a receiving phone's, running a little fast. The rail takes
+            # such a stamp as now for the overlay, but the ledger record
+            # keeps it, and a read has to reach it (``read_ahead``). None
+            # for a chat no such message has landed in.
+            "inbound_ahead": None,
             # Whether the last arrival's sender is one the dashboard knows
             # nothing about from the rail: True for a direct message from
             # anyone who is not a VIP, False for a VIP, None for a group or
@@ -537,35 +648,230 @@ class ChatStateStore:
             self._write(doc)
             return doc
 
-    def advance_last_read(self, chat_id: str, ts: str | float | None) -> dict:
-        """Advance the read watermark — forward only, so a stale client (or an
-        out-of-order echo) can never resurrect already-read messages."""
-        mark = iso_z(ts)
+    def advance_last_read(self, chat_id: str, ts: str | float | None, *,
+                          everything: bool = False) -> dict:
+        """Advance the read mark for the user's own reply — forward only, so
+        a stale client (or an out-of-order echo) can never resurrect
+        already-read messages.
+
+        A reply is one of the two things that make a chat read, the explicit
+        *Mark as read* (:meth:`mark_read`) being the other. Opening a chat
+        calls nothing. ``ts`` is when the reply was written; ``everything``
+        says it was written here and now (the dashboard's own send), so it
+        answers every message that has landed, whatever clock stamped it. An
+        echo from the user's device is taken by its stamp instead — see
+        :meth:`_read_up_to`. No undo reaches behind a reply, so the record
+        of the newest mark's undo is dropped."""
         with self._lock:
             doc = self._read(chat_id)
-            if doc["last_read"] is None or mark > doc["last_read"]:
-                doc["last_read"] = mark
-            doc["read_seq"] = int(doc.get("read_seq") or 0) + 1
-            if doc.get("unread_since") and doc["last_read"] >= doc["unread_since"]:
-                doc["unread_since"] = None
+            if self._read_up_to(doc, iso_z(ts), everything=everything):
+                doc["read_undo"] = None
             self._write(doc)
             return doc
 
-    def mark_unread(self, chat_id: str, ts: str | float | None) -> tuple[dict, bool]:
+    @staticmethod
+    def _read_up_to(doc: dict, instant: str, *, everything: bool,
+                    cap: str | None = None) -> bool:
+        """One read, applied to ``doc``: the mark moves forward to
+        ``instant`` (never back, and no further than ``cap`` where one is
+        given), the read is counted, and — where this read covers the
+        messages that have landed so far — ``read_inbound`` takes the arrival
+        count. Returns whether it covered them.
+
+        It does when it reads ``everything``, and otherwise when its instant
+        is not behind the mark it found: a read naming an older instant (a
+        stale client, a late echo of an old reply) says nothing about what
+        landed after the newer read, and must not hide it.
+
+        A read of ``everything`` also reaches the one message the mark
+        cannot: an arrival stamped a little ahead of this clock
+        (``inbound_ahead``), whose ledger record lies later than a mark made
+        after it landed. Its stamp is kept beside the mark as ``read_ahead``
+        — not in it: the mark stays the instant the read happened at, so
+        that what a later reply or mark is compared with is a time of this
+        clock. A read up to a named instant reaches no further than that
+        instant: the stamp where the instant is not short of it (a caller
+        naming the stamp of the message it showed, which the mark itself is
+        not lifted to), and otherwise ``read_ahead`` stays as it was found.
+        Either way it is dropped once the mark has passed it."""
+        previous = doc["last_read"]
+        mark = instant if cap is None else min(instant, cap)
+        if previous is None or mark > previous:
+            doc["last_read"] = mark
+        doc["read_seq"] = int(doc.get("read_seq") or 0) + 1
+        covers = everything or previous is None or instant >= previous
+        if covers:
+            doc["read_inbound"] = int(doc.get("inbound_seq") or 0)
+        ahead = doc.get("inbound_ahead") or ""
+        if everything or ahead <= instant:
+            doc["read_ahead"] = ahead or None
+        if (doc.get("read_ahead") or "") <= doc["last_read"]:
+            doc["read_ahead"] = None
+        if doc.get("unread_since") and (everything
+                                        or doc["last_read"] >= doc["unread_since"]):
+            doc["unread_since"] = None
+        return covers
+
+    def mark_read(self, chat_id: str,
+                  ts: str | float | None = None) -> tuple[dict, str | None]:
+        """*Mark as read*: ``(doc, previous)``, ``previous`` being the mark
+        before this call — None for a chat never read. The pair is what an
+        undo hands back to :meth:`restore_last_read`, so it is taken under
+        the same lock as the write it describes.
+
+        Without ``ts`` the chat is read as it stands: the mark moves to this
+        clock's now, and every message that has landed is covered, whatever
+        its stamp. With one it is read up to that instant, forward only —
+        what is stamped later stays unread.
+
+        Either way the mark is never set past this clock's now. A read cannot
+        have happened later than that, and an instant from ahead of it — the
+        stamp of a message from a fast clock, named by a client — would
+        stand as the cut-off for whatever arrives until then. Such a
+        message, where the mark covers it, is covered beside the mark
+        instead (``read_ahead``, see :meth:`_read_up_to`). (A reply is
+        different: :meth:`advance_last_read` keeps the instant it was
+        written at, which is the reply's own place in the conversation.)"""
+        return self.mark_read_unless_arrived(chat_id, ts, None)[1:]
+
+    def mark_read_unless_arrived(self, chat_id: str, ts: str | float | None,
+                                 seen: int | None) -> tuple[bool, dict, str | None]:
+        """:meth:`mark_read` by a caller that says what it showed the user:
+        ``seen`` is the ``inbound_seq`` its view of the chat carried. Returns
+        ``(marked, doc, previous)``.
+
+        A message that has landed since (``inbound_seq`` past ``seen``) is
+        one the user was never shown, and "read" was not said about it: the
+        mark is refused and nothing is written. One decision under the lock,
+        like :meth:`archive_unless_arrived` — an arrival counts itself under
+        the same lock, so either it is seen here or it lands after the mark
+        and is unread by its place in the count. ``seen`` None marks
+        unconditionally."""
+        now = iso_z()
+        instant = now if ts is None else iso_z(ts)
+        with self._lock:
+            doc = self._read(chat_id)
+            if seen is not None and int(doc.get("inbound_seq") or 0) > seen:
+                return False, doc, doc["last_read"]
+            previous = doc["last_read"]
+            found = {"read_inbound": doc.get("read_inbound"),
+                     "read_ahead": doc.get("read_ahead")}
+            if self._read_up_to(doc, instant, everything=ts is None, cap=now):
+                doc["read_undo"] = found
+            self._write(doc)
+            return True, doc, previous
+
+    def restore_last_read(self, chat_id: str, *, restore: str | None,
+                          marked: str) -> tuple[bool, dict]:
+        """Undo a *Mark as read*: put the mark back to ``restore`` (None for
+        a chat that had none) — the one way ``last_read`` ever moves
+        backwards. Returns ``(restored, doc)``.
+
+        Guarded twice, because moving this mark back resurrects messages as
+        unread. It happens only while the mark is still exactly ``marked``,
+        the value the call being undone answered: a reply or a later mark in
+        between has said something newer about the chat, and an undo that
+        arrives after it must not take that back (refused, nothing changes).
+        And ``restore`` may not lie past ``marked``, which would be an
+        advance wearing the undo's name — that raises ValueError.
+
+        ``read_inbound`` and ``read_ahead`` go back with the mark, to what
+        the mark being undone found (``read_undo``): the messages that had
+        landed unread before it are unread again, with any that came since —
+        one stamped ahead of this clock among them. Where a reply fell into
+        the mark's own second — the one way past the first guard — nothing
+        is recorded to put back, and the reply's cover stands.
+
+        ``read_seq`` stays: it counts reads, and the read that is being
+        undone happened. ``unread_since`` is not put back either; the next
+        arrival sets it afresh."""
+        marked = iso_z(marked)
+        if restore is not None:
+            restore = iso_z(restore)
+            if restore > marked:
+                raise ValueError("restore must not be later than the mark it undoes")
+        with self._lock:
+            doc = self._read(chat_id)
+            if doc["last_read"] != marked:
+                return False, doc
+            doc["last_read"] = restore
+            undo = doc.get("read_undo")
+            if isinstance(undo, dict):
+                doc["read_inbound"] = undo.get("read_inbound")
+                # (A record written before ``read_ahead`` existed holds none:
+                # the mark it describes changed none.)
+                if "read_ahead" in undo:
+                    doc["read_ahead"] = undo["read_ahead"]
+            doc["read_undo"] = None
+            self._write(doc)
+            return True, doc
+
+    def set_read_settled(self, chat_id: str, done_at: str | None) -> dict:
+        """Record — or clear, with None — which attention item the newest
+        *Mark as read* settled, by that item's ``done_at``.
+
+        The mark and the item are settled in two steps (the web-gateway first
+        has to see whether the mark left anything unread), and an undo comes
+        as a separate request, so the link between them has to be stored. An
+        identity rather than a flag: an item that was reopened by a new
+        message and settled again by something else carries another
+        ``done_at``, and undoing the old mark then leaves it alone."""
+        with self._lock:
+            doc = self._read(chat_id)
+            doc["read_settled"] = done_at or None
+            self._write(doc)
+            return doc
+
+    def mark_unread(self, chat_id: str, ts: str | float | None, *,
+                    message_id: str | None = None,
+                    stamp: str | float | None = None) -> tuple[dict, bool]:
         """Note one inbound landing unread; returns ``(doc, had_unread)``.
 
         ``had_unread`` says whether the chat already held unread messages
         *before* this one — the notification-mode split (False = "new",
         True = "reply") without querying the store on the hot path.
 
-        Every call counts the arrival (``inbound_seq``), read or not."""
+        Every message counts as an arrival (``inbound_seq``), read or not —
+        and the count is what makes it unread: past ``read_inbound`` it
+        landed after the newest read, wherever its stamp puts it
+        (:func:`arrived_since_read`).
+
+        Every message, not every call: the rail delivers at least once (a
+        gateway retries a POST that timed out, and redelivers what it was
+        never told was taken), and a second event for one message is no
+        second arrival. ``message_id`` is what tells: one that is among the
+        chat's newest counted arrivals (``inbound_recent``) is a repeat, and
+        nothing is counted or written for it — ``had_unread`` is then
+        simply how the chat stands, and :func:`arrival_seq` gives the place
+        the message was counted at. The record is in the document, so the
+        answer is the same after a restart. An event without an id cannot
+        be told from a new message and is counted.
+
+        ``stamp`` is the message's own stamp where ``ts`` is not it — the
+        rail hands on a stamp from ahead of this clock as now. One that lies
+        ahead by no more than READ_SKEW_SECONDS is kept as
+        ``inbound_ahead``, for the read that covers this message
+        (:meth:`_read_up_to`); one further ahead is no clock's error anyone
+        can vouch for, and is not."""
         mark = iso_z(ts)
+        stamp = mark if stamp is None else iso_z(stamp)
+        now = time.time()
         with self._lock:
             doc = self._read(chat_id)
             had_unread = bool(doc.get("unread_since"))
+            recent = [pair for pair in doc.get("inbound_recent") or []
+                      if isinstance(pair, list) and len(pair) == 2]
+            if message_id and any(mid == message_id for mid, _seq in recent):
+                return doc, had_unread
             if not had_unread:
                 doc["unread_since"] = mark
             doc["inbound_seq"] = int(doc.get("inbound_seq") or 0) + 1
+            if message_id:
+                recent.append([message_id, doc["inbound_seq"]])
+                doc["inbound_recent"] = recent[-INBOUND_RECENT_MAX:]
+            if (iso_z(now) < stamp <= iso_z(now + READ_SKEW_SECONDS)
+                    and stamp > (doc.get("inbound_ahead") or "")):
+                doc["inbound_ahead"] = stamp
             self._write(doc)
             return doc, had_unread
 

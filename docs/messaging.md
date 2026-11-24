@@ -294,6 +294,14 @@ Two deliberate differences from the other channels:
   `SMS_WEBHOOK_SIGNING_KEY` is unset. Redeliveries are deduplicated by message
   id. The gateway registers the webhook with the server itself at startup.
 
+For the chat mirror this means two things. The gateway hears only
+`sms:received`, so an SMS the user sends from the phone's own SMS app is not
+seen: such a chat stays *Unread* on the dashboard until it is answered from
+there or marked read (docs/messenger-chats.md, "Unread · Read · Archived").
+And a received SMS carries the phone's receipt time, which a delayed or
+retried webhook delivers later — it is unread by the order it arrived in,
+whatever that stamp says.
+
 **Setup.**
 
 1. In `.env`: `COMPOSE_PROFILES=sms`, `SMS_GATEWAY_BASE_URL=http://sms-gateway:8095`

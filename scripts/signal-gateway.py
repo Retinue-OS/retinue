@@ -1592,8 +1592,10 @@ def _record_sync_sent(sent: dict) -> None:
                      timestamp=(int(ts) / 1000.0) if ts else None,
                      attachment_urls=attachment_urls)
     if SIGNAL_GATEWAY_MODE == "inbox":
-        # Chats rail: an own-device send advances the chat's read watermark on
-        # the dashboard (the user was visibly in that chat on their phone).
+        # Chats rail: an own-device send is the user's reply, and a reply
+        # reads the chat — so it advances the chat's read mark on the
+        # dashboard. (Opening or viewing a chat, here or on the phone, reads
+        # nothing.)
         _notify_chat_event_async(
             group_id=str(group_id) if group_id else None,
             direction="out", channel=INBOUND_CHANNEL, chat=chat,

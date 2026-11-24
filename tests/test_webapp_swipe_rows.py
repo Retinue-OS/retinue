@@ -17,7 +17,12 @@ events, and pins what a finger feels:
   * Delete arms on the first tap and confirms on the second;
   * a rebuild of the list keeps an open tray open and an armed Delete armed;
   * no gesture starts while a write is on the wire, and `dragging` tells a
-    list not to re-render under a finger.
+    list not to re-render under a finger;
+  * the chats page's opt-ins leave all of the above alone where a row does
+    not carry them: a row with `data-quick-left` commits that action on a
+    swipe left past the same threshold (over its own layer, never the tray,
+    which a long press still opens), and a row without `data-quick` does not
+    move to the right at all.
 
 Also: starredFirst (base.js) puts starred rows first and keeps each group's
 order, and neither list carries a copy of the gesture of its own.
@@ -114,6 +119,33 @@ function list(ids) {
     root.append(li);
   }
   return { host, root };
+}
+// Rows of the chats page's Unread and Read tabs: a committing swipe left
+// (data-quick-left), and on Read no swipe right (no data-quick).
+function leftList(ids, { quick = 'read' } = {}) {
+  const host = new El('section', 'host');
+  const root = new El('div', 'tabs');
+  host.append(root);
+  for (const id of ids) {
+    const li = new El('div', 'swipe', ROW_W);
+    li.dataset.id = id;
+    if (quick) li.dataset.quick = quick;
+    li.dataset.quickLeft = 'archive';
+    const tray = new El('div', 'tray', TRAY_W).append(new El('button', 'star'), new El('button', 'mute'));
+    li.append(new El('div', 'quick read'), new El('div', 'quick-left archive'), tray, new El('button', 'row'));
+    root.append(li);
+  }
+  return { host, root };
+}
+function setupLeft(ids = ['a', 'b'], opts = {}) {
+  const calls = { quick: [], tap: [] };
+  const { host, root } = leftList(ids, opts);
+  const swipe = new SwipeRows(host, {
+    onQuick: (id, action) => calls.quick.push([id, action]),
+    onTap: (id) => calls.tap.push(id),
+  });
+  swipe.wire(root);
+  return { swipe, root, host, calls };
 }
 const rowOf = (root, id) => root.querySelectorAll('.swipe').find((el) => el.dataset.id === id);
 function swipe(li, dx, dy = 0) {
@@ -343,6 +375,93 @@ await check('no gesture starts while a write is on the wire', async () => {
   await sleep(200);
   assert.deepEqual(calls.quick, [['a', 'archive']]);
   assert.equal(s.dragging, false);
+});
+
+await check('on a row without the opt-in a swipe left never commits', async () => {
+  const { root, calls, swipe: s } = setup();
+  swipe(rowOf(root, 'a'), -300);
+  await sleep(200);
+  assert.deepEqual(calls.quick, [], 'it opened the tray instead');
+  assert.equal(s.openId, 'a');
+});
+
+await check('data-quick-left: a swipe left past the threshold commits that action', async () => {
+  const { root, calls, swipe: s } = setupLeft();
+  const li = rowOf(root, 'b');
+  const row = li.querySelector('.row');
+  row.fire('pointerdown', { clientX: 300, clientY: 100 });
+  row.fire('pointermove', { clientX: 280, clientY: 100 });
+  row.fire('pointermove', { clientX: 160, clientY: 100 });
+  assert.equal(row.style.transform, 'translateX(-140px)', 'no tray resistance on this side');
+  assert.ok(li.classList.contains('show-quick-left'), 'its own layer shows under it');
+  assert.ok(!li.classList.contains('show-tray'), 'the tray stays hidden');
+  row.fire('pointerup', { clientX: 160, clientY: 100 });
+  assert.equal(row.style.transform, `translateX(${-ROW_W}px)`, 'the row slides out to the left');
+  assert.equal(s.openId, null, 'no tray opened');
+  await sleep(200);
+  assert.deepEqual(calls.quick, [['b', 'archive']]);
+});
+
+await check('data-quick-left: the left side runs to most of the row, as the right does', async () => {
+  const { root } = setupLeft();
+  const li = rowOf(root, 'a');
+  const row = li.querySelector('.row');
+  row.fire('pointerdown', { clientX: 350, clientY: 100 });
+  row.fire('pointermove', { clientX: 330, clientY: 100 });
+  row.fire('pointermove', { clientX: 0, clientY: 100 });
+  assert.equal(row.style.transform, `translateX(${-ROW_W * 0.8}px)`);
+});
+
+await check('data-quick-left: a shorter swipe left snaps back and opens nothing', async () => {
+  const { root, calls, swipe: s } = setupLeft();
+  const li = rowOf(root, 'a');
+  const row = swipe(li, -(TRAY_W / 2 + 20));  // would open a tray on a plain row
+  assert.equal(row.style.transform, '');
+  assert.ok(!li.classList.contains('show-quick-left'));
+  assert.equal(s.openId, null);
+  await sleep(200);
+  assert.deepEqual(calls.quick, []);
+});
+
+await check('data-quick-left: the right side still commits data-quick', async () => {
+  const { root, calls } = setupLeft();
+  swipe(rowOf(root, 'a'), 200);
+  await sleep(200);
+  assert.deepEqual(calls.quick, [['a', 'read']]);
+});
+
+await check('data-quick-left: a long press still opens the tray, and a drag then moves the tray', async () => {
+  const { root, calls, swipe: s } = setupLeft();
+  const li = rowOf(root, 'a');
+  const row = li.querySelector('.row');
+  row.fire('contextmenu', { pointerType: 'touch', button: 0 });
+  assert.equal(s.openId, 'a');
+  assert.ok(li.classList.contains('show-tray') && !li.classList.contains('show-quick-left'));
+  row.fire('pointerdown', { clientX: 300, clientY: 100 });
+  row.fire('pointermove', { clientX: 280, clientY: 100 });
+  row.fire('pointermove', { clientX: 220, clientY: 100 });
+  assert.equal(row.style.transform, `translateX(${-TRAY_W - 20}px)`, 'past the open tray it resists');
+  row.fire('pointerup', { clientX: 220, clientY: 100 });
+  assert.equal(s.openId, 'a', 'and the tray stays open');
+  await sleep(200);
+  assert.deepEqual(calls.quick, [], 'nothing committed from an open tray');
+});
+
+await check('no data-quick: the row does not move right and commits nothing there', async () => {
+  const { root, calls } = setupLeft(['a'], { quick: '' });
+  const li = rowOf(root, 'a');
+  const row = li.querySelector('.row');
+  row.fire('pointerdown', { clientX: 100, clientY: 100 });
+  row.fire('pointermove', { clientX: 120, clientY: 100 });
+  row.fire('pointermove', { clientX: 300, clientY: 100 });
+  assert.equal(row.style.transform, '', 'held at rest');
+  assert.ok(!li.classList.contains('show-quick'));
+  row.fire('pointerup', { clientX: 300, clientY: 100 });
+  await sleep(200);
+  assert.deepEqual(calls.quick, []);
+  swipe(li, -200);
+  await sleep(200);
+  assert.deepEqual(calls.quick, [['a', 'archive']], 'the left side still commits');
 });
 
 await check('starredFirst: starred rows lead, each group keeps its order', async () => {
