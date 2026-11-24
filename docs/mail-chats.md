@@ -357,11 +357,26 @@ the mails, every time they are looked for: a folder may hold several mails
 under one id, all of them are looked at, and the placeholder's own copy may
 be the older one — after a move to the archive, or a folder renumbered.
 
+A mail whose record is written again — a placeholder that reads, a mail on
+record from its INBOX copy whose Sent copy shows, a tombstone whose mail is
+back — gets its new record in the old one's place, in one step, and only
+once that is written: until then, should writing fail for an hour or the
+process be stopped, the old record stands as it was, and its mail is followed
+like any (and tombstoned like any, if it leaves). A placeholder gives way only
+to the mail its record keeps the header block of; a UID is taken to be the
+mail the index has there only while its folder's `UIDVALIDITY` is the one it
+was recorded under. And a mail whose record is gone from the ledger (restored
+from a backup, a file lost) is known no more: it is read again where it lies,
+as any mail is read the first time — what a Sent copy holds is the user's,
+what is in the archive is the user's when it is from one of the user's own
+addresses — and nothing that was known of the record is carried over to
+whatever mail is found under its id.
+
 The bookkeeping behind this keeps four rules, written out above `class
 Mirror` in the gateway: an answer that was not obtained is never an answer; a
-record is replaced or buried only on evidence about its own mail; what is
-known of a mail — its direction above all — stays with it until its record
-stands again; and a fault delays only the work that failed.
+record is replaced or buried only on evidence about its own mail; a record
+stands until what replaces it does; and a fault delays only the work that
+failed.
 
 **Whose fault a failure is, is decided by what failed.** *Reading* a mail —
 the parse, the walk of its parts, the trim — fails on the mail's account when
@@ -381,11 +396,9 @@ mail at a time with `/health` still `connected`: the pass ends there. No mail
 is set aside or marked over it, and no folder's mark moves past a mail that
 has neither a record nor a place — so the next pass reads it again, after a
 restart too, and if it has left for the archive by then it is read there, as a
-mail that came and went. A mail whose record was dropped to be written anew
-and then could not be — or whose record is gone from the ledger — keeps its
-row and its places meanwhile: it is followed like any mail, in whichever
-folder it lies, and read again from there as what it was, outbound mail as
-outbound. `/health` reports `connected: false` with `blocked: "mirror"`
+mail that came and went. A mail whose record is to be written again and
+cannot be keeps the record it has meanwhile (see above). `/health` reports
+`connected: false` with `blocked: "mirror"`
 meanwhile, and `error` says on what — naming the mail, where the pass stopped
 at one. A fault delays only the work it was in. Following the folders — new
 mail, vanished mail — is done first and by itself, every poll interval; when

@@ -363,7 +363,9 @@ def test_listing_fetching_and_finding():
 
             raw = server.folders["INBOX"]["mails"][3]["raw"]
             got = box.fetch("INBOX", 3)
-            assert got == gw.Fetched(raw, len(raw), frozenset({"\\Seen"}), t.T0 + 3 * t.DAY)
+            # (With the UIDVALIDITY the folder was opened under: the UID is
+            # this mail under that one only.)
+            assert got == gw.Fetched(raw, len(raw), frozenset({"\\Seen"}), t.T0 + 3 * t.DAY, 7)
             assert box.fetch("INBOX", 4).flags == frozenset()
             assert box.fetch("INBOX", 2) is None and box.fetch("INBOX", 77) is None
             # A capped fetch: the head of the mail, and the whole mail's size.
@@ -377,6 +379,14 @@ def test_listing_fetching_and_finding():
             assert box.fetch("INBOX", 3) == got
             server.flags_after_body = False
             assert box.fetch("INBOX", 3) == got
+            # A folder rebuilt under a new UIDVALIDITY: a fetch once it is
+            # opened again says so, and a listing does too.
+            server.folders["INBOX"]["validity"] = 8
+            assert box.list_uids("INBOX").uidvalidity == 8
+            assert box.fetch("INBOX", 3).uidvalidity == 8
+            assert box.fetch("Sent", 1) is None and box.fetch("INBOX", 3).uidvalidity == 8
+            server.folders["INBOX"]["validity"] = 7
+            box.list_uids("INBOX")
             assert box.list_uids("INBOX", dates=True).uids[5] == t.T0 + 5 * t.DAY
             server.unsolicited = False
 

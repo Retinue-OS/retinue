@@ -159,6 +159,16 @@ class FakeMailbox:
         box["mails"] = {uid + offset: mail for uid, mail in box["mails"].items()}
         box["next"] += offset
 
+    def rebuild(self, folder) -> None:
+        """The folder rebuilt by the server: a UIDVALIDITY change, and the
+        same mails under UIDs handed out afresh from 1 — so an old UID may
+        hold another mail now."""
+        box = self.boxes[folder]
+        box["validity"] += 1
+        box["mails"] = {n: mail for n, (_uid, mail) in
+                        enumerate(sorted(box["mails"].items()), start=1)}
+        box["next"] = len(box["mails"]) + 1
+
     def uids_of(self, folder, message_id) -> tuple:
         """Every UID in ``folder`` under this Message-ID, newest first."""
         return tuple(
@@ -211,12 +221,13 @@ class FakeMailbox:
     def fetch(self, folder, uid, limit=None):
         self._check(folder)
         self.fetched.append((folder, uid, limit))
-        mail = self.boxes.get(folder, {"mails": {}})["mails"].get(uid)
+        box = self.boxes.get(folder, {"mails": {}, "validity": None})
+        mail = box["mails"].get(uid)
         if mail is None:
             return None
         raw = mail["raw"]
         return self.gw.Fetched(raw[:limit] if limit else raw, len(raw),
-                               mail["flags"], mail["date"])
+                               mail["flags"], mail["date"], box["validity"])
 
     def find(self, folder, message_id):
         self._check(folder)

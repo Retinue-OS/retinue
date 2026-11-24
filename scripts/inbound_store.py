@@ -747,6 +747,33 @@ def _record_blob_meta(store_dir, fields: dict, content_ids) -> dict:
     return meta
 
 
+_RECORD_NAME_RE = re.compile(r"^\d{16}-([0-9a-f]{16})\.nt$")
+
+
+def _replacing(store_dir, replace, ts: float) -> tuple[str, Path]:
+    """The token and the file of a record about to be written.
+
+    A new record gets a file of its own. Filename: zero-padded epoch millis
+    (sortable) + token (unique, IRI-safe). With ``replace`` — a record of
+    this store, by its path — the new record takes that one's place instead:
+    its file name and its token, written in one atomic rename (as every
+    record is), so the file holds the old record or the new one and never
+    neither — whatever stops the write, the old record still stands. Its
+    blobs are not touched: the ones the new record no longer names are the
+    caller's to unlink (:func:`discard_media`), once it stands. ``replace``
+    must name a record in this store's ``messages/``; anything else is a
+    programming error and raises ``ValueError``."""
+    if replace is None:
+        token = secrets.token_hex(8)
+        return token, messages_dir(store_dir) / f"{int(ts * 1000):016d}-{token}.nt"
+    path = Path(replace)
+    named = _RECORD_NAME_RE.match(path.name)
+    if not named or path.parent.resolve() != messages_dir(store_dir).resolve() \
+            or not path.is_file():
+        raise ValueError(f"not a record of this store: {replace}")
+    return named.group(1), path
+
+
 # -- public API ---------------------------------------------------------------
 
 def write_message(
@@ -776,6 +803,7 @@ def write_message(
     trim: str | None = None,
     content_ids: dict | None = None,
     arrived_at: float | None = None,
+    replace: str | Path | None = None,
 ) -> tuple[str, Path]:
     """Persist one inbound message as a deterministic N-Triples file.
 
@@ -818,9 +846,12 @@ def write_message(
     see :data:`P_ARRIVED_AT` — ``timestamp`` is the mail's time on record,
     which its sender may have written). Every one defaults to absent, and an
     absent one writes no triple.
+
+    ``replace`` is a record of this store that the new one takes the place
+    of (see :func:`_replacing`).
     """
     ts = time.time() if timestamp is None else float(timestamp)
-    token = secrets.token_hex(8)
+    token, path = _replacing(store_dir, replace, ts)
     urn = f"urn:retinue:inbound:{_slug(channel)}:{token}"
     fields = {
         **_mail_fields(subject=subject, sender_name=sender_name, recipients=recipients,
@@ -842,9 +873,6 @@ def write_message(
         "media": media or None,
     }
     fields["attachment_meta"] = _record_blob_meta(store_dir, fields, content_ids)
-    # Filename: zero-padded epoch millis (sortable) + token (unique, IRI-safe).
-    fname = f"{int(ts * 1000):016d}-{token}.nt"
-    path = messages_dir(store_dir) / fname
     _atomic_write(_render(fields), path)
     return urn, path
 
@@ -874,6 +902,7 @@ def write_outbound(
     trim: str | None = None,
     content_ids: dict | None = None,
     arrived_at: float | None = None,
+    replace: str | Path | None = None,
 ) -> tuple[str, Path]:
     """Persist one successfully sent outbound message as its own N-Triples file.
 
@@ -901,12 +930,13 @@ def write_outbound(
     A mail also states its From — ``sender`` (the account's own address, or
     the alias it went out as) and ``sender_name`` — and takes the same mail
     arguments as :func:`write_message`; a messenger send passes none of them
-    and its record is what it always was.
+    and its record is what it always was. So does ``replace``
+    (see :func:`_replacing`).
     """
     if author not in AUTHORS:
         raise ValueError(f"author must be one of {'|'.join(AUTHORS)}, got {author!r}")
     ts = time.time() if timestamp is None else float(timestamp)
-    token = secrets.token_hex(8)
+    token, path = _replacing(store_dir, replace, ts)
     urn = f"urn:retinue:outbound:{_slug(channel)}:{token}"
     fields = {
         **_mail_fields(subject=subject, sender_name=sender_name, recipients=recipients,
@@ -926,8 +956,6 @@ def write_outbound(
         "attachments": [u for u in (attachment_urls or []) if u],
     }
     fields["attachment_meta"] = _record_blob_meta(store_dir, fields, content_ids)
-    fname = f"{int(ts * 1000):016d}-{token}.nt"
-    path = messages_dir(store_dir) / fname
     _atomic_write(_render(fields), path)
     return urn, path
 
