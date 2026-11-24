@@ -747,7 +747,9 @@ touched; it is read or archived by a later action of its own.
 
 `POST /chats/<id>/read` and `POST /chats/<id>/flags` write to the real mailbox
 now, so they are the user's own act like send, compose and delete:
-**same-origin only**. Delete is the exception: it needs `X-Chat-Erase-Token`
+**same-origin only**. The flags, like a send, are also accepted only through
+the reverse proxy; an agent sets them through `POST
+/internal/chats/<id>/flags` (`chat-flags.py`). Delete is the exception: it needs `X-Chat-Erase-Token`
 (`CHAT_ERASE_TOKEN`; 503 while unset, 403 on a mismatch), and the gateway must
 succeed before the web gateway erases its own state — if any move fails, or a
 mail of the thread cannot be placed, nothing is erased and the answer reports

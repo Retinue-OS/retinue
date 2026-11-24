@@ -729,7 +729,9 @@ The API, as the components consume it:
   else changes — mute, restore and an arrival all leave it. `POST
   /chats/<id>/flags` (body `{archived?, muted?, starred?}`, any of them) is
   the one way in, and the answer carries the flags as they ended up — a
-  client reads them back rather than assuming what it asked for.
+  client reads them back rather than assuming what it asked for. Like a
+  send, it is accepted only through the reverse proxy (`403` from inside the
+  container, where an agent uses `scripts/chat-flags.py`).
 
   `POST /chats/<id>/delete` (no body) is not a flag but an erasure: every
   inbox gateway of the channel is asked to erase the chat (its own
