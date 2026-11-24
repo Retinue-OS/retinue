@@ -239,14 +239,27 @@ gateway reads that before it falls back to reading a slug.
 
 `/health` answers `{configured, connected, mode: "inbox", account, error,
 blocked, needs_repair: false, build, backfill: {done, pending, days},
-waiting: {rail, since, news, failing, failing_since}}` —
-`backfill.days` is the window fixed at the first run; `waiting` says how many
-mirrored mails the chats rail has not taken yet (and since when the oldest of
-them has been in the mailbox), how many news mails wait for the feed or for
-their move out of the INBOX, and how many rail events the web gateway keeps
-failing on (*The gate*, "One queue, in order"). `blocked` names what
-holds the mirror when that is not the mailbox: `"policy"` (below) or
+placeholders: {standing, made, why}, lost, waiting: {rail, since, news,
+failing, failing_since}, can_send, cannot_send_reason,
+rewritten_message_ids}` — `backfill.days` is the window fixed at the first
+run; `can_send` is false, with the reason, where no SMTP server is set, and
+`rewritten_message_ids` counts the gateway's own sends its provider was seen
+to file under a `Message-ID` of its own (see *Writing*). `waiting` says how
+many mirrored mails the chats rail has not taken yet (and since when the
+oldest of them has been in the mailbox), how many news mails wait for the
+feed or for their move out of the INBOX, and how many rail events the web
+gateway keeps failing on (*The gate*, "One queue, in order"). `blocked` names
+what holds the mirror when that is not the mailbox: `"policy"` (below) or
 `"mirror"` — it stopped on a fault of its own, and `error` says on what.
+`placeholders` counts the mail that could not be
+read (below): how many placeholders stand, how many were `made` since this
+start, and `why`, by reason — a mail that cannot be read leaves the mirror
+`connected`, so a run of them shows here, whatever the cause, and the
+connection monitor reads it: when five or more stand beyond those it last
+told the user of, it says so in a thread of its own — a notice, not an
+outage. `lost` counts the mails whose record is gone from the ledger and
+that are still looked for in the mailbox (below); the monitor counts them
+with the placeholders.
 An unconfigured gateway (`configured: false`) idles and is not an outage; so
 does one not opted in — no `MAIL_GATEWAY_TOKEN`, or the default account where
 `MESSENGER_BUILTIN_CHANNELS` is set without `email` — and `error` says which.
@@ -328,34 +341,210 @@ always kept. The work of parsing is bounded too, not only what is built: the
 parser tests every line against the boundary of every multipart around it, so
 a mail may nest 200 levels at most and ask for no more than 50 million such
 tests (lines × levels; under six seconds on Python 3.12, three on 3.13) —
-beyond either it is not parsed to the end.
+beyond either it is not parsed to the end. The parameters of all its parts'
+`Content-Type` and `Content-Disposition` fields have a sum of their own
+(semicolons × length, a thousand million), since the parser splits them at a
+cost that grows with both.
+
+**And so is the time one mail may take**, which is the bound for what the
+others did not foresee: each of them closes one way a mail made the standard
+library's mail code spend the square of something its sender chose, and each
+was found when some hundred kilobytes had held the mirror's one thread for a
+minute. Reading a mail has a deadline — `MAIL_READ_SECONDS` (30), and one
+more for every megabyte fetched; an ordinary mail reads in a millisecond, the
+heaviest honest one in a second or two. The gateway reads its mail in **a
+process of its own** (the same script, started with `--reader`, given none of
+the gateway's secrets): the reader looks at the clock wherever its own code
+runs, and where a single call into the library does not come back, the
+process is ended and replaced. Either way the mail is a placeholder — it took
+too long to read. (The slowest mail the bounds let through is one of
+thousands of parts under encoded file names, at about a second a megabyte:
+that is what the second per megabyte is for.) The header block a placeholder
+is made from, and the one a mail is found again by, are read the same way —
+with one difference, because of what is decided on them. A header block
+whose reading does not come back is read once more, after the reader has
+shown on the canaries that it works; if it still does not come back, that is
+**no answer**: the mail looked for is left as it is, nothing is remembered,
+and no mail is called gone on it. (Where the folders are followed, or old
+mail read, a placeholder must be made all the same, so the folder can go
+on: it is made without the block, under an id of the block's bytes, by which
+it is found again with no reading at all, and which gives way in one step
+once the mail reads under its own. The mail of a lost record — below — has
+no folder to keep going: its id is simply looked for again later.)
 
 **A mail that cannot be read is still there.** One mail's failure never stops
 the folder, or the backfill: a mail the gateway cannot read is mirrored as a
 placeholder that says so (with its sender, its time and its header block,
 unchanged in the mailbox), at once. It is read again at start and every hour
-(less often each time it changes nothing), and takes its placeholder's place
+(less often each time it changes nothing; a round of such readings has two
+minutes, and what it does not get to waits for the next — a mail that took
+too long to read takes that long again), and takes its placeholder's place
 when it reads — that mail, and no other: the placeholder's record keeps the
 header block of the copy it was made from, and only a mail with that very
 header block replaces it, wherever it lies by then. A mail that merely
-arrives under a placeholder's `Message-ID` is one more place of the mail on
-record, as a second copy of any mail is; ids are their sender's to choose.
+arrives under a placeholder's `Message-ID` replaces nothing, whether it can
+be read or not; ids are their sender's to choose. While the placeholder
+stands it is set apart as another mail's: the placeholder is never read
+again from it, and is not kept by it — when the placeholder's own copy has
+left the mailbox the placeholder leaves a tombstone like any mail, and what
+still lies there under its id is then mirrored as the mail it is. Once the
+placeholder has given way to its mail, the other is one more place of the
+mail on record, as a second copy of any mail is. Which is which is read off
+the mails, every time they are looked for: a folder may hold several mails
+under one id, all of them are looked at, and the placeholder's own copy may
+be the older one — after a move to the archive, or a folder renumbered.
+
+A mail whose record is written again — a placeholder that reads, a mail on
+record from its INBOX copy whose Sent copy shows, a tombstone whose mail is
+back — gets its new record in the old one's place, in one step, and only
+once that is written: until then, should writing fail for an hour or the
+process be stopped, the old record stands as it was, and its mail is followed
+like any (and tombstoned like any, if it leaves). A placeholder gives way only
+to the mail its record keeps the header block of; a UID is taken to be the
+mail the index has there only while its folder's `UIDVALIDITY` is the one it
+was recorded under. (A record whose file is gone when it is to be written
+again is written as the first time, and the index is matched with the
+ledger again.) A record of the user's own that is written again keeps who
+wrote the mail, and any record written again — whichever way, one that
+came in included — every id its provider gave the mail (`kb:sentAs`): the
+gateway's own send is on record with its author from the start, and stays
+so when its Sent copy comes back from the Trash; a restart knows the same
+ids, and a follow-up cites the one the recipients have. An id its provider
+gave a send names that send only on the send's own evidence — every
+recipient has it, and every answer cites it. In Sent, a copy under it is
+the send's as the gateway's own send is matched there (From the account, to
+the people it went to, dated when it went, naming no other send): in a
+renumbered Sent, moved out and back, a second copy, it is one more place of
+the record under the id the gateway minted, and where that record is a
+tombstone, the record is written again in its own place, under the minted
+id, by the user; never a second record under the provider's id. (A
+tombstone keeps no addresses, nor does a placeholder, whose were never
+read: its copy is told by the rest.) Outside Sent, nothing a recipient
+holds is evidence that a mail is the user's send — not the gateway's
+`X-Retinue-Message-ID`, not From, To, Cc or Date, alone or together: the
+mail that went out carries them all, and whoever got it can write them on
+a mail of their own. A mail there under the provider's id is
+the send's only by the very header block its live record keeps (the copy
+the record was written from, moved), and then only one more place of it;
+it never revives the send's tombstone, and never rewrites the record —
+unless that record is a placeholder made from this very copy, which then
+takes its place as it would under any id, as what the record already is. Any
+other mail under that id — a stranger's, a recipient's forgery of the
+send's header block — is a mail of its own that came in, recorded under its
+own id, and no place of the send's: the send stays what it was, a tombstone
+the user's until the send's own Sent copy comes back. Met before the send's
+Sent copy, it is that still, and the Sent copy, matched to the send, is the
+send's place beside it. So on a provider that rewrites ids, the INBOX copy
+of a mail the user sent to themselves (a Cc to their own address) is a mail
+of its own under the provider's id, come in From the user's own address,
+beside the send — the chat shows it once as sent and once as received, as
+any mail client does.
+
+A mail whose record is gone from the ledger (restored from an older backup,
+a file lost) is known no more: its row and its places go, and what the row
+said — the id, the sender, the direction, the chat, when the mail arrived —
+is kept as hints for finding the mail, never as knowledge of it (the
+`lost` list; nothing in it is a record, a place or a claim). The rest of
+the work looks for each such id by its `Message-ID` in Sent, INBOX and the
+archive (and, for a mail of the gateway's own whose provider filed it under
+an id of its own, by that one too — the ids stay known while it is looked
+for) — every mail under it in every folder, so a move or a renumbered
+folder makes no difference — at most `LOST_BATCH` ids a pass, the one
+tried least recently first, before the backfill and never in the way of
+new mail. Of what is found, ONE mail is read as the record's: for a row
+that said the mail was the user's, a Sent copy, whenever the server
+received it (a client may append its Sent copy late); then the copy the
+server received when the row said the mail arrived, an archive copy first;
+then the rest. For any other row, the copy From the sender the row named
+(the one received when the row said, else the first). A From is never
+evidence by itself: whoever was sent a mail knows its `Message-ID` and can
+write any From. What is: a copy in Sent (only the user's client or the
+gateway puts one there), or a copy received when the row said (a move
+keeps the arrival time; a look-alike delivered a second or more later does
+not have it). A match whose header block does not come back counts as From
+nobody and comes last; it holds up nothing where the first is known to be
+the record's — a Sent copy, or one From the row's sender received when the
+row said (in the archive, for a row that said the mail was the user's).
+That one mail is read as any mail is read the first time where it lies —
+what a Sent copy holds is the user's, what is in the archive the user's when
+it is from one of the user's own addresses and left Sent unseen — with one
+difference: in the archive, From that very sender and received when the row
+said, where the row said the mail was the user's, it is the user's again,
+whatever address that is — and found under an id its provider gave a send of
+the gateway's own, the record again under the id the gateway minted, with
+the provider's as `kb:sentAs` and the author noted for it. Never in INBOX,
+nor in the archive on its From alone: a look-alike From the user's own
+address stays a mail that came in — in INBOX, archived, or in an "all mail"
+archive — and a second copy where the Sent copy is there. The others found
+are read as further copies of any
+mail are (one more place, another mail's, or a placeholder). Found in no
+folder, with every folder sure of it, the id is dropped. Where that cannot
+be told yet — a folder that would not answer, a header block that did not
+come back — the id stays, is looked for again less and less often, and holds
+back none behind it; `/health` counts it. An id that cannot be searched for
+(no `Message-ID`, or one the search cannot spell) is found by reading
+headers, and the copy received when the row said is read without waiting for
+that reading to cover the whole window. After `LOST_TRIES` (8) tries in
+vain, what was found is read as mail nothing is known of, a log line says
+so, and the id is looked for no more — but where every match is gone between
+the search and the reading, or one is and what is left is not known to be the
+record's, it is looked for so once more, an hour on.
+
+What this leaves, plainly: while the archive does not answer, every lost id
+waits (`/health` says the archive does not answer, and counts them); an id
+whose mail is in no folder, or no more where the search found it, leaves
+the list with a log line and no `removed` event — there is no record to
+tombstone — so a mail moved under both of the last looks can be left
+unmirrored, and a look-alike under its id read in its place;
+a ledger restored from an older backup over a live one can leave two
+record files for one id (a record written as the first time takes a name
+of its own, and the backup brings back the one it had before); a mail to
+oneself whose Sent copy is gone comes back as a mail that came in —
+nothing but its From says the user wrote it; on a server that stamps a
+moved mail with a new arrival time, an archived sent mail comes back as a
+mail that came in too — its From is all that is left to say so; and an
+arrival time has whole seconds, so a look-alike under the id, From the same
+address, delivered in the same second, cannot be told from the record's own
+mail: archived, with the Sent copy gone, it comes back as the user's, and
+where it and the record's mail lie in different folders, the folder
+decides which is read as the record — for a mail that came in, a
+look-alike in INBOX before the record's mail archived.
+
+The bookkeeping behind this keeps four rules, written out above `class
+Mirror` in the gateway: an answer that was not obtained is never an answer; a
+record is replaced or buried only on evidence about its own mail; a record
+stands until what replaces it does; and a fault delays only the work that
+failed.
 
 **Whose fault a failure is, is decided by what failed.** *Reading* a mail —
 the parse, the walk of its parts, the trim — fails on the mail's account when
-the same reader still reads a known-good mail the gateway carries with it
-(the canary): whatever was raised, one of the bounds above or a recursion or
-memory error among them, the mail is a placeholder and the mirror as healthy
-as it was. *Writing* — the ledger, the indexes, the blobs — never fails on a
-mail's account. A reader that cannot read the canary either, and any failure
-in writing, is a fault of the mirror itself, which must not turn the mailbox
-into placeholders one mail at a time with `/health` still `connected`: the
-pass ends there. No mail is set aside or marked over it, and no folder's mark
-moves past a mail that has neither a record nor a place — so the next pass
-reads it again, after a restart too, and if it has left for the archive by
-then it is read there, as a mail that came and went. `/health` reports
-`connected: false` with `blocked: "mirror"` meanwhile, and `error` says on
-what — naming the mail, where the pass stopped at one.
+the same reader still reads the known-good mails the gateway carries with it
+(the canaries, one for every path a mail takes through the reader: a plain
+reply beside its HTML, HTML alone, an inline image and a nested mail):
+whatever was raised, one of the bounds above or a recursion or memory error
+among them, the mail is a placeholder and the mirror as healthy as it was.
+Time is judged the same way: after a mail ran out of it, the canaries are read
+against the clock too, with a tenth of `MAIL_READ_SECONDS` for their few
+milliseconds — on a machine slow enough to time out ordinary mail they time
+out first, and that is no mail's fault. *Writing* — the ledger, the indexes,
+the blobs — never fails on a mail's account. A reader that cannot read the
+canaries either, or not in their time, and any failure in writing, is a fault
+of the mirror itself, which must not turn the mailbox into placeholders one
+mail at a time with `/health` still `connected`: the pass ends there. No mail
+is set aside or marked over it, and no folder's mark moves past a mail that
+has neither a record nor a place — so the next pass reads it again, after a
+restart too, and if it has left for the archive by then it is read there, as a
+mail that came and went. A mail whose record is to be written again and
+cannot be keeps the record it has meanwhile (see above). `/health` reports
+`connected: false` with `blocked: "mirror"`
+meanwhile, and `error` says on what — naming the mail, where the pass stopped
+at one. A fault delays only the work it was in. Following the folders — new
+mail, vanished mail — is done first and by itself, every poll interval; when
+that is what fails, it is tried again after one interval, then twice as long
+each time, up to an hour (every try fetches the mail in hand whole again).
+When the rest fails — finding mail again, reading mail again, the backfill —
+it is the rest that waits so, and new mail goes on being mirrored: `error`
+says that too.
 
 A record's time is the earlier of the mail's `Date` and the server's arrival
 time, never the future, so a forged date cannot pin a mail to the head of its
@@ -451,14 +640,24 @@ falls back to the untrimmed text: a bubble is never blank because the trim was
 greedy.
 
 **What one mail may cost is bounded**, like everything else it controls — the
-mirror has one thread for all of them. The trim works on at most 10,000 lines
-and 500,000 characters of text, and runs over them a fixed number of times
-(four passes a reading, four readings a mail); a longer text is not trimmed
-and is recorded as it came, `wanting`. Of an HTML part the first 1,000,000
-characters of markup are parsed: beside a plain part a longer one is not
-consulted, and where it is the mail's only text the bubble ends where the
-reading did, on a line `[…]` — *Original* shows all of it. Within those
-bounds the cost is linear in the size of the mail, for hostile mail too.
+mirror has one thread for all of them. The bounds are on the work, not on how
+long a mail may be: a short reply above megabytes of thread, a log sent in
+answer, a digest are ordinary mail and are trimmed to their own text. The
+trim runs over a text a fixed number of times (four passes a reading, four
+readings a mail). Lines it finds to be quoted history it skips, at next to no
+cost; every other line it reads closely, and one reading reads at most 50,000
+of them and 4,000,000 characters, counted once per pass — all four passes for
+12,500 lines of the author's own, the two an ordinary mail takes for 25,000.
+A mail that would take more is not trimmed and is recorded as it came,
+`wanting`, as is one of more than 200,000 lines or 5,000,000 characters,
+which is not read at all. Of an HTML part the first 1,000,000 characters of
+markup are parsed, not counting inline `data:` images (but one folded into
+lines where a browser does not read it as a value in quotes, and any after
+a CDATA section, which mail almost never has): beside a plain part a longer
+one is not consulted, and where it is the mail's only text the bubble ends
+where the reading did, on a line `[…]` — *Original* shows all of it.
+Within those bounds the cost is linear in the size of the mail, for hostile
+mail too.
 
 ### The model trim (phase 4)
 
@@ -517,6 +716,29 @@ reverse").
   which the record now keeps — and `Cc` everyone on its `To`/`Cc` except the
   account's own addresses and the `To`; *sender only*: the `To` alone. If the
   latest mail is the user's own, a reply-all goes to its recipients again.
+  The user's own is a mail on record as theirs; one that came in `From` an
+  address of theirs (an INBOX copy of their own mail, or anyone's mail
+  claiming that `From`) has no say in the addressing — its `To` and `Cc` are
+  its sender's to write. Where only such mails are left (the user wrote from
+  another address of theirs, or "send as" from a phone, with this mailbox in
+  copy and the Sent copy in no followed folder), the newest of them is
+  followed up as the user's own is: to its `To` and `Cc` but the account's
+  own addresses, and to that address only where nobody else is left — the
+  same exposure as any mail's reply-all, shown in the preview before
+  anything is sent. So a forgery `From` the user steers no reply beside a
+  real mail; in a thread made of it alone, the reply goes where a mail
+  `From` its writer would. The cost: beside real mails, a mail the user
+  wrote from another address of theirs adds nobody to a reply (Ann writes,
+  the user answers her and Bob from work: a reply-all goes to Ann and her
+  `Cc`, not Bob).
+  An older record does not keep `Reply-To`: its header block says it, and is
+  read in the reader process — only where the block has a `Reply-To` line, so
+  a reply to a mail that named none waits for nothing, and once for both
+  modes. The wait that remains: a reply to such an older record whose mail
+  has a `Reply-To`, while the mirror reads a heavy mail, waits for the reader
+  — up to that reading's deadline; past the web gateway's preview budget the
+  preview fails and the send is refused client-side, and the press made again
+  once the reading is done finds it answered.
 - **The recipients the user sees are the recipients the gateway uses.** The
   browser never recomputes a reply's addressing. `POST /reply-preview
   {chat, account}` on the mail gateway (token-gated like `/send`, read-only,
@@ -686,7 +908,13 @@ reverse").
   the same `Message-ID` and writes nothing; and a record the gateway wrote for
   its own send is not "unlocated" until its Sent copy has had
   `MAIL_SENT_GRACE_SECONDS` (600) to appear — with `SMTP_SAVE_SENT=false` and
-  no copy appearing it stays a live record, the mail having been sent. The
+  no copy appearing it stays a live record, the mail having been sent. A
+  provider that files the copy under a `Message-ID` of its own has it matched
+  to the send (by the gateway's `X-Retinue-Message-ID` header with the
+  account, the recipients and the date, or where it kept none by the mail
+  itself), and the provider's id is kept as `kb:sentAs`; a copy the reader
+  cannot read is matched by that header with the account and the date — no
+  placeholder of its own in a chat of its own. The
   gateway never writes policy: sending to someone does not make them known to
   the gate.
 - **New mail.** ＋ on the Chats page offers *E-mail* (what
@@ -753,7 +981,12 @@ the reverse proxy; an agent sets them through `POST
 (`CHAT_ERASE_TOKEN`; 503 while unset, 403 on a mismatch), and the gateway must
 succeed before the web gateway erases its own state — if any move fails, or a
 mail of the thread cannot be placed, nothing is erased and the answer reports
-`errors > 0`, with the reason as one sentence in `error`. The answer is
+`errors > 0`, with the reason as one sentence in `error`. A mail of the thread
+whose record the ledger lost (still looked for, above) is one of them — of
+the thread it is in now: a merge takes it along — it is looked for under
+every id it is known by and moved to the Trash with the rest (a copy the
+server keeps flagged `\Deleted` is kept as any other is, below), and while a
+folder cannot say where it is, nothing is erased. The answer is
 `delete_chat`'s shape plus `trashed`; a mail that turns up again later in a
 mirrored folder (restored from the Trash) starts the chat anew.
 
@@ -773,7 +1006,23 @@ the call made again finishes).
 IMAP writes are `UID STORE` and `UID MOVE`, with `UID COPY` + `\Deleted` +
 `UID EXPUNGE` of exactly those UIDs as the fallback where `UIDPLUS` allows
 (else the `\Deleted` copy is left flagged and reported) — never a whole-folder
-`EXPUNGE`.
+`EXPUNGE`. Such a leftover is no place of the mail for a later read or
+archive, and keeps it from being called gone; a delete asks after it, and
+one a client has undeleted since is the mail's place again, moved to the
+Trash with the rest. It is never the mail's only place for good: where the
+server named no new UID and the look in the archive could not tell, the
+mail settles and is looked for again until its copy there is found (a
+leftover no longer flagged `\Deleted` is its place again). And a move is
+noted before the server is asked, so a stop between the server's move and
+the index following it is put right at the next start: the source UID gone
+or flagged `\Deleted` is no place any more, and the copy in the archive is
+found. And where a mail is looked for in
+a folder — after a move whose new UID the server did not name, or by a
+delete — every mail there under its id is looked at, as the mirror looks:
+the mail of a placeholder is only the copy its record keeps the header block
+of, and another mail under the same id is neither moved nor flagged; once
+the placeholder is erased with its chat, that other mail is mirrored as the
+mail it is.
 
 **Folders.** The gateway never invents a **Trash**: it is the folder the server
 marks `\Trash`, else the one `MAIL_TRASH_FOLDER` names, and with neither,

@@ -95,11 +95,12 @@ text — and without it leaves the text in and the state ``wanting``:
   * *A signature is under the standard's delimiter, once.* ``-- `` with its
     trailing blank, the only one within reach of the end. Two within reach
     are dividers between sections; a bare ``--`` is as often a divider someone
-    typed. A phone's line is the mail's last paragraph, short and without a
-    clause, and beside the table's words it holds the name of the sender's
-    device or of a product, and names only — "Sent from the warehouse this
-    morning: 14 boxes." is the message, and so is "Sent from my iPhone to
-    yours yesterday".
+    typed; and a delimiter with nothing above it has the whole mail under
+    it, which then is the message. A phone's line is the mail's last
+    paragraph, short and without a clause, and beside the table's words it
+    holds the name of the sender's device or of a product, and names only —
+    "Sent from the warehouse this morning: 14 boxes." is the message, and so
+    is "Sent from my iPhone to yours yesterday".
   * *A legal notice is what the mail ends on, under the sign-off.* The
     paragraph names the mail itself, confidentiality and a recipient, opens
     on two of them, has nothing but more notices after it, and stands under
@@ -166,11 +167,13 @@ The HTML is turned into text with its quotes as ``>`` lines and then goes
 through the very same pipeline, so there is one set of rules, not two.
 
 Of an HTML part the first ``MAX_HTML_CHARS`` characters of markup are read
-(see "Cost"). Beside a plain part a longer one is not consulted. Where it is
-the source, the text ends where the reading did, on a line of its own that
-says so (``CUT_MARK``), and what stands above that line is not taken for the
-end of the mail: quotes go, a signature or a footer is not looked for. The
-whole of the part is the caller's to show.
+(see "Cost") — not counting what is never text: the payload of an image
+written into the part as a ``data:`` URL. Beside a plain part a longer one
+is not consulted. Where it is the source, the text ends where the reading
+did — in the middle of a paragraph, if that is where the bound falls — on a
+line of its own that says so (``CUT_MARK``), and what stands above that line
+is not taken for the end of the mail: quotes go, a signature or a footer is
+not looked for. The whole of the part is the caller's to show.
 
 State
 =====
@@ -179,10 +182,11 @@ State
 model trim is due on first view: the mail is HTML-only (or its plain part a
 stub), or more than ``WANTING_CHARS`` remain (``MAIL_TRIM_WANTING_CHARS``,
 default 2500), or the mail is more than the trim works on (see "Cost"), or
-a quote marker survived, or a rule saw its shape and held
-back for want of evidence (history in a mail not known to be a reply, an
-unsubscribe block in mail not known to be bulk, a bare ``--``, a notice with
-no sign-off above it, an attribution in a language without a verb here).
+an HTML part was read that was not read to its end, or a quote marker
+survived, or a rule saw its shape and held back for want of evidence
+(history in a mail not known to be a reply, an unsubscribe block in mail not
+known to be bulk, a bare ``--``, a notice with no sign-off above it, an
+attribution in a language without a verb here).
 
 Idempotence
 ===========
@@ -191,23 +195,35 @@ Idempotence
 fixpoint inside one call, and whatever it keeps is kept in a form the next
 call recognises the same way — a call with no evidence cuts nothing that a
 call with evidence kept. A text built never to settle gets no trim at all,
-and neither does one longer than the trim works on: the same answer however
-often it is asked for.
+and neither does one that is more than the trim works on: the same answer
+however often it is asked for.
 
 Cost
 ====
 
 Bounded, whatever a mail holds — it is anyone's to write, and the caller
-has one thread for all of them:
+has one thread for all of them. But a bound is on what a mail can cost, not
+on how long it may be: a short reply above megabytes of thread, a log sent
+in answer, a digest are ordinary mail, and are trimmed like any.
 
-  * The pipeline works on at most ``MAX_SOURCE_LINES`` lines and
-    ``MAX_SOURCE_CHARS`` characters. A longer source gets no trim: it is
-    answered as it came, ``wanting``, and no line of it is looked at.
-  * It runs over a source at most ``_MAX_PASSES`` times, and one call reads
-    a mail at most four ways (the plain part; the HTML part with what the
-    markup knows, and without; the text alone, when that left nothing).
-    After a reading that did not settle, only the last is still tried.
-  * Of an HTML part ``MAX_HTML_CHARS`` characters of markup are parsed.
+  * A source of more than ``MAX_SOURCE_LINES`` lines or ``MAX_SOURCE_CHARS``
+    characters gets no trim: it is answered as it came, ``wanting``, and no
+    line of it is looked at.
+  * The pipeline runs over a source at most ``_MAX_PASSES`` times, and one
+    call reads a mail at most four ways (the plain part; the HTML part with
+    what the markup knows, and without; the text alone, when that left
+    nothing). After a reading that did not settle, only the last is still
+    tried.
+  * A pass skips the lines it finds to be quoted history, or cuts them from
+    one line on to the end, at next to no cost. Every other line it reads
+    closely, and one reading reads at most ``MAX_READ_LINES`` of them, with
+    ``MAX_READ_CHARS`` characters, counted once for each pass. That is all
+    the passes for a text of its author's that is long, and the two a mail
+    as clients write it takes — one that trims, one that finds nothing more
+    to trim — for one twice as long. A reading that would read more is
+    given up like one that does not settle.
+  * Of an HTML part ``MAX_HTML_CHARS`` characters of markup are parsed, and
+    of an image written into it no more than the tag.
 
 Within the bounds, linear, for hostile mail too. Every look-ahead and
 look-back is bounded by a count of lines AND by the length an attribution or
@@ -253,15 +269,28 @@ FOOTER_MAX_PARAGRAPHS = 8
 
 #: What one call works on is bounded, whatever a mail holds (see "Cost" in the
 #: module docstring). A source with more lines or more characters than this
-#: gets no trim: it is answered as it came, state ``wanting``. Ten thousand
-#: lines are a thread of a few hundred replies. Read at call time.
-MAX_SOURCE_LINES = 10_000
-MAX_SOURCE_CHARS = 500_000
+#: is not read at all: it is answered as it came, state ``wanting``. Five
+#: megabytes are a thread of several thousand replies, quoted in full. Read
+#: at call time, like the bounds below.
+MAX_SOURCE_LINES = 200_000
+MAX_SOURCE_CHARS = 5_000_000
 
-#: Of an HTML part, this much markup is read. Where a longer one is the
-#: source, the text ends where the reading did, on a line that says so — and
-#: under which no signature and no footer is looked for, in this call or in
-#: a later one: the end of what was read is not the end of the mail.
+#: Of a source within that, the lines that are quoted history are skipped,
+#: and cost next to nothing. Every other line is read closely, and of those
+#: one reading reads at most this many, with this many characters — counted
+#: once for each pass that reads them. So 12,500 lines of the author's own
+#: (a megabyte of them) can have all the passes there are, and 25,000 lines
+#: (two megabytes) the two that a mail as clients write it takes: one that
+#: trims it, one that confirms it. A reading that would take more is given
+#: up, and the mail gets no trim.
+MAX_READ_LINES = 50_000
+MAX_READ_CHARS = 4_000_000
+
+#: Of an HTML part, this much markup is read (what does not count as markup:
+#: see _markup_read). Where a longer one is the source, the text ends where
+#: the reading did, on a line that says so — and under which no signature
+#: and no footer is looked for, in this call or in a later one: the end of
+#: what was read is not the end of the mail.
 MAX_HTML_CHARS = 1_000_000
 CUT_MARK = "[…]"
 
@@ -701,7 +730,14 @@ _ATTR = "\x01"            # prefix: this line is an attribution
 _BOUNDARY = "\x02"        # a line of its own: quoted history may start here
 _MARK_HARD = _BOUNDARY + "H"   # … by an element only a quoting client writes
 _MARK_SOFT = _BOUNDARY + "S"   # … by a styling that others use too
-_MARKS_RE = re.compile("[\x01\x02]")
+
+
+def _no_marks(text: str) -> str:
+    """The text without a mark in it. (Not taken out by a pattern, which
+    stops at every mark it finds: a part can be fifty megabytes of them, and
+    this is done to all of a part, whatever else is.)"""
+    return text.replace(_ATTR, "").replace(_BOUNDARY, "")
+
 
 # Up to three spaces of indent: four make a code block, and code that starts
 # with ">" is not a quote.
@@ -765,10 +801,33 @@ _LINK_CLOSERS = " .)>]\"'»"
 _LABEL_RE = re.compile(
     r"^\s*[*_]{0,2}([^\W\d_][^:：*\n]{0,40}?)[*_]{0,2}\s?[:：][*_]{0,2}"
     r"(?:[ \t\xa0]+(.*))?$")
-# "----- Some words -----": the shape of every client's separator line.
-_DASHED_RE = re.compile(r"^[-_=]{3,}\s*([^\W_].{1,60}?)\s*[-_=]{3,}$")
 _RULER_RE = re.compile(r"^\s*[-_=*~]{5,}\s*$")
 _LIST_RULER_RE = re.compile(r"^_{16,}$")
+
+
+def _dashed(line: str) -> str | None:
+    """The words of "----- Some words -----", or None: the shape of every
+    client's separator line, on a line with no blanks around it.
+
+    What ``^[-_=]{3,}\\s*([^\\W_].{1,60}?)\\s*[-_=]{3,}$`` captures — found
+    by hand, because the pattern reads the dashes of a long line once for
+    every length the words could have.
+    """
+    body = line.lstrip("-_=")
+    if len(line) - len(body) < 3:
+        return None
+    start = len(line) - len(body.lstrip())
+    if start == len(line) or not line[start].isalnum():
+        return None
+    words = line.rstrip("-_=")
+    if len(line) - len(words) < 3:
+        return None
+    # Two characters at least, to where the blanks before the closing dashes
+    # begin — and three of the dashes are left after them.
+    end = max(start + 2, len(words.rstrip()))
+    if end > len(line) - 3 or end - start > 61:
+        return None
+    return line[start:end]
 
 
 def _unmark(line: str) -> str:
@@ -803,7 +862,7 @@ def _clean_lines(text: str, keep_marks: bool = False) -> list:
     """
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     if not keep_marks:
-        text = _MARKS_RE.sub("", text)
+        text = _no_marks(text)
     return _squeeze([_rstrip(line) for line in text.split("\n")])
 
 
@@ -1042,9 +1101,9 @@ def _is_forward_marker(lines: list, index: int) -> bool:
     line = lines[index].strip()
     if not line or len(line) > 80:
         return False
-    match = _DASHED_RE.match(line)
-    if match:
-        return _has_stem(match.group(1), _FORWARD)
+    words = _dashed(line)
+    if words:
+        return _has_stem(words, _FORWARD)
     if (not _COLON_END_RE.search(line) or len(line.split()) > 7
             or not _has_stem(line, _FORWARD)):
         return False
@@ -1137,6 +1196,26 @@ class _Evidence:
         self.held = False
 
 
+class _Spent(Exception):
+    """A reading has read all it may (MAX_READ_LINES, MAX_READ_CHARS)."""
+
+
+class _Budget:
+    """What one reading may still read closely, over all its passes."""
+
+    __slots__ = ("lines", "chars")
+
+    def __init__(self):
+        self.lines = MAX_READ_LINES
+        self.chars = MAX_READ_CHARS
+
+    def spend(self, lines: int, chars: int) -> None:
+        self.lines -= lines
+        self.chars -= chars
+        if self.lines < 0 or self.chars < 0:
+            raise _Spent()
+
+
 def _history_event(lines: list, quoted: list, index: int, kept: list,
                    marked: list, evidence: _Evidence,
                    known: dict) -> int | None:
@@ -1148,9 +1227,9 @@ def _history_event(lines: list, quoted: list, index: int, kept: list,
     line = lines[index].strip()
     if not line:
         return None
-    match = _DASHED_RE.match(line)
-    if match:
-        if _has_stem(match.group(1), _ORIGINAL):
+    words = _dashed(line)
+    if words:
+        if _has_stem(words, _ORIGINAL):
             return 0
         following = _next_content(lines, index + 1, 2)
         if following is not None and _header_block(lines, following, known):
@@ -1216,7 +1295,7 @@ def _boundary_confirmed(lines: list, index: int, hard: bool,
                 and _BRACKET_ADDRESS_RE.search(first.group(2) or ""))
 
 
-def _strip_quotes(raw: list, evidence: _Evidence):
+def _strip_quotes(raw: list, evidence: _Evidence, budget: _Budget):
     """Stage 1. Answers ``(intro, forwarded, removed_chars, end_cut)``.
 
     `intro` is the author's own lines; `forwarded` is None, or the forwarded
@@ -1228,7 +1307,17 @@ def _strip_quotes(raw: list, evidence: _Evidence):
     the HTML marked — is cut to the end only when `evidence.history` says
     the mail is a reply; under a forward's subject it is the message being
     passed on; with neither it stays where it is and the pass is unsettled.
+
+    What is read closely or kept is paid for from `budget`, line by line: a
+    line of the author's, a quote block (as one line: its first is looked
+    at), a forwarded message. Lines that are skipped or cut are not — which
+    is all that a long thread under a short reply consists of. Raises _Spent
+    where the budget ends.
     """
+    def kept_whole(body: list) -> list:
+        budget.spend(len(body), sum(map(len, body)))
+        return body
+
     lines = [_unmark(line) for line in raw]
     quoted = _quote_flags(lines)
     lone = sum(quoted) == 1
@@ -1260,17 +1349,18 @@ def _strip_quotes(raw: list, evidence: _Evidence):
                 end += 1
             if index and (_DIFF_HUNK_RE.match(lines[index - 1].strip())
                           or (lone and _mid_sentence(lines, index))):
-                for line in lines[index:end]:      # content, not a quote
+                for line in kept_whole(lines[index:end]):   # content, not a quote
                     keep(line)
                 index = end
                 continue
+            budget.spend(1, 0)
             inner = [_unquote(line) for line in lines[index:end]]
             first = _next_content(inner, 0)
             if first is not None and _is_forward_marker(inner, first):
                 # Apple Mail (HTML) and Yahoo quote the whole forward, marker
                 # included.
-                return (kept, _forward_body(inner[first:] + lines[end:]),
-                        removed, False)
+                return (kept, kept_whole(_forward_body(
+                    inner[first:] + lines[end:])), removed, False)
             # A tail already found to be no attribution is not asked again
             # by the next quote block: a mail of a thousand blocks under one
             # line would ask a thousand times.
@@ -1286,13 +1376,15 @@ def _strip_quotes(raw: list, evidence: _Evidence):
                 judged = len(kept)
             index = end
             continue
+        budget.spend(1, len(lines[index]))
         event = None
         if raw[index].startswith(_BOUNDARY):
             if _boundary_confirmed(lines, index, raw[index] == _MARK_HARD,
                                    known):
                 event = 0
         elif _is_forward_marker(lines, index):
-            return kept, _forward_body(lines[index:]), removed, False
+            return (kept, kept_whole(_forward_body(lines[index:])), removed,
+                    False)
         else:
             event = _history_event(lines, quoted, index, kept, marked,
                                    evidence, known)
@@ -1320,10 +1412,10 @@ def _strip_quotes(raw: list, evidence: _Evidence):
             start = _next_content(rest, 0)
             while start is not None and (
                     _RULER_RE.match(rest[start])
-                    or _DASHED_RE.match(rest[start].strip())):
+                    or _dashed(rest[start].strip())):
                 start = _next_content(rest, start + 1)
             rest = rest[start:] if start is not None else []
-            return kept, [FORWARD_MARKER] + rest, removed, False
+            return kept, [FORWARD_MARKER] + kept_whole(rest), removed, False
         removed += _chars(rest)
         end_cut = True
         break
@@ -1417,7 +1509,8 @@ def _mobile_line(lines: list, index: int) -> int:
     return 2 if _names_only(said) else 1
 
 
-def _strip_signature(lines: list, evidence: _Evidence) -> int:
+def _strip_signature(lines: list, evidence: _Evidence,
+                     more: bool = False) -> int:
     """Stage 2, in place: the ``-- `` delimiter, then the phone's closing line.
 
     Walking up from the end, a delimiter counts while no more than
@@ -1426,6 +1519,13 @@ def _strip_signature(lines: list, evidence: _Evidence) -> int:
     with its trailing blank. Two within reach of each other are dividers
     between sections; a bare ``--`` is as likely a divider someone typed as
     a delimiter a relay stripped. Both stay, and leave the pass unsettled.
+
+    So does a delimiter that is the first line of the text: a signature
+    under nothing is the mail (a post that is an attachment and the sender's
+    name), as _under_a_message says of footers. Cut, it would leave nothing,
+    and the answer to nothing is the mail as it came — with the footer that
+    was rightly cut from under it. Unless `more` follows these lines: above
+    a forwarded message, a signature alone is the whole of an intro.
     """
     removed = 0
     found = []
@@ -1441,7 +1541,8 @@ def _strip_signature(lines: list, evidence: _Evidence) -> int:
             below += 1
             if below > SIGNATURE_MAX_LINES:
                 break
-    if len(found) == 1 and lines[found[0]] == SIGNATURE_DELIMITER:
+    if (len(found) == 1 and lines[found[0]] == SIGNATURE_DELIMITER
+            and (found[0] or more)):
         removed += _drop_from(lines, found[0])
     elif found:
         evidence.unsettled = True
@@ -1753,7 +1854,7 @@ def _strip_footer(lines: list, evidence: _Evidence, judged: dict) -> int:
 
 
 def _strip_tail(lines: list, removed: dict, end_cut: bool,
-                evidence: _Evidence) -> None:
+                evidence: _Evidence, more: bool = False) -> None:
     """Stages 2 and 3, repeated until the end of the text is settled.
 
     They uncover work for each other — a notice under the phone's closing
@@ -1761,6 +1862,7 @@ def _strip_tail(lines: list, removed: dict, end_cut: bool,
     run — so neither is done before both find nothing.
 
     `end_cut`: what stood under these lines was quoted history, and is gone.
+    `more`: a forwarded message stands under them, and stays.
 
     Not for a text that was cut off (CUT_MARK): where that ends is not where
     the mail ended, and a signature or a footer is one at the END only.
@@ -1778,19 +1880,20 @@ def _strip_tail(lines: list, removed: dict, end_cut: bool,
         while end_cut and lines and _RULER_RE.match(lines[-1]):
             removed[counter] += _drop_from(lines, len(lines) - 1)
         before = len(lines)
-        removed["signature"] += _strip_signature(lines, evidence)
+        removed["signature"] += _strip_signature(lines, evidence, more)
         removed["footer"] += _strip_footer(lines, evidence, judged)
         end_cut, counter = len(lines) < before, "footer"
         if len(lines) == size:
             return
 
 
-def _pass(raw: list, evidence: _Evidence, removed: dict) -> list:
+def _pass(raw: list, evidence: _Evidence, removed: dict,
+          budget: _Budget) -> list:
     evidence.unsettled = False      # what the LAST pass leaves open counts
-    intro, forwarded, cut, end_cut = _strip_quotes(raw, evidence)
+    intro, forwarded, cut, end_cut = _strip_quotes(raw, evidence, budget)
     removed["quote"] += cut
     intro = _squeeze(intro)
-    _strip_tail(intro, removed, end_cut, evidence)
+    _strip_tail(intro, removed, end_cut, evidence, forwarded is not None)
     if forwarded is not None:
         intro = intro + [""] + forwarded
     return _squeeze([_rstrip(line) for line in intro])
@@ -1811,14 +1914,22 @@ def _trim_lines(raw: list, evidence: _Evidence, removed: dict) -> list | None:
     what makes the trim idempotent by construction. A real mail settles on
     the second pass. One that has not settled after `_MAX_PASSES` was built
     not to, and gets no trim at all (None): the untrimmed text is the one
-    answer that is the same however often it is asked for.
+    answer that is the same however often it is asked for. Nor does one
+    whose passes would read more, between them, than a reading may (see
+    MAX_READ_LINES): the first pass leaves a mail's quoted history behind,
+    so that is a mail with more text of its author's than the trim takes on
+    — or one built to be read at length.
     """
+    budget = _Budget()
     lines = raw
-    for _ in range(_MAX_PASSES):
-        after = _pass(lines, evidence, removed)
-        if after == lines:
-            return lines
-        lines = after
+    try:
+        for _ in range(_MAX_PASSES):
+            after = _pass(lines, evidence, removed, budget)
+            if after == lines:
+                return lines
+            lines = after
+    except _Spent:
+        pass
     return None
 
 
@@ -1858,9 +1969,9 @@ def is_reply_subject(subject: str | None) -> bool:
 
 def _settle(raw: list, evidence: _Evidence) -> tuple:
     """``(lines, removed, unsettled)`` of one source. No lines when the trim
-    left nothing; None for them when it failed or did not settle — after
-    which the caller tries no reading but its last, each of them costing up
-    to `_MAX_PASSES` again."""
+    left nothing; None for them when it failed, did not settle or would have
+    read more than a reading may — after which the caller tries no reading
+    but its last, each of them costing up to that much again."""
     removed = {"quote": 0, "signature": 0, "footer": 0, "pixels": 0}
     evidence.held = False
     try:
@@ -1874,11 +1985,11 @@ def _as_it_came(text: str) -> str:
     """A plain part with nothing done to it but what every answer has done:
     one kind of line end, no mark, no empty line at either end."""
     text = text.replace("\r\n", "\n").replace("\r", "\n")
-    return _MARKS_RE.sub("", text).strip("\n")
+    return _no_marks(text).strip("\n")
 
 
 def _oversize(text: str) -> bool:
-    """More text than the pipeline works on? (MAX_SOURCE_LINES, …_CHARS)"""
+    """More text than a source may be? (MAX_SOURCE_LINES, …_CHARS)"""
     return (len(text) > MAX_SOURCE_CHARS
             or text.count("\n") >= MAX_SOURCE_LINES)
 
@@ -1909,6 +2020,250 @@ def _is_stub(plain: str, marked: str) -> bool:
     # history may begin says nothing, however many of them there are.
     says = len(" ".join(" ".join(_unmarked(marked.split("\n"))).split()))
     return says > 1000 and says > STUB_RATIO * said
+
+
+# Where markup stands in a part, as a browser reads it: a tag (its values in
+# quotes may hold a ">"), a comment and its like, and the text of the
+# elements in which nothing but their own end tag is a tag — a script, a
+# <textarea>, … — of which a style sheet's is markup all the same.
+_TAG_OPEN_RE = re.compile(r"<(?:/?[A-Za-z]|!|\?|/(?!>))")
+# A tag's name, then its attributes — each with a value or none: in quotes,
+# or up to a blank or a ">" — and the blanks between them (HTML's own).
+_TAG_NAME_RE = re.compile(r"[^\t\n\f\r />]*")
+_COMMENT_END_RE = re.compile(r"--!?>")
+_TAG_ATTRIBUTES_RE = re.compile(
+    r"(?:[{b}/]+|[^{b}/>][^{b}/>=]*"
+    r"""(?:[{b}]*=[{b}]*(?:"[^"]*"?|'[^']*'?|[^{b}>]*))?)*""".format(
+        b=r"\t\n\f\r "))
+# … one of them at a time, a value in quotes (its quotes with it) in group 1.
+_TAG_ATTRIBUTE_RE = re.compile(
+    r"[{b}/]+|[^{b}/>][^{b}/>=]*"
+    r"""(?:[{b}]*=[{b}]*(?:("[^"]*"?|'[^']*'?)|[^{b}>]*))?""".format(
+        b=r"\t\n\f\r "))
+_RAW_TEXT_ENDS = {tag: re.compile(r"</%s[\t\n\f\r />]" % tag, re.I) for tag in (
+    "style", "script", "xmp", "iframe", "noembed", "noframes", "textarea",
+    "title")}
+# A ``data:`` URL where markup holds one — an attribute's value, a url() of
+# a style — and its payload, by its shape: a media type and parameters, a
+# comma, then the characters of base64 and of a URL. No quote, no "<", ">"
+# or "&", no blank — but between the lines of folded base64 (_folded), in
+# quotes — and what began it ends it: its quote, or what ends a value.
+_DATA_URL_RE = re.compile(r"data:", re.I)
+_DATA_URL_PAYLOAD = r"A-Za-z0-9._~%!$*+,;=:@/?\-"
+_DATA_URL_BARE_RE = re.compile(
+    r"[A-Za-z0-9.+/;=_-]{0,127},[%s]*" % _DATA_URL_PAYLOAD)
+_DATA_URL_QUOTED_RE = re.compile(
+    r"[A-Za-z0-9.+/;=_-]{0,127},[%s\t\n\f\r ]*" % _DATA_URL_PAYLOAD)
+_DATA_URL_CLOSERS = {
+    "\"": ("\"",), "'": ("'",),
+    "&quot;": ("&quot;", "&#34;"), "&#34;": ("&quot;", "&#34;"),
+    "&#39;": ("&#39;", "&apos;"), "&apos;": ("&#39;", "&apos;"),
+    "": ("\t", "\n", "\f", "\r", " ", ">", ")")}
+_BLANKS_RE = re.compile(r"[\t\n\f\r ]+")
+_BASE64_RE = re.compile(r"[A-Za-z0-9+/=]+")
+#: Of base64 folded into lines, every line but the last has this many
+#: characters at least, and all of them the same (MIME's have 76).
+BASE64_LINE_CHARS = 40
+#: A ``data:`` URL longer than this is an image, a font: never text of the
+#: mail, and not counted as markup that is read (MAX_HTML_CHARS).
+DATA_URL_CHARS = 4096
+# How many candidates for one are looked at in a part. A mail of nothing
+# but the word is not searched to its end for an image.
+_MAX_DATA_URLS = 20_000
+_CHARREF_END_RE = re.compile(r"[\s;<]")
+
+
+def _markup_spans(html: str):
+    """``(start, end, markup)`` of each stretch of a part that is no text of
+    it, in order: a tag or a style sheet (`markup`: True, or "style" for the
+    sheet), a comment, the text of a script — up to the first CDATA
+    section. Then ``(len, len + 1, False)``, for ever. A part is looked at
+    once, and only as far as it is asked for."""
+    size = len(html)
+    at = 0
+    while True:
+        match = _TAG_OPEN_RE.search(html, at)
+        if match is None:
+            break
+        start = match.start()
+        if not match.group()[-1].isalpha():
+            # A comment ends at "-->" ("<!-->" is one) or at "--!>" (not
+            # "<!--!>"), what else begins with "<!", "<?" or "</" and no
+            # name at the first ">".
+            if html.startswith("<!--", start):
+                ended = _COMMENT_END_RE.search(html, start + 2)
+                if ended and ended.start() < start + 4 and ended.group() == "--!>":
+                    ended = _COMMENT_END_RE.search(html, start + 4)
+                end = ended.end() if ended else size
+            else:
+                end = html.find(">", start + 2)
+                end = size if end < 0 else end + 1
+            yield start, end, False
+            if html.startswith("<![CDATA[", start):
+                # In an <svg> or a <math> a browser ends one at "]]>", not
+                # here, and which this is, is not followed: from here on,
+                # nothing is markup a payload is left out of.
+                break
+            at = end
+            continue
+        name = start + len(match.group()) - 1
+        named = _TAG_NAME_RE.match(html, name).end()
+        end = _TAG_ATTRIBUTES_RE.match(html, named).end()
+        end = min(size, end + 1)        # past its ">", if it has one
+        yield start, end, True
+        at = end
+        tag = html[name:named].lower()
+        if match.group()[1] == "/":
+            continue
+        if tag == "plaintext":
+            break                       # the rest is text
+        if tag in _RAW_TEXT_ENDS:
+            close = _RAW_TEXT_ENDS[tag].search(html, end)
+            at = close.start() if close else size
+            yield end, at, "style" if tag == "style" else False
+    while True:
+        yield size, size + 1, False
+
+
+def _folded(payload: str) -> bool:
+    """Is a payload with blanks in it base64 folded into lines: each line
+    nothing but base64, every one but the first and the last as long as the
+    second, these two no longer, and not short? (The first may share its
+    line with the tag, where a client folded all of the markup.) Words
+    joined by line breaks are not."""
+    lines = payload.split()
+    width = len(lines[1] if len(lines) > 2 else lines[0]) if lines else 0
+    return (width >= BASE64_LINE_CHARS
+            and len(lines[0]) <= width and len(lines[-1]) <= width
+            and all(len(line) == width for line in lines[1:-1])
+            and all(_BASE64_RE.fullmatch(line) for line in lines))
+
+
+class _TagWalk:
+    """A browser's reading of one tag's attributes — the tokenizer's
+    attribute states, an attribute at a time — walked once: asked of
+    stretches of the tag in order, it goes on from where it stopped."""
+
+    def __init__(self, html: str, start: int, end: int):
+        self.html, self.start, self.end = html, start, end
+        name = _TAG_OPEN_RE.match(html, start).end() - 1
+        self.at = _TAG_NAME_RE.match(html, name).end()
+        self.attribute = None       # the first that does not end before
+
+    def quotes(self, start: int, end: int) -> bool:
+        """Is html[start:end] inside one value in quotes: opened by a quote
+        (an entity opens none) before it, and not closed before its end?"""
+        while self.attribute is None or self.attribute.end() <= start:
+            attribute = _TAG_ATTRIBUTE_RE.match(self.html, self.at, self.end)
+            if attribute is None:
+                return False            # the tag's ">", or its end
+            self.attribute, self.at = attribute, attribute.end()
+        opened, closed = self.attribute.span(1)
+        return opened < start and end < closed
+
+
+def _markup_read(html: str) -> tuple:
+    """``(markup, cut)``: what a call reads of an HTML part, and whether
+    that is not all of it.
+
+    The first MAX_HTML_CHARS characters — of markup that can be text, or can
+    say where the text is. An image a client wrote into the part itself is
+    neither, and a megabyte of it would use up the bound before the first
+    word (or after the second, and take the rest of the mail with it): the
+    payload of a long ``data:`` URL in a tag or a style sheet is left out,
+    not counted, and the tag that held it stays. Text shaped like one is
+    text, and counts. And what is left out is a payload by its shape —
+    base64 or a URL's characters, no blank but between the lines of folded
+    base64, no quote — up to the first character that is none of it: where
+    a home-made reading of the markup takes text for a tag, what that
+    costs is a long run of a URL's characters, never words a blank divides
+    nor the end of a value. (Words joined by "-", "_", "." or "%20" are such
+    a run, so past a CDATA section — the one misreading known: a browser
+    ends one in an <svg> at "]]>" — nothing is left out.) Folded base64 is
+    left out only where a browser's own reading of the tag puts all of it
+    in one value in quotes, which nothing but its quote ends: what stands
+    in for it cannot change where the tag is split. Anywhere else a browser
+    ended the value at the first blank, and what follows is attributes or
+    text as it reads them — so the run is no folded value, and counts.
+
+    A longer part is cut at the bound, wherever that falls: the parser is
+    handed what was read and not told that it ends there (see _convert), so
+    a tag, a comment or a character reference the bound falls into is
+    dropped, and nothing of it is taken for text. Cutting back to where the
+    last tag begins instead would drop all of an element that is longer than
+    the bound allows — a log in a <pre> — from its first word on.
+    """
+    limit = MAX_HTML_CHARS
+    if len(html) <= limit:
+        return html, False
+    kept: list = []
+    size = done = at = 0
+    spans = _markup_spans(html)
+    span = (0, 0, False)    # the first that does not end before a candidate
+    walk = None             # of the tag the last folded one stood in
+    for _ in range(_MAX_DATA_URLS):
+        # (Looked for from where the last payload, or what looked like one,
+        # ended: what stands in one is not searched for more of them.)
+        match = _DATA_URL_RE.search(html, at)
+        if match is None:
+            break
+        start, at = match.span()
+        if size + start - done >= limit:
+            break                   # the bound falls before this one
+        # It stands in a tag or a style sheet — asked first, so that one in
+        # text costs no more than that. Text shaped like one is shown by a
+        # browser, line breaks and all: it is text here too …
+        while span[1] <= start:
+            span = next(spans)
+        if not (span[2] and span[0] < start):
+            continue
+        # … in an attribute or a url(): right after "=" or "(", in quotes
+        # or not …
+        before = html[max(done, start - 10):start]
+        opener = before[-1:] if before[-1:] in ("\"", "'") else next(
+            (opener for opener in _DATA_URL_CLOSERS
+             if opener and before.endswith(opener)), "")
+        if not before[:len(before) - len(opener)].rstrip().endswith(("=", "(")):
+            continue
+        # … and what follows is a payload by its shape, which ends at the
+        # first character that is none of one: what began the value must
+        # end it there. Whatever else a reading of the markup gets wrong,
+        # what is left out is never words a blank divides, nor a quote that
+        # ends one value and lets the next take the mail.
+        payload = (_DATA_URL_QUOTED_RE if opener else _DATA_URL_BARE_RE).match(html, at)
+        if payload is None:
+            continue                # no URL: it has no comma where one has
+        end = at = payload.end()
+        comma = html.index(",", start)
+        blank = "\n" if _BLANKS_RE.search(html, comma, end) else ""
+        if (end - start <= DATA_URL_CHARS
+                or not html.startswith(_DATA_URL_CLOSERS[opener], end)
+                or (blank and not _folded(html[comma + 1:end]))):
+            continue
+        # Folded in a tag, it is a value in quotes as a browser reads the
+        # tag — or a browser read no such value, and it counts. (In a style
+        # sheet nothing but its end tag ends anything. A tag is walked once,
+        # on from where the last candidate in it was.)
+        if blank and span[2] is True:
+            if walk is None or walk.start != span[0]:
+                walk = _TagWalk(html, span[0], span[1])
+            if not walk.quotes(start, end):
+                continue
+        # (One blank stays for its blanks: in quotes it splits nothing.)
+        kept.append(html[done:start + 5] + blank)
+        size += start + 5 - done + len(blank)
+        done = end
+    kept.append(html[done:done + max(0, limit - size) + 1])
+    markup = "".join(kept)
+    if len(markup) <= limit:
+        return markup, False
+    markup = markup[:limit]
+    # A character reference the bound falls into would be read as the text
+    # it begins with, and a "<" at the very end as a character.
+    reference = markup.rfind("&", max(0, limit - 34))
+    if reference >= 0 and not _CHARREF_END_RE.search(markup, reference):
+        markup = markup[:reference]
+    return markup.rstrip("<"), True
 
 
 def trim(plain: str | None, html: str | None, subject: str | None = None, *,
@@ -1944,21 +2299,18 @@ def trim(plain: str | None, html: str | None, subject: str | None = None, *,
     if has_plain:
         whole = _as_it_came(plain)
         if _oversize(whole):
-            # More than the pipeline works on: no trim, and no line of it is
-            # so much as looked at. Asked again, the answer is the same.
+            # More than a source may be: no trim, and no line of it is so
+            # much as looked at. Asked again, the answer is the same.
             return TrimResult(whole, "wanting", removed)
-    cut = has_html and len(html) > MAX_HTML_CHARS
-    if cut:
-        # Read up to the last tag that begins within the bound, so that none
-        # is read in half.
-        end = html.rfind("<", 0, MAX_HTML_CHARS)
-        html = html[:end if end > 0 else MAX_HTML_CHARS]
+    cut = False
+    if has_html:
+        html, cut = _markup_read(html)
     converted = None            # (marked text, pixels) of the HTML part, once
 
     def html_source():
         nonlocal converted
         if converted is None:
-            converted = _convert(html, marks=True)
+            converted = _convert(html, marks=True, cut=cut)
         return converted
 
     if (has_plain and has_html and len(plain.strip()) < STUB_CHARS
@@ -1970,7 +2322,9 @@ def trim(plain: str | None, html: str | None, subject: str | None = None, *,
     untrimmed: list = []
     unsettled = False
     if has_plain:
-        untrimmed = _clean_lines(plain)
+        # (Of the part as it came, which is within the bounds: the part
+        # itself can be fifty megabytes of marks around a few lines.)
+        untrimmed = _clean_lines(whole)
         lines, removed, unsettled = _settle(untrimmed, evidence)
     consult = has_html and (not has_plain or (
         lines is not None and not removed["quote"]
@@ -1986,7 +2340,7 @@ def trim(plain: str | None, html: str | None, subject: str | None = None, *,
             raw += ["", CUT_MARK] if raw else [CUT_MARK]
         bare = _unmarked(raw)
         if _oversize(_text_of(bare)):
-            # More than the pipeline works on, as above: no trim.
+            # More than a source may be, as above: no trim.
             candidate, open_ = bare, True
             counted = {"quote": 0, "signature": 0, "footer": 0, "pixels": 0}
         else:
@@ -2022,8 +2376,13 @@ def trim(plain: str | None, html: str | None, subject: str | None = None, *,
             removed.update(quote=0, signature=0, footer=0)
         removed["pixels"] = pixels
         unsettled = True
+    if cut and converted is not None:
+        # Whatever was decided by a part that was not read to its end — that
+        # the plain part is no stub beside it, too — is open: what the rest
+        # of it says, nobody has seen.
+        unsettled = True
     # The delimiter's blank and (never, by now) a mark go last.
-    text = _MARKS_RE.sub("", "\n".join(line.rstrip() for line in lines))
+    text = _no_marks("\n".join(line.rstrip() for line in lines))
     wanting = bool(text) and (
         not has_plain or unsettled or len(text) > WANTING_CHARS
         or _marker_survives(lines))
@@ -2070,6 +2429,24 @@ _TABLE_TAGS = frozenset((
     "colgroup"))
 # … unless a container stands between them.
 _P_BARRIERS = (_CLOSES_P - {"p"}) | _TABLE_TAGS
+# What a second <a> does not end with the link it stands in, as a browser
+# reads the two. An element of HTML's "special" category (a block, a list, a
+# table and its parts, …) is moved out from under the first link and stays
+# open, and a formatting element (_REOPENED_TAGS: the sanitiser's
+# _CARRIED_TAGS, and <nobr>) is opened again: one of either kind that hides
+# what is in it goes on hiding it.
+_REOPENED_TAGS = frozenset((
+    "a", "b", "big", "code", "em", "font", "i", "nobr", "s", "small",
+    "strike", "strong", "tt", "u"))
+_LASTING_TAGS = (
+    _PARAGRAPH_TAGS | _BREAK_TAGS | _CLOSES_P | _TABLE_TAGS | _REOPENED_TAGS
+    | frozenset(("button", "dir", "hgroup", "listing", "marquee", "menu",
+                 "search"))) - frozenset(("legend", "option"))
+# And inside these an <a> is no link at all to a browser: text of a script,
+# a tag that a <select> drops, an element of another kind in an <svg>. (Not
+# so in the muted elements whose content is ordinary markup that merely is
+# not shown.)
+_OPAQUE_TAGS = _MUTE_TAGS - frozenset(("audio", "video", "canvas", "datalist"))
 # Quote containers, by the client that writes them.
 _QUOTE_BLOCK_CLASSES = frozenset((
     "gmail_quote", "protonmail_quote", "tutanota_quote"))
@@ -2330,6 +2707,18 @@ class _TextConverter(HTMLParser):
         # the stack is answered from these, so none of them walks it.
         self._where: dict = {}
         self._walls: list = []
+        # Where the elements are open that hide what is in them — the one
+        # that mutes, and those inside it that would — and which of them a
+        # second <a> does not end (_LASTING_TAGS); where the outermost is in
+        # which an <a> is none (_OPAQUE_TAGS; -1: nowhere); and where the
+        # links are that a second <a> has ended all the same, with what a
+        # browser took off its stack with them (_end_link), and for how long:
+        # the element that kept on hiding, and where its part of those begins.
+        self._veils: list = []
+        self._lasting: list = []
+        self._opaque = -1
+        self._stale: list = []
+        self._keepers: list = []
         self._inert = 0         # depth inside muted or hidden elements
         self._overflow = None   # [tag, depth] of a muted element past _MAX_DEPTH
         self._pre = 0
@@ -2341,18 +2730,41 @@ class _TextConverter(HTMLParser):
 
     # ── stack discipline ──
 
-    def _push(self, element: _Element) -> None:
+    def _push(self, element: _Element, veil: bool = False) -> None:
         self._where.setdefault(element.tag, []).append(len(self._stack))
         if element.kind in ("cell", "table"):
             self._walls.append(len(self._stack))
+        if veil:
+            self._veils.append(len(self._stack))
+            if element.tag in _LASTING_TAGS:
+                self._lasting.append(len(self._stack))
+            elif self._opaque < 0 and element.tag in _OPAQUE_TAGS:
+                self._opaque = len(self._stack)
         self._stack.append(element)
 
     def _pop_to(self, index: int) -> None:
         while len(self._stack) > index:
             element = self._stack.pop()
             self._where[element.tag].pop()
-            if self._walls and self._walls[-1] == len(self._stack):
+            here = len(self._stack)
+            if self._walls and self._walls[-1] == here:
                 self._walls.pop()
+            if self._veils and self._veils[-1] == here:
+                self._veils.pop()
+                if self._lasting and self._lasting[-1] == here:
+                    self._lasting.pop()
+                if self._opaque == here:
+                    self._opaque = -1
+            if self._stale and self._stale[-1] == here:
+                self._stale.pop()
+            while self._keepers and self._keepers[-1][0] >= here:
+                # A formatting element the browser opened again in this one
+                # is open after it as well: its end tag ends it.
+                first = self._keepers.pop()[1]
+                self._stale[first:] = [
+                    at for at in self._stale[first:]
+                    if self._stack[at].tag == "a"
+                    or self._stack[at].tag not in _REOPENED_TAGS]
             self._close(element)
 
     def _last(self, tags) -> int:
@@ -2369,7 +2781,10 @@ class _TextConverter(HTMLParser):
         """The innermost open element with one of `tags` that no element with
         one of `barriers` stands inside of; None when there is none."""
         found = self._last(tags)
-        if found < 0 or self._last(barriers) > found:
+        if found < 0:
+            return None
+        # (Nothing stands inside the element that was opened last.)
+        if found < len(self._stack) - 1 and self._last(barriers) > found:
             return None
         return found
 
@@ -2398,18 +2813,69 @@ class _TextConverter(HTMLParser):
         elif tag == "a":
             # A link does not nest: a second <a> ends the first. (Else every
             # word of a mail could be written into 256 open links at once.)
-            # Not one inside hidden content, though, which takes no text and
-            # no part in what is shown: ending the link around it would end
-            # what hides it too, and show the rest of what it hides.
-            if self._inert:
-                return
+            # With the first it ends what was opened in it, and with that
+            # what hides the second — if the first link does, or a <span>
+            # and its like opened in it: the rest of what they hid is shown
+            # by a browser and in the Original view, and so here.
             found = self._find(("a",), ("td", "th", "table"))
+            if self._inert:
+                # Not if the hiding is from further out, or where an <a> is
+                # no link to a browser: such a tag ends nothing, takes no
+                # text and has no part in what is shown.
+                if (found is None or self._veils[0] < found
+                        or self._opaque > found or self._gone(found)):
+                    return
+                # Nor if an element in the link hides that the browser
+                # keeps (_LASTING_TAGS: a mobile duplicate in a <div>, a
+                # <font> with display:none). The first link ends, what it
+                # holds stays open, and hidden.
+                if self._lasting and self._lasting[-1] > found:
+                    self._end_link(found)
+                    return
         elif tag in _CLOSES_P:
             found = self._find(("p",), _P_BARRIERS)
         else:
             return
         if found is not None:
             self._pop_to(found)
+
+    def _end_link(self, index: int) -> None:
+        """End the link at `index` for a second <a> in it that stays hidden.
+
+        The link is left on the stack, for what was opened in it: it takes
+        no more text, and is no link to end again. What hides is, from here
+        on, the first element in the link that the browser keeps — whatever
+        hid around that one has ended with the link, so the hiding is over
+        when that element is.
+
+        What stands between the two a browser has taken off its stack with
+        the link — all of it but a block and its like, which it moves and
+        keeps open (a formatting element it opens again, inside the one that
+        hides): an end tag of theirs is a stray one, as the link's own </a>
+        is, and does not end the hiding. Once that element has closed, the
+        end tag of a formatting element is a real one again — the browser's
+        copy of it is open — and ends it, and what was opened in it since.
+        """
+        element = self._stack[index]
+        if element.kind == "link":
+            self._close(element)
+            element.kind = "inline"
+        keeper = self._lasting[bisect_right(self._lasting, index)]
+        self._keepers.append((keeper, len(self._stale)))
+        self._stale.extend(
+            at for at in range(index, keeper)
+            if self._stack[at].tag in _REOPENED_TAGS
+            or self._stack[at].tag not in _LASTING_TAGS)
+        if self._veils[0] != keeper:
+            self._stack[self._veils[0]].kind = "inert"
+            self._stack[keeper].kind = "mute"
+            del self._veils[:bisect_left(self._veils, keeper)]
+            del self._lasting[:bisect_left(self._lasting, keeper)]
+
+    def _gone(self, index: int) -> bool:
+        """Is the element at `index` off a browser's stack (_end_link)?"""
+        at = bisect_left(self._stale, index)
+        return at < len(self._stale) and self._stale[at] == index
 
     # ── parser callbacks ──
 
@@ -2443,9 +2909,9 @@ class _TextConverter(HTMLParser):
                 self._overflow = [tag, 1]
             return
         if self._inert:
-            self._push(_Element(tag, "inert"))
+            self._push(_Element(tag, "inert"), mute)
         elif mute:
-            self._push(_Element(tag, "mute"))
+            self._push(_Element(tag, "mute"), True)
             self._inert += 1
         else:
             self._push(self._open(tag, a))
@@ -2582,6 +3048,8 @@ class _TextConverter(HTMLParser):
         # A stray </div> inside a cell must not close the table around it.
         if tag not in _TABLE_TAGS and self._walls and self._walls[-1] > index:
             return
+        if self._gone(index):
+            return                  # ended with a link: a stray end tag
         self._pop_to(index)
 
     def _close(self, element: _Element) -> None:
@@ -2680,19 +3148,27 @@ class _TextConverter(HTMLParser):
         if not self._inert and not self._overflow:
             self._write(data.translate(_INVISIBLE))
 
-    def finish(self) -> list:
-        self.close()
+    def finish(self, whole: bool = True) -> list:
+        if whole:
+            self.close()
         self._pop_to(0)
         return self._blocks[0].done()
 
 
-def _convert(html: str, marks: bool = False):
-    """``(text, tracking pixels)`` of an HTML part."""
+def _convert(html: str, marks: bool = False, cut: bool = False):
+    """``(text, tracking pixels)`` of an HTML part.
+
+    `cut`: the markup is the beginning of a longer part (see _markup_read).
+    The parser is then not told that it has ended. Told so, it would write
+    out what it holds back as unfinished — a tag, a comment, as far as they
+    got — as text, or not, by its version; this way none does. Only text is
+    not to wait for more of itself, which a blank sees to.
+    """
     converter = _TextConverter(
         marks, _PREFIX_ALLOWANCE * len(html) + _PREFIX_FLOOR)
     try:
-        converter.feed(html)
-        lines = converter.finish()
+        converter.feed(html + " " if cut else html)
+        lines = converter.finish(whole=not cut)
     except Exception:
         # A document that trips the parser still has words in it.
         lines = _html.unescape(re.sub(r"<[^<>]*>", " ", html)).split("\n")
@@ -2705,7 +3181,7 @@ def _convert(html: str, marks: bool = False):
         out.append(line if line.strip(" \u200c\u200d\u2060") else "")
     text = "\n".join(_squeeze(out))
     if not marks:
-        text = _MARKS_RE.sub("", text)      # belt: no input reaches a line raw
+        text = _no_marks(text)      # belt: no input reaches a line raw
     return text, converter.pixels
 
 
@@ -2770,10 +3246,12 @@ _SAFE_TAG_ATTRS = {
 # output would end the very same element at the very same place — the tree
 # of the document is the mail's with the tag and without it:
 #
-#   * <p> ends the open paragraph, as long as nothing but inline markup has
-#     been opened since that began. The start tag of one of these has ended
-#     it for the browser already, and what was opened since is not inside
-#     it; that paragraph keeps its level, as it always did.
+#   * <p> ends the open paragraph, and so does the start tag of one of
+#     these — a rule, a heading, a list, a table, a <div> — as long as
+#     nothing but inline markup has been opened since the paragraph began.
+#     A part of a table ends it in a table only: outside one a browser drops
+#     that tag, the paragraph is as open as before, and its own </p> is
+#     still its end.
 _ENDS_P = frozenset((
     "address", "article", "aside", "blockquote", "caption", "center",
     "colgroup", "dd", "details", "div", "dl", "dt", "figcaption", "figure",
@@ -2787,7 +3265,11 @@ _ITEM_ENDS = {"li": ("li",), "dd": ("dd", "dt"), "dt": ("dd", "dt")}
 _ITEM_STOPS = tuple(sorted(_ENDS_P - {"address", "div", "hr"}))
 #   * Neither a paragraph nor an item is ended with one of these open in
 #     it: a browser opens them again in the next paragraph or item, and
-#     only it can. That end is left to the browser, as before.
+#     only it can. That end is left to the browser, and the element keeps
+#     its level. (The known limit: a mail that leaves a <b> or a <font> open
+#     in every paragraph still nests once for each, and past _MAX_DEPTH its
+#     paragraphs run together. Writing those ends would mean reopening what
+#     the browser carries over, exactly as it does.)
 _CARRIED_TAGS = (
     "a", "b", "big", "code", "em", "font", "i", "s", "small", "strike",
     "strong", "tt", "u")
@@ -2804,11 +3286,17 @@ _TABLE_ENDS = {
     "tfoot": (("thead", "tbody", "tfoot"), ("tr",), ("td", "th")),
 }
 _TABLE_PARTS = ("td", "th", "tr", "thead", "tbody", "tfoot")
+# … and every tag that is one only in a table: outside, a browser drops it.
+_TABLE_ONLY = _TABLE_PARTS + ("caption", "colgroup")
 # What an end tag does not reach across: a stray </div> inside a cell must
 # not close the table around it, nor a stray </li> the list it stands in,
 # nor a stray </tr> a row of the table around this one. (With the end tags
 # above written, an end tag written twice no longer meets an element that
-# was left open, and would otherwise end the next one out.)
+# was left open, and would otherwise end the next one out.) To a paragraph's
+# end tag a cell is a wall in a table only: outside one a browser drops the
+# <td>, and </p> ends the paragraph — dropped behind such a wall, it would
+# leave what follows a hidden paragraph written into it. (Unless a carried
+# element is open in the paragraph: that end is the browser's, as above.)
 _END_WALLS = ("td", "th", "table")
 _ITEM_END_WALLS = _END_WALLS + ("ul", "ol")
 _PART_END_WALLS = ("table",)
@@ -3260,24 +3748,50 @@ class _Sanitizer(HTMLParser):
         """
         if tag in _TABLE_ENDS:
             self._implied_table_end(tag)
-        targets = ("p",) if tag == "p" else _ITEM_ENDS.get(tag)
-        if targets:
+        targets = _ITEM_ENDS.get(tag)
+        if targets and self._open:
             top = len(self._open) - 1
             found = top if self._open[top] in targets else self._last(targets)
             if found < 0 or found in self._ended:
                 pass
             elif found == top:
                 self._close_to(found)
-            elif tag != "p" and self._last(_ITEM_STOPS) > found:
+            elif self._last(_ITEM_STOPS) > found:
                 pass                # the new one is its descendant
             elif self._last(_CARRIED_TAGS) > found:
                 self._ended.add(found)
             else:
                 self._close_to(found)
-        if tag in _ENDS_P:
-            paragraphs = self._open_at.get("p")
-            if paragraphs:
-                self._ended.add(paragraphs[-1])
+        if tag == "p" or tag in _ENDS_P:
+            self._implied_paragraph_end(tag)
+
+    def _implied_paragraph_end(self, tag: str) -> None:
+        """The same for the open paragraph, which this start tag ends.
+
+        Its end tag is written wherever a browser ends it with all that was
+        opened in it — which is every time but one: with a carried element
+        open in it, the paragraph is only known to be ended. (A mail whose
+        paragraphs end at a rule, a heading, a list or a table would
+        otherwise count as nested once for each, like one without </p>.)
+        """
+        paragraphs = self._open_at.get("p")
+        if not paragraphs or paragraphs[-1] in self._ended:
+            return
+        found = paragraphs[-1]
+        in_table = bool(self._open_at.get("table"))
+        if not in_table and tag in _TABLE_ONLY:
+            return                  # no table: a browser drops this tag
+        if found < len(self._open) - 1:
+            if in_table and self._last(_END_WALLS + ("caption",)) > found:
+                return              # the paragraph is not in this cell
+            if (self._last(_CARRIED_TAGS) > found
+                    or self._last(_TABLE_ONLY) > found):
+                # (A part of a table in a paragraph that has not ended is
+                # one the browser dropped. No end tag is written across it:
+                # its own would then meet another element.)
+                self._ended.add(found)
+                return
+        self._close_to(found)
 
     def _implied_table_end(self, tag: str) -> None:
         """The same for a cell, a row or a group of rows (see _TABLE_ENDS)."""
@@ -3347,6 +3861,9 @@ class _Sanitizer(HTMLParser):
         for wall in walls:
             inside = self._open_at.get(wall)
             if inside and inside[-1] > index:
+                if (tag == "p" and not self._open_at.get("table")
+                        and self._last(_CARRIED_TAGS) < index):
+                    break           # no table, no cell: see _END_WALLS
                 return
         if index in self._ended and index < len(self._open) - 1:
             # Ended by the browser long ago: this end tag is a stray one to

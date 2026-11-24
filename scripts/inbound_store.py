@@ -206,7 +206,8 @@ P_REFUSED = KB + "refused"
 # one their answers cite — one triple each (kb:messageId stays the id the
 # gateway minted, which is what the record, the chat and every index are
 # keyed by). Identity, not content: kept on a tombstone, where a thread index
-# rebuilt from the ledger still needs every id a mail was ever known by.
+# rebuilt from the ledger still needs every id a mail was ever known by — and
+# on a record written in its place, inbound-shaped ones included.
 P_SENT_AS = KB + "sentAs"
 # Threading, as the headers carried it: the parent's id, and the References
 # ids space-separated in header order (followed by any further id the
@@ -782,6 +783,33 @@ def _record_blob_meta(store_dir, fields: dict, content_ids) -> dict:
     return meta
 
 
+_RECORD_NAME_RE = re.compile(r"^\d{16}-([0-9a-f]{16})\.nt$")
+
+
+def _replacing(store_dir, replace, ts: float) -> tuple[str, Path]:
+    """The token and the file of a record about to be written.
+
+    A new record gets a file of its own. Filename: zero-padded epoch millis
+    (sortable) + token (unique, IRI-safe). With ``replace`` — a record of
+    this store, by its path — the new record takes that one's place instead:
+    its file name and its token, written in one atomic rename (as every
+    record is), so the file holds the old record or the new one and never
+    neither — whatever stops the write, the old record still stands. Its
+    blobs are not touched: the ones the new record no longer names are the
+    caller's to unlink (:func:`discard_media`), once it stands. ``replace``
+    must name a record in this store's ``messages/``; anything else is a
+    programming error and raises ``ValueError``."""
+    if replace is None:
+        token = secrets.token_hex(8)
+        return token, messages_dir(store_dir) / f"{int(ts * 1000):016d}-{token}.nt"
+    path = Path(replace)
+    named = _RECORD_NAME_RE.match(path.name)
+    if not named or path.parent.resolve() != messages_dir(store_dir).resolve() \
+            or not path.is_file():
+        raise ValueError(f"not a record of this store: {replace}")
+    return named.group(1), path
+
+
 # -- public API ---------------------------------------------------------------
 
 def write_message(
@@ -813,6 +841,8 @@ def write_message(
     arrived_at: float | None = None,
     reply_to: list[str] | None = None,
     gate_sender: str | None = None,
+    replace: str | Path | None = None,
+    sent_as: list[str] | None = None,
 ) -> tuple[str, Path]:
     """Persist one inbound message as a deterministic N-Triples file.
 
@@ -858,9 +888,14 @@ def write_message(
     see :data:`P_ARRIVED_AT` — ``timestamp`` is the mail's time on record,
     which its sender may have written). Every one defaults to absent, and an
     absent one writes no triple.
+
+    ``replace`` is a record of this store that the new one takes the place
+    of (see :func:`_replacing`). ``sent_as`` as for :func:`write_outbound`:
+    a record written in the place of a mail the gateway sent keeps the ids
+    a provider gave that mail, whichever way it is written.
     """
     ts = time.time() if timestamp is None else float(timestamp)
-    token = secrets.token_hex(8)
+    token, path = _replacing(store_dir, replace, ts)
     urn = f"urn:retinue:inbound:{_slug(channel)}:{token}"
     fields = {
         **_mail_fields(subject=subject, sender_name=sender_name, recipients=recipients,
@@ -882,10 +917,8 @@ def write_message(
         "attachments": [u for u in (attachment_urls or []) if u],
         "media": media or None,
     }
+    fields["sent_as"] = _many(sent_as)
     fields["attachment_meta"] = _record_blob_meta(store_dir, fields, content_ids)
-    # Filename: zero-padded epoch millis (sortable) + token (unique, IRI-safe).
-    fname = f"{int(ts * 1000):016d}-{token}.nt"
-    path = messages_dir(store_dir) / fname
     _atomic_write(_render(fields), path)
     return urn, path
 
@@ -917,6 +950,8 @@ def write_outbound(
     arrived_at: float | None = None,
     reply_to: list[str] | None = None,
     refused: list[str] | None = None,
+    replace: str | Path | None = None,
+    sent_as: list[str] | None = None,
 ) -> tuple[str, Path]:
     """Persist one successfully sent outbound message as its own N-Triples file.
 
@@ -944,14 +979,17 @@ def write_outbound(
     A mail also states its From — ``sender`` (the account's own address, or
     the alias it went out as) and ``sender_name`` — and takes the same mail
     arguments as :func:`write_message`; a messenger send passes none of them
-    and its record is what it always was. ``refused`` is a sent mail's alone:
-    the addresses the SMTP server would not take it for (see
-    :data:`P_REFUSED`) — ``recipients`` and ``cc`` are then the others.
+    and its record is what it always was. So does ``replace``
+    (see :func:`_replacing`). ``refused`` is a sent mail's alone: the
+    addresses the SMTP server would not take it for (see :data:`P_REFUSED`)
+    — ``recipients`` and ``cc`` are then the others. ``sent_as`` too: the
+    ids a provider gave the mail (see :data:`P_SENT_AS`) — for a record
+    that replaces one which had them, so that they are not lost with it.
     """
     if author not in AUTHORS:
         raise ValueError(f"author must be one of {'|'.join(AUTHORS)}, got {author!r}")
     ts = time.time() if timestamp is None else float(timestamp)
-    token = secrets.token_hex(8)
+    token, path = _replacing(store_dir, replace, ts)
     urn = f"urn:retinue:outbound:{_slug(channel)}:{token}"
     fields = {
         **_mail_fields(subject=subject, sender_name=sender_name, recipients=recipients,
@@ -971,9 +1009,8 @@ def write_outbound(
         "sent_at": _iso(ts),
         "attachments": [u for u in (attachment_urls or []) if u],
     }
+    fields["sent_as"] = _many(sent_as)
     fields["attachment_meta"] = _record_blob_meta(store_dir, fields, content_ids)
-    fname = f"{int(ts * 1000):016d}-{token}.nt"
-    path = messages_dir(store_dir) / fname
     _atomic_write(_render(fields), path)
     return urn, path
 
