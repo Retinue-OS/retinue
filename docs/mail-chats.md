@@ -390,7 +390,14 @@ again is written as the first time, and the index is matched with the
 ledger again.) A record of the user's own that is written again keeps who
 wrote the mail and every id its provider gave it (`kb:sentAs`): the
 gateway's own send is on record with its author from the start, and stays
-so when its Sent copy comes back from the Trash.
+so when its Sent copy comes back from the Trash. An id its provider gave a
+mail is that mail's in every folder, Sent included: a copy under it — in a
+renumbered Sent, moved out and back, a second copy — is one more place of
+the record under the id the gateway minted, and where that record is a
+tombstone, the record is written again in its own place, under the minted
+id; never a second record under the provider's id. (A stranger's mail under that id is
+what it is under the minted one: one more place, or another mail's beside a
+placeholder.)
 
 A mail whose record is gone from the ledger (restored from an older backup,
 a file lost) is known no more: its row and its places go, and what the row
@@ -422,7 +429,10 @@ holds is the user's, what is in the archive the user's when it is from one
 of the user's own addresses and left Sent unseen — with one difference: in
 the archive, From that very sender and received when the row said, where
 the row said the mail was the user's, it is the user's again, whatever
-address that is. Never in INBOX, nor in the archive on its From alone: a
+address that is — and found under an id its provider gave a send of the
+gateway's own, the record again under the id the gateway minted, with the
+provider's as `kb:sentAs` and the author noted for it. Never in INBOX, nor
+in the archive on its From alone: a
 look-alike From the user's own address stays a mail that came in — in
 INBOX, archived, or in an "all mail" archive — and a second copy where the
 Sent copy is there. The others found are read as further copies of any
@@ -650,6 +660,14 @@ reverse").
   which the record now keeps — and `Cc` everyone on its `To`/`Cc` except the
   account's own addresses and the `To`; *sender only*: the `To` alone. If the
   latest mail is the user's own, a reply-all goes to its recipients again.
+  An older record does not keep `Reply-To`: its header block says it, and is
+  read in the reader process — only where the block has a `Reply-To` line, so
+  a reply to a mail that named none waits for nothing, and once for both
+  modes. The wait that remains: a reply to such an older record whose mail
+  has a `Reply-To`, while the mirror reads a heavy mail, waits for the reader
+  — up to that reading's deadline; past the web gateway's preview budget the
+  preview fails and the send is refused client-side, and the press made again
+  once the reading is done finds it answered.
 - **The recipients the user sees are the recipients the gateway uses.** The
   browser never recomputes a reply's addressing. `POST /reply-preview
   {chat, account}` on the mail gateway (token-gated like `/send`, read-only,
@@ -819,7 +837,13 @@ reverse").
   the same `Message-ID` and writes nothing; and a record the gateway wrote for
   its own send is not "unlocated" until its Sent copy has had
   `MAIL_SENT_GRACE_SECONDS` (600) to appear — with `SMTP_SAVE_SENT=false` and
-  no copy appearing it stays a live record, the mail having been sent. The
+  no copy appearing it stays a live record, the mail having been sent. A
+  provider that files the copy under a `Message-ID` of its own has it matched
+  to the send (by the gateway's `X-Retinue-Message-ID` header with the
+  account, the recipients and the date, or where it kept none by the mail
+  itself), and the provider's id is kept as `kb:sentAs`; a copy the reader
+  cannot read is matched by that header with the account and the date — no
+  placeholder of its own in a chat of its own. The
   gateway never writes policy: `email_client`'s whitelist-on-send is disabled
   inside it.
 - **New mail.** ＋ on the Chats page offers *E-mail* (what
@@ -884,7 +908,10 @@ now, so they are the user's own act like send, compose and delete:
 (`CHAT_ERASE_TOKEN`; 503 while unset, 403 on a mismatch), and the gateway must
 succeed before the web gateway erases its own state — if any move fails, or a
 mail of the thread cannot be placed, nothing is erased and the answer reports
-`errors > 0`, with the reason as one sentence in `error`. The answer is
+`errors > 0`, with the reason as one sentence in `error`. A mail of the thread
+whose record the ledger lost (still looked for, above) is one of them: it is
+looked for under every id it is known by and moved to the Trash with the
+rest, and while a folder cannot say where it is, nothing is erased. The answer is
 `delete_chat`'s shape plus `trashed`; a mail that turns up again later in a
 mirrored folder (restored from the Trash) starts the chat anew.
 
@@ -907,7 +934,14 @@ IMAP writes are `UID STORE` and `UID MOVE`, with `UID COPY` + `\Deleted` +
 `EXPUNGE`. Such a leftover is no place of the mail for a later read or
 archive, and keeps it from being called gone; a delete asks after it, and
 one a client has undeleted since is the mail's place again, moved to the
-Trash with the rest. And where a mail is looked for in
+Trash with the rest. It is never the mail's only place for good: where the
+server named no new UID and the look in the archive could not tell, the
+mail settles and is looked for again until its copy there is found (a
+leftover no longer flagged `\Deleted` is its place again). And a move is
+noted before the server is asked, so a stop between the server's move and
+the index following it is put right at the next start: the source UID gone
+or flagged `\Deleted` is no place any more, and the copy in the archive is
+found. And where a mail is looked for in
 a folder — after a move whose new UID the server did not name, or by a
 delete — every mail there under its id is looked at, as the mirror looks:
 the mail of a placeholder is only the copy its record keeps the header block
