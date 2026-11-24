@@ -382,20 +382,43 @@ the work looks for each such id by its `Message-ID` in Sent, INBOX and the
 archive — every mail under it in every folder, so a move or a renumbered
 folder makes no difference — at most `LOST_BATCH` ids a pass, the one
 tried least recently first, before the backfill and never in the way of
-new mail. Of what is found, the one mail From the sender the row named that
-the server received first (Sent first on a tie; the first of all if none is
-From that sender) is read as any mail is read the first time where it lies
-— what a Sent copy holds is the user's, what is in the archive the user's
-when it is from one of the user's own addresses and left Sent unseen — with
-one difference: From that very sender, where the row said the mail was the
-user's, it is the user's again, whatever address that is. That is evidence
-about the mail itself; a forged From in the archive stays a mail that came
-in, and a look-alike under the id stays a second copy. The others found are
-read as further copies of any mail are. Found in no folder, with every
-folder sure of it, the id is dropped (there is no record to tombstone).
-Where that cannot be told yet — a folder that would not answer, a header
-block that did not come back — the id stays, is looked for again less and
-less often, and holds back none behind it; `/health` counts it.
+new mail. Of what is found, ONE mail is read as the record's: for a row
+that said the mail was the user's, a Sent copy, whenever the server
+received it (a client may append its Sent copy late); then the copy the
+server received when the row said the mail arrived; then an archive copy;
+then the rest. For any other row, the copy From the sender the row named
+(the one received when the row said, else the first). A match whose header
+block does not come back counts as From nobody and comes last; it holds up
+nothing where the first is known to be the record's. That one mail is read
+as any mail is read the first time where it lies — what a Sent copy holds
+is the user's, what is in the archive the user's when it is from one of the
+user's own addresses and left Sent unseen — with one difference: in the
+archive, From that very sender, where the row said the mail was the
+user's, it is the user's again, whatever address that is (a copy the user
+can have put there). Never in INBOX: a From there is its sender's to write,
+and whoever was sent a mail knows its `Message-ID`, so a look-alike From
+the user's own address stays a mail that came in, and a second copy where
+the Sent copy is there. The others found are read as further copies of any
+mail are (one more place, another mail's, or a placeholder). Found in no
+folder, with every folder sure of it, the id is dropped. Where that cannot
+be told yet — a folder that would not answer, a header block that did not
+come back — the id stays, is looked for again less and less often, and
+holds back none behind it; `/health` counts it. An id that cannot be
+searched for (no `Message-ID`, or one the search cannot spell) is found by
+reading headers, and the copy received when the row said is read without
+waiting for that reading to cover the whole window. After `LOST_TRIES` (8)
+tries in vain, what was found is read as mail nothing is known of, a log
+line says so, and the id is looked for no more.
+
+What this leaves, plainly: while the archive does not answer, every lost id
+waits (`/health` says the archive does not answer, and counts them); an id
+whose mail is in no folder leaves the list with a log line and no `removed`
+event — there is no record to tombstone; a ledger restored from an older
+backup over a live one can leave two record files for one id (a record
+written as the first time takes a name of its own, and the backup brings
+back the one it had before); and a mail to oneself whose Sent copy is gone
+comes back as a mail that came in — nothing but its From says the user
+wrote it.
 
 The bookkeeping behind this keeps four rules, written out above `class
 Mirror` in the gateway: an answer that was not obtained is never an answer; a

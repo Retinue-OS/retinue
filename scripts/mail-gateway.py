@@ -415,6 +415,10 @@ RELOCATE_BATCH = 200
 # and a mail read whole, and a ledger restored from an old backup may lose
 # thousands at once.
 LOST_BATCH = 50
+# How often such an id is looked for (at the set-aside back-off) before what
+# was found of it is read as mail nothing is known of, and the id leaves the
+# list: none is looked for for ever.
+LOST_TRIES = 8
 # A mail whose Message-ID the server cannot be searched for is looked for by
 # reading the headers of the mails in the folder that have no place yet and
 # are not older than it (a copy or a move keeps a mail's arrival time, or
@@ -2613,12 +2617,25 @@ def _environment(exc: BaseException) -> bool:
 #       direction) is kept as HINTS for finding the mail again (`lost`,
 #       Mirror._prepare). Its mail is looked for by its Message-ID in every
 #       folder, and one mail found is read as a mail read the first time
-#       where it lies — the one From the sender the lost record had, that
-#       came first — the user's own again only where it is From that sender
-#       and the record was the user's: evidence of the mail itself, never of
-#       the list (Mirror._read_lost, Mirror._read_found). A mail that cannot
-#       be told yet stays looked for, and /health counts it. Nothing else
-#       is carried over to whatever mail is found under its id.
+#       where it lies — for a record that was the user's, a Sent copy
+#       first, then the copy received when the record said, then the
+#       archive; for any other, the one From the sender the lost record had
+#       — and it is the user's own again only in Sent, or in the archive
+#       From that sender: a copy the user can have put there. Never in
+#       INBOX on the strength of its From, which is its sender's to write
+#       (Mirror._read_lost, Mirror._read_found). A mail that cannot be told
+#       yet stays looked for, and /health counts it — LOST_TRIES times at
+#       most; then what is found is read as mail nothing is known of.
+#       Nothing else is carried over to whatever mail is found under its id.
+#       The limits, as they stand: while the archive does not answer, every
+#       lost id waits (/health says the archive does not answer, and counts
+#       them); an id whose mail is in no folder leaves the list with a log
+#       line and no "removed" event (there is no record to tombstone); a
+#       ledger restored from an older backup over a live one can leave two
+#       record files for one id (a record written as the first time takes a
+#       name of its own, and the backup brings back the one it had before);
+#       and a mail to oneself whose Sent copy is gone comes back as one
+#       that came in.
 #
 #   I4  A FAULT DELAYS ONLY THE WORK THAT FAILED. Following the folders —
 #       new mail, vanished mail — keeps the poll interval whatever the rest
@@ -3781,8 +3798,10 @@ class Mirror:
         no record). Not known (a folder that could not say, a header block
         that was not read — I1): the id stays, and is looked for again
         less and less often, as a placeholder is read again; the ids behind
-        it are not held back. A UIDVALIDITY change asks nothing of this:
-        nothing in `lost` names a UID."""
+        it are not held back. At the LOST_TRIES-th time in vain, what is
+        found of it is read as mail nothing is known of, and it goes. A
+        UIDVALIDITY change asks nothing of this: nothing in `lost` names a
+        UID."""
         now = self._clock()
         due = self.index.rows(
             "SELECT * FROM lost WHERE due <= ? "
@@ -3796,28 +3815,47 @@ class Mirror:
                            (now, hint["message_id"]))
             if not self._read_found(hint, policy):
                 tries = hint["tries"] + 1
+                if tries >= LOST_TRIES:
+                    # Never told, however often it was looked for: what is
+                    # there is read as what it is, and the id waits no more.
+                    self._read_found(hint, policy, plain=True)
+                    continue
                 self.index.run(
                     "UPDATE lost SET tries = ?, due = ? WHERE message_id = ?",
                     (tries, now + SET_ASIDE_RETRY_SECONDS * (1 << min(tries, 5)),
                      hint["message_id"]))
         return len(due) > LOST_BATCH
 
-    def _read_found(self, hint, policy) -> bool:
+    def _read_found(self, hint, policy, plain: bool = False) -> bool:
         """One id of `lost`: find its mail and read it, or know it is in no
         folder. False when that cannot be told yet.
 
-        The mail read as the record's is ONE of what lies under the id:
-        among those From the sender the lost row named, the one the server
-        received first (INTERNALDATE; Sent first on a tie, then INBOX); if
-        none is From that sender, the first of all. It is read as a mail
-        read for the first time where it lies (_ingest), with one thing
-        more: From that sender, where the row said "out", it is recorded as
-        the user's own — evidence about the mail itself, the same sender
-        the lost record had (_mirror_one). The others are then read as any
-        further copy is: one more place of the record, or marked as another
-        mail's, by their own evidence. When the row said the mail arrived
-        is the search's only bound where an id cannot be searched for
-        (_find)."""
+        The mail read as the record's is ONE of what lies under the id. For
+        a row that said "out": a Sent copy, whenever the server received it
+        (a client may append its Sent copy late); then the copy the server
+        received when the row said the mail arrived; then an archive copy;
+        then the rest. For any other: the copy From the sender the lost row
+        named — the one received when the row said, else the first. A match
+        whose header block does not come back counts as From nobody, and
+        comes last (in Sent, still before the rest): it holds up nothing
+        where the first is known to be the record's — a Sent copy, an
+        archive copy From that sender for "out", one From that sender for
+        any other — and holds up the id where it may be the record's
+        itself. The one is read as a mail read for the first time where
+        it lies (_ingest), with one thing more: in the archive, From that
+        sender, where the row said "out", it is the user's own — a copy the
+        user can have put there, the same sender the lost record had
+        (_mirror_one). Never in INBOX: a From there is its sender's to write,
+        and whoever was sent a mail knows its id. The others are then read
+        as any further copy is: one more place of the record, marked as
+        another mail's, or a placeholder, by their own evidence.
+
+        When the row said the mail arrived is the search's only bound where
+        an id cannot be searched for (_find), and a copy received just then
+        is read without waiting for the scan to be whole. ``plain``: the id
+        was looked for LOST_TRIES times in vain, and nothing more is waited
+        for — what is found is read as mail nothing is known of (no hint),
+        and the id leaves `lost`, found or not (_read_lost)."""
         mid = hint["message_id"]
         found, sure = [], True
         for order, role in enumerate(("sent", "inbox", "archive")):
@@ -3827,36 +3865,65 @@ class Mirror:
             uids, whole = self._find(role, mid, None, hint["arrived"], every=True)
             sure = sure and whole
             found += [(order, role, name, uid) for uid in uids]
-        if not sure:
+        if not sure and not plain and (not found or _searchable(mid)):
             return False
+        if plain:
+            print(f"[mail-gateway] the mail {mid!r}, whose record is gone from the ledger, "
+                  f"was looked for {LOST_TRIES} times: what was found of it "
+                  f"({len(found)} {'copy' if len(found) == 1 else 'copies'}) is read as mail "
+                  f"nothing is known of, and it is looked for no more", flush=True)
         if not found:
             self.index.run("DELETE FROM lost WHERE message_id = ?", (mid,))
-            print(f"[mail-gateway] the mail {mid!r}, whose record is gone from the ledger, "
-                  f"is in no folder: there is no record to tombstone", flush=True)
+            if sure:
+                print(f"[mail-gateway] the mail {mid!r}, whose record is gone from the "
+                      f"ledger, is in no folder: there is no record to tombstone", flush=True)
             return True
-        if len(found) > 1:
-            # Which one is the record's: who each is From, and when it came.
-            ranked = []
+        if len(found) > 1 or not sure:
+            # Which one is the record's: where it lies, who it is From, and
+            # when it came.
+            out, arrived = hint["direction"] == "out", hint["arrived"]
+            ranked, timely = [], False
             for order, role, name, uid in found:
                 got = self._peek(name, uid)
                 if got is None:
+                    if plain:
+                        continue
                     return False   # gone since the search: where to, the next one says
                 try:
-                    facts = read_head(_head_of(got.raw))
+                    sender, unread = (read_head(_head_of(got.raw)) or {}).get("sender"), False
                 except NotRead:
-                    return False
-                sender = (facts or {}).get("sender")
-                ranked.append((not (hint["sender"] and sender == hint["sender"]),
-                               got.date is None, got.date or 0.0, order, uid, role, name))
-            found = [(order, role, name, uid)
-                     for *_key, order, uid, role, name in sorted(ranked)]
+                    sender, unread = None, True
+                theirs = not (hint["sender"] and sender == hint["sender"])
+                # (An INTERNALDATE has whole seconds; what the record keeps
+                # of it may not.)
+                late = not (got.date is not None and arrived is not None
+                            and abs(got.date - arrived) < 1.0)
+                timely = timely or not late
+                key = ((role != "sent", unread, late, role != "archive", theirs) if out
+                       else (unread, theirs, late))
+                ranked.append(((*key, got.date is None, got.date or 0.0, order, uid),
+                               (order, role, name, uid), unread, theirs))
+            if not sure and not plain and not timely:
+                return False   # the scan reads on: the mail may be among the rest
+            ranked.sort(key=lambda entry: entry[0])
+            _rank, (_order, top, _name, _uid), _unread, stranger = ranked[0]
+            told = (top == "sent" or (top == "archive" and not stranger)) if out \
+                else not stranger
+            if not plain and not told and len(ranked) > 1 \
+                    and any(unread for _rank, _where, unread, _theirs in ranked):
+                # A match that did not come back may be the record's, and the
+                # first of those that did is not known to be: which one is,
+                # is not known yet (I1).
+                return False
+            found = [where for _rank, where, _unread, _theirs in ranked]
         for n, (_order, role, name, uid) in enumerate(found):
+            first = n == 0 and not plain
             try:
                 self._ingest(role, name, uid, policy, backfill=True,
-                             lost=hint if n == 0 else None)
+                             lost=hint if first else None)
             except NotRead:
                 return False   # its header block did not come back: not read (I1)
-            if n == 0 and self.index.one(
+            if first and self.index.one(
                     "SELECT 1 FROM locations l JOIN folders f ON f.role = l.role "
                     "AND f.gen = l.gen WHERE l.role = ? AND l.uid = ?", (role, uid)) is None:
                 # Not read after all: the server holds no such mail there any
@@ -4057,12 +4124,16 @@ class Mirror:
         known = self.index.one("SELECT * FROM mails WHERE message_id = ? AND record != ''",
                                (mail.message_id,))
         if lost is not None and known is None and mail.message_id == lost["message_id"] \
-                and mail.sender and mail.sender == lost["sender"] and lost["direction"] == "out":
+                and role in ("sent", "archive") and mail.sender \
+                and mail.sender == lost["sender"] and lost["direction"] == "out":
             # The mail of a record gone from the ledger (_read_found), From the
-            # very sender that record had, which was the user's own: this
-            # mail is evidence of itself — the same From — and is the user's
-            # again, whatever address that is (a plus-address, an alias
-            # nobody listed). Any other is read as a first reading here is.
+            # very sender that record had, which was the user's own, in a
+            # folder the user can have put it in: the user's again, whatever
+            # address that is (a plus-address, an alias nobody listed). Never
+            # in INBOX — a From there is its sender's to write, and whoever
+            # was sent a mail knows its id: a mail to oneself whose Sent copy
+            # is gone comes back as one that came in. Any other is read as a
+            # first reading here is.
             outbound = True
         if direction is not None and known is None:
             # What the record it had under another id said (see _ingest): the

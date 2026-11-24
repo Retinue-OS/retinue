@@ -14,8 +14,10 @@ tests/test_mail_gateway_imap.py; both load this file for its helpers.
 
     python3 tests/test_mail_gateway.py
 """
+import contextlib
 import email.utils
 import importlib.util
+import io
 import json
 import os
 import shutil
@@ -565,6 +567,180 @@ def test_a_record_whose_file_is_gone_is_written_as_the_first_time():
         assert row["direction"] == "out" and mirror.index.rows("SELECT * FROM claims") == []
     print("ok: a record whose file is gone is written as the first time, and the folders "
           "go on")
+
+
+def _lost(gw, box, clock, mirror):
+    """The ledger restored from a backup that lacks every record — the state
+    volume closed for it, as a restore comes with a restart — and the mirror
+    started again."""
+    for path, _fields in list(gw._ibstore.iter_records(gw.INBOUND_STORE_DIR)):
+        path.unlink()
+    mirror.index.close()
+    mirror.threads.close()
+    return gw.Mirror(box, clock=lambda: clock["now"])
+
+
+def _turns(gw, mirror, clock, loop, n) -> dict:
+    """``n`` turns of the mirror loop a minute apart, each with a look at the
+    folders; what /health says after them."""
+    for _ in range(n):
+        clock["now"] += 61
+        gw.MIRROR = mirror
+        loop.pop("synced", None)
+        gw._loop_step(mirror, loop)
+    return gw._health_snapshot()
+
+
+def test_a_forged_from_in_inbox_never_makes_a_lost_record_the_users():
+    """The mail of a lost record that was the user's was the user's again
+    wherever it lay From the same sender — in INBOX too — and the copy the
+    server received first came before the Sent copy. Whoever was sent a
+    mail knows its id, and a From in INBOX is its sender's to write: a
+    look-alike From the user's address became the user's outbound mail,
+    the Sent copy deleted or appended later than the look-alike came in.
+    The hint's "out" counts in Sent and the archive only, and a Sent copy
+    comes first whenever it came. So a mail to oneself whose Sent copy is
+    gone comes back as one that came in: the stated limit."""
+    for variant in ("deleted", "appended late"):
+        with tempfile.TemporaryDirectory() as tmp:
+            gw = load(tmp)
+            _write_policy(gw)
+            events = rail(gw)
+            clock = {"now": NOW}
+            box = FakeMailbox(gw)
+            mirror = gw.Mirror(box, clock=lambda: clock["now"])
+            loop = {}
+            _turns(gw, mirror, clock, loop, 1)
+            sent, forged = T0 + 39.9 * DAY, T0 + 39.95 * DAY
+            if variant == "appended late":
+                sent = forged + 600
+            box.put("Sent", msg("own@example.org", sender=ME, to="Mallory <m@evil.org>",
+                                body="My offer: 100.\n", day=39.9), date=sent)
+            _turns(gw, mirror, clock, loop, 2)
+            # Mallory, who was sent it, sends a mail under its id From the
+            # user's own address.
+            box.put("INBOX", msg("own@example.org", sender=ME, to=ME, subject="Re",
+                                 body="I agree to pay Mallory 5000.\n", day=39.95), date=forged)
+            _turns(gw, mirror, clock, loop, 2)
+            assert by_id(gw)["own@example.org"]["text"] == "My offer: 100.", variant
+            if variant == "deleted":
+                box.remove("Sent", box.uid_of("Sent", "own@example.org"))
+                _turns(gw, mirror, clock, loop, 2)
+            told = len(events)
+            mirror, loop = _lost(gw, box, clock, mirror), {}
+            snap = _turns(gw, mirror, clock, loop, 4)
+            record = by_id(gw)["own@example.org"]
+            got = [(p["direction"], p["text"]) for p in inbound(events[told:])]
+            if variant == "deleted":
+                # Nothing but its From says the user wrote what lies in INBOX.
+                assert record["type"] == gw._ibstore.T_INBOUND and not record.get("author")
+                assert got == [("in", "I agree to pay Mallory 5000.")], got
+            else:
+                assert record["type"] == gw._ibstore.T_OUTBOUND, variant
+                assert got == [("out", "My offer: 100.")], got
+                assert sorted(row["role"] for row in mirror.index.rows(
+                    "SELECT role FROM locations WHERE message_id = 'own@example.org' "
+                    "AND skipped IS NULL")) == ["inbox", "sent"]
+            assert snap["lost"] == 0, snap
+    print("ok: a forged From in INBOX never makes a lost record the user's own mail — a "
+          "Sent copy comes first, whenever it was appended")
+
+
+def _hanging(gw):
+    """Every mail with an ``X-Hang`` header neither reads nor has a header
+    block that comes back. Returns the undo."""
+    saved = gw.read_mail, gw.stub_mail, gw._head_facts
+
+    def read_mail(raw, date, *args, **kwargs):
+        if b"X-Hang: yes" in raw:
+            raise gw.UnreadableMail("too much work", "work")
+        return saved[0](raw, date, *args, **kwargs)
+
+    def stub_mail(head, date, reason, *args, **kwargs):
+        if b"X-Hang: yes" in head:
+            raise gw.TookTooLong("hangs")
+        return saved[1](head, date, reason, *args, **kwargs)
+
+    def head_facts(head):
+        if b"X-Hang: yes" in head:
+            raise gw.TookTooLong("hangs")
+        return saved[2](head)
+    gw.read_mail, gw.stub_mail, gw._head_facts = read_mail, stub_mail, head_facts
+    return lambda: (setattr(gw, "read_mail", saved[0]), setattr(gw, "stub_mail", saved[1]),
+                    setattr(gw, "_head_facts", saved[2]))
+
+
+def test_a_lost_id_is_not_looked_for_for_ever():
+    """An id whose record the ledger lost stayed in `lost` for good where one
+    of its matches had a header block that does not come back (a look-alike
+    anybody can plant), or where an id that cannot be searched for needed a
+    scan that never got to be whole (an unreadable mail of any sender in
+    its window, or more unplaced mail there than the scan remembers): its
+    mail was never mirrored again, and only /health's count said so. A
+    match that does not read comes last and is read as a further copy (a
+    placeholder); a copy received when the record said needs no whole scan;
+    and after LOST_TRIES tries what was found is read as mail nothing is
+    known of, and a log line says so."""
+    cases = ("a look-alike that never reads", "no Message-ID, unreadable mail archived",
+             "no Message-ID, more archived mail than the scan remembers",
+             "a search that never settles")
+    for case in cases:
+        with tempfile.TemporaryDirectory() as tmp:
+            gw = load(tmp)
+            _write_policy(gw)
+            rail(gw)
+            clock = {"now": NOW}
+            box = FakeMailbox(gw)
+            undo = _hanging(gw)
+            try:
+                mirror = gw.Mirror(box, clock=lambda: clock["now"])
+                loop = {}
+                _turns(gw, mirror, clock, loop, 1)
+                mid = None if case.startswith("no Message-ID") else "a@x.org"
+                box.put("INBOX", msg(mid, body="Ann: the contract is signed.\n", day=39.0))
+                _turns(gw, mirror, clock, loop, 2)
+                if case == "a look-alike that never reads":
+                    box.put("INBOX", msg("a@x.org", sender="Mallory <m@evil.org>",
+                                         headers=[("X-Hang", "yes")], body="x\n", day=39.1))
+                elif case == "no Message-ID, unreadable mail archived":
+                    box.put("Archive", msg("junk@spam.org", sender="Spam <s@spam.org>",
+                                           headers=[("X-Hang", "yes")], body="x\n", day=39.5))
+                elif case == "no Message-ID, more archived mail than the scan remembers":
+                    gw.SCAN_CACHE_MAX, gw.SCAN_BUDGET = 100, 40
+                    for i in range(150):
+                        box.put("Archive", msg(f"arch{i}@x.org", subject=f"a{i}", day=39.2))
+                _turns(gw, mirror, clock, loop, 2)
+                (ann,) = [m for m, r in by_id(gw).items() if r["sender"] == "ann@x.org"]
+                if case == "a search that never settles":
+                    find = box.find
+                    box.find = lambda folder, wanted: (
+                        gw.Matches((), False) if folder == "Archive" else find(folder, wanted))
+                mirror, loop = _lost(gw, box, clock, mirror), {}
+                said, left = io.StringIO(), []
+                with contextlib.redirect_stdout(said):
+                    for _day in range(10):
+                        _turns(gw, mirror, clock, loop, 3)
+                        left.append(mirror.lost())
+                        clock["now"] += DAY
+                    snap = _turns(gw, mirror, clock, loop, 3)
+                recs = by_id(gw)
+                assert recs.get(ann, {}).get("text") == "Ann: the contract is signed.", (
+                    case, {m: r["text"] for m, r in recs.items()})
+                assert snap["lost"] == 0 and snap["connected"] is True, (case, snap)
+                if case == "a look-alike that never reads":
+                    # Mallory's is a placeholder of its own, under its bytes.
+                    assert [r["text"] for m, r in recs.items() if m != ann] == [
+                        gw.UNREADABLE_TEXT], case
+                if case == "a search that never settles":
+                    # Waited for, LOST_TRIES times, then read as what it is.
+                    assert gw.LOST_TRIES == 8 and left[:4] == [1] * 4, left
+                    assert f"was looked for {gw.LOST_TRIES} times" in said.getvalue(), case
+                else:
+                    assert left[0] == 0, (case, left)
+            finally:
+                undo()
+    print("ok: a lost id is not looked for for ever — a match that does not read is a "
+          "further copy, a copy received just then needs no whole scan, and the tries end")
 
 
 def test_a_move_to_the_archive_leaves_the_record_alone():
