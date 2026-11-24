@@ -733,6 +733,42 @@ def test_a_turn_archives_over_mail_whose_turn_asked_too():
         print("PASS test_a_turn_archives_over_mail_whose_turn_asked_too")
 
 
+def test_what_is_owed_for_a_mail_outlasts_the_newest_arrivals():
+    """What a chat still owes for a mail — the telling, the count of its
+    turns, the note that its turn completed and asked — is not kept in the
+    cache of the newest arrivals (INBOUND_RECENT_MAX): more later mail than
+    that cache holds leaves all of it standing, also through a merge."""
+    with tempfile.TemporaryDirectory() as tmp:
+        store = cs.ChatStateStore(tmp)
+        a = "email:~me@x.example:owed@x.example"
+        b = "email:~me@x.example:other@x.example"
+        store.count_arrival(a, 1000.0, message_id="m0", owe=True)
+        assert store.note_turn_attempt(a, "m0") == 1
+        store.count_arrival(a, 1000.5, message_id="d0", owe=True)
+        store.note_turn_done(a, "d0", asked=True)
+        later = cs.INBOUND_RECENT_MAX + 1
+        for n in range(later):
+            store.count_arrival(a, 1001.0 + n, message_id=f"n{n}", owe=True)
+            store.note_turn_attempt(a, f"n{n}")
+            store.note_turn_done(a, f"n{n}")
+        doc = store.get(a)
+        assert len(doc["inbound_recent"]) == cs.INBOUND_RECENT_MAX
+        assert "m0" not in [mid for mid, _seq in doc["inbound_recent"]]
+        assert cs.owes(doc, "m0"), "still owed its telling"
+        assert cs.turn_attempts(doc, "m0") == 1 and store.note_turn_attempt(a, "m0") == 2
+        assert cs.turn_done(doc, "d0") and "d0" in doc["archive_asked"]
+        # … and folded into another chat, it is owed by the whole.
+        store.count_arrival(b, 900.0, message_id="b0", owe=True)
+        store.merge(a, b)
+        doc = store.get(b)
+        assert cs.owes(doc, "m0") and cs.owes(doc, "b0")
+        assert cs.turn_attempts(doc, "m0") == 2 and cs.turn_done(doc, "d0")
+        assert "d0" in doc["archive_asked"]
+        # The bound that remains is the flood's: the oldest note gives way.
+        assert cs.TURN_STATE_MAX >= 16 * cs.INBOUND_RECENT_MAX
+    print("PASS test_what_is_owed_for_a_mail_outlasts_the_newest_arrivals")
+
+
 def test_an_ask_from_before_the_users_unarchive_is_none():
     """Decision AZ: the user's unarchive (set_flags ``forget_asked``) moves
     the chat's asked_epoch on, and a turn that asked before it — its
@@ -1581,4 +1617,5 @@ if __name__ == "__main__":
     test_the_copy_follows_the_gateways_queue()
     test_a_send_that_was_decided_stays_as_decided()
     test_owed_calls_outlast_the_process()
+    test_what_is_owed_for_a_mail_outlasts_the_newest_arrivals()
     print("all chat-state tests passed")

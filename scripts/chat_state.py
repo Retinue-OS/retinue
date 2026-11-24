@@ -162,6 +162,12 @@ READ_SKEW_SECONDS = 120.0
 # a few messages later; this is far more than either needs, and small enough
 # to ride in every state write.
 INBOUND_RECENT_MAX = 64
+# How many mails of one chat can stand owed at once — told of, counted in
+# turns, or noted as worked — before the oldest note gives way. Far above the
+# newest arrivals remembered for telling a repeat (INBOUND_RECENT_MAX): what
+# is owed for a mail must not be lost because later mail came, only where a
+# thread is flooded past this.
+TURN_STATE_MAX = 1024
 
 # How many merges the store remembers (ChatStateStore.note_merged), newest
 # kept. A merge consumes a chat, so there are never more of them than there
@@ -780,7 +786,7 @@ class ChatStateStore:
             # (arrived_since_read, forget_arrivals).
             "inbound_gone": [],
             # A mail's counted arrivals the user has not been told of yet, by
-            # message id, oldest first, at most INBOUND_RECENT_MAX: written
+            # message id, oldest first, at most TURN_STATE_MAX: written
             # with the count (count_arrival's ``owe``) and taken out once the
             # arrival's attention step and push have run to the end, or its
             # ring that waited on a turn went out (told). One per arrival,
@@ -789,15 +795,15 @@ class ChatStateStore:
             # repeated offer of it must still find it owed.
             "untold": [],
             # How many turns each mail has had, as ``[message id, n]``, at
-            # most INBOUND_RECENT_MAX (note_turn_attempt): the web gateway
+            # most TURN_STATE_MAX (note_turn_attempt): the web gateway
             # stops starting turns for one whose turn keeps failing.
             "turn_attempts": [],
-            # The mails whose turn completed, at most INBOUND_RECENT_MAX
+            # The mails whose turn completed, at most TURN_STATE_MAX
             # (note_turn_done): one offered again — its answer lost, this
             # process restarted — is accepted without another turn.
             "turns_done": [],
             # Those of them whose completed turn asked for the thread's
-            # archive (note_turn_done's ``asked``), at most INBOUND_RECENT_MAX:
+            # archive (note_turn_done's ``asked``), at most TURN_STATE_MAX:
             # a turn worked later — an older mail's, left for a turn of its
             # own — may archive the thread over them (archive_through).
             "archive_asked": [],
@@ -1253,22 +1259,22 @@ class ChatStateStore:
             untold = list(dict.fromkeys(
                 [str(m) for m in (gone.get("untold") or []) if m]
                 + [str(m) for m in (doc.get("untold") or []) if m]))
-            doc["untold"] = untold[-INBOUND_RECENT_MAX:]
+            doc["untold"] = untold[-TURN_STATE_MAX:]
             attempts: dict[str, int] = {}
             for source in (gone, doc):
                 for pair in source.get("turn_attempts") or []:
                     if isinstance(pair, list) and len(pair) == 2 and pair[0]:
                         attempts[str(pair[0])] = max(attempts.get(str(pair[0]), 0),
                                                      int(pair[1] or 0))
-            doc["turn_attempts"] = [[m, n] for m, n in attempts.items()][-INBOUND_RECENT_MAX:]
+            doc["turn_attempts"] = [[m, n] for m, n in attempts.items()][-TURN_STATE_MAX:]
             done = list(dict.fromkeys(
                 [str(m) for m in (gone.get("turns_done") or []) if m]
                 + [str(m) for m in (doc.get("turns_done") or []) if m]))
-            doc["turns_done"] = done[-INBOUND_RECENT_MAX:]
+            doc["turns_done"] = done[-TURN_STATE_MAX:]
             asked = list(dict.fromkeys(
                 [str(m) for m in (gone.get("archive_asked") or []) if m]
                 + [str(m) for m in (doc.get("archive_asked") or []) if m]))
-            doc["archive_asked"] = asked[-INBOUND_RECENT_MAX:]
+            doc["archive_asked"] = asked[-TURN_STATE_MAX:]
 
             doc["read_inbound"] = mine_read + their_read if read_before else None
             doc["last_read"] = mark
@@ -1743,7 +1749,7 @@ class ChatStateStore:
                 doc["inbound_recent"] = recent[-INBOUND_RECENT_MAX:]
                 if owe:
                     untold = [m for m in doc.get("untold") or [] if m != message_id]
-                    doc["untold"] = (untold + [message_id])[-INBOUND_RECENT_MAX:]
+                    doc["untold"] = (untold + [message_id])[-TURN_STATE_MAX:]
             if (iso_z(now) < stamp <= iso_z(now + READ_SKEW_SECONDS)
                     and stamp > (doc.get("inbound_ahead") or "")):
                 doc["inbound_ahead"] = stamp
@@ -1806,7 +1812,7 @@ class ChatStateStore:
             pairs = [p for p in doc.get("turn_attempts") or []
                      if isinstance(p, list) and len(p) == 2 and p[0] != message_id]
             count = turn_attempts(doc, message_id) + 1
-            doc["turn_attempts"] = (pairs + [[str(message_id), count]])[-INBOUND_RECENT_MAX:]
+            doc["turn_attempts"] = (pairs + [[str(message_id), count]])[-TURN_STATE_MAX:]
             self._write(doc)
             return count
 
@@ -1831,9 +1837,9 @@ class ChatStateStore:
             if asked and epoch is not None and asked_epoch(doc) != int(epoch):
                 asked = False
             done = [m for m in doc.get("turns_done") or [] if m != mid]
-            doc["turns_done"] = (done + [mid])[-INBOUND_RECENT_MAX:]
+            doc["turns_done"] = (done + [mid])[-TURN_STATE_MAX:]
             ask = [m for m in doc.get("archive_asked") or [] if m != mid]
-            doc["archive_asked"] = (ask + [mid] if asked else ask)[-INBOUND_RECENT_MAX:]
+            doc["archive_asked"] = (ask + [mid] if asked else ask)[-TURN_STATE_MAX:]
             self._write(doc)
 
     def archive_through(self, chat_id: str, cut: int) -> tuple[dict, bool]:
