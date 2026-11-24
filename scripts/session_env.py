@@ -107,11 +107,18 @@ SESSION_ENV_NAMES: frozenset[str] = frozenset({
     "QLEVER_LIFE_URL", "QLEVER_TIMEOUT", "QLEVER_GRAPH_BASE",
     # Where the delivery gate's policy files are, for a session that edits
     # them (scripts/triage_policy.py: a group flag, a hand-set VIP). Named one
-    # by one, not by a TRIAGE_ prefix: these two are all a session reads, and
-    # the prefix used to carry e-mail triage's tunables, which are retired.
-    # No mailbox setting is listed either — a session reaches the mailbox
-    # through the backend, which holds the settings with the credentials.
+    # by one, not by a TRIAGE_ prefix: the prefix used to carry e-mail
+    # triage's tunables, which are retired. No mailbox setting is listed
+    # either — a session reaches the mailbox through the backend, which holds
+    # the settings with the credentials.
     "TRIAGE_MESSENGER_DIR", "TRIAGE_EMAIL_WHITELIST_PATH",
+    # The one-time triage migration (scripts/migrate-triage.py), which the
+    # boot thread's chips and its report's "for you to do" lines send a
+    # session to run: its state directory (marker, snapshot, the retired
+    # status store), the user's own addresses (they get no contact; the
+    # mailbox variables stay out) and its two tunables.
+    "TRIAGE_STATE_DIR", "MAIL_OWN_ADDRESSES",
+    "MIGRATE_TRIAGE_MODEL_TIMEOUT", "MIGRATE_TRIAGE_MIRROR_WAIT",
     "PROJECT_DEADLINE_LEAD_DAYS",
     # No chamber's credentials here: a variable a chamber's own scripts read
     # (a data source's login, say) is the deployment's to name in

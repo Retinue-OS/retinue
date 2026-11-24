@@ -293,11 +293,27 @@ the `sender:` memories — onto contacts, as their instruction. What it does and
 why is `docs/mail-chats.md`, "The migration"; this is how an operator runs it.
 
 **It runs by itself.** The entrypoint secures the legacy whitelist triples
-first thing (`--step snapshot`) and starts the migration in the background
-once the daemons are up (`--boot`): the pending steps, a few tries where the
-life store or the model is not there yet, then one dashboard thread with the
-report. A boot that finds it complete does nothing. Its log lines carry
-`[migrate-triage]`.
+first thing (`--step snapshot`, which also fixes the cutoff: only `sender:`
+memories recorded before the new code first ran are triage's) and starts the
+migration in the background once the daemons are up (`--boot`): the pending
+steps, a few tries where the life store or the model is not there yet, polls
+while the mail mirror does its first backfill (at most
+`MIGRATE_TRIAGE_MIRROR_WAIT`, 6 h by default), then one dashboard thread with
+the report — followed up in the same thread if it had to say "not finished".
+A boot that finds it complete does nothing. Its log lines carry
+`[migrate-triage]`. A `--step snapshot` that exits non-zero with "not secured
+in full" means a policy file is there and cannot be read: both steps wait
+until it reads, and nothing is taken for "no whitelist".
+
+**Set `MAIL_GATEWAY_TOKEN` as part of this upgrade.** Triage retires whether
+or not the mail gateway runs, and the gateway mirrors and gates nothing until
+the token is set (`docs/messaging.md`, "E-mail (the mail gateway)"): a
+deployment without it has **no e-mail handling at all** after the upgrade.
+The migration then moves nothing (it needs the mirror), the report says so
+first, a job left calling `triage-gate.py` says so in its log, and the boot
+run opens one dashboard thread about it (on a deployment that had e-mail
+triage). Set the token (`openssl rand -hex 32`) and restart; the migration
+runs once the mirror has its first backfill.
 
 **To look before it acts**, keep the boot run from doing anything and read a
 dry run — which writes nothing and spawns no model:
@@ -320,11 +336,13 @@ docker exec <retinue> python3 /workspace/scripts/migrate-triage.py --step memori
 ```
 
 Run it with `docker exec` on the `retinue` container rather than from an
-agent session: the user's own addresses get no contact, and the script knows
-them by the mailbox variables a session's environment does not carry (beyond
-those, only by what the mirror shows: its accounts, and the addresses the
-user's mail went out under). A run by hand opens no thread; it prints the
-report. The memories step starts a
+agent session where you can: the user's own addresses get no contact, and the
+script knows them by the mailbox variables a session's environment does not
+carry (a session gets `TRIAGE_STATE_DIR`, `MAIL_OWN_ADDRESSES` and the
+script's tunables — enough for the thread's "show the report" — but never
+`EMAIL_USER*`; beyond those the script knows them only by what the mirror
+shows: its accounts, and the addresses the user's mail went out under). A run
+by hand opens no thread; it prints the report. The memories step starts a
 `claude` process the way every framework spawner does — it refreshes the
 sign-in under the shared lock first — so it needs no `claude_auth.py refresh`
 beforehand.
@@ -332,21 +350,37 @@ beforehand.
 - **A full run skips the steps the marker has complete; `--step <name>` runs
   that step again whatever the marker says.** That is how to have it look
   again after fixing something: `--step memories` re-reads the store and puts
-  what a model verdict left alone to the model once more. A whitelist entry
-  that was settled and a memory that was moved are never touched twice.
+  what a model verdict left alone to the model once more — only memories
+  from before the cutoff, never a later one. A whitelist entry that was
+  settled and a memory that was moved are never touched twice; a rule that
+  is on a contact and whose memory waits to be superseded is not written
+  again, so an edit on the contact meanwhile stands.
 - **Exit status** 0: everything asked for is complete; 75: something is
   pending, and the report says what; 1: the marker could not be read —
   nothing was changed, move the file aside (every step is safe to repeat).
+- **The model only classifies.** Either way an instruction's text is the
+  memory's own (or, for a filing memory whose text names a document and
+  filing it, the fixed filing instruction); nothing the model writes reaches
+  a contact.
 - **`--no-model`** carries every sender rule over verbatim. Nothing then
   judges whether a memory's text was the user's instruction or something a
   message said: read the instructions it wrote (the report lists them).
-- **What is left for a person:** the scheduled triage jobs in chambers'
-  `.schedule.json` (the report names them); a rule the report lists as left
-  alone that should stand (`contacts.py update <id> --instruction …`, then
-  `memory.py store --supersedes <memory id> …`); two contacts the report
-  says share a name; and taking the instruction off any migrated contact
-  whose mail does not need a model turn each time (`contacts.py update <id>
-  --no-instruction`, or the Contacts page).
+- **An instruction is the person's, on every channel.** A person the
+  migration briefed — an existing contact who held a whitelisted address, the
+  owner of a whitelisted domain — has each Signal, WhatsApp, Telegram and SMS
+  message worked by a model turn from then on, its ring waiting up to
+  `CHAT_INSTRUCTION_TIMEOUT`; a mail's ring waits up to
+  `MAIL_INSTRUCTION_TIMEOUT` (600 s by default; raise it where filing turns
+  run longer). The report names the briefed people who hold messenger
+  handles or a phone.
+- **What is left for a person:** the scheduled jobs that run `triage-gate.py`
+  (to remove) and the prompt jobs that only mention triage (to check — a
+  messenger recovery job still belongs), both named in the report; a rule the
+  report lists as left alone that should stand (`contacts.py update <id>
+  --instruction …`, then `memory.py store --supersedes <memory id> …`); two
+  contacts the report says share a name; and taking the instruction off any
+  migrated contact whose messages do not need a model turn each time
+  (`contacts.py update <id> --no-instruction`, or the Contacts page).
 - **Nothing is deleted, and the way back is by hand.** A contact it created
   is deleted on the Contacts page; an instruction is edited there. A
   superseded memory is still in the log (`memory.py recall --tag

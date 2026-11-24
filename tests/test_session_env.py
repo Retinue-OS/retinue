@@ -113,6 +113,12 @@ NEEDED = {
     # where the delivery gate's policy files are (triage_policy.py's CLI)
     "TRIAGE_MESSENGER_DIR": "/workspace/chambers/_generated/messenger",
     "TRIAGE_EMAIL_WHITELIST_PATH": "/workspace/chambers/_generated/messenger/email/policy/email-policy.nt",
+    # the triage migration, which the boot thread's chips send a session to
+    # run: its state directory and the user's own addresses (no contact)
+    "TRIAGE_STATE_DIR": "/data/triage",
+    "MAIL_OWN_ADDRESSES": "me@alias.example",
+    "MIGRATE_TRIAGE_MODEL_TIMEOUT": "300",
+    "MIGRATE_TRIAGE_MIRROR_WAIT": "21600",
     # git shim and python
     "GIT_SERIALIZE_LOCK_DIR": "/tmp/git-locks",
     "PYTHONPATH": "/workspace/scripts",
@@ -130,7 +136,6 @@ DAEMON_ONLY = {
     "SENT_FOLDER": "Sent",
     # the retired e-mail triage's settings, should a deployment's environment
     # still carry them: no session reads them, so none gets them
-    "TRIAGE_STATE_DIR": "/root/.retinue/triage",
     "TRIAGE_INBOX_SCAN_LIMIT": "50",
     "TRIAGE_BATCH_SIZE": "25",
     "TRIAGE_NEWS_FOLDER": "Archive",
@@ -141,7 +146,6 @@ DAEMON_ONLY = {
     # the mail gateway's own settings, should a deployment set them here
     "MAIL_ACCOUNT_NAME": "ari",
     "MAIL_BACKFILL_DAYS": "90",
-    "MAIL_OWN_ADDRESSES": "me@alias.example",
     # the web gateway's mail-chat tunables: the daemon reads them, no session does
     "MAIL_SEND_TIMEOUT": "120",
     "CHAT_PENDING_TIMEOUT": "4",
@@ -200,7 +204,8 @@ def test_prefixes_admit_the_framework_namespaces():
                  "ANTHROPIC_SMALL_FAST_MODEL", "LC_MESSAGES", "NEWS_MAX_ITEMS",
                  "GIT_AUTHOR_NAME", "PYTHONUNBUFFERED"):
         assert name in env, name
-    # TRIAGE_ is not a namespace: only the two policy paths are named.
+    # TRIAGE_ is not a namespace: only the policy paths and the migration's
+    # state directory are named.
     assert "TRIAGE_" not in se.SESSION_ENV_PREFIXES
     # A prefix never admits the one key that lives under an allowed namespace.
     assert "RETINUE_LITELLM_KEY" not in env

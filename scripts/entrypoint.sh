@@ -39,9 +39,12 @@ python3 /workspace/scripts/triage_policy.py place-email-policy \
 # migration"). Its triples live in the policy file placed above, and the code
 # that writes that file no longer knows them: the file's next write drops
 # them. So they are copied into the migration's state directory here, before
-# any daemon or session exists that could write it. Standard library only,
-# and nothing to do once taken. Best effort: the migration below takes the
-# snapshot itself as its first act.
+# any daemon or session exists that could write it. The same call fixes the
+# migration's cutoff on the first start of this code: only a `sender:` memory
+# recorded before it was triage's to read. Standard library only, and nothing
+# to do once taken. Best effort: the migration below takes the snapshot itself
+# as its first act (and a policy file it cannot read fails this call, loudly,
+# rather than reading as "no whitelist").
 python3 /workspace/scripts/migrate-triage.py --step snapshot \
   || echo "[migrate-triage][warn] could not secure the legacy e-mail whitelist; the migration retries" >&2
 
@@ -576,11 +579,15 @@ case "$MODE" in
     # memories — moves onto contacts (scripts/migrate-triage.py;
     # docs/mail-chats.md, "The migration"). In the background and best effort,
     # never in the boot's way: it waits for the life store and the model where
-    # it needs them, opens one dashboard thread with its report (hence after
-    # the web gateway), and a boot that finds the migration done exits at
-    # once. Forked here with the daemons, so it holds the environment they
-    # hold — it knows the user's own addresses by the mailbox variables that
-    # are scrubbed for the main session further down.
+    # it needs them, and for the mail mirror's first backfill (at most
+    # MIGRATE_TRIAGE_MIRROR_WAIT, 6 h by default, polling — so it may run for
+    # hours); it opens one dashboard thread with its report (hence after the
+    # web gateway), and a boot that finds the migration done exits at once.
+    # With MAIL_GATEWAY_TOKEN unset it migrates nothing and says, once, that
+    # no mail is handled. Forked here with the daemons, so it holds the
+    # environment they hold — it knows the user's own addresses by the mailbox
+    # variables that are scrubbed for the main session further down, and the
+    # gateway's opt-in by its token.
     echo "[claude] Checking the one-time triage migration (background)..."
     python3 /workspace/scripts/migrate-triage.py --boot &
     # Start the Claude.ai session only where it can actually connect. With a

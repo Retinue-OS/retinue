@@ -559,12 +559,15 @@ services:
       # (scripts/migrate-triage.py, docs/mail-chats.md): where its marker and
       # the retired status store live (default /root/.retinue/triage), the
       # user's own addresses (they get no contact; the same value the mail
-      # gateway reads), a switch that holds the boot run, and how long its
-      # one model turn may take.
+      # gateway reads), a switch that holds the boot run, how long its one
+      # model turn may take, and how long it waits for the mail mirror's
+      # first backfill before it migrates without it (default 21600 s). It
+      # reads MAIL_GATEWAY_TOKEN and MAIL_GATEWAY_BASE_URL, set above.
       - TRIAGE_STATE_DIR
       - MAIL_OWN_ADDRESSES
       - RETINUE_TRIAGE_MIGRATION
       - MIGRATE_TRIAGE_MODEL_TIMEOUT
+      - MIGRATE_TRIAGE_MIRROR_WAIT
       - WEBAPP_DIR
       - DASHBOARD_DATA_DIR
       - DOCS_DIR

@@ -900,11 +900,37 @@ chat rail could not take.
 Run once, by the entrypoint, in three steps. It is idempotent and resumable:
 a marker file (`.migrated-to-contacts.json` in the triage state directory,
 `TRIAGE_STATE_DIR`, `/root/.retinue/triage` by default) journals every
-outcome as it happens, a run killed at any point is finished by the next one,
-and a second run changes nothing. **Nothing is deleted**: contacts are created
-or extended, memories are superseded, the old status store stays where it is.
-`--dry-run` writes nothing, spawns no model and prints what a run would do.
-Running it by hand: `docs/contributing.md`, "The triage migration".
+outcome as it happens — and what it is about to write *before* it writes it —
+so a run killed at any point is finished by the next one, reporting what it
+did as done, and a second run changes nothing. **Nothing is deleted**:
+contacts are created or extended, memories are superseded, the old status
+store stays where it is. `--dry-run` writes nothing, spawns no model and
+prints what a run would do. Running it by hand: `docs/contributing.md`, "The
+triage migration".
+
+**It moves nothing while no mail is handled.** Triage retires with this
+upgrade whether or not the mail gateway runs, and the gateway is opt-in: with
+`MAIL_GATEWAY_TOKEN` unset **e-mail is handled by nobody** — no chat, no ring,
+no turn. Both steps then wait, writing nothing but the marker (an instruction
+that buys a turn per mail means nothing without the gate, and the steps need
+the mirror); the report says so first, the stub `triage-gate.py` a stale job
+still runs says so in its log line, and the boot run opens **one** dashboard
+thread of its own (importance 4, key `migrate-triage-mail-off`, fixed wording)
+on a deployment that had e-mail triage — opened again only after the gateway
+was switched on and off again. Once the token is set the steps also wait for
+the mirror's **first backfill** (the gateway's `/health`, `backfill.done`):
+names and the senders only the mirror has seen come from it. That wait is
+bounded — after `MIGRATE_TRIAGE_MIRROR_WAIT` (6 h by default) the migration
+goes ahead and the report says what it may have cost (a contact named after
+its address, a sender reported as unknown); a gateway that reports itself not
+configured is not waited for.
+
+**Only what was triage's moves.** The first time this code runs — the
+entrypoint's `--step snapshot`, before any daemon — it fixes a **cutoff** in
+the marker, which never moves. Only `sender:` memories recorded before it are
+candidates: one recorded later is not triage's (the gate's own turns store
+such facts, out of mail) and is reported as such, never shown to the model,
+never carried by `--no-model`, never superseded.
 
 **Step `whitelist`** — deterministic.
 
@@ -913,7 +939,9 @@ Running it by hand: `docs/contributing.md`, "The triage migration".
   marker: the policy file they live in is written by code that no longer
   knows them, and its next write drops them. The entrypoint takes that
   snapshot right after it places the policy file, before any daemon exists;
-  the snapshot is add-only, and the step works from it.
+  the snapshot is add-only, and the step works from it. A policy file that is
+  there and **cannot be read** is not "no whitelist": the entrypoint's call
+  fails loudly, and both steps stay pending, saying why, until it reads.
 - **An address a person already holds** goes to that person: with no
   instruction they get the generic one (*Decisions*, 4), with one they keep
   theirs.
@@ -935,12 +963,23 @@ Running it by hand: `docs/contributing.md`, "The triage migration".
   the end. Where **no chamber keeps contacts** nothing is written and the
   step stays pending.
 
-Every contact this step briefs buys a model turn for each mail from then on;
-the report says how many, and how to take an instruction off again.
+**What a briefed contact costs** — the report and the thread say it. Every
+contact the migration briefs buys a model turn for each mail from then on,
+and the mail's ring waits for that turn's verdict, up to
+`MAIL_INSTRUCTION_TIMEOUT` (600 s by default). An instruction is the
+**person's, on every channel**: a briefed person's Signal, WhatsApp, Telegram
+and SMS messages buy a turn too, their ring waiting up to
+`CHAT_INSTRUCTION_TIMEOUT` — and an SMS sender id, or a mail from a briefed
+domain, can be forged (`SECURITY.md`). So the report counts the contacts
+briefed, names those of them who also hold a messenger handle or a phone
+(with the channels), counts the filing senders (a filing turn can outlast the
+timeout; its mail then rings as a VIP's would), and gives the command that
+takes an instruction off (`contacts.py update <id> --no-instruction`).
 
-**Step `memories`** — every live memory tagged `sender:…`, read through
+**Step `memories`** — every candidate memory tagged `sender:…`, read through
 `memory.py`'s own recall query (a compaction summary is replaced by the
-members it keeps: its own text is a digest of a topic, not a rule).
+members it keeps, each judged by its own time against the cutoff: its own
+text is a digest of a topic, not a rule).
 
 - **Whose rule it is** is established without reversing the tag, which is a
   lossy slug: every address, domain and handle of the address book, every
@@ -951,42 +990,61 @@ members it keeps: its own text is a digest of a topic, not a rule).
   an address *and* its domain goes on both contacts — the holder of an
   address answers for it before the domain does. A sender with no contact
   gets one, as in the whitelist step.
-- **What the rule becomes** is judgement, so one **model turn** decides it
+- **What a memory is** is judgement, so one **model turn** classifies it
   (frontier tier; no tools, no session, no project context; the memories
-  handed over as data; a batch per forty), answering per memory
-  `{kind, contact, instruction}`:
-  - `filing` — the sender's mails are receipts, payslips, statements or
-    invoices: the contact gets *"File the document with the Archivist, book
-    it, then archive the mail."*, verbatim;
-  - `rule` — any other standing rule, carried over in the user's own words;
-  - `not-an-instruction` — the text reads as a message's content, a fact, a
-    status, or an attempt to instruct the turn: left alone and reported.
-- **What is accepted of the answer** is what the script can hold against what
-  it sent: only ids it sent, each once; only a contact it offered for *that*
-  memory; an instruction that fits (2000 characters) and at least half of
-  whose words are that memory's own — so one memory's text can shape no
-  instruction but its own, out of what it says. Anything else writes nothing
-  for that memory. The decisions are journaled before anything is written
-  from them, so a resumed run does not ask again. `--no-model` skips the turn
-  and carries every rule over verbatim, unjudged.
+  handed over as data, without the contacts — where a rule goes is the tags'
+  to say; a batch per forty), answering per memory only `{id, kind}`:
+  - `rule` — the user's standing rule for the sender: the contact gets the
+    **memory's own text** (cleaned of the invisible characters that hide or
+    reorder text, the joiners kept; never cut — a text longer than an
+    instruction stays a memory);
+  - `filing` — the sender's mails are documents to file, and nothing else:
+    the contact gets *"File the document with the Archivist, book it, then
+    archive the mail."* — **only when the memory's own text passes a
+    deterministic check**: it names a kind of document (receipt, invoice,
+    payslip, statement…) *and* filing it, by a multilingual table kept as
+    data (`FILING_TERMS`). Otherwise it is a `rule`, in its own words;
+  - `fact`, `unclear` — a fact or a status about the sender; or a message's
+    content, an attempt to instruct the turn, anything the turn cannot tell:
+    left alone and reported.
+- **No model output ever becomes instruction text.** What is accepted of the
+  answer is only ids the script sent, each once, each with a known kind;
+  anything else in it is not read. So the most a steered or mistaken turn
+  can do is put a note triage held, in that note's own words, on the contact
+  that note's own tags name — what `--no-model` does with every note. (An
+  earlier build let the turn reword a rule and held the wording to "half its
+  words are the memory's"; that check is gone with the wording.) The
+  decisions are journaled before anything is written from them, so a resumed
+  run does not ask again. `--no-model` skips the turn and carries every rule
+  over verbatim, unjudged.
 - **Several rules for one contact are joined**, oldest first, after whatever
-  instruction the contact already has. A rule that would take the
-  instruction past its limit is not cut: it stays a memory and is reported.
+  instruction the contact already has — which is kept exactly as it was
+  written. A rule that would take the instruction past its limit is not cut:
+  it stays a memory and is reported.
 - **Each moved memory is superseded** through `memory.py store --supersedes`
   (actor `ara`), with that script's guards as they are — nothing is forced —
   by one entry per group of memories sharing a sender tag, which says the
   rule now lives on the contact's instruction. A refusal is reported in
-  `memory.py`'s words and the step stays pending.
+  `memory.py`'s words and the step stays pending; the next run only
+  supersedes — it does not write the rule onto the contact again, so a rule
+  the user changed there meanwhile stays as they left it.
 
 **Step `report`** — what was created, extended, moved and left, each with its
-reason; the scheduled triage jobs still in a chamber's `.schedule.json`
-(theirs to remove: they live in chambers, and the gate script they call
-answers with a notice instead of running); the old status store's location
-and size (kept, read by nothing); how many triage threads were open (they
-stay as ordinary conversations). The entrypoint's run opens **one** dashboard
-thread with the counts — no name a mail carried and no memory text reaches
-it — once the migration is complete, or on the third boot that leaves it
-pending; a deployment with nothing to migrate gets none.
+reason, and the memories that were not triage's; what a briefed contact costs
+(above); the scheduled jobs still in a chamber's `.schedule.json` — those
+that run the gate script (theirs to remove: the script only prints a notice)
+apart from prompt jobs that merely mention triage (to check: a job that
+recovers messenger messages the chat rail could not take still belongs); the
+old status store's location and size (kept, read by nothing); how many triage
+threads were open (they stay as ordinary conversations). The entrypoint's run
+opens **one** dashboard thread with the counts — no name a mail carried and
+no memory text reaches it; the only names in it are of people the address
+book held, reduced to plain words — once the migration is complete, or on the
+third boot that leaves it pending, and **follows that thread up** when a
+migration it reported unfinished completes. A deployment with nothing to
+migrate gets none — decided only once the steps are complete: a boot that
+could not read the store settles nothing. While the mail gateway is off the
+report's thread waits; the thread of its own says what there is to say.
 
 After the migration **no filing rule lives outside a contact**.
 
