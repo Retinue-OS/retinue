@@ -184,9 +184,15 @@ month of memories.
   status. Compaction uses it to tell what to carry forward.
 - **Tags: reuse first.** `memory.py tags` lists the tags in use with their
   counts (`--prefix`, `--contains` to narrow); pick an existing one before
-  coining a new one. Sender instructions keep their identifier tags
-  (`sender:<address>` or `sender:<domain>`, slugged to `sender-…`), which
-  triage recalls by.
+  coining a new one. An identifier tag names one sender
+  (`sender:<address or handle>`, slugged to `sender-…`) and files what is
+  *known* about them; a chat's companion turn recalls by it. What the user
+  wants *done* with a sender's messages is not a memory: that is the
+  instruction on the contact (docs/contacts.md, "The instruction"), which
+  briefs the turn that works them. E-mail triage used to keep such rules as
+  `sender:` memories; `scripts/migrate-triage.py` wrote them onto the
+  contacts and superseded each with a memory that says where the rule lives
+  now (docs/mail-chats.md, "The migration").
 - **Name the actor.** A subagent's session inherits the `ara` default, so a
   dispatch prompt that asks a subagent to store must say `--actor <its
   basename>` explicitly.
@@ -374,8 +380,8 @@ half, the next section its mechanics:
 - **Tags.** A summary's tags are the cluster tag plus every tag of every
   member it keeps. Recall finds a compacted entry only through its summary,
   so a summary missing one of those tags would hide the entry from
-  `recall --tag`: a sender's standing instructions from triage, which
-  recalls them by a `sender-…` tag that typically occurs once in a cluster,
+  `recall --tag`: what is known about one sender, recalled by a `sender-…`
+  tag that typically occurs once in a cluster,
   and as well any entry filed under a tag no other member shares — many are,
   since tags are coined freely. (The scheme first carried only the tags
   occurring at least twice; the job showed that this hides exactly those.)
@@ -481,8 +487,8 @@ outcome — dropping it instead would bring the same batch round first on
 every run. An object failing any of the checks is dropped and logged; its
 batch comes round again. The job sets the rest itself rather than trusting
 it: the topic, and the tags — every tag of every member kept (the tag rule
-above) — so a summary can never hide a sender rule from triage, nor any kept
-entry from a `recall --tag` that found it before. It writes what survives to
+above) — so a summary can never hide a sender's entry, nor any other kept
+entry, from a `recall --tag` that found it before. It writes what survives to
 `/root/.retinue/memory/compaction-plan.json` and runs `memory.py compact` on
 it under the session's environment, whose frontier stamp `compact` checks and
 records. When `compact` refuses the plan (a member compacted or corrected

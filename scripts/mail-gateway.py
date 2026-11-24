@@ -170,12 +170,6 @@ import build_stamp as _build
 import send_origin as _origin
 from reply_tokens import ReplyTokenStore
 
-# The gateway never writes policy (docs/mail-chats.md, "Writing"): a mail it
-# sends whitelists nobody. email_client does that for its own sends, in its
-# own process; here its helpers are a library, and this switches the side
-# effect off for everything this process does through them.
-_ec.WHITELIST_ON_SEND = False
-
 CHANNEL = "email"
 # Mail is the user's own correspondence; there is no control mode to run.
 MAIL_GATEWAY_MODE = "inbox"
@@ -2619,7 +2613,7 @@ class Mirror:
         except Exception as exc:  # noqa: BLE001 - no flags is the safe reading
             print(f"[mail-gateway] e-mail policy unreadable ({exc}); mirroring "
                   f"as with no flags", flush=True)
-            return _triage.EmailPolicy(frozenset(), frozenset())
+            return _triage.EmailPolicy()
 
     def _record_path(self, name: str) -> Path:
         return _ibstore.messages_dir(INBOUND_STORE_DIR) / name

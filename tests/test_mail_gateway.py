@@ -1311,7 +1311,7 @@ def test_no_backfill_mirrors_only_new_mail():
 # --------------------------------------------------------------------------
 
 def _write_policy(gw, **sets):
-    policy = gw._triage.EmailPolicy(frozenset(), frozenset())._replace(
+    policy = gw._triage.EmailPolicy(
         **{key: frozenset(values) for key, values in sets.items()})
     gw.POLICY_PATH.parent.mkdir(parents=True, exist_ok=True)
     gw.POLICY_PATH.write_text(gw._triage.render_email_policy(policy), encoding="utf-8")

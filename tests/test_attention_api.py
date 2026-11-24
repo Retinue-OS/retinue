@@ -666,7 +666,6 @@ def test_a_person_carries_attention_and_vip(base, wg):
     assert tp.gate_decision("whatsapp", pia)["vip"] is True
     assert tp.gate_decision("signal", "+41790000999")["vip"] is True, "a hand-set VIP stays"
     assert tp.gate_decision("email", "pia@example.org")["vip"] is True
-    assert tp.email_gate_decision("pia@example.org")["triage_now"] is False
     status, out = _http(base, "POST", f"/contacts/{person}", {"vip": False})
     assert status == 200 and out["contact"]["vip"] is False, out
     assert tp.gate_decision("signal", pia)["vip"] is False

@@ -74,8 +74,8 @@ services:
       - messenger-telegram:/workspace/chambers/_generated/messenger/telegram
       - messenger-sms:/workspace/chambers/_generated/messenger/sms
       # The mail gateway's ledger, the same way. Its policy/ also holds the
-      # e-mail policy file (email-policy.nt: the whitelist and the group
-      # flags), which the retinue side writes and the gateway reads.
+      # e-mail policy file (email-policy.nt: the e-mail group flags), which
+      # the retinue side writes and the gateway reads.
       - messenger-email:/workspace/chambers/_generated/messenger/email
       # RW mount of the project tree itself. Agents can branch/commit/push
       # infra changes (Tier 3 in CLAUDE.md) straight from this live checkout
@@ -302,7 +302,6 @@ services:
       # Overrides the router tier for unpinned dashboard threads only, so the
       # door in front of the user can be strong while dispatch stays cheap.
       - RETINUE_DASHBOARD_MODEL
-      - RETINUE_TRIAGE_MODEL
       # Per-subagent model overrides (scripts/agent_models.py): the deployment
       # default; the dashboard's Settings › Agent models card writes the file
       # (RETINUE_AGENT_MODELS_FILE, default on the persistent /root volume).
@@ -359,9 +358,8 @@ services:
       # NAMED account (EMAIL_USER_ARI, EMAIL_PASS_ARI, IMAP_HOST_ARI, …) is
       # deployment content: list its variables in the override. The mail
       # gateway (below) holds the same mailbox credentials for its mirror, but
-      # they stay here too: email_client.py's backend, the e-mail triage and
-      # the /sends approval of e-mail drafts still run in this container, and
-      # do until the mail gateway takes over sending (docs/mail-chats.md).
+      # they stay here too: email_client.py's backend and the /sends approval
+      # of e-mail drafts still run in this container (docs/mail-chats.md).
       - EMAIL_USER
       - EMAIL_FROM_NAME
       - EMAIL_PASS
@@ -376,7 +374,6 @@ services:
       - SEND_STRIP_HEADERS
       - EMAIL_BACKEND_TOKEN
       - EMAIL_ENV_FILE
-      - EMAIL_PROCESSING_INTERVAL
       # Dashboard: the conversation backend token (auto-generated when unset),
       # the public base URLs links are built with, Web Push (the VAPID key
       # pair itself is a file on the /root volume, never an env var), the
@@ -491,8 +488,8 @@ services:
       - ARA_MCP_RATE_LIMIT
       - ARA_MCP_RATE_WINDOW
       - ARA_MCP_JOB_RETENTION
-      # News feed and triage tunables (scripts/news_store.py, news-fetch.py,
-      # news-curate.py, triage-gate.py), the project-deadline lead
+      # News feed tunables (scripts/news_store.py, news-fetch.py,
+      # news-curate.py), the project-deadline lead
       # (scripts/recurring-projects.py), the self-update call timeout
       # (scripts/self-update.py), the chamber plugin watcher's interval
       # (scripts/sync-plugins.py) and the session-side scripts' backend
@@ -502,17 +499,6 @@ services:
       - NEWS_MAX_ITEMS
       - NEWS_FETCH_TIMEOUT
       - NEWS_CURATE_BATCH
-      - TRIAGE_STATE_DIR
-      - TRIAGE_INBOX_SCAN_LIMIT
-      - TRIAGE_INBOX_SCAN_MAX
-      - TRIAGE_PROMPT_LIST_LIMIT
-      - TRIAGE_STALL_DAYS
-      - TRIAGE_SENT_DERIVE_LIMIT
-      - TRIAGE_BATCH_SIZE
-      - TRIAGE_SENT_RECONCILE
-      - TRIAGE_ANSWERED_FOLDER
-      - TRIAGE_NEWS_FOLDER
-      - TRIAGE_NEWS_EXCERPT_CHARS
       - PROJECT_DEADLINE_LEAD_DAYS
       - UPDATER_TIMEOUT
       - PLUGIN_SYNC_INTERVAL
@@ -521,7 +507,7 @@ services:
       # workspace, the chambers, the credential file and the in-container
       # backends are (scripts/entrypoint.sh, scheduler.py, memory.py,
       # claude_auth.py, ara-mcp-server.py, conversation-push.py,
-      # chat-draft.py, recurring-projects.py, triage-gate.py,
+      # chat-draft.py, recurring-projects.py,
       # triage_policy.py, discover-agents.py, emit-conversation-models.py,
       # web-gateway.py, git-serialize.sh). A deployment rarely sets one;
       # listed so that the audit above holds without exception.
@@ -542,7 +528,6 @@ services:
       - CONVERSATION_BACKEND_URL
       - CHAT_DRAFT_BACKEND_URL
       - CONVERSATION_PUSH
-      - EMAIL_CLIENT_PATH
       - TRIAGE_MESSENGER_DIR
       - TRIAGE_EMAIL_WHITELIST_PATH
       - WEBAPP_DIR
@@ -1518,7 +1503,7 @@ volumes:
   messenger-sms:
   # The mail gateway's ledger. Besides policy/policy.nt (the channel's sender
   # policy, from the gate phase) its policy/ holds email-policy.nt, the e-mail
-  # whitelist and group flags.
+  # group flags.
   messenger-email:
   # qlever-life's two blue-green index slots — see the qlever-life service
   # above for why these are persisted.

@@ -109,9 +109,9 @@ NEEDED = {
     "MAIL_GATEWAY_TOKEN": "mail-cap",
     "MAIL_GATEWAY_BASE_URL": "http://mail-gateway:8096",
     "MAIL_GATEWAY_SEND_URL": "http://mail-gateway:8096/send",
-    # non-secret mailbox setting the triage gate lists by name
-    "SENT_FOLDER": "Sent",
-    "TRIAGE_STATE_DIR": "/root/.retinue/triage",
+    # where the delivery gate's policy files are (triage_policy.py's CLI)
+    "TRIAGE_MESSENGER_DIR": "/workspace/chambers/_generated/messenger",
+    "TRIAGE_EMAIL_WHITELIST_PATH": "/workspace/chambers/_generated/messenger/email/policy/email-policy.nt",
     # git shim and python
     "GIT_SERIALIZE_LOCK_DIR": "/tmp/git-locks",
     "PYTHONPATH": "/workspace/scripts",
@@ -125,6 +125,16 @@ DAEMON_ONLY = {
     "IMAP_HOST": "imap.example.com",
     "SMTP_HOST": "smtp.example.com",
     "EMAIL_SEND_POLICY": "[]",
+    # a mailbox setting: the backend's, like the credentials it goes with
+    "SENT_FOLDER": "Sent",
+    # the retired e-mail triage's settings, should a deployment's environment
+    # still carry them: no session reads them, so none gets them
+    "TRIAGE_STATE_DIR": "/root/.retinue/triage",
+    "TRIAGE_INBOX_SCAN_LIMIT": "50",
+    "TRIAGE_BATCH_SIZE": "25",
+    "TRIAGE_NEWS_FOLDER": "Archive",
+    "EMAIL_PROCESSING_INTERVAL": "86400",
+    "EMAIL_CLIENT_PATH": "/workspace/scripts/email_client.py",
     "MESSENGER_GATEWAYS": '[{"base_url":"http://x:1","token":"t"}]',
     "SCHEDULER_TICK_SECONDS": "30",
     # the mail gateway's own settings, should a deployment set them here
@@ -172,17 +182,19 @@ def test_daemon_only_configuration_is_dropped():
 
 
 def test_prefixes_admit_the_framework_namespaces():
-    src = _source(RETINUE_TRIAGE_MODEL="sonnet", RETINUE_ANYTHING_NEW="x",
+    src = _source(RETINUE_REPORT_MODEL="sonnet", RETINUE_ANYTHING_NEW="x",
                   SPARQL_ENDPOINT_GENOMICS="http://qlever-genomics:7001",
                   CLAUDE_CODE_FUTURE_FLAG="1", ANTHROPIC_SMALL_FAST_MODEL="haiku",
-                  LC_MESSAGES="C", NEWS_MAX_ITEMS="500", TRIAGE_INBOX_SCAN_LIMIT="50",
+                  LC_MESSAGES="C", NEWS_MAX_ITEMS="500",
                   GIT_AUTHOR_NAME="Ara", PYTHONUNBUFFERED="1")
     env = se.build(src)
-    for name in ("RETINUE_TRIAGE_MODEL", "RETINUE_ANYTHING_NEW",
+    for name in ("RETINUE_REPORT_MODEL", "RETINUE_ANYTHING_NEW",
                  "SPARQL_ENDPOINT_GENOMICS", "CLAUDE_CODE_FUTURE_FLAG",
                  "ANTHROPIC_SMALL_FAST_MODEL", "LC_MESSAGES", "NEWS_MAX_ITEMS",
-                 "TRIAGE_INBOX_SCAN_LIMIT", "GIT_AUTHOR_NAME", "PYTHONUNBUFFERED"):
+                 "GIT_AUTHOR_NAME", "PYTHONUNBUFFERED"):
         assert name in env, name
+    # TRIAGE_ is not a namespace: only the two policy paths are named.
+    assert "TRIAGE_" not in se.SESSION_ENV_PREFIXES
     # A prefix never admits the one key that lives under an allowed namespace.
     assert "RETINUE_LITELLM_KEY" not in env
     print("ok: the RETINUE_/CLAUDE_/ANTHROPIC_/SPARQL_ENDPOINT_ namespaces pass, "

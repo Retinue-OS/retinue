@@ -178,9 +178,9 @@ summary per topic, so a recall shows a topic's summary first and only its
 newer entries one by one. Relevance
 is expected durability: 1.0 standing rule, 0.7 decision or lesson, 0.3
 incident or status. A subagent asked to store must be told its own `--actor`.
-A standing instruction the user gives about one sender is tagged
-`sender:<address or handle>` (or `sender:<domain>`) so triage finds it — pass
-the raw value, `memory.py` slugs it.
+A standing instruction the user gives about one sender is **not** a memory:
+put it on the contact (`contacts.py update <id> --instruction "…"`, see
+**Contacts**), where it briefs the turn that works that sender's messages.
 
 `store` refuses in two cases — a refusal names the way out, never retry
 blindly. **Near-duplicate** of a live entry: reinforce it, or challenge it
@@ -251,13 +251,15 @@ and Telegram accounts. Each chamber's `chambers.json` entry names its address
 book (`contacts`, default `contacts/`). Use `scripts/contacts.py` — `find
 --email/--phone/--handle/--name` before asking who someone is, `add --chamber
 <chamber>` (a contact always names its chamber; ask when unclear), `update <id>
---add-handle`/`--add-email` rather than filing a second person. The person also
+--add-handle`/`--add-email` rather than filing a second person, `--add-domain
+example.org` for an organisation that writes from many addresses. The person also
 carries the attention model's facts about them (sphere, importance prior, the
 modes they may interrupt), the **VIP flag** (`--vip`: a model works their
-messages on every channel; their e-mail is whitelisted) and the user's
+messages on every channel, e-mail included, and they ring on arrival) and the user's
 **instruction** (`--instruction "…"`: the brief a model works each of their
-messenger messages by; its verdict decides whether the message rings) — set
-these on the person, not per handle. The dashboard's contact card and its Contacts page (a
+messages by, mail included; its verdict decides whether the message rings) — set
+these on the person, not per handle. A mail from anyone else pushes nothing and
+buys no model turn; there is no e-mail whitelist. The dashboard's contact card and its Contacts page (a
 tab of the navigation row) write the same files. Vocabulary and file format:
 `docs/contacts.md`.
 
@@ -288,6 +290,11 @@ without the link leaves the message stuck. A queued send you no longer want is
 taken back before approval with `--retract <id>` on any push CLI
 (`mail-push.py`'s own queue; `email_client.py retract` for an e-mail draft) —
 never left for the user to deny.
+**Inbound needs no session by default**: every message, a mail included, lands
+in its chat (Chats page: Unread · Read · Archived), and a model turn works it —
+in that chat's companion — only for a VIP or an instructed sender. There is no
+e-mail triage (no INBOX pass, no omnibus, no status store); the `triage` skill
+is only the fallback for a messenger message the chat rail could not take.
 A send queued in a dashboard-thread turn is linked to that thread
 (`RETINUE_THREAD_ID`; from elsewhere `--thread <id>` on a push CLI, or
 `RETINUE_THREAD_ID=<id>` for `email_client.py`), and the user's Allow/Deny is
@@ -396,7 +403,8 @@ gateway's serving logic are **Tier 3**.
 ## News feed
 
 Broadcast-style inbound (channel posts, newsletters, RSS) belongs in the news
-feed, not in triage archives: file non-feed finds yourself with
+feed, not among the chats: a group or mailing list flagged `news`
+(`triage_policy.py`) is filed by its gateway; file non-feed finds yourself with
 `scripts/news-add.py` (use `--expires` for anything dated); RSS/Atom sources
 come from per-chamber `.news.json`. The **Herald** owns scoring and the taste
 profile. Before changing how the feed ranks, ingests or learns:
@@ -473,6 +481,7 @@ variable a session needs is named in `RETINUE_SESSION_ENV_EXTRA`
 | chamber mounting, plugins, INSTRUCTIONS.md contract | `docs/chambers.md` |
 | editing `.refresh.json`/`.schedule.json`/`.inbox.json`, project wake semantics | `docs/scheduling.md` |
 | unfamiliar messaging accounts, send policies, gateway config | `docs/messaging.md` |
+| who gets a model turn on arrival (the delivery gate, group flags), mail threads as chats | `docs/triage-delivery-gate.md`, `docs/mail-chats.md` |
 | contacts: the address book, its vocabulary, a chamber's `contacts` entry | `docs/contacts.md` |
 | webapp/gateway changes, attachments, push, voice input | `docs/dashboard.md` |
 | importance, urgency, focus modes, the digest — the attention model | `docs/attention-model.md`, `docs/attention-migration.md` |

@@ -4,7 +4,7 @@
 Every headless session the framework starts — dashboard turns, the transcript
 cleanup and the presentation lint (scripts/web-gateway.py), scheduler prompt
 jobs and the sessions the command jobs spawn themselves (scripts/scheduler.py,
-agent-self-review.py, news-curate.py, triage-gate.py), Ask-Ara answers
+agent-self-review.py, news-curate.py, inbox-sweep.py), Ask-Ara answers
 (scripts/ara-mcp-server.py) — gets its environment from build() below, never
 from a copy of the spawner's os.environ.
 
@@ -90,7 +90,7 @@ SESSION_ENV_NAMES: frozenset[str] = frozenset({
     # mail, open this thread, file this news item); the service still applies
     # the send policy and holds the credential. That is the whole design of
     # the credential isolation (.env.example, "E-mail credential isolation").
-    "EMAIL_BACKEND_TOKEN", "EMAIL_BACKEND_URL", "EMAIL_CLIENT_PATH",
+    "EMAIL_BACKEND_TOKEN", "EMAIL_BACKEND_URL",
     "CONVERSATION_BACKEND_TOKEN", "CONVERSATION_BACKEND_URL",
     "CONVERSATION_BACKEND_TIMEOUT", "CONVERSATION_BASE_URL",
     "CONVERSATION_PUSH", "CHAT_DRAFT_BACKEND_URL", "SEND_APPROVAL_BASE_URL",
@@ -105,11 +105,13 @@ SESSION_ENV_NAMES: frozenset[str] = frozenset({
     # recurring-projects.py); the SPARQL_ENDPOINT_ prefix below carries the
     # advertised form.
     "QLEVER_LIFE_URL", "QLEVER_TIMEOUT", "QLEVER_GRAPH_BASE",
-    # Triage: the gate lists the Sent folder of the default account by name
-    # (scripts/triage-gate.py) and the skill derives its omnibus window from
-    # the processing interval. Non-secret mailbox *settings*; the credentials
-    # stay with the gateway's backend.
-    "SENT_FOLDER", "EMAIL_PROCESSING_INTERVAL",
+    # Where the delivery gate's policy files are, for a session that edits
+    # them (scripts/triage_policy.py: a group flag, a hand-set VIP). Named one
+    # by one, not by a TRIAGE_ prefix: these two are all a session reads, and
+    # the prefix used to carry e-mail triage's tunables, which are retired.
+    # No mailbox setting is listed either — a session reaches the mailbox
+    # through the backend, which holds the settings with the credentials.
+    "TRIAGE_MESSENGER_DIR", "TRIAGE_EMAIL_WHITELIST_PATH",
     "PROJECT_DEADLINE_LEAD_DAYS",
     # No chamber's credentials here: a variable a chamber's own scripts read
     # (a data source's login, say) is the deployment's to name in
@@ -141,8 +143,8 @@ SESSION_ENV_PREFIXES: tuple[str, ...] = (
     # Read-only store advertisement (CLAUDE.md "SPARQL endpoints").
     "SPARQL_ENDPOINT_",
     # News feed (scripts/news_store.py, news-fetch.py, news-curate.py,
-    # news_ingest.py) and triage tunables (scripts/triage-gate.py).
-    "NEWS_", "TRIAGE_",
+    # news_ingest.py).
+    "NEWS_",
 )
 
 SESSION_ENV_SUFFIXES: tuple[str, ...] = (
