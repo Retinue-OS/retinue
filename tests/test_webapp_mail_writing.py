@@ -47,10 +47,26 @@ and pin:
     `{unconfirmed}` keeps the bubble ("Sending — not confirmed yet") and
     never restores the words; it gives way to the mail (by Message-ID, never
     by words) or to the server's pending entry (by Message-ID or
-    request_key); Check again posts the same body under the same key; no
-    answer, a 5xx or a 200 that is no document put the words back with the
-    key they went under, so the same press again is the same mail — also
-    across a reload and a page left mid-send; only a 4xx is "Not sent";
+    request_key, the focus going with it); it is kept on the device — in a
+    record of its own, which costs the composer's kept words nothing — and
+    comes back after a reload until it is accounted for or dismissed, with
+    its words offered back and never in silence; Check again posts the same
+    body under the same key, but only after the recipients were asked for
+    and still are whom the press's line named; no answer, a 5xx that does
+    not say `"sent": false` or a 200 that is no document put the words back
+    with the key they went under, so the same press again is the same mail
+    — also across a reload and a page left mid-send;
+  * a send that certainly failed ends its press: any 4xx and any answer
+    with `"sent": false` is "Not sent", the words stay and the next press
+    mints a new key (the composer and the compose sheet alike);
+  * the key's life: one per press, dropped as soon as the box holds other
+    words (even for a moment), and when the press turns up in the thread —
+    a mail like it, or the server's entry under its key (the words then
+    leave the box; an entry that failed for certain leaves them); a poll
+    draws no second bubble for the press in flight; an entry marked
+    `dismissed` is over and never drawn;
+  * the address book's name for a recipient is `contact`, the person's id
+    `contact_id`: a lowercase one-word name is shown as filed;
   * ＋ on the Chats page: present only when GET /chats/compose offers
     something, its menu, the sheet it opens, the mailboxes on offer asked
     for again as it is opened; the delete wording of a mail
@@ -67,7 +83,10 @@ and pin:
     again; a failure after closing brings the sheet back), errors in place
     and never "not sent" where the outcome is open, the key kept with the
     mail, Escape and the focus given back, the page behind inert, the unsent
-    mail kept per mailbox and never moved to another one unseen;
+    mail kept per mailbox and never moved to another one unseen — nor
+    forgotten once another mailbox is written from: every opening names the
+    mailboxes that hold one, and a mail whose mailbox can send again comes
+    back;
   * the quick-pattern prompts worded for mail.
 
 Standalone like the rest of the suite. Needs `node` on PATH; without it the
@@ -380,6 +399,9 @@ const SOLO = () => PV({ all: { to: [ANN], cc: [] }, choice: false });
 
 // The chat page with its thread: render() rebuilds the thread from
 // _chatThreadHtml and mounts the approval links, as the real one does.
+// `realKeep`: the page keeps the composer's words on the device as the real
+// one does, also while it loads (otherwise only where a test turns it on).
+let realKeep = false;
 function rig(el) {
   el.render = function () {
     const thread = this._state === 'ok' ? new Thread(this._chatThreadHtml()) : null;
@@ -399,7 +421,7 @@ function rig(el) {
   el._notes = [];
   el._showNote = (h) => el._notes.push(h);
   el._refreshChatComposer = () => {};
-  el._keepLocal = () => {};
+  if (!realKeep) el._keepLocal = () => {};
 }
 // One request for the reply preview, answered: a document (200), [document,
 // status], or 'offline'.
@@ -538,6 +560,26 @@ await ok('the reply preview is read whole or not at all', async () => {
   assert.equal(named('ann-example'), 'Mail Name');
   assert.equal(named(null), 'Mail Name');
   assert.equal(named(7), 'Mail Name');
+  // The gateway's answer names the person's id beside the name (`contact_id`),
+  // and the name is then shown as it is filed — also a lowercase one-word
+  // one, which alone would read as an id — before whatever a mail called
+  // its own sender.
+  const filed = (contact, contact_id, name = 'Totally Your Bank') => replyPreview(PV({
+    sender: { to: [{ address: 'mum@example.org', name, contact, contact_id }], cc: [] } })).sender.to[0].name;
+  assert.equal(filed('mum', 'private:contacts/mum'), 'mum');
+  assert.equal(filed('anna', 'private:contacts/anna'), 'anna');
+  assert.equal(filed('acme-gmbh', 'work:contacts/acme', 'Invoice Dept'), 'acme-gmbh');
+  assert.equal(filed('Helga Schmidt', 'private:contacts/mum'), 'Helga Schmidt');
+  assert.equal(filed({ name: 'mum' }, 'private:contacts/mum'), 'mum');
+  // Nobody's address has no address-book name, whatever stands beside it;
+  // and an id is never its own name.
+  assert.equal(filed('mum', null), 'Totally Your Bank');
+  assert.equal(filed('mum', ''), 'Totally Your Bank');
+  assert.equal(filed('mum', 7), 'Totally Your Bank');
+  assert.equal(filed('private:contacts/mum', 'private:contacts/mum'), 'Totally Your Bank');
+  assert.equal(filed(null, 'private:contacts/mum'), 'Totally Your Bank');
+  // A name that reads as an address is dropped wherever it came from.
+  assert.equal(filed('ceo@company.com', 'private:contacts/x', null), '');
   // `choice` only on the server's plain word; a Cc left out is none.
   assert.equal(replyPreview(PV({ choice: 'yes' })).choice, false);
   assert.deepEqual(replyPreview(PV({ sender: { to: [ANN] } })).sender.cc, []);
@@ -1376,12 +1418,19 @@ await ok('Check again asks about the same press, and never sends a second mail',
     await quiet(el);
     return { el, first: req };
   };
+  // The recipients are asked for first (answered as the page was told
+  // last), then the question leaves.
   const again = async (el) => {
     const p = el._recheck('local-1');
     await settle();
+    assert.equal(wire.filter((w) => w.method === 'POST').length, 0, 'nothing is posted before the recipients are known');
+    answerPreview(el, el._pv, 'the preview before the question');
+    await settle();
     const req = take((w) => w.method === 'POST', 'the question');
     el._recheck('local-1');
+    await settle();
     assert.equal(wire.filter((w) => w.method === 'POST').length, 0, 'one question at a time');
+    assert.equal(asked(el), 0, 'one question at a time');
     return { p, req };
   };
   // Sent: the very same request went out again, and the answer is the mail.
@@ -1403,19 +1452,29 @@ await ok('Check again asks about the same press, and never sends a second mail',
   await quiet(el);
   assert.deepEqual(el._thread.layout(), ['m1', 'm2', 'm3', 'P:q1']);
   // The gateway's word is that it did not go: now, and only now, the words
-  // come back — after what the box holds.
-  ({ el, first } = await start());
-  el._draft = 'typed since';
-  q = await again(el);
-  q.req.answer({ error: 'The mail server refused it.' }, 409);
-  await q.p;
-  await quiet(el);
-  assert.deepEqual(el._thread.layout(), ['m1', 'm2', 'm3']);
-  assert.deepEqual(el._into, ['typed since\n\nthe mail']);
-  assert.equal(el._notes.at(-1), 'Not sent: The mail server refused it. The text is back in the box.');
+  // come back — after what the box holds. Its word on this press is a 424
+  // (the send failed for certain), or a refusal that names the key.
+  for (const [doc, status, note] of [
+    [{ error: 'The mail server refused it.', sent: false }, 424, 'Not sent: The mail server refused it. The text is back in the box.'],
+    [{}, 424, 'Not sent: the server refused it (424). The text is back in the box.'],
+    [{ error: 'This thread has no mail left to reply to.', request_key: 'KEY' }, 409,
+     'Not sent: This thread has no mail left to reply to. The text is back in the box.'],
+  ]) {
+    ({ el, first } = await start());
+    el._draft = 'typed since';
+    q = await again(el);
+    q.req.answer(doc.request_key ? { ...doc, request_key: first.body.request_key } : doc, status);
+    await q.p;
+    await quiet(el);
+    assert.deepEqual(el._thread.layout(), ['m1', 'm2', 'm3'], String(status));
+    assert.deepEqual(el._into, ['typed since\n\nthe mail']);
+    assert.equal(el._notes.at(-1), note);
+    assert.equal(el._unconfirmed.length, 0);
+  }
   // Still unknown — by the server's word, or because it cannot be reached:
   // the bubble stays and nothing is sent again.
   ({ el, first } = await start());
+  assert.ok(!el._thread.node('local-1').html.includes('data-unsure-'), 'no way out is offered before the server was asked');
   q = await again(el);
   q.req.answer({ unconfirmed: true, message_id: 'real-6@me.example.org', request_key: first.body.request_key }, 202);
   await q.p;
@@ -1426,11 +1485,395 @@ await ok('Check again asks about the same press, and never sends a second mail',
   await q.p;
   assert.deepEqual(el._thread.layout(), ['m1', 'm2', 'm3', 'local-1']);
   assert.deepEqual(el._into, []);
+  assert.equal(el._notes.at(-1), 'The server could not be asked about this mail. It is still not confirmed; nothing was sent a second time.');
+  // An answer that is about this request, not about the first one, says
+  // nothing of the mail: a gateway that could not be reached now ("sent":
+  // false — nothing was sent NOW), a sign-in that ran out, another site's
+  // request refused, a proxy's error. None of them is "Not sent".
+  for (const [doc, status, why] of [
+    [{ error: 'The mail gateway could not be reached; nothing was sent.', sent: false, request_key: 'KEY' }, 502,
+     ' (The mail gateway could not be reached; nothing was sent.)'],
+    [{ error: 'the mail gateway is not configured', sent: false, request_key: 'KEY' }, 503, ' (the mail gateway is not configured)'],
+    [{}, 401, ' (it answered 401)'],
+    [{ error: 'cross-site request rejected' }, 403, ' (cross-site request rejected)'],
+    [{ error: 'no gateway serves this chat' }, 409, ' (no gateway serves this chat)'],
+    [null, 500, ' (it answered 500)'],
+  ]) {
+    q = await again(el);
+    q.req.answer(doc && doc.request_key ? { ...doc, request_key: first.body.request_key } : doc, status);
+    await q.p;
+    assert.deepEqual(el._thread.layout(), ['m1', 'm2', 'm3', 'local-1'], String(status));
+    assert.deepEqual(el._into, [], String(status));
+    assert.equal(el._notes.at(-1), `The server could not be asked about this mail${why}. ` +
+      'It is still not confirmed; nothing was sent a second time.');
+    assert.ok(!el._notes.at(-1).startsWith('Not sent'));
+  }
+  // Asked without an end: the bubble now offers its words back, and a way
+  // off the thread, beside the question.
+  const stuck = el._thread.node('local-1').html;
+  assert.ok(stuck.includes('data-recheck') && stuck.includes('data-unsure-copy') && stuck.includes('data-unsure-dismiss'), stuck);
   // The mail arrives on its own: asking again has nothing left to ask about.
   await poll(el, [...BASE, mail('real-6@me.example.org', 'out', '2026-11-20T10:00:05Z', { author: 'user', sender: ACCT })], []);
   wire.length = 0;
   await el._recheck('local-1');
   assert.equal(wire.length, 0);
+});
+
+await ok('Check again never sends to recipients the press did not name', async () => {
+  // The gateway may never have had the key: the question is then the first
+  // request to send the mail, addressed from the thread as it stands now.
+  const start = async (mode = 'all') => {
+    const el = await open();
+    el._into = [];
+    el._restoreComposer = (t) => { el._into.push(t); el._draft = t; };
+    if (mode !== 'all') el._setReplyMode(mode);
+    const p = el._sendChat('the mail');
+    await settle();
+    answerPreview(el, PV(), 'the preview at the press');
+    await settle();
+    const req = take((w) => w.method === 'POST', 'the send');
+    req.answer({ unconfirmed: true, request_key: req.body.request_key }, 202);
+    await p;
+    await quiet(el);
+    return { el, first: req };
+  };
+  const posts = () => wire.filter((w) => w.method === 'POST').length;
+  // Bob has written since, and a reply to the sender now goes to him.
+  const BOB_NOW = PV({ sender: { to: [BOB], cc: [] } });
+  let { el, first } = await start('sender');
+  assert.equal(first.body.reply, 'sender');
+  let p = el._recheck('local-1');
+  await settle();
+  answerPreview(el, BOB_NOW, 'the preview before the question');
+  await p;
+  assert.equal(posts(), 0, 'nothing is posted: it would reach Bob, whom the line never named');
+  assert.ok(el._notes.at(-1).startsWith('Not asked: the thread has changed, and a reply now reaches other recipients'), el._notes.at(-1));
+  assert.ok(!/not sent/i.test(el._notes.at(-1)), 'nothing here says it did not go');
+  assert.deepEqual(el._thread.layout(), ['m1', 'm2', 'm3', 'local-1'], 'the bubble stays');
+  // And is not asked again from here, even when the recipients are back:
+  // the bubble offers its words instead of the question.
+  let h = el._thread.node('local-1').html;
+  assert.ok(!h.includes('data-recheck'), h);
+  assert.ok(h.includes('<span class="pend-badge">Not confirmed &mdash; this mail may have gone out</span>'), h);
+  assert.ok(h.includes('data-unsure-copy>Copy text back to the composer</button>') && h.includes('data-unsure-dismiss'), h);
+  wire.length = 0;
+  await el._recheck('local-1');
+  assert.equal(wire.length, 0, 'no request at all');
+  // The other mode is compared on its own side: Reply all still reaches
+  // the same people, and that press may be asked about.
+  ({ el, first } = await start('all'));
+  p = el._recheck('local-1');
+  await settle();
+  answerPreview(el, BOB_NOW, 'the preview before the question');
+  await settle();
+  const q = take((w) => w.method === 'POST', 'the question');
+  assert.deepEqual(q.body, first.body);
+  q.answer(sentMsg('real-9@me.example.org', 'the mail'));
+  await p;
+  await quiet(el);
+  assert.deepEqual(el._thread.layout(), ['m1', 'm2', 'm3', 'real-9@me.example.org']);
+  // The recipients cannot be had, or the thread moved while they were
+  // asked for: nothing is posted, and the question can be put again.
+  for (const at of ['offline', [{ error: 'x' }, 502], [{ error: 'no mail left to reply to' }, 409], [{}, 404], 'moved']) {
+    ({ el, first } = await start());
+    p = el._recheck('local-1');
+    await settle();
+    if (at === 'moved') {
+      el._bumpThread();
+      answerPreview(el, PV(), 'the preview before the question');
+    } else {
+      answerPreview(el, at, 'the preview before the question');
+    }
+    await p;
+    assert.equal(posts(), 0, JSON.stringify(at));
+    assert.equal(el._notes.at(-1), 'Not asked: whom this mail would reach could not be confirmed just now. ' +
+      'Nothing was sent; try again in a moment.');
+    h = el._thread.node('local-1').html;
+    assert.ok(h.includes('data-recheck') && h.includes('data-unsure-copy'), 'still askable, and no dead end');
+    await quiet(el);
+  }
+  // A press from longer ago than the gateway keeps a key is not asked
+  // about: the same request would be a new mail.
+  ({ el, first } = await start());
+  el._unconfirmed[0].at = Date.now() - 13 * 3600 * 1000;
+  wire.length = 0;
+  await el._recheck('local-1');
+  assert.equal(wire.length, 0);
+  assert.ok(el._notes.at(-1).startsWith('This mail can no longer be asked about from here.'));
+  assert.ok(!el._thread.node('local-1').html.includes('data-recheck'));
+});
+
+await ok('an unconfirmed mail nobody can account for has two ways out: its words back, and Dismiss', async () => {
+  // A server that did not echo the key cannot be asked: the ways out are
+  // there from the start.
+  const el = await open();
+  el._into = [];
+  el._restoreComposer = (t) => { el._into.push(t); el._draft = t; };
+  el._draft = 'typed since';
+  await send(el, 'lost words', { unconfirmed: true }, 202);
+  const h = el._thread.node('local-1').html;
+  assert.ok(!h.includes('data-recheck') && h.includes('data-unsure-copy') && h.includes('data-unsure-dismiss'), h);
+  // The words back: after what the box holds, the bubble still there.
+  el._copyUnconfirmed('local-1');
+  assert.deepEqual(el._into, ['typed since\n\nlost words']);
+  assert.deepEqual(el._thread.layout(), ['m1', 'm2', 'm3', 'local-1']);
+  assert.ok(el._notes.at(-1).startsWith('The text is back in the box.'));
+  // Dismiss: off the thread, no request (the bubble is the page's own), and
+  // focus on its button does not fall to the document.
+  el._thread.node('local-1').focus();
+  wire.length = 0;
+  el._dismissUnconfirmed('local-1');
+  assert.equal(wire.length, 0);
+  assert.deepEqual(el._thread.layout(), ['m1', 'm2', 'm3']);
+  assert.equal(el._unconfirmed.length, 0);
+  assert.equal(globalThis.focused, el._thread, 'focus goes to the thread');
+  assert.equal(el._notes.at(-1), 'Dismissed. If that mail did go out, it shows in the thread.');
+  el._dismissUnconfirmed('local-1');
+  el._copyUnconfirmed('local-1');
+  assert.deepEqual(el._into, ['typed since\n\nlost words'], 'nothing left to act on');
+});
+
+await ok('an unconfirmed mail survives a reload on the device until it is accounted for or dismissed', async () => {
+  const KEPT = `retinue-draft:chat-unsure:${ID}`;
+  const kept = () => { const r = JSON.parse(store.get(KEPT) || 'null'); return r ? r.v : null; };
+  // The web gateway's hop broke after the request was written and the mail
+  // gateway never stored it: 202 {unconfirmed}, no Message-ID, and the
+  // queue lists nothing. The words are in no box and no draft.
+  const press = async (text = 'the mail', answer = {}) => {
+    const el = await open();
+    el._keepLocal = Page.prototype._keepLocal;
+    el._into = [];
+    el._restoreComposer = (t) => { el._into.push(t); el._draft = t; };
+    const p = el._sendChat(text);
+    await settle();
+    answerPreview(el, PV(), 'the preview at the press');
+    await settle();
+    const req = take((w) => w.method === 'POST', 'the send');
+    req.answer({ unconfirmed: true, request_key: req.body.request_key, ...answer }, 202);
+    await p;
+    await quiet(el);
+    return { el, first: req };
+  };
+  const reload = async (messages = BASE, pending = []) => {
+    const el = await open({}, messages, pending, PV(), true);
+    el._keepLocal = Page.prototype._keepLocal;
+    el._into = [];
+    el._restoreComposer = (t) => { el._into.push(t); el._draft = t; };
+    return el;
+  };
+  let { el, first } = await press();
+  const key = first.body.request_key;
+  assert.equal(kept().list.length, 1, 'kept on the device');
+  assert.deepEqual({ ...kept().list[0], at: 0, shown: '' },
+    { key, text: 'the mail', mode: 'all', shown: '', at: 0, messageId: '', echoed: true, files: 0, stale: false });
+  assert.ok(kept().list[0].shown.includes('ann@example.com'), 'with whom its line named');
+  // The tab is discarded, the page reloads: the bubble is there again, with
+  // the question and the ways out — not a thread that says nothing.
+  el = await reload();
+  assert.deepEqual(el._thread.layout(), ['m1', 'm2', 'm3', 'local-1']);
+  let h = el._thread.node('local-1').html;
+  assert.ok(h.includes('<span class="pend-badge">Sending &mdash; not confirmed yet</span>'), h);
+  assert.ok(h.includes('data-recheck') && h.includes('data-unsure-copy') && h.includes('data-unsure-dismiss'), h);
+  assert.ok(h.includes('the mail'));
+  assert.equal(el._draft, '', 'the words are not put back in the box unasked');
+  assert.equal(kept().list.length, 1, 'and it stays kept');
+  // Check again asks as the press asked — the same words, choice and key —
+  // after the recipients, and the gateway's word ends it: not sent, with
+  // the words offered back.
+  let p = el._recheck('local-1');
+  await settle();
+  answerPreview(el, PV(), 'the preview before the question');
+  await settle();
+  let q = take((w) => w.method === 'POST', 'the question');
+  assert.equal(q.url, SEND_URL);
+  assert.deepEqual(q.body, first.body, 'the very request of the press');
+  q.answer({ error: 'send failed: the mail server refused it', sent: false, request_key: key }, 424);
+  await p;
+  await quiet(el);
+  assert.deepEqual(el._thread.layout(), ['m1', 'm2', 'm3']);
+  assert.deepEqual(el._into, ['the mail']);
+  assert.equal(el._notes.at(-1), 'Not sent: send failed: the mail server refused it The text is back in the box.');
+  assert.ok(!kept(), 'the device lets go of it');
+  // The gateway never had the key and the mail is sent by the question:
+  // the mail takes the bubble's place.
+  ({ el, first } = await press());
+  el = await reload();
+  p = el._recheck('local-1');
+  await settle();
+  answerPreview(el, PV(), 'the preview before the question');
+  await settle();
+  take((w) => w.method === 'POST', 'the question').answer(sentMsg('late@me.example.org', 'the mail'));
+  await p;
+  await quiet(el);
+  assert.deepEqual(el._thread.layout(), ['m1', 'm2', 'm3', 'late@me.example.org']);
+  assert.ok(!kept());
+  // After a reload the question is held to the recipients of the press too.
+  ({ el, first } = await press());
+  el = await reload();
+  p = el._recheck('local-1');
+  await settle();
+  answerPreview(el, PV({ all: { to: [BOB], cc: [] } }), 'the preview before the question');
+  await p;
+  assert.equal(wire.filter((w) => w.method === 'POST').length, 0);
+  assert.equal(kept().list[0].stale, true, 'kept: the next reload does not offer the question again');
+  el = await reload();
+  assert.ok(!el._thread.node('local-1').html.includes('data-recheck'));
+  // Accounted for while the page was away — the mail is in the thread (by
+  // its Message-ID), or the server lists the send (by Message-ID or key):
+  // no bubble of the page's own, and nothing kept.
+  ({ el, first } = await press('the mail', { message_id: 'mid-1@me.example.org' }));
+  assert.equal(kept().list[0].messageId, 'mid-1@me.example.org');
+  el = await reload([...BASE, mail('mid-1@me.example.org', 'out', '2026-11-20T10:00:05Z', { author: 'user', sender: ACCT })]);
+  assert.deepEqual(el._thread.layout(), ['m1', 'm2', 'm3', 'mid-1@me.example.org']);
+  assert.equal(el._unconfirmed.length, 0);
+  assert.ok(!kept());
+  ({ el, first } = await press());
+  el = await reload(BASE, [pend('g9', { status: 'failed', outcome_unknown: true, error: 'No answer.', text: 'the mail',
+                                       request_key: first.body.request_key })]);
+  assert.deepEqual(el._thread.layout(), ['m1', 'm2', 'm3', 'P:g9'], 'the server\'s entry speaks for it');
+  assert.equal(el._unconfirmed.length, 0);
+  // A mail with the same words is not it: nothing is matched by words.
+  ({ el, first } = await press());
+  el = await reload([...BASE, mail('x@y', 'out', new Date().toISOString(), { text: 'the mail', author: 'user', sender: ACCT })]);
+  assert.ok(el._thread.layout().includes('local-1'));
+  // Dismissed: gone from the thread and from the device, also after a reload.
+  el._dismissUnconfirmed('local-1');
+  assert.ok(!kept());
+  el = await reload();
+  assert.deepEqual(el._thread.layout(), ['m1', 'm2', 'm3']);
+  // It stands in the thread where it was sent: a mail that arrived since
+  // comes after it.
+  ({ el, first } = await press());
+  const later = mail('m9', 'in', new Date(Date.now() + 5 * 60 * 1000).toISOString());
+  el = await reload([...BASE, later]);
+  assert.deepEqual(el._thread.layout(), ['m1', 'm2', 'm3', 'local-1', 'm9']);
+  // A mail with attachments cannot be asked about again (the files are not
+  // kept), nor one whose server did not echo the key, nor one from longer
+  // ago than a key is known: the ways out, no question.
+  const rec = { key: 'k'.repeat(32), text: 'kept text', mode: 'all', shown: kept().list[0].shown, at: Date.now() - 1000,
+                messageId: '', echoed: true, files: 0, stale: false };
+  const keep = (list) => store.set(KEPT, JSON.stringify({ at: Date.now(), v: { list } }));
+  for (const odd of [{ files: 2 }, { echoed: false }, { at: Date.now() - 13 * 3600 * 1000 }, { shown: '' }, { stale: true }]) {
+    keep([{ ...rec, ...odd }]);
+    el = await reload();
+    h = el._thread.node('local-1').html;
+    assert.ok(!h.includes('data-recheck') && h.includes('data-unsure-copy') && h.includes('data-unsure-dismiss'), JSON.stringify(odd));
+    assert.ok(h.includes('<span class="pend-badge">Not confirmed &mdash; this mail may have gone out</span>'), h);
+    wire.length = 0;
+    await el._recheck('local-1');
+    assert.equal(wire.length, 0, JSON.stringify(odd));
+  }
+  // What is kept is read as data: a record that is none draws nothing, and
+  // the same press is not drawn twice.
+  keep([{ ...rec, key: '../../etc' }, { ...rec, text: 7 }, { ...rec, at: 'now' }, { ...rec, at: Date.now() + 3600 * 1000 },
+        null, 'k', rec, rec]);
+  el = await reload();
+  assert.deepEqual(el._thread.layout(), ['m1', 'm2', 'm3', 'local-1']);
+  assert.ok(el._thread.node('local-1').html.includes('kept text'));
+  keep('nonsense');
+  el = await reload();
+  assert.deepEqual(el._thread.layout(), ['m1', 'm2', 'm3']);
+  // Its text is text: escaped like any bubble's.
+  keep([{ ...rec, text: '<img src=x onerror=alert(1)>' }]);
+  el = await reload();
+  h = el._thread.node('local-1').html;
+  assert.ok(h.includes('&lt;img src=x onerror=alert(1)&gt;') && !h.includes('<img'), h);
+  // The list is a record of its own, apart from the composer's: letting go
+  // of a mail as the page loads costs the box neither the words the device
+  // kept for it nor the press kept with them — they are read back after.
+  const BOX = `retinue-draft:chat:${ID}`;
+  const box = () => { const r = JSON.parse(store.get(BOX) || 'null'); return r ? r.v : null; };
+  const retry = { key: 'r'.repeat(32), text: 'unsaved words', mode: 'all', imgs: '[]', at: Date.now() - 1000, seen: 0 };
+  const keepBox = () => store.set(BOX, JSON.stringify({ at: Date.now(),
+    v: { text: 'unsaved words', version: 0, byAra: false, sending: null, retry } }));
+  const arrived = [...BASE, mail('mid-2@me.example.org', 'out', '2026-11-20T10:00:05Z', { author: 'user', sender: ACCT })];
+  keep([{ ...rec, messageId: 'mid-2@me.example.org' }]);
+  keepBox();
+  realKeep = true;
+  try {
+    el = await open({}, arrived, [], PV(), true);
+    assert.equal(el._unconfirmed.length, 0, 'the mail is in the thread');
+    assert.ok(!kept());
+    assert.equal(el._draft, 'unsaved words', 'the words the device kept are back in the box');
+    assert.equal(el._retry && el._retry.key, retry.key, 'with their press');
+    assert.equal(box().text, 'unsaved words');
+    // Nor while the chat cannot be written to: its words wait on the device.
+    keep([{ ...rec, messageId: 'mid-2@me.example.org' }]);
+    keepBox();
+    el = await open({ can_send: false, cannot_send_reason: 'The mail gateway is not connected.' }, arrived, [], PV(), true);
+    assert.equal(el._unconfirmed.length, 0);
+    assert.ok(!kept());
+    assert.deepEqual([box().text, box().retry.key], ['unsaved words', retry.key], 'untouched');
+    // And an unconfirmed mail does not make the box's record stay: nothing
+    // unsaved, nothing kept there.
+    ({ el, first } = await press());
+    assert.equal(kept().list.length, 1);
+    assert.equal(box(), null);
+  } finally {
+    realKeep = false;
+  }
+});
+
+await ok('focus on an unconfirmed bubble goes with what takes its place', async () => {
+  const start = async () => {
+    const el = await open();
+    el._restoreComposer = (t) => { el._draft = t; };
+    const p = el._sendChat('hello');
+    await settle();
+    answerPreview(el, PV(), 'the preview at the press');
+    await settle();
+    const req = take((w) => w.method === 'POST', 'the send');
+    req.answer({ unconfirmed: true, request_key: req.body.request_key }, 202);
+    await p;
+    await quiet(el);
+    el._thread.node('local-1').focus();
+    return { el, key: req.body.request_key };
+  };
+  // The server's pending entry takes over: its bubble has the focus.
+  let { el, key } = await start();
+  await poll(el, BASE, [pend('g1', { status: 'sending', text: 'hello', request_key: key })]);
+  assert.deepEqual(el._thread.layout(), ['m1', 'm2', 'm3', 'P:g1']);
+  assert.equal(globalThis.focused, el._thread.pnode('g1'), 'the bubble that took its place');
+  assert.equal(el._thread.pnode('g1').attrs.get('tabindex'), '-1');
+  // One that waits for approval: its link.
+  ({ el, key } = await start());
+  await poll(el, BASE, [pend('g2', { text: 'hello', request_key: key })]);
+  assert.equal(globalThis.focused, link(el, 'g2').children[0], 'the approval link');
+  // Focus elsewhere stays where it is.
+  ({ el, key } = await start());
+  const other = { focus() {} };
+  document.activeElement = other;
+  globalThis.focused = other;
+  await poll(el, BASE, [pend('g3', { status: 'sending', text: 'hello', request_key: key })]);
+  assert.equal(globalThis.focused, other);
+  // Check again answered with a refusal: the bubble goes, the words are in
+  // the box, and so is the focus.
+  ({ el, key } = await start());
+  const box = { focus() { globalThis.focused = box; }, matches: () => true };
+  const root = el.shadowRoot;
+  const q0 = root.querySelector;
+  root.querySelector = (s) => (s === '[data-composer="chat"] textarea' ? box : q0(s));
+  let p = el._recheck('local-1');
+  await settle();
+  answerPreview(el, PV(), 'the preview before the question');
+  await settle();
+  take((w) => w.method === 'POST', 'the question').answer({ error: 'Refused.', sent: false }, 424);
+  await p;
+  assert.equal(globalThis.focused, box, 'the composer');
+  await quiet(el);
+  // Check again answered with the mail the thread already shows: the mail.
+  ({ el, key } = await start());
+  const there = mail('real-7@me.example.org', 'out', '2026-11-20T10:00:05Z', { text: 'hello', author: 'user', sender: ACCT });
+  await poll(el, [...BASE, there], []);
+  el._thread.node('local-1').focus();
+  p = el._recheck('local-1');
+  await settle();
+  answerPreview(el, PV(), 'the preview before the question');
+  await settle();
+  take((w) => w.method === 'POST', 'the question').answer(there);
+  await p;
+  assert.deepEqual(el._thread.layout(), ['m1', 'm2', 'm3', 'real-7@me.example.org']);
+  assert.equal(globalThis.focused, el._thread.node('real-7@me.example.org'));
 });
 
 await ok('a refused mail says why, and the words come back', async () => {
@@ -1459,14 +1902,22 @@ await ok('no answer, or a 5xx, is not "not sent" — and the same press again is
     'It is back in the box &mdash; if it shows up in the thread, do not send it again.');
   assert.ok(!el._notes.some((n) => /not sent|couldn't send/i.test(n)), el._notes.join(' | '));
   // Pressed again as it is: the same request_key, so the gateway answers
-  // from the first time instead of sending a second mail.
-  req = await send(el, 'did it go?', { error: 'gateway unreachable <x>' }, 502);
+  // from the first time instead of sending a second mail. A 5xx that does
+  // not say "sent": false — a proxy between the page and the server, a
+  // crash — is no word on the mail either.
+  req = await send(el, 'did it go?', { error: 'bad gateway <x>' }, 502);
   assert.equal(req.body.request_key, key);
-  assert.equal(el._notes.at(-1), 'The server could not confirm this mail (gateway unreachable &lt;x&gt;). ' +
+  assert.equal(el._notes.at(-1), 'The server could not confirm this mail (bad gateway &lt;x&gt;). ' +
     'It is back in the box &mdash; if it shows up in the thread, do not send it again.');
   req = await send(el, 'did it go?', {}, 500);
   assert.equal(req.body.request_key, key);
   assert.ok(el._notes.at(-1).startsWith('The server could not confirm this mail (it answered 500).'));
+  // Nor is a "sent" that is not the plain boolean.
+  for (const sent of ['false', 0, null, 'no']) {
+    req = await send(el, 'did it go?', { error: 'x', sent }, 502);
+    assert.equal(req.body.request_key, key, JSON.stringify(sent));
+    assert.ok(el._notes.at(-1).startsWith('The server could not confirm this mail (x).'), JSON.stringify(sent));
+  }
   // A 200 that is no document is no word on the mail either.
   req = await send(el, 'did it go?', null, 200);
   assert.equal(req.body.request_key, key);
@@ -1490,6 +1941,311 @@ await ok('no answer, or a 5xx, is not "not sent" — and the same press again is
   req = await send(el, 'did it go? (edited)', sentMsg('s9', 'did it go? (edited)'));
   assert.equal(req.body.request_key, key3);
   assert.equal(el._retry, null, 'answered: the key is spent');
+});
+
+await ok('a send that certainly failed ends its press: "sent": false is "Not sent", and the next press is a new one', async () => {
+  // The web gateway's word that nothing went out, whatever its status: the
+  // mail server refused the mail (424), the mail gateway was never reached
+  // (502), it cannot send (503).
+  for (const [doc, status, note] of [
+    [{ error: 'send failed: SMTP send failed: (535, b"auth")', sent: false, request_key: 'KEY' }, 424,
+     'Not sent: send failed: SMTP send failed: (535, b&quot;auth&quot;)'],
+    [{ error: 'The mail gateway could not be reached (refused); nothing was sent.', sent: false }, 502,
+     'Not sent: The mail gateway could not be reached (refused); nothing was sent.'],
+    [{ error: 'the mail gateway is not configured', sent: false, request_key: 'KEY' }, 503, 'Not sent: the mail gateway is not configured'],
+    [{ sent: false }, 502, 'Not sent: the server could not send it (502).'],
+    [{}, 424, 'Not sent: the server refused it (424).'],
+  ]) {
+    const el = await open();
+    let restored = '';
+    el._restoreComposer = (t) => { restored = t; el._draft = t; };
+    let req = await send(el, 'will it go?', doc, status);
+    const key = req.body.request_key;
+    assert.equal(el._notes.at(-1), note, String(status));
+    assert.ok(!el._notes.some((n) => /could not confirm|not known/i.test(n)), el._notes.join(' | '));
+    assert.equal(restored, 'will it go?', 'the words stay in the box');
+    assert.deepEqual(el._thread.layout(), ['m1', 'm2', 'm3']);
+    assert.equal(el._retry, null, 'the press is over: its key is dropped');
+    // The mail server is back: the same words pressed again are a new
+    // attempt under a new key — not the failed one's, which a gateway
+    // would answer from its entry without trying.
+    req = await send(el, 'will it go?', sentMsg('s-after', 'will it go?'));
+    assert.match(req.body.request_key, KEY_RE);
+    assert.notEqual(req.body.request_key, key, String(status));
+    assert.deepEqual(el._thread.layout(), ['m1', 'm2', 'm3', 's-after']);
+  }
+  // Also where the failed press was itself a repeat of one never answered.
+  const el = await open();
+  el._restoreComposer = (t) => { el._draft = t; };
+  let req = await send(el, 'twice', 'offline');
+  const key = req.body.request_key;
+  req = await send(el, 'twice', { error: 'send failed: refused', sent: false, request_key: key }, 424);
+  assert.equal(req.body.request_key, key, 'the repeat went under the first key');
+  assert.equal(el._retry, null);
+  req = await send(el, 'twice', sentMsg('s-twice', 'twice'));
+  assert.notEqual(req.body.request_key, key);
+});
+
+await ok('one key per press: other words in the box, even for a moment, end the kept press', async () => {
+  // The connection dropped after the POST; the words are back with key K.
+  const start = async () => {
+    const el = await open();
+    el._keepLocal = Page.prototype._keepLocal;
+    el._restoreComposer = (t) => { el._draft = t; el._keepLocal(); };
+    const req = await send(el, 'Thanks!', 'offline');
+    assert.equal(el._retry.key, req.body.request_key);
+    return { el, key: req.body.request_key };
+  };
+  const stored = () => JSON.parse(store.get(`retinue-draft:chat:${ID}`) || 'null');
+  // The user empties the box — the mail did go out, they saw it — and later
+  // answers Ann's next mail with the same short words: a new mail.
+  let { el, key } = await start();
+  assert.equal(stored().v.retry.key, key);
+  el._draft = '';
+  await settle();
+  assert.equal(el._retry, null, 'the kept press went with its words');
+  assert.ok(!stored() || !stored().v.retry, 'on the device too');
+  el._draft = 'Thanks!';
+  await poll(el, [...BASE, mail('m4', 'in', '2026-11-20T12:00:00Z')], []);
+  let req = await send(el, 'Thanks!', sentMsg('s2', 'Thanks!'));
+  assert.notEqual(req.body.request_key, key, 'the next mail has its own key');
+  assert.deepEqual(el._thread.layout(), ['m1', 'm2', 'm3', 'm4', 's2'], 'and it is sent');
+  assert.ok(!el._notes.some((n) => n.includes('had gone out the first time')), el._notes.join(' | '));
+  // Edited and put back as it was: other words were in the box in between.
+  ({ el, key } = await start());
+  el._draft = 'Thanks!!';
+  await settle();
+  el._draft = 'Thanks!';
+  await settle();
+  req = await send(el, 'Thanks!', sentMsg('s3', 'Thanks!'));
+  assert.notEqual(req.body.request_key, key);
+  // Words appended to it (Check again's refusal, a dictation), a draft
+  // from elsewhere taking the box: the same.
+  ({ el, key } = await start());
+  el._intoComposer('more');
+  await settle();
+  assert.equal(el._retry, null);
+  // Untouched, the press is the same press — the box emptied by the press
+  // itself is no edit.
+  ({ el, key } = await start());
+  await settle();
+  el._draft = '';
+  req = await send(el, 'Thanks!', sentMsg('s4', 'Thanks!'));
+  assert.equal(req.body.request_key, key, 'the same press again');
+  // Across a reload: the device no longer holds the key either.
+  ({ el, key } = await start());
+  el._draft = 'Other words';
+  await settle();
+  el._keepLocal();
+  el = await open({}, BASE, [], PV(), true);
+  assert.equal(el._draft, 'Other words');
+  assert.equal(el._retry, null);
+});
+
+await ok('a kept press whose mail shows up in the thread is over: the key goes, and the words leave the box', async () => {
+  const now = () => new Date().toISOString();
+  const start = async (text = 'did it go?') => {
+    const el = await open();
+    el._restoreComposer = (t) => { el._draft = t; };
+    el._spent = [];
+    el._saveDraft = () => { el._spent.push(el._draft); };
+    el._undos = [];
+    el._setUndo = (u) => { el._undos.push(u); };
+    const req = await send(el, text, 'offline');
+    assert.equal(el._draft, text);
+    return { el, key: req.body.request_key };
+  };
+  // The mail did go out: a poll shows it, sent by the user, at the press.
+  let { el, key } = await start();
+  const went = mail('went@me.example.org', 'out', now(), { text: 'did it go?', author: 'user', sender: ACCT });
+  await poll(el, [...BASE, went], []);
+  assert.equal(el._retry, null, 'its outcome is known: the key is dropped');
+  assert.equal(el._draft, '', 'the words are out of the box — one press would have sent them twice');
+  assert.deepEqual(el._spent, [''], 'and out of the shared draft');
+  assert.deepEqual(el._undos.at(-1), { text: 'did it go?', byAra: false }, 'offered back, as after a clear');
+  assert.equal(el._notes.at(-1), 'That mail is in the thread after all, so it was taken out of the box &mdash; it is not sent twice.');
+  // Typed again, the same words are a new mail.
+  let req = await send(el, 'did it go?', sentMsg('s5', 'did it go?'));
+  assert.notEqual(req.body.request_key, key);
+  // Not a mail from before the press, not somebody else's, not other words.
+  for (const other of [
+    mail('old@me.example.org', 'out', new Date(Date.now() - 3600 * 1000).toISOString(), { text: 'did it go?', author: 'user', sender: ACCT }),
+    mail('in@x.org', 'in', now(), { text: 'did it go?' }),
+    mail('else@me.example.org', 'out', now(), { text: 'did it go? yes', author: 'user', sender: ACCT }),
+  ]) {
+    ({ el, key } = await start());
+    await poll(el, [...BASE, other], []);
+    assert.equal(el._retry.key, key, other.id);
+    assert.equal(el._draft, 'did it go?', other.id);
+  }
+  // The server lists the send under the press's key (it waits for approval,
+  // is being sent, failed): that entry is the press, whatever its words.
+  for (const extra of [{}, { status: 'sending' }, { status: 'failed', outcome_unknown: true, error: 'No answer.' }]) {
+    ({ el, key } = await start());
+    await poll(el, BASE, [pend('q7', { text: 'did it go? (as the gateway trimmed it)', request_key: key, ...extra })]);
+    assert.equal(el._retry, null, JSON.stringify(extra));
+    assert.equal(el._draft, '', JSON.stringify(extra));
+    assert.deepEqual(el._thread.layout(), ['m1', 'm2', 'm3', 'P:q7']);
+  }
+  // But an entry that failed for certain is the server's word that the
+  // press did NOT go (the gateway was stopped before the mail was handed
+  // over): the press is over and its key with it, and the words stay in the
+  // box — they were not sent, and the next press is a new mail.
+  ({ el, key } = await start());
+  await poll(el, BASE, [pend('q9', { text: 'did it go?', request_key: key, status: 'failed',
+                                    error: 'the gateway was stopped before this mail was handed to the mail server; it was not sent <b>' })]);
+  assert.equal(el._retry, null);
+  assert.equal(el._draft, 'did it go?', 'nothing is taken out of the box');
+  assert.deepEqual([el._spent, el._undos], [[], []]);
+  assert.equal(el._notes.at(-1), 'Not sent: the gateway was stopped before this mail was handed to the mail server; ' +
+    'it was not sent &lt;b&gt; The words are still in the box.');
+  assert.ok(!el._notes.some((n) => n.includes('in the thread after all')), el._notes.join(' | '));
+  assert.deepEqual(el._thread.layout(), ['m1', 'm2', 'm3', 'P:q9'], 'the failed send says why, in the thread');
+  req = await send(el, 'did it go?', sentMsg('s6', 'did it go?'));
+  assert.notEqual(req.body.request_key, key, 'a new attempt, under a new key');
+  // An entry the gateway only keeps to remember the key (`dismissed`) is
+  // none: it settles nothing.
+  ({ el, key } = await start());
+  await poll(el, BASE, [pend('q10', { text: 'did it go?', request_key: key, status: 'failed', dismissed: true, error: 'x' })]);
+  assert.equal(el._retry.key, key);
+  assert.equal(el._draft, 'did it go?');
+  assert.deepEqual(el._thread.layout(), ['m1', 'm2', 'm3']);
+  // Another press's entry is not this one's.
+  ({ el, key } = await start());
+  await poll(el, BASE, [pend('q8', { text: 'something else', request_key: 'another-press-key-0000' })]);
+  assert.equal(el._retry.key, key);
+  // A poll that came back while the press was out showed the mail already:
+  // the answer that never came does not leave the words armed in the box.
+  el = await open();
+  el._restoreComposer = (t) => { el._draft = t; };
+  el._saveDraft = () => {};
+  el._setUndo = () => {};
+  const flying = el._sendChat('quick one');
+  await settle();
+  answerPreview(el, PV(), 'the preview at the press');
+  await settle();
+  const out = take((w) => w.method === 'POST', 'the send');
+  await poll(el, [...BASE, mail('quick@me.example.org', 'out', now(), { text: 'quick one', author: 'user', sender: ACCT })], []);
+  out.fail();
+  await flying;
+  await quiet(el);
+  assert.equal(el._retry, null);
+  assert.equal(el._draft, '');
+  assert.equal(el._notes.at(-1), 'That mail is in the thread after all, so it was taken out of the box &mdash; it is not sent twice.');
+  // The words were changed meanwhile: nothing is taken out of the box.
+  ({ el, key } = await start());
+  el._draft = 'did it go? — and one more thing';
+  await poll(el, [...BASE, went], []);
+  assert.equal(el._retry, null);
+  assert.equal(el._draft, 'did it go? — and one more thing');
+  assert.deepEqual(el._spent, []);
+  // On a reload the chat is asked the same: the mail is there, the words
+  // do not come back armed.
+  el = await open();
+  el._keepLocal = Page.prototype._keepLocal;
+  el._restoreComposer = (t) => { el._draft = t; el._keepLocal(); };
+  req = await send(el, 'kept, and sent', 'offline');
+  assert.equal(JSON.parse(store.get(`retinue-draft:chat:${ID}`)).v.retry.key, req.body.request_key);
+  const there = mail('there@me.example.org', 'out', now(), { text: 'kept, and sent', author: 'user', sender: ACCT });
+  const spent = [];
+  const realSave = Page.prototype._saveDraft;
+  Page.prototype._saveDraft = function () { spent.push(this._draft); };
+  try {
+    el = await open({}, [...BASE, there], [], PV(), true);
+  } finally {
+    Page.prototype._saveDraft = realSave;
+  }
+  assert.equal(el._retry, null);
+  assert.deepEqual(spent, [''], 'the box was emptied');
+});
+
+await ok('a dismissed entry is over: no bubble, and one on screen leaves', async () => {
+  // The gateway keeps a dismissed send for a day so that its key stays
+  // known, and answers for it by id as {status: error, dismissed: true}.
+  // Whoever passes such an entry on, the page does not draw it as failed.
+  const gone = pend('d1', { status: 'failed', dismissed: true, error: 'SMTP send failed: (535) auth', text: 'old words' });
+  let el = await open({}, BASE, [gone, pend('q1')]);
+  assert.deepEqual(el._thread.layout(), ['m1', 'm2', 'm3', 'P:q1'], 'on a load');
+  assert.deepEqual(el._pending.map((x) => x.p.request_id), ['q1']);
+  await poll(el, BASE, [gone, pend('q1')]);
+  assert.deepEqual(el._thread.layout(), ['m1', 'm2', 'm3', 'P:q1'], 'on a poll');
+  // A failed send on screen that the next answer marks dismissed (another
+  // device dismissed it) leaves like one no longer listed.
+  el = await open({}, BASE, [pend('d2', { status: 'failed', error: 'refused' })]);
+  assert.deepEqual(el._thread.layout(), ['m1', 'm2', 'm3', 'P:d2']);
+  await poll(el, BASE, [pend('d2', { status: 'failed', error: 'refused', dismissed: true })]);
+  assert.deepEqual(el._thread.layout(), ['m1', 'm2', 'm3']);
+  // Only the plain boolean is that word.
+  await poll(el, BASE, [pend('d3', { status: 'failed', error: 'refused', dismissed: 'no' })]);
+  assert.deepEqual(el._thread.layout(), ['m1', 'm2', 'm3', 'P:d3']);
+  // An unconfirmed mail of the page's own is not handed over to it either.
+  el = await open();
+  el._restoreComposer = (t) => { el._draft = t; };
+  const p = el._sendChat('the mail');
+  await settle();
+  answerPreview(el, PV(), 'the preview at the press');
+  await settle();
+  const req = take((w) => w.method === 'POST', 'the send');
+  req.answer({ unconfirmed: true, request_key: req.body.request_key }, 202);
+  await p;
+  await quiet(el);
+  await poll(el, BASE, [pend('d4', { status: 'failed', dismissed: true, request_key: req.body.request_key, text: 'the mail' })]);
+  assert.deepEqual(el._thread.layout(), ['m1', 'm2', 'm3', 'local-1'], 'its own bubble stays, with its question');
+});
+
+await ok('a poll does not draw a second bubble for the press that is on its way', async () => {
+  const el = await open();
+  const p = el._sendChat('slow one');
+  await settle();
+  answerPreview(el, PV(), 'the preview at the press');
+  await settle();
+  const req = take((w) => w.method === 'POST', 'the send');
+  const key = req.body.request_key;
+  assert.deepEqual(el._thread.layout(), ['m1', 'm2', 'm3', 'local-1']);
+  // The gateway lists the mail while it is with the mail server.
+  const flying = pend('f1', { status: 'sending', text: 'slow one', request_key: key });
+  await poll(el, BASE, [flying, pend('q1')]);
+  assert.deepEqual(el._thread.layout(), ['m1', 'm2', 'm3', 'local-1', 'P:q1'], 'one bubble for the press; other sends as ever');
+  assert.deepEqual(el._pending.map((x) => x.p.request_id), ['q1']);
+  // The mail server then refuses it: "Not sent", the words back — and no
+  // failed bubble for words that are in the box.
+  el._restoreComposer = (t) => { el._draft = t; };
+  req.answer({ error: 'send failed: (535) auth', sent: false, request_key: key }, 424);
+  await p;
+  await quiet(el);
+  assert.equal(el._notes.at(-1), 'Not sent: send failed: (535) auth');
+  await poll(el, BASE, [pend('q1')]);
+  assert.deepEqual(el._thread.layout(), ['m1', 'm2', 'm3', 'P:q1']);
+  // Sent: the mail takes the optimistic bubble's place, and a list that
+  // still lags does not add the entry beside it.
+  const b = await open();
+  const pb = b._sendChat('slow two');
+  await settle();
+  answerPreview(b, PV(), 'the preview at the press');
+  await settle();
+  const rb = take((w) => w.method === 'POST', 'the send');
+  const lag = pend('f2', { status: 'sending', text: 'slow two', request_key: rb.body.request_key, message_id: 's-two' });
+  await poll(b, BASE, [lag]);
+  rb.answer(sentMsg('s-two', 'slow two'));
+  await pb;
+  await quiet(b);
+  await poll(b, [...BASE, sentMsg('s-two', 'slow two')], [lag]);
+  assert.deepEqual(b._thread.layout(), ['m1', 'm2', 'm3', 's-two']);
+  // Unconfirmed: once the answer is in, the server's entry takes over.
+  const c = await open();
+  const pc = c._sendChat('slow three');
+  await settle();
+  answerPreview(c, PV(), 'the preview at the press');
+  await settle();
+  const rc = take((w) => w.method === 'POST', 'the send');
+  const mine = pend('f3', { status: 'sending', text: 'slow three', request_key: rc.body.request_key });
+  await poll(c, BASE, [mine]);
+  assert.deepEqual(c._thread.layout(), ['m1', 'm2', 'm3', 'local-1']);
+  rc.answer({ unconfirmed: true, request_key: rc.body.request_key }, 202);
+  await pc;
+  await quiet(c);
+  await poll(c, BASE, [mine]);
+  assert.deepEqual(c._thread.layout(), ['m1', 'm2', 'm3', 'P:f3']);
 });
 
 await ok('a mail that never left the page is simply not sent', async () => {
@@ -1519,7 +2275,7 @@ await ok('the key stays with the words across a reload', async () => {
   const key = req.body.request_key;
   const kept = JSON.parse(store.get(`retinue-draft:chat:${ID}`)).v;
   assert.ok(Math.abs(Date.now() - kept.retry.at) < 60000);
-  assert.deepEqual({ ...kept.retry, at: 0 }, { key, text: 'kept words', mode: 'sender', imgs: '[]', at: 0 });
+  assert.deepEqual({ ...kept.retry, at: 0 }, { key, text: 'kept words', mode: 'sender', imgs: '[]', at: 0, seen: 0 });
   // The words reach the server's draft; the press is kept all the same.
   el._draftSaved = 'kept words';
   el._keepLocal();
@@ -1554,10 +2310,16 @@ await ok('the key stays with the words across a reload', async () => {
   // one from long ago — the same words typed then are a mail of their own,
   // which the gateway must not take for the old one.
   const keep = (retry) => store.set(`retinue-draft:chat:${ID}`, JSON.stringify({ at: Date.now(), v: { text: 'x', version: 0, retry } }));
-  const good = { key: 'k'.repeat(32), text: 'x', mode: 'all', imgs: '[]', at: Date.now() - 60 * 1000 };
+  const good = { key: 'k'.repeat(32), text: 'x', mode: 'all', imgs: '[]', at: Date.now() - 60 * 1000, seen: 0 };
   keep(good);
   el = await open({}, BASE, [], PV(), true);
   assert.deepEqual(el._retry, good);
+  // A press is kept with its words only: where the box comes back holding
+  // others — the server's draft moved on since — it is a press no longer.
+  keep(good);
+  el = await open({ draft: { text: 'written elsewhere since', version: 9, author: 'user' } }, BASE, [], PV(), true);
+  assert.equal(el._draft, 'written elsewhere since');
+  assert.equal(el._retry, null, 'the kept press is not carried to other words');
   for (const bad of [{ ...good, key: '../../etc' }, { ...good, text: 7 }, { ...good, at: Date.now() - 13 * 3600 * 1000 },
                      { ...good, at: 'now' }, { ...good, at: Date.now() + 3600 * 1000 }, 'k', null]) {
     keep(bad);
@@ -2095,6 +2857,18 @@ await ok('a refusal is shown in place; an answer that leaves it open is never "n
     [{}, 409, 'Not sent: the server refused the request (409).'],
     [{}, 503, 'The server could not confirm this mail (it answered 503). If it shows up in the chat list, do not send it again.'],
     [{ error: 'gateway unreachable' }, 502, 'The server could not confirm this mail (gateway unreachable). If it shows up in the chat list, do not send it again.'],
+    // The server's word that nothing went out, whatever its status: the mail
+    // server refused the mail (424), the mail gateway was never reached
+    // (502), it cannot send (503). Only the plain boolean is that word.
+    [{ error: 'send failed: SMTP send failed: (451) try later', sent: false, request_key: 'K' }, 424,
+     'Not sent: send failed: SMTP send failed: (451) try later'],
+    [{ sent: false }, 424, 'Not sent: the server refused the request (424).'],
+    [{ error: 'The mail gateway could not be reached; nothing was sent.', sent: false }, 502,
+     'Not sent: The mail gateway could not be reached; nothing was sent.'],
+    [{ error: 'the mail gateway is not configured', sent: false, request_key: 'K' }, 503, 'Not sent: the mail gateway is not configured'],
+    [{ sent: false }, 502, 'Not sent: the server could not send it (502).'],
+    [{ error: 'x', sent: 'false' }, 502, 'The server could not confirm this mail (x). If it shows up in the chat list, do not send it again.'],
+    [{ error: 'x', sent: 0 }, 503, 'The server could not confirm this mail (x). If it shows up in the chat list, do not send it again.'],
     [{ message: {} }, 200, 'The server did not say where the new chat is — look for it in the chat list.'],
     [{ unconfirmed: true }, 202, 'The mail was handed over, but it is not confirmed yet that it went out. Look for it in the chat list before you send it again.'],
     [null, 0, 'No answer came back, so it is not known whether the mail went out. If it shows up in the chat list, do not send it again.'],
@@ -2114,10 +2888,13 @@ await ok('a refusal is shown in place; an answer that leaves it open is never "n
     assert.deepEqual(el._chips.to.map((r) => r.address), ['ann@example.com']);
     assert.equal(el._text, 'Hello');
     assert.deepEqual(assigned, []);
-    // Only the server's own refusal says "not sent"; only then is the next
-    // press a new one.
-    const open = !(status >= 400 && status < 500);
+    // Only the server's word that nothing went out — its own refusal, or
+    // an answer that says "sent": false — reads "not sent"; then, and only
+    // then, the press is over and the next one is a new one. A failed key
+    // pressed again would be answered from the failure without a try.
+    const open = !((status >= 400 && status < 500) || (!!doc && doc.sent === false));
     assert.equal(/^Not sent/.test(said), !open, said);
+    assert.equal(kept().press === null, !open, `${status}: the press kept with the mail`);
     const p2 = el._submit();
     const req2 = take((w) => w.method === 'POST', 'the compose again');
     assert.equal(req2.body.request_key === req.body.request_key, open, `${status}: the same press again keeps its key`);
@@ -2276,6 +3053,119 @@ await ok('a kept mail belongs to its mailbox and never changes sender unseen', a
   await el._submit();
   assert.equal(wire.filter((w) => w.method === 'POST').length, 0);
   assert.equal(q(root, '[data-err="form"]').textContent, 'Choose the mailbox this mail leaves from.');
+});
+
+await ok('a mail kept for another mailbox is not forgotten once a different one is written from', async () => {
+  const WORK = 'work@example.com';
+  const PRIV = 'me@example.org';
+  const BOTH = { ...TWO, accounts: [WORK, PRIV] };
+  const ONLY_WORK = { ...ONE, accounts: [WORK] };
+  const INDEX = 'retinue-draft:compose:email';
+  const index = () => (store.has(INDEX) ? JSON.parse(store.get(INDEX)).v : null);
+  const pick = (root, account) => { const a = q(root, '[data-account]'); a.value = account; root.fire('change', a); };
+  const WAITS = 'A mail you started from me@example.org is kept. It comes back when that mailbox can send again.';
+  const THERE = 'A mail you started from me@example.org is kept. Choose that mailbox under From to go on with it.';
+  // A mail started from the private mailbox; then that mailbox is away.
+  const parkPrivate = () => {
+    const { el, root } = openSheet(BOTH);
+    pick(root, PRIV);
+    write(root, 'ann@example.com,', 'A private matter');
+    el.close();
+    const away = openSheet(ONLY_WORK, true);
+    assert.ok(away.root.innerHTML.includes(WAITS));
+    return away;
+  };
+  // A work mail is written and SENT meanwhile. The private mailbox is still
+  // away: the sheet still says that its mail waits …
+  let { el, root } = parkPrivate();
+  write(root, 'bob@builder.example,', 'Work');
+  let p = el._submit();
+  take((w) => w.method === 'POST', 'the compose').answer({ id: 'email:~work@example.com:n1@work.example.com', message: {} });
+  await p;
+  assert.deepEqual(index(), { account: WORK, waiting: [PRIV] }, 'the index still knows who holds a mail');
+  ({ el, root } = openSheet(ONLY_WORK, true));
+  assert.equal(el._account, WORK);
+  assert.equal(el._text, '');
+  assert.ok(root.innerHTML.includes(WAITS), 'said again, every time');
+  el.close();
+  // … and once it can send again, its mail comes back, as the sheet said it
+  // would: the sheet opens on it, from the mailbox it was written from.
+  ({ el, root } = openSheet(BOTH, true));
+  assert.equal(el._account, PRIV);
+  assert.equal(el._text, 'A private matter');
+  assert.deepEqual(el._chips.to.map((r) => r.address), ['ann@example.com']);
+  assert.ok(root.innerHTML.includes('The mail you started earlier is back.'));
+  assert.ok(root.innerHTML.includes(`<option value="${PRIV}" selected>`));
+  assert.ok(!root.innerHTML.includes('is kept.'), 'nothing waits elsewhere');
+  p = el._submit();
+  const sent = take((w) => w.method === 'POST', 'the compose');
+  assert.equal(sent.body.account, PRIV, 'and leaves from it');
+  sent.answer({ id: 'email:~me@example.org:n2@me.example.org', message: {} });
+  await p;
+  // Sent: nothing waits any more, and nothing is said.
+  ({ el, root } = openSheet(BOTH, true));
+  assert.ok(!root.innerHTML.includes('is kept.') && !root.innerHTML.includes('is back.'));
+  assert.equal(el._text, '');
+  el.close();
+  // A work mail only STARTED meanwhile: the sheet opens on it, the mailbox
+  // written from last — and says where the other mail is and how to get to
+  // it, the mailbox being on offer.
+  ({ el, root } = parkPrivate());
+  write(root, 'bob@builder.example,', 'Work in progress');
+  el.close();
+  assert.deepEqual(index(), { account: WORK, waiting: [PRIV] });
+  ({ el, root } = openSheet(BOTH, true));
+  assert.equal(el._account, WORK);
+  assert.equal(el._text, 'Work in progress');
+  assert.ok(root.innerHTML.includes(THERE), root.innerHTML.slice(0, 1200));
+  assert.ok(!root.innerHTML.includes(WAITS));
+  // Chosen under From, it comes back; the work mail is the one kept now.
+  pick(root, PRIV);
+  assert.equal(el._text, 'A private matter');
+  assert.deepEqual(index(), { account: PRIV, waiting: [WORK] });
+  assert.ok(el.shadowRoot.innerHTML.includes('A mail you started from work@example.com is kept. Choose that mailbox under From to go on with it.'));
+  // Discarded: it is no longer waiting anywhere, and the next opening goes
+  // to the mail that is.
+  el._discard();
+  el.close();
+  ({ el, root } = openSheet(BOTH, true));
+  assert.equal(el._account, WORK);
+  assert.equal(el._text, 'Work in progress');
+  assert.ok(!root.innerHTML.includes('is kept.'));
+  assert.deepEqual(index(), { account: PRIV, waiting: [WORK] }, 'the index is pruned, not rewritten: nothing was written');
+  // Opening is not writing: the mailbox written from last stays that one
+  // while it is away, and the sheet is back on it once it is offered again.
+  ({ el, root } = openSheet(BOTH));
+  pick(root, PRIV);
+  write(root, 'ann@example.com,', 'From my own address');
+  p = el._submit();
+  take((w) => w.method === 'POST', 'the compose').answer({ id: 'email:~me@example.org:n3@me.example.org', message: {} });
+  await p;
+  ({ el, root } = openSheet(ONLY_WORK, true));
+  assert.equal(el._account, WORK);
+  el.close();
+  assert.deepEqual(index(), { account: PRIV, waiting: [] });
+  ({ el, root } = openSheet(BOTH, true));
+  assert.equal(el._account, PRIV);
+  el.close();
+  // What the device holds is read as data: names that are none are dropped,
+  // one is not listed twice, and a name is text.
+  const EVIL = 'a"><img src=x onerror=alert(1)>@x.org';
+  const slot = (a) => store.set(`retinue-draft:compose:email:${a.toLowerCase()}`, JSON.stringify({ at: Date.now(),
+    v: { to: [{ address: 'ann@example.com' }], cc: [], typed: { to: '', cc: '' }, subject: '', text: 'kept', account: a } }));
+  store.clear();
+  slot(PRIV);
+  slot(EVIL);
+  store.set(INDEX, JSON.stringify({ at: Date.now(),
+    v: { account: WORK, waiting: [PRIV, PRIV.toUpperCase(), 7, null, '', 'x'.repeat(300), 'empty@example.org', EVIL] } }));
+  ({ el, root } = openSheet(ONLY_WORK, true));
+  assert.deepEqual(el._parked, [PRIV, EVIL]);
+  assert.equal(root.innerHTML.split(WAITS).length - 1, 1, 'named once');
+  assert.ok(root.innerHTML.includes('a&quot;&gt;&lt;img src=x onerror=alert(1)&gt;@x.org'));
+  assert.ok(!root.innerHTML.includes('<img'));
+  store.set(INDEX, JSON.stringify({ at: Date.now(), v: { account: WORK, waiting: 'me@example.org' } }));
+  ({ el, root } = openSheet(ONLY_WORK, true));
+  assert.deepEqual(el._parked, []);
 });
 
 console.log(`${passed} checks passed`);

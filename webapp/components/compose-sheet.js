@@ -26,11 +26,15 @@
 // One press is one mail. A press mints a `request_key` and holds the Send
 // button until it is answered — closing the sheet and opening it again
 // brings back the same sheet, still sending, never a second Send for the
-// same mail. Where the answer leaves open whether the mail went out (202
-// `{unconfirmed}`, a 5xx, no answer at all) the sheet says exactly that,
-// never "not sent", and the press stays with the mail (also on the device):
-// sent again unchanged it goes out under the same key, which the gateway
-// answers from the first time instead of sending twice.
+// same mail. The server's word that nothing went out — any 4xx, and any
+// answer that says `"sent": false` (the mail server refused the mail, the
+// gateway was never reached) — is "Not sent": the press is over, and the
+// next one is a new attempt under a new key. Where the answer leaves open
+// whether the mail went out (202 `{unconfirmed}`, a 5xx that does not say
+// so, no answer at all) the sheet says exactly that, never "not sent", and
+// the press stays with the mail (also on the device): sent again unchanged
+// it goes out under the same key, which the gateway answers from the first
+// time instead of sending twice.
 //
 // The sheet is a modal dialog: the page behind it is inert while it is open,
 // focus starts in To and stays inside (Tab wraps), Escape closes it (a first
@@ -40,7 +44,10 @@
 // send that went through drops it. The kept mail belongs to the mailbox it
 // was started from (`compose:<channel>:<mailbox>`): it comes back only into
 // a sheet writing from that mailbox, and never moves to another one unless
-// the user picks that one under From.
+// the user picks that one under From. A mail kept for another mailbox than
+// the one the sheet writes from is not forgotten: the sheet remembers which
+// mailboxes hold one, says so each time it opens, and opens on such a
+// mailbox when the one last written from has nothing waiting.
 //
 // Everything a field holds is the user's own input, an address book entry or
 // the server's error line: all of it is escaped as text, and none of it ever
@@ -63,6 +70,8 @@ const MAX_RECIPIENTS = 50;
 const ADDRESS_MAX = 254;
 const FIELDS = ['to', 'cc'];
 const REQUEST_KEY_RE = /^[A-Za-z0-9_-]{16,64}$/;
+// How many other mailboxes with a kept mail the sheet remembers.
+const MAX_PARKED = 20;
 
 // An opaque token for one press of Send (see chat-page.js, newRequestKey).
 function newRequestKey() {
@@ -177,7 +186,11 @@ class RetinueComposeSheet extends HTMLElement {
     // made. The same request again goes out under the same key.
     this._press = null;
     this._restored = false;    // the sheet opened on what an earlier one kept
-    this._waiting = '';        // a mailbox not offered now that has a mail kept
+    // The other mailboxes that hold a kept mail (`_parked`, kept in the
+    // index so the next opening knows of them), and of those the ones not
+    // offered now (`_waiting`).
+    this._parked = [];
+    this._waiting = [];
     this._moved = '';          // the mailbox the form was just switched away from
     // The open suggestion list: which field it belongs to, its entries and
     // the one the arrow keys are on (-1: none).
@@ -201,9 +214,15 @@ class RetinueComposeSheet extends HTMLElement {
   }
 
   // Where things are kept on the device. One mail per mailbox, under
-  // `compose:<channel>:<mailbox>`; and under `compose:<channel>` which
-  // mailbox was written from last, so the sheet opens on it again.
+  // `compose:<channel>:<mailbox>`; and under `compose:<channel>` the index
+  // `{account, waiting}`: which mailbox was written from last, so the sheet
+  // opens on it again, and which others hold a kept mail, so none of them
+  // drops out of sight once another mailbox is written from.
   get _indexKey() { return `compose:${(this._offer && this._offer.channel) || ''}`; }
+
+  _saveIndex() {
+    saveDraft(this._indexKey, { account: this._account, waiting: this._parked });
+  }
 
   _slotKey(account) { return `${this._indexKey}:${String(account || '').toLowerCase()}`; }
 
@@ -231,17 +250,36 @@ class RetinueComposeSheet extends HTMLElement {
     this._errors = {};
     this._done = false;
     this._closeSugg(false);
-    // The mailbox written from last, where it can be written from now.
+    // The mailboxes that hold a kept mail: the one written from last and
+    // those the index remembers beside it — each asked for its slot, since
+    // a mail may have been sent or discarded since.
     const index = loadDraft(this._indexKey);
     const last = index && typeof index.account === 'string' ? index.account : '';
-    this._account = accounts.includes(last) ? last : (accounts[0] || '');
+    const known = [last].concat(index && Array.isArray(index.waiting) ? index.waiting : [])
+      .filter((a) => typeof a === 'string' && a && a.length <= ADDRESS_MAX).slice(0, MAX_PARKED + 1);
+    const holding = known.filter((a, i) => known.findIndex((b) => b.toLowerCase() === a.toLowerCase()) === i
+      && loadDraft(this._slotKey(a)));
+    // The mailbox written from last, where it can be written from now and
+    // has something waiting; else one that can and has (a mail kept while
+    // its mailbox could not send comes back when it can again); else the
+    // one written from last, or the first on offer.
+    const offered = (a) => accounts.includes(a);
+    this._account = holding.find(offered) || (offered(last) ? last : (accounts[0] || ''));
     // What an earlier sheet kept for this mailbox comes back — into this
-    // mailbox only. A mail kept for one that is not offered now stays where
-    // it is and waits for it: it is never taken into another mailbox, where
-    // one press would send it from the wrong address.
+    // mailbox only. A mail kept for another one stays where it is: it is
+    // never taken into this mailbox, where one press would send it from
+    // the wrong address — and the sheet says that it is there.
     this._loadKept();
-    this._waiting = last && last !== this._account && !accounts.includes(last) && loadDraft(this._slotKey(last))
-      ? last : '';
+    this._parked = holding.filter((a) => a.toLowerCase() !== this._account.toLowerCase());
+    this._waiting = this._parked.filter((a) => !offered(a));
+    // The index is told what was found — a mailbox whose mail was sent or
+    // discarded since holds none any more — but not that anything was
+    // written: the mailbox written from last stays that one, also while it
+    // is not offered, until the user writes from another (_saveLocal).
+    if (index) {
+      const from = last || this._account;
+      saveDraft(this._indexKey, { account: from, waiting: holding.filter((a) => a.toLowerCase() !== from.toLowerCase()) });
+    }
     this._show();
   }
 
@@ -289,9 +327,11 @@ class RetinueComposeSheet extends HTMLElement {
     if (!this._offer || this._busy || next === this._account || !this._offer.accounts.includes(next)) return;
     const from = this._account;
     const theirs = loadDraft(this._slotKey(next));
+    const not = (a) => (b) => b.toLowerCase() !== a.toLowerCase();
     if (!this._empty() && !theirs) {
       saveDraft(this._slotKey(from), null);
       this._account = next;
+      this._parked = this._parked.filter(not(next));
       this._saveLocal();
       return;
     }
@@ -301,7 +341,11 @@ class RetinueComposeSheet extends HTMLElement {
     this._errors = {};
     this._closeSugg(false);
     this._loadKept();
-    saveDraft(this._indexKey, { account: next });
+    // The mailbox left holds a mail now, if the form held one; the one
+    // chosen has given its mail to the form.
+    this._parked = this._parked.filter(not(next)).filter(not(from)).concat(mine ? [from] : []).slice(-MAX_PARKED);
+    this._waiting = this._parked.filter((a) => !this._offer.accounts.includes(a));
+    this._saveIndex();
     this._moved = mine ? from : '';
     this._render();
     this._moved = '';
@@ -337,7 +381,7 @@ class RetinueComposeSheet extends HTMLElement {
       to: this._chips.to, cc: this._chips.cc, typed: { ...this._typed },
       subject: this._subject, text: this._text, account: this._account, press: this._press,
     });
-    saveDraft(this._indexKey, { account: this._account });
+    this._saveIndex();
   }
 
   // The page behind a modal is out of reach: every other child of the body
@@ -388,9 +432,13 @@ class RetinueComposeSheet extends HTMLElement {
         (this._press ? ' It was being sent when this sheet was last open, and it is not confirmed ' +
           'whether it went out: look in the chat list before you send it again.' : '') + '</p>';
     }
-    if (this._waiting) {
-      restored += `<p class="note" role="status">A mail you started from ${esc(this._waiting)} is kept. ` +
-        'It comes back when that mailbox can send again.</p>';
+    // The mails kept for other mailboxes, each named: one whose mailbox is
+    // not offered now waits for it; one whose mailbox is, is a choice under
+    // From away.
+    for (const a of this._parked) {
+      restored += `<p class="note" role="status">A mail you started from ${esc(a)} is kept. ` +
+        (this._waiting.includes(a) ? 'It comes back when that mailbox can send again.'
+          : 'Choose that mailbox under From to go on with it.') + '</p>';
     }
     this.shadowRoot.innerHTML = `<style>${CSS}</style>` +
       `<div class="overlay" data-overlay>` +
@@ -821,11 +869,13 @@ class RetinueComposeSheet extends HTMLElement {
   //  - 200 / 202 with the new chat's id: sent, queued, or handed over and
   //    not confirmed yet — the chat is where the mail now lives and says
   //    which (its message, its pending bubble); the kept mail is dropped;
-  //  - 4xx: the server's refusal, shown with its sentence. Nothing went out;
-  //  - anything else (202 `{unconfirmed}` without a chat, a 5xx, no answer):
-  //    it is not known whether the mail went out, and the sheet says so. The
-  //    press stays with the mail: unchanged, it goes out again under the
-  //    same key.
+  //  - 4xx, or any answer that says `"sent": false`: the server's word that
+  //    nothing went out, shown with its sentence. The press is over — the
+  //    next one is a new attempt, under a new key;
+  //  - anything else (202 `{unconfirmed}` without a chat, a 5xx that does
+  //    not say so, no answer): it is not known whether the mail went out,
+  //    and the sheet says so. The press stays with the mail: unchanged, it
+  //    goes out again under the same key.
   // An answer that is not a success comes to a sheet that was closed
   // meanwhile by opening it again: a mail that did not verifiably go out is
   // not left unsaid.
@@ -894,10 +944,15 @@ class RetinueComposeSheet extends HTMLElement {
             : ' before you send it again.');
       } else if (res.ok) {
         error = 'The server did not say where the new chat is — look for it in the chat list.';
-      } else if (res.status >= 400 && res.status < 500) {
-        // Refused: nothing went out, and the next press is a new one.
+      } else if ((res.status >= 400 && res.status < 500) || (doc && typeof doc === 'object' && doc.sent === false)) {
+        // The server's word that nothing went out — its own refusal, or an
+        // answer that says so ("sent": false: the mail server refused the
+        // mail, the gateway was never reached). The press is over, and the
+        // next one is a new one: a key that failed is not pressed again.
         this._press = null;
-        error = said ? `Not sent: ${said}` : `Not sent: the server refused the request${res.status === 403 ? '' : ` (${res.status})`}.`;
+        error = said ? `Not sent: ${said}`
+          : (res.status >= 500 ? `Not sent: the server could not send it (${res.status}).`
+            : `Not sent: the server refused the request${res.status === 403 ? '' : ` (${res.status})`}.`);
       } else {
         error = `The server could not confirm this mail (${said || `it answered ${res.status}`}). ` +
           'If it shows up in the chat list, do not send it again.';
