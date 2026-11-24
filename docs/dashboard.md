@@ -1111,8 +1111,11 @@ card nor moves what the profile learned under their name.
 
 **A mail pushes nothing by default**: an unjudged mail is passive — listed,
 never pushed, in no digest — whether the thread is one-to-one or not
-(`attention_store.CHANNEL_DEFAULT_IMPORTANCE`); a person's prior says
-otherwise.
+(`attention_store.CHANNEL_DEFAULT_IMPORTANCE`); from the gate phase on
+(docs/mail-chats.md, "The gate") a person's prior or VIP flag says otherwise.
+While the mirror is read-only every mail arrives held (the mail gateway's
+`MIRROR_GATE`, `forward: false`), so none pushes, starts a turn or arrives in
+attention, whatever the prior.
 
 **The home list.** A mail chat is an attention item **while it holds unread
 mail the user has not settled** — one rule, whether or not the chat has an

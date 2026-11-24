@@ -11077,8 +11077,10 @@ def _chat_push_notification(chat_id: str, doc: dict, entry: dict,
     if _is_mail(channel):
         # A mail's notification reads as a mail client's does: who, then the
         # subject and the text. (Nothing pushes a mail by default — see
-        # attention_store.CHANNEL_DEFAULT_IMPORTANCE — so this is a VIP's, or
-        # one the user's rules let through.)
+        # attention_store.CHANNEL_DEFAULT_IMPORTANCE. While the mirror is
+        # read-only no mail reaches this point at all: every mail arrives
+        # held. From the gate phase on it is a VIP's, or one the user's
+        # rules let through.)
         peer = _mail_people(doc, _AddressBook())["peer"] or {}
         if peer.get("name"):
             title, body = peer["name"], f"{title}: {body}"
