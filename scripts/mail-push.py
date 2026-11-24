@@ -24,12 +24,22 @@ must be approved on the web gateway's /sends page — the thread shows it
 waiting meanwhile; a `trust` mailbox sends directly only with --user-approved.
 On a queued send this prints the approval URL.
 
+One run is one mail. Each run names its request to the gateway with a key of
+its own, and the gateway answers a second request under the same key with
+what became of the first, sending nothing. So when no answer comes back (a
+timeout, a dropped connection) this asks once more, safely; and when it still
+does not know, it says so — "NOT KNOWN whether this mail was sent" — and
+prints the key: run the same command again with `--request-key <key>` to
+learn the outcome. Never send the mail anew to find out.
+
 Examples:
     mail-push.py --chat 'email:~me@example.org:abc@x.org' --file /tmp/reply.txt
     mail-push.py --chat 'email:~me@example.org:abc@x.org' --reply sender "Thanks, got it."
     mail-push.py --to ann@x.org --cc bob@y.org --subject "Minutes" \\
         --file /tmp/minutes.txt --attach /tmp/minutes.pdf
     mail-push.py --retract 0123456789abcdef0123456789abcdef
+    mail-push.py --to ann@x.org --subject "Minutes" --file /tmp/minutes.txt \\
+        --request-key 5d41402abc4b2a76b9719d911017c592     # what became of that send?
 
 Configuration (environment):
     MAIL_GATEWAY_SEND_URL   default http://mail-gateway:8096/send
@@ -37,12 +47,16 @@ Configuration (environment):
 """
 import argparse
 import base64
+import http.client
 import json
 import mimetypes
 import os
+import re
+import socket
 import sys
 import urllib.error
 import urllib.request
+import uuid
 from pathlib import Path
 
 import chat_state
@@ -52,9 +66,11 @@ import send_origin
 CHANNEL = "email"
 DEFAULT_URL = os.environ.get("MAIL_GATEWAY_SEND_URL", "http://mail-gateway:8096/send")
 TOKEN = os.environ.get("MAIL_GATEWAY_TOKEN", "").strip()
-# A direct send answers once the SMTP server took the mail and the Sent copy
-# is filed: longer than a messenger's.
+# A direct send answers once the SMTP server has taken the mail — which, with
+# attachments on a slow line, takes longer than a messenger's send.
 DEFAULT_TIMEOUT = float(os.environ.get("MAIL_GATEWAY_TIMEOUT", "120"))
+# A request key as the gateway takes one.
+_REQUEST_KEY_RE = re.compile(r"[\x21-\x7e]{1,64}")
 
 
 def _encode_attachment(path: Path) -> dict:
@@ -107,6 +123,11 @@ def main() -> int:
                         help="assert that the user has already approved this very send; "
                              "bypasses the verify flow for 'trust'-category mailboxes")
     send_origin.add_argument(parser)
+    parser.add_argument("--request-key", metavar="KEY",
+                        help="ask about a send an earlier run made and got no answer "
+                             "for (the key that run printed), with the same arguments: "
+                             "the gateway answers what became of it and sends nothing "
+                             "a second time")
     parser.add_argument("--retract", metavar="REQUEST_ID",
                         help="retract a queued send you created (the id printed when it "
                              "was queued) before the user approves it; nothing is sent")
@@ -166,51 +187,108 @@ def main() -> int:
     if args.attach:
         # "images" is the wire key's historical name; it carries any file.
         payload["images"] = [_encode_attachment(Path(p)) for p in args.attach]
+    # One run is one mail: the key lets the gateway tell a second request
+    # for this very mail from a new one, and answer it without sending.
+    key = args.request_key or uuid.uuid4().hex
+    if not _REQUEST_KEY_RE.fullmatch(key):
+        parser.error("--request-key is the key an earlier run printed: up to 64 "
+                     "printable ASCII characters, without spaces")
+    payload["request_key"] = key
 
     headers = {"Content-Type": "application/json"}
     if TOKEN:
         headers["Authorization"] = f"Bearer {TOKEN}"
-    request = urllib.request.Request(
-        args.url, data=json.dumps(payload).encode("utf-8"), headers=headers, method="POST"
-    )
+    data = json.dumps(payload).encode("utf-8")
+
+    def ask():
+        """One request: ``(status, body)``, or None when no answer came back
+        although the gateway may have the request (a timeout, a connection
+        that broke) — raises for a gateway that was never reached."""
+        request = urllib.request.Request(args.url, data=data, headers=headers, method="POST")
+        try:
+            with urllib.request.urlopen(request, timeout=args.timeout) as resp:
+                body = json.loads(resp.read().decode("utf-8"))
+                return resp.status, body if isinstance(body, dict) else {}
+        except urllib.error.HTTPError as exc:
+            raw = exc.read().decode("utf-8", "replace")
+            try:
+                body = json.loads(raw)
+            except ValueError:
+                body = None
+            return exc.code, body if isinstance(body, dict) else {"error": raw.strip()[:200]}
+        except urllib.error.URLError as exc:
+            if isinstance(exc.reason, (ConnectionRefusedError, socket.gaierror)):
+                raise       # never reached: nothing was asked, nothing sent
+            return None
+        except (OSError, http.client.HTTPException, ValueError):
+            return None
+
     try:
-        with urllib.request.urlopen(request, timeout=args.timeout) as resp:
-            body = json.loads(resp.read().decode("utf-8"))
-        if body.get("status") == "pending_approval":
-            print(f"mail-push: send queued for approval (id={body.get('request_id', '?')})")
-            print(f"mail-push: take it back before approval with "
-                  f"mail-push.py --retract {body.get('request_id', '?')}")
-            approval_url = body.get("approval_url", "")
-            # Absolutize a relative approval path, as telegram-push.py does.
-            if approval_url.startswith("/"):
-                base = (os.environ.get("SEND_APPROVAL_BASE_URL")
-                        or os.environ.get("CONVERSATION_BASE_URL", "")).rstrip("/")
-                if base:
-                    approval_url = base + approval_url
-            if approval_url:
-                print(f"mail-push: approve or deny at {approval_url}")
-            note = body.get("note", "")
-            if note:
-                print(f"mail-push: {note}")
-            return 0
+        answer = ask()
+        if answer is None:
+            # The gateway may be sending the mail right now. Asking again
+            # under the same key sends nothing a second time: it is told
+            # what became of the first request, or waits for it.
+            print("mail-push: no answer from the gateway yet; asking again about this "
+                  "same send (it is not sent twice)", file=sys.stderr)
+            answer = ask()
+    except urllib.error.URLError as exc:
+        print(f"mail-push: could not reach gateway at {args.url}: {exc}", file=sys.stderr)
+        return 1
+    unknown = (f"mail-push: it is NOT KNOWN whether this mail was sent. Do not send it "
+               f"again as a new mail. Ask about this same send with the same arguments "
+               f"plus --request-key {key} (that never sends a second time), or look in "
+               f"the thread.")
+    if answer is None:
+        print(f"mail-push: the gateway at {args.url} did not answer.", file=sys.stderr)
+        print(unknown, file=sys.stderr)
+        return 1
+    status, body = answer
+    if 200 <= status < 300 and body.get("status") == "sending":
+        # (Asked about again after the user allowed it: on its way.)
+        print(f"mail-push: send {body.get('request_id', '?')} was approved and is "
+              f"being sent")
+        return 0
+    if 200 <= status < 300 and body.get("status") == "pending_approval":
+        print(f"mail-push: send queued for approval (id={body.get('request_id', '?')})")
+        print(f"mail-push: take it back before approval with "
+              f"mail-push.py --retract {body.get('request_id', '?')}")
+        approval_url = body.get("approval_url", "")
+        # Absolutize a relative approval path, as telegram-push.py does.
+        if approval_url.startswith("/"):
+            base = (os.environ.get("SEND_APPROVAL_BASE_URL")
+                    or os.environ.get("CONVERSATION_BASE_URL", "")).rstrip("/")
+            if base:
+                approval_url = base + approval_url
+        if approval_url:
+            print(f"mail-push: approve or deny at {approval_url}")
+        note = body.get("note", "")
+        if note:
+            print(f"mail-push: {note}")
+        _say_skipped(body)
+        return 0
+    if 200 <= status < 300:
         print(f"mail-push: sent (message id {body.get('message_id', '?')}, "
               f"thread {body.get('chat', '?')})")
         refused = body.get("refused") or []
         if refused:
             print(f"mail-push: the mail server refused {', '.join(map(str, refused))}; "
                   f"the mail went to the others")
+        _say_skipped(body)
         return 0
-    except urllib.error.HTTPError as exc:
-        raw = exc.read().decode("utf-8", "replace")
-        try:
-            detail = json.loads(raw).get("error", "")
-        except (ValueError, AttributeError):
-            detail = raw.strip()[:200]
-        print(f"mail-push: gateway returned {exc.code}: {detail}", file=sys.stderr)
-        return 1
-    except (urllib.error.URLError, OSError, ValueError) as exc:
-        print(f"mail-push: could not reach gateway at {args.url}: {exc}", file=sys.stderr)
-        return 1
+    print(f"mail-push: gateway returned {status}: {body.get('error', '')}", file=sys.stderr)
+    if body.get("unconfirmed"):
+        print(unknown, file=sys.stderr)
+    return 1
+
+
+def _say_skipped(body: dict) -> None:
+    """Whom a reply was not addressed to, although the mail it answers names
+    them: the gateway found no address there that a mail can be sent to."""
+    skipped = body.get("skipped") or []
+    if skipped:
+        print(f"mail-push: not written to (no address a mail can be sent to): "
+              f"{', '.join(map(str, skipped))}")
 
 
 if __name__ == "__main__":

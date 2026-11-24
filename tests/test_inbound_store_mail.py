@@ -36,7 +36,7 @@ ACCOUNT = "me@example.org"
 MAIL_PREDICATES = (ist.P_SUBJECT, ist.P_SENDER_NAME, ist.P_RECIPIENT, ist.P_CC,
                    ist.P_REPLY_TO, ist.P_IN_REPLY_TO, ist.P_REFERENCES, ist.P_LIST_ID, ist.P_BODY_PART,
                    ist.P_HTML_PART, ist.P_HEADER_PART, ist.P_CONTENT_ID, ist.P_TRIM,
-                   ist.P_REMOVED_AT, ist.P_ARRIVED_AT)
+                   ist.P_REMOVED_AT, ist.P_ARRIVED_AT, ist.P_REFUSED, ist.P_SENT_AS)
 
 
 def _png(w, h):
@@ -596,6 +596,62 @@ def test_the_author_of_an_outbound_record_can_be_corrected():
     print("PASS test_the_author_of_an_outbound_record_can_be_corrected")
 
 
+def test_a_sent_mail_says_whom_the_server_refused_and_what_else_it_is_known_as():
+    """Two facts only a mail the gateway sent has: the addresses the SMTP
+    server would not take it for (kb:refused — gone from a tombstone, like
+    every address), and the Message-ID a provider gave it in place of its
+    own (kb:sentAs — identity, kept on a tombstone)."""
+    with tempfile.TemporaryDirectory() as tmp:
+        urn, path = ist.write_outbound(
+            tmp, channel="email", chat="root@x.org", account=ACCOUNT, text="Hello.",
+            author="user", message_id="minted@example.org", timestamp=1000.0, sender=ACCOUNT,
+            subject="Plans", recipients=["ann@x.org"], cc=["cat@z.org"],
+            refused=["typo@y.org", " typo@y.org ", ""], references=["root@x.org"])
+        text = path.read_text(encoding="utf-8")
+        assert f'<{urn}> <{ist.P_REFUSED}> "typo@y.org" .' in text and text.count("refused") == 1
+        fields = ist._parse(text)
+        assert fields["refused"] == ["typo@y.org"] and fields["sent_as"] == []
+        assert fields["recipients"] == ["ann@x.org"] and fields["cc"] == ["cat@z.org"]
+        assert ist._render(fields) == text and ist.P_SENT_AS not in text
+
+        # The id it was sent as is learned later, and added — never replaced.
+        ist.update_message(path, sent_as="prov-1@provider.example")
+        ist.update_message(path, sent_as=["prov-1@provider.example", " prov-2@provider.example "])
+        text = path.read_text(encoding="utf-8")
+        fields = ist._parse(text)
+        assert sorted(fields["sent_as"]) == ["prov-1@provider.example", "prov-2@provider.example"]
+        assert f'<{urn}> <{ist.P_SENT_AS}> "prov-1@provider.example" .' in text
+        assert fields["message_id"] == "minted@example.org", "its own id is what it is keyed by"
+        assert fields["refused"] == ["typo@y.org"] and ist._render(fields) == text
+        # Through the other rewrites.
+        ist.update_message(path, author="agent", chat="other@x.org")
+        fields = ist._parse(path.read_text())
+        assert len(fields["sent_as"]) == 2 and fields["refused"] == ["typo@y.org"]
+        assert ist.rekey_chat(tmp, "other@x.org", ACCOUNT, "root@x.org")["errors"] == 0
+        assert len(ist._parse(path.read_text())["sent_as"]) == 2
+        # A tombstone loses to whom, and keeps every id the mail was known by.
+        assert ist.tombstone_message(path, 2000.0)
+        gone = ist._parse(path.read_text())
+        assert gone["refused"] == [] and gone["recipients"] == []
+        assert "refused" not in path.read_text()
+        assert sorted(gone["sent_as"]) == ["prov-1@provider.example", "prov-2@provider.example"]
+        assert gone["message_id"] == "minted@example.org" and gone["references"] == "root@x.org"
+
+        # An inbound record has neither, and does not grow one.
+        _u, inbound, _refs = _mail(tmp, timestamp=1001.0)
+        before = inbound.read_text()
+        assert ist.P_REFUSED not in before and ist.P_SENT_AS not in before
+        ist.update_message(inbound, sent_as="x@provider.example")
+        assert inbound.read_text() == before
+        # And a record written before either existed reads as having none.
+        fields = ist._parse(before)
+        assert fields["refused"] == [] and fields["sent_as"] == []
+        # A messenger's outbound record writes neither triple.
+        _u, sms = ist.write_outbound(tmp, channel="sms", chat="+41790000000", text="Hi")
+        assert ist.P_REFUSED not in sms.read_text() and ist.P_SENT_AS not in sms.read_text()
+    print("PASS test_a_sent_mail_says_whom_the_server_refused_and_what_else_it_is_known_as")
+
+
 def test_discard_media():
     """Blobs stored for a record that then could not be written are taken
     back, sidecars and all."""
@@ -658,6 +714,7 @@ if __name__ == "__main__":
     test_a_long_literal_is_read_without_a_gigabyte()
     test_delete_chat_unlinks_part_blobs()
     test_the_author_of_an_outbound_record_can_be_corrected()
+    test_a_sent_mail_says_whom_the_server_refused_and_what_else_it_is_known_as()
     test_discard_media()
     test_iter_records()
     print("all inbound_store mail tests passed")
