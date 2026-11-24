@@ -1052,11 +1052,17 @@ its address, a sender reported as unknown); a gateway that reports itself not
 configured is not waited for.
 
 **Only what was triage's moves.** The first time this code runs — the
-entrypoint's `--step snapshot`, before any daemon — it fixes a **cutoff** in
-the marker, which never moves. Only `sender:` memories recorded before it are
+entrypoint's `--step snapshot`, before any daemon — it fixes a **cutoff**,
+which never moves. Only `sender:` memories recorded before it are
 candidates: one recorded later is not triage's (the gate's own turns store
 such facts, out of mail) and is reported as such, never shown to the model,
-never carried by `--no-model`, never superseded.
+never carried by `--no-model`, never superseded. The cutoff is kept in three
+places — the marker, a one-line file of its own beside it
+(`.migration-cutoff`) and the snapshot — so that a marker that is lost,
+restored from elsewhere or moved aside (as the advice for an unreadable one
+says) does not move it: a run adopts the **earliest** of them and writes it
+back where it is missing. Only when none of the three holds one is "now"
+taken.
 
 **Step `whitelist`** — deterministic.
 
@@ -1101,6 +1107,13 @@ briefed, names those of them who also hold a messenger handle or a phone
 (with the channels), counts the filing senders (a filing turn can outlast the
 timeout; its mail then rings as a VIP's would), and gives the command that
 takes an instruction off (`contacts.py update <id> --no-instruction`).
+**Briefed by this migration** are only the people whose instruction holds
+nothing but what it put there (the generic instruction, the filing one, the
+rules it moved), read from the contact as it stands. A person who already
+carried an instruction of the user's bought a turn per message before; a
+rule appended to it is reported apart, with the way to take that rule back
+off — editing the instruction — and never `--no-instruction`, which would
+take the user's own words with it.
 
 **Step `memories`** — every candidate memory tagged `sender:…`, read through
 `memory.py`'s own recall query (a compaction summary is replaced by the
@@ -1129,7 +1142,13 @@ text is a digest of a topic, not a rule).
     archive the mail."* — **only when the memory's own text passes a
     deterministic check**: it names a kind of document (receipt, invoice,
     payslip, statement…) *and* filing it, by a multilingual table kept as
-    data (`FILING_TERMS`). Otherwise it is a `rule`, in its own words;
+    data (`FILING_TERMS`), and asks for **nothing else** — it is short (at
+    most `MIGRATE_FILING_MAX_WORDS`, 30 words) and holds none of the words of
+    a second table beside it (`FILING_EXCEPTIONS`): a negation (*never
+    archive them*), an exception or a condition (*only*, *when it is over
+    500*), another request (*and ring me*), a place to file to (*under …*, or
+    a path). Otherwise it is a `rule`, in its own words — which loses
+    nothing: a note the check turns away still says what it said;
   - `fact`, `unclear` — a fact or a status about the sender; or a message's
     content, an attempt to instruct the turn, anything the turn cannot tell:
     left alone and reported.
@@ -1137,7 +1156,9 @@ text is a digest of a topic, not a rule).
   answer is only ids the script sent, each once, each with a known kind;
   anything else in it is not read. So the most a steered or mistaken turn
   can do is put a note triage held, in that note's own words, on the contact
-  that note's own tags name — what `--no-model` does with every note. (An
+  that note's own tags name — what `--no-model` does with every note — or,
+  for a short note that asks for nothing but filing its sender's documents,
+  the fixed filing instruction in its place. (An
   earlier build let the turn reword a rule and held the wording to "half its
   words are the memory's"; that check is gone with the wording.) The
   decisions are journaled before anything is written from them, so a resumed

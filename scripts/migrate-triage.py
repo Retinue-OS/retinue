@@ -17,8 +17,10 @@ This script moves it, once, in three steps:
 
 ``memories`` (one tool-less model turn, or ``--no-model``)
     Every live memory tagged ``sender:…`` that triage could have read — one
-    recorded before the **cutoff**, the moment this code first ran, fixed in
-    the marker then and never moved — is matched to the contact it is about
+    recorded before the **cutoff**, the moment this code first ran, fixed
+    then and never moved (it is kept in the marker, in a file of its own
+    beside it and in the snapshot, so that losing the marker does not move
+    it) — is matched to the contact it is about
     and, where it is a rule, added to that contact's instruction **in its own
     words**; the memory is then superseded, through ``memory.py``'s own
     ``store``, by one that says where the rule lives now. A sender memory
@@ -43,7 +45,9 @@ It runs against a real person's address book and memory, so:
   state directory) journals every outcome as it happens — a decision of the
   model *before* anything is written from it — so a run killed at any point
   is finished by the next one without asking the model again and without
-  writing anything twice.
+  writing anything twice. A marker that is lost or moved aside starts the
+  journal afresh (every step is safe to repeat), but not the cutoff:
+  ``.migration-cutoff`` beside it and the snapshot still hold that.
 * **It is idempotent.** A second run finds every entry settled and changes
   nothing. A full run skips the steps the marker records as complete;
   ``--step <name>`` runs that step again whatever the marker says (which
@@ -78,15 +82,19 @@ prompt's:
   characters, never cut: a text too long for an instruction stays a memory);
 * ``filing`` puts the fixed filing instruction there only when the memory's
   own text passes a deterministic check — it names a kind of document and
-  filing it (``FILING_TERMS``, a multilingual table) — and is a ``rule``
-  otherwise;
+  filing it (``FILING_TERMS``, a multilingual table), and asks for nothing
+  else: it is short (``MIGRATE_FILING_MAX_WORDS``) and holds no negation, no
+  exception or condition, no other request and no place to file to
+  (``FILING_EXCEPTIONS``, a table beside it) — and is a ``rule`` otherwise;
 * ``fact`` and ``unclear`` leave the memory alone.
 
 So the most a steered or wrong answer can do is put a note triage held, in
 that note's own words, on the contact that note's own tags name — what
-``--no-model`` does with every note. ``--no-model`` skips the turn and carries
-every rule over verbatim; nothing then judges whether a text was the user's
-instruction, so read the report.
+``--no-model`` does with every note — or, for a short note that asks for
+nothing but filing its sender's documents, the fixed filing instruction in
+its place. ``--no-model`` skips the turn and carries every rule over
+verbatim; nothing then judges whether a text was the user's instruction, so
+read the report.
 
 Usage::
 
@@ -110,8 +118,9 @@ Exit status: 0 when everything asked for is complete (always, for a dry run),
 75 when something stays pending, 1 on an error that stopped the run.
 
 Environment:
-  TRIAGE_STATE_DIR              the state directory: marker, snapshot, and the
-                                old status store (default /root/.retinue/triage)
+  TRIAGE_STATE_DIR              the state directory: marker, cutoff, snapshot,
+                                and the old status store (default
+                                /root/.retinue/triage)
   CHAMBERS_DIR, CHAMBERS_MANIFEST   the address book (scripts/contacts.py)
   TRIAGE_EMAIL_WHITELIST_PATH, TRIAGE_MESSENGER_DIR   as scripts/triage_policy.py
   RETINUE_FRONTIER_MODEL        the model of the memories turn, falling back to
@@ -183,6 +192,7 @@ CONTACTS_SUFFIX = ":contacts"
 
 MARKER_NAME = ".migrated-to-contacts.json"
 SNAPSHOT_NAME = ".legacy-email-whitelist.json"
+CUTOFF_NAME = ".migration-cutoff"
 LOCK_NAME = ".migrated-to-contacts.lock"
 HOLD_NAME = ".migration-hold"
 MARKER_VERSION = 1
@@ -394,6 +404,65 @@ class Marker:
         _checkpoint("marker")
 
 
+# The cutoff, beside the marker and in the snapshot (Run.cutoff). A file that
+# is there and cannot be read is a MarkerError like the marker's own: what it
+# held is not known to be nothing.
+
+def read_cutoff_file(directory: Path) -> str | None:
+    path = directory / CUTOFF_NAME
+    try:
+        text = path.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        return None
+    except (OSError, UnicodeDecodeError) as exc:
+        raise MarkerError(f"{path} is not readable ({exc})")
+    if _parse_iso(text) is None:
+        raise MarkerError(f"{path} does not hold a time ({text[:40]!r})")
+    return text
+
+
+def write_cutoff_file(directory: Path, cutoff: str) -> None:
+    path = directory / CUTOFF_NAME
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(cutoff + "\n", encoding="utf-8")
+    os.replace(tmp, path)
+    _checkpoint("cutoff")
+
+
+def _read_snapshot(directory: Path) -> dict | None:
+    path = directory / SNAPSHOT_NAME
+    try:
+        stored = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(stored, dict):
+            raise ValueError("not an object")
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as exc:
+        raise MarkerError(f"{path} is not readable ({exc})")
+    return stored
+
+
+def snapshot_cutoff(directory: Path) -> str | None:
+    """The cutoff the snapshot holds; "" for a snapshot without one (taken
+    by an earlier build), None for no snapshot."""
+    stored = _read_snapshot(directory)
+    if stored is None:
+        return None
+    cutoff = str(stored.get("cutoff") or "")
+    if cutoff and _parse_iso(cutoff) is None:
+        raise MarkerError(f"{directory / SNAPSHOT_NAME}: its cutoff {cutoff!r} is not a time")
+    return cutoff
+
+
+def stamp_snapshot(directory: Path, cutoff: str) -> None:
+    """Write the cutoff into a snapshot that is there, keeping all it holds."""
+    stored = _read_snapshot(directory)
+    if stored is not None:
+        _write_json(directory / SNAPSHOT_NAME, dict(stored, cutoff=cutoff))
+        _checkpoint("snapshot")
+
+
 @contextlib.contextmanager
 def run_lock(directory: Path):
     """One migration at a time: a boot run and a person's run would otherwise
@@ -436,6 +505,7 @@ class Run:
         self._virtual: dict[tuple[str, str], dict] = {}
         self._chamber: str | None | bool = False
         self._gateway: tuple[bool, bool, str] | None = None
+        self._cutoff: str | None = None
 
     def fresh_pass(self) -> None:
         """Forget what one pass read, so that a retry reads it again: the
@@ -470,13 +540,31 @@ class Run:
         """The moment this code first ran, in the memory store's own clock:
         a sender memory recorded before it is one triage could have read; one
         recorded after it is not triage's — the gate's own turns store such
-        entries, out of mail. Fixed in the marker the first time, never
-        moved; a dry run that finds none uses now and saves nothing."""
-        data = self.marker.data
-        if not data.get("cutoff"):
-            data["cutoff"] = _iso(memory._now())
-            self.marker.save()
-        return data["cutoff"]
+        entries, out of mail. Fixed the first time and never moved: kept in
+        three places — the marker, a one-line file of its own beside it
+        (``.migration-cutoff``) and the snapshot — so that a marker that is
+        lost, or moved aside on an operator's word, does not move it. The
+        earliest of them stands, and is written back where it is missing;
+        only when none holds one is "now" taken. A dry run reads and saves
+        nothing."""
+        if self._cutoff is None:
+            marked, filed, snapped = (self.marker.data.get("cutoff"), read_cutoff_file(self.dir),
+                                      snapshot_cutoff(self.dir))
+            if marked and _parse_iso(marked) is None:
+                raise MarkerError(f"the marker's cutoff {marked!r} is not a time")
+            known = [when for when in (marked, filed, snapped) if when]
+            cutoff = min(known, key=_parse_iso) if known else _iso(memory._now())
+            if not self.dry_run:
+                # The file first: it is the one a lost marker is recovered from.
+                if filed != cutoff:
+                    write_cutoff_file(self.dir, cutoff)
+                if marked != cutoff:
+                    self.marker.data["cutoff"] = cutoff
+                    self.marker.save()
+                if snapped is not None and snapped != cutoff:
+                    stamp_snapshot(self.dir, cutoff)
+            self._cutoff = cutoff
+        return self._cutoff
 
     def gateway(self) -> tuple[bool, bool, str]:
         """(may migrate now, worth looking again soon, why not). Asked by a
@@ -765,14 +853,9 @@ def take_snapshot(run: Run) -> dict:
     on it, and the next read tries again."""
     path = run.dir / SNAPSHOT_NAME
     keys = ("addresses", "wildcards", "projected", "sources")
-    try:
-        stored = json.loads(path.read_text(encoding="utf-8"))
-        if not isinstance(stored, dict):
-            raise ValueError("not an object")
-    except FileNotFoundError:
-        stored = None
-    except (OSError, ValueError) as exc:
-        raise MarkerError(f"{path} is not readable ({exc})")
+    stored = _read_snapshot(run.dir)
+    # The cutoff travels with the snapshot it is written into (Run.cutoff).
+    cutoff = run.marker.data.get("cutoff") or (stored or {}).get("cutoff")
     unreadable = []
     found = {key: set() for key in keys}
     for policy in legacy_policy_paths():
@@ -788,7 +871,7 @@ def take_snapshot(run: Run) -> dict:
         if any(merged[key] != sorted((stored or {}).get(key) or []) for key in keys) and not run.dry_run:
             merged["taken"] = (stored or {}).get("taken") or _now()
             merged["updated"] = _now()
-            _write_json(path, merged)
+            _write_json(path, dict(merged, **({"cutoff": cutoff} if cutoff else {})))
             _checkpoint("snapshot")
         else:
             merged["taken"] = (stored or {}).get("taken")
@@ -801,7 +884,7 @@ def take_snapshot(run: Run) -> dict:
         merged["taken"] = (stored or {}).get("taken") or _now()
         merged["updated"] = _now()
         if not run.dry_run:
-            _write_json(path, merged)
+            _write_json(path, dict(merged, **({"cutoff": cutoff} if cutoff else {})))
             _checkpoint("snapshot")
             log(f"legacy whitelist secured in {path}: {len(merged['addresses'])} address(es), "
                 f"{len(merged['wildcards'])} wildcard(s)")
@@ -1415,7 +1498,8 @@ def clean_rule(text) -> str:
 # taken on the model's word: it must name a kind of document and filing it.
 # Data, by language — a language is added here, never special-cased in code.
 # A term matches where a word starts (so a plural, or a compound that begins
-# with it, counts), and anywhere in a script written without spaces.
+# with it, counts) — where it ends in ``$``, only as a whole word — and
+# anywhere in a script written without spaces.
 FILING_TERMS = {
     "document": {
         "en": ["receipt", "invoice", "payslip", "pay slip", "salary slip", "wage slip", "statement"],
@@ -1436,10 +1520,10 @@ FILING_TERMS = {
         "ko": ["영수증", "청구서", "급여명세서", "명세서"],
     },
     "filing": {
-        "en": ["file", "filing", "archiv", "book"],
+        "en": ["file", "filing", "archiv", "book$", "books$", "booked$", "bookkeep"],
         "de": ["ablegen", "ablage", "archivier", "abheften", "einordnen", "verbuch", "buchen"],
-        "fr": ["classer", "class", "archiv", "ranger", "comptabilis"],
-        "it": ["archivia", "registra"],
+        "fr": ["classe", "archiv", "ranger", "comptabilis"],
+        "it": ["archivia", "registra$", "registrare$", "registrala$", "registrale$", "registrali$"],
         "es": ["archiva", "registrar", "contabiliz"],
         "pt": ["arquiva", "registrar", "contabiliz"],
         "nl": ["archiveer", "archiveren", "opbergen", "inboeken", "boeken"],
@@ -1453,19 +1537,92 @@ FILING_TERMS = {
     },
 }
 
+# Naming filing is not enough for the fixed filing instruction to stand in
+# for a note: the note must ask for nothing else. Held conservatively — a
+# short note (at most MIGRATE_FILING_MAX_WORDS words; in a script written
+# without spaces each character counts as one) in which none of these words
+# appears: a negation ("never archive them"), an exception or a condition
+# ("only", "when it is over 500"), another request ("and ring me"), a place
+# to file to ("under …"; a path, too, is one). Every other note is a rule in
+# its own words, which loses nothing. Data, by language, beside FILING_TERMS:
+# whole words, except in a script written without spaces and for a term that
+# ends in an apostrophe (French "n'").
+MIGRATE_FILING_MAX_WORDS = 30
+FILING_EXCEPTIONS = {
+    "en": ["not", "no", "never", "nothing", "none", "nor", "neither", "without", "don't", "dont",
+           "doesn't", "didn't", "won't", "can't", "shouldn't", "except", "unless", "but", "only",
+           "if", "when", "whenever", "instead", "also", "tell", "ring", "call", "notify", "alert",
+           "remind", "forward", "reply", "answer", "respond", "send", "show", "draft", "ignore",
+           "delete", "flag", "ask", "pay", "check", "under", "into", "folder"],
+    "de": ["nicht", "nie", "niemals", "kein", "keine", "keinen", "keiner", "nichts", "ohne", "außer",
+           "ausser", "sondern", "aber", "nur", "wenn", "falls", "sobald", "statt", "sag", "sage",
+           "melde", "ruf", "rufe", "anrufen", "benachrichtige", "erinnere", "leite", "weiterleiten",
+           "antworte", "schick", "schicke", "sende", "zeig", "zeige", "entwirf", "ignoriere",
+           "lösche", "bezahle", "zahle", "prüfe", "frag", "unter", "ordner"],
+    "fr": ["ne", "n'", "pas", "jamais", "rien", "aucun", "aucune", "sans", "sauf", "sinon", "mais",
+           "seulement", "uniquement", "si", "quand", "lorsque", "dis", "dites", "préviens",
+           "prévenez", "appelle", "appelez", "transfère", "transférez", "réponds", "répondez",
+           "envoie", "envoyez", "montre", "montrez", "ignore", "ignorez", "supprime", "paie", "paye",
+           "sous", "dans", "dossier"],
+    "it": ["non", "mai", "niente", "nessun", "nessuno", "nessuna", "senza", "tranne", "salvo",
+           "eccetto", "ma", "solo", "soltanto", "se", "quando", "invece", "dimmi", "avvisa",
+           "avvisami", "chiama", "chiamami", "inoltra", "rispondi", "invia", "manda", "mostra",
+           "ignora", "elimina", "cancella", "paga", "sotto", "cartella"],
+    "es": ["no", "nunca", "jamás", "nada", "ningún", "ninguna", "ninguno", "sin", "excepto", "salvo",
+           "sino", "pero", "solo", "sólo", "si", "cuando", "avísame", "avisa", "llama", "llámame",
+           "reenvía", "responde", "contesta", "envía", "manda", "muestra", "ignora", "borra",
+           "elimina", "paga", "bajo", "carpeta"],
+    "pt": ["não", "nao", "nunca", "jamais", "nada", "nenhum", "nenhuma", "sem", "exceto", "salvo",
+           "senão", "mas", "só", "somente", "apenas", "se", "quando", "avise", "avisa", "ligue",
+           "encaminhe", "responda", "responde", "envie", "mostre", "ignore", "apague", "pague",
+           "pasta"],
+    "nl": ["niet", "nooit", "geen", "niets", "zonder", "behalve", "tenzij", "maar", "alleen", "als",
+           "wanneer", "vertel", "meld", "bel", "waarschuw", "stuur", "beantwoord", "antwoord",
+           "toon", "negeer", "verwijder", "betaal", "onder", "map"],
+    "sv": ["inte", "ej", "aldrig", "ingen", "inget", "inga", "utan", "utom", "förutom", "men",
+           "bara", "endast", "om", "när", "säg", "meddela", "ring", "vidarebefordra", "svara",
+           "skicka", "visa", "ignorera", "radera", "betala", "under", "mapp"],
+    "da": ["ikke", "aldrig", "ingen", "intet", "uden", "undtagen", "men", "kun", "hvis", "når",
+           "sig", "ring", "videresend", "svar", "send", "vis", "ignorer", "slet", "betal", "under",
+           "mappe"],
+    "pl": ["nie", "nigdy", "żaden", "żadna", "żadne", "nic", "bez", "oprócz", "poza", "ale",
+           "tylko", "jeśli", "jeżeli", "gdy", "kiedy", "powiedz", "powiadom", "zadzwoń", "przekaż",
+           "odpowiedz", "wyślij", "pokaż", "zignoruj", "usuń", "zapłać", "folder", "katalog"],
+    "ru": ["не", "нет", "никогда", "ничего", "никаких", "без", "кроме", "но", "только", "если",
+           "когда", "скажи", "сообщи", "позвони", "перешли", "ответь", "отправь", "покажи",
+           "игнорируй", "удали", "оплати", "папку", "папке"],
+    "ja": ["ない", "ません", "禁止", "以外", "ただし", "だけ", "場合", "なら", "たら", "知らせ", "連絡",
+           "電話", "転送", "返信", "送信", "見せ", "無視", "削除", "支払", "フォルダ"],
+    "zh": ["不", "没", "沒", "别", "別", "勿", "除了", "除非", "但", "只", "如果", "若", "告诉", "告訴",
+           "通知", "电话", "電話", "转发", "轉發", "回复", "回覆", "发送", "發送", "显示", "顯示", "忽略",
+           "删除", "刪除", "付款", "支付", "文件夹", "資料夾"],
+    "ko": ["않", "말고", "말아", "마세요", "없", "못", "제외", "외에", "하지만", "그러나", "경우", "알려",
+           "연락", "전화", "전달", "답장", "보내", "보여", "무시", "삭제", "지불", "폴더"],
+}
+
 
 def _spaceless(term: str) -> bool:
     return any(unicodedata.name(ch, "").startswith(("CJK", "HIRAGANA", "KATAKANA", "HANGUL"))
                for ch in term)
 
 
-def _names_any(text: str, terms) -> bool:
+def _flat_text(text: str) -> str:
+    """A text as the tables are held against it: NFKC, case-folded, and a
+    typographic apostrophe read as the plain one."""
+    flat = unicodedata.normalize("NFKC", str(text or "")).casefold()
+    return re.sub("[‘’ʼ]", "'", flat)
+
+
+def _names_any(text: str, terms, *, whole: bool = False) -> bool:
     for term in terms:
         term = unicodedata.normalize("NFKC", term).casefold()
         if _spaceless(term):
             if term in text:
                 return True
-        elif re.search(r"(?<!\w)" + re.escape(term), text):
+            continue
+        end = term.endswith("$") or (whole and not term.endswith("'"))
+        term = term.rstrip("$")
+        if re.search(r"(?<!\w)" + re.escape(term) + (r"(?!\w)" if end else ""), text):
             return True
     return False
 
@@ -1474,18 +1631,37 @@ def names_filing(text: str) -> bool:
     """Whether a memory's own text says its sender's mail is documents to
     file: it names a kind of document AND filing (or archiving, or booking)
     it, in any language of FILING_TERMS."""
-    flat = unicodedata.normalize("NFKC", str(text or "")).casefold()
+    flat = _flat_text(text)
     return all(_names_any(flat, [t for terms in FILING_TERMS[group].values() for t in terms])
                for group in ("document", "filing"))
+
+
+def _words(text: str) -> int:
+    """How many words a text holds; in a script written without spaces each
+    character counts as one."""
+    return sum(len(run) if _spaceless(run) else 1 for run in re.findall(r"\w+", text))
+
+
+def only_filing(text: str) -> bool:
+    """Whether a memory's own text asks for filing documents and for nothing
+    else, so that the fixed filing instruction loses nothing of it: it names
+    filing (names_filing), is short, and carries no word of FILING_EXCEPTIONS
+    and no path."""
+    flat = _flat_text(text)
+    return (names_filing(flat) and _words(flat) <= MIGRATE_FILING_MAX_WORDS
+            and not re.search(r"[/\\]", flat)
+            and not _names_any(flat, [t for terms in FILING_EXCEPTIONS.values() for t in terms],
+                               whole=True))
 
 
 def decide(kind: str, content: str) -> dict | None:
     """What a memory becomes on its contact, from its kind and its own text —
     never from anything the model wrote: ``{"kind", "instruction"}``, or None
     when its text is too long to be an instruction (nothing is cut). A
-    ``filing`` the text does not bear out is a ``rule``."""
+    ``filing`` the text does not bear out — one that asks for anything but
+    filing documents (only_filing) — is a ``rule``, in the memory's words."""
     text = clean_rule(content)
-    if kind == "filing" and names_filing(text):
+    if kind == "filing" and only_filing(text):
         return {"kind": "filing", "instruction": FILING_INSTRUCTION}
     if not text or len(text) > contacts.INSTRUCTION_MAX:
         return None
@@ -1944,13 +2120,19 @@ def _timeout(name: str, default: float) -> str:
     return f"{_seconds(name, default):g}"
 
 
-def briefed_people(run: Run, whitelist: dict, memories: dict) -> list[dict]:
-    """Everyone this migration gave an instruction: the whitelist's new
-    contacts and the people it briefed, and every contact a sender rule went
-    onto. Per person: the key, the name, and the channels beside e-mail an
-    instruction of theirs now reaches — an instruction is the person's, on
-    every channel."""
+def briefed_people(run: Run, whitelist: dict, memories: dict) -> tuple[list[dict], list[dict]]:
+    """(briefed, extended). Briefed: everyone this migration gave their first
+    instruction — whose instruction holds nothing but what the migration
+    put there (the generic one, the filing one, the sender rules it moved).
+    Extended: everyone a sender rule was appended to whose instruction also
+    holds words of the user's — they bought a turn per message before, and
+    taking the instruction off would take those words with it. Per person:
+    the key, the name, and the channels beside e-mail an instruction of
+    theirs reaches — an instruction is the person's, on every channel. Read
+    from the contact as it stands, so a run killed between a write and its
+    journal, and an edit the user made since, are counted as they are."""
     keys: dict[str, str] = {}
+    placed: dict[str, list[str]] = {}
     for entry in whitelist.values():
         if entry.get("outcome") in ("created", "instructed") and entry.get("contact"):
             for key in entry.get("briefed") or [entry["contact"]]:
@@ -1959,13 +2141,21 @@ def briefed_people(run: Run, whitelist: dict, memories: dict) -> list[dict]:
         if entry.get("state") in ("migrated", "written"):
             for ref in entry.get("contacts") or []:
                 keys.setdefault(ref.get("contact"), ref.get("name") or "?")
-    out = []
+                placed.setdefault(ref.get("contact"), []).append(entry.get("instruction") or "")
+    briefed, extended = [], []
     for key, name in sorted(keys.items(), key=lambda kv: (kv[1].casefold(), kv[0])):
         record = run.contact(key) or {}
+        own = _flat(record.get("instruction"))
+        if not own:
+            continue   # taken off since: it buys nothing
+        for ours in [GENERIC_INSTRUCTION, FILING_INSTRUCTION] + placed.get(key, []):
+            if _flat(ours):
+                own = own.replace(_flat(ours), " ")
         channels = sorted({channel for channel, _handle in record.get("accounts") or []}
                           | ({"sms"} if record.get("all_phones") else set()))
-        out.append({"contact": key, "name": record.get("name") or name, "channels": channels})
-    return out
+        person = {"contact": key, "name": record.get("name") or name, "channels": channels}
+        (extended if own.strip() else briefed).append(person)
+    return briefed, extended
 
 
 def build_report(run: Run) -> dict:
@@ -2022,13 +2212,13 @@ def build_report(run: Run) -> dict:
     }
     report["whitelist"]["contacts"] = {key: people(report["whitelist"][key])
                                        for key in ("created", "instructed", "kept")}
-    briefed = briefed_people(run, whitelist, memories)
+    briefed, extended = briefed_people(run, whitelist, memories)
     beyond = [p for p in briefed if p["channels"]]
     filing = [e for e in report["memories"]["moved"] + report["memories"]["waiting"]
               if e.get("kind") == "filing"]
     mail_wait = _timeout("MAIL_INSTRUCTION_TIMEOUT", 600)
     chat_wait = _timeout("CHAT_INSTRUCTION_TIMEOUT", 60)
-    report["briefed"] = {"contacts": len(briefed), "beyond_mail": beyond,
+    report["briefed"] = {"contacts": len(briefed), "beyond_mail": beyond, "extended": extended,
                          "filing": len({c.get("contact") for e in filing for c in e.get("contacts") or []}),
                          "mail_timeout": mail_wait, "chat_timeout": chat_wait}
     by_hand = []
@@ -2063,6 +2253,16 @@ def build_report(run: Run) -> dict:
                        "was briefed before: "
                        + "; ".join(f"{p['name']} [{p['contact']}] ({', '.join(p['channels'])})"
                                    for p in beyond))
+    if extended:
+        # Their instruction was the user's before: --no-instruction would
+        # take the user's own words with the rule.
+        by_hand.append(f"{len(extended)} contact(s) already carried an instruction of yours, and a "
+                       "sender rule was appended to it (they bought a turn per message before, on "
+                       "every channel): "
+                       + "; ".join(f"{p['name']} [{p['contact']}]" for p in extended)
+                       + ". To take an appended rule back off, edit the instruction on the Contacts "
+                       "page (or `contacts.py update <id> --instruction …`) — not --no-instruction, "
+                       "which takes your own words with it")
     if filing:
         by_hand.append(f"{report['briefed']['filing']} contact(s) carry the filing instruction. A turn "
                        "that files with the Archivist can take minutes; their mail rings as a VIP's "
@@ -2203,6 +2403,10 @@ def thread_message(report: dict, *, follow_up: bool = False) -> str:
                      f"well ({_listed([_md(p['name']) for p in beyond])}) "
                      "[[chip: Take theirs off | Take the triage migration's instruction off the "
                      "people it briefed who also write on a messenger.]]")
+    if briefed.get("extended"):
+        lines.append(f"- **Rules added to an instruction of yours:** {len(briefed['extended'])} "
+                     "contact(s) already had one, and a sender rule was appended to it; to take a "
+                     "rule back off, edit the instruction on the Contacts page — your own words stay.")
     if briefed.get("filing"):
         lines.append(f"- **Filing senders:** {briefed['filing']} contact(s) now have their documents "
                      "filed by the Archivist. A filing turn can take minutes: such a mail rings as "
@@ -2486,7 +2690,8 @@ def main(argv: list[str] | None = None) -> int:
             return 0 if done else EXIT_PENDING
     except MarkerError as exc:
         log(f"stopped: {exc}. Nothing was changed. Every step is safe to repeat: move the file "
-            "aside to start the journal afresh.")
+            f"aside to start afresh — but keep {CUTOFF_NAME} and {SNAPSHOT_NAME} beside it: the "
+            "cutoff they hold is what keeps the sender memories stored since out of the migration.")
         return 1
 
 

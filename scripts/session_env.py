@@ -116,9 +116,12 @@ SESSION_ENV_NAMES: frozenset[str] = frozenset({
     # boot thread's chips and its report's "for you to do" lines send a
     # session to run: its state directory (marker, snapshot, the retired
     # status store), the user's own addresses (they get no contact; the
-    # mailbox variables stay out) and its two tunables.
+    # mailbox variables stay out), its two tunables, and the two verdict
+    # timeouts its report states (a session's report must say what the
+    # web gateway waits, not the defaults).
     "TRIAGE_STATE_DIR", "MAIL_OWN_ADDRESSES",
     "MIGRATE_TRIAGE_MODEL_TIMEOUT", "MIGRATE_TRIAGE_MIRROR_WAIT",
+    "MAIL_INSTRUCTION_TIMEOUT", "CHAT_INSTRUCTION_TIMEOUT",
     "PROJECT_DEADLINE_LEAD_DAYS",
     # No chamber's credentials here: a variable a chamber's own scripts read
     # (a data source's login, say) is the deployment's to name in

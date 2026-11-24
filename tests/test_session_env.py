@@ -114,11 +114,14 @@ NEEDED = {
     "TRIAGE_MESSENGER_DIR": "/workspace/chambers/_generated/messenger",
     "TRIAGE_EMAIL_WHITELIST_PATH": "/workspace/chambers/_generated/messenger/email/policy/email-policy.nt",
     # the triage migration, which the boot thread's chips send a session to
-    # run: its state directory and the user's own addresses (no contact)
+    # run: its state directory and the user's own addresses (no contact),
+    # and the verdict timeouts its report states as they are set
     "TRIAGE_STATE_DIR": "/data/triage",
     "MAIL_OWN_ADDRESSES": "me@alias.example",
     "MIGRATE_TRIAGE_MODEL_TIMEOUT": "300",
     "MIGRATE_TRIAGE_MIRROR_WAIT": "21600",
+    "MAIL_INSTRUCTION_TIMEOUT": "900",
+    "CHAT_INSTRUCTION_TIMEOUT": "90",
     # git shim and python
     "GIT_SERIALIZE_LOCK_DIR": "/tmp/git-locks",
     "PYTHONPATH": "/workspace/scripts",

@@ -63,9 +63,30 @@ The format is **N-Triples**, which gives two properties at once:
   path;
 - a person or agent may add triples of their own (an address, a birthday, an
   organisation, a note). A rewrite removes only the triples this module would
-  itself have written for the person's previous state and keeps every other
-  line byte for byte, comments included. Deleting a person removes their
+  itself have written for the person's previous state, and the lines a read
+  *took* into the person in a spelling of their own (below), and keeps every
+  other line byte for byte, comments included. Deleting a person removes their
   managed triples; if anything else is left, the file stays.
+
+**Values written by hand, twice or in another spelling.** A read takes a value
+it understands into the person, whatever spelling a hand edit or a merged
+chamber sync left: every domain, address and telephone (each once, in today's
+spelling), the VIP flag (`"true"`/`"1"`, any case; any one says VIP), the
+highest importance of the literals that hold one, and **every** instruction
+literal that says anything, joined by a blank line — so no instruction hides
+behind another, and the one the user is shown is all the gate reads. A rewrite
+removes exactly what the read took, and only on these terms:
+
+- a line the read did not take stays exactly as written: a domain that is
+  none, a VIP flag or importance in a spelling this module does not read, an
+  empty instruction;
+- a rewrite that leaves the instruction as it was leaves its literals as the
+  user wrote them (two stay two); one that changes it — the user edited the
+  text they were shown, or the migration added a rule to it — writes the new
+  text as one literal;
+- a second importance below the one read stays while the importance is left
+  as it was; a rewrite that sets the importance replaces every literal it was
+  read from, so the value the user removed or lowered does not come back.
 
 A person described by hand in the address-book directory (`foaf:Person` or
 `schema:Person`, with a name, `vcard:hasEmail` or `vcard:hasTelephone`) is a
@@ -366,13 +387,18 @@ instruction without VIP and has it ask for a high importance.
   Read · Archived* in docs/messenger-chats.md.
 - **A turn cannot silence the mail it was given.** An instructed mail turn
   may archive its thread (`scripts/chat-flags.py`) where the instruction
-  asks. An archive or a mute the turn sets is recorded as the turn's own: a
-  turn that ends with a verdict keeps them, and the mail rings nothing; a turn
-  that fails, ends without a verdict or times out has them undone — the thread
-  un-archived and un-muted — before the failure ring. And a turn's archive covers only what
-  the turn was started for: if another mail arrived in the thread after the
-  turn's own, the thread is not archived (the answer says `newer mail
-  arrived`), and the mailbox is touched only for the mail the turn worked.
+  asks. It cannot mute it: a mute asked by a running arrival turn is taken as
+  an archive of the turn's own mail (the answer says `a turn cannot mute;
+  archived instead`). Muting stays the user's — their own flags, or an agent
+  acting on their word outside an arrival turn. The archive a mail turn sets
+  is recorded as the turn's own: a turn that ends with a verdict keeps it, and
+  the mail rings nothing; a turn that fails, ends without a verdict or times
+  out has it undone — the thread un-archived — before the failure ring. That
+  undo is for mail only: a messenger turn's archive stands as it always did
+  (docs/messenger-chats.md). And a turn's archive covers only what the turn
+  was started for: if another mail arrived in the thread after the turn's
+  own, the thread is not archived (the answer says `newer mail arrived`), and
+  the mailbox is touched only for the mail the turn worked.
 - **No sending on a messenger.** A reply is only ever staged in the chat's
   draft; the user's send press is the only way a chat reply leaves in their
   name. That is how the chat surface works for every agent

@@ -666,6 +666,94 @@ def test_instruction(chambers, manifest):
     print("ok test_instruction")
 
 
+def test_written_by_hand_twice(chambers, manifest):
+    """Every value the read widened to a spelling of its own, written by hand
+    twice: a rewrite takes away only a literal the read took into the record
+    (in another spelling, or joined into it), and an unrelated update leaves
+    every literal the record did not take exactly as the user wrote it."""
+    book = contacts.ContactBook(chambers, manifest)
+    path = chambers / "work" / "contacts" / "hand-twice.nt"
+    person = "<https://example.org/people#twice>"
+    kb = "https://w3id.org/retinue/kb#"
+    vc = "http://www.w3.org/2006/vcard/ns#"
+    unread = [  # literals the read does not take: they never change
+        f'{person} <{kb}emailDomain> "com" .',
+        f'{person} <{kb}vip> "yes" .',
+        f'{person} <{kb}importance> "high" .',
+        f'{person} <{kb}instruction> "" .',
+    ]
+    house = f'{person} <{kb}instruction> "Ring me for the house sale." .'
+    invoices = f'{person} <{kb}instruction> "Also: forward invoices to my accountant." .'
+    lower = f'{person} <{kb}importance> "2" .'
+    path.write_text("\n".join([
+        f'{person} <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://xmlns.com/foaf/0.1/Person> .',
+        f'{person} <http://xmlns.com/foaf/0.1/name> "Twice Person" .',
+        f'{person} <{kb}emailDomain> "*@twice.example" .',
+        f'{person} <{kb}emailDomain> "Twice.Example" .',
+        f'{person} <{vc}hasEmail> <mailto:Mara@Twice.example> .',
+        f'{person} <{vc}hasEmail> <mailto:mara@twice.example> .',
+        f'{person} <{vc}hasTelephone> <tel:+41 44 222 22 22> .',
+        f'{person} <{vc}hasTelephone> <tel:0041442222222> .',
+        f'{person} <{kb}vip> "1" .',
+        f'{person} <{kb}vip> "TRUE" .',
+        f'{person} <{kb}importance> "4.50" .',
+        lower, house, invoices, *unread]) + "\n", encoding="utf-8")
+    rec = book.find("email", "mara@twice.example")
+    assert (rec["domains"], rec["emails"], rec["phones"], rec["vip"], rec["importance"]) == (
+        ["twice.example"], ["mara@twice.example"], ["+41442222222"], True, 4.5), rec
+    # Both instructions are the record's: neither is hidden behind the other.
+    assert rec["instruction"] == ("Also: forward invoices to my accountant.\n\n"
+                                  "Ring me for the house sale."), rec["instruction"]
+
+    # An unrelated update: what the record took is written once, in today's
+    # spelling; the two instructions and everything unread stay as written.
+    book.update(rec["key"], add_domains=["twice.org"])
+    text = path.read_text(encoding="utf-8")
+    for line in (house, invoices, lower, *unread):
+        assert line in text.splitlines(), (line, text)
+    for gone in ('"*@twice.example"', '"Twice.Example"', "mailto:Mara@", "tel:+41 44", "tel:0041",
+                 '"1"', '"TRUE"', '"4.50"'):
+        assert gone not in text, (gone, text)
+    assert text.count("kb#emailDomain> \"twice.example\"") == 1, text
+    assert text.count("<mailto:mara@twice.example>") == 1 and text.count("<tel:+41442222222>") == 1, text
+    book._cache.clear()
+    again = book.get(rec["key"])
+    for field in ("emails", "phones", "vip", "importance", "instruction"):
+        assert again[field] == rec[field], (field, again[field], rec[field])
+    assert again["domains"] == ["twice.example", "twice.org"], again
+
+    # The migration's way: one more rule on the instruction the user was
+    # shown. Both of theirs are in it; the rewrite writes one literal.
+    rule = "Archive their newsletters."
+    book.update(rec["key"], instruction=again["instruction"] + "\n\n" + rule)
+    text = path.read_text(encoding="utf-8")
+    assert house not in text and invoices not in text, text
+    book._cache.clear()
+    joined = book.get(rec["key"])["instruction"]
+    assert "Ring me for the house sale." in joined and "forward invoices" in joined and rule in joined, joined
+
+    # Changing a value replaces every literal it was read from: neither a
+    # lower importance nor a second VIP spelling comes back in its place.
+    book.update(rec["key"], importance=1, vip=False)
+    book._cache.clear()
+    after = book.get(rec["key"])
+    assert (after["importance"], after["vip"]) == (1.0, False), after
+    assert lower not in path.read_text(encoding="utf-8").splitlines()
+    book.update(rec["key"], importance=None, instruction=None,
+                remove=[("email", "mara@twice.example"), ("sms", "+41442222222")],
+                remove_domains=["twice.example", "twice.org"])
+    book._cache.clear()
+    after = book.get(rec["key"])
+    assert (after["importance"], after["vip"], after["instruction"], after["emails"], after["phones"],
+            after["domains"]) == (None, False, None, [], [], []), after
+    text = path.read_text(encoding="utf-8")
+    for line in unread:
+        assert line in text.splitlines(), (line, text)
+    book.delete(rec["key"])
+    path.unlink(missing_ok=True)
+    print("ok test_written_by_hand_twice")
+
+
 def test_cli(chambers, manifest):
     env = dict(os.environ,
                TRIAGE_MESSENGER_DIR=str(chambers.parent / "policy" / "messenger"),
@@ -810,6 +898,7 @@ def main():
         test_domains(chambers, manifest)
         test_attention_and_vip(chambers, manifest)
         test_instruction(chambers, manifest)
+        test_written_by_hand_twice(chambers, manifest)
         test_cli(chambers, manifest)
         test_commit(tmp)
     print("all contacts checks passed")
