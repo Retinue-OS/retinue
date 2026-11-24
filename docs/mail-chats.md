@@ -485,7 +485,12 @@ of its own, and the backup brings back the one it had before); a mail to
 oneself whose Sent copy is gone comes back as a mail that came in —
 nothing but its From says the user wrote it; on a server that stamps a
 moved mail with a new arrival time, an archived sent mail comes back as a
-mail that came in too — its From is all that is left to say so; and an
+mail that came in too — its From is all that is left to say so; so does
+an archived mail the gateway sent whose Sent copy the provider filed
+(`SMTP_SAVE_SENT=false`): the record's arrival time is the gateway's clock
+at the send, the copy's the provider's at the filing, and they agree only
+by chance (found under an id the provider gave it, it also comes back under
+that id, not the one the gateway minted); and an
 arrival time has whole seconds, so a look-alike under the id, From the same
 address, delivered in the same second, cannot be told from the record's own
 mail: archived, with the Sent copy gone, it comes back as the user's, and
