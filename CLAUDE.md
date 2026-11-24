@@ -467,6 +467,7 @@ variable a session needs is named in `RETINUE_SESSION_ENV_EXTRA`
 | unfamiliar messaging accounts, send policies, gateway config | `docs/messaging.md` |
 | contacts: the address book, its vocabulary, a chamber's `contacts` entry | `docs/contacts.md` |
 | webapp/gateway changes, attachments, push, voice input | `docs/dashboard.md` |
+| chamber apps: `window.Retinue`, `/apps/api/`, app reminders | `docs/chamber-apps.md` |
 | importance, urgency, focus modes, the digest — the attention model | `docs/attention-model.md`, `docs/attention-migration.md` |
 | news ranking/ingestion/learning changes | `docs/news.md` |
 | the Ask-Ara connector | `docs/ask-ara.md` |

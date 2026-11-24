@@ -37,7 +37,7 @@ lives in `webapp/` (baked into the image):
 
 **Navigation is one row at the top of every page**
 (`webapp/components/nav.js`): *Home · Chats · Threads · Projects · News ·
-Contacts*, then an outbox icon for the pending sends (`/sends`, the approval
+Apps · Contacts*, (*Apps*: the chambers' own apps, `docs/chamber-apps.md`) then an outbox icon for the pending sends (`/sends`, the approval
 queue — a queue that wants action, one tap away) and the settings gear, with
 the page you are on underlined. It is the first thing
 on the home, the list pages and settings, and it stays pinned while a list
@@ -143,6 +143,11 @@ back means giving `index.html` `media-src 'self'` there.) The file viewer
 frame; it is the only page that frames anything. `/sparql` (also served as
 `/sparql.html`) adds `data:` to `img-src`, for the icons in YASGUI's
 stylesheet. It needs nothing else: the vendored YASGUI compiles no strings.
+Every page of a **chamber app** (`/apps/<chamber>/<app>/`, see
+`docs/chamber-apps.md`) gets the same directives under the key `chamber-app`,
+plus `media-src 'self'` and `blob:` images, and gets them **enforced** in
+report mode too (`content_policy.app_headers`): an app is new and written
+against the policy, so it needs no migration period; only `off` drops it.
 Two other policies stay as they were, separate and always enforced:
 `/settings-instance.html`'s `frame-ancestors` (who may frame it, see "The
 settings page") and the file viewer's own `frame-src 'self'`. Inside the
@@ -242,7 +247,11 @@ attachments, messenger media through `/chats/media`, the life store's results
 on `/sparql` and the pairing-code proxy answer a script type as
 `application/octet-stream` (`_served_media_type` in the gateway); the
 letterbox share serves every file as a download anyway; `/data/` answers JSON
-and any other file as a download. `tests/test_web_gateway_no_script_types.py`
+and any other file as a download. Scripts are served as scripts outside
+`webapp/` in one place only, a chamber app's own directory
+(`/apps/<chamber>/<app>/`, the chamber's reviewed code), and nothing from
+outside can land there: `Retinue.submit` refuses every dot path,
+`.retinue/` included (`tests/test_chamber_apps.py`). `tests/test_web_gateway_no_script_types.py`
 asks each of them for every script type a sender might state.
 
 **Other services on the dashboard's host.** The policy reaches what the
@@ -939,6 +948,10 @@ opens that thread. This is automatic — there is no separate step after
 posting to a conversation. Pushes carry the RFC 8030 headers the model uses:
 `Urgency: high` on a breakthrough, `Urgency: normal` and `Topic: digest` on
 the digest, so an undelivered digest is replaced rather than stacked.
+A chamber app's **reminder** (`docs/chamber-apps.md`, "Reminders") is pushed
+the same way, but opens the app's deep link instead of a thread and carries
+two actions, *In 15 min* and *Skip today*, which `sw.js` posts to the
+reminder's `/apps/api/schedule/…` path without opening anything.
 
 The plumbing lives in `scripts/push_notify.py` (VAPID keypair, one file per
 device subscription, both persisted under `PUSH_DIR` — by default a sibling of
@@ -1478,7 +1491,7 @@ The contract the two sides share (web side: `webapp/components/shell.js`):
 
 | Direction | What |
 |---|---|
-| User agent | ` RetinueShell/6 (Android)` appended (` RetinueShell/5` before `placeCall`, ` RetinueShell/4` before the keyboard members, ` RetinueShell/3` before the app's own settings page and the per-device preferences, `/2` before the endpoint members, `/1` before the Health Connect members; the page feature-detects every member rather than parsing the version). |
+| User agent | ` RetinueShell/7 (Android)` appended (` RetinueShell/6` before the chamber-app members, ` RetinueShell/5` before `placeCall`, ` RetinueShell/4` before the keyboard members, ` RetinueShell/3` before the app's own settings page and the per-device preferences, `/2` before the endpoint members, `/1` before the Health Connect members; the page feature-detects every member rather than parsing the version). |
 | `window.RetinueShell` | Installed at document start, configured origin only: `platform`, `version`, `setVoiceActive(bool)` and `openSettings(section?)`, which opens the app's settings: from RetinueShell/4 its own page (the gear calls it when `settingsPage` is true), before that the native screens behind Settings → Phone shell (shown only when the object exists; the card is the first on the page there). `setVoiceActive(true)` means *a voice conversation is engaged: keep the screen on and pause the wake phrase*. The page asserts it before it asks for the mic (the wake detector must release it first) and keeps it asserted for as long as a continuous conversation is going — through transcription, Ara's answer and its reading, not only while the mic is open — and sends `false` once the loop stops (mode off, no speech, leaving the thread, an error). Wake detection being paused for the whole conversation is intended. |
 | Endpoints (RetinueShell/3) | The shell holds a list of Retinue servers (address, client certificate, sign-in, health switch) and shows one; the app's settings page lists, edits and switches them (RetinueShell/3: the Settings page's Phone shell card lists them in a menu and switches between them). `endpoints()` → a JSON string `[{"id": str, "label": str, "current": bool}]` — the label is the instance's own name, the manifest `short_name` the shell fetched with that endpoint's certificate or password (the host while it is unknown; the host appended when two names collide); no URLs, the other servers being none of the current page's business. `selectEndpoint(id)` asks the shell to show that server (it loads that dashboard's start page, so the page is left). `openSettings("endpoints")` opens the app's settings at the endpoint list, or at the editor straight away with one endpoint. The page may ask; it can never write an address, certificate or password — whatever origin the shell is pointed at receives its bridge, microphone, certificate and password, so that stays in the app. An `endpoints` event (`detail.type`) says the list changed while a page is open; the card re-renders. The shell's one base URL of earlier builds is the first endpoint after an update. |
 | Health Connect (RetinueShell/2) | Further members on `window.RetinueShell`: `healthConnectAvailable()` → `"true"`/`"false"`; `healthSync()` — a deliberate sync now, returns at once (a deliberate sync always runs, whatever the interval); `healthSyncStatus()` → a JSON string `{"available": bool, "permissions": "granted"\|"partial"\|"none", "last_sync_at": ISO\|null, "last_result": "ok"\|"error"\|"skipped"\|null, "last_error": str\|null, "last_count": int\|null, "min_interval_minutes": int, "auto_on_resume": bool, "enabled": bool}` (`enabled`, RetinueShell/3: the current endpoint's own health switch, set in the shell's editor — off, nothing is read or sent for that server, a sync asked for is `skipped` with reason `disabled`, and the card shows one line and *Edit endpoint* instead of the controls; an older shell omits the field and uploads for its one server); `setHealthSyncInterval(minutes)`; `setHealthAutoSync(bool)`. The shell reads the phone's Health Connect store through its Changes API and uploads what it returns, unaltered, as one JSON file per delivery by **WebDAV `PUT` to `/inbox/<name>`** — the letterbox share below, with the WebView's own client certificate and cookies — where a chamber that declares the file type in its `accepts` takes it (docs/scheduling.md); the framework knows nothing about the data. On resume the shell syncs on its own at most every `min_interval_minutes` (default 5) while `auto_on_resume` holds. From RetinueShell/4 the app's settings page has these controls, beside the endpoint's switch, and the dashboard shows none; with RetinueShell/3, Settings → Phone shell shows, only where `healthConnectAvailable()` is true, "Update health data now", the last sync (from `healthSyncStatus()` and the events), the auto-sync toggle and the interval. Every member is feature-detected (`webapp/components/shell.js`): an older shell simply shows none of it. |
@@ -1490,6 +1503,7 @@ The contract the two sides share (web side: `webapp/components/shell.js`):
 | Cold wake | With no page loaded the shell loads `/?wake=1`; the home treats it as a wake and drops the flag from the address. A wake should reach the page once it is resumed; one that arrives while the page is hidden still waits (up to 60 s) for it to come to the front before the mic opens. |
 | Speech output | A `speechSynthesis` / `SpeechSynthesisUtterance` stand-in over the native TTS when the WebView has none; `webapp/components/speech.js` is unchanged. |
 | Phone calls (RetinueShell/6) | `placeCall(number)` on `window.RetinueShell`: the shell calls the number without a tap (`ACTION_CALL`, on speakerphone — the user may not be holding the phone) when *Call directly by voice* is on for the endpoint (a switch per endpoint, in the app's settings under *This app with <endpoint>* → *Phone calls*, off for a new endpoint), Android's phone-call permission is granted, and a voice conversation is engaged (`setVoiceActive(true)`) — never outside one, so no page can dial behind the user's back. The shell normalises the number (separators, a leading `tel:` and the `(0)` of `+44 (0)20` dropped); it must then be an optional `+` followed by digits, `*` and `#`, with 3 to 20 digits and at most 32 characters. It answers with a `retinue-shell` event `{type: "call", state, reason?, number?}`: `placed` (with `number`); `dialer` — the dialer opened with the number instead (with `number`), for an emergency number (Android lets no app call those directly; `reason: "emergency"`), a service code — any number with `*` or `#`, which always opens the dialer (`service-code`) —, with the switch off (`disabled`) or without the permission (`no-permission`); or `refused` (`invalid-number`, `not-in-voice`, `no-telephony`, or `failed` with `number`). An empty string is answered `refused` / `invalid-number`; `placeCall()` and `placeCall(null)` send nothing. The web side (`shell.js`: `canPlaceCall`, `placeCall`, `onCall`) uses it only for the call directive of the continuous loop's own answer (above), and lets the voice flag go on any answer, whatever its state. |
+| Chamber apps (RetinueShell/7) | The shell lists the endpoint's chamber apps (`GET /apps/index.json`) on a screen of its own and opens one in its WebView, the dashboard a tap away (`docs/chamber-apps.md`). On `window.RetinueShell`: `speak(text, lang, id)` — native text-to-speech, answered by a `retinue-shell` event `{type: "speak", id, state: "done" \| "error"}`; `notify(title, body)` — an immediate notification while the page is open; `remindersChanged()` — the app changed its reminders, so the shell fetches `GET /apps/api/schedule?arm=1` again and re-arms its local alarms. The shell arms each reminder occurrence as an Android alarm, shows it with *In 15 min* and *Skip today*, confirms it (`POST …/delivered`) so the server does not push it a second time, and opens the app's deep link on a tap. `webapp/apps/retinue.js` feature-detects every member; the dashboard's own pages use none of them. |
 | Files | A file the WebView cannot show (a PDF, anything served as `attachment`) reaches the shell's download listener, which follows the `Content-Disposition` as a browser does. `inline` — a PDF row's name link (`?inline=1`; images and text open in the dashboard's file viewer, see "Attachments") — means *view*: the shell opens it in the phone's app for the type from a private copy, so no copy lands in Downloads (none installed: it saves it there and says so). Anything else — the ↓ link — is saved to Downloads. The name is the header's (`filename*`, then `filename`); the attachment URL ends in it too (see "Attachments"). |
 
 ### Shell actions: typing on a paired device
