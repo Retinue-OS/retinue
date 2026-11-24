@@ -11904,7 +11904,8 @@ def _contact_file_card(handle: tuple[str, str], card: dict, *, name: str, sphere
     Raises contacts.ContactError, whose status is the HTTP answer."""
     current = _CONTACTS.get(card["person"]) if card.get("person") else None
     if not name:
-        if current and _CONTACTS.find(*handle) and _CONTACTS.find(*handle)["iri"] == current["iri"]:
+        owner = _CONTACTS.find(*handle, exact=True) if current else None
+        if owner and owner["iri"] == current["iri"]:
             return _CONTACTS.update(current["key"], remove=[handle]), "unlink a handle of"
         return None, ""
     target = None
@@ -11913,13 +11914,16 @@ def _contact_file_card(handle: tuple[str, str], card: dict, *, name: str, sphere
         if target is None:
             raise contacts_mod.ContactError(f"no contact {person!r}", 404)
     else:
-        target = current or _CONTACTS.find(*handle)
+        # The owner of the handle itself (exact): a person whose e-mail domain
+        # merely covers the address does not own it, and filing the card must
+        # not rename them or move anything off them.
+        target = current or _CONTACTS.find(*handle, exact=True)
     if target is None:
         if not chamber:
             raise contacts_mod.ContactError("chamber is required: which chamber stores this contact?")
         return _CONTACTS.create(chamber, name, [handle], sphere=sphere, tags=tags, vip=bool(vip),
                                 instruction=instruction or None), "add"
-    owner = _CONTACTS.find(*handle)
+    owner = _CONTACTS.find(*handle, exact=True)
     if owner and owner["iri"] != target["iri"]:
         # The handle moves: the person it leaves is written — and committed — too.
         _contact_changed(_CONTACTS.update(owner["key"], remove=[handle]), "move a handle off")
@@ -11948,7 +11952,9 @@ def _chat_autolink(chat_id: str, doc: dict | None = None, *, profile: dict | Non
     if handle is None:
         return None
     try:
-        record = _CONTACTS.find(*handle)
+        # Exact, as the rule above says: a domain that covers a mail peer's
+        # address says who wrote, not whose address it is.
+        record = _CONTACTS.find(*handle, exact=True)
     except Exception:  # noqa: BLE001 - an unreadable address book leaves the chat a handle
         return None
     if record is None:
@@ -12203,7 +12209,7 @@ def _contacts_migrate() -> int:
             left += 1
             continue
         try:
-            record = _CONTACTS.find(*handle) or _CONTACTS.create(
+            record = _CONTACTS.find(*handle, exact=True) or _CONTACTS.create(
                 default, card["name"], [handle], sphere=card.get("sphere"),
                 tags=card.get("tags") or (), created=card.get("at"))
         except contacts_mod.ContactError as exc:

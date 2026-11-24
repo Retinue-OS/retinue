@@ -7,8 +7,10 @@ declared, the opt-out, a declared path that would leave its chamber); handles of
 messenger accounts) and their normalization, a handle filed in an older spelling
 among them; the Telegram user id filed next to a name, and its backfill; lookup
 by handle, phone and name; the uniqueness of accounts and addresses; lossless rewrites that keep lines the
-module did not write; the standing instruction and its projection into the
-gate; the CLI; and the best-effort commit in the chamber repo.
+module did not write; e-mail domains (validation, the lookup's fallback from
+an address to the most specific domain, conflicts); the standing instruction
+and the projection into the gate, e-mail included; the CLI; and the
+best-effort commit in the chamber repo.
 
 Standalone (stdlib only):
 
@@ -92,14 +94,43 @@ def test_handles():
     assert contacts.normalize_handle("sms", "4636") == ("sms", "4636")
     # Any character the SMS gateway keeps may lead, as long as a letter follows.
     assert contacts.normalize_handle("sms", ".HBL") == ("sms", ".HBL")
+    # An address is no wildcard: "*@example.org" is a domain, filed as one.
+    # (Inside a local part `*` is a character like another.)
+    assert contacts.normalize_handle("email", "ma*a@example.org") == ("email", "ma*a@example.org")
     for bad in (("email", "no-at-sign"), ("sms", "not a number at all"), ("sms", "079 123 45 67"),
-                ("sms", "<b>HBL</b>"), ("sms", "12"), ("Not A Channel", "x"), ("signal", " ")):
+                ("sms", "<b>HBL</b>"), ("sms", "12"), ("Not A Channel", "x"), ("signal", " "),
+                ("email", "*@example.org"), ("email", "*@*.example.org"), ("email", "mara@*.example.org")):
         try:
             contacts.normalize_handle(*bad)
             raise AssertionError(f"accepted {bad}")
         except contacts.ContactError:
             pass
     print("ok test_handles")
+
+
+def test_domain_spelling():
+    """A domain is filed as `example.org` or `*.example.org`, lowercased; the
+    gate's spelling of the two is read as what it means; and nothing that
+    would cover more than one sender's own domain is taken."""
+    for given, filed in (("Example.ORG", "example.org"), (" *.Example.org ", "*.example.org"),
+                         ("*@example.org", "example.org"), ("*@*.example.org", "*.example.org"),
+                         ("@example.org", "example.org"), ("mail.example.co.uk", "mail.example.co.uk"),
+                         ("example.co.uk", "example.co.uk"), ("xn--mnchen-3ya.de", "xn--mnchen-3ya.de"),
+                         ("münchen.de", "münchen.de"), ("b-2.example", "b-2.example")):
+        assert contacts.normalize_domain(given) == filed, given
+    for bad in ("", " ", "*", "*.", "com", "*.com", "*@com", "co.uk", "*.co.uk", "*@*.com.au", "or.jp",
+                "ex*ample.org", "*.*.example.org", "a.*.org", "example.*", "*example.org",
+                "mara@example.org", "*@mara@example.org", "example.org.", ".example.org", "a..org",
+                "-a.org", "a-.org", "exa mple.org", "example.org/path", "<example.org>", "[127.0.0.1]",
+                "192.168.0.1", "a" * 64 + ".org", ".".join(["abcdefgh"] * 30)):
+        try:
+            contacts.normalize_domain(bad)
+            raise AssertionError(f"accepted the domain {bad!r}")
+        except contacts.ContactError:
+            pass
+    assert contacts.domain_wildcard("example.org") == "*@example.org"
+    assert contacts.domain_wildcard("*.example.org") == "*@*.example.org"
+    print("ok test_domain_spelling")
 
 
 def test_telegram_ids(chambers, manifest):
@@ -367,6 +398,156 @@ def test_hand_written_person(chambers, manifest):
     print("ok test_hand_written_person")
 
 
+def _refused(call, status: int) -> None:
+    try:
+        call()
+    except contacts.ContactError as exc:
+        assert exc.status == status, (exc, exc.status)
+    else:
+        raise AssertionError("accepted what should have been refused")
+
+
+def test_domains(chambers, manifest):
+    """A person can carry the e-mail domains they write from (kb:emailDomain).
+    The lookup of an address falls back from the address to the most specific
+    domain and marks such a hit; an address inside a domain can still be a
+    person's own; a domain belongs to one person, like a handle; and what the
+    gate is given agrees with what the lookup answers."""
+    book = contacts.ContactBook(chambers, manifest)
+    acme = book.create("work", "ACME GmbH", [("email", "office@acme.example")],
+                       domains=["ACME.example", "*@acme.example"], instruction="File the invoice.")
+    assert acme["domains"] == ["acme.example"], acme
+    text = (chambers / acme["path"]).read_text(encoding="utf-8")
+    assert f'<{acme["iri"]}> <https://w3id.org/retinue/kb#emailDomain> "acme.example" .' in text, text
+    shown = contacts.public(acme)
+    # A domain is no handle — nothing can be sent to it — and is listed apart.
+    assert shown["domains"] == ["acme.example"], shown
+    assert shown["handles"] == [{"channel": "email", "handle": "office@acme.example"}], shown
+
+    # The address itself: its holder, unmarked. Any other address there: the
+    # same person by the domain, marked, and nobody when only the exact owner
+    # is asked for.
+    hit = book.find("email", "office@acme.example")
+    assert hit["key"] == acme["key"] and "match" not in hit, hit
+    hit = book.find("email", " Billing@ACME.example ")
+    assert (hit["key"], hit["match"], hit["match_domain"]) == (acme["key"], "domain", "acme.example"), hit
+    assert book.find("email", "billing@acme.example", exact=True) is None
+    assert "match" not in book.get(acme["key"]), "the mark is on a copy, not on the book's record"
+    # A plain domain covers its own addresses only: no subdomain, no look-alike.
+    for other in ("x@eu.acme.example", "x@notacme.example", "x@acme.example.evil.org", "x@example"):
+        assert book.find("email", other) is None, other
+    # No other channel has such a fallback.
+    assert book.find("signal", "+41790000123") is None
+    assert book.find("matrix", "@x:acme.example") is None
+
+    # The most specific filing wins: the domain itself before a wildcard that
+    # also covers it, a longer wildcard before a shorter one — and a wildcard
+    # covers its own apex, as the gate reads it.
+    group = book.create("work", "ACME Group", domains=["*.acme.example"], vip=True)
+    eu = book.create("work", "ACME Europe", domains=["*.eu.acme.example"])
+    assert book.find("email", "x@acme.example")["key"] == acme["key"]
+    assert book.find("email", "x@us.acme.example")["key"] == group["key"]
+    for address in ("x@eu.acme.example", "x@de.eu.acme.example"):
+        hit = book.find("email", address)
+        assert (hit["key"], hit["match_domain"]) == (eu["key"], "*.eu.acme.example"), (address, hit)
+    assert [r["key"] for r in book.email_matches("x@de.eu.acme.example")] == [eu["key"], group["key"]]
+    assert [r["key"] for r in book.email_matches("office@acme.example")] == [acme["key"], group["key"]]
+    assert book.email_matches("x@elsewhere.example") == []
+
+    # An address inside somebody's domain is free to be a person's own, and
+    # is then that person's — exactly, with no mark.
+    jo = book.create("private", "Jo at ACME", [("email", "jo@acme.example")])
+    hit = book.find("email", "jo@acme.example")
+    assert hit["key"] == jo["key"] and "match" not in hit, hit
+    # The card's suggestions: the owner alone — or, for an address nobody
+    # holds, the person whose domain covers it, as a guess to confirm.
+    assert [(r["key"], r["exact"]) for r in book.suggest("email", "jo@acme.example")] == [(jo["key"], True)]
+    assert [(r["key"], r["exact"], r["match"]) for r in book.suggest("email", "sales@acme.example")] == [
+        (acme["key"], False, "domain")]
+    assert book.suggest("email", "x@elsewhere.example") == []
+    assert {r["key"] for r in book.search("acme.exam")} == {acme["key"], group["key"], eu["key"], jo["key"]}
+
+    # The instruction that applies to a mail is the most specific person's
+    # who carries one: an organisation's brief stands for a member the book
+    # knows by name but gives no brief of their own.
+    hit = contacts.instructed_person(book, "email", "jo@acme.example")
+    assert (hit["key"], hit["match"]) == (acme["key"], "domain"), hit
+    assert contacts.instructed_person(book, "email", "x@us.acme.example") is None, "a VIP is not a brief"
+    book.update(group["key"], instruction="Group brief.")
+    assert contacts.instructed_person(book, "email", "x@eu.acme.example")["key"] == group["key"]
+    book.update(jo["key"], instruction="Ring me.")
+    hit = contacts.instructed_person(book, "email", "JO@acme.example")
+    assert hit["key"] == jo["key"] and "match" not in hit, hit
+
+    # The projection: addresses and the domains' wildcard forms, on `email`.
+    assert contacts.policy_projection(book) == {"email": {"*@*.acme.example"}}
+    assert contacts.instruction_projection(book) == {"email": {
+        "office@acme.example", "*@acme.example", "jo@acme.example", "*@*.acme.example"}}
+    # And the gate, given exactly that, says of every sender what the lookup
+    # says: instructed where a brief is found, VIP where someone in the chain is.
+    import triage_policy
+    with tempfile.TemporaryDirectory() as tmp:
+        policy = Path(tmp) / "policy.nt"
+        policy.write_text(triage_policy.render_messenger_policy("email", triage_policy.MessengerPolicy(
+            set(), set(), set(), set(), contacts.policy_projection(book)["email"],
+            contacts.instruction_projection(book)["email"])), encoding="utf-8")
+        for sender in ("office@acme.example", "jo@acme.example", "x@acme.example", "x@us.acme.example",
+                       "x@de.eu.acme.example", "x@notacme.example", "x@acme.example.evil.org",
+                       "x@elsewhere.example"):
+            gate = triage_policy.gate_decision("email", sender, path=policy)
+            assert gate["instructed"] == (contacts.instructed_person(book, "email", sender) is not None), sender
+            assert gate["vip"] == any(r["vip"] for r in book.email_matches(sender)), sender
+
+    # A domain claimed by two people is a conflict like a handle claimed
+    # twice — in any spelling, on create and on update, and nothing is written.
+    _refused(lambda: book.create("private", "Other", domains=["acme.example"]), 409)
+    _refused(lambda: book.update(jo["key"], add_domains=["*@*.ACME.example"], name="Renamed"), 409)
+    _refused(lambda: book.update(jo["key"], domains=["*.eu.acme.example"]), 409)
+    assert book.get(jo["key"])["domains"] == [] and book.get(jo["key"])["name"] == "Jo at ACME"
+    assert not [r for r in book.all() if r["name"] == "Other"]
+    # One's own domain again is no conflict; a list replaces, then add and
+    # remove apply; None leaves them and an empty list clears them.
+    assert book.update(acme["key"], add_domains=["acme.example"])["domains"] == ["acme.example"]
+    assert book.update(acme["key"], domains=["acme.example", "acme-mail.example"])["domains"] == [
+        "acme-mail.example", "acme.example"]
+    changed = book.update(acme["key"], remove_domains=["*@acme-mail.example"], add_domains=["*.acme-pay.example"])
+    assert changed["domains"] == ["*.acme-pay.example", "acme.example"], changed
+    assert "acme-mail.example" not in (chambers / acme["path"]).read_text(encoding="utf-8")
+    for bad in ("com", "co.uk", "*.com", "sales@acme.example", "ac*me.example"):
+        _refused(lambda: book.update(acme["key"], add_domains=[bad]), 400)
+        _refused(lambda: book.create("work", "Too Wide", domains=[bad]), 400)
+    assert book.update(acme["key"], name="ACME AG")["domains"] == ["*.acme-pay.example", "acme.example"]
+    assert book.update(eu["key"], domains=[])["domains"] == []
+    assert "emailDomain" not in (chambers / eu["path"]).read_text(encoding="utf-8")
+    assert book.find("email", "x@eu.acme.example")["key"] == group["key"]
+
+    # Written by hand: a domain is read in today's spelling; a value that is
+    # none (a public suffix) is not matched on, and stays in the file; and an
+    # "address" with a wildcard in it never reaches the gate as a domain.
+    path = chambers / "work" / "contacts" / "hand-org.nt"
+    person = "<https://example.org/orgs#hand>"
+    path.write_text(
+        f'{person} <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://xmlns.com/foaf/0.1/Person> .\n'
+        f'{person} <http://xmlns.com/foaf/0.1/name> "Hand Org" .\n'
+        f'{person} <https://w3id.org/retinue/kb#emailDomain> "Hand.Example" .\n'
+        f'{person} <https://w3id.org/retinue/kb#emailDomain> "com" .\n'
+        f'{person} <http://www.w3.org/2006/vcard/ns#hasEmail> <mailto:*@wild.example> .\n',
+        encoding="utf-8")
+    hand = book.find("email", "a@hand.example")
+    assert (hand["name"], hand["domains"], hand["match"]) == ("Hand Org", ["hand.example"], "domain"), hand
+    assert book.find("email", "a@anything.com") is None
+    assert book.find("email", "a@wild.example") is None
+    book.update(hand["key"], vip=True)
+    assert '"com"' in path.read_text(encoding="utf-8"), "a line this module would not write is kept"
+    assert contacts.policy_projection(book)["email"] == {"*@*.acme.example", "*@hand.example"}
+
+    for person in (acme, group, eu, jo, hand):
+        book.delete(person["key"])
+    path.unlink()
+    assert contacts.policy_projection(book) == {} and contacts.instruction_projection(book) == {}
+    print("ok test_domains")
+
+
 def test_attention_and_vip(chambers, manifest):
     """The person carries the attention model's facts and the VIP flag, and
     the VIPs project into the delivery gate's policy."""
@@ -377,8 +558,10 @@ def test_attention_and_vip(chambers, manifest):
     text = (chambers / lou["path"]).read_text(encoding="utf-8")
     assert '<https://w3id.org/retinue/kb#importance> "4.5"^^<http://www.w3.org/2001/XMLSchema#decimal>' in text
     assert "<urn:retinue:mode:focused>" in text and '"true"^^<http://www.w3.org/2001/XMLSchema#boolean>' in text
-    handles, emails = contacts.policy_projection(book)
-    assert handles == {"telegram": {"@lou_berg"}} and emails == {"lou@example.org"}, (handles, emails)
+    # One table, channel → handles: her address is a handle of the `email`
+    # channel like any other (no second return value, no whitelist).
+    handles = contacts.policy_projection(book)
+    assert handles == {"telegram": {"@lou_berg"}, "email": {"lou@example.org"}}, handles
     for bad in ({"importance": 7}, {"importance": "high"}, {"permits": ["not a mode!"]}):
         try:
             book.update(lou["key"], **bad)
@@ -388,7 +571,7 @@ def test_attention_and_vip(chambers, manifest):
     lou = book.update(lou["key"], importance=None, permits=[], vip=False)
     assert (lou["importance"], lou["permits"], lou["vip"]) == (None, [], False), lou
     assert "kb#vip" not in (chambers / lou["path"]).read_text(encoding="utf-8")
-    assert contacts.policy_projection(book) == ({}, set())
+    assert contacts.policy_projection(book) == {}
     book.delete(lou["key"])
     # A handle filed before a normalization rule existed projects in its
     # current form — the one the gateway compares against.
@@ -396,7 +579,7 @@ def test_attention_and_vip(chambers, manifest):
     path = chambers / old["path"]
     path.write_text(path.read_text(encoding="utf-8").replace('"@old_filing"', '"41791234567@s.whatsapp.net"')
                     .replace('"telegram"', '"whatsapp"'), encoding="utf-8")
-    handles, _ = contacts.policy_projection(book)
+    handles = contacts.policy_projection(book)
     assert handles == {"whatsapp": {"+41791234567"}}, handles
     book.delete(old["key"])
     print("ok test_attention_and_vip")
@@ -404,9 +587,9 @@ def test_attention_and_vip(chambers, manifest):
 
 def test_instruction(chambers, manifest):
     """A person carries the user's standing instruction (kb:instruction): kept
-    in their file, projected into the gate as the `instructed` class by their
-    messenger handles alone, and found again from a handle the way the gate
-    matched it."""
+    in their file, projected into the gate as the `instructed` class by every
+    handle they have, e-mail included, and found again from a handle the way
+    the gate matched it."""
     book = contacts.ContactBook(chambers, manifest)
     brief = "Draft a reply to every message.\nRing me only if a visit moves to today."
     spitex = book.create("work", "Spitex Team", [("signal", "+41790000077"), ("email", "team@spitex.example")],
@@ -415,15 +598,18 @@ def test_instruction(chambers, manifest):
     assert contacts.public(spitex)["instruction"] == brief
     text = (chambers / spitex["path"]).read_text(encoding="utf-8")
     assert '<https://w3id.org/retinue/kb#instruction> "Draft a reply to every message.\\nRing me' in text, text
-    # Not a VIP: the instruction is its own class, and the e-mail address is
-    # not whitelisted by it.
-    assert contacts.policy_projection(book) == ({}, set())
+    # Not a VIP: the instruction is its own class.
+    assert contacts.policy_projection(book) == {}
     projected = contacts.instruction_projection(book)
-    assert projected == {"signal": {"+41790000077"}, "sms": {"+41790000077"}}, projected
+    assert projected == {"signal": {"+41790000077"}, "sms": {"+41790000077"},
+                         "email": {"team@spitex.example"}}, projected
     # The lookup matches as the gate does — the projected form, any case.
     assert contacts.instructed_person(book, "signal", "+41 79 000 00 77")["key"] == spitex["key"]
     assert contacts.instructed_person(book, "sms", "0041790000077")["key"] == spitex["key"]
     assert contacts.instructed_person(book, "whatsapp", "+41790000077") is None
+    assert contacts.instructed_person(book, "email", " Team@Spitex.example ")["key"] == spitex["key"]
+    assert contacts.instructed_person(book, "email", "other@spitex.example") is None
+    assert contacts.instructed_person(book, "email", "not an address") is None
     # A handle filed before a normalization rule still finds its person.
     old = book.create("work", "Old Filing", [("telegram", "@old_filing")], instruction="Flag everything.")
     path = chambers / old["path"]
@@ -473,15 +659,20 @@ def test_cli(chambers, manifest):
     upd = run("update", eva["id"], "--add-email", "eva@work.example", "--remove-handle", "whatsapp:+41790000001")
     assert {h["channel"] for h in upd["handles"]} == {"email", "sms"}, upd
     run("add", "--chamber", "elsewhere", "--name", "X", code=2)
-    # --vip projects the person's handles into the gate's policy files.
+    # --vip projects the person's handles into the gate's policy files: her
+    # addresses are VIP handles of the `email` channel, in the mail gateway's
+    # policy file — and no longer whitelist entries in the e-mail policy.
     vip = run("update", eva["id"], "--vip", "--importance", "4", "--permit", "focused")
     assert vip["vip"] is True and vip["importance"] == 4 and vip["permits"] == ["focused"], vip
-    policy = (Path(env["TRIAGE_EMAIL_WHITELIST_PATH"])).read_text(encoding="utf-8")
-    assert '"eva@example.org"' in policy and "email-whitelist:contacts" in policy, policy
+    mail = Path(env["TRIAGE_MESSENGER_DIR"]) / "email" / "policy" / "policy.nt"
+    for address in ("eva@example.org", "eva@work.example"):
+        assert ('<urn:retinue:triage:email:contacts> <https://w3id.org/retinue/kb#triageVipHandle> '
+                f'"{address}" .') in mail.read_text(encoding="utf-8"), mail.read_text(encoding="utf-8")
+    assert Path(env["TRIAGE_EMAIL_WHITELIST_PATH"]).read_text(encoding="utf-8") == ""
     sms = Path(env["TRIAGE_MESSENGER_DIR"]) / "sms" / "policy" / "policy.nt"
     assert '"+41790000000"' in sms.read_text(encoding="utf-8")
     run("update", eva["id"], "--no-vip", "--importance", "", "--no-permits")
-    assert '"eva@example.org"' not in Path(env["TRIAGE_EMAIL_WHITELIST_PATH"]).read_text(encoding="utf-8")
+    assert '"eva@example.org"' not in mail.read_text(encoding="utf-8")
     # An instruction, given to a team at once: one update, several ids, and
     # the gate learns each member's handles as `instructed`.
     max_ = run("add", "--chamber", "work", "--name", "Max Weber", "--handle", "signal:+41790000002")
@@ -494,6 +685,10 @@ def test_cli(chambers, manifest):
     nt = signal.read_text(encoding="utf-8")
     assert '<https://w3id.org/retinue/kb#triageInstructedHandle> "+41790000002"' in nt, nt
     assert "kb#triageVipHandle" not in nt, "an instruction does not make anyone a VIP"
+    # The instruction reaches e-mail: Eva's addresses are instructed handles.
+    nt = mail.read_text(encoding="utf-8")
+    assert '<https://w3id.org/retinue/kb#triageInstructedHandle> "eva@example.org"' in nt, nt
+    assert "kb#triageVipHandle" not in nt, nt
     # A name or a handle belongs to one person; contradictory flags are
     # refused; an unknown id changes nobody.
     run("update", eva["id"], max_["id"], "--name", "Twins", code=2)
@@ -502,6 +697,38 @@ def test_cli(chambers, manifest):
     assert run("show", eva["id"])["instruction"] == lea["instruction"]
     assert run("update", eva["id"], max_["id"], "--no-instruction")[0]["instruction"] is None
     assert "triageInstructedHandle" not in signal.read_text(encoding="utf-8")
+    assert "triageInstructedHandle" not in mail.read_text(encoding="utf-8")
+    # Domains: filed with --add-domain (on add also --domain), in either
+    # spelling; an address nobody holds is then found by its domain, marked;
+    # and the gate gets the wildcard forms.
+    org = run("add", "--chamber", "work", "--name", "ACME GmbH", "--add-domain", "ACME.example",
+              "--domain", "*@*.acme-pay.example", "--vip")
+    assert org["domains"] == ["*.acme-pay.example", "acme.example"] and org["handles"] == [], org
+    hits = run("find", "--email", "Billing@acme.example")
+    assert [(h["id"], h["match"], h["match_domain"]) for h in hits] == [(org["id"], "domain", "acme.example")], hits
+    hit = run("find", "--email", "eva@example.org")[0]
+    assert hit["match"] == "exact" and "match_domain" not in hit, hit
+    run("find", "--email", "x@eu.acme.example", code=1)
+    assert run("find", "--name", "acme-pay")[0]["id"] == org["id"]
+    plain = subprocess.run(CLI + ["--chambers-dir", str(chambers), "--manifest", str(manifest),
+                                  "find", "--email", "billing@acme.example"], capture_output=True, text=True, env=env)
+    assert "[by the domain acme.example, not this address]" in plain.stdout, plain.stdout
+    assert "email-domain:acme.example" in plain.stdout, plain.stdout
+    nt = mail.read_text(encoding="utf-8")
+    for wildcard in ("*@acme.example", "*@*.acme-pay.example"):
+        assert f'<https://w3id.org/retinue/kb#triageVipHandle> "{wildcard}" .' in nt, nt
+    upd = run("update", org["id"], "--remove-domain", "*.acme-pay.example", "--add-domain", "mail.acme.example")
+    assert upd["domains"] == ["acme.example", "mail.acme.example"], upd
+    assert "acme-pay" not in mail.read_text(encoding="utf-8")
+    # Refused: a public suffix, a wildcard typed as an address, a domain
+    # somebody already has, and a domain for several people at once.
+    run("update", org["id"], "--add-domain", "co.uk", code=2)
+    run("update", org["id"], "--add-email", "*@acme.example", code=2)
+    run("add", "--chamber", "work", "--name", "Rival", "--add-domain", "*@ACME.example", code=2)
+    run("update", org["id"], max_["id"], "--add-domain", "team.example", code=2)
+    assert run("show", org["id"])["domains"] == ["acme.example", "mail.acme.example"]
+    run("delete", org["id"])
+    assert "acme" not in mail.read_text(encoding="utf-8")
     print("ok test_cli")
 
 
@@ -541,10 +768,12 @@ def main():
         chambers, manifest = _setup(tmp)
         test_locations(chambers, manifest)
         test_handles()
+        test_domain_spelling()
         test_telegram_ids(chambers, manifest)
         test_telegram_backfill(chambers, manifest)
         test_create_find_update(chambers, manifest)
         test_hand_written_person(chambers, manifest)
+        test_domains(chambers, manifest)
         test_attention_and_vip(chambers, manifest)
         test_instruction(chambers, manifest)
         test_cli(chambers, manifest)

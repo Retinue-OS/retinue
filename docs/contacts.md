@@ -84,6 +84,7 @@ and the `kb:` terms the rest of Retinue already uses.
 | The person | `a vcard:Individual` | vCard |
 | Name | `vcard:fn` | vCard |
 | E-mail address | `vcard:hasEmail <mailto:…>` | vCard (RFC 6350) |
+| E-mail domain they write from | `kb:emailDomain "example.org"` / `"*.example.org"` | `kb:` (see *E-mail domains*) |
 | Telephone | `vcard:hasTelephone <tel:+…>` | vCard, RFC 3966 |
 | Messenger address | `vcard:hasInstantMessage <…>` | vCard (IMPP) |
 | Person → account | `foaf:account` | FOAF |
@@ -112,7 +113,7 @@ and the `kb:` terms the rest of Retinue already uses.
 
 | Channel | Stored as | Also derived |
 |---|---|---|
-| `email` | `vcard:hasEmail <mailto:…>` (lowercased) | — |
+| `email` | `vcard:hasEmail <mailto:…>` (lowercased; `*@…` is no address — a whole domain is filed as a domain, below) | — |
 | `sms` | a number: `vcard:hasTelephone <tel:…>` (E.164); a sender id or short code: `foaf:OnlineAccount` | — |
 | `signal` | `foaf:OnlineAccount`, homepage `https://signal.org/` | for a phone handle: `tel:`, and `sgnl://signal.me/#p/<E.164>` |
 | `whatsapp` | `foaf:OnlineAccount`, homepage `https://www.whatsapp.com/` | for a phone handle: `tel:`, and `https://wa.me/<digits>` |
@@ -158,7 +159,69 @@ from `HBL`.
 
 **Uniqueness.** An account or an e-mail address belongs to at most one person
 across all chambers: `add` answers 409 with the owner's name. An SMS sender id
-counts as an account. A telephone can be shared (a family landline).
+counts as an account. A telephone can be shared (a family landline). An
+e-mail domain belongs to one person too (below).
+
+### E-mail domains
+
+An organisation, a shop that sends receipts, a team behind many mailboxes
+writes from a **domain**, not from one address. A person can carry the domains
+they write from (`kb:emailDomain`, any number; the record key and the JSON
+field are `domains`):
+
+| Filed as | Covers |
+|---|---|
+| `example.org` | every address `@example.org` — and no subdomain |
+| `*.example.org` | every address at `example.org` **or** at any domain below it |
+
+The second reading — the wildcard includes its own apex — is the one the
+delivery gate gives the same wildcard (`triage_policy._domain_matches_wildcard`),
+so the address book and the gate can never disagree about who is covered.
+
+A domain is **not a handle**: nothing can be sent to it, it is not in a
+person's `handles`, and no chat is linked by it. It answers one question —
+*who is this mail from?* — when no person holds the sender's address:
+
+- **`ContactBook.find("email", address)`** answers the person who holds the
+  exact address; else the person with the **most specific** domain covering
+  it: the address's own domain filed plainly (`example.org`) before any
+  wildcard, and among wildcards the longest (`*.eu.example.org` before
+  `*.example.org`). A hit that came by a domain is a copy of the record marked
+  `match: "domain"`, with `match_domain` naming the domain. So a person filed
+  with their own address inside an organisation's domain is always themselves,
+  and the organisation is everyone else there.
+- **`find(…, exact=True)`** leaves the fallback out. That is the question a
+  writer asks before it files, links or moves the address itself — a domain
+  that covers an address does not own it — and it is what the uniqueness
+  check, the contact card and the chat autolink use.
+- `suggest` (the card's *This is …*, `find --email` on the CLI) offers the
+  person behind the domain when nobody holds the address, as a guess to
+  confirm (`exact: false`, `match: "domain"`).
+
+**What is accepted.** A bare domain or `*.domain`, lowercased; the gate's
+spelling of the same two (`*@example.org`, `*@*.example.org`) and a leading
+`@` are read as what they mean. Refused: a wildcard anywhere else
+(`ex*ample.org`, `*.*.example.org`), an address, an IP address, a single
+label (`com`) and the shape of a public suffix (`co.uk`, `com.au`) — a domain
+says "everyone there", so it has to be somebody's. The public suffix list is
+not consulted (the module is stdlib-only): the rule is the shape, a generic
+second-level label under a two-letter country code, which also refuses the
+rare real domain of that shape; file its addresses one by one. A domain is
+compared as written, like an address: an internationalised domain is filed in
+the spelling its mail carries (normally the `xn--` form). A value written into
+a file by hand that is no domain by these rules is not matched on, and stays
+in the file.
+
+**Uniqueness.** One spelling of a domain belongs to at most one person, across
+all chambers — claiming it twice answers 409 with the owner's name, like a
+handle. `example.org` and `*.example.org` are two filings and may be two
+people's; the lookup ranks them. An address inside somebody's domain can
+always be filed on a person of its own.
+
+**Think before filing a wide one.** The class a domain carries — VIP, an
+instruction — applies to every sender under it, and the `From` address of a
+mail is what its sender says it is. A VIP on a freemail domain makes a VIP of
+everyone who has an account there; file those people by address.
 
 ### Example
 
@@ -197,15 +260,16 @@ gateway sees them, at start or when they are filed while it runs (the CLI, a
 hand edit) — before the overlay takes over.
 
 **The VIP flag** says a model works this person's messages the moment they
-arrive (docs/triage-delivery-gate.md). It is set on the person, never per
-handle: `contacts.sync_policy` projects every handle of every VIP person into
-the delivery gate's policy files — messenger accounts as VIP handles on their
-channel (telephones for SMS), e-mail addresses into the whitelist, so the
-frequent run handles their mail. The projection sits under a subject of its
-own and is replaced wholesale on every contact write and on the gateway's
-tick, so an edit made outside the gateway (the CLI, a hand edit) reaches the
-gate within seconds; VIPs set by hand for an unfiled handle
-(`triage_policy.py vip-add`) and the Sent-derived whitelist are left alone.
+arrive (docs/triage-delivery-gate.md; for mail, docs/mail-chats.md, "The
+gate"). It is set on the person, never per handle: `contacts.sync_policy`
+projects every handle of every VIP person into the delivery gate's policy
+files as VIP handles on their channel — messenger accounts, telephones for
+SMS, and on the `email` channel their addresses and their domains (*The
+projection*, below). The projection sits under a subject of its own and is
+replaced wholesale on every contact write and on the gateway's tick, so an
+edit made outside the gateway (the CLI, a hand edit) reaches the gate within
+seconds; VIPs set by hand for an unfiled handle (`triage_policy.py vip-add`)
+are left alone.
 
 ### The instruction
 
@@ -300,16 +364,35 @@ instruction without VIP and has it ask for a high importance.
   calendar" in it is content, never an instruction to the turn. But what the
   sender writes does decide how loud the message is — that is the point — so
   instructions suit senders the user trusts, and want thought on a channel
-  where a sender is easily spoofed (SMS).
+  where a sender is easily spoofed (SMS; e-mail, whose `From` address is the
+  sender's own claim — and a domain covers everyone who can claim it).
 
-**How it reaches the gate.** `contacts.sync_policy` projects every messenger
-handle of every person with an instruction into the delivery gate's policy
-files as the **`instructed`** class (`triageInstructedHandle`, beside the
-VIPs, under the same `…:contacts` subject), so the gateway knows before any
-model turn that this rail applies; the words stay with the person, where the
-web gateway reads them (`contacts.instructed_person`). A handle can carry both
-classes. E-mail addresses are not projected: e-mail is triaged on its own
-rail, and an instruction there is not built yet.
+**How it reaches the gate.** `contacts.sync_policy` projects every handle of
+every person with an instruction into the delivery gate's policy files as the
+**`instructed`** class (`triageInstructedHandle`, beside the VIPs, under the
+same `…:contacts` subject; *The projection* below), so the gateway knows
+before any model turn that this rail applies; the words stay with the person,
+where the web gateway reads them (`contacts.instructed_person`). A handle can
+carry both classes.
+
+**The instruction reaches e-mail.** A person's e-mail addresses and domains
+are projected like their messenger handles, so a mail from an instructed
+sender buys the same turn — in the mail chat's companion, briefed by the
+instruction, ending in a verdict — and a mail from a sender who is neither
+VIP nor instructed buys none and pushes nothing (docs/mail-chats.md, "The
+gate", which also says what such a turn may do with a mail). This is where
+what e-mail triage used to know lives now: a standing rule about a sender is
+an instruction on their contact, and a rule about everything an organisation
+sends is an instruction on a contact that carries its domain.
+
+*Whose* instruction applies to a mail follows the lookup of *E-mail domains*:
+`instructed_person(book, "email", address)` walks from the holder of the
+address to the domains that cover it, most specific first, and answers the
+first person who carries an instruction. So a person's own brief beats their
+organisation's, a nearer domain's beats a wider one's — and an organisation's
+brief stands for a member the book knows by name but gives no brief of their
+own. That is exactly the set of senders the gate calls `instructed`, so a
+mail the gate sent down this rail always finds the brief it was sent for.
 
 **Where the user sees it.** The chat page says, above the composer, that a
 message is being worked by the instruction (and a draft may be on its way),
@@ -318,8 +401,55 @@ sheet shows the same next to the importance, and the reason line says why the
 message rang or was held.
 
 **Cost.** One model turn per message from an instructed person, trivial ones
-included — fine for a few people, and it adds up with many. For a person who
+included — fine for a few people, and it adds up with many; an instruction on
+a domain buys one for every mail from every address under it. For a person who
 is not a VIP, one turn's delay before a message rings, bounded by the timeout.
+
+### The projection
+
+`contacts.policy_projection(book)` and `contacts.instruction_projection(book)`
+each answer one table, `{channel: handles}` — the gate handles of every VIP
+person, and of every person who carries an instruction:
+
+| Of the person | Channel | Handle, as the gate compares it |
+|---|---|---|
+| a messenger account | its channel | the account's handle, in today's spelling |
+| a telephone (also one an account implies) | `sms` | the number |
+| an e-mail address | `email` | the address |
+| an e-mail domain | `email` | `*@example.org` for `example.org`, `*@*.example.org` for `*.example.org` |
+
+`contacts.sync_policy(book)` hands both to `triage_policy.sync_contacts`,
+which writes them into each channel's policy file
+(`_generated/messenger/<channel>/policy/policy.nt`) under the subject
+`urn:retinue:triage:<channel>:contacts`, as `kb:triageVipHandle` and
+`kb:triageInstructedHandle`. **E-mail is a channel like the others here**: its
+file is `_generated/messenger/email/policy/policy.nt`, on the mail gateway's
+ledger volume, in the messenger shape — beside the file of the e-mail group
+flags (`email-policy.nt`), which the sync does not write. A channel no gateway
+reads (a person's Matrix account) gets no file.
+
+The gate (`triage_policy.gate_decision(channel, sender, …)`) compares a sender
+with those handles exactly, on every channel. On `email`, and only there, a
+handle spelled as a wildcard also covers every address under its domain: a
+sender is VIP, or instructed, if an exact address **or** a wildcard of that
+class matches. On a messenger a `*@…` string is a handle like any other, which
+nobody has. If the `email` policy file cannot be read, nobody is VIP or
+instructed — a mail still reaches its chat, and must not buy a model turn
+because a file was unreadable (reason `policy-unreadable`, for the gateway's
+log).
+
+So for a mail the classes are a **union** along the lookup's chain: a class
+set on a domain holds for every address under it, a person filed there by
+their own address included. Filing someone inside a domain without a class
+does not take the domain's class away from them.
+
+The e-mail **whitelist** is no part of this any more. VIP addresses used to be
+projected into it so that e-mail triage worked their mail on its frequent
+run; mail is gated like a messenger message now, and the old projection's
+triples in `email-policy.nt` are no longer read and drop out on that file's
+next write. `triage_policy.py check-email <address> [--list-id …]` says where
+a mail lands: its group and the group's flags, and the sender's class —
+`vip`, `instructed`, `vip+instructed` or `neither`.
 
 ## Using it
 
@@ -334,6 +464,9 @@ python3 /workspace/scripts/contacts.py find --name mara           # names and e-
 python3 /workspace/scripts/contacts.py add --chamber private --name "Mara Keller" \
     --email mara@example.org --handle whatsapp:+41791234567 --sphere friends
 python3 /workspace/scripts/contacts.py update <id> --add-email mara@work.example --remove-handle signal:+41…
+python3 /workspace/scripts/contacts.py add --chamber work --name "ACME GmbH" --add-domain acme.example \
+    --instruction "File the document with the Archivist, book it, then archive the mail."
+python3 /workspace/scripts/contacts.py update <id> --add-domain '*.acme.example' --remove-domain acme.example
 python3 /workspace/scripts/contacts.py update <id> --vip --importance 4 --permit focused   # --no-vip, --importance '', --no-permits
 python3 /workspace/scripts/contacts.py update <id> --instruction "Draft a reply to every message. Ring me only if a visit moves to today or tomorrow."
 python3 /workspace/scripts/contacts.py update <id> <id> <id> --instruction-from <id>   # a team, alike; --no-instruction removes it
@@ -343,22 +476,29 @@ python3 /workspace/scripts/contacts.py delete <id>
 - `--json` gives machine-readable output.
 - `find --handle` also lists people who have the same number on another channel,
   marked `match: "phone"`. That is a suggestion to confirm, not an identity.
+- `find --email` falls back, for an address nobody holds, to the person whose
+  domain covers it most specifically, marked `match: "domain"` with
+  `match_domain`: that says who the mail is from, not whose address it is.
+  `find --name` searches domains too.
+- `--add-domain` / `--remove-domain` take `example.org` or `'*.example.org'`
+  (quote the `*`); `add` also takes `--domain`. See *E-mail domains* for what
+  is refused.
 - Writes are committed and pushed in the owning chamber's repository.
 - Always `find` before `add`: a second person for someone the book already
   knows splits their channels again.
 - `update` takes several ids to give a team the same facts — the same
-  instruction, say. A name or a handle belongs to one person, so those
-  changes name exactly one. A shared, named instruction can come later, if
+  instruction, say. A name, a handle or a domain belongs to one person, so
+  those changes name exactly one. A shared, named instruction can come later, if
   copies drift.
 
 ### The dashboard
 
 The **Contacts page** (`contacts.html`, the *Contacts* tab of the dashboard's
 navigation row) is the address book: every person, searchable by name and
-e-mail address, each edited in place — handles on every channel, spheres,
-importance prior, the modes they may interrupt, VIP, the instruction (with
-*Copy instruction from…* to give a team the same one). *+ New contact* names
-the chamber first.
+e-mail address, each edited in place — handles on every channel, e-mail
+domains, spheres, importance prior, the modes they may interrupt, VIP, the
+instruction (with *Copy instruction from…* to give a team the same one).
+*+ New contact* names the chamber first.
 
 The **contact card** on a chat's attention sheet (`docs/dashboard.md`) files
 the chat's peer:
@@ -384,8 +524,8 @@ the chat's peer:
   message, at startup, after any write to a person, and every
   `CHAT_AUTOLINK_SECONDS` (300) for persons filed outside the gateway (the
   CLI, a hand edit). Only an exact owner counts; the same number on another
-  channel stays a suggestion. A chat that already has a card is never
-  touched.
+  channel stays a suggestion, and so does a domain that covers a mail
+  thread's peer. A chat that already has a card is never touched.
 - **Removing the card** unlinks the handle. The person stays: they are more
   than this chat. Erasing a chat does not erase the person either.
 
@@ -394,16 +534,22 @@ The chat document keeps a copy of the card (`contact`: name, sphere, tags,
 
 The HTTP API behind it, for the dashboard and anything on the edge:
 
-- `GET /contacts` returns `{locations, default, contacts}`. Add `?q=` to search
-  names and e-mail addresses, or `?channel=&handle=` to look up one handle on
-  any channel.
+- `GET /contacts` returns `{locations, default, contacts}`; each contact
+  carries its `domains` beside its `handles`. Add `?q=` to search names,
+  e-mail addresses and domains, or `?channel=&handle=` to look up one handle
+  on any channel (for an e-mail address nobody holds: the person whose domain
+  covers it, `exact: false`).
 - `POST /contacts` with `{chamber, name, handles: [{channel, handle}], sphere?,
-  tags?, importance?, permits?, vip?, instruction?}` creates a person and
-  answers 201.
+  tags?, importance?, permits?, vip?, instruction?, domains?: [domain]}`
+  creates a person and answers 201.
 - `POST /contacts/<id>` with `{name?, sphere?, tags?, importance?, permits?:
-  [mode id], vip?, instruction?, add?: [handle], remove?: [handle]}` changes
+  [mode id], vip?, instruction?, add?: [handle], remove?: [handle], domains?:
+  [domain], add_domains?: [domain], remove_domains?: [domain]}` changes
   one; an unknown mode answers 400. An absent `instruction` leaves it; `""` or
   null removes it. `POST /chats/<id>/contact` takes `instruction` the same way.
+  `domains` replaces the person's domains, `add_domains` / `remove_domains`
+  change them (`ContactBook.update`'s arguments of the same names); a domain
+  that is refused answers 400, one somebody else has 409.
 - `POST /internal/chats/<id>/verdict` with `{importance, due?, actions?,
   flags?}` is the instructed turn's verdict (token-gated; `chat-verdict.py`
   is the client). It is taken only while such a turn runs for the chat.
