@@ -188,9 +188,14 @@ sorts anything; it supplies judgement:
 
 It runs from the scheduler through **`scripts/news-curate.py`**, a `command` job
 (so the scheduler spends no credits invoking it) whose gate is a file read: no
-unscored items and no new feedback means **nothing is spawned**. The feedback
-cursor only advances after a clean run, so a crashed session re-reads its input
-instead of losing it.
+unscored items and no new feedback means **nothing is spawned**. The session is
+started with `--add-dir` on the news directory, which lies outside its working
+directory: without it the Herald's reads of the payload are denied. A run counts
+as successful only when it exits cleanly **and** at least one of the items it
+handed over comes back scored; a clean exit that scored nothing exits 1, so the
+scheduler shows the job as failing instead of reporting it ok. The feedback
+cursor only advances after a successful run, so a failed session re-reads its
+input instead of losing it.
 
 Base schedule (`.schedule.json`): `news-fetch` hourly, `news-curate` hourly.
 

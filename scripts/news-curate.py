@@ -61,6 +61,15 @@ def unscored_items(limit: int) -> list[dict]:
     return pending[:limit]
 
 
+def count_scored(ids: list[str]) -> int:
+    """How many of the given items carry an importance now — read back from the
+    store after the session, since a clean exit says nothing about scoring."""
+    wanted = set(ids)
+    return sum(1 for i in store.load_items()
+               if i.get("id") in wanted
+               and isinstance(i.get("importance"), (int, float)))
+
+
 def build_payload(items: list[dict], feedback: list[dict]) -> dict:
     return {
         "generated": store.iso(store.now()),
@@ -122,8 +131,15 @@ def main() -> int:
     log(f"{len(items)} item(s) to score, {len(feedback)} feedback entry(ies); "
         "spawning session")
 
+    # The payload, the items and the preferences all live under NEWS_DIR, on
+    # the persistent volume outside the session's working directory. Without
+    # --add-dir the Herald's Read on them is denied; a background-dispatched
+    # Herald then (rightly) refuses to work around the denial, and the run ends
+    # cleanly having scored nothing — which is how scoring silently stopped
+    # from Claude Code 2.1.317 on.
     cmd = ["claude", "-p", "--output-format=json",
            "--permission-mode", PERMISSION_MODE,
+           "--add-dir", str(store.NEWS_DIR),
            build_prompt(path, len(items), len(feedback))]
     if CLAUDE_MODEL:
         cmd[2:2] = ["--model", CLAUDE_MODEL]
@@ -140,13 +156,23 @@ def main() -> int:
     # once, under the lock every framework spawner shares (docs/claude-auth.md).
     claude_auth.ensure_fresh_credentials(log=log)
     result = subprocess.run(cmd, cwd="/workspace", env=env)
-    if result.returncode == 0:
-        # Only advance the cursor on a clean run: a crashed session must see the
-        # same feedback again rather than lose it.
-        store.ack_feedback(cursor)
-    else:
+    if result.returncode != 0:
         log(f"curation session exited {result.returncode}; feedback left pending")
-    return result.returncode
+        return result.returncode
+    # A clean exit is not success: a session whose Herald could not read the
+    # payload exits 0 too. Items were handed over, so some must come back
+    # scored; otherwise the run fails, and the scheduler shows it.
+    if items:
+        scored = count_scored([i["id"] for i in items])
+        if scored == 0:
+            log(f"curation session exited 0 but scored none of {len(items)} "
+                "item(s); feedback left pending")
+            return 1
+        log(f"scored {scored} of {len(items)} item(s)")
+    # Only advance the cursor on a successful run: a failed session must see
+    # the same feedback again rather than lose it.
+    store.ack_feedback(cursor)
+    return 0
 
 
 if __name__ == "__main__":
