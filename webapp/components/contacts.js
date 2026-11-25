@@ -47,6 +47,9 @@ const CSS = `
   input[type=search], input[type=text], input[type=email], select, textarea {
     font: inherit; color: var(--fg, #e7ebf2); background: var(--card-2, #1c2230);
     border: 1px solid var(--line, rgba(231, 235, 242, .12)); border-radius: 10px; padding: 8px 10px; min-width: 0; }
+  /* A select is as wide as its longest option (a contact's name in "Copy
+     instruction from…"): never wider than the card. */
+  select { max-width: 100%; }
   input[type=search] { width: 100%; margin-bottom: 10px; }
   .btn { font: inherit; font-size: .84rem; color: var(--fg, #e7ebf2); background: var(--card-2, #1c2230);
          border: 1px solid var(--line, rgba(231, 235, 242, .12)); border-radius: 999px; padding: 6px 12px; cursor: pointer; }
@@ -56,6 +59,7 @@ const CSS = `
   .btn[disabled] { opacity: .5; cursor: default; }
   ul { list-style: none; margin: 0; padding: 0; display: grid; gap: 8px;
        grid-template-columns: repeat(auto-fill, minmax(min(100%, 340px), 1fr)); align-content: start; }
+  li { min-width: 0; }
   li > button.row { all: unset; display: block; width: 100%; box-sizing: border-box; cursor: pointer;
        padding: 10px 12px; border-radius: 12px; background: var(--card-2, #1c2230);
        -webkit-tap-highlight-color: transparent; }
@@ -69,13 +73,23 @@ const CSS = `
   textarea[data-set="instruction"] { width: 100%; min-height: 4.5em; resize: vertical; line-height: 1.35; }
   .meta { font-size: .76rem; color: var(--muted, #8b93a3); margin-top: 3px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .editor { background: var(--card, #151922); border: 1px solid var(--accent, #6ea8fe); border-radius: 14px;
-            padding: 12px; display: grid; gap: 12px; }
+            padding: 12px; display: grid; gap: 12px;
+            /* One column the card's width: a long handle, name or option wraps
+               inside it instead of widening the page past the screen. */
+            grid-template-columns: minmax(0, 1fr); }
+  .editor > * { min-width: 0; }
   .editor .k { font-size: .7rem; font-weight: 600; letter-spacing: .05em; text-transform: uppercase;
                color: var(--muted, #8b93a3); margin-bottom: 5px; }
   .chips { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
   .handle { display: flex; align-items: center; gap: 6px; font-size: .86rem; }
+  .handle > span { min-width: 0; overflow-wrap: anywhere; }
+  .handle .ch { flex: none; }
   .handle .ch { color: var(--muted, #8b93a3); min-width: 72px; }
   .handle .covers { color: var(--muted, #8b93a3); font-size: .76rem; }
+  /* A domain row: the domain and its ✕ on the first line, who it covers
+     below, aligned under the domain. */
+  .handle.domain { flex-wrap: wrap; row-gap: 0; }
+  .handle.domain .covers { order: 1; flex-basis: 100%; padding-left: 78px; }
   .handle .x { all: unset; cursor: pointer; color: var(--muted, #8b93a3); padding: 0 6px; }
   .add { display: flex; gap: 6px; flex-wrap: wrap; }
   .add input { flex: 1 1 160px; }
@@ -335,7 +349,7 @@ class RetinueContacts extends HTMLElement {
       `<div class="handle"><span class="ch">${esc(CHANNEL_LABEL[h.channel] || h.channel)}</span>` +
       `<span>${esc(h.handle)}</span><button class="x" data-act="drop-handle" data-v="${i}" aria-label="Remove">✕</button></div>`).join('');
     const domains = f.domains.map((d, i) =>
-      `<div class="handle"><span class="ch">Domain</span><span>${esc(d)}</span>` +
+      `<div class="handle domain"><span class="ch">Domain</span><span>${esc(d)}</span>` +
       `<span class="covers">${esc(domainCovers(d))}</span>` +
       `<button class="x" data-act="drop-domain" data-v="${i}" aria-label="Remove the domain ${esc(d)}">✕</button></div>`).join('');
     return `<div class="editor">` +
