@@ -22,18 +22,28 @@ the triage view and starts a run:
 
 | Section | What it holds | Section action |
 |---|---|---|
-| **Action suggested — see Ara** | the user should do or decide something | — (each row opens the chat on Ara's pane) |
+| **Action suggested** (*— see Ara* where follow-ups run) | the user should do or decide something | — (a row with Ara's note opens the chat on her pane) |
 | **No action — proposed archive** | nothing to do, worth keeping | **Archive all** (one Undo for the section) |
-| **No action — proposed delete** | nothing to do, nothing to keep | **Delete all** (two taps, no Undo; mails move to the Trash) |
+| **No action — proposed delete** | nothing to do, nothing to keep | **Delete all** (two taps, no Undo; a mail thread's mails move to the Trash, other chats are erased for good — the armed button says which) |
 | **Not sorted** | no word yet, a failed sorting, or a message newer than the sorting | — (the next press sorts them) |
 
 Every row is the Chats list's own row: tapping opens the chat, the swipes and
 the tray (mark read, archive, mute, spam, delete) do what they do on the
 chat's tab. Under the row stands the sorting's one-line note ("Invoice from
-the plumber, CHF 320, due 30 Nov — pay it."), and on an action chat Ara's own
-note once her follow-up lands: *Ara is looking at it…* until then. An action
+the plumber, CHF 320, due 30 Nov — pay it."). Where follow-ups are switched
+on (`CHAT_TRIAGE_FOLLOWUPS`, off by default: *The follow-up* below), an action
+chat also gets Ara's own note once her follow-up lands — *Ara is looking at
+it…* until then — the section is headed *Action suggested — see Ara*, and the
 row opens the chat on its companion pane (`chat.html?id=…&pane=ara`), where
-the note is in full and a staged reply waits in the composer.
+the note is in full and a staged reply waits in the composer. Without a
+follow-up, an action row opens the chat on its messages like any other.
+
+**Delete all** takes two taps, and the armed button counts the rows and
+says what happens to them. It is armed for the rows it was armed over: a
+poll that changes the section (a chat sorted into it while the run still
+sorts, one archived elsewhere) disarms it, and the next tap arms it again for
+what is listed then — the second tap never deletes a row the first did not
+see.
 
 The lists are there as soon as the fast pass has answered — a minute or two
 for several dozen chats — while Ara's notes are still being written; the

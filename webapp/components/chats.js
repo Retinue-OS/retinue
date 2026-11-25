@@ -119,7 +119,8 @@ const TRIAGE_URL = '/chats/triage';
 const TRIAGE_POLL_MS = 2500;
 // The view's sections, in the order shown, with what each is called.
 export const TRIAGE_SECTIONS = [
-  { id: 'action', title: 'Action suggested — see Ara' },
+  // "— see Ara" is added where follow-ups write her notes (_triageHtml).
+  { id: 'action', title: 'Action suggested' },
   { id: 'archive', title: 'No action — proposed archive' },
   { id: 'delete', title: 'No action — proposed delete' },
   { id: 'unsorted', title: 'Not sorted' },
@@ -456,6 +457,22 @@ export function listGroup(chat) {
 // "Mara") get no label: it would be the same on each and tell them apart
 // no better — the participants line and the preview do that. Computed
 // over the rows actually shown, so an unambiguous list carries none.
+// What the armed Delete of several chats says its second tap does: a mail
+// thread's mails move to the mailbox's Trash before the chat is erased, any
+// other chat is erased for good — and a mix says both.
+export function deleteManyText(chats) {
+  const n = chats.length;
+  const mails = chats.filter(isMail).length;
+  const what = mails === n ? 'Mails move to the Trash'
+    : mails === 0 ? 'For good'
+    : 'Mails move to the Trash, other chats are deleted for good';
+  return `Delete ${n} chat${n === 1 ? '' : 's'}? ${what}`;
+}
+
+// Which rows a section holds, as one key: what an armed Delete all was
+// armed over.
+const triKey = (items) => items.map((it) => it.chat.id).join('\n');
+
 // Whether triage has work open: a run sorting, or a note Ara still writes.
 export function triageBusy(doc) {
   if (!doc) return false;
@@ -1097,22 +1114,27 @@ class RetinueChats extends RetinueCard {
       if (sec.id === 'archive') {
         bulk = `<button type="button" class="tri-all archive" data-tri-all="archive">Archive all</button>`;
       } else if (sec.id === 'delete') {
-        const n = items.length;
-        const mails = items.some((it) => isMail(it.chat));
+        // Armed for the rows it was armed over: a poll that changed them
+        // (a chat sorted in while it still sorts, one gone) disarms it, so
+        // the second tap never deletes a row the first one did not see.
+        if (this._triArmed === 'delete' && this._triArmedKey !== triKey(items)) this._triArmed = '';
         bulk = this._triArmed === 'delete'
-          ? `<button type="button" class="tri-all delete confirm" data-tri-all="delete">Delete ${n} chat${
-            n === 1 ? '' : 's'}? ${mails ? 'Mails move to the Trash' : 'For good'}</button>`
+          ? `<button type="button" class="tri-all delete confirm" data-tri-all="delete">${
+            esc(deleteManyText(items.map((it) => it.chat)))}</button>`
           : `<button type="button" class="tri-all delete" data-tri-all="delete">Delete all</button>`;
       }
+      // "see Ara" only where her follow-ups write notes (CHAT_TRIAGE_FOLLOWUPS;
+      // off by default): an action row opens on her pane only when it has one.
+      const ara = sec.id === 'action' && items.some((it) => it.entry && it.entry.followup);
       const rows = items.map((it) => {
         shownIds.push(it.chat.id);
-        const href = sec.id === 'action'
+        const href = sec.id === 'action' && it.entry && it.entry.followup
           ? `/chat.html?id=${encodeURIComponent(it.chat.id)}&pane=ara` : '';
         return this._rowHtml(it.chat, listGroup(it.chat), accountsOf,
           { note: this._triageNoteHtml(it), href });
       }).join('');
       return `<section class="tri-sec ${sec.id}" aria-labelledby="tri-${sec.id}">` +
-        `<div class="tri-sec-head"><h3 id="tri-${sec.id}">${esc(sec.title)} ` +
+        `<div class="tri-sec-head"><h3 id="tri-${sec.id}">${esc(sec.title)}${ara ? ' — see Ara' : ''} ` +
         `<span class="tri-n">${items.length}</span></h3>${bulk}</div>` +
         `<ul class="list">${rows}</ul></section>`;
     }).join('');
@@ -1134,8 +1156,12 @@ class RetinueChats extends RetinueCard {
       return;
     }
     if (bucket !== 'delete') return;
-    if (this._triArmed !== 'delete') {
+    const key = triKey(this._triageSections(this._data).delete);
+    if (this._triArmed !== 'delete' || this._triArmedKey !== key) {
+      // The first tap — or a second one over rows that changed since the
+      // first: (re-)armed for what is listed now, and nothing deleted.
       this._triArmed = 'delete';
+      this._triArmedKey = key;
       this._rerender();
       return;
     }
@@ -1247,9 +1273,8 @@ class RetinueChats extends RetinueCard {
       star: '&#9733; Star', unstar: 'Unstar', spam: 'Spam', delete: 'Delete' };
     const btn = (what) => {
       if (what === 'delete' && this._bulkArmed) {
-        const mails = chats.some(isMail);
-        return `<button type="button" class="bulk delete confirm" data-bulk="delete">Delete ${n} chat${
-          n === 1 ? '' : 's'}? ${mails ? 'Mails move to the Trash' : 'For good'}</button>`;
+        return `<button type="button" class="bulk delete confirm" data-bulk="delete">${
+          esc(deleteManyText(chats))}</button>`;
       }
       return `<button type="button" class="bulk ${what}" data-bulk="${what}"${n ? '' : ' disabled'}>${LABEL[what]}</button>`;
     };
