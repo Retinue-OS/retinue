@@ -730,10 +730,13 @@ class RetinueChats extends RetinueCard {
   // Deferred actions go out, one request per chat (bounded). Each that
   // succeeded is in Archived, muted (Spam); each that failed comes back,
   // marked failed with the server's reason — and a single row's tray, with
-  // Retry, is opened.
+  // Retry, is opened. A page on its way out (`keepalive`) sends every request
+  // at once, unbounded: a bounded queue issues the next one only once an
+  // answer comes, which a page that is gone never gets.
   async _commitMany(ids, kind, keepalive = false) {
     ids.forEach((id) => this._pending.set(id, kind));
-    const outs = await eachBounded(ids, BULK_CONCURRENCY, (id) => commitChatAction(id, kind, keepalive));
+    const bound = keepalive ? ids.length : BULK_CONCURRENCY;
+    const outs = await eachBounded(ids, bound, (id) => commitChatAction(id, kind, keepalive));
     ids.forEach((id, k) => {
       this._pending.delete(id);
       const out = outs[k] || { ok: false, reason: 'No answer' };

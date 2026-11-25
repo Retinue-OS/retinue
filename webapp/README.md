@@ -312,7 +312,8 @@ docstring). Pieces:
   that writes every chat's previous state back; failures are counted
   ("Archived 5 of 7 — 2 failed") and each failed row says why. A bulk Delete
   takes two taps ("Delete 7 chats? Mails move to the Trash"); a bulk Spam is
-  deferred like a single one, and where some of it fails once the window
+  deferred like a single one — a page left in its window sends every chat's
+  request at once, with keepalive, not four at a time — and where some of it fails once the window
   ends a notice — no Undo, it waits for any Undo toast on screen — counts
   them ("Marked as spam 5 of 7 — 2 failed"). The chat page's ⋮ has **Spam** (mail only:
   handed to the list, which carries it out with its Undo) and **Delete** (two

@@ -596,6 +596,21 @@ await ok('a page hidden or left sends the waiting Spam at once, with keepalive',
   }
 });
 
+await ok('a page left with a bulk Spam waiting sends every request before any answer', async () => {
+  const many = Array.from({ length: 7 }, (_v, k) => mailChat(`mb${k}`, { unread: 1, list_group: 'unread' }));
+  const el = await mount(payload([...MIXED, ...many]));
+  el._enterSelect('mb0');
+  for (let k = 1; k < 7; k += 1) el._toggleSelect(`mb${k}`, {});
+  el._bulk('spam');
+  fireWin('pagehide');
+  // No answer comes: a page that is gone gets none.
+  const posts = wire.filter((w) => w.method === 'POST');
+  assert.equal(posts.length, 7, `${posts.length} of 7 sent`);
+  assert.ok(posts.every((w) => w.keepalive === true));
+  for (const w of posts) w.answer({ archived: true, muted: true });
+  await settle();
+});
+
 await ok('a failed Spam brings the row back with the reason and a Retry', async () => {
   const el = await mount(payload(MIXED));
   el._defer('mu', 'spam');
