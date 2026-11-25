@@ -14981,7 +14981,11 @@ CHAT_TRIAGE_FOLLOWUP_MODEL = (os.environ.get("CHAT_TRIAGE_FOLLOWUP_MODEL", "").s
 CHAT_TRIAGE_BATCH = max(1, int(os.environ.get("CHAT_TRIAGE_BATCH", "12")))
 CHAT_TRIAGE_CONCURRENCY = max(1, int(os.environ.get("CHAT_TRIAGE_CONCURRENCY", "4")))
 CHAT_TRIAGE_TIMEOUT = float(os.environ.get("CHAT_TRIAGE_TIMEOUT", "180"))
-CHAT_TRIAGE_FOLLOWUPS = max(0, int(os.environ.get("CHAT_TRIAGE_FOLLOWUPS", "20")))
+# Off by default (0): a follow-up is a full-tool turn on a correspondent's
+# words, and nothing in the backend yet holds that turn to "send nothing,
+# change no flag" — only its prompt does (docs/chat-triage.md, "Follow-ups
+# are off by default"). A deployment that accepts that sets a number here.
+CHAT_TRIAGE_FOLLOWUPS = max(0, int(os.environ.get("CHAT_TRIAGE_FOLLOWUPS", "0")))
 CHAT_TRIAGE_FOLLOWUP_CONCURRENCY = max(1, int(os.environ.get(
     "CHAT_TRIAGE_FOLLOWUP_CONCURRENCY", "2")))
 

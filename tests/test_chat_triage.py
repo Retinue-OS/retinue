@@ -237,6 +237,24 @@ def test_action_chats_get_a_bounded_followup():
         assert e["a4"]["followup"] == {"state": "skipped", "why": "over this run's limit"}
 
 
+def test_followups_off_leave_action_rows_alone():
+    """followup_max 0 (the gateway's default): an action chat is sorted and
+    keeps its note, no follow-up turn runs, and the row carries no
+    follow-up state at all (no "skipped" mark either)."""
+    with tempfile.TemporaryDirectory() as d:
+        store = ct.TriageStore(Path(d) / "t.json")
+        seen = []
+        answers = {"r1": "action", "x": "archive"}
+        r, _ = _runner(store, answers, followup=lambda c, e: seen.append(c) or "x",
+                       followup_max=0, batch_size=10)
+        r.start([{"id": k, "seq": 1} for k in answers])
+        r.join(10)
+        e = store.snapshot()["entries"]
+        assert seen == [], "no follow-up turn may run"
+        assert e["r1"]["bucket"] == "action" and e["r1"]["note"] == "note r1"
+        assert "followup" not in e["r1"], e["r1"]
+
+
 def test_no_new_run_while_followups_work():
     """Sorting is done, a follow-up still works: a press then starts
     nothing, or two turns would work one companion and the new entry would
@@ -300,6 +318,7 @@ if __name__ == "__main__":
     test_a_failed_batch_leaves_its_chats_unsorted()
     test_one_run_at_a_time()
     test_action_chats_get_a_bounded_followup()
+    test_followups_off_leave_action_rows_alone()
     test_no_new_run_while_followups_work()
     test_a_followup_never_writes_onto_a_later_runs_entry()
     test_followup_prompt_quotes_the_note_as_data()

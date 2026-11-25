@@ -129,8 +129,20 @@ words, onto the triage entry
 
 A follow-up is a full-tool turn on a correspondent's words — the same
 exposure as the user tapping *Propose* on that chat, which is what the press
-stands for. `CHAT_TRIAGE_FOLLOWUPS` (20) bounds how many one press buys; the
+stands for. `CHAT_TRIAGE_FOLLOWUPS` bounds how many one press buys; the
 rest are marked *skipped* and say so on the row.
+
+**Follow-ups are off by default** (`CHAT_TRIAGE_FOLLOWUPS=0`): the press
+then only sorts, and an action row shows the sorting's note alone, with no
+*skipped* mark. The reason: what keeps a follow-up from sending, queuing or
+setting flags is its prompt, not the backend. The turn carries no user-turn
+proof, yet a token-less `chat-flags.py` call on a messenger chat acts with
+the user's authority, and the push CLIs send or queue by the account's
+policy. Unlike a VIP's or an instructed sender's arrival turn, triage would
+run that turn on a chat from anyone — so a crafted message could do what the
+prompt forbids. Follow-ups become the default once the backend enforces a
+triage-turn capability that refuses those calls; until then a deployment
+that accepts the exposure opts in with a number.
 
 ### The store
 
@@ -163,7 +175,7 @@ follow-up writes only onto the entry of its own run.
 | `CHAT_TRIAGE_BATCH` | `12` | chats per call |
 | `CHAT_TRIAGE_CONCURRENCY` | `4` | calls at once |
 | `CHAT_TRIAGE_TIMEOUT` | `180` | seconds a call may take |
-| `CHAT_TRIAGE_FOLLOWUPS` | `20` | follow-ups one press buys |
+| `CHAT_TRIAGE_FOLLOWUPS` | `0` (off) | follow-ups one press buys; see "Follow-ups are off by default" |
 | `CHAT_TRIAGE_FOLLOWUP_CONCURRENCY` | `2` | follow-ups at once |
 
 ## Not built

@@ -1048,8 +1048,9 @@ for the tabs. (`group` on a chat is the boolean "a group chat", as before.)
 
 Beside the tabs, **Triage** sorts the *Unread* tab on the user's press into
 action (see Ara), proposed archive and proposed delete, with *Archive all* /
-*Delete all* per section and Ara's note on each action chat from a follow-up
-in its companion — [chat-triage.md](chat-triage.md).
+*Delete all* per section and, where follow-ups are switched on
+(`CHAT_TRIAGE_FOLLOWUPS`, off by default), Ara's note on each action chat
+from a follow-up in its companion — [chat-triage.md](chat-triage.md).
 
 - A chat is **unread** while its latest inbound message has neither been
   replied to nor marked read, and **read** once it has — by a reply from the

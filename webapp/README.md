@@ -338,7 +338,8 @@ docstring). Pieces:
   press: `POST /chats/triage {}` sorts the unread chats that have no fresh
   word, and **Sort again** posts `{again: true}`. Every row is the list's own
   row — it opens the chat, swipes and has the tray as on its tab — with the
-  sorting's one-line note under it, and on an action chat Ara's note from her
+  sorting's one-line note under it, and on an action chat — where follow-ups
+  are switched on (`CHAT_TRIAGE_FOLLOWUPS`, off by default) — Ara's note from her
   follow-up in the chat's companion ("Ara is looking at it…" until it lands);
   an action row opens the chat on Ara's pane (`chat.html?id=…&pane=ara`).
   The view polls `GET /chats/triage` while a run sorts or a note is on its

@@ -424,7 +424,10 @@ class TriageRunner:
                 continue
             entry = {"bucket": v["bucket"], "note": v["note"], "reply": v["reply"],
                      "seq": c.get("seq"), "at": _now(), "run": run_id}
-            follow = v["bucket"] == "action" and self.followup is not None
+            # followup_max 0 (the default, CHAT_TRIAGE_FOLLOWUPS): no follow-up
+            # at all, and no "skipped" mark on the row either.
+            follow = (v["bucket"] == "action" and self.followup is not None
+                      and self.followup_max > 0)
             if follow:
                 with count_lock:
                     follow = counted["followups"] < self.followup_max

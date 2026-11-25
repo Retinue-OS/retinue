@@ -87,6 +87,9 @@ def main() -> int:
         wg._conv_add_message = add_then_another
         wg.CHAT_TRIAGE_MODEL = "fast-model"
         wg.CHAT_TRIAGE_FOLLOWUP_MODEL = "frontier-model"
+        # Follow-ups are off by default; this test opts in to exercise them.
+        assert wg.CHAT_TRIAGE_FOLLOWUPS == 0 and wg._TRIAGE.followup_max == 0
+        wg._TRIAGE.followup_max = 20
         wg.contacts_mod.commit = lambda *a, **k: None
         server = ThreadingHTTPServer(("127.0.0.1", 0), wg.Handler)
         threading.Thread(target=server.serve_forever, daemon=True).start()
