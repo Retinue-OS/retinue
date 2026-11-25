@@ -2533,7 +2533,9 @@ if it was all the take had heard, the take goes back to waiting. Only a take
 that ends on a pause after speech is transcribed and sent, on the same path
 as ➤; the loop waits for the answer, and repeats. Every other end goes to the
 draft for review, never out — and the two are told apart by ear: a soft
-low gong for a take on its way, a short rising whistle for one kept for
+low gong once a take's send went through (one whose send turns back, its
+transcript left in the box, gets the whistle instead), a
+short rising whistle for one kept for
 review without a tap (`takeCue`; a dropped take and ✓ stay silent): a take that runs to the length
 cap (default 4 min, 1–30 min per device under Settings → Voice, kept in the
 page's own storage; three soft ticks half a minute before it, `warn`) without falling silent — a hard limit, voice or not, so an

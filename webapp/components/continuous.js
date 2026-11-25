@@ -303,9 +303,19 @@ export class Vad {
       return null;
     }
     if (this.floor == null) this.floor = lv;
+    // The length cap is decided first, before anything this frame heard: a
+    // take at or past it is never one to send unseen, even if it fell silent
+    // on this very frame, and a frame that arrives late (a throttled timer)
+    // must end the take rather than warn. Still waiting, no speech is in
+    // this take: it closes as the no-speech window would.
+    if (elapsed >= o.maxMs) {
+      if (this.state === 'speaking') return this._done({ type: 'end', reason: 'max' });
+      return this._waitedOut();
+    }
     // The cap draws near. This frame only warns; the next one is judged as
-    // usual (nothing here depends on seeing every frame).
-    if (!this._warned && elapsed >= o.maxMs - o.warnBeforeMs) {
+    // usual (nothing here depends on seeing every frame). A cap no longer
+    // than the lead gets no warning: it would sound at the start.
+    if (!this._warned && o.maxMs > o.warnBeforeMs && elapsed >= o.maxMs - o.warnBeforeMs) {
       this._warned = true;
       return { type: 'warn' };
     }
@@ -368,7 +378,6 @@ export class Vad {
       this._learn(lv);
       if (now - this._lastVoice >= o.silenceMs) return this._done({ type: 'end', reason: 'silence' });
     }
-    if (elapsed >= o.maxMs) return this._done({ type: 'end', reason: 'max' });
     return null;
   }
 
@@ -459,7 +468,8 @@ export function chime() {
 // take that went to Ara from one that was kept in the box for review and
 // will get no answer. Only these two get a cue: a take dropped because
 // nobody spoke stays silent, as silence was the answer.
-//   'sent' — a soft low gong: transcribed and on its way to Ara.
+//   'sent' — a soft low gong: transcribed and sent to Ara (played once
+//            the send went through, never on intent alone).
 //   'warn' — three soft ticks: the length cap is half a minute away.
 //   'kept' — a short rising whistle: recording stopped, nothing was sent;
 //            the transcript waits in the box.
@@ -470,11 +480,14 @@ export const TAKE_CUES = Object.freeze({
   kept: [{ freq: 1100, to: 1900, at: 0, peak: 0.12, decay: 0.16 }, { freq: 1100, to: 1900, at: 0.2, peak: 0.12, decay: 0.16 }],
 });
 
-// Which cue, if any, a take of the loop gets when its recording stops:
-// `goes` it is sent, `kept` it has audio that lands in the draft, `byTouch`
-// the user ended it on the row (they see what happened; ➤ still gets the gong).
-export function takeCue({ goes, kept, byTouch } = {}) {
-  if (goes) return 'sent';
+// Which cue, if any, a take of the loop gets once its fate is known:
+// `sent` it went to Ara (the send went through, not merely meant to go),
+// `kept` what it holds waits in the draft instead — audio of a take kept
+// for review, or the transcript of one whose send turned back — and
+// `byTouch` the user ended it for review on the row's ✓ (they see what
+// happened; ➤ still gets its cue).
+export function takeCue({ sent, kept, byTouch } = {}) {
+  if (sent) return 'sent';
   if (kept && !byTouch) return 'kept';
   return null;
 }

@@ -1376,9 +1376,9 @@ Threads can be spoken as well as typed, with no streaming and split by direction
   goes to the draft for review, never out — a hard limit, so an open mic that
   catches a phone call or a talk in the room is not sent to Ara. Each take's
   end is heard as well as seen (`continuous.js`, `takeCue`): a soft low gong
-  when it goes to Ara, a short rising whistle when recording stopped without
-  sending (the cap, an unsure end, the page hidden) and the transcript waits
-  in the box; a take dropped because nobody spoke, or ended by the row's ✓,
+  once its send to Ara went through, a short rising whistle when recording
+  stopped without sending (the cap, an unsure end, the page hidden) or the
+  send turned back, and the transcript waits in the box; a take dropped because nobody spoke, or ended by the row's ✓,
   stays silent. No speech for
   about 8 s closes the mic with the mode left on — the mic button resumes;
   leaving the thread or hiding the page ends listening (a take with speech in

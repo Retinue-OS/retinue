@@ -2345,11 +2345,13 @@ class RetinueConversation extends HTMLElement {
   // `call`, when given (null included), is the cancelled call this turn
   // carries, in place of whatever CANCELLED_CALLS holds for the thread —
   // which is then neither read nor spent (see sendMessage).
+  // Resolves true when the turn went out, false when it did not (kept in
+  // the box instead).
   async _send(text, { fromDraft = true, call } = {}) {
     const key = this._key();
     const d = draftOf(key);
     // A message needs text or at least one attachment.
-    if (!text.trim() && !(fromDraft && d.files.length)) return;
+    if (!text.trim() && !(fromDraft && d.files.length)) return false;
     // One send at a time. The host's controls stay live through it, so a
     // second ask arriving now is kept rather than dropped (see _keepUnsent) —
     // unless it is the very turn on the wire, pressed again: that one is
@@ -2357,7 +2359,7 @@ class RetinueConversation extends HTMLElement {
     if (this._busy) {
       const out = SENDS.get(key);
       if (!(out && out.text === text)) this._keepUnsent(key, text, fromDraft);
-      return;
+      return false;
     }
     const sent = { text, files: fromDraft ? d.files.slice() : [], fromDraft };
     // How often the thread held these words before they went: a send that
@@ -2458,6 +2460,7 @@ class RetinueConversation extends HTMLElement {
         el._schedulePoll();
       }
     }
+    return delivered;
   }
 
   // A first message opened a thread: go on as it, and the host hears of the
@@ -2783,10 +2786,14 @@ class RetinueConversation extends HTMLElement {
     if (wasTake) {
       const goes = !aborted && intent === 'send' && chunks.length;
       const here = this.isConnected && this._key() === key;
-      // Heard, not seen: a gong when the take goes to Ara, a whistle when
-      // it stopped without going and waits in the box (continuous.js, takeCue).
-      const kind = takeCue({ goes, kept: !aborted && !!chunks.length, byTouch });
-      if (kind) cue(kind);
+      // Heard, not seen: a whistle when it stopped without going and waits
+      // in the box (continuous.js, takeCue). A take meant to go gets its cue
+      // once the job below knows whether it went: the gong only for a send
+      // that went through, never on intent alone.
+      if (!goes) {
+        const kind = takeCue({ sent: false, kept: !aborted && !!chunks.length, byTouch });
+        if (kind) cue(kind);
+      }
       // A take sent by touch (➤) while a call waits is the user answering
       // it, heard by the detector or not: it cancels the call as speech
       // does, and its transcript decides, as for speech (an empty one lets
@@ -2817,6 +2824,8 @@ class RetinueConversation extends HTMLElement {
     if (live()) live().render();
     let toSend = '';
     let sentByWorker = false;
+    let sentByPage = false;  // the page's own send below went through
+    let transcribed = false; // a transcript landed in the box
     try {
       // The service worker transcribes (dictation.js): should this page be
       // left meanwhile, a dictation kept for review lands in this draft, and
@@ -2837,6 +2846,7 @@ class RetinueConversation extends HTMLElement {
         VOICE_ERRORS.delete(key);
       } else if (text) {
         appendToDraft(key, text);
+        transcribed = true;
         if (send && got.unsent) {
           // The worker could not send it (or may have): it waits in the box
           // for review, and like a take kept for review it tells nobody of
@@ -2885,7 +2895,7 @@ class RetinueConversation extends HTMLElement {
       if (live()) live().render();
       const el = live();
       if (!isNewKey(key) && el) {
-        await el._send(toSend, { call });
+        sentByPage = await el._send(toSend, { call });
       } else {
         // Off screen, or a first message: the send goes out with the context
         // captured when the recording started. The key names that context —
@@ -2925,6 +2935,7 @@ class RetinueConversation extends HTMLElement {
           const conv = await sendMessage(target, toSend, sentFiles, seed, model, out, isNewKey(key) ? null : call)
             .catch((err) => arrivedAnyway(err, target, toSend, before))
             .catch((err) => { VOICE_ERRORS.set(key, sendFailureNote(err)); throw err; });
+          sentByPage = true;
           draftOf(key).leftSend = null;
           clearSent(draftOf(key), toSend, sentFiles);
           const now = live();
@@ -2942,6 +2953,14 @@ class RetinueConversation extends HTMLElement {
     }
     VOICE_JOBS.delete(key);
     if (sentByWorker) refreshSent(key);
+    // The cue of a take of the loop meant to go: the gong once it went, the
+    // whistle when it did not (a send that turned back, a worker that could
+    // not send it) and its transcript waits in the box. A transcription that
+    // failed, or found no words, has nothing in the box: no cue.
+    if (wasTake && intent === 'send') {
+      const kind = takeCue({ sent: sentByWorker || sentByPage, kept: transcribed });
+      if (kind) cue(kind);
+    }
     keepDraft(key);  // as after _send: no turn of this job's is on the wire now
     const el = adopted || live();
     // The loop's take did not get through (nothing heard, a failed
@@ -3320,9 +3339,10 @@ class RetinueConversation extends HTMLElement {
       this._finishRecording('review');
     }, noSpeechMs));
     const { maxMs } = voiceTimeouts();
-    this._contTimers.push(setTimeout(() => {
+    // As the detector does: no warning for a cap no longer than its lead.
+    if (maxMs > VAD_DEFAULTS.warnBeforeMs) this._contTimers.push(setTimeout(() => {
       if (this._mediaRecorder === mr) cue('warn');
-    }, Math.max(0, maxMs - VAD_DEFAULTS.warnBeforeMs)));
+    }, maxMs - VAD_DEFAULTS.warnBeforeMs));
     this._contTimers.push(setTimeout(() => {
       if (this._mediaRecorder === mr) this._finishRecording('review');
     }, maxMs));
