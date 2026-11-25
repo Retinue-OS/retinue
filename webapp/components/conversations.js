@@ -3,7 +3,7 @@
 // Unlike the other cards (which render one static JSON document), this card is
 // interactive and talks to the gateway's conversation API:
 //   GET  /conversations                 list of active threads (tabs)
-//   GET  /conversations?archived=1      list of archived threads
+//   GET  /conversations?archived=1&limit=N   archived threads, a page at a time
 //   GET  /conversations?all=1&kind=…    the normally hidden kinds (full page)
 //   POST /conversations/<id>/flags      archive, mute, star (the full page's swipe)
 //   POST /conversations/<id>/delete     erase a thread for good (its tray)
@@ -57,6 +57,14 @@
 // every view entry is unwound to the list, the attention list scrolls to its
 // top.
 //
+// The Archived tab can hold years of threads, so it asks for ARCHIVED_PAGE of
+// them (starred first, then newest — the gateway orders them from the life
+// store) and ends in a "Load more" button while the gateway says there are
+// more; each press widens the window by another page. Archived threads rarely
+// change by themselves, so that tab polls every ARCHIVED_POLL_MS instead of
+// every POLL_MS; whatever is done here (a restore, a delete) still refreshes
+// at once.
+//
 // Everything degrades gracefully offline (the list just fails to refresh; the
 // last rendered state stays on screen).
 
@@ -87,6 +95,8 @@ const COMPOSER_HASH_RE = /^#new(?:\?(.*))?$/;
 // its own column, so it is lifted there (see _shownThreads).
 const MAX_CARD_THREADS = 5;
 const POLL_MS = 4000;
+const ARCHIVED_PAGE = 50;
+const ARCHIVED_POLL_MS = 30000;
 // What the tray's and the swipe's words send to POST /conversations/<id>/flags
 // — the chats page's words, meaning the same.
 const THREAD_FLAGS = {
@@ -127,6 +137,9 @@ class RetinueConversations extends HTMLElement {
     this._epoch = 0;
     this._flagging = false;  // a flag write or a delete is on the wire
     this._swipe = null;      // the full page's row gesture (swipe-rows.js)
+    this._limit = ARCHIVED_PAGE; // how many archived threads the tab asks for
+    this._hasMore = false;   // the gateway has archived threads past _limit
+    this._lastFetch = 0;     // when the last list request went out (ms)
   }
 
   connectedCallback() {
@@ -209,7 +222,7 @@ class RetinueConversations extends HTMLElement {
     }
     this.render();
     this.refresh();
-    this._timer = setInterval(() => this.refresh(), POLL_MS);
+    this._timer = setInterval(() => this._poll(), POLL_MS);
     // A wake that found the page not loaded loads /?wake=1. The flag leaves
     // the address at once, so a reload or a later visit is not a wake. Only
     // the shell's own load of it opens the mic by itself: anywhere else the
@@ -376,7 +389,7 @@ class RetinueConversations extends HTMLElement {
   // connector's cowork audit threads; otherwise we list active chat threads —
   // the default the dashboard card and agents expect.
   _listUrl() {
-    if (this._full && this._scope === 'archived') return `${LIST_URL}?archived=1`;
+    if (this._archivedScope()) return `${LIST_URL}?archived=1&limit=${this._limit}`;
     if (this._full && this._scope === 'edits') return `${LIST_URL}?all=1&kind=edit`;
     if (this._full && this._scope === 'cowork') return `${LIST_URL}?all=1&kind=cowork`;
     return LIST_URL;
@@ -401,10 +414,27 @@ class RetinueConversations extends HTMLElement {
     this.refresh();
   }
 
+  _archivedScope() {
+    return this._full && this._scope === 'archived';
+  }
+
+  // The timer's tick: the Archived tab is fetched at its own, slower pace.
+  _poll() {
+    if (this._archivedScope() && Date.now() - this._lastFetch < ARCHIVED_POLL_MS) return;
+    this.refresh();
+  }
+
+  // "Load more": the same list, one page longer.
+  _loadMore() {
+    this._limit += ARCHIVED_PAGE;
+    this._changed();
+  }
+
   async refresh() {
     // The viewer has no list of its own to keep fresh: only an open thread.
     if (this._viewer && !this._active && !this._composing) return;
     const epoch = this._epoch;
+    this._lastFetch = Date.now();
     try {
       const res = await fetch(this._listUrl(), { cache: 'no-store' });
       if (!res.ok) throw new Error(String(res.status));
@@ -414,6 +444,7 @@ class RetinueConversations extends HTMLElement {
       // tick fetches the list as it now is.
       if (epoch !== this._epoch) return;
       this._threads = Array.isArray(data.conversations) ? data.conversations : [];
+      this._hasMore = this._archivedScope() && !!data.has_more;
       // In place: a full render would tear down the open conversation.
       this._partialUpdate();
     } catch (_err) {
@@ -453,7 +484,7 @@ class RetinueConversations extends HTMLElement {
     if (tabsEl && !(this._swipe && this._swipe.dragging)) {
       const sig = this._listSignature();
       if (sig !== this._listSig) {
-        tabsEl.innerHTML = this._tabsHtml() + this._emptyHtml();
+        tabsEl.innerHTML = this._tabsHtml() + this._emptyHtml() + this._moreHtml();
         this._listSig = sig;
         const allLink = root.querySelector('.all-link');
         if (allLink && !this._full) allLink.innerHTML = this._allLinkLabel();
@@ -465,6 +496,8 @@ class RetinueConversations extends HTMLElement {
   // The rows' own wiring, after every rebuild of the list: a tap opens a
   // thread; on the full page the tiles swipe and their trays act.
   _wireRows(scope) {
+    const more = scope.querySelector('[data-more]');
+    if (more) more.addEventListener('click', () => this._loadMore());
     scope.querySelectorAll('[data-open]').forEach((el) =>
       el.addEventListener('click', () => this._openThread(el.getAttribute('data-open'))));
     if (!this._swipe) return;
@@ -577,6 +610,8 @@ class RetinueConversations extends HTMLElement {
     this._scope = scope;
     if (this._swipe) this._swipe.reset();
     this._threads = [];
+    this._limit = ARCHIVED_PAGE;
+    this._hasMore = false;
     this.render();
     this._changed(); // a refresh of the old scope in flight must not land here
   }
@@ -745,10 +780,10 @@ class RetinueConversations extends HTMLElement {
   }
 
   _listSignature() {
-    return JSON.stringify(this._threads.map((t) => [
+    return JSON.stringify([this._hasMore, this._threads.map((t) => [
       t.id, t.title, t.initiator, t.updated, !!t.unread, !!t.pending, t.last_preview,
       t.kind || '', t.project_title || '', !!t.starred, !!t.archived, !!t.muted,
-    ]));
+    ])]);
   }
 
   // An open thread: the conversation element. Back — the navigation row's
@@ -793,7 +828,7 @@ class RetinueConversations extends HTMLElement {
     // bar sits between them: a reading follows the user out of its thread.
     return this._filterHtml() +
       `<div class="tabs${this._view === 'list' ? ' as-list' : ''}">` +
-      `${this._tabsHtml()}${this._emptyHtml()}</div>` +
+      `${this._tabsHtml()}${this._emptyHtml()}${this._moreHtml()}</div>` +
       `<retinue-read-aloud></retinue-read-aloud>` +
       `<div class="list-foot">${newBtn}${this._footerHtml()}</div>`;
   }
@@ -820,6 +855,12 @@ class RetinueConversations extends HTMLElement {
           ? 'No cowork sessions yet. These appear when an outside Claude session asks Ara something.'
           : 'No conversations yet.';
     return `<div class="empty"><span class="e-ico" aria-hidden="true">&#x1F4AC;</span><p>${msg}</p></div>`;
+  }
+
+  // The end of the Archived tab while the gateway holds more of it.
+  _moreHtml() {
+    if (!this._hasMore || !this._threads.length) return '';
+    return '<button type="button" class="more" data-more>Load more</button>';
   }
 
   // The card links out to the full page; the full page's way home is the
@@ -991,6 +1032,10 @@ const CSS = `
            gap: 6px; color: var(--muted, #8b93a3); text-align: center; padding: 24px 12px; }
   .empty .e-ico { font-size: 2rem; opacity: .55; }
   .empty p { margin: 0; max-width: 32ch; }
+  .more { grid-column: 1 / -1; background: transparent; color: var(--accent, #6ea8fe);
+          border: 1px solid var(--accent, #6ea8fe); border-radius: 14px; padding: 10px;
+          font-weight: 600; cursor: pointer; -webkit-tap-highlight-color: transparent; }
+  .more:active { filter: brightness(1.12); }
   .list-foot { flex: none; display: flex; flex-direction: column; gap: 10px; padding-top: 12px; }
   .new { width: 100%; background: var(--accent, #6ea8fe); color: #0b0d12; border: 0;
          border-radius: 14px; padding: 12px; font-weight: 650; font-size: .95rem; cursor: pointer;

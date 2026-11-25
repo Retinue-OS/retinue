@@ -656,6 +656,36 @@ the e-mail backend and `signal-push.py`. Threads persist under
 volume (`/root/.retinue/conversations`) so threads survive container
 recreation.
 
+**Each thread's summary is also in the life store**
+(`scripts/thread_index.py`): one N-Triples file per thread,
+`chambers/_generated/threads/<id>.nt`, subject `urn:retinue:thread:<id>` (the
+attention emit's subject too) — `kb:Thread` with
+`dcterms:created`/`dcterms:modified`, `kb:kind`, `kb:initiator`, the
+`kb:archived`/`kb:muted`/`kb:starred`/`kb:unread` flags, `kb:messageCount`,
+and `kb:project` / `kb:companionOf` (the chat's `urn:retinue:chat:<id>`) where
+linked. Never the title — a thread opened without one is titled with the
+start of its first message, and an agent's title is often a mail's subject —
+nor a message text, a preview, an attachment or a shell action: the store is
+readable by every agent, and a thread's words stay in its file.
+`_save_conv` rewrites the summary when it changed; a delete removes the file,
+so the thread's named graph — everything the store knew of it — leaves with
+it (the tombstone stays the gateway's own); at startup the gateway writes any
+missing summary and removes any whose thread is gone. The thread files remain
+the truth.
+
+The full page's **Archived** tab is what this is for. It grew with every
+archived thread, and listing it parsed every thread file on every four-second
+poll. Now it asks `GET /conversations?archived=1&limit=50`: the order (starred
+first, then newest) is a SPARQL `ORDER BY … LIMIT … OFFSET` over the summaries,
+and only that page's files are read to build its rows — so a thread the store
+has not caught up with yet (deleted or restored seconds ago) is dropped there
+without costing the page a slot (it reads on, and `next_offset` is where it
+stopped), and one archived seconds ago joins on a later poll. "Load more" at the end
+widens the window by another page. The tab polls every 30 s rather than every
+4 s; a change made on it refreshes at once. When the store cannot answer, or
+knows no archived thread at all (a fresh deployment's summaries still being
+indexed), the page is built from the files as before (`source: "files"`).
+
 **Opening a thread is a side effect, so it takes an idempotency key.** The
 same turn can legitimately run twice — the escalation re-run replays a junior
 turn's prompt on the frontier model (its reply is discarded, but a thread it

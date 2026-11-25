@@ -27,6 +27,14 @@ Conversation tabs (dashboard chat threads, distinct from the per-day log):
                                          and messenger-companion threads are
                                          hidden from normal lists) and
                                          ?project=<uri>.
+  GET  /conversations?archived=1&limit=N[&offset=M]
+                                      -> one page of archived threads, starred
+                                         first, then newest: {conversations,
+                                         has_more, next_offset, source}. Ordered
+                                         by the life store's thread summaries
+                                         (thread_index.py), rows built from the
+                                         thread files; the files alone when the
+                                         store cannot answer.
   GET  /conversations/<id>            -> full thread {id,title,messages,...}
   POST /conversations                 -> open a new thread (body {message};
                                          optional kind: "chat"|"edit", project:
@@ -531,6 +539,7 @@ import send_origin
 import inbound_store
 import session_env
 import shell_actions
+import thread_index
 import gateway_auth
 import instance_branding
 import letterbox
@@ -1432,6 +1441,22 @@ CONVERSATIONS_DIR.mkdir(parents=True, exist_ok=True)
 # the thread JSON on the same persistent volume so downloads survive restarts.
 CONVERSATION_ATTACHMENTS_DIR = CONVERSATIONS_DIR / "attachments"
 CONVERSATION_ATTACHMENTS_DIR.mkdir(parents=True, exist_ok=True)
+# Each thread's summary in the life store (scripts/thread_index.py): one
+# N-Triples file per thread, rewritten by _save_conv and removed with the
+# thread, so the Archived list is a paged SPARQL query instead of a parse of
+# every thread file. Only list fields go there — no message text.
+THREADS_EMIT_DIR = Path(os.environ.get(
+    "THREADS_EMIT_DIR", str(CHAMBERS_DIR / "_generated" / "threads")))
+# One page of the Archived list (GET /conversations?archived=1&limit=N). No
+# upper bound on `limit`: the Threads page's "Load more" widens one window
+# from the top (limit 50, 100, …) rather than fetching further offsets, so a
+# cap would leave every archived thread past it unreachable — the unpaged
+# list this replaced returned them all. A request costs what it asks for: one
+# store query and the files of the rows it returns.
+ARCHIVED_PAGE_DEFAULT = 50
+# How many store reads one page may take when rows the store still lists turn
+# out deleted or restored (it is seconds behind at most, so one is the rule).
+_ARCHIVED_PAGE_ROUNDS = 5
 # Cap a single attachment's decoded size to keep memory and disk bounded.
 MAX_ATTACHMENT_BYTES = int(os.environ.get("CONVERSATION_MAX_ATTACHMENT_BYTES", str(25 * 1024 * 1024)))
 # Files forwarded with POST /message (e.g. an image received on a messenger
@@ -2872,6 +2897,52 @@ def _save_conv(conv: dict) -> None:
     with open(tmp, "w") as f:
         json.dump(conv, f, ensure_ascii=False)
     os.replace(tmp, path)
+    _thread_index_write(conv)
+
+
+_thread_index_warned = False
+
+
+def _thread_index_write(conv: dict) -> None:
+    """Bring the thread's life-store summary up to date. Best-effort: the
+    thread file is what counts, and the startup reconcile repairs a miss.
+    A directory that cannot be written is said once, not on every save."""
+    global _thread_index_warned
+    try:
+        thread_index.write(THREADS_EMIT_DIR, conv)
+    except Exception as exc:  # noqa: BLE001
+        if not _thread_index_warned:
+            _thread_index_warned = True
+            print(f"[web-gateway] thread summaries not written ({THREADS_EMIT_DIR}): {exc}", flush=True)
+
+
+def _thread_index_reconcile() -> tuple[int, int]:
+    """Make the summaries match the threads: write the missing or outdated
+    ones, remove those whose thread is gone. Returns (written, removed)."""
+    written = 0
+    live: set[str] = set()
+    for path in sorted(CONVERSATIONS_DIR.glob("*.json")):
+        if not _CONV_ID_RE.fullmatch(path.stem):
+            continue
+        # Under the lock every thread write takes, so a save racing the scan
+        # cannot have its fresher summary overwritten by this older read.
+        with _conversations_lock:
+            conv = _load_conv_raw(path.stem)
+            if conv is None:
+                continue
+            live.add(path.stem)
+            try:
+                written += thread_index.write(THREADS_EMIT_DIR, conv)
+            except OSError as exc:
+                print(f"[web-gateway] thread summary not written for {path.stem}: {exc}", flush=True)
+    removed = 0
+    for cid in thread_index.stale_ids(THREADS_EMIT_DIR, live):
+        # Re-checked under the lock: a thread created since the scan is live.
+        with _conversations_lock:
+            if (CONVERSATIONS_DIR / f"{cid}.json").exists():
+                continue
+            removed += thread_index.remove(THREADS_EMIT_DIR, cid)
+    return written, removed
 
 
 def _conv_summary(conv: dict) -> dict:
@@ -2960,6 +3031,84 @@ def _list_convs(scope: str = "active", kind: str = "chat",
         summaries.append(_conv_summary(conv))
     summaries.sort(key=lambda s: s.get("updated") or "", reverse=True)
     return summaries
+
+
+def _archived_page(kind: str = "chat", limit: int = ARCHIVED_PAGE_DEFAULT,
+                   offset: int = 0) -> dict:
+    """One page of the Archived list, starred first, then newest first.
+
+    The order comes from the life store (thread_index.page_query), which
+    selects ids only; each row is built from the thread's own file, which
+    stays the truth. So a thread the store has not caught up with yet — deleted
+    or restored a moment ago — is dropped here rather than shown as it was.
+    The store is a few seconds behind at most: a thread archived just now
+    joins the page on a later poll.
+
+    When the store cannot answer, or answers with no archived thread at all
+    on the first page (the summaries of a fresh deployment, still being
+    indexed), the page comes from the files instead — slower, never wrong.
+    `source` says which ("store" or "files").
+
+    A store row whose thread no longer qualifies does not cost the page a
+    slot: the page reads on from the store until it holds `limit` rows, and
+    `next_offset` is the store position after the last row it read, so the
+    next page starts exactly there — nothing repeated, nothing skipped."""
+    chunk = limit + 1
+
+    def from_store(at: int) -> tuple[list[str], int]:
+        bindings = _sparql_bindings(thread_index.page_query(kind, chunk, at))
+        return thread_index.page_ids(bindings, unique=False), len(bindings)
+
+    try:
+        ids, got = from_store(offset)
+    except Exception as exc:  # noqa: BLE001 — store down: the files still answer
+        print(f"[web-gateway] archived page from the files: {exc}", flush=True)
+        ids, got = None, 0
+    if ids is None or (not ids and offset == 0):
+        rows = sorted(_list_convs("archived", kind),
+                      key=lambda t: not t.get("starred"))  # stable: newest first within
+        return {"conversations": rows[offset:offset + limit],
+                "has_more": len(rows) > offset + limit,
+                "next_offset": offset + limit, "source": "files"}
+    rows: list[dict] = []
+    seen: set[str] = set()
+    pos = offset
+    has_more = False
+    for _round in range(_ARCHIVED_PAGE_ROUNDS):
+        for cid in ids:
+            if len(rows) == limit:
+                has_more = True
+                break
+            pos += 1
+            if cid in seen:  # mid-update the store may hold a thread twice
+                continue
+            seen.add(cid)
+            conv = _load_conv(cid)
+            if conv is None or not conv.get("archived"):
+                continue
+            if kind != "all" and (conv.get("kind") or "chat") != kind:
+                continue
+            rows.append(_conv_summary(conv))
+        if has_more or got < chunk:  # full with one to spare, or the store is through
+            break
+        try:
+            ids, got = from_store(pos)
+        except Exception as exc:  # noqa: BLE001 — what was read stands; more may follow
+            print(f"[web-gateway] archived page cut short: {exc}", flush=True)
+            has_more = True
+            break
+    else:
+        has_more = True  # rounds used up on rows the files dropped: more may follow
+    return {"conversations": rows, "has_more": has_more,
+            "next_offset": pos, "source": "store"}
+
+
+def _page_param(params: dict, name: str, default: int, low: int, high: int) -> int:
+    try:
+        value = int((params.get(name) or [str(default)])[0])
+    except ValueError:
+        value = default
+    return max(low, min(high, value))
 
 
 def _store_attachments(cid: str, raw_atts) -> list[dict]:
@@ -12016,6 +12165,10 @@ def _delete_conversation(cid: str, *, by_user: bool = False) -> bool:
         if by_user:
             _conv_write_tombstone(cid)
         path.unlink(missing_ok=True)
+        try:
+            thread_index.remove(THREADS_EMIT_DIR, cid)
+        except OSError as exc:  # the startup reconcile removes it then
+            print(f"[web-gateway] thread summary not removed for {cid}: {exc}", flush=True)
     shutil.rmtree(CONVERSATION_ATTACHMENTS_DIR / cid, ignore_errors=True)
     with _conv_keys_lock:
         try:
@@ -21883,6 +22036,12 @@ class Handler(BaseHTTPRequestHandler):
             if kind not in ("chat", "edit", "cowork", "companion", "all"):
                 kind = "chat"
             project = (params.get("project") or [None])[0]
+            if scope == "archived" and "limit" in params and not project:
+                # The Archived page, a page at a time (see _archived_page).
+                limit = _page_param(params, "limit", ARCHIVED_PAGE_DEFAULT, 1, 10 ** 9)
+                offset = _page_param(params, "offset", 0, 0, 10 ** 9)
+                self._send_json(200, _archived_page(kind, limit, offset))
+                return
             self._send_json(200, {"conversations": _list_convs(scope, kind, project)})
             return
         if conv_path in ("/projects/item", "/projects/item/"):
@@ -22408,6 +22567,18 @@ if __name__ == "__main__":
         except Exception as exc:  # noqa: BLE001
             print(f"[web-gateway] sensitive-text sweep skipped: {exc}", flush=True)
     threading.Thread(target=_sweep_sensitive, name="sensitive-sweep", daemon=True).start()
+    # The threads' life-store summaries (scripts/thread_index.py): written for
+    # every thread that predates them or changed while the gateway was down,
+    # removed for every thread that is gone. In the background, like the sweep.
+    def _reconcile_thread_index() -> None:
+        try:
+            written, removed = _thread_index_reconcile()
+            if written or removed:
+                print(f"[web-gateway] thread summaries: {written} written, "
+                      f"{removed} removed", flush=True)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[web-gateway] thread summary reconcile skipped: {exc}", flush=True)
+    threading.Thread(target=_reconcile_thread_index, name="thread-index", daemon=True).start()
     # Before serving, so it never meets a manifest of a turn of this process.
     try:
         _sweep_stale_shell_manifests()

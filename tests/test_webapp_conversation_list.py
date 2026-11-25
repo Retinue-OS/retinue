@@ -75,7 +75,7 @@ globalThis.CustomEvent = class { constructor(t, i = {}) { this.type = t; this.de
 // race it is describing would have them answered in.
 const wire = [];
 globalThis.fetch = (url) => new Promise((resolve) => {
-  wire.push({ url, answer: (list) => resolve({ ok: true, json: async () => ({ conversations: list }) }) });
+  wire.push({ url, answer: (list, extra = {}) => resolve({ ok: true, json: async () => ({ conversations: list, ...extra }) }) });
 });
 const pending = (n) => { assert.equal(wire.length, n, `expected ${n} request(s) on the wire, saw ${wire.length}`); };
 const settle = () => new Promise((r) => setTimeout(r, 0));
@@ -220,6 +220,66 @@ await ok('an archive event without an id changes no rows but still shows the lis
   card.dispatchEvent(new CustomEvent('retinue-archived', { detail: {} }));
   assert.deepEqual(ids(card), [A, B]);
   assert.equal(card._active, null);
+  card.disconnectedCallback();
+});
+
+// ── The Archived tab, a page at a time ───────────────────────────────────────
+// It grows with every archived thread, so it asks for a page, ends in "Load
+// more" while the gateway says there is more, and polls at a slower pace.
+await ok('the archived tab asks for a page and offers more while there is more', async () => {
+  const card = await mount({ full: true });
+  card._setScope('archived');
+  pending(1);
+  const first = wire.shift();
+  assert.ok(first.url.includes('archived=1') && first.url.includes('limit=50'), first.url);
+  first.answer([thread(A, { archived: true })], { has_more: true });
+  await settle();
+  assert.ok(card._moreHtml().includes('data-more'), 'the button is there while there is more');
+  card._loadMore();
+  pending(1);
+  const next = wire.shift();
+  assert.ok(next.url.includes('limit=100'), 'Load more widens the window by a page: ' + next.url);
+  next.answer([thread(A, { archived: true }), thread(B, { archived: true })], { has_more: false });
+  await settle();
+  assert.deepEqual(ids(card), [A, B]);
+  assert.equal(card._moreHtml(), '', 'no button at the end');
+
+  card._setScope('active');
+  pending(1);
+  const act = wire.shift();
+  assert.ok(!act.url.includes('limit'), 'the active list is not paged: ' + act.url);
+  act.answer([thread(A)], { has_more: true });
+  await settle();
+  assert.equal(card._moreHtml(), '', 'and never offers more');
+  card._setScope('archived');
+  pending(1);
+  assert.ok(wire[0].url.includes('limit=50'), 'a new visit starts at one page again');
+  wire.shift().answer([]);
+  await settle();
+  card.disconnectedCallback();
+});
+
+await ok('the archived tab polls at its own pace, a change still at once', async () => {
+  const card = await mount({ full: true });
+  card._poll();
+  pending(1);                              // the active list: every tick
+  wire.shift().answer([thread(A), thread(B)]);
+  await settle();
+  card._setScope('archived');
+  pending(1);
+  wire.shift().answer([thread(A, { archived: true })], { has_more: false });
+  await settle();
+  card._poll();
+  pending(0);                              // archived: not on the next tick
+  card._lastFetch -= 31000;
+  card._poll();
+  pending(1);                              // but once its own interval passed
+  wire.shift().answer([thread(A, { archived: true })]);
+  await settle();
+  card._changed();
+  pending(1);                              // and at once after a change made here
+  wire.shift().answer([]);
+  await settle();
   card.disconnectedCallback();
 });
 
