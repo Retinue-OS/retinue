@@ -161,8 +161,10 @@ const FLAGS = {
 export const BULK_CONCURRENCY = 4;
 
 // `fn` over `items`, at most `limit` at once; the results in item order (a
-// throw is a result too: {ok: false, reason}).
-export async function eachBounded(items, limit, fn) {
+// throw is a result too: {ok: false, reason}). With `control`, its `rush()`
+// is set: called, it starts every item not yet started at once —
+// synchronously, so a page on its way out still sends them.
+export async function eachBounded(items, limit, fn, control = null) {
   const out = new Array(items.length);
   let next = 0;
   const worker = async () => {
@@ -176,8 +178,36 @@ export async function eachBounded(items, limit, fn) {
       }
     }
   };
-  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+  const workers = Array.from({ length: Math.min(limit, items.length) }, worker);
+  if (control) {
+    control.rush = () => {
+      while (next < items.length) workers.push(worker());
+    };
+  }
+  await Promise.all(workers);
+  // (Workers a rush started after Promise.all was called are awaited too.)
+  await Promise.all(workers);
   return out;
+}
+
+// Deferred commits still going out, a few at a time: when the page is hidden
+// or left, what has not gone yet goes at once, with keepalive — a bounded
+// queue would issue the rest only on answers a page that is gone never gets.
+const draining = new Set();
+let drainWired = false;
+function wireDrain() {
+  if (drainWired || typeof document === 'undefined') return;
+  drainWired = true;
+  const rushAll = () => {
+    for (const drain of draining) {
+      drain.keepalive = true;
+      if (drain.rush) drain.rush();
+    }
+  };
+  if (typeof window !== 'undefined' && window.addEventListener) window.addEventListener('pagehide', rushAll);
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'hidden' || document.hidden === true) rushAll();
+  });
 }
 
 // Hand a Spam to the chat list (the chat page's menu): true when it was put
@@ -732,11 +762,20 @@ class RetinueChats extends RetinueCard {
   // marked failed with the server's reason — and a single row's tray, with
   // Retry, is opened. A page on its way out (`keepalive`) sends every request
   // at once, unbounded: a bounded queue issues the next one only once an
-  // answer comes, which a page that is gone never gets.
+  // answer comes, which a page that is gone never gets — and one left while
+  // the queue still drains sends the rest at once (wireDrain).
   async _commitMany(ids, kind, keepalive = false) {
     ids.forEach((id) => this._pending.set(id, kind));
     const bound = keepalive ? ids.length : BULK_CONCURRENCY;
-    const outs = await eachBounded(ids, bound, (id) => commitChatAction(id, kind, keepalive));
+    const drain = { keepalive: !!keepalive, rush: null };
+    wireDrain();
+    draining.add(drain);
+    let outs;
+    try {
+      outs = await eachBounded(ids, bound, (id) => commitChatAction(id, kind, drain.keepalive), drain);
+    } finally {
+      draining.delete(drain);
+    }
     ids.forEach((id, k) => {
       this._pending.delete(id);
       const out = outs[k] || { ok: false, reason: 'No answer' };

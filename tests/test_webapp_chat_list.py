@@ -611,6 +611,25 @@ await ok('a page left with a bulk Spam waiting sends every request before any an
   await settle();
 });
 
+await ok('a page left while a bulk Spam drains sends the rest at once, with keepalive', async () => {
+  const many = Array.from({ length: 7 }, (_v, k) => mailChat(`md${k}`, { unread: 1, list_group: 'unread' }));
+  const el = await mount(payload([...MIXED, ...many]));
+  el._enterSelect('md0');
+  for (let k = 1; k < 7; k += 1) el._toggleSelect(`md${k}`, {});
+  el._bulk('spam');
+  dismissUndo();      // the window ends: four go out, the rest wait for answers
+  let posts = wire.filter((w) => w.method === 'POST');
+  assert.equal(posts.length, 4);
+  assert.ok(posts.every((w) => w.keepalive === false));
+  fireWin('pagehide');
+  posts = wire.filter((w) => w.method === 'POST');
+  assert.equal(posts.length, 7, `${posts.length} of 7 sent`);
+  assert.ok(posts.slice(4).every((w) => w.keepalive === true), 'the rest with keepalive');
+  for (const w of posts) w.answer({ archived: true, muted: true });
+  await settle();
+  assert.deepEqual(rowIds(html(el)).filter((id) => id.startsWith('md')), []);
+});
+
 await ok('a failed Spam brings the row back with the reason and a Retry', async () => {
   const el = await mount(payload(MIXED));
   el._defer('mu', 'spam');
