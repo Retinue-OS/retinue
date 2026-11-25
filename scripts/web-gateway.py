@@ -534,6 +534,7 @@ import claude_auth
 import agent_models
 import content_policy
 import chat_state as chat_state_mod
+import chat_triage
 import contacts as contacts_mod
 import dictation_vocabulary
 import email_client as ec
@@ -5238,13 +5239,18 @@ _conv_pending_lock = threading.Lock()
 
 def _conv_worker(cid: str, session_key: str, *, arrival: str | None = None,
                  push: bool = True, error_reply: bool = True,
-                 arrival_turn: str | None = None) -> bool:
+                 arrival_turn: str | None = None, model: str | None = None,
+                 reply_sink: list | None = None) -> bool:
     """Background worker: ask Ara for the next turn in a thread and store it.
 
     `arrival` runs the turn on a chat message instead of on something the user
     wrote (see _chat_arrival_worker); `push` is False there because the arrival
     itself already notified the user's devices, and a second push for the same
-    message would say the same thing twice. `error_reply` False stores nothing
+    message would say the same thing twice. `model` runs this one turn on the
+    model named, whatever the thread's own choice (chat triage's follow-up
+    asks for the frontier tier: docs/chat-triage.md), and `reply_sink` gets
+    the reply this turn stored — its own, never another turn's that landed in
+    the thread meanwhile. `error_reply` False stores nothing
     for a turn that failed (a mail's arrival turn, which is retried by design).
     `arrival_turn` is that turn's token (send_message). A turn without
     `arrival` is the user's own conversation with Ara: its sessions are
@@ -5287,7 +5293,7 @@ def _conv_worker(cid: str, session_key: str, *, arrival: str | None = None,
         # thread default applies — the dashboard's own tier where the
         # deployment configures one, else the router tier send_message()
         # would have picked anyway.
-        chosen = _conv_model(conv)
+        chosen = model or _conv_model(conv)
         if chosen is None and conv.get("escalated") and FRONTIER_MODEL:
             chosen = FRONTIER_MODEL
         elif chosen is None and DASHBOARD_MODEL:
@@ -5471,6 +5477,8 @@ def _conv_worker(cid: str, session_key: str, *, arrival: str | None = None,
         # this turn. Saying otherwise would let a gateway mark an inbound
         # message delivered against a reply that does not exist.
         return False
+    if reply_sink is not None:
+        reply_sink.append(reply)
     if push:
         # A reply that is only shell actions still says something: a fixed
         # phrase, never the text to type, which may be a sensitive one and must
@@ -15106,6 +15114,171 @@ def _mail_trim_parse(answer: str) -> list | None:
     return keep
 
 
+# ── Chat triage (docs/chat-triage.md) ─────────────────────────────────────────
+# The Chats page's Triage button sorts the unread chats into "action", "no
+# action — archive" and "no action — delete". Only the user's press starts a
+# run: there is no schedule, and an arrival never spends a turn on it. Many
+# chats go into one call of a fast model (the router tier unless one is named)
+# — that is where the saving is, against a turn per message. Each chat put
+# under action is then handed to a follow-up turn in its companion thread, on
+# the frontier tier, which writes Ara's note and stages a reply where one is
+# wanted; the sorted lists are shown while those still work. The pass itself
+# is tool-less, like the mail trim: what a correspondent wrote can at worst
+# mis-sort its own chat. The follow-up is the companion's "Propose" chip, run
+# for the user, and is told to send, archive and queue nothing.
+CHAT_TRIAGE = os.environ.get("CHAT_TRIAGE", "1").strip().lower() not in (
+    "0", "false", "no", "off")
+CHAT_TRIAGE_MODEL = (os.environ.get("CHAT_TRIAGE_MODEL", "").strip()
+                     or ROUTER_MODEL or CLAUDE_MODEL or "haiku")
+# Empty (and no frontier tier): the companion thread's own model.
+CHAT_TRIAGE_FOLLOWUP_MODEL = (os.environ.get("CHAT_TRIAGE_FOLLOWUP_MODEL", "").strip()
+                              or FRONTIER_MODEL)
+CHAT_TRIAGE_BATCH = max(1, int(os.environ.get("CHAT_TRIAGE_BATCH", "12")))
+CHAT_TRIAGE_CONCURRENCY = max(1, int(os.environ.get("CHAT_TRIAGE_CONCURRENCY", "4")))
+CHAT_TRIAGE_TIMEOUT = float(os.environ.get("CHAT_TRIAGE_TIMEOUT", "180"))
+# Off by default (0): a follow-up is a full-tool turn on a correspondent's
+# words, and nothing in the backend yet holds that turn to "send nothing,
+# change no flag" — only its prompt does (docs/chat-triage.md, "Follow-ups
+# are off by default"). A deployment that accepts that sets a number here.
+CHAT_TRIAGE_FOLLOWUPS = max(0, int(os.environ.get("CHAT_TRIAGE_FOLLOWUPS", "0")))
+CHAT_TRIAGE_FOLLOWUP_CONCURRENCY = max(1, int(os.environ.get(
+    "CHAT_TRIAGE_FOLLOWUP_CONCURRENCY", "2")))
+
+
+def _triage_classify(prompt: str) -> str | None:
+    """One batch through the fast model: its answer text, or None for a
+    call that gave none. Spawned as the mail trim's turn is — no tools, no
+    MCP server, no session kept, away from /workspace — since every word of
+    the prompt but the instruction is a correspondent's."""
+    cmd = [
+        "claude", "-p", "--output-format=json",
+        "--model", CHAT_TRIAGE_MODEL,
+        "--no-session-persistence",
+        "--allowed-tools", "",
+        "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}',
+        "--exclude-dynamic-system-prompt-sections",
+        "--system-prompt", chat_triage.SYSTEM_PROMPT,
+        "--", prompt,
+    ]
+    try:
+        result = _run_claude(
+            cmd, capture_output=True, text=True, timeout=CHAT_TRIAGE_TIMEOUT,
+            cwd=tempfile.gettempdir(),  # away from /workspace: no CLAUDE.md
+            env=session_env.build(model=CHAT_TRIAGE_MODEL),
+        )
+    except subprocess.TimeoutExpired:
+        print("[web-gateway] chat triage: a batch ran out of time", flush=True)
+        return None
+    except OSError as exc:
+        print(f"[web-gateway] chat triage: the call could not start ({type(exc).__name__})",
+              flush=True)
+        return None
+    try:
+        body = json.loads(result.stdout or "")
+    except ValueError:
+        body = None
+    if (result.returncode != 0 or not isinstance(body, dict) or body.get("is_error")
+            or body.get("subtype") not in (None, "success")):
+        print(f"[web-gateway] chat triage: a batch failed (exit {result.returncode})",
+              flush=True)
+        return None
+    answer = body.get("result")
+    return answer if isinstance(answer, str) else None
+
+
+def _triage_digest(chat_id: str) -> dict | None:
+    """A chat as the sorting pass reads it: what it is, and its newest
+    messages — the user's own last one and everything since where there is
+    one, else the last few — with who wrote each."""
+    parts = chat_state_mod.split_chat_id(chat_id)
+    channel, key = parts if parts else ("", chat_id)
+    doc = _CHAT_STATE.get(chat_id)
+    name = _chat_display_name(doc, channel, key)
+    mail = _is_mail(channel)
+    try:
+        messages = _chat_messages_payload(chat_id)["messages"]
+    except Exception as exc:  # noqa: BLE001 - this chat stays unsorted
+        print(f"[web-gateway] chat triage: no messages for {chat_id} ({exc})", flush=True)
+        return None
+    last_out = max((i for i, m in enumerate(messages) if m.get("direction") == "out"),
+                   default=-1)
+    since = messages[last_out + 1:]
+    if not since:
+        shown = messages[-3:]
+    elif last_out >= 0:
+        shown = [messages[last_out], *since]
+    else:
+        shown = since
+    out = []
+    for m in shown:
+        text = "" if (mail and m.get("removed")) else str(m.get("text") or "")
+        out.append({
+            "at": m.get("ts") or "",
+            "from": "me" if m.get("direction") == "out" else _companion_speaker(m, name, mail),
+            "text": text,
+            "files": len(m.get("attachments") or []),
+        })
+    kind = ("mail thread" if mail
+            else "group chat" if _chat_group(doc, channel, key) else "chat")
+    return {"channel": channel, "kind": kind, "name": name, "messages": out}
+
+
+def _triage_followup(chat_id: str, entry: dict) -> str | None:
+    """The higher tier's turn for one action chat, in its companion: Ara's
+    note (her reply there, as words), or None for a turn that failed."""
+    try:
+        cid, _created = _chat_companion(chat_id)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[web-gateway] chat triage: no companion for {chat_id} ({exc})", flush=True)
+        return None
+    stored: list = []
+    ok = _conv_worker(cid, f"conv:{cid}", arrival=chat_triage.followup_prompt(entry),
+                      push=False, model=CHAT_TRIAGE_FOLLOWUP_MODEL or None,
+                      reply_sink=stored)
+    if not ok:
+        return None
+    # This turn's own reply, as words; none (a turn another one covered).
+    return attention_store.markup_words(str(stored[-1] or "")) if stored else ""
+
+
+_TRIAGE_STORE = chat_triage.TriageStore(CHAT_STATE_DIR / "triage.json")
+_TRIAGE = chat_triage.TriageRunner(
+    _TRIAGE_STORE, classify=lambda p: _triage_classify(p),
+    digest=lambda c: _triage_digest(c),
+    followup=lambda c, e: _triage_followup(c, e), batch_size=CHAT_TRIAGE_BATCH,
+    concurrency=CHAT_TRIAGE_CONCURRENCY,
+    followup_concurrency=CHAT_TRIAGE_FOLLOWUP_CONCURRENCY,
+    followup_max=CHAT_TRIAGE_FOLLOWUPS,
+    log=lambda m: print(f"[web-gateway] {m}", flush=True))
+
+
+def _triage_payload() -> dict:
+    """The GET /chats/triage body: whether triage is on, the last run, and
+    what it said per chat. Which of those chats are still to be shown (not
+    archived, no newer message) is the page's to decide against its list."""
+    doc = _TRIAGE_STORE.snapshot()
+    return {"enabled": CHAT_TRIAGE, "running": _TRIAGE.running, "busy": _TRIAGE.busy,
+            "model": CHAT_TRIAGE_MODEL, "run": doc.get("run"),
+            "entries": doc.get("entries") or {}}
+
+
+def _triage_start(again: bool) -> tuple[int, dict]:
+    """Start a run over the unread chats (POST /chats/triage): 202 with the
+    run started, 200 while one is already running (that run's state)."""
+    if not CHAT_TRIAGE:
+        return 409, {"error": "chat triage is switched off (CHAT_TRIAGE)"}
+    try:
+        chats = _chats_payload()["chats"]
+    except Exception as exc:  # noqa: BLE001 - the store is down
+        return 502, {"error": "life store unreachable", "detail": str(exc)}
+    if not _TRIAGE.running:
+        _TRIAGE_STORE.prune({c["id"] for c in chats})
+    scope = [{"id": c["id"], "seq": c.get("inbound_seq")}
+             for c in chats if c.get("list_group") == "unread"]
+    started = _TRIAGE.start(scope, again=again)
+    return (202 if started.get("started") else 200), {**started, **_triage_payload()}
+
+
 def _chat_messages_payload(chat_id: str, before: str | None = None) -> dict:
     """The GET /chats/<id>/messages body. Raises on store errors (→ 502)."""
     channel, account, key = chat_state_mod.split_chat_ref(chat_id)
@@ -18425,6 +18598,9 @@ class Handler(BaseHTTPRequestHandler):
         if chat_trim_match:
             self._handle_chat_trim(chat_trim_match.group(1), chat_trim_match.group(2))
             return
+        if self.path in ("/chats/triage", "/chats/triage/"):
+            self._handle_chats_triage_start()
+            return
         chat_flags_match = _CHAT_FLAGS_RE.match(self.path)
         if chat_flags_match:
             self._handle_chat_flags(chat_flags_match.group(1))
@@ -18791,6 +18967,19 @@ class Handler(BaseHTTPRequestHandler):
         self._send_json(status, result)
 
     # ── Conversation tabs ─────────────────────────────────────────────────────
+
+    def _handle_chats_triage_start(self) -> None:
+        """POST /chats/triage — the Triage button: sort the unread chats
+        (body ``{again?}``; ``again`` sorts those already sorted too). It
+        spends model calls on the user's press, so a cross-site page may not
+        press it for them."""
+        if not self._user_act_same_origin():
+            return
+        body = self._read_json_body()
+        if body is None:
+            self._send_json(400, {"error": "invalid JSON"})
+            return
+        self._send_json(*_triage_start(body.get("again") is True))
 
     def _read_json_body(self) -> dict | None:
         length = int(self.headers.get("Content-Length", 0))
@@ -22842,6 +23031,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if conv_path in ("/chats/compose", "/chats/compose/"):
             self._handle_chats_compose_options()
+            return
+        if conv_path in ("/chats/triage", "/chats/triage/"):
+            self._send_json(200, _triage_payload())
             return
         if conv_path in ("/contacts", "/contacts/"):
             self._handle_contacts_get(conv_query)

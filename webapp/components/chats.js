@@ -112,6 +112,18 @@ import { SwipeRows, SWIPE_CSS, STAR_MARK, offerUndo, showNotice, starButtonHtml,
 import { openComposeSheet } from './compose-sheet.js';
 
 const LIST_URL = '/chats';
+// Triage (docs/chat-triage.md): what the last run said per chat, and the
+// press that starts one. While a run sorts or Ara still writes her notes,
+// the open view asks again this often.
+const TRIAGE_URL = '/chats/triage';
+const TRIAGE_POLL_MS = 2500;
+// The view's sections, in the order shown, with what each is called.
+export const TRIAGE_SECTIONS = [
+  { id: 'action', title: 'Action suggested — see Ara' },
+  { id: 'archive', title: 'No action — proposed archive' },
+  { id: 'delete', title: 'No action — proposed delete' },
+  { id: 'unsorted', title: 'Not sorted' },
+];
 // What the full page's ＋ can start (docs/mail-chats.md, "Writing"): the
 // channels whose gateway takes a new conversation, with their accounts.
 const COMPOSE_URL = '/chats/compose';
@@ -434,6 +446,34 @@ export function listGroup(chat) {
   return LIST_GROUPS.includes(g) ? g : deriveListGroup(chat);
 }
 
+// Two accounts of one channel talking to the same peer are two chats with
+// the same name (and so is a peer's unattributed history beside its
+// account-named chat; and so is one mail thread that reached two of the
+// user's mailboxes). The name alone cannot tell them apart, so where — and
+// only where — a name repeats within a channel ACROSS accounts, each row
+// also says which account it is. Rows that share a name on one account
+// (two mail threads both called "Invoice", two contacts both called
+// "Mara") get no label: it would be the same on each and tell them apart
+// no better — the participants line and the preview do that. Computed
+// over the rows actually shown, so an unambiguous list carries none.
+// Whether triage has work open: a run sorting, or a note Ara still writes.
+export function triageBusy(doc) {
+  if (!doc) return false;
+  if (doc.running || doc.busy || (doc.run && doc.run.state === 'running')) return true;
+  return Object.values(doc.entries || {}).some((e) =>
+    e && e.followup && ['queued', 'working'].includes(e.followup.state));
+}
+
+const nameKey = (c) => `${c.channel}\u0000${c.name}`;
+function accountsByName(shown) {
+  const accountsOf = {};
+  for (const c of shown) {
+    const k = nameKey(c);
+    (accountsOf[k] = accountsOf[k] || new Set()).add(c.account || '');
+  }
+  return accountsOf;
+}
+
 class RetinueChats extends RetinueCard {
   connectedCallback() {
     this._full = this.hasAttribute('full');
@@ -474,8 +514,20 @@ class RetinueChats extends RetinueCard {
       selecting: () => this._selecting,
       onSelect: (id, _el, e) => this._toggleSelect(id, e),
     });
-    // The back gesture leaves selection mode (the mode is a history entry).
-    this._onPop = () => { if (this._selecting) this._exitSelect(false); };
+    // Triage (full page): whether the view is open, the last GET/POST
+    // /chats/triage answer, a line to show about the press (an error), the
+    // section whose "Delete all" is armed, and the poll while work is open.
+    this._triage = false;
+    this._tri = null;
+    this._triMsg = '';
+    this._triArmed = '';
+    this._triTimer = null;
+    // The back gesture leaves selection mode and the triage view (each is a
+    // history entry).
+    this._onPop = () => {
+      if (this._selecting) this._exitSelect(false);
+      else if (this._triage && !(history.state && history.state.chatsTriage)) this._closeTriage(false);
+    };
     this._onKey = (e) => {
       if (e.key === 'Escape' && this._selecting) { e.preventDefault(); this._exitSelect(); }
     };
@@ -521,6 +573,8 @@ class RetinueChats extends RetinueCard {
     this._offFrame = null;
     if (this._timer) clearInterval(this._timer);
     this._timer = null;
+    if (this._triTimer) clearTimeout(this._triTimer);
+    this._triTimer = null;
     this._swipe.disconnect();
   }
 
@@ -598,6 +652,19 @@ class RetinueChats extends RetinueCard {
         if (what === 'cancel') this._exitSelect();
         else if (what === 'start') this._enterSelect(null);
         else this._bulk(what);
+      }));
+    this.shadowRoot.querySelectorAll('[data-triage]').forEach((el) =>
+      el.addEventListener('click', (e) => {
+        e.preventDefault();
+        const what = el.getAttribute('data-triage');
+        if (what === 'open') this._openTriage();
+        else if (what === 'close') this._closeTriage();
+        else if (what === 'again') this._startTriage(true);
+      }));
+    this.shadowRoot.querySelectorAll('[data-tri-all]').forEach((el) =>
+      el.addEventListener('click', (e) => {
+        e.preventDefault();
+        this._triageAll(el.getAttribute('data-tri-all'));
       }));
     if (this._full) this._swipe.wire(this.shadowRoot);
     this._wireNew();
@@ -847,6 +914,243 @@ class RetinueChats extends RetinueCard {
     return outs;
   }
 
+  // ── Triage ─────────────────────────────────────────────────────────────────
+  // The Triage button opens a view of the chats sorted three ways — action
+  // suggested (see Ara), no action / archive, no action / delete — by one
+  // fast pass over the unread chats that only this press starts (POST
+  // /chats/triage; a chat sorted before and not spoken in since is not sorted
+  // again). Ara's note on each action chat comes after, from a turn in its
+  // companion: the view shows the lists at once and the notes as they land.
+  // Every row is the list's own row — it opens the chat, swipes and has the
+  // tray as on its tab — and the sections add "Archive all" and "Delete all"
+  // (two taps). A row leaves the view when it is archived or deleted; one
+  // spoken in since it was sorted waits under "Not sorted" for the next
+  // press. The view is a history entry: back closes it.
+  _openTriage() {
+    if (!this._full || this._triage) return;
+    if (this._selecting) this._exitSelect(true, false);
+    this._triage = true;
+    this._triArmed = '';
+    this._triMsg = '';
+    try { history.pushState({ ...(history.state || {}), chatsTriage: true }, ''); } catch (_e) { /* none */ }
+    this._swipe.reset();
+    this._rerender();
+    this._startTriage(false);
+  }
+
+  // `back`: take the view's history entry off too (not when the back
+  // gesture already did).
+  _closeTriage(back = true) {
+    if (!this._triage) return;
+    this._triage = false;
+    this._triArmed = '';
+    if (this._triTimer) clearTimeout(this._triTimer);
+    this._triTimer = null;
+    try {
+      if (back && history.state && history.state.chatsTriage) history.back();
+    } catch (_e) { /* none */ }
+    this._swipe.reset();
+    this._rerender();
+  }
+
+  // The press: sort what is new (`again`: everything unread). A run already
+  // going is shown as it is; the answer carries the state either way.
+  async _startTriage(again) {
+    this._triMsg = '';
+    try {
+      const res = await fetch(TRIAGE_URL, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(again ? { again: true } : {}),
+      });
+      const doc = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        this._triMsg = (doc && doc.error) ? `Triage could not start: ${doc.error}.`
+          : `Triage could not start (the server answered ${res.status}).`;
+        if (doc && doc.run) this._tri = doc;
+      } else {
+        this._tri = doc;
+      }
+    } catch (_err) {
+      this._triMsg = 'Triage could not start: the dashboard is offline.';
+    }
+    if (this._triage) this._rerender();
+    this._triageSchedule();
+  }
+
+  async _pollTriage() {
+    this._triTimer = null;
+    if (!this._triage) return;
+    const wasRunning = triageBusy(this._tri);
+    try {
+      const res = await fetch(TRIAGE_URL, { cache: 'no-store' });
+      if (res.ok) this._tri = await res.json();
+    } catch (_err) {
+      // The next poll asks again.
+    }
+    if (!this._triage) return;
+    // Sorting done or a note landed: the list too (a staged draft shows on
+    // the row).
+    if (wasRunning && !triageBusy(this._tri)) this.load();
+    if (!this._swipe.dragging) this._rerender();
+    this._triageSchedule();
+  }
+
+  _triageSchedule() {
+    if (this._triTimer || !this._triage || !triageBusy(this._tri)) return;
+    this._triTimer = setTimeout(() => this._pollTriage(), TRIAGE_POLL_MS);
+  }
+
+  // Which chats each section shows: every chat triage has a word on, and
+  // every unread chat besides (not sorted yet). A chat archived since leaves
+  // the view; one with a message newer than its sorting is not sorted.
+  _triageSections(d) {
+    const entries = (this._tri && this._tri.entries) || {};
+    const all = (Array.isArray(d.chats) ? d.chats : []).filter((c) => !this._pending.has(c.id));
+    all.sort((a, b) => String((b.last || {}).ts || '').localeCompare(String((a.last || {}).ts || '')));
+    const out = { action: [], archive: [], delete: [], unsorted: [] };
+    for (const c of all) {
+      if (listGroup(c) === 'archived') continue;
+      const e = entries[c.id];
+      if (!e) {
+        if (listGroup(c) === 'unread') out.unsorted.push({ chat: c, entry: null, why: 'Came in after the sorting.' });
+        continue;
+      }
+      if (!['action', 'archive', 'delete'].includes(e.bucket)) {
+        out.unsorted.push({ chat: c, entry: e, why: e.error ? `Not sorted: ${e.error}.` : 'Not sorted.' });
+      } else if (Number.isInteger(c.inbound_seq) && Number.isInteger(e.seq) && c.inbound_seq !== e.seq) {
+        out.unsorted.push({ chat: c, entry: e, why: 'A new message came in since it was sorted.' });
+      } else {
+        out[e.bucket].push({ chat: c, entry: e });
+      }
+    }
+    return out;
+  }
+
+  // What the view says about the run above the sections.
+  _triageStatus() {
+    const t = this._tri;
+    if (this._triMsg) return { text: this._triMsg, err: true };
+    if (!t) return { text: 'Starting…' };
+    if (t.enabled === false) return { text: 'Triage is switched off on this deployment (CHAT_TRIAGE).', err: true };
+    const run = t.run || {};
+    const writing = Object.values(t.entries || {}).filter((e) =>
+      e && e.followup && ['queued', 'working'].includes(e.followup.state)).length;
+    const notes = writing ? ` Ara is still writing ${writing === 1 ? 'her note on 1 chat' : `notes on ${writing} chats`}.` : '';
+    if (t.running || run.state === 'running') {
+      const n = Number(run.sorted || 0) + Number(run.failed || 0);
+      return { text: `Sorting ${n} of ${Number(run.total || 0)} chats…${notes}`, busy: true };
+    }
+    if (run.state === 'failed' || run.state === 'interrupted') {
+      return { text: 'The last sorting did not finish — Sort again picks it up.', err: true };
+    }
+    if (run.state === 'done') {
+      const when = run.finished ? ` ${fmtAge(run.finished)}` : '';  // fmtAge says "ago"
+      const failed = Number(run.failed || 0) ? ` ${Number(run.failed)} could not be sorted.` : '';
+      const fresh = Number(run.total || 0) === 0 ? 'Nothing new to sort.' : `Sorted${when}.`;
+      return { text: `${fresh}${failed}${notes}`, busy: !!writing };
+    }
+    return { text: 'Not sorted yet.' };
+  }
+
+  // The note under a row: what the sorting said, and on an action chat
+  // Ara's own note — on its way, written, or not come.
+  _triageNoteHtml(item) {
+    const e = item.entry;
+    const lines = [];
+    if (item.why) lines.push(`<span class="tn-why">${esc(item.why)}</span>`);
+    if (e && e.note && !item.why) lines.push(`<span class="tn-sort">${esc(e.note)}</span>`);
+    const fu = e && !item.why ? e.followup : null;
+    if (fu) {
+      if (fu.state === 'done' && fu.text) {
+        lines.push(`<span class="tn-ara"><b>Ara:</b> ${esc(fu.text)}</span>`);
+      } else if (fu.state === 'queued' || fu.state === 'working') {
+        lines.push('<span class="tn-ara working">Ara is looking at it…</span>');
+      } else if (fu.state === 'skipped') {
+        lines.push('<span class="tn-ara off">Ara has not looked at this one (too many at once) — open it and ask her.</span>');
+      } else if (fu.state === 'failed' || fu.state === 'interrupted') {
+        lines.push('<span class="tn-ara off">Ara\'s note did not come — open the chat and ask her.</span>');
+      }
+    }
+    return lines.length ? `<span class="tnote">${lines.join('')}</span>` : '';
+  }
+
+  _triageHtml(d) {
+    const secs = this._triageSections(d);
+    const st = this._triageStatus();
+    const sorting = !!(this._tri && (this._tri.running || (this._tri.run || {}).state === 'running'));
+    // No second press while a run sorts or Ara's notes are on their way: the
+    // server refuses it then (a new run would set two turns on one chat).
+    const busy = triageBusy(this._tri);
+    const head = '<div class="tri-head">' +
+      '<button type="button" class="tri-back" data-triage="close" title="Back to all chats">&#8249; Chats</button>' +
+      '<h2 class="tri-title">Triage</h2>' +
+      `<button type="button" class="tri-again" data-triage="again"${busy ? ' disabled' : ''} ` +
+      'title="Sort every unread chat again, also those sorted before">Sort again</button></div>' +
+      `<p class="tri-status${st.err ? ' err' : ''}${st.busy ? ' busy' : ''}" role="status">${esc(st.text)}</p>`;
+    const shownIds = [];
+    const all = [].concat(...TRIAGE_SECTIONS.map((sec) => secs[sec.id].map((it) => it.chat)));
+    const accountsOf = accountsByName(all);
+    const body = TRIAGE_SECTIONS.map((sec) => {
+      const items = secs[sec.id];
+      if (!items.length) return '';
+      let bulk = '';
+      if (sec.id === 'archive') {
+        bulk = `<button type="button" class="tri-all archive" data-tri-all="archive">Archive all</button>`;
+      } else if (sec.id === 'delete') {
+        const n = items.length;
+        const mails = items.some((it) => isMail(it.chat));
+        bulk = this._triArmed === 'delete'
+          ? `<button type="button" class="tri-all delete confirm" data-tri-all="delete">Delete ${n} chat${
+            n === 1 ? '' : 's'}? ${mails ? 'Mails move to the Trash' : 'For good'}</button>`
+          : `<button type="button" class="tri-all delete" data-tri-all="delete">Delete all</button>`;
+      }
+      const rows = items.map((it) => {
+        shownIds.push(it.chat.id);
+        const href = sec.id === 'action'
+          ? `/chat.html?id=${encodeURIComponent(it.chat.id)}&pane=ara` : '';
+        return this._rowHtml(it.chat, listGroup(it.chat), accountsOf,
+          { note: this._triageNoteHtml(it), href });
+      }).join('');
+      return `<section class="tri-sec ${sec.id}" aria-labelledby="tri-${sec.id}">` +
+        `<div class="tri-sec-head"><h3 id="tri-${sec.id}">${esc(sec.title)} ` +
+        `<span class="tri-n">${items.length}</span></h3>${bulk}</div>` +
+        `<ul class="list">${rows}</ul></section>`;
+    }).join('');
+    this._shownIds = shownIds;
+    const empty = !shownIds.length
+      ? `<p class="muted">${sorting || !this._tri ? 'Sorting your unread chats…' : 'Nothing left to triage.'}</p>` : '';
+    return head + body + empty;
+  }
+
+  // "Archive all" (one Undo for the section) and "Delete all" (two taps,
+  // no Undo) over the rows the section shows.
+  async _triageAll(bucket) {
+    if (!this._triage || this._flagging || !this._data) return;
+    const ids = (this._triageSections(this._data)[bucket] || []).map((it) => it.chat.id);
+    if (!ids.length) return;
+    if (bucket === 'archive') {
+      this._triArmed = '';
+      await this._runBulk(ids, 'archive');
+      return;
+    }
+    if (bucket !== 'delete') return;
+    if (this._triArmed !== 'delete') {
+      this._triArmed = 'delete';
+      this._rerender();
+      return;
+    }
+    this._triArmed = '';
+    this._flagging = true;
+    try {
+      const outs = await this._deleteMany(ids);
+      const ok = outs.filter((o) => o && o.ok).length;
+      showNotice(ok === ids.length ? `${ACTIONS.delete.done} ${ok}`
+        : `${ACTIONS.delete.done} ${ok} of ${ids.length} — ${ids.length - ok} failed`);
+    } finally {
+      this._flagging = false;
+    }
+  }
+
   // ── Multi-select ───────────────────────────────────────────────────────────
   // A long press on a row (or the list's Select) starts it, with that row
   // selected; a tap — or Space on a focused row — then toggles a row, and a
@@ -855,7 +1159,8 @@ class RetinueChats extends RetinueCard {
   // them. Esc, Cancel, the back gesture and a tab switch end it; a row that
   // leaves the tab (a poll) leaves the selection.
   _enterSelect(id) {
-    if (!this._full) return;
+    // Triage's sections act on themselves ("Archive all"); no selection there.
+    if (!this._full || this._triage) return;
     if (!this._selecting) {
       this._selecting = true;
       this._selected = new Set();
@@ -999,6 +1304,14 @@ class RetinueChats extends RetinueCard {
       });
       return;
     }
+    await this._runBulk(ids, what);
+  }
+
+  // A flag or read action on many chats (the selection's bar, triage's
+  // "Archive all"): one request per chat (bounded), the failed ones marked
+  // with their reasons, and ONE Undo that writes every chat's previous state
+  // back.
+  async _runBulk(ids, what) {
     this._rerender();
     this._flagging = true;
     let outs;
@@ -1371,6 +1684,41 @@ class RetinueChats extends RetinueCard {
       .new-item { background: transparent; border: 0; border-radius: 8px; padding: 8px 10px; text-align: left;
                   color: var(--fg, #e7ebf2); cursor: pointer; font: inherit; font-size: .88rem; }
       .new-item:hover { background: rgba(110, 168, 254, .14); }
+      /* Triage: its button beside the tabs, and its view. */
+      .tri-btn { flex: none; height: 38px; padding: 0 12px; border-radius: 12px; border: 0; cursor: pointer;
+                 background: var(--card-2, #1c2230); color: var(--accent, #6ea8fe); font: inherit;
+                 font-size: .85rem; font-weight: 600; }
+      .tri-btn:focus-visible, .tri-back:focus-visible, .tri-again:focus-visible, .tri-all:focus-visible {
+        outline: 2px solid var(--fg, #e7ebf2); outline-offset: 1px; }
+      .tri-head { display: flex; align-items: center; gap: 8px; margin-bottom: 4px; }
+      .tri-title { flex: 1; margin: 0; font-size: 1.05rem; }
+      .tri-back, .tri-again { background: transparent; border: 0; color: var(--accent, #6ea8fe); font: inherit;
+                              font-size: .85rem; cursor: pointer; padding: 6px 4px; }
+      .tri-again:disabled { opacity: .45; cursor: default; }
+      .tri-status { margin: 0 0 10px; font-size: .8rem; color: var(--muted, #8b93a3); }
+      .tri-status.err { color: #ff8a80; }
+      .tri-status.busy::before { content: ""; display: inline-block; width: 7px; height: 7px; margin-right: 6px;
+                                 border-radius: 50%; background: var(--accent, #6ea8fe); vertical-align: middle;
+                                 animation: tri-pulse 1.2s ease-in-out infinite; }
+      @keyframes tri-pulse { 50% { opacity: .25; } }
+      @media (prefers-reduced-motion: reduce) { .tri-status.busy::before { animation: none; } }
+      .tri-sec { margin-bottom: 14px; }
+      .tri-sec-head { display: flex; align-items: center; gap: 8px; margin: 0 2px 6px; }
+      .tri-sec-head h3 { flex: 1; margin: 0; font-size: .85rem; font-weight: 600; color: var(--fg, #e7ebf2); }
+      .tri-sec.action .tri-sec-head h3 { color: var(--outbound, #f0b45e); }
+      .tri-n { margin-left: 4px; font-weight: 400; color: var(--muted, #8b93a3); }
+      .tri-all { border: 0; border-radius: 8px; padding: 6px 10px; cursor: pointer; font: inherit;
+                 font-size: .76rem; font-weight: 600; background: var(--card-2, #1c2230); color: var(--fg, #e7ebf2); }
+      .tri-all.delete { background: #d0564f; color: #fff; }
+      .tri-all.delete.confirm { background: #a8322c; }
+      /* The note under a triage row: what the sorting said, then Ara's. */
+      .tnote { grid-column: 2 / 4; display: flex; flex-direction: column; gap: 2px; margin-top: 3px;
+               font-size: .78rem; line-height: 1.35; white-space: normal; min-width: 0; }
+      .tnote .tn-sort { color: var(--fg, #e7ebf2); opacity: .85; }
+      .tnote .tn-why { color: var(--muted, #8b93a3); font-style: italic; }
+      .tnote .tn-ara { color: var(--fg, #e7ebf2); padding-left: 8px; border-left: 2px solid var(--outbound, #f0b45e);
+                       display: -webkit-box; -webkit-line-clamp: 4; -webkit-box-orient: vertical; overflow: hidden; }
+      .tnote .tn-ara.working, .tnote .tn-ara.off { color: var(--muted, #8b93a3); font-style: italic; }
     `;
   }
 
@@ -1414,8 +1762,121 @@ class RetinueChats extends RetinueCard {
     }[this._scope];
   }
 
+  // One chat's row: the link, its swipe layers and its tray. `scope` is the
+  // tab the row is shown as (it decides the swipes and the tray); `opts`
+  // adds triage's note under the row (`note`, markup) and its link
+  // (`href`: an action chat opens on Ara's pane).
+  _rowHtml(c, scope, accountsOf, opts = {}) {
+    const archived = scope === 'archived';
+    // The count says what it counts in words too, for whoever does not see
+    // the pill: "3" alone is not a statement.
+    const unread = Number(c.unread) > 0 ? Number(c.unread) : 0;
+    const badge = unread
+      ? `<span class="unread${c.muted ? ' muted-chat' : ''}" title="${unread} unread">` +
+        `${unread}<span class="vh"> unread</span></span>`
+      : (c.muted ? '<span class="mute-mark" title="Muted" aria-label="Muted">&#128277;</span>' : '');
+    // A staged draft outranks the last message in the preview — it is what
+    // this chat is waiting on.
+    const draft = c.draft && c.draft.text;
+    // A Delete or Spam that failed: the server's reason, where the preview
+    // was, until the next attempt.
+    const failed = this._full && this._failed ? this._failed.get(c.id) : null;
+    const prev = failed
+      ? `<span class="pv-failed" role="alert">${esc((ACTIONS[failed.kind] || ACTIONS.delete).failed)}: ${esc(failed.reason)}</span>`
+      : draft
+      ? `<span class="pv-draft">${c.draft.author === 'agent'
+        ? `Draft by ${esc(c.draft.agent || 'Ara')}` : 'Draft'}:</span> ${esc(c.draft.text)}`
+      : previewHtml(c);
+    // The actions sit UNDER the row, never inside it: a row is a link, and
+    // a button within a link is not a button. Only on the full page — the
+    // dashboard card is a glance, not a place to curate.
+    const act = (label, set, title, confirm = '') =>
+      `<button type="button" class="${set}" data-flag="${esc(c.id)}" data-set="${set}" ` +
+      `title="${esc(title)}"${confirm ? ` data-confirm="${esc(confirm)}"` : ''}>${label}</button>`;
+    // A failed Delete or Spam: its button retries, and says why it failed.
+    const again = (kind, label, title, confirm = '') => {
+      if (!failed || failed.kind !== kind) return act(label, kind, title, confirm);
+      const off = failed.unconfigured;
+      return act(off ? 'Delete not set up' : ACTIONS[kind].retry, kind,
+        off ? "Chat deletion needs CHAT_ERASE_TOKEN on retinue and on the chat's gateway" : failed.reason,
+        confirm);
+    };
+    // Deleting a mail thread does something in the mailbox too, and the
+    // button says what before the second tap: the mails move to the
+    // mailbox's Trash (nothing is expunged), then the chat is erased here.
+    const mailbox = c.account || 'the mailbox';
+    const del = isMail(c)
+      ? again('delete', 'Delete',
+          `Moves the thread's mails to the Trash of ${mailbox}, then erases the chat here`,
+          'Move mails to Trash?')
+      : again('delete', 'Delete', 'Erase this chat and all its messages from the system');
+    // Spam: a mail thread's alone — its mails go to the Junk folder, and
+    // the chat is muted and archived. A messenger chat is muted instead.
+    const spam = isMail(c)
+      ? again('spam', 'Spam',
+          `Moves the thread's mails to the Junk folder of ${mailbox}, then mutes and archives the chat`)
+      : '';
+    const star = starButtonHtml(!!c.starred,
+      (set) => `data-flag="${esc(c.id)}" data-set="${set}"`);
+    // What a swipe does is in the tray too — Mark read and Archive beside
+    // Star and Mute — so a keyboard, which opens the tray with the
+    // context-menu key, reaches everything a finger does.
+    const tray = star + (archived
+      ? act('Restore', 'restore', 'Put this chat back in the list') +
+        (c.muted
+          ? act('Unmute', 'unmute', 'Stay archived, but come back when it speaks')
+          : act('Mute', 'mute', 'Keep it out of the list, even when it speaks')) +
+        spam + del
+      : (scope === 'unread'
+        ? act('Mark read', 'read', 'Mark everything in this chat as read') : '') +
+        act('Archive', 'archive', 'Out of the list until the next message') +
+        act('Mute', 'mute',
+            'Out of the list, and the next message does not bring it back') +
+        spam + del);
+    // The two sides of a swipe, per tab: right marks read (Unread),
+    // restores (Archived) or does nothing (Read — nothing to mark); left
+    // uncovers the tray everywhere, and on Unread and Read a full swipe
+    // left archives.
+    const quick = { unread: 'read', archived: 'restore' }[scope] || '';
+    const quickLeft = archived ? '' : 'archive';
+    const QUICK_LABEL = { read: 'Mark read', restore: 'Restore' };
+    const under = !this._full ? ''
+      : (quick ? `<div class="quick ${quick}" aria-hidden="true">${QUICK_LABEL[quick]}</div>` : '') +
+        (quickLeft ? `<div class="quick-left ${quickLeft}" aria-hidden="true">Archive</div>` : '') +
+        `<div class="tray">${tray}</div>`;
+    const people = participantsText(c);
+    const picked = this._selecting && this._selected.has(c.id);
+    return (this._full
+      ? `<li class="swipe${failed ? ' failed' : ''}${picked ? ' selected' : ''}" data-id="${esc(c.id)}"` +
+        (quick ? ` data-quick="${quick}"` : '') +
+        (quickLeft ? ` data-quick-left="${quickLeft}"` : '') + '>'
+      : '<li>') + under +
+      `<a class="row${unread ? ' has-unread' : ''}${people ? ' has-people' : ''}"` +
+      (this._full ? ' draggable="false" ' : ' ') +
+      (this._selecting ? `aria-pressed="${picked}" ` : '') +
+      `href="${opts.href || `/chat.html?id=${encodeURIComponent(c.id)}`}">` +
+      (this._selecting
+        ? `<span class="sel-mark${picked ? ' on' : ''}" aria-hidden="true">${picked ? '&#10003;' : ''}</span>`
+        : `${avatarHtml(c)}`) +
+      `<span class="name">${c.starred ? STAR_MARK : ''}${esc(c.name)}` +
+      ((accountsOf[nameKey(c)] || new Set()).size > 1
+        ? `<span class="acct" title="${c.account
+            ? `On the account ${esc(c.account)}`
+            : 'Older messages, from before the account was recorded'}">${
+            c.account ? esc(c.account) : 'earlier'}</span>`
+        : '') +
+      `</span>` +
+      `<span class="when">${esc(fmtAge((c.last || {}).ts))}</span>` +
+      (people ? `<span class="ppl" title="${esc(people)}">${esc(people)}</span>` : '') +
+      `<span class="prev">${prev}</span>` +
+      badge +
+      (opts.note || '') +
+      '</a></li>';
+  }
+
   body(d) {
     this._data = d;
+    if (this._full && this._triage) return this._triageHtml(d);
     // A row whose Spam waits for its Undo window is out of view.
     const all = (Array.isArray(d.chats) ? d.chats : []).filter((c) => !(this._pending && this._pending.has(c.id)));
     // The API contract returns the list ordered by last activity; keep that
@@ -1425,7 +1886,6 @@ class RetinueChats extends RetinueCard {
     // that is not archived. The Archived tab is where archived chats remain
     // reachable — and where Restore puts them back.
     const scope = this._full ? this._scope : '';
-    const archived = scope === 'archived';
     const inScope = (c) => (scope ? listGroup(c) === scope : listGroup(c) !== 'archived');
     // Starred chats first, each group still by last activity.
     const chats = starredFirst(all.filter(inScope));
@@ -1437,7 +1897,12 @@ class RetinueChats extends RetinueCard {
     // The tabs, and beside them the ＋ where there is something to start.
     const filter = this._filterHtml(this._full ? this._counts(d, all) : null);
     const plus = this._newHtml();
-    const tabs = (plus ? `<div class="list-head">${filter}${plus}</div>` : filter) +
+    // Triage: on the full page, beside the tabs.
+    const tri = this._full
+      ? '<button type="button" class="tri-btn" data-triage="open" ' +
+        'title="Sort the unread chats: what needs you, what to archive, what to delete">Triage</button>'
+      : '';
+    const tabs = (plus || tri ? `<div class="list-head">${filter}${tri}${plus}</div>` : filter) +
       this._barHtml(chats);
     // The tabs' panel: what the selected tab shows, rows or its empty line.
     const panel = (inner) => (this._full
@@ -1448,127 +1913,9 @@ class RetinueChats extends RetinueCard {
     }
     const shown = (this._full || isWideFrame()) ? chats : chats.slice(0, MAX_CARD_CHATS);
     this._shownIds = shown.map((c) => c.id);
-    // Two accounts of one channel talking to the same peer are two chats with
-    // the same name (and so is a peer's unattributed history beside its
-    // account-named chat; and so is one mail thread that reached two of the
-    // user's mailboxes). The name alone cannot tell them apart, so where — and
-    // only where — a name repeats within a channel ACROSS accounts, each row
-    // also says which account it is. Rows that share a name on one account
-    // (two mail threads both called "Invoice", two contacts both called
-    // "Mara") get no label: it would be the same on each and tell them apart
-    // no better — the participants line and the preview do that. Computed
-    // over the rows actually shown, so an unambiguous list carries none.
-    const accountsOf = {};
-    const nameKey = (c) => `${c.channel}\u0000${c.name}`;
-    for (const c of shown) {
-      const k = nameKey(c);
-      (accountsOf[k] = accountsOf[k] || new Set()).add(c.account || '');
-    }
-    const rows = shown.map((c) => {
-      // The count says what it counts in words too, for whoever does not see
-      // the pill: "3" alone is not a statement.
-      const unread = Number(c.unread) > 0 ? Number(c.unread) : 0;
-      const badge = unread
-        ? `<span class="unread${c.muted ? ' muted-chat' : ''}" title="${unread} unread">` +
-          `${unread}<span class="vh"> unread</span></span>`
-        : (c.muted ? '<span class="mute-mark" title="Muted" aria-label="Muted">&#128277;</span>' : '');
-      // A staged draft outranks the last message in the preview — it is what
-      // this chat is waiting on.
-      const draft = c.draft && c.draft.text;
-      // A Delete or Spam that failed: the server's reason, where the preview
-      // was, until the next attempt.
-      const failed = this._full && this._failed ? this._failed.get(c.id) : null;
-      const prev = failed
-        ? `<span class="pv-failed" role="alert">${esc((ACTIONS[failed.kind] || ACTIONS.delete).failed)}: ${esc(failed.reason)}</span>`
-        : draft
-        ? `<span class="pv-draft">${c.draft.author === 'agent'
-          ? `Draft by ${esc(c.draft.agent || 'Ara')}` : 'Draft'}:</span> ${esc(c.draft.text)}`
-        : previewHtml(c);
-      // The actions sit UNDER the row, never inside it: a row is a link, and
-      // a button within a link is not a button. Only on the full page — the
-      // dashboard card is a glance, not a place to curate.
-      const act = (label, set, title, confirm = '') =>
-        `<button type="button" class="${set}" data-flag="${esc(c.id)}" data-set="${set}" ` +
-        `title="${esc(title)}"${confirm ? ` data-confirm="${esc(confirm)}"` : ''}>${label}</button>`;
-      // A failed Delete or Spam: its button retries, and says why it failed.
-      const again = (kind, label, title, confirm = '') => {
-        if (!failed || failed.kind !== kind) return act(label, kind, title, confirm);
-        const off = failed.unconfigured;
-        return act(off ? 'Delete not set up' : ACTIONS[kind].retry, kind,
-          off ? "Chat deletion needs CHAT_ERASE_TOKEN on retinue and on the chat's gateway" : failed.reason,
-          confirm);
-      };
-      // Deleting a mail thread does something in the mailbox too, and the
-      // button says what before the second tap: the mails move to the
-      // mailbox's Trash (nothing is expunged), then the chat is erased here.
-      const mailbox = c.account || 'the mailbox';
-      const del = isMail(c)
-        ? again('delete', 'Delete',
-            `Moves the thread's mails to the Trash of ${mailbox}, then erases the chat here`,
-            'Move mails to Trash?')
-        : again('delete', 'Delete', 'Erase this chat and all its messages from the system');
-      // Spam: a mail thread's alone — its mails go to the Junk folder, and
-      // the chat is muted and archived. A messenger chat is muted instead.
-      const spam = isMail(c)
-        ? again('spam', 'Spam',
-            `Moves the thread's mails to the Junk folder of ${mailbox}, then mutes and archives the chat`)
-        : '';
-      const star = starButtonHtml(!!c.starred,
-        (set) => `data-flag="${esc(c.id)}" data-set="${set}"`);
-      // What a swipe does is in the tray too — Mark read and Archive beside
-      // Star and Mute — so a keyboard, which opens the tray with the
-      // context-menu key, reaches everything a finger does.
-      const tray = star + (archived
-        ? act('Restore', 'restore', 'Put this chat back in the list') +
-          (c.muted
-            ? act('Unmute', 'unmute', 'Stay archived, but come back when it speaks')
-            : act('Mute', 'mute', 'Keep it out of the list, even when it speaks')) +
-          spam + del
-        : (scope === 'unread'
-          ? act('Mark read', 'read', 'Mark everything in this chat as read') : '') +
-          act('Archive', 'archive', 'Out of the list until the next message') +
-          act('Mute', 'mute',
-              'Out of the list, and the next message does not bring it back') +
-          spam + del);
-      // The two sides of a swipe, per tab: right marks read (Unread),
-      // restores (Archived) or does nothing (Read — nothing to mark); left
-      // uncovers the tray everywhere, and on Unread and Read a full swipe
-      // left archives.
-      const quick = { unread: 'read', archived: 'restore' }[scope] || '';
-      const quickLeft = archived ? '' : 'archive';
-      const QUICK_LABEL = { read: 'Mark read', restore: 'Restore' };
-      const under = !this._full ? ''
-        : (quick ? `<div class="quick ${quick}" aria-hidden="true">${QUICK_LABEL[quick]}</div>` : '') +
-          (quickLeft ? `<div class="quick-left ${quickLeft}" aria-hidden="true">Archive</div>` : '') +
-          `<div class="tray">${tray}</div>`;
-      const people = participantsText(c);
-      const picked = this._selecting && this._selected.has(c.id);
-      return (this._full
-        ? `<li class="swipe${failed ? ' failed' : ''}${picked ? ' selected' : ''}" data-id="${esc(c.id)}"` +
-          (quick ? ` data-quick="${quick}"` : '') +
-          (quickLeft ? ` data-quick-left="${quickLeft}"` : '') + '>'
-        : '<li>') + under +
-        `<a class="row${unread ? ' has-unread' : ''}${people ? ' has-people' : ''}"` +
-        (this._full ? ' draggable="false" ' : ' ') +
-        (this._selecting ? `aria-pressed="${picked}" ` : '') +
-        `href="/chat.html?id=${encodeURIComponent(c.id)}">` +
-        (this._selecting
-          ? `<span class="sel-mark${picked ? ' on' : ''}" aria-hidden="true">${picked ? '&#10003;' : ''}</span>`
-          : `${avatarHtml(c)}`) +
-        `<span class="name">${c.starred ? STAR_MARK : ''}${esc(c.name)}` +
-        (accountsOf[nameKey(c)].size > 1
-          ? `<span class="acct" title="${c.account
-              ? `On the account ${esc(c.account)}`
-              : 'Older messages, from before the account was recorded'}">${
-              c.account ? esc(c.account) : 'earlier'}</span>`
-          : '') +
-        `</span>` +
-        `<span class="when">${esc(fmtAge((c.last || {}).ts))}</span>` +
-        (people ? `<span class="ppl" title="${esc(people)}">${esc(people)}</span>` : '') +
-        `<span class="prev">${prev}</span>` +
-        badge +
-        '</a></li>';
-    }).join('');
+    // Which account a row is, where a name repeats (accountsByName).
+    const accountsOf = accountsByName(shown);
+    const rows = shown.map((c) => this._rowHtml(c, scope, accountsOf)).join('');
     return `${tabs}${panel(`<ul class="list">${rows}</ul>`)}${this._footHtml()}`;
   }
 

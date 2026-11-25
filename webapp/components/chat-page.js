@@ -980,6 +980,10 @@ class RetinueChatPage extends HTMLElement {
   connectedCallback() {
     if (!this.shadowRoot) this.attachShadow({ mode: 'open' });
     this._id = new URLSearchParams(location.search).get('id') || '';
+    // Opened from triage's "Action suggested" list (chats.js): on the phone,
+    // straight onto Ara's pane, where her note on the chat is. A shelf
+    // restore (a page brought back from the shelf) still says where it was.
+    if (new URLSearchParams(location.search).get('pane') === 'ara') this._pane = 'companion';
     // Leaving with input in the composer: the words not yet saved go to the
     // server as the page unloads, and stay on the device in case they do not
     // get there (_keepLocal); a live recording is handed on to be transcribed

@@ -1,0 +1,253 @@
+#!/usr/bin/env python3
+"""Behavioural tests for the Chats page's triage view
+(webapp/components/chats.js, docs/chat-triage.md), on the scripted DOM and
+fetch of tests/test_webapp_chat_list.py. Pins:
+
+  * the full page offers Triage beside the tabs; opening it is a press —
+    POST /chats/triage {} — and Sort again posts {again: true};
+  * the sections: action (the row opens the chat on Ara's pane), archive,
+    delete, and Not sorted — an unread chat with no word yet, one whose
+    sorting failed, and one spoken in since it was sorted; an archived chat
+    leaves the view; each row is the list's own row (its swipes and tray);
+  * the sorting's note and Ara's — on its way, written, or not come;
+  * the status line while sorting and after; a refused press says why;
+  * the poll runs while work is open, and the list is fetched again once
+    the sorting is done;
+  * Archive all archives every row of its section with one Undo that puts
+    them all back; Delete all takes two taps and deletes every row;
+  * no multi-select inside the view; Close (and back) returns to the tabs.
+
+Standalone like the rest of the suite. Needs `node` on PATH; without it the
+test reports a skip and passes.
+"""
+import importlib.util
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+COMPONENTS = os.path.join(HERE, "..", "webapp", "components")
+FIXTURE = os.path.join(HERE, "..", "webapp", "data", "chats.json")
+
+
+def _list_harness() -> str:
+    """The chat list test's scripted DOM, fetch and helpers — everything up
+    to its own checks."""
+    spec = importlib.util.spec_from_file_location(
+        "test_webapp_chat_list", os.path.join(HERE, "test_webapp_chat_list.py"))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    harness = mod.HARNESS
+    cut = harness.index("const LIST = [")
+    return harness[:cut]
+
+
+CHECKS = r"""
+const takeTri = (method, what) => take((w) => w.method === method && w.url === '/chats/triage', what);
+
+const LIST = [
+  chat('u1', { unread: 1, list_group: 'unread', inbound_seq: 7, last: { ts: '2026-11-21T09:00:00Z', direction: 'in', text: 'invoice' } }),
+  chat('u2', { unread: 2, list_group: 'unread', inbound_seq: 3, last: { ts: '2026-11-20T09:00:00Z', direction: 'in', text: 'receipt' } }),
+  chat('u3', { unread: 1, list_group: 'unread', inbound_seq: 4, last: { ts: '2026-11-19T09:00:00Z', direction: 'in', text: 'promo' } }),
+  chat('u4', { unread: 1, list_group: 'unread', inbound_seq: 2, last: { ts: '2026-11-18T09:00:00Z', direction: 'in', text: 'new' } }),
+  chat('r1', { unread: 0, list_group: 'read', inbound_seq: 9 }),
+  chat('a1', { unread: 0, list_group: 'archived', archived: true }),
+];
+const RUNNING = {
+  enabled: true, running: true,
+  run: { state: 'running', total: 4, sorted: 1, failed: 0 },
+  entries: { u1: { bucket: 'action', note: 'Pay the plumber by Friday.', reply: true, seq: 7, run: 'r', followup: { state: 'working' } } },
+};
+const DONE = {
+  enabled: true, running: false,
+  run: { state: 'done', total: 4, sorted: 3, failed: 1, finished: '2026-11-21T09:30:00Z' },
+  entries: {
+    u1: { bucket: 'action', note: 'Pay the plumber by Friday.', reply: true, seq: 7, run: 'r',
+          followup: { state: 'done', text: 'The invoice is CHF 320, due Friday. <b>I staged</b> a reply.' } },
+    u2: { bucket: 'archive', note: 'Receipt for the train ticket.', seq: 3, run: 'r' },
+    u3: { bucket: 'delete', note: 'Advertising.', seq: 4, run: 'r' },
+    u4: { bucket: null, error: 'the sorting did not complete', seq: 2, run: 'r' },
+    r1: { bucket: 'archive', note: 'Old.', seq: 8, run: 'r' },
+    a1: { bucket: 'delete', note: 'x', seq: 5, run: 'r' },
+  },
+};
+const sectionOf = (h, sec) => {
+  const start = h.indexOf(`<section class="tri-sec ${sec}"`);
+  if (start < 0) return '';
+  return h.slice(start, h.indexOf('</section>', start));
+};
+const ids = (h) => rowIds(h);
+
+async function openTriage(el, answer = RUNNING) {
+  el._openTriage();
+  const post = takeTri('POST', 'the press');
+  assert.deepEqual(post.body, {}, 'opening sorts what is new');
+  post.answer(JSON.parse(JSON.stringify(answer)), answer.running ? 202 : 200);
+  await settle();
+  clearTimeout(el._triTimer);  // the test drives every poll itself
+  el._triTimer = null;
+  return post;
+}
+
+await ok('the full page offers Triage beside the tabs', async () => {
+  const el = await mount(payload(LIST));
+  assert.ok(/<div class="list-head">.*data-triage="open"/s.test(html(el)), html(el));
+});
+
+await ok('opening it presses: the sections, the notes and the status while it sorts', async () => {
+  const el = await mount(payload(LIST));
+  await openTriage(el);
+  const h = html(el);
+  assert.ok(!h.includes('role="tablist"'), 'the view replaces the tabs');
+  assert.ok(h.includes('Sorting 1 of 4 chats… Ara is still writing her note on 1 chat.'), h);
+  const action = sectionOf(h, 'action');
+  assert.deepEqual(ids(action), ['u1']);
+  assert.ok(action.includes('href="/chat.html?id=u1&pane=ara"'), 'an action chat opens on Ara\'s pane');
+  assert.ok(action.includes('Pay the plumber by Friday.'));
+  assert.ok(action.includes('Ara is looking at it…'));
+  const unsorted = sectionOf(h, 'unsorted');
+  assert.deepEqual(ids(unsorted), ['u2', 'u3', 'u4'], 'unread chats with no word yet');
+  assert.ok(unsorted.includes('Came in after the sorting.'));
+  assert.ok(!ids(h).includes('r1'), 'a read chat with no word is no triage row');
+  assert.ok(!ids(h).includes('a1'));
+  assert.ok(h.includes('data-triage="again" disabled'), 'no second press while it sorts');
+  // The list's own row: its swipes and tray, by the tab it is on.
+  assert.deepEqual(rowAttrs(h, 'u1'), { quick: 'read', left: 'archive' });
+  assert.deepEqual(trayOf(h, 'u1'), ['star', 'read', 'archive', 'mute', 'delete']);
+});
+
+await ok('the poll: buckets, Ara\'s note escaped, not sorted with reasons, the list fetched again', async () => {
+  const el = await mount(payload(LIST));
+  await openTriage(el);
+  el._pollTriage();
+  takeTri('GET', 'the poll').answer(JSON.parse(JSON.stringify(DONE)));
+  await settle();
+  takeList().answer(payload(LIST));  // the sorting finished: the list too
+  await settle();
+  const h = html(el);
+  assert.ok(/Sorted \S+ \S+ ago\. 1 could not be sorted\./.test(h), h);
+  assert.ok(!h.includes('ago ago'), h);
+  assert.ok(!h.includes('data-triage="again" disabled'));
+  assert.deepEqual(ids(sectionOf(h, 'action')), ['u1']);
+  assert.ok(sectionOf(h, 'action').includes('<b>Ara:</b> The invoice is CHF 320, due Friday. &lt;b&gt;I staged&lt;/b&gt; a reply.'));
+  assert.deepEqual(ids(sectionOf(h, 'archive')), ['u2']);
+  assert.deepEqual(ids(sectionOf(h, 'delete')), ['u3'], 'an archived chat leaves the view');
+  const unsorted = sectionOf(h, 'unsorted');
+  assert.deepEqual(ids(unsorted), ['r1', 'u4'], 'newest first, as everywhere');
+  assert.ok(unsorted.includes('Not sorted: the sorting did not complete.'));
+  assert.ok(unsorted.includes('A new message came in since it was sorted.'));
+  assert.equal(el._triTimer, null, 'nothing open: no further poll');
+});
+
+await ok('no second press while Ara still writes a note, though the sorting is done', async () => {
+  const el = await mount(payload(LIST));
+  const writing = JSON.parse(JSON.stringify(DONE));
+  writing.entries.u1.followup = { state: 'working' };
+  writing.busy = true;
+  await openTriage(el, writing);
+  assert.ok(html(el).includes('data-triage="again" disabled'), html(el));
+  const idle = JSON.parse(JSON.stringify(DONE));
+  idle.busy = false;
+  el._tri = idle;
+  el._rerender();
+  assert.ok(!html(el).includes('data-triage="again" disabled'));
+});
+
+await ok('Archive all: one request per row, one Undo for all', async () => {
+  const el = await mount(payload(LIST));
+  await openTriage(el, DONE);
+  const run = el._triageAll('archive');
+  await settle();
+  const post = take((w) => w.method === 'POST' && w.url === '/chats/u2/flags', 'the archive');
+  assert.deepEqual(post.body, { archived: true });
+  post.answer({ id: 'u2', archived: true, muted: false, starred: false });
+  await run;
+  await settle();
+  assert.ok(!ids(html(el)).includes('u2'), 'the archived row leaves the view');
+  assert.ok(toast && toast.undo && /Archived 1/.test(toast.text), JSON.stringify(toast));
+  toast.undo();
+  await settle();
+  const back = take((w) => w.method === 'POST' && w.url === '/chats/u2/flags', 'the undo');
+  assert.deepEqual(back.body, { archived: false, muted: false, starred: false });
+  back.answer({ id: 'u2', archived: false, muted: false, starred: false });
+  await settle();
+  await settle();
+  assert.deepEqual(ids(sectionOf(html(el), 'archive')), ['u2'], 'Undo puts it back');
+  dismissUndo();
+});
+
+await ok('Delete all takes two taps and deletes every row of the section', async () => {
+  const el = await mount(payload(LIST));
+  await openTriage(el, DONE);
+  await el._triageAll('delete');
+  assert.ok(!wire.some((w) => w.url.endsWith('/delete')), 'the first tap only arms');
+  assert.ok(sectionOf(html(el), 'delete').includes('Delete 1 chat? For good'), html(el));
+  const run = el._triageAll('delete');
+  await settle();
+  take((w) => w.method === 'POST' && w.url === '/chats/u3/delete', 'the delete').answer({ deleted: true });
+  await run;
+  await settle();
+  assert.ok(!ids(html(el)).includes('u3'));
+  assert.ok(!html(el).includes('tri-sec delete'), 'an empty section is not shown');
+});
+
+await ok('Sort again presses with again; a refused press says why', async () => {
+  const el = await mount(payload(LIST));
+  await openTriage(el, DONE);
+  el._startTriage(true);
+  const post = takeTri('POST', 'the second press');
+  assert.deepEqual(post.body, { again: true });
+  post.answer({ error: 'chat triage is switched off (CHAT_TRIAGE)' }, 409);
+  await settle();
+  await settle();
+  assert.ok(html(el).includes('Triage could not start: chat triage is switched off (CHAT_TRIAGE).'), html(el));
+});
+
+await ok('no multi-select in the view; Close and back return to the tabs', async () => {
+  history.stack = [null];  // the earlier checks' views were never closed
+  const el = await mount(payload(LIST));
+  await openTriage(el, DONE);
+  el._enterSelect('u1');
+  assert.equal(el._selecting, false);
+  assert.equal(history.state && history.state.chatsTriage, true, 'the view is a history entry');
+  el._closeTriage();
+  assert.equal(el._triage, false);
+  assert.ok(html(el).includes('role="tablist"'));
+  await openTriage(el, DONE);
+  history.back();
+  assert.equal(el._triage, false, 'the back gesture closes it');
+});
+
+console.log(`${passed} checks passed`);
+"""
+
+
+def main() -> int:
+    node = shutil.which("node")
+    if not node:
+        print("SKIP: node is not installed; the chat triage test needs it")
+        return 0
+    with tempfile.TemporaryDirectory() as tmp:
+        for name in os.listdir(COMPONENTS):
+            if name.endswith(".js"):
+                shutil.copy(os.path.join(COMPONENTS, name), os.path.join(tmp, name))
+        with open(os.path.join(tmp, "package.json"), "w", encoding="utf-8") as fh:
+            fh.write('{"type":"module"}')
+        with open(os.path.join(tmp, "harness.mjs"), "w", encoding="utf-8") as fh:
+            fh.write(_list_harness() + CHECKS)
+        env = dict(os.environ, CHATS_FIXTURE=os.path.abspath(FIXTURE))
+        proc = subprocess.run([node, "harness.mjs"], cwd=tmp, capture_output=True,
+                              text=True, timeout=120, env=env)
+        sys.stdout.write(proc.stdout)
+        if proc.returncode != 0:
+            sys.stderr.write(proc.stderr)
+            print("FAIL: chat triage view test")
+            return 1
+    print("PASS: chat triage view test")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
