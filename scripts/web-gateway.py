@@ -305,6 +305,18 @@ Messenger chats (the deterministic chat mirror; see scripts/chat_state.py):
                                          of the triage delivery gate: whether a
                                          group is a news source, or costs a
                                          model turn, is that policy's business.
+  POST /chats/<id>/spam               -> mark a mail thread as spam (no body):
+                                         its gateway moves the thread's
+                                         inbound mails in INBOX and the
+                                         archive to the mailbox's Junk folder
+                                         (POST /chats/spam) and only once it
+                                         has, the chat is muted and archived
+                                         (its attention item settled). On a
+                                         failure nothing changes here and
+                                         `error` says why in one sentence.
+                                         Mail chats only (400 for a messenger
+                                         chat). Same-origin and through the
+                                         reverse proxy only, like delete.
   POST /chats/<id>/contact            -> the contact card: {name, sphere?,
                                          tags?, permit?, chamber?, person?}.
                                          Files the chat's peer as a person in
@@ -8143,6 +8155,7 @@ _CHAT_TRIM_RE = re.compile(r"^/chats/([^/]+)/messages/([A-Za-z0-9_-]+)/trim/?$")
 _CHAT_READ_RE = re.compile(r"^/chats/([^/]+)/read/?$")
 _CHAT_FLAGS_RE = re.compile(r"^/chats/([^/]+)/flags/?$")
 _CHAT_DELETE_RE = re.compile(r"^/chats/([^/]+)/delete/?$")
+_CHAT_SPAM_RE = re.compile(r"^/chats/([^/]+)/spam/?$")
 _CHAT_DRAFT_RE = re.compile(r"^/chats/([^/]+)/draft/?$")
 _CHAT_DRAFT_UNDO_RE = re.compile(r"^/chats/([^/]+)/draft/undo/?$")
 _CHAT_SEND_RE = re.compile(r"^/chats/([^/]+)/send/?$")
@@ -12151,6 +12164,78 @@ def _delete_chat(chat_id: str) -> tuple[dict, str | None]:
     return report, None
 
 
+# How much of a gateway's own sentence on a refused spam is passed on.
+CHAT_SPAM_REASON_MAX = 300
+
+
+def _spam_chat(chat_id: str) -> tuple[int, dict]:
+    """Mark a mail thread as spam; ``(HTTP status, answer)``.
+
+    The mailbox first: the thread's gateway moves the thread's inbound mails
+    that lie in INBOX or the archive folder — never the user's own, never
+    Sent — to the account's Junk folder (POST <gateway>/chats/spam, with the
+    Message-IDs the chat holds now, as an archive's hook names them:
+    _mailbox_scope). Only once it answers that it has is the chat muted and
+    archived here, on the user's word (_set_chat_flags ``user``), which
+    settles its attention item as a mute does. On any failure — no gateway
+    for the mailbox, the store unable to say which mails the chat holds, the
+    gateway's refusal (no Junk folder, and which variable names one) —
+    nothing here changes, and the answer's ``error`` is one sentence saying
+    why: the user sees the chat still there, with the reason, and can try
+    again.
+
+    Not a hook like archive's: the user is shown the outcome, so it is made
+    in the request, and never owed. And never the reverse: restoring the
+    chat later (Restore, Unmute) moves nothing out of Junk — the mailbox
+    follows the chat, never back (docs/mail-chats.md).
+
+    Mail chats only. A messenger chat has no Junk folder to send anything
+    to; muting it is what keeps it out of the way (400)."""
+    ref = chat_state_mod.split_chat_ref(chat_id)
+    if ref is None:
+        return 404, {"error": "not a chat id"}
+    channel, account, key = ref
+    if not _is_mail(channel):
+        return 400, {"error": "only a mail thread can be marked as spam; mute this chat "
+                              "instead to keep it out of the list"}
+    if not account:
+        return 400, {"error": "this mail thread names no mailbox, so there is no Junk "
+                              "folder to move its mails to"}
+    slug, gw, problem = _chat_gateway(_CHAT_STATE.get(chat_id), channel, account)
+    if gw is None:
+        return 503, {"error": f"no mail gateway serves {account} just now, so nothing was "
+                              f"moved and the chat is unchanged — try again in a minute",
+                     "detail": problem}
+    scope = _mailbox_scope(chat_id, _mailbox_cut(chat_id, "archive"))
+    if scope is None:
+        return 503, {"error": "the chat's mails could not be listed just now, so nothing "
+                              "was moved and the chat is unchanged — try again in a minute"}
+    try:
+        status, answer = _gateway_hop(gw, "/chats/spam",
+                                      {"chat": key, "account": account, "message_ids": scope})
+    except Exception as exc:  # noqa: BLE001 - a transport failure: nothing changed here
+        print(f"[web-gateway] spam of {chat_id} did not reach {slug}: {exc}", flush=True)
+        return 502, {"error": "the mail gateway could not be reached, so nothing was moved "
+                              "and the chat is unchanged — try again in a minute"}
+    if status != 200 or not isinstance(answer, dict) or answer.get("ok") is not True:
+        said = _one_line(answer.get("error") if isinstance(answer, dict) else None,
+                         CHAT_SPAM_REASON_MAX)
+        print(f"[web-gateway] spam of {chat_id} refused by {slug}: HTTP {status}: "
+              f"{said or answer!r}", flush=True)
+        return 502, {"error": said or f"the mail gateway answered HTTP {status}; the chat "
+                                      f"is unchanged"}
+    # The archive that muting brings reaches the mails the user marked, never
+    # one that came since (the gateway left that one where it is, too).
+    doc = _set_chat_flags(chat_id, {"muted": True, "archived": True}, user=True,
+                          scope=scope)
+    print(f"[web-gateway] chat {chat_id} marked as spam: {answer.get('moved')} mail(s) "
+          f"to Junk", flush=True)
+    return 200, {"id": chat_id, "spam": True,
+                 "moved": answer.get("moved") if isinstance(answer.get("moved"), int) else 0,
+                 "archived": bool(doc.get("archived")), "muted": bool(doc.get("muted")),
+                 "starred": bool(doc.get("starred"))}
+
+
 def _merge_chats(channel: str, account: str | None, absorbed_keys,
                  survivor_key: str) -> tuple[str, list[str]]:
     """Two or more chats turned out to be one: fold the absorbed chats into
@@ -13493,7 +13578,8 @@ def _read_chat_flags(payload: dict) -> dict[str, bool]:
     return flags
 
 
-def _set_chat_flags(chat_id: str, flags: dict[str, bool], *, user: bool = False) -> dict:
+def _set_chat_flags(chat_id: str, flags: dict[str, bool], *, user: bool = False,
+                    scope: list[str] | None = None) -> dict:
     """Set a chat's flags and everything that follows from them: the list,
     the attention item, the mailbox. Returns the chat's state document.
 
@@ -13510,12 +13596,16 @@ def _set_chat_flags(chat_id: str, flags: dict[str, bool], *, user: bool = False)
     the user's last unarchive can put the thread away over a newer mail
     (_turn_put_away) — also where the turn is wrapping up as this lands
     (the record's ``epoch``). The undo of a turn that did not finish is no
-    such word."""
+    such word.
+
+    ``scope``: the Message-IDs the mailbox's archive reaches, where the
+    action was about those only (Spam: the mails the chat held when the user
+    acted), as for _chat_flags_follow; else everything that has landed."""
     before = _CHAT_STATE.get(chat_id)
     doc = _CHAT_STATE.set_flags(chat_id, **flags,
                                 forget_asked=user and flags.get("archived") is False)
     _turn_flags_overruled(chat_id, flags)
-    return _chat_flags_follow(chat_id, flags, before, doc)
+    return _chat_flags_follow(chat_id, flags, before, doc, scope=scope)
 
 
 def _turn_flags_overruled(chat_id: str, flags: dict[str, bool]) -> None:
@@ -17500,6 +17590,10 @@ class Handler(BaseHTTPRequestHandler):
         if chat_delete_match:
             self._handle_chat_delete(chat_delete_match.group(1))
             return
+        chat_spam_match = _CHAT_SPAM_RE.match(self.path)
+        if chat_spam_match:
+            self._handle_chat_spam(chat_spam_match.group(1))
+            return
         chat_draft_undo_match = _CHAT_DRAFT_UNDO_RE.match(self.path)
         if chat_draft_undo_match:
             self._handle_chat_draft_undo(chat_draft_undo_match.group(1))
@@ -18939,6 +19033,26 @@ class Handler(BaseHTTPRequestHandler):
                             {"error": error, **report})
             return
         self._send_json(200, {"deleted": True, **report})
+
+    def _handle_chat_spam(self, raw_id: str) -> None:
+        """Mark a mail thread as spam (no body): its mails to the mailbox's
+        Junk folder, then the chat muted and archived — see _spam_chat. The
+        same gates as a delete: the user's own act, which moves real mail,
+        so same-origin and through the reverse proxy only."""
+        if not self._user_act_same_origin():
+            return
+        ok, reason = self._request_from_edge(f"chat spam of {raw_id}")
+        if not ok:
+            self._send_json(403, {
+                "error": "marking a chat as spam is the user's own action and is "
+                         "accepted only from the dashboard through the reverse proxy",
+                "detail": reason,
+            })
+            return
+        chat_id = self._chat_id_or_404(raw_id)
+        if chat_id is None:
+            return
+        self._send_json(*_spam_chat(chat_id))
 
     def _handle_chat_draft(self, raw_id: str) -> None:
         """The user writes the shared draft (body {text, version}).

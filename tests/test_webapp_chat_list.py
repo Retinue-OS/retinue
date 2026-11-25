@@ -26,7 +26,23 @@ and pins:
   * a mark the server refuses (409: a message landed that the row does not
     show) leaves the row in Unread, offers no Undo and refetches the list;
   * a committed archive posts the flag and moves the row to Archived;
-  * a refresh that left before a write is dropped when it answers.
+  * a refresh that left before a write is dropped when it answers;
+  * the same tray on every tab and channel — Star · (Mark read) · Archive ·
+    Mute (Restore · Mute/Unmute on Archived) · Spam (mail only) · Delete;
+  * Delete asks for two taps on every tab, for mail and messenger chats
+    alike (the armed wording on mail: "Move mails to Trash?"), and a failed
+    one comes back with the server's reason and a Retry;
+  * Spam (mail only) is deferred: the row leaves, nothing is sent inside the
+    15 s window, Undo sends nothing, the window's end sends it, a page hidden
+    sends it with keepalive, a failure brings the row back with the reason;
+    a Spam the chat page handed over is taken up with the same Undo;
+  * multi-select: a long press enters it with the row selected, a tap
+    toggles, Shift-click selects a range on a wide screen, the bar offers
+    the tab's actions (Spam only when every chat is a mail), each bulk action
+    is one request per chat with ONE Undo that restores all, a bulk Delete
+    takes two taps, a partial failure is counted and each failed row says
+    why, a poll that drops a selected row drops it from the selection, and a
+    tab switch, Esc and the back gesture end the mode.
 
 Standalone like the rest of the suite. Needs `node` on PATH; without it the
 test reports a skip and passes.
@@ -71,9 +87,11 @@ class ToastHost extends FakeElement {
   attachShadow() {
     const self = this;
     this.shadowRoot = {
-      set innerHTML(h) { this._h = h; if (!h) toast = null; },
+      // A notice (no button) is kept as a toast with no Undo.
+      set innerHTML(h) { this._h = h; toast = h && !h.includes('<button') ? { text: h, undo: null } : (h ? toast : null); },
       get innerHTML() { return this._h || ''; },
-      querySelector() {
+      querySelector(sel) {
+        if (sel !== 'button') return { addEventListener() {} };
         return { addEventListener: (_t, f) => { toast = { text: self.shadowRoot._h, undo: f }; } };
       },
     };
@@ -82,17 +100,31 @@ class ToastHost extends FakeElement {
 }
 globalThis.HTMLElement = FakeElement;
 globalThis.customElements = { define: (n, c) => registry.set(n, c), get: (n) => registry.get(n) };
+const docListeners = {};
 globalThis.document = {
-  addEventListener() {}, removeEventListener() {}, createElement: () => new ToastHost(),
+  addEventListener(t, f) { (docListeners[t] ||= []).push(f); },
+  removeEventListener(t, f) { docListeners[t] = (docListeners[t] || []).filter((g) => g !== f); },
+  createElement: () => new ToastHost(),
   querySelector() { return null; }, hidden: false, visibilityState: 'visible',
   body: { appendChild() {} },
 };
 globalThis.window = globalThis;
 globalThis.location = { hash: '', pathname: '/chats.html', href: 'http://dash/chats.html' };
-globalThis.addEventListener = () => {};
-globalThis.removeEventListener = () => {};
-globalThis.matchMedia = () => ({ matches: false, addEventListener() {}, removeEventListener() {}, addListener() {}, removeListener() {} });
-globalThis.localStorage = { getItem() { return null; }, setItem() {}, removeItem() {} };
+const winListeners = {};
+globalThis.addEventListener = (t, f) => { (winListeners[t] ||= []).push(f); };
+globalThis.removeEventListener = (t, f) => { winListeners[t] = (winListeners[t] || []).filter((g) => g !== f); };
+const fireWin = (t) => { for (const f of [...(winListeners[t] || [])]) f({ type: t }); };
+// The mode's history entry (multi-select), and the back gesture.
+globalThis.history = {
+  stack: [null],
+  get state() { return this.stack[this.stack.length - 1]; },
+  pushState(st) { this.stack.push(st); },
+  back() { if (this.stack.length > 1) { this.stack.pop(); fireWin('popstate'); } },
+};
+let wide = false;
+globalThis.matchMedia = () => ({ matches: wide, addEventListener() {}, removeEventListener() {}, addListener() {}, removeListener() {} });
+const stored = new Map();
+globalThis.localStorage = { getItem: (k) => (stored.has(k) ? stored.get(k) : null), setItem: (k, v) => stored.set(k, String(v)), removeItem: (k) => stored.delete(k) };
 Object.defineProperty(globalThis, 'navigator', { value: { userAgent: 'node' }, configurable: true });
 globalThis.CustomEvent = class { constructor(t, i = {}) { this.type = t; this.detail = i.detail; } };
 
@@ -102,6 +134,7 @@ const wire = [];
 globalThis.fetch = (url, init = {}) => new Promise((resolve) => {
   wire.push({
     url: String(url), method: init.method || 'GET', body: init.body ? JSON.parse(init.body) : null,
+    keepalive: !!init.keepalive,
     answer: (doc, status = 200) => resolve({ ok: status < 400, status, json: async () => doc }),
   });
 });
@@ -116,7 +149,8 @@ const takeList = () => take((w) => w.method === 'GET' && w.url === '/chats', 'GE
 await import('./chats.js');
 const List = registry.get('retinue-chats');
 assert.ok(List, 'the element registered itself');
-const { listGroup, deriveListGroup } = await import('./chats.js');
+const { listGroup, deriveListGroup, HANDOFF_KEY } = await import('./chats.js');
+const { dismissUndo, flushPendingCommit, hasPendingCommit, UNDO_MS } = await import('./swipe-rows.js');
 // What the list tells the shelf (the minimized chat's count).
 const { shelf } = await import('./shelf-store.js');
 const observed = [];
@@ -131,15 +165,20 @@ const chat = (id, extra = {}) => ({
 // A fresh copy each time: the element writes into the rows it was given.
 const payload = (chats, counts) => JSON.parse(JSON.stringify(
   { generated: '2026-11-20T10:00:00Z', ...(counts ? { counts } : {}), chats }));
-const rowIds = (html) => [...html.matchAll(/<li class="swipe" data-id="([^"]*)"/g)].map((m) => m[1]);
+const rowIds = (html) => [...html.matchAll(/<li class="swipe[^"]*" data-id="([^"]*)"/g)].map((m) => m[1]);
 const rowAttrs = (html, id) => {
-  const m = new RegExp(`<li class="swipe" data-id="${id}"([^>]*)>`).exec(html);
+  const m = new RegExp(`<li class="swipe[^"]*" data-id="${id}"([^>]*)>`).exec(html);
   assert.ok(m, `row ${id} rendered`);
   return { quick: (/data-quick="([^"]*)"/.exec(m[1]) || [])[1] || '',
            left: (/data-quick-left="([^"]*)"/.exec(m[1]) || [])[1] || '' };
 };
+const liOf = (html, id) => {
+  const start = html.search(new RegExp(`<li class="swipe[^"]*" data-id="${id}"`));
+  assert.ok(start >= 0, `row ${id} rendered`);
+  return html.slice(start, html.indexOf('</li>', start));
+};
 const trayOf = (html, id) => {
-  const start = html.indexOf(`<li class="swipe" data-id="${id}"`);
+  const start = html.search(new RegExp(`<li class="swipe[^"]*" data-id="${id}"`));
   const end = html.indexOf('</li>', start);
   const li = html.slice(start, end);
   const tray = li.slice(li.indexOf('<div class="tray">'), li.indexOf('<a class="row'));
@@ -270,11 +309,11 @@ await ok('swipes per tab: Unread right=read left=archive, Read left=archive only
   assert.deepEqual(rowAttrs(html(el), 'u1'), { quick: 'read', left: 'archive' });
   assert.ok(html(el).includes('<div class="quick read" aria-hidden="true">Mark read</div>'));
   assert.ok(html(el).includes('<div class="quick-left archive" aria-hidden="true">Archive</div>'));
-  assert.deepEqual(trayOf(html(el), 'u1'), ['star', 'read', 'archive', 'mute']);
+  assert.deepEqual(trayOf(html(el), 'u1'), ['star', 'read', 'archive', 'mute', 'delete']);
   tab(el, 'read');
   assert.deepEqual(rowAttrs(html(el), 'r1'), { quick: '', left: 'archive' });
   assert.ok(!html(el).includes('<div class="quick '), 'no right-hand-swipe layer where nothing commits');
-  assert.deepEqual(trayOf(html(el), 'r1'), ['star', 'archive', 'mute']);
+  assert.deepEqual(trayOf(html(el), 'r1'), ['star', 'archive', 'mute', 'delete']);
   tab(el, 'archived');
   assert.deepEqual(rowAttrs(html(el), 'a1'), { quick: 'restore', left: '' });
   assert.ok(!html(el).includes('<div class="quick-left'), 'the left swipe opens the tray here');
@@ -435,6 +474,401 @@ await ok('a refresh that left before a write is dropped when it answers', async 
   stale.answer(payload(LIST, COUNTS));
   await settle();
   assert.deepEqual(rowIds(html(el)), ['u2', 'u3'], 'the stale list does not put the row back');
+});
+
+// ── Every action on every tab; Delete in two taps; Spam for mail ─────────────
+const mailChat = (id, extra = {}) => chat(id, {
+  channel: 'email', account: 'me@example.org', name: 'M' + id, participants: [], ...extra });
+const MIXED = [
+  chat('su', { unread: 2, list_group: 'unread' }), mailChat('mu', { unread: 1, list_group: 'unread' }),
+  chat('sr', { list_group: 'read' }), mailChat('mr', { list_group: 'read' }),
+  chat('sa', { list_group: 'archived', archived: true }), mailChat('ma', { list_group: 'archived', archived: true }),
+];
+const fakeBtn = (confirm) => ({ classList: { add() {}, remove() {} }, dataset: confirm ? { confirm } : {}, textContent: 'Delete' });
+
+await ok('the same tray on every tab and channel; Spam on mail only', async () => {
+  const el = await mount(payload(MIXED));
+  assert.deepEqual(trayOf(html(el), 'su'), ['star', 'read', 'archive', 'mute', 'delete']);
+  assert.deepEqual(trayOf(html(el), 'mu'), ['star', 'read', 'archive', 'mute', 'spam', 'delete']);
+  tab(el, 'read');
+  assert.deepEqual(trayOf(html(el), 'sr'), ['star', 'archive', 'mute', 'delete']);
+  assert.deepEqual(trayOf(html(el), 'mr'), ['star', 'archive', 'mute', 'spam', 'delete']);
+  tab(el, 'archived');
+  assert.deepEqual(trayOf(html(el), 'sa'), ['star', 'restore', 'mute', 'delete']);
+  assert.deepEqual(trayOf(html(el), 'ma'), ['star', 'restore', 'mute', 'spam', 'delete']);
+  assert.ok(liOf(html(el), 'ma').includes('title="Moves the thread&#39;s mails to the Junk folder of me@example.org, then mutes and archives the chat"'));
+});
+
+await ok('Delete takes two taps on every tab, mail and messenger alike', async () => {
+  for (const [scope, sid, mid] of [['unread', 'su', 'mu'], ['read', 'sr', 'mr'], ['archived', 'sa', 'ma']]) {
+    const el = await mount(payload(MIXED));
+    tab(el, scope);
+    const h = html(el);
+    const delOf = (id) => (/<button type="button" class="delete"[^>]*>Delete<\/button>/.exec(liOf(h, id)) || [''])[0];
+    assert.ok(delOf(mid).includes('data-confirm="Move mails to Trash?"'), delOf(mid));
+    assert.ok(delOf(mid).includes('Moves the thread&#39;s mails to the Trash of me@example.org, then erases the chat here'));
+    assert.ok(delOf(sid) && !delOf(sid).includes('data-confirm'), delOf(sid));
+    for (const id of [sid, mid]) {
+      const btn = fakeBtn(id === mid ? 'Move mails to Trash?' : '');
+      el._confirmDelete(id, btn);
+      assert.equal(btn.textContent, id === mid ? 'Move mails to Trash?' : 'Delete for good?', 'armed, and saying so');
+      await settle();
+      assert.deepEqual(wire.filter((w) => w.method === 'POST'), [], 'the first tap sends nothing');
+      el._confirmDelete(id, btn);
+      const post = take((w) => w.method === 'POST', 'the delete');
+      assert.equal(post.url, `/chats/${id}/delete`);
+      post.answer({ deleted: true });
+      await settle();
+      assert.ok(!rowIds(html(el)).includes(id), `${scope}: ${id} is gone`);
+    }
+    assert.equal(toast === null || !toast.text.includes('Deleted'), true, 'no Undo for a delete');
+  }
+});
+
+await ok('a failed delete comes back with the server\'s reason and a Retry', async () => {
+  const el = await mount(payload(MIXED));
+  const btn = fakeBtn('Move mails to Trash?');
+  el._confirmDelete('mu', btn);
+  el._confirmDelete('mu', btn);
+  take((w) => w.method === 'POST', 'the delete').answer(
+    { error: "the chat's messages could not be completely erased (mail-gateway: the mailbox has no Trash folder)" }, 502);
+  await settle();
+  const li = liOf(html(el), 'mu');
+  assert.ok(li.includes('<li class="swipe failed"') || /class="swipe failed/.test(li), li.slice(0, 80));
+  assert.ok(li.includes('Not deleted: The chat&#39;s messages could not be completely erased (mail-gateway: the mailbox has no Trash folder)'), li);
+  assert.ok(li.includes('>Retry delete</button>'), li);
+  // A deployment without the capability: 503, and no reason given.
+  el._confirmDelete('su', fakeBtn(''));
+  el._confirmDelete('su', fakeBtn(''));
+  take((w) => w.method === 'POST', 'the delete').answer({}, 503);
+  await settle();
+  assert.ok(liOf(html(el), 'su').includes('Not deleted: Delete not set up'));
+  assert.ok(liOf(html(el), 'su').includes('>Delete not set up</button>'));
+});
+
+await ok('Spam is deferred: nothing sent in the window, Undo sends nothing, its end sends it', async () => {
+  const el = await mount(payload(MIXED));
+  assert.equal(UNDO_MS, 15000);
+  el._defer('su', 'spam');
+  assert.ok(rowIds(html(el)).includes('su'), 'a messenger chat is never spam');
+  el._defer('mu', 'spam');
+  assert.ok(!rowIds(html(el)).includes('mu'), 'the row leaves at once');
+  assert.ok(toast && toast.text.includes('Marked as spam · Mmu'), toast && toast.text);
+  // A refresh while it waits does not bring it back.
+  el.load();
+  takeList().answer(payload(MIXED));
+  await settle();
+  assert.ok(!rowIds(html(el)).includes('mu'));
+  assert.deepEqual(wire.filter((w) => w.method === 'POST'), [], 'nothing sent');
+  toast.undo();
+  await settle();
+  assert.ok(rowIds(html(el)).includes('mu'), 'back');
+  assert.equal(hasPendingCommit(), false);
+  assert.deepEqual(wire.filter((w) => w.method === 'POST'), [], 'and nothing sent, ever');
+  // Again, and the window ends.
+  el._defer('mu', 'spam');
+  flushPendingCommit(false);
+  const post = take((w) => w.method === 'POST', 'the spam');
+  assert.equal(post.url, '/chats/mu/spam');
+  assert.equal(post.keepalive, false);
+  post.answer({ id: 'mu', spam: true, moved: 1, archived: true, muted: true, starred: false });
+  await settle();
+  assert.ok(!rowIds(html(el)).includes('mu'));
+  tab(el, 'archived');
+  assert.ok(rowIds(html(el)).includes('mu'), 'in Archived, muted');
+});
+
+await ok('a page hidden or left sends the waiting Spam at once, with keepalive', async () => {
+  for (const how of ['pagehide', 'hidden']) {
+    const el = await mount(payload(MIXED));
+    el._defer('mu', 'spam');
+    if (how === 'pagehide') fireWin('pagehide');
+    else {
+      document.visibilityState = 'hidden';
+      for (const f of docListeners.visibilitychange || []) f({ type: 'visibilitychange' });
+      document.visibilityState = 'visible';
+    }
+    const post = take((w) => w.method === 'POST', 'the spam');
+    assert.equal(post.url, '/chats/mu/spam');
+    assert.equal(post.keepalive, true, how);
+    post.answer({ archived: true, muted: true });
+    await settle();
+  }
+});
+
+await ok('a page left with a bulk Spam waiting sends every request before any answer', async () => {
+  const many = Array.from({ length: 7 }, (_v, k) => mailChat(`mb${k}`, { unread: 1, list_group: 'unread' }));
+  const el = await mount(payload([...MIXED, ...many]));
+  el._enterSelect('mb0');
+  for (let k = 1; k < 7; k += 1) el._toggleSelect(`mb${k}`, {});
+  el._bulk('spam');
+  fireWin('pagehide');
+  // No answer comes: a page that is gone gets none.
+  const posts = wire.filter((w) => w.method === 'POST');
+  assert.equal(posts.length, 7, `${posts.length} of 7 sent`);
+  assert.ok(posts.every((w) => w.keepalive === true));
+  for (const w of posts) w.answer({ archived: true, muted: true });
+  await settle();
+});
+
+await ok('a page left while a bulk Spam drains sends the rest at once, with keepalive', async () => {
+  const many = Array.from({ length: 7 }, (_v, k) => mailChat(`md${k}`, { unread: 1, list_group: 'unread' }));
+  const el = await mount(payload([...MIXED, ...many]));
+  el._enterSelect('md0');
+  for (let k = 1; k < 7; k += 1) el._toggleSelect(`md${k}`, {});
+  el._bulk('spam');
+  dismissUndo();      // the window ends: four go out, the rest wait for answers
+  let posts = wire.filter((w) => w.method === 'POST');
+  assert.equal(posts.length, 4);
+  assert.ok(posts.every((w) => w.keepalive === false));
+  fireWin('pagehide');
+  posts = wire.filter((w) => w.method === 'POST');
+  assert.equal(posts.length, 7, `${posts.length} of 7 sent`);
+  assert.ok(posts.slice(4).every((w) => w.keepalive === true), 'the rest with keepalive');
+  for (const w of posts) w.answer({ archived: true, muted: true });
+  await settle();
+  assert.deepEqual(rowIds(html(el)).filter((id) => id.startsWith('md')), []);
+});
+
+await ok('a failed Spam brings the row back with the reason and a Retry', async () => {
+  const el = await mount(payload(MIXED));
+  el._defer('mu', 'spam');
+  flushPendingCommit(false);
+  take((w) => w.method === 'POST', 'the spam').answer({ error: "the mailbox has no Junk folder — set MAIL_JUNK_FOLDER" }, 502);
+  await settle();
+  const li = liOf(html(el), 'mu');
+  assert.ok(li.includes('Not marked as spam: The mailbox has no Junk folder — set MAIL_JUNK_FOLDER'), li);
+  assert.ok(li.includes('>Retry spam</button>'), li);
+});
+
+await ok('a Spam the chat page handed over is taken up with the same Undo', async () => {
+  stored.set(HANDOFF_KEY, JSON.stringify({ id: 'mu', kind: 'spam', name: 'Mmu', at: Date.now() }));
+  const el = await mount(payload(MIXED));
+  assert.equal(stored.has(HANDOFF_KEY), false, 'taken');
+  assert.ok(!rowIds(html(el)).includes('mu'));
+  assert.ok(toast && toast.text.includes('Marked as spam · Mmu'));
+  assert.deepEqual(wire.filter((w) => w.method === 'POST'), []);
+  toast.undo();
+  await settle();
+  assert.ok(rowIds(html(el)).includes('mu'));
+  // A Delete is never handed over (it takes its two taps on the chat page).
+  stored.set(HANDOFF_KEY, JSON.stringify({ id: 'su', kind: 'delete', at: Date.now() }));
+  const two = await mount(payload(MIXED));
+  assert.ok(rowIds(html(two)).includes('su'));
+  assert.deepEqual(wire.filter((w) => w.method === 'POST'), []);
+});
+
+// ── Multi-select ─────────────────────────────────────────────────────────────
+const barOf = (h) => {
+  const m = /<div class="select-bar"[\s\S]*?data-bulk="cancel"/.exec(h);
+  return m ? m[0] : '';
+};
+const bulkActs = (h) => [...barOf(h).matchAll(/data-bulk="([a-z]+)"/g)].map((m) => m[1]);
+const answerAll = async (pred, doc, status = 200) => {
+  await settle();
+  const got = wire.filter(pred);
+  for (const w of got) { wire.splice(wire.indexOf(w), 1); w.answer(typeof doc === 'function' ? doc(w) : doc, typeof status === 'function' ? status(w) : status); }
+  await settle();
+  await settle();
+  return got;
+};
+
+await ok('a long press starts selecting with that row; a tap toggles; the bar counts', async () => {
+  const el = await mount(payload(LIST, COUNTS));
+  assert.ok(html(el).includes('data-bulk="start"'), 'a Select button');
+  el._swipe._onLongPress('u1');
+  assert.equal(el._selecting, true);
+  assert.equal(history.state && history.state.chatsSelect, true, 'the mode is a history entry');
+  let h = html(el);
+  assert.ok(barOf(h).includes('1 selected'), barOf(h));
+  assert.deepEqual(bulkActs(h), ['read', 'archive', 'mute', 'star', 'delete', 'cancel'],
+    'what the tray offers; no Spam for messenger chats');
+  assert.ok(/class="swipe selected" data-id="u1"/.test(h));
+  assert.ok(liOf(h, 'u1').includes('aria-pressed="true"'));
+  el._swipe._onSelect('u3', null, {});
+  assert.ok(barOf(html(el)).includes('2 selected'));
+  el._swipe._onSelect('u1', null, {});
+  assert.deepEqual([...el._selected], ['u3']);
+  // Esc ends it, and the history entry with it.
+  for (const f of docListeners.keydown || []) f({ key: 'Escape', preventDefault() {} });
+  assert.equal(el._selecting, false);
+  assert.ok(!history.state || !history.state.chatsSelect);
+  assert.ok(!barOf(html(el)));
+});
+
+await ok('the back gesture and a tab switch end selection; Cancel too', async () => {
+  const el = await mount(payload(LIST, COUNTS));
+  el._swipe._onLongPress('u1');
+  history.back();
+  assert.equal(el._selecting, false, 'back');
+  el._swipe._onLongPress('u1');
+  tab(el, 'read');
+  assert.equal(el._selecting, false, 'tab switch');
+  assert.equal(el._selected.size, 0);
+  tab(el, 'unread');
+  el._enterSelect('u2');
+  el._bulk('cancel');
+  el._exitSelect();
+  assert.equal(el._selecting, false);
+});
+
+await ok('Shift-click selects a range on a wide screen, not on a phone', async () => {
+  const el = await mount(payload(LIST, COUNTS));
+  el._swipe._onLongPress('u2');
+  el._swipe._onSelect('u1', null, { shiftKey: true });
+  assert.deepEqual([...el._selected].sort(), ['u1', 'u2'], 'narrow: a toggle');
+  el._exitSelect();
+  wide = true;
+  try {
+    el._swipe._onLongPress('u2');       // shown: u2 (starred), u3, u1
+    el._swipe._onSelect('u1', null, { shiftKey: true });
+    assert.deepEqual([...el._selected].sort(), ['u1', 'u2', 'u3']);
+  } finally {
+    wide = false;
+  }
+});
+
+await ok('bulk archive: one request per chat, ONE Undo that restores them all', async () => {
+  const el = await mount(payload(LIST, COUNTS));
+  el._enterSelect('u1');
+  el._toggleSelect('u2', {});
+  el._toggleSelect('u3', {});
+  el._bulk('archive');
+  assert.equal(el._selecting, false, 'the mode ends with the action');
+  const posts = await answerAll((w) => w.method === 'POST', { archived: true, muted: false, starred: false });
+  assert.deepEqual(posts.map((w) => w.url).sort(), ['/chats/u1/flags', '/chats/u2/flags', '/chats/u3/flags']);
+  assert.ok(posts.every((w) => JSON.stringify(w.body) === '{"archived":true}'));
+  assert.deepEqual(rowIds(html(el)), [], 'all three out of Unread');
+  assert.ok(toast && toast.text.includes('Archived 3'), toast && toast.text);
+  toast.undo();
+  const undos = await answerAll((w) => w.method === 'POST', (w) => ({ archived: false, muted: false, starred: w.url.includes('u2') }));
+  assert.deepEqual(undos.map((w) => w.url).sort(), ['/chats/u1/flags', '/chats/u2/flags', '/chats/u3/flags']);
+  assert.deepEqual(undos.find((w) => w.url.includes('u2')).body, { archived: false, muted: false, starred: true },
+    'each chat\'s previous state, exactly');
+  assert.deepEqual(rowIds(html(el)), ['u2', 'u3', 'u1'], 'all back');
+});
+
+await ok('bulk mark read, mute, star; restore and unmute on Archived', async () => {
+  const el = await mount(payload(LIST, COUNTS));
+  el._enterSelect('u1');
+  el._toggleSelect('u3', {});
+  el._bulk('read');
+  const reads = await answerAll((w) => w.method === 'POST',
+    (w) => ({ id: 'x', last_read: 'L', previous: 'P', unread: 0, list_group: 'read' }));
+  assert.deepEqual(reads.map((w) => [w.url, w.body]).sort(), [['/chats/u1/read', { seen: 5 }], ['/chats/u3/read', { seen: 5 }]]);
+  assert.deepEqual(rowIds(html(el)), ['u2']);
+  assert.ok(toast.text.includes('Marked read 2'));
+  toast.undo();
+  const back = await answerAll((w) => w.method === 'POST', { last_read: 'P', unread: 2, list_group: 'unread' });
+  assert.ok(back.every((w) => JSON.stringify(w.body) === '{"restore":"P","marked":"L"}'));
+  assert.deepEqual(rowIds(html(el)).sort(), ['u1', 'u2', 'u3']);
+  el._enterSelect('u2');
+  assert.ok(bulkActs(html(el)).includes('unstar'), 'every one starred: Unstar');
+  el._toggleSelect('u1', {});
+  assert.ok(bulkActs(html(el)).includes('star'), 'not every one: Star');
+  el._bulk('star');
+  const stars = await answerAll((w) => w.method === 'POST', { archived: false, muted: false, starred: true });
+  assert.ok(stars.every((w) => JSON.stringify(w.body) === '{"starred":true}') && stars.length === 2);
+  el._enterSelect('u1');
+  el._bulk('mute');
+  const mutes = await answerAll((w) => w.method === 'POST', { archived: true, muted: true, starred: true });
+  assert.deepEqual(mutes.map((w) => w.body), [{ muted: true }]);
+  tab(el, 'archived');
+  el._enterSelect('a1');
+  el._toggleSelect('u1', {});
+  const acts = bulkActs(html(el));
+  assert.deepEqual(acts.slice(0, 2), ['restore', 'unmute'], 'every one muted: Unmute');
+  el._bulk('restore');
+  const restores = await answerAll((w) => w.method === 'POST', { archived: false, muted: false, starred: false });
+  assert.ok(restores.length === 2 && restores.every((w) => JSON.stringify(w.body) === '{"archived":false,"muted":false}'));
+});
+
+await ok('a partial failure: counted in the toast, each failed row says why', async () => {
+  const el = await mount(payload(LIST, COUNTS));
+  el._enterSelect('u1');
+  el._toggleSelect('u2', {});
+  el._toggleSelect('u3', {});
+  el._bulk('archive');
+  await answerAll((w) => w.method === 'POST',
+    (w) => (w.url.includes('u3') ? { error: 'the chat state could not be written' } : { archived: true, muted: false, starred: false }),
+    (w) => (w.url.includes('u3') ? 500 : 200));
+  assert.ok(toast && toast.text.includes('Archived 2 of 3 — 1 failed'), toast && toast.text);
+  assert.deepEqual(rowIds(html(el)), ['u3'], 'the failed one stays');
+  assert.ok(liOf(html(el), 'u3').includes('Not archived: The chat state could not be written'));
+  toast.undo();
+  const undos = await answerAll((w) => w.method === 'POST', { archived: false, muted: false, starred: false });
+  assert.equal(undos.length, 2, 'only what was done is undone');
+});
+
+await ok('a bulk delete takes two taps, and says what the second does', async () => {
+  const el = await mount(payload(MIXED));
+  el._enterSelect('su');
+  el._toggleSelect('mu', {});
+  assert.deepEqual(bulkActs(html(el)), ['read', 'archive', 'mute', 'star', 'delete', 'cancel'], 'a messenger chat among them: no Spam');
+  el._bulk('delete');
+  await settle();
+  assert.deepEqual(wire.filter((w) => w.method === 'POST'), [], 'armed only');
+  assert.ok(barOf(html(el)).includes('Delete 2 chats? Mails move to the Trash'), barOf(html(el)));
+  el._bulk('delete');
+  const dels = await answerAll((w) => w.method === 'POST',
+    (w) => (w.url.includes('mu') ? { error: 'the mailbox has no Trash folder' } : { deleted: true }),
+    (w) => (w.url.includes('mu') ? 502 : 200));
+  assert.deepEqual(dels.map((w) => w.url).sort(), ['/chats/mu/delete', '/chats/su/delete']);
+  assert.deepEqual(rowIds(html(el)), ['mu']);
+  assert.ok(liOf(html(el), 'mu').includes('Not deleted: The mailbox has no Trash folder'));
+  // Messenger chats only: "For good".
+  const two = await mount(payload([chat('x1', { unread: 1 }), chat('x2', { unread: 1 })]));
+  two._enterSelect('x1');
+  two._toggleSelect('x2', {});
+  two._bulk('delete');
+  assert.ok(barOf(html(two)).includes('Delete 2 chats? For good'));
+  two._exitSelect();
+});
+
+await ok('a bulk spam: offered only when every chat is a mail; deferred like one', async () => {
+  const el = await mount(payload([...MIXED, mailChat('mu2', { unread: 1, list_group: 'unread' })]));
+  el._enterSelect('mu');
+  el._toggleSelect('mu2', {});
+  assert.ok(bulkActs(html(el)).includes('spam'));
+  el._bulk('spam');
+  assert.deepEqual(rowIds(html(el)), ['su']);
+  assert.ok(toast.text.includes('Marked as spam 2'));
+  await settle();
+  assert.deepEqual(wire.filter((w) => w.method === 'POST'), [], 'nothing sent in the window');
+  flushPendingCommit(false);
+  const posts = await answerAll((w) => w.method === 'POST', { archived: true, muted: true });
+  assert.deepEqual(posts.map((w) => w.url).sort(), ['/chats/mu/spam', '/chats/mu2/spam']);
+});
+
+await ok('a deferred bulk spam that partly fails says so, with no Undo', async () => {
+  const el = await mount(payload([...MIXED, mailChat('mu2', { unread: 1, list_group: 'unread' }),
+    mailChat('mu3', { unread: 1, list_group: 'unread' })]));
+  el._enterSelect('mu');
+  el._toggleSelect('mu2', {});
+  el._toggleSelect('mu3', {});
+  el._bulk('spam');
+  dismissUndo();      // the window ends: the commit goes out
+  await answerAll((w) => w.method === 'POST',
+    (w) => (w.url.includes('mu3') ? { error: 'the mailbox has no Junk folder' } : { archived: true, muted: true }),
+    (w) => (w.url.includes('mu3') ? 502 : 200));
+  await settle();
+  assert.ok(toast && toast.text.includes('Marked as spam 2 of 3 — 1 failed'), toast && toast.text);
+  assert.equal(toast.undo, null, 'a notice, no Undo');
+  assert.deepEqual(rowIds(html(el)).filter((id) => id.startsWith('mu')), ['mu3'], 'the failed one is back');
+  assert.ok(liOf(html(el), 'mu3').includes('Not marked as spam: The mailbox has no Junk folder'));
+  dismissUndo();
+});
+
+await ok('a poll that drops a selected row drops it from the selection', async () => {
+  const el = await mount(payload(LIST, COUNTS));
+  el._enterSelect('u1');
+  el._toggleSelect('u3', {});
+  el.load();
+  takeList().answer(payload(LIST.map((c) => (c.id === 'u3' ? { ...c, unread: 0, list_group: 'read' } : c))));
+  await settle();
+  assert.deepEqual([...el._selected], ['u1']);
+  assert.ok(barOf(html(el)).includes('1 selected'));
+  el._exitSelect();
 });
 
 console.log(`${passed} checks passed`);

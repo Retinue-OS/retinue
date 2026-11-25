@@ -398,7 +398,7 @@ await ok('focus is not dropped when the row goes with nothing in its place', asy
   await markRead(el, { id: ID, last_read: 'L', previous: 'P', unread: 0, list_group: 'read' });
   document.activeElement = row().button;
   globalThis.focused = null;
-  const lapse = held.filter((t) => t.ms === 6000).pop();
+  const lapse = held.filter((t) => t.ms === 15000).pop();   // UNDO_MS
   assert.ok(lapse, 'the Undo has its timer');
   lapse.fn();
   assert.deepEqual(el._thread.layout().slice(-1), ['m5'], 'the row is gone');

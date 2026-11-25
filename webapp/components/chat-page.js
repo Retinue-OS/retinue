@@ -140,10 +140,11 @@ import { canRecord, micErrorText, recordingRowHtml, statusRowHtml, Waveform, VOI
 import { pastedFiles, pastedText } from './clipboard.js';
 import {
   avatarHtml, avatarInitials, avatarKey, colorFor, CHANNELS, isMail, participantsText,
+  handOffChatAction, commitChatAction,
 } from './chats.js';
 import { openAttentionSheet, instructedSummary } from './attention-sheet.js';
 import { shelf, goLive, takeRestore, threadFacts } from './shelf-store.js';
-import { UNDO_MS } from './swipe-rows.js';
+import { UNDO_MS, offerUndo } from './swipe-rows.js';
 // Registers <retinue-conversation>, the companion pane (see _companionHtml).
 // The chat mirror renders no Markdown of its own — what other people sent is
 // shown as sent (linkify below) — so the Markdown renderer and its styles
@@ -3214,7 +3215,7 @@ class RetinueChatPage extends HTMLElement {
   }
 
   // The chat's menu, at the header's right end: the attention sheet, Star,
-  // Archive and Mute. They used to take a ⓘ in the header and a row of switches under
+  // Archive and Mute, then Spam (mail threads only) and Delete (_actionsHtml). They used to take a ⓘ in the header and a row of switches under
   // it — a whole row on a phone for two controls that are rarely touched. The
   // button carries a dot while the chat is archived or muted, so the state
   // stays visible with the menu shut.
@@ -3227,7 +3228,7 @@ class RetinueChatPage extends HTMLElement {
       `<div class="menu" id="chat-menu" data-menu hidden><div class="items">` +
       `<button class="item" data-attention ` +
       `title="Importance, urgency, delivery — and their corrections">Attention details</button>` +
-      this._switchesHtml() + `</div></div></div>`;
+      this._switchesHtml() + this._actionsHtml() + `</div></div></div>`;
   }
 
   // Archived or muted: what the ⋮ button's dot shows.
@@ -3261,6 +3262,11 @@ class RetinueChatPage extends HTMLElement {
       this._menuAway();
       this._menuAway = null;
     }
+    // Shut, the menu forgets an armed Delete: the next opening asks again.
+    if (!show && this._deleteArmed) {
+      this._deleteArmed = false;
+      this._refreshActionsUi();
+    }
   }
 
   // The menu's switches, under Attention details: Star, Archive and Mute.
@@ -3282,6 +3288,94 @@ class RetinueChatPage extends HTMLElement {
          'Leaves the chat list; comes back when a message arrives, unless muted') +
       sw('muted', !!c.muted, 'Mute', 'Muted', 'Archived, no push, and a new message does not bring it back') +
       `</div>`;
+  }
+
+  // Under the switches: Spam (a mail thread's alone — a messenger chat has no
+  // Junk folder) and Delete. Spam is the chat list's to carry out: the page
+  // hands it over (chats.js handOffChatAction) and leaves for the list, which
+  // hides the row and offers the same 15 s Undo there, sending nothing until
+  // it ends. Delete asks for a second tap, as in the list — the armed button
+  // says what it does ("Move mails to Trash?" on a mail thread) — and once
+  // the chat is erased the page leaves for the list; a refusal stays here,
+  // with the server's reason under the button.
+  _actionsHtml() {
+    const c = this._chat || {};
+    const mail = isMail(c);
+    const mailbox = c.account || 'the mailbox';
+    const armed = !!this._deleteArmed;
+    const label = armed ? (mail ? 'Move mails to Trash?' : 'Delete for good?')
+      : (this._deleteFailed ? (this._deleteFailed.unconfigured ? 'Delete not set up' : 'Retry delete') : 'Delete');
+    return `<div class="items" data-chat-acts>` +
+      (mail
+        ? `<button class="item" data-chat-act="spam" title="Moves the thread's mails to the Junk folder of ` +
+          `${esc(mailbox)}, then mutes and archives the chat">Spam</button>` : '') +
+      `<button class="item danger${armed ? ' confirm' : ''}" data-chat-act="delete" title="${mail
+        ? `Moves the thread's mails to the Trash of ${esc(mailbox)}, then erases the chat here`
+        : 'Erase this chat and all its messages from the system'}">${label}</button>` +
+      (this._deleteFailed
+        ? `<p class="item-note" role="alert" data-act-note>${esc(this._deleteFailed.reason)}</p>` : '') +
+      `</div>`;
+  }
+
+  _refreshActionsUi() {
+    const root = this.shadowRoot;
+    const box = root && root.querySelector('[data-chat-acts]');
+    if (!box) return;
+    const had = box.contains(deepActiveElement());
+    box.outerHTML = this._actionsHtml();
+    this._bindActions();
+    const again = had && root.querySelector('[data-chat-act="delete"]');
+    if (again) again.focus();
+  }
+
+  _bindActions() {
+    this.shadowRoot.querySelectorAll('[data-chat-act]').forEach((el) =>
+      el.addEventListener('click', () => this._chatAct(el.getAttribute('data-chat-act'))));
+  }
+
+  async _chatAct(what) {
+    if (!this._chat || this._acting) return;
+    const name = this._chat.name || '';
+    if (what === 'spam') {
+      if (!isMail(this._chat)) return;
+      this._toggleMenu(false);
+      // To the list, with the Undo there. Where nothing can be kept for it
+      // (storage blocked), the same Undo here, and the list once it is done.
+      if (handOffChatAction(this._id, 'spam', name)) {
+        location.replace(CHATS_URL);
+        return;
+      }
+      offerUndo(`Marked as spam · ${name}`, () => {}, {
+        commit: async (keepalive) => {
+          const out = await commitChatAction(this._id, 'spam', keepalive);
+          if (out.ok) location.replace(CHATS_URL);
+          else this._showNote(`Not marked as spam: ${esc(out.reason)}`);
+        },
+      });
+      return;
+    }
+    if (what !== 'delete') return;
+    if (!this._deleteArmed) {
+      this._deleteArmed = true;
+      this._refreshActionsUi();
+      return;
+    }
+    this._deleteArmed = false;
+    this._acting = true;
+    try {
+      const out = await commitChatAction(this._id, 'delete');
+      if (out.ok) {
+        this._deleteFailed = null;
+        shelf.muted(this._shelfKey());
+        location.replace(CHATS_URL);
+        return;
+      }
+      this._deleteFailed = { reason: out.reason, unconfigured: out.unconfigured };
+      this._showNote(`Not deleted: ${esc(out.reason)}`);
+    } finally {
+      this._acting = false;
+    }
+    this._refreshActionsUi();
   }
 
   async _setFlag(flag, on) {
@@ -3346,6 +3440,7 @@ class RetinueChatPage extends HTMLElement {
     const menuBtn = root.querySelector('[data-menu-btn]');
     if (menuBtn) menuBtn.addEventListener('click', () => this._toggleMenu());
     this._bindSwitches();
+    this._bindActions();
     // The attention sheet for this chat: its importance, urgency and delivery,
     // the corrections, Later and Mark handled.
     const att = root.querySelector('[data-attention]');
@@ -6164,6 +6259,11 @@ const CSS = `
   .item.on { color: var(--muted, #8b93a3); }
   .item b { color: var(--fg, #e7ebf2); font-weight: 600; }
   .item:hover { background: rgba(110, 168, 254, .14); }
+  /* Spam and Delete, under the switches: Delete in red, darker once armed. */
+  [data-chat-acts] { border-top: 1px solid var(--line, rgba(231, 235, 242, .08)); margin-top: 4px; padding-top: 4px; }
+  .item.danger { color: #ff8a80; }
+  .item.danger.confirm { background: #a8322c; color: #fff; }
+  .item-note { margin: 2px 12px 8px; font-size: .76rem; color: #ff8a80; max-width: 260px; }
 
   /* Typing mode (phone keyboard up, see _watchKeyboard): the header and the
      companion's bar give their rows to the thread and the field. */

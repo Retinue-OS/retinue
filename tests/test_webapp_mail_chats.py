@@ -51,7 +51,11 @@ and pin:
     a composer addressed as the server's reply preview says, and a reply
     waiting for approval (writing itself: tests/test_webapp_mail_writing.py);
   * a mail removed in a mail client makes the page ask the server again
-    where a reply would go.
+    where a reply would go;
+  * the chat page's ⋮: Spam (mail threads only) under Star · Archive · Mute,
+    handed over to the list with nothing sent from the page, and Delete in
+    two taps (the armed wording, disarmed when the menu shuts, the server's
+    reason and a Retry on a refusal, the list once the chat is erased).
 
 Standalone like the rest of the suite. Needs `node` on PATH; without it the
 test reports a skip and passes (the static checks still run).
@@ -1156,6 +1160,55 @@ await ok('a chat a merge absorbed: the page follows it, quietly', async () => {
   await loading;
   assert.deepEqual(replaced, [to]);
   assert.ok(!page._pollTimer);
+});
+
+await ok('the chat page\'s menu: Spam (mail only) hands over to the list; Delete takes two taps', async () => {
+  const el = await open();
+  const m = el._menuHtml();
+  const acts = [...m.matchAll(/data-chat-act="([a-z]+)"/g)].map((x) => x[1]);
+  assert.deepEqual(acts, ['spam', 'delete'], m);
+  assert.ok(m.indexOf('data-flag="muted"') < m.indexOf('data-chat-act="spam"'), 'under Star, Archive, Mute');
+  assert.ok(m.includes(`title="Moves the thread's mails to the Junk folder of me@example.org, then mutes and archives the chat">Spam</button>`), m);
+  assert.ok(m.includes(`title="Moves the thread's mails to the Trash of me@example.org, then erases the chat here">Delete</button>`), m);
+  // A messenger chat: no Spam.
+  const sig = await open({ channel: 'signal', account: '+41000', participants: undefined });
+  assert.deepEqual([...sig._menuHtml().matchAll(/data-chat-act="([a-z]+)"/g)].map((x) => x[1]), ['delete']);
+  await sig._chatAct('spam');
+  assert.deepEqual(replaced, [], 'nothing for a messenger chat');
+  // Spam: handed to the list, which carries it out with its Undo — nothing sent here.
+  replaced.length = 0;
+  store.delete(chats.HANDOFF_KEY);
+  await el._chatAct('spam');
+  assert.deepEqual(replaced, ['/chats.html']);
+  const h = JSON.parse(store.get(chats.HANDOFF_KEY));
+  assert.deepEqual([h.id, h.kind, h.name], [ID, 'spam', 'Quarterly numbers']);
+  assert.ok(!wire.some((w) => w.method === 'POST'), 'nothing sent from the page');
+  store.delete(chats.HANDOFF_KEY);
+  // Delete: the first tap arms it and says what the second does.
+  replaced.length = 0;
+  await el._chatAct('delete');
+  assert.ok(!wire.some((w) => w.method === 'POST'), 'the first tap sends nothing');
+  assert.ok(el._actionsHtml().includes('>Move mails to Trash?</button>'), el._actionsHtml());
+  assert.ok(sig._actionsHtml().includes('>Delete</button>'));
+  sig._deleteArmed = true;
+  assert.ok(sig._actionsHtml().includes('>Delete for good?</button>'));
+  // Shutting the menu disarms it.
+  el._toggleMenu(false);
+  assert.ok(el._actionsHtml().includes('>Delete</button>'));
+  await el._chatAct('delete');
+  let p = el._chatAct('delete');
+  take((w) => w.method === 'POST', 'the delete').answer({ error: 'the mailbox has no Trash folder' }, 502);
+  await p;
+  assert.deepEqual(replaced, [], 'refused: the page stays');
+  const a = el._actionsHtml();
+  assert.ok(a.includes('The mailbox has no Trash folder') && a.includes('>Retry delete</button>'), a);
+  await el._chatAct('delete');
+  p = el._chatAct('delete');
+  const post = take((w) => w.method === 'POST', 'the delete');
+  assert.equal(post.url, `/chats/${ENC}/delete`);
+  post.answer({ deleted: true });
+  await p;
+  assert.deepEqual(replaced, ['/chats.html'], 'erased: back to the list');
 });
 
 await ok('the reference documents carry a mail thread that renders', async () => {

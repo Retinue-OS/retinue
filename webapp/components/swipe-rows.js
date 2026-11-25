@@ -10,18 +10,23 @@
 //                Star · Restore · Mute (Unmute) · Delete
 //
 // A long press, a right-click or the context-menu key opens the same tray
-// without swiping. The gesture is claimed only once it is clearly horizontal,
+// without swiping — except where a list takes the long press for selecting
+// rows (onLongPress: the chats page); right-click and the key still open it. The gesture is claimed only once it is clearly horizontal,
 // so a scroll that starts on a row is still a scroll.
 //
 // Two variations are the row's to opt into, so a list that wants neither (the
 // threads page) keeps the gesture above exactly:
 //
-//   data-quick-left="<action>"  a swipe left COMMITS that action at once, past
-//                the same threshold as a swipe right, over a layer of its own
-//                docked to the right edge (.quick-left). The tray is then
-//                reached only by long press, right-click or the context-menu
-//                key — which is the chats page's Unread and Read tabs:
-//                right marks read, left archives.
+//   data-quick-left="<action>"  the left side both reveals and commits, as
+//                iOS Mail's does: a partial swipe left past half the tray
+//                opens the tray, as on any row; one that goes on past the far
+//                threshold (most of the row: farThreshold) — or a fast fling
+//                past the commit threshold — COMMITS that action at once,
+//                over a layer of its own docked to the right edge
+//                (.quick-left), which takes over from the tray as the finger
+//                crosses the far threshold. That is the chats page's Unread
+//                and Read tabs: right marks read, left reveals Star · … ·
+//                Delete, and a full swipe left archives.
 //   no data-quick               the row does not move to the right at all:
 //                there is nothing to commit on that side (a chat already read).
 //
@@ -38,12 +43,23 @@
 //   </div|li>
 //
 // The component keeps what the actions mean; this module keeps how a row
-// moves. It also holds the two-tap confirm a Delete needs, and the Undo toast
-// a commit that takes a row out of view offers (the home list's, UNDO_MS).
+// moves. It also holds the two-tap confirm a Delete needs where a list still
+// asks for one (the threads page), and the Undo toast a commit that takes a
+// row out of view offers (UNDO_MS) — for an action already made, or for one
+// that is only made once the toast lapses (a deferred commit: offerUndo's
+// `commit`).
 
 import { onPressOutside } from './base.js';
 
-export const UNDO_MS = 6000;
+// How long an Undo stays offered: ample time to notice an accidental swipe on
+// a phone — and, for a deferred commit (a chat's Delete or Spam), how long
+// nothing is sent at all.
+export const UNDO_MS = 15000;
+// A fling: a swipe left that ends this fast (px per ms) and past the commit
+// threshold commits a row's data-quick-left without reaching the far one.
+export const FLING_PX_PER_MS = 1.1;
+// How long a finger rests on a row before it is a long press (selection).
+export const LONG_PRESS_MS = 500;
 
 // The CSS a swipeable list needs, for the component's shadow root. Rows bring
 // their own look; this is only the layering and the tray's colours.
@@ -78,6 +94,7 @@ export const SWIPE_CSS = `
   .tray .read { background: #3fa7a0; }
   .tray .restore { background: #4f9e63; }
   .tray .mute, .tray .unmute { background: #c9a13f; }
+  .tray .spam { background: #8d6e63; color: #fff; }
   .tray .delete { background: #d0564f; color: #fff; }
   .tray .delete.confirm { background: #a8322c; }
   .swipe.failed .tray .delete { outline: 2px solid #fff; outline-offset: -4px; }
@@ -103,11 +120,24 @@ export class SwipeRows {
   // row that opts into one). `onTap(id, el, event)`: a plain tap on a row (optional — a
   // link row navigates by itself). `isBusy()`: a write is under way, so no
   // new gesture starts.
-  constructor(host, { onQuick, onTap = null, isBusy = () => false } = {}) {
+  //
+  // Selection, for a list that opts in (the chats page; the threads page does
+  // not): `onLongPress(id, el)` — a finger held on a row (LONG_PRESS_MS, not
+  // moving) calls this INSTEAD of opening the tray, which right-click and the
+  // context-menu key still open; `selecting()` — while true, a tap on a row
+  // (or Space on a focused one) calls `onSelect(id, el, event)` instead of
+  // following it, and no swipe starts.
+  constructor(host, { onQuick, onTap = null, isBusy = () => false,
+                      onLongPress = null, selecting = () => false, onSelect = null } = {}) {
     this._host = host;
     this._onQuick = onQuick;
     this._onTap = onTap;
     this._isBusy = isBusy;
+    this._onLongPress = onLongPress;
+    this._selecting = selecting;
+    this._onSelect = onSelect;
+    this._press = null;
+    this._pressedAt = -Infinity;
     this._root = null;
     this._drag = null;
     this._openId = null;
@@ -138,14 +168,22 @@ export class SwipeRows {
     rows.forEach((el) => {
       const row = el.querySelector('.row');
       if (!row) return;
-      row.addEventListener('pointerdown', (e) => this._dragStart(e, el, row));
-      row.addEventListener('pointermove', (e) => this._dragMove(e));
-      row.addEventListener('pointerup', (e) => this._dragEnd(e));
-      row.addEventListener('pointercancel', () => this._dragCancel());
+      row.addEventListener('pointerdown', (e) => { this._pressStart(e, el); this._dragStart(e, el, row); });
+      row.addEventListener('pointermove', (e) => { this._pressMove(e); this._dragMove(e); });
+      row.addEventListener('pointerup', (e) => { this._pressEnd(); this._dragEnd(e); });
+      row.addEventListener('pointercancel', () => { this._pressEnd(); this._dragCancel(); });
       // A swipe ends on the row, and the browser then clicks it: swallow that
       // click, and a tap on an open row closes it rather than opening it.
       row.addEventListener('click', (e) => {
         const swiped = performance.now() < this._suppressUntil;
+        if (this._selecting()) {
+          // Selection mode: a tap picks the row (the long press that began
+          // the mode ends in a click too, which is swallowed).
+          e.preventDefault();
+          this._suppressUntil = 0;
+          if (!swiped && this._onSelect) this._onSelect(el.dataset.id, el, e);
+          return;
+        }
         if (swiped || this._openId === el.dataset.id) {
           e.preventDefault();
           this._suppressUntil = 0;
@@ -162,9 +200,20 @@ export class SwipeRows {
       // Long press, right-click, the context-menu key: the tray, for whoever
       // cannot or would rather not swipe. From the keyboard, focus lands on
       // its first button.
+      row.addEventListener('keydown', (e) => {
+        if (e.key !== ' ' || !this._selecting() || !this._onSelect) return;
+        e.preventDefault();
+        this._onSelect(el.dataset.id, el, e);
+      });
       row.addEventListener('contextmenu', (e) => {
         e.preventDefault();
         this._drag = null;
+        // A long press of a finger is the list's (selection), where it takes
+        // one; once only, whether the timer or the browser saw it first.
+        if (this._onLongPress && (e.pointerType === 'touch' || e.pointerType === 'pen')) {
+          if (performance.now() - this._pressedAt > LONG_PRESS_MS) this._longPress(el);
+          return;
+        }
         this.open(el);
         if (!e.pointerType || e.pointerType === 'mouse') {
           const first = el.querySelector('.tray button');
@@ -197,6 +246,14 @@ export class SwipeRows {
   _trayWidth(el) {
     const tray = el.querySelector('.tray');
     return tray ? tray.offsetWidth : 0;
+  }
+
+  // Where a swipe left on a row with data-quick-left stops revealing and
+  // starts committing: well past the tray, at least 60 % of the row, and
+  // never so far that the finger cannot get there (the row slides to 95 %).
+  farThreshold(el) {
+    const width = el.offsetWidth;
+    return Math.min(Math.max(this._trayWidth(el) + 40, width * 0.6), width * 0.85);
   }
 
   // `left` names what a row moved to the left uncovers: the tray, or — while
@@ -258,13 +315,48 @@ export class SwipeRows {
     if (btn.dataset.label) btn.textContent = btn.dataset.label;
   }
 
+  // A finger held still on a row, for a list that takes a long press.
+  _pressStart(e, el) {
+    this._pressEnd();
+    if (!this._onLongPress || e.button !== 0 || (e.pointerType !== 'touch' && e.pointerType !== 'pen')) return;
+    const press = { id: e.pointerId, x0: e.clientX, y0: e.clientY, el };
+    press.timer = setTimeout(() => {
+      if (this._press !== press) return;
+      this._press = null;
+      this._longPress(el);
+    }, LONG_PRESS_MS);
+    this._press = press;
+  }
+
+  _pressMove(e) {
+    const p = this._press;
+    if (!p || e.pointerId !== p.id) return;
+    if (Math.abs(e.clientX - p.x0) > 8 || Math.abs(e.clientY - p.y0) > 8) this._pressEnd();
+  }
+
+  _pressEnd() {
+    if (this._press) clearTimeout(this._press.timer);
+    this._press = null;
+  }
+
+  _longPress(el) {
+    this._pressEnd();
+    this._drag = null;
+    this._pressedAt = performance.now();
+    // The click the lifted finger makes is the long press's, not a tap.
+    this._suppressUntil = performance.now() + 1500;
+    if (this._openId) this.close();
+    this._onLongPress(el.dataset.id, el);
+  }
+
   _dragStart(e, el, row) {
-    if (e.button !== 0 || this._isBusy()) return;
+    if (e.button !== 0 || this._isBusy() || this._selecting()) return;
     const base = this._openId === el.dataset.id ? -this._trayWidth(el) : 0;
     // A row that commits to the left does so from rest; with its tray open
     // (a long press put it there) the drag moves the tray as on any row.
     const left = el.dataset.quickLeft && !base ? 'quick' : 'tray';
-    this._drag = { el, row, id: e.pointerId, x0: e.clientX, y0: e.clientY, base, dx: 0, axis: null, left };
+    this._drag = { el, row, id: e.pointerId, x0: e.clientX, y0: e.clientY, base, dx: 0, axis: null, left,
+                   v: 0, t: typeof e.timeStamp === 'number' ? e.timeStamp : null };
   }
 
   _dragMove(e) {
@@ -287,15 +379,23 @@ export class SwipeRows {
     // quick sides, on a row that commits to the left as well.
     let x = d.base + dx;
     if (d.left === 'quick') {
-      if (x < -width * 0.8) x = -width * 0.8;
+      if (x < -width * 0.95) x = -width * 0.95;
     } else if (x < -tray) {
       x = -tray + (x + tray) / 4;
     }
     if (x > width * 0.8) x = width * 0.8;
     // Nothing to commit on the right: the row stays where it is on that side.
     if (x > 0 && !d.el.dataset.quick) x = 0;
+    // How fast the row moves (px per ms, the last move's), for a fling — from
+    // the events' own clock; an event without one says nothing of speed.
+    if (typeof e.timeStamp === 'number' && d.t !== null && e.timeStamp > d.t) {
+      d.v = (x - d.dx) / (e.timeStamp - d.t);
+    }
+    if (typeof e.timeStamp === 'number') d.t = e.timeStamp;
     d.dx = x;
-    this.slide(d.el, x, false, d.left);
+    // A row that commits to the left shows its tray while the finger is short
+    // of the far threshold, and the action it commits past it.
+    this.slide(d.el, x, false, d.left === 'quick' && x <= -this.farThreshold(d.el) ? 'quick' : 'tray');
   }
 
   _dragEnd(e) {
@@ -313,17 +413,17 @@ export class SwipeRows {
       // Committed: slide the row out and act. The quick action is the one
       // the row's state calls for — out of the list, or back into it.
       this._openId = null;
-      this.slide(d.el, x, true, d.left);
+      this.slide(d.el, x, true, 'quick');
       const id = d.el.dataset.id;
       const el = d.el;
       setTimeout(() => this._onQuick(id, action, el), 160);
     };
     if (d.dx > past && d.el.dataset.quick) {
       commit(width, d.el.dataset.quick);
-    } else if (d.left === 'quick') {
-      // The left side commits like the right one, and never opens the tray.
-      if (d.dx < -past) commit(-width, d.el.dataset.quickLeft);
-      else this.slide(d.el, 0);
+    } else if (d.left === 'quick' && (d.dx <= -this.farThreshold(d.el)
+                                       || (d.dx < -past && d.v <= -FLING_PX_PER_MS))) {
+      // All the way, or flung: the left side's action, at once.
+      commit(-width, d.el.dataset.quickLeft);
     } else if (d.dx < -tray / 2) {
       this.open(d.el);
     } else {
@@ -349,6 +449,23 @@ export class SwipeRows {
 
 let toastHost = null;
 let toastTimer = 0;
+// When the toast lapses (performance.now()), and — while a finger or the
+// pointer rests on it — how long it had left: it stays as long as it is held.
+let toastDeadline = 0;
+let toastHeld = null;
+// The offer's deferred commit, made when the toast lapses, when a newer
+// offer replaces it, or at once when the page is hidden or left (`keepalive`
+// true: the request must outlive the page). Undo drops it unmade.
+let pendingCommit = null;
+let leaveWired = false;
+// Whether the toast on screen offers Undo, and a notice waiting for it to go:
+// a notice never takes the way back from a newer change away.
+let undoLive = false;
+let queuedNotice = null;
+// How long a notice (no Undo) stays.
+export const NOTICE_MS = 6000;
+// Once let go, a toast that was held stays at least this long more.
+const TOAST_AFTER_HOLD_MS = 2500;
 
 const TOAST_CSS = `
   .toast { position: fixed; left: 50%; transform: translateX(-50%); z-index: 30;
@@ -361,29 +478,130 @@ const TOAST_CSS = `
            color: var(--accent, #6ea8fe); font-weight: 600; }
 `;
 
+const nowMs = () => (typeof performance !== 'undefined' ? performance.now() : Date.now());
+
+// Take the toast away. A deferred commit it carried is made now — the toast
+// going is the window ending, never a silent cancel.
 export function dismissUndo() {
   clearTimeout(toastTimer);
+  toastHeld = null;
+  undoLive = false;
   if (toastHost && toastHost.shadowRoot) toastHost.shadowRoot.innerHTML = '';
+  flushPendingCommit(false);
+  if (queuedNotice !== null && !undoLive) {
+    const text = queuedNotice;
+    queuedNotice = null;
+    showNotice(text);
+  }
 }
 
-// Offer the way back from a change for UNDO_MS: `text` says what happened,
-// `onUndo` puts it back.
-export function offerUndo(text, onUndo) {
+// Say something that offers no way back — an outcome, a partial failure —
+// for NOTICE_MS. While an Undo toast is up it waits for that one to go.
+export function showNotice(text) {
   if (typeof document === 'undefined') return;
+  if (undoLive) {
+    queuedNotice = String(text);
+    return;
+  }
+  renderToast(text, false);
+  armToast(NOTICE_MS);
+}
+
+function renderToast(text, withUndo) {
+  clearTimeout(toastTimer);
+  toastHeld = null;
   if (!toastHost || !toastHost.isConnected) {
     toastHost = document.createElement('div');
     toastHost.setAttribute('data-undo-toast', '');
     toastHost.attachShadow({ mode: 'open' });
     document.body.appendChild(toastHost);
   }
-  clearTimeout(toastTimer);
   const esc = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
   toastHost.shadowRoot.innerHTML = `<style>${TOAST_CSS}</style>` +
     `<div class="toast" role="status"><span class="t">${esc(text)}</span>` +
-    `<button type="button">Undo</button></div>`;
+    (withUndo ? `<button type="button">Undo</button>` : '') + `</div>`;
+  undoLive = !!withUndo;
+  const toast = toastHost.shadowRoot.querySelector('.toast');
+  if (toast && toast.addEventListener) {
+    const hold = () => {
+      if (toastHeld !== null) return;
+      clearTimeout(toastTimer);
+      toastHeld = Math.max(0, toastDeadline - nowMs());
+    };
+    const release = (e) => {
+      if (toastHeld === null) return;
+      // A mouse that clicks stays over the toast: only leaving lets it go.
+      if (e && e.type === 'pointerup' && e.pointerType === 'mouse') return;
+      const left = toastHeld;
+      toastHeld = null;
+      armToast(Math.max(left, TOAST_AFTER_HOLD_MS));
+    };
+    ['pointerenter', 'pointerdown'].forEach((t) => toast.addEventListener(t, hold));
+    ['pointerleave', 'pointercancel', 'pointerup'].forEach((t) => toast.addEventListener(t, release));
+  }
+}
+
+// Make the deferred commit now, if one waits; `keepalive` for a page on its
+// way out. Returns whether there was one.
+export function flushPendingCommit(keepalive = false) {
+  const commit = pendingCommit;
+  pendingCommit = null;
+  if (!commit) return false;
+  try {
+    commit(!!keepalive);
+  } catch (_e) { /* the commit reports its own failure */ }
+  return true;
+}
+
+// Whether a deferred commit is waiting for its toast to lapse.
+export function hasPendingCommit() { return !!pendingCommit; }
+
+// Hidden (another app, the tab switched, the screen off) or left: what the
+// user did is sent now, with keepalive, rather than lost with the page.
+function wireLeave() {
+  if (leaveWired || typeof document === 'undefined') return;
+  leaveWired = true;
+  const leave = () => {
+    if (!pendingCommit) return;
+    clearTimeout(toastTimer);
+    toastHeld = null;
+    undoLive = false;
+    if (toastHost && toastHost.shadowRoot) toastHost.shadowRoot.innerHTML = '';
+    flushPendingCommit(true);
+  };
+  if (typeof window !== 'undefined' && window.addEventListener) window.addEventListener('pagehide', leave);
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'hidden' || document.hidden === true) leave();
+  });
+}
+
+function armToast(ms) {
+  clearTimeout(toastTimer);
+  toastDeadline = nowMs() + ms;
+  toastTimer = setTimeout(dismissUndo, ms);
+}
+
+// Offer the way back from a change for UNDO_MS: `text` says what happened,
+// `onUndo` puts it back. With `commit`, the change has NOT been made yet: it
+// is made — commit(keepalive) — when the toast lapses, when a newer offer
+// takes its place, or at once (keepalive true) when the page is hidden or
+// left; Undo drops it unmade and calls `onUndo`. The toast stays while a
+// finger or the pointer is on it.
+export function offerUndo(text, onUndo, { commit = null } = {}) {
+  if (typeof document === 'undefined') return;
+  // A newer offer replaces an older one: an older change simply stands, and
+  // an older deferred one is made now.
+  clearTimeout(toastTimer);
+  toastHeld = null;
+  undoLive = false;
+  flushPendingCommit(false);
+  renderToast(text, true);
+  pendingCommit = typeof commit === 'function' ? commit : null;
+  if (pendingCommit) wireLeave();
   toastHost.shadowRoot.querySelector('button').addEventListener('click', () => {
+    pendingCommit = null;
     dismissUndo();
     onUndo();
   });
-  toastTimer = setTimeout(dismissUndo, UNDO_MS);
+  armToast(UNDO_MS);
 }

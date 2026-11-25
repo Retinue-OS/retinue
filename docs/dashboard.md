@@ -83,7 +83,7 @@ swipe does there is in "Chats: unread, read, archived" below):
 a swipe right archives an active thread or restores an archived one at once,
 a swipe left (or a long press) opens a tray of Star · Archive · Mute, or
 Star · Restore · Mute/Unmute · Delete. A commit that takes a row out of view
-offers Undo for a few seconds. The open thread's bar keeps its Archive button
+offers Undo for 15 s (the toast stays while a finger is on it). The open thread's bar keeps its Archive button
 and has a ☆/★ beside it. Archived threads drop off the active list but stay
 on that page; what each action means is in "Archived, muted, starred,
 deleted" below.
@@ -1067,12 +1067,32 @@ for the tabs. (`group` on a chat is the boolean "a group chat", as before.)
   clock). A message is one arrival however often its channel delivers it,
   and one a fast clock stamped a little ahead of the mark that read it stays
   read. An agent's own outbound message changes nothing: it is no reply.
-- On the page's rows a **swipe right marks as read** (on *Unread*) and a
-  **swipe left archives**; the tray — Star, on *Unread* Mark read, Archive
-  and Mute; on *Archived* Star, Restore, Mute or Unmute and Delete — opens by
-  long press, right-click or the context-menu key, so a keyboard reaches
-  what a swipe does. On the *Archived* tab a swipe right restores and a swipe
-  left opens the tray.
+- On the page's rows a **swipe right marks as read** (on *Unread*), a
+  **partial swipe left reveals the tray** and a **full swipe left (or a
+  fling) archives** at once (on *Unread* and *Read*); on the *Archived* tab a
+  swipe right restores and a swipe left reveals the tray. The tray is the
+  same on every tab and every channel — Star, on *Unread* Mark read, Archive
+  and Mute (on *Archived* Restore and Mute or Unmute), Spam and Delete — with
+  one exception: **Spam** is for mail threads only (a messenger has no junk
+  folder; mute the chat instead). Right-click and the context-menu key open
+  the tray too, so a keyboard reaches what a swipe does.
+- **Delete** takes two taps (the armed button says what the second does:
+  "Delete for good?", "Move mails to Trash?" on mail) and has no Undo. Every
+  other action that takes a chat out of view offers **Undo for 15 s**; Spam
+  is deferred — nothing is sent until the window ends, and a page hidden or
+  left sends it at once (`keepalive`). A failed action brings the row back
+  with the server's own reason.
+- **Multi-select**: a long press starts it (a tap then toggles a row, Space
+  on a focused row, Shift-click a range on a wide screen); a bar offers the
+  tab's actions for every selected chat — Spam only when all are mail — with
+  one request per chat, one Undo for the batch, failures counted and each
+  failed row saying why, and a bulk Delete in two taps. Esc, Cancel, the
+  back gesture or a tab switch end it.
+- **Spam** (`POST /chats/<id>/spam`, mail only) moves the thread's inbound
+  mails to the mailbox's Junk folder (`MAIL_JUNK_FOLDER`), and only then mutes
+  and archives the chat. Restore or Unmute bring it back like any muted
+  chat; the mails stay in Junk — the mailbox follows the chat, never back
+  (docs/mail-chats.md).
 - The badge on a row is the number of messages that have arrived since the
   user last dealt with the chat; the *Unread* tab carries the number of
   unread chats.

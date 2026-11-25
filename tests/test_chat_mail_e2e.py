@@ -35,7 +35,11 @@ two processes:
   on the wire is "not confirmed", never "not sent";
 - **a repeat clears the draft it repeats** (I), and only that draft — a
   new attempt under the press's kept key too;
-- a delete on a mailbox without a Trash says why, in the gateway's words.
+- a delete on a mailbox without a Trash says why, in the gateway's words;
+- spam: the thread's inbound mails go to Junk and the chat is muted and
+  archived; without a Junk folder the gateway's sentence is the answer and
+  the chat is untouched; Restore brings the chat back and the mails stay
+  in Junk.
 
 Standalone:
 
@@ -947,6 +951,52 @@ def test_a_delete_on_a_mailbox_without_a_trash_says_why(r: Rig):
     assert out["gateways"][SLUG]["trashed"] == 1 and out["gateways"][SLUG]["errors"] == 0
     assert "e@x.org" in S.held_in(r.box, "Trash") and "e@x.org" not in S.held_in(r.box, "INBOX")
     assert r.chat("e@x.org") not in mail._chats(r.base)
+
+
+# ── Spam ─────────────────────────────────────────────────────────────────────
+
+def test_spam_sends_the_mails_to_junk_and_puts_the_chat_away(r: Rig):
+    root = "spam@x.org"
+    r.arrives(root, day=1, subject="Cheap watches")
+    r.arrives("more-" + root, irt=root, refs=[root], day=2, subject="Re: Cheap watches")
+    chat = r.chat(root)
+    path = "/chats/" + mail._quote(chat) + "/spam"
+    assert r.listed(root)["list_group"] == "unread"
+    # No Junk folder: the gateway's sentence, and nothing changed anywhere.
+    status, out = r.http("POST", path, None, {"Sec-Fetch-Site": "same-origin"})
+    assert status == 502 and "MAIL_JUNK_FOLDER" in out["error"], out
+    assert "\n" not in out["error"]
+    assert r.listed(root)["list_group"] == "unread"
+    doc = r.wg._CHAT_STATE.get(chat)
+    assert not doc.get("muted") and not doc.get("archived")
+    assert sorted(S.held_in(r.box, "INBOX")).count(root) == 1
+    # With one: the mails are in Junk, the chat is muted and archived.
+    r.box.boxes["Junk"] = {"validity": 700, "next": 1, "mails": {}}
+    try:
+        status, out = r.http("POST", path, None, {"Sec-Fetch-Site": "same-origin"})
+        assert status == 200 and out["muted"] is True and out["archived"] is True, out
+        assert out["moved"] == 2, out
+        assert sorted(S.held_in(r.box, "Junk")) == sorted([root, "more-" + root])
+        assert root not in S.held_in(r.box, "INBOX")
+        r.settle()
+        listed = r.listed(root)
+        assert listed["list_group"] == "archived" and listed["muted"] is True, listed
+        # The mirror's next pass sees them in no mirrored folder; nothing it
+        # does brings the chat back.
+        r.w.mirror.poll()
+        r.settle()
+        assert r.listed(root)["list_group"] == "archived"
+        # Restore: the chat is back; the mails stay in Junk (the mailbox
+        # follows the chat, never back).
+        status, out = r.http("POST", "/chats/" + mail._quote(chat) + "/flags",
+                             {"archived": False, "muted": False})
+        assert status == 200 and out["archived"] is False and out["muted"] is False, out
+        r.settle()
+        assert r.listed(root)["list_group"] != "archived"
+        assert sorted(S.held_in(r.box, "Junk")) == sorted([root, "more-" + root])
+        assert root not in S.held_in(r.box, "INBOX")
+    finally:
+        r.box.boxes.pop("Junk", None)
 
 
 # What a check needs from the mail gateway beyond what the web gateway does

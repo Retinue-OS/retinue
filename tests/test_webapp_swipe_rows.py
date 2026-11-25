@@ -19,10 +19,23 @@ events, and pins what a finger feels:
   * no gesture starts while a write is on the wire, and `dragging` tells a
     list not to re-render under a finger;
   * the chats page's opt-ins leave all of the above alone where a row does
-    not carry them: a row with `data-quick-left` commits that action on a
-    swipe left past the same threshold (over its own layer, never the tray,
-    which a long press still opens), and a row without `data-quick` does not
-    move to the right at all.
+    not carry them: a row with `data-quick-left` reveals its tray on a
+    partial swipe left (past half the tray, as any row) and commits that
+    action on a full one — past the far threshold, over its own layer, which
+    takes over from the tray as the finger crosses it — or on a fast fling
+    past the commit threshold; a long press still opens the tray; and a row
+    without `data-quick` does not move to the right at all;
+  * selection, for a list that opts in (onLongPress / selecting / onSelect):
+    a finger held still for LONG_PRESS_MS calls onLongPress instead of
+    opening the tray (a moving one does not; right-click and the
+    context-menu key still open the tray), the click it ends in is no tap,
+    and while selecting a tap or Space calls onSelect and no swipe starts;
+    a list that does not opt in (the threads page) keeps the long press's
+    tray;
+  * the Undo toast (offerUndo): it lapses after UNDO_MS (15 s), stays while
+    a finger or the pointer is on it, and a deferred commit is made when it
+    lapses, when a newer offer replaces it, or at once with keepalive when
+    the page is hidden or left — and never after Undo.
 
 Also: starredFirst (base.js) puts starred rows first and keeps each group's
 order, and neither list carries a copy of the gesture of its own.
@@ -88,10 +101,33 @@ class El {
   }
 }
 const docListeners = {};
+// The toast's host and shadow root: enough to read its text, press its
+// button, and put a finger on it.
+class ToastRoot {
+  constructor() { this.html = ''; this.button = null; this.toast = null; }
+  set innerHTML(h) {
+    this.html = h;
+    this.button = h && h.includes('<button') ? new El('button') : null;
+    this.toast = h ? new El('div', 'toast') : null;
+  }
+  get innerHTML() { return this.html; }
+  querySelector(sel) { return sel === 'button' ? this.button : sel === '.toast' ? this.toast : null; }
+}
+const toastRoots = [];
 globalThis.document = {
+  visibilityState: 'visible',
+  hidden: false,
   addEventListener(t, f) { (docListeners[t] ||= []).push(f); },
   removeEventListener(t, f) { docListeners[t] = (docListeners[t] || []).filter((g) => g !== f); },
+  createElement() {
+    const host = { isConnected: true, setAttribute() {}, attachShadow() { this.shadowRoot = new ToastRoot(); toastRoots.push(this.shadowRoot); return this.shadowRoot; } };
+    return host;
+  },
+  body: { appendChild() {} },
 };
+const winListeners = {};
+globalThis.window = { addEventListener(t, f) { (winListeners[t] ||= []).push(f); } };
+const toastRoot = () => toastRoots[toastRoots.length - 1];
 globalThis.localStorage = { getItem() { return null; }, setItem() {}, removeItem() {} };
 globalThis.HTMLElement = class {};  // base.js defines a card class at import
 const pressOutside = (target) => {
@@ -99,7 +135,7 @@ const pressOutside = (target) => {
 };
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-const { SwipeRows } = await import('./swipe-rows.js');
+const { SwipeRows, offerUndo, dismissUndo, showNotice, NOTICE_MS, UNDO_MS, hasPendingCommit, LONG_PRESS_MS } = await import('./swipe-rows.js');
 const { starredFirst } = await import('./base.js');
 
 const ROW_W = 360;
@@ -385,39 +421,93 @@ await check('on a row without the opt-in a swipe left never commits', async () =
   assert.equal(s.openId, 'a');
 });
 
-await check('data-quick-left: a swipe left past the threshold commits that action', async () => {
+// The far threshold of these rows: the tray plus 40 px, at least 60 % of the
+// row, at most 85 % of it.
+const FAR = Math.min(Math.max(TRAY_W + 40, ROW_W * 0.6), ROW_W * 0.85);
+
+await check('data-quick-left: a partial swipe left reveals the tray, and commits nothing', async () => {
   const { root, calls, swipe: s } = setupLeft();
   const li = rowOf(root, 'b');
   const row = li.querySelector('.row');
   row.fire('pointerdown', { clientX: 300, clientY: 100 });
   row.fire('pointermove', { clientX: 280, clientY: 100 });
   row.fire('pointermove', { clientX: 160, clientY: 100 });
-  assert.equal(row.style.transform, 'translateX(-140px)', 'no tray resistance on this side');
-  assert.ok(li.classList.contains('show-quick-left'), 'its own layer shows under it');
-  assert.ok(!li.classList.contains('show-tray'), 'the tray stays hidden');
+  assert.equal(row.style.transform, 'translateX(-140px)', 'no resistance on this side');
+  assert.ok(li.classList.contains('show-tray'), 'the tray shows under it');
+  assert.ok(!li.classList.contains('show-quick-left'), 'the commit layer does not, yet');
   row.fire('pointerup', { clientX: 160, clientY: 100 });
+  assert.equal(s.openId, 'b', 'the tray is open');
+  assert.equal(row.style.transform, `translateX(${-TRAY_W}px)`, 'flush with it');
+  await sleep(200);
+  assert.deepEqual(calls.quick, [], 'nothing committed');
+});
+
+await check('data-quick-left: a full swipe left past the far threshold commits that action', async () => {
+  const { root, calls, swipe: s } = setupLeft();
+  assert.equal(s.farThreshold(rowOf(root, 'b')), FAR);
+  const li = rowOf(root, 'b');
+  const row = li.querySelector('.row');
+  row.fire('pointerdown', { clientX: 350, clientY: 100 });
+  row.fire('pointermove', { clientX: 330, clientY: 100 });
+  row.fire('pointermove', { clientX: 350 - FAR + 10, clientY: 100 });
+  assert.ok(li.classList.contains('show-tray') && !li.classList.contains('show-quick-left'),
+    'short of the far threshold: still the tray');
+  row.fire('pointermove', { clientX: 350 - FAR - 20, clientY: 100 });
+  assert.ok(li.classList.contains('show-quick-left'), 'past it: the action\'s own layer');
+  assert.ok(!li.classList.contains('show-tray'), 'and the tray gives way');
+  row.fire('pointerup', { clientX: 350 - FAR - 20, clientY: 100 });
   assert.equal(row.style.transform, `translateX(${-ROW_W}px)`, 'the row slides out to the left');
   assert.equal(s.openId, null, 'no tray opened');
   await sleep(200);
   assert.deepEqual(calls.quick, [['b', 'archive']]);
 });
 
-await check('data-quick-left: the left side runs to most of the row, as the right does', async () => {
+await check('data-quick-left: a fast fling past the commit threshold commits; a slow one reveals', async () => {
+  const fling = (li, ms) => {
+    const row = li.querySelector('.row');
+    row.fire('pointerdown', { clientX: 300, clientY: 100, timeStamp: 1000 });
+    for (let i = 1; i <= 5; i += 1) {
+      row.fire('pointermove', { clientX: 300 - 30 * i, clientY: 100, timeStamp: 1000 + ms * i });
+    }
+    row.fire('pointerup', { clientX: 150, clientY: 100, timeStamp: 1000 + ms * 5 });
+  };
+  const fast = setupLeft();
+  fling(rowOf(fast.root, 'a'), 10);  // 3 px/ms, 150 px: short of the far threshold
+  await sleep(200);
+  assert.deepEqual(fast.calls.quick, [['a', 'archive']]);
+  const slow = setupLeft();
+  fling(rowOf(slow.root, 'a'), 100);  // 0.3 px/ms
+  await sleep(200);
+  assert.deepEqual(slow.calls.quick, []);
+  assert.equal(slow.swipe.openId, 'a', 'revealed instead');
+  // A fling that does not even reach the commit threshold only reveals.
+  const short = setupLeft();
+  const row = rowOf(short.root, 'a').querySelector('.row');
+  row.fire('pointerdown', { clientX: 300, clientY: 100, timeStamp: 0 });
+  row.fire('pointermove', { clientX: 250, clientY: 100, timeStamp: 5 });
+  row.fire('pointermove', { clientX: 190, clientY: 100, timeStamp: 10 });
+  row.fire('pointerup', { clientX: 190, clientY: 100, timeStamp: 10 });
+  await sleep(200);
+  assert.deepEqual(short.calls.quick, []);
+  assert.equal(short.swipe.openId, 'a');
+});
+
+await check('data-quick-left: the left side runs to nearly all of the row', async () => {
   const { root } = setupLeft();
   const li = rowOf(root, 'a');
   const row = li.querySelector('.row');
   row.fire('pointerdown', { clientX: 350, clientY: 100 });
   row.fire('pointermove', { clientX: 330, clientY: 100 });
   row.fire('pointermove', { clientX: 0, clientY: 100 });
-  assert.equal(row.style.transform, `translateX(${-ROW_W * 0.8}px)`);
+  assert.equal(row.style.transform, `translateX(${-ROW_W * 0.95}px)`);
 });
 
-await check('data-quick-left: a shorter swipe left snaps back and opens nothing', async () => {
+await check('data-quick-left: a swipe short of half the tray snaps back and opens nothing', async () => {
   const { root, calls, swipe: s } = setupLeft();
   const li = rowOf(root, 'a');
-  const row = swipe(li, -(TRAY_W / 2 + 20));  // would open a tray on a plain row
+  const row = swipe(li, -(TRAY_W / 2 - 10));
   assert.equal(row.style.transform, '');
-  assert.ok(!li.classList.contains('show-quick-left'));
+  assert.ok(!li.classList.contains('show-quick-left') && !li.classList.contains('show-tray'));
   assert.equal(s.openId, null);
   await sleep(200);
   assert.deepEqual(calls.quick, []);
@@ -459,9 +549,239 @@ await check('no data-quick: the row does not move right and commits nothing ther
   row.fire('pointerup', { clientX: 300, clientY: 100 });
   await sleep(200);
   assert.deepEqual(calls.quick, []);
-  swipe(li, -200);
+  swipe(li, -(FAR + 20));
   await sleep(200);
   assert.deepEqual(calls.quick, [['a', 'archive']], 'the left side still commits');
+});
+
+// ── Selection (the chats page's opt-in) ─────────────────────────────────────
+function setupSelect() {
+  const calls = { long: [], select: [], tap: [], quick: [] };
+  let selecting = false;
+  const { host, root } = list(['a', 'b']);
+  const s = new SwipeRows(host, {
+    onQuick: (id, action) => calls.quick.push([id, action]),
+    onTap: (id) => calls.tap.push(id),
+    onLongPress: (id) => { calls.long.push(id); selecting = true; },
+    selecting: () => selecting,
+    onSelect: (id, _el, e) => calls.select.push([id, !!(e && e.shiftKey)]),
+  });
+  s.wire(root);
+  return { s, root, calls, stop: () => { selecting = false; } };
+}
+
+await check('a finger held still is a long press: selection, not the tray', async () => {
+  const { s, root, calls } = setupSelect();
+  const row = rowOf(root, 'a').querySelector('.row');
+  row.fire('pointerdown', { clientX: 100, clientY: 100, pointerType: 'touch' });
+  await sleep(LONG_PRESS_MS + 60);
+  assert.deepEqual(calls.long, ['a']);
+  assert.equal(s.openId, null, 'no tray');
+  // The browser's own contextmenu for the same press: once only.
+  row.fire('contextmenu', { pointerType: 'touch', button: 0 });
+  assert.deepEqual(calls.long, ['a']);
+  row.fire('pointerup', { clientX: 100, clientY: 100, pointerType: 'touch' });
+  const ev = row.fire('click');
+  assert.equal(ev.defaultPrevented, true, 'the lifted finger is no tap');
+  assert.deepEqual(calls.select, [], 'nor a toggle');
+});
+
+await check('a finger that moves is no long press; a mouse right-click still opens the tray', async () => {
+  const { s, root, calls } = setupSelect();
+  const row = rowOf(root, 'a').querySelector('.row');
+  row.fire('pointerdown', { clientX: 100, clientY: 100, pointerType: 'touch' });
+  row.fire('pointermove', { clientX: 100, clientY: 130, pointerType: 'touch' });
+  await sleep(LONG_PRESS_MS + 60);
+  assert.deepEqual(calls.long, []);
+  row.fire('pointerup', { clientX: 100, clientY: 130 });
+  row.fire('contextmenu', { pointerType: 'mouse', button: 2 });
+  assert.equal(s.openId, 'a', 'right-click: the tray');
+  assert.deepEqual(calls.long, []);
+  s.close();
+  // A contextmenu of a touch without the timer having seen it (a browser
+  // that says so first) is the long press too.
+  rowOf(root, 'b').querySelector('.row').fire('contextmenu', { pointerType: 'touch', button: 0 });
+  assert.deepEqual(calls.long, ['b']);
+  assert.equal(s.openId, null);
+});
+
+await check('while selecting a tap or Space selects, and no swipe starts', async () => {
+  const { s, root, calls } = setupSelect();
+  rowOf(root, 'b').querySelector('.row').fire('contextmenu', { pointerType: 'touch', button: 0 });
+  await sleep(1600);  // past the long press's own click
+  const row = rowOf(root, 'a').querySelector('.row');
+  const ev = row.fire('click', { shiftKey: true });
+  assert.equal(ev.defaultPrevented, true, 'the link is not followed');
+  assert.deepEqual(calls.select, [['a', true]]);
+  assert.deepEqual(calls.tap, []);
+  const key = row.fire('keydown', { key: ' ' });
+  assert.equal(key.defaultPrevented, true);
+  assert.deepEqual(calls.select, [['a', true], ['a', false]]);
+  swipe(rowOf(root, 'a'), 200);
+  await sleep(200);
+  assert.deepEqual(calls.quick, [], 'no swipe while selecting');
+  assert.equal(row.style.transform, undefined);
+  assert.equal(s.dragging, false);
+});
+
+await check('a list without the opt-in keeps the long press\'s tray', async () => {
+  const { root, swipe: s } = setup();
+  const li = rowOf(root, 'a');
+  li.querySelector('.row').fire('pointerdown', { clientX: 100, clientY: 100, pointerType: 'touch' });
+  await sleep(LONG_PRESS_MS + 60);
+  assert.equal(s.openId, null, 'no timer of its own');
+  li.querySelector('.row').fire('contextmenu', { pointerType: 'touch', button: 0 });
+  assert.equal(s.openId, 'a');
+  li.querySelector('.row').fire('keydown', { key: ' ' });
+});
+
+// ── The Undo toast ──────────────────────────────────────────────────────────
+// Timers under test: setTimeout is captured, and time is the tests' to move.
+const realSetTimeout = globalThis.setTimeout;
+const realClearTimeout = globalThis.clearTimeout;
+let clock = 0;
+let timers = [];
+function fakeTime() {
+  clock = 0;
+  timers = [];
+  globalThis.performance = { now: () => clock };
+  globalThis.setTimeout = (f, ms) => { const t = { f, at: clock + ms, id: timers.length + 1 }; timers.push(t); return t.id; };
+  globalThis.clearTimeout = (id) => { timers = timers.filter((t) => t.id !== id); };
+}
+function advance(ms) {
+  clock += ms;
+  for (;;) {
+    const due = timers.filter((t) => t.at <= clock).sort((a, b) => a.at - b.at)[0];
+    if (!due) break;
+    timers = timers.filter((t) => t !== due);
+    due.f();
+  }
+}
+function realTime() {
+  globalThis.setTimeout = realSetTimeout;
+  globalThis.clearTimeout = realClearTimeout;
+}
+
+await check('the Undo lasts 15 s, and stays while a finger is on it', async () => {
+  fakeTime();
+  try {
+    assert.equal(UNDO_MS, 15000);
+    let undone = 0;
+    offerUndo('Archived · Mara', () => { undone += 1; });
+    const root = toastRoot();
+    assert.ok(root.innerHTML.includes('Archived · Mara'));
+    advance(14000);
+    assert.ok(root.innerHTML, 'still there after 14 s');
+    // A finger on it: it does not lapse while held …
+    root.toast.fire('pointerdown', { pointerType: 'touch' });
+    advance(60000);
+    assert.ok(root.innerHTML, 'held: still there a minute later');
+    // … and once let go it stays a little longer, then lapses.
+    root.toast.fire('pointerup', { pointerType: 'touch' });
+    root.toast.fire('pointerleave', { pointerType: 'touch' });
+    advance(2000);
+    assert.ok(root.innerHTML, 'not gone the moment the finger lifts');
+    advance(1000);
+    assert.equal(root.innerHTML, '', 'lapsed');
+    assert.equal(undone, 0);
+    // A mouse resting on it holds it too; a click does not let it go.
+    offerUndo('Muted · Mara', () => { undone += 1; });
+    const r2 = toastRoot();
+    r2.toast.fire('pointerenter', { pointerType: 'mouse' });
+    r2.toast.fire('pointerup', { pointerType: 'mouse' });
+    advance(30000);
+    assert.ok(r2.innerHTML, 'the pointer is still on it');
+    r2.button.fire('click');
+    assert.equal(undone, 1, 'Undo');
+    assert.equal(r2.innerHTML, '');
+  } finally {
+    realTime();
+  }
+});
+
+await check('a deferred commit: made when the toast lapses, never after Undo', async () => {
+  fakeTime();
+  try {
+    const made = [];
+    let undone = 0;
+    offerUndo('Deleted · Mara', () => { undone += 1; }, { commit: (keepalive) => made.push(['a', keepalive]) });
+    assert.equal(hasPendingCommit(), true);
+    advance(14900);
+    assert.deepEqual(made, [], 'nothing is sent inside the window');
+    advance(200);
+    assert.deepEqual(made, [['a', false]], 'sent once it ends');
+    assert.equal(hasPendingCommit(), false);
+    advance(60000);
+    assert.deepEqual(made, [['a', false]], 'and only once');
+    // Undo within the window: nothing is sent, ever.
+    offerUndo('Marked as spam · Ann', () => { undone += 1; }, { commit: (k) => made.push(['b', k]) });
+    advance(5000);
+    toastRoot().button.fire('click');
+    advance(60000);
+    assert.equal(undone, 1);
+    assert.deepEqual(made, [['a', false]]);
+    // A newer offer replaces an older one: the older deferred commit is made now.
+    offerUndo('Deleted · C', () => {}, { commit: (k) => made.push(['c', k]) });
+    offerUndo('Archived · D', () => {});
+    assert.deepEqual(made.slice(1), [['c', false]]);
+  } finally {
+    realTime();
+  }
+});
+
+await check('a page hidden or left commits what waits, at once and with keepalive', async () => {
+  fakeTime();
+  try {
+    const made = [];
+    offerUndo('Deleted · Mara', () => {}, { commit: (keepalive) => made.push(['pagehide', keepalive]) });
+    for (const f of winListeners.pagehide || []) f({ type: 'pagehide' });
+    assert.deepEqual(made, [['pagehide', true]]);
+    assert.equal(toastRoot().innerHTML, '', 'the toast is gone with it');
+    offerUndo('Marked as spam · Ann', () => {}, { commit: (keepalive) => made.push(['hidden', keepalive]) });
+    document.visibilityState = 'hidden';
+    for (const f of docListeners.visibilitychange || []) f({ type: 'visibilitychange' });
+    document.visibilityState = 'visible';
+    assert.deepEqual(made, [['pagehide', true], ['hidden', true]]);
+    advance(60000);
+    assert.equal(made.length, 2, 'never a second time');
+    // Nothing waiting: hiding the page does nothing.
+    offerUndo('Archived · D', () => {});
+    for (const f of winListeners.pagehide || []) f({ type: 'pagehide' });
+    assert.ok(toastRoot().innerHTML, 'an ordinary Undo stays');
+  } finally {
+    realTime();
+  }
+});
+
+await check('a notice offers no Undo, and never takes one away', async () => {
+  fakeTime();
+  try {
+    dismissUndo();    // (the toast an earlier check left up)
+    showNotice('Marked as spam 2 of 3 — 1 failed');
+    const root = toastRoot();
+    assert.ok(root.innerHTML.includes('2 of 3'));
+    assert.equal(root.button, null, 'no Undo');
+    advance(NOTICE_MS + 10);
+    assert.equal(root.innerHTML, '', 'it lapses');
+    // An Undo toast on screen: the notice waits for it to go.
+    const made = [];
+    offerUndo('Archived · D', () => {}, { commit: (k) => made.push(k) });
+    showNotice('Archived 1 of 2 — 1 failed');
+    assert.ok(toastRoot().innerHTML.includes('Archived · D'), 'the Undo stays');
+    assert.ok(toastRoot().button, 'with its button');
+    advance(UNDO_MS + 10);
+    assert.deepEqual(made, [false]);
+    assert.ok(toastRoot().innerHTML.includes('1 of 2'), 'then the notice');
+    assert.equal(toastRoot().button, null);
+    advance(NOTICE_MS + 10);
+    assert.equal(toastRoot().innerHTML, '');
+    // A notice on screen is replaced by a newer Undo.
+    showNotice('X failed');
+    offerUndo('Muted · E', () => {});
+    assert.ok(toastRoot().innerHTML.includes('Muted · E') && toastRoot().button);
+  } finally {
+    realTime();
+  }
 });
 
 await check('starredFirst: starred rows lead, each group keeps its order', async () => {

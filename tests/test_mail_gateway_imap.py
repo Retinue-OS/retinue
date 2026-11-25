@@ -412,11 +412,14 @@ def test_folder_roles():
         server.folder("Archiv &AOQ-lter", "\\Archive")           # "Archiv älter"
         server.folder("Gel&APY-scht", "\\Trash \\HasNoChildren")  # "Gelöscht"
         server.folder("Alle", "\\All")
+        server.folder("Unerw&APw-nscht", "\\Junk")                # "Unerwünscht"
+        server.folder("Junk")                                    # a client's own, unmarked
         server.folder("Ordner", "\\Noselect \\HasChildren")
         with Wired(gw, server):
             box = gw.Mailbox(gw.MAIL_CONFIG)
             assert box.folders() == {"inbox": "INBOX", "sent": "Gesendete Objekte",
-                                     "archive": "Archiv älter", "trash": "Gelöscht"}
+                                     "archive": "Archiv älter", "trash": "Gelöscht",
+                                     "junk": "Unerwünscht"}
             # The decoded name goes back on the wire in modified UTF-7.
             listing = box.list_uids("Archiv älter")
             assert listing is not None and listing.uidvalidity == 7
@@ -432,12 +435,13 @@ def test_folder_roles():
         # the archive it names, and for a Trash name the server does not
         # have, none — never the marked one in its place.
         gw = t.load(tmp, SENT_FOLDER="Sent Items", MAIL_ARCHIVE_FOLDER="Ablage",
-                    MAIL_TRASH_FOLDER="Bin")
+                    MAIL_TRASH_FOLDER="Bin", MAIL_JUNK_FOLDER="Spam")
         assert gw.MAIL_ARCHIVE_FOLDER_SET and gw.MAIL_TRASH_FOLDER_SET
+        assert gw.MAIL_JUNK_FOLDER_SET and gw.MAIL_JUNK_FOLDER == "Spam"
         with Wired(gw, marked):
             box = gw.Mailbox(gw.MAIL_CONFIG)
             assert box.folders() == {"inbox": "INBOX", "sent": "Gesendete Objekte",
-                                     "archive": "Ablage", "trash": None}
+                                     "archive": "Ablage", "trash": None, "junk": None}
             marked.folder("bin")
             assert box.folders()["trash"] == "bin", "matched without case, like every name"
         # No SPECIAL-USE: the configured names, matched exactly, else without case.
@@ -446,13 +450,16 @@ def test_folder_roles():
             server.folder(name)
         with Wired(gw, server):
             assert gw.Mailbox(gw.MAIL_CONFIG).folders() == {
-                "inbox": "Inbox", "sent": "Sent Items", "archive": "ablage", "trash": None}
+                "inbox": "Inbox", "sent": "Sent Items", "archive": "ablage", "trash": None,
+                "junk": None}
 
     with tempfile.TemporaryDirectory() as tmp:
         # Set but empty is not set (compose passes the variables through).
-        gw = t.load(tmp, MAIL_ARCHIVE_FOLDER="  ", MAIL_TRASH_FOLDER="")
+        gw = t.load(tmp, MAIL_ARCHIVE_FOLDER="  ", MAIL_TRASH_FOLDER="", MAIL_JUNK_FOLDER=" ")
         assert not gw.MAIL_ARCHIVE_FOLDER_SET and not gw.MAIL_TRASH_FOLDER_SET
-        assert (gw.MAIL_ARCHIVE_FOLDER, gw.MAIL_TRASH_FOLDER) == ("Archive", "Trash")
+        assert not gw.MAIL_JUNK_FOLDER_SET
+        assert (gw.MAIL_ARCHIVE_FOLDER, gw.MAIL_TRASH_FOLDER, gw.MAIL_JUNK_FOLDER) == (
+            "Archive", "Trash", "Junk")
 
     with tempfile.TemporaryDirectory() as tmp:
         gw = t.load(tmp)
@@ -463,7 +470,16 @@ def test_folder_roles():
                  ({"\\noselect"}, "[Gmail]")]
         assert resolve(gmail, "Sent", "Archive", "Trash") == {
             "inbox": "INBOX", "sent": "[Gmail]/Sent Mail", "archive": "[Gmail]/All Mail",
-            "trash": "[Gmail]/Trash"}
+            "trash": "[Gmail]/Trash", "junk": None}
+        # Junk: the server's \\Junk first, the given name only where it marks
+        # none — and a set name is the folder, or none.
+        spam = gmail + [({"\\junk"}, "[Gmail]/Spam"), (set(), "Junk")]
+        assert resolve(spam, "Sent", "Archive", "Trash")["junk"] == "[Gmail]/Spam"
+        assert resolve(gmail + [(set(), "junk")], "Sent", "Archive", "Trash")["junk"] == "junk"
+        assert resolve(spam, "Sent", "Archive", "Trash", junk="Junk",
+                       junk_explicit=True)["junk"] == "Junk"
+        assert resolve(spam, "Sent", "Archive", "Trash", junk="Bulk",
+                       junk_explicit=True)["junk"] is None
         both = gmail + [({"\\archive"}, "Archive")]
         assert resolve(both, "Sent", "Archive", "Trash")["archive"] == "Archive"
         # A set name wins over both marks — and while no folder has it, the
@@ -471,18 +487,20 @@ def test_folder_roles():
         named = both + [(set(), "Done"), (set(), "Bin")]
         assert resolve(named, "Sent", "Done", "Bin") == {
             "inbox": "INBOX", "sent": "[Gmail]/Sent Mail", "archive": "Archive",
-            "trash": "[Gmail]/Trash"}
+            "trash": "[Gmail]/Trash", "junk": None}
         assert resolve(named, "Sent", "Done", "Bin", archive_explicit=True,
                        trash_explicit=True) == {
-            "inbox": "INBOX", "sent": "[Gmail]/Sent Mail", "archive": "Done", "trash": "Bin"}
+            "inbox": "INBOX", "sent": "[Gmail]/Sent Mail", "archive": "Done", "trash": "Bin",
+            "junk": None}
         assert resolve(both, "Sent", "Done", "Bin", archive_explicit=True,
                        trash_explicit=True) == {
-            "inbox": "INBOX", "sent": "[Gmail]/Sent Mail", "archive": None, "trash": None}
+            "inbox": "INBOX", "sent": "[Gmail]/Sent Mail", "archive": None, "trash": None,
+            "junk": None}
         assert resolve(both, "Sent", "Done", "Bin", trash_explicit=True)["archive"] == "Archive"
         # A folder that cannot be opened plays no role, whatever it is marked.
         assert resolve([({"\\sent", "\\noselect"}, "Sent")], "Sent", "A", "T")["sent"] is None
         assert resolve([], "Sent", "Archive", "Trash") == {
-            "inbox": "INBOX", "sent": None, "archive": None, "trash": None}
+            "inbox": "INBOX", "sent": None, "archive": None, "trash": None, "junk": None}
         entry = gw._parse_list_entry
         assert entry(b'(\\HasNoChildren \\Sent) "/" "Sent \\"old\\""') == (
             {"\\hasnochildren", "\\sent"}, 'Sent "old"')

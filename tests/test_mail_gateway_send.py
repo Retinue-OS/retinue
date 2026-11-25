@@ -26,6 +26,11 @@ message, byte for byte.
     fails halfway; the erase capability; read and archive limited to the
     mails the caller counted; a delete that erases nothing while a mail is
     neither in the Trash nor known to be gone; no Trash is ever invented;
+  * spam: only the thread's inbound mails in INBOX and the archive go to the
+    Junk folder (never Sent, never the user's own), scoped by the ids the
+    caller names; no Junk folder is ever invented (a sentence naming
+    MAIL_JUNK_FOLDER, nothing moved); the endpoint's token and account; a
+    stop between the server's move and the index is put right at restart;
   * input that tries to add a header or a recipient — an address is one
     address of a stated grammar or it is refused, and no mail leaves whose
     headers and envelope disagree;
@@ -5574,6 +5579,266 @@ def test_a_move_stopped_before_the_index_followed_is_put_right():
         finally:
             done(w)
     print("ok: a move stopped before the index followed it is put right at the next start")
+
+
+# --------------------------------------------------------------------------
+# Spam: the thread's inbound mails to the Junk folder
+# --------------------------------------------------------------------------
+
+def spam_world(**kwargs):
+    kwargs.setdefault("folders", ("INBOX", "Sent", "Archive", "Trash", "Junk"))
+    return world(**kwargs)
+
+
+def thread_with_own_mail(w) -> None:
+    """thread_of_three, and a mail of the user's own that lies in the INBOX
+    (a copy a client filed there, a mail to oneself): theirs, and no spam."""
+    thread_of_three(w)
+    w.box.put("INBOX", t.msg("own@example.org", sender=ME, to="ann@x.org",
+                             subject="Re: Quarterly numbers", refs=["a@x.org"],
+                             irt="a@x.org", day=3.5))
+    w.mirror.poll()
+    assert t.by_id(w.gw)["own@example.org"]["chat"] == "a@x.org"
+
+
+def test_spam_moves_the_threads_inbound_mails_to_junk():
+    w = spam_world()
+    try:
+        gw, box, mirror = w.gw, w.box, w.mirror
+        thread_with_own_mail(w)
+        assert mirror.spam("a@x.org") == {"moved": 2, "flagged": 0}
+        # INBOX and the archive, inbound only: never Sent, never the user's own.
+        assert held_in(box, "Junk") == ["a@x.org", "b@x.org"]
+        assert held_in(box, "INBOX") == ["other@x.org", "own@example.org"]
+        assert held_in(box, "Archive") == [] and held_in(box, "Sent") == ["s@example.org"]
+        assert not any(x[0] == "create" for x in box.writes), "no folder is made"
+        assert mirror.index.get("moving") is None, "the move was followed"
+        # Junk is no mirrored folder: the next pass finds the two in none and
+        # says so, as for mail a client moved to its junk — tombstones, and
+        # the rest of the thread stands. Nothing is ever erased.
+        mirror.poll()
+        recs = t.by_id(gw)
+        assert recs["a@x.org"]["removed_at"] and recs["b@x.org"]["removed_at"]
+        assert not recs["s@example.org"]["removed_at"]
+        assert not recs["own@example.org"]["removed_at"]
+        assert not recs["other@x.org"]["removed_at"]
+        # Nothing left to move: no write at all.
+        writes = len(box.writes)
+        assert mirror.spam("a@x.org") == {"moved": 0, "flagged": 0}
+        assert mirror.spam("nope@x.org") == {"moved": 0, "flagged": 0}
+        assert len(box.writes) == writes
+        # Taken out of Junk in a mail client, a mail is the thread's again.
+        box.move_mail("Junk", box.uid_of("Junk", "a@x.org"), "INBOX")
+        mirror.poll()
+        assert not t.by_id(gw)["a@x.org"]["removed_at"]
+        assert t.by_id(gw)["a@x.org"]["chat"] == "a@x.org"
+    finally:
+        done(w)
+
+    # ``only``: the mails the chat held when the user acted; one that came
+    # since stays where it is.
+    w = spam_world()
+    try:
+        gw, box, mirror = w.gw, w.box, w.mirror
+        thread_of_three(w)
+        box.put("INBOX", t.msg("c@x.org", subject="Re: Quarterly numbers", refs=["a@x.org"],
+                               day=5))
+        mirror.poll()
+        assert mirror.spam("a@x.org", {"a@x.org", "s@example.org", "nope@x.org"}) == {
+            "moved": 1, "flagged": 0}
+        assert held_in(box, "Junk") == ["a@x.org"]
+        assert held_in(box, "INBOX") == ["c@x.org", "other@x.org"]
+        assert held_in(box, "Archive") == ["b@x.org"] and held_in(box, "Sent") == ["s@example.org"]
+        writes = len(box.writes)
+        assert mirror.spam("a@x.org", set()) == {"moved": 0, "flagged": 0}
+        assert len(box.writes) == writes
+    finally:
+        done(w)
+
+    # A server with neither MOVE nor UIDPLUS: the copies are made, the
+    # originals stay flagged \Deleted, and are neither moved nor read again.
+    w = spam_world()
+    try:
+        gw, box, mirror = w.gw, w.box, w.mirror
+        box.can_expunge = False
+        thread_of_three(w)
+        assert mirror.spam("a@x.org") == {"moved": 2, "flagged": 2}
+        assert "\\Deleted" in flags(box, "INBOX", "a@x.org")
+        assert mirror.spam("a@x.org") == {"moved": 0, "flagged": 0}
+        assert held_in(box, "Junk") == ["a@x.org", "b@x.org"], "one copy each"
+        for _ in range(2):
+            mirror.poll()
+        assert len(t.records(gw)) == 4
+    finally:
+        done(w)
+    print("ok: spam moves the thread's inbound INBOX and archive mails to Junk, nothing else")
+
+
+def test_spam_fails_where_a_folder_goes_under_the_move():
+    """A source folder that vanishes between the listing and the move leaves
+    its mails out of Junk: spam fails rather than report them moved."""
+    w = spam_world()
+    try:
+        gw, box, mirror = w.gw, w.box, w.mirror
+        thread_of_three(w)
+        real_move = box.move
+
+        def move(folder, uids, target, validity=None):
+            if folder == "Archive":
+                return None     # the server: no such folder
+            return real_move(folder, uids, target, validity=validity)
+
+        box.move = move
+        try:
+            mirror.spam("a@x.org")
+            raise AssertionError("spam reported success with a folder gone")
+        except gw.MailboxError as exc:
+            said = str(exc)
+        assert "1 mail(s) were not moved" in said and "(1 were)" in said, said
+        assert held_in(box, "Junk") == ["a@x.org"]
+        assert held_in(box, "Archive") == ["b@x.org"]
+        assert mirror.index.get("moving") is None, "nothing left noted"
+        assert not t.by_id(gw)["b@x.org"]["removed_at"], "the index was not told it moved"
+        # Once the folder answers again, a second try moves the rest.
+        box.move = real_move
+        assert mirror.spam("a@x.org") == {"moved": 1, "flagged": 0}
+        assert held_in(box, "Junk") == ["a@x.org", "b@x.org"]
+    finally:
+        done(w)
+    print("ok: spam fails, and moves nothing it cannot, where a folder goes under it")
+
+
+def test_spam_never_invents_a_junk_folder():
+    for env in ({}, {"MAIL_JUNK_FOLDER": "Bulk"}):
+        w = world(**env)        # INBOX, Sent, Archive, Trash: no Junk
+        try:
+            gw, box, mirror = w.gw, w.box, w.mirror
+            if env:
+                box.roles["junk"] = "Bulk"
+            thread_of_three(w)
+            events = len(w.events)
+            try:
+                mirror.spam("a@x.org")
+                raise AssertionError("moved without a Junk folder")
+            except gw.MailboxError as exc:
+                said = str(exc)
+            assert "MAIL_JUNK_FOLDER" in said and "no Junk folder" in said, said
+            assert ("as MAIL_JUNK_FOLDER says" in said) == bool(env), said
+            assert not any(x[0] in ("create", "move") for x in box.writes), box.writes
+            assert "Junk" not in box.boxes and "Bulk" not in box.boxes
+            assert held_in(box, "INBOX") == ["a@x.org", "other@x.org"]
+            assert held_in(box, "Archive") == ["b@x.org"]
+            mirror.poll()
+            assert not any(r["removed_at"] for r in t.records(gw)) and len(w.events) == events
+            # Over HTTP: a 502 with that sentence, as any mailbox failure.
+            server, base = t.serve(gw)
+            try:
+                status, _h, raw = t.call(base + "/chats/spam", token=t.TOKEN, body=json.dumps(
+                    {"chat": "a@x.org", "account": ACCOUNT}).encode())
+                assert status == 502 and "MAIL_JUNK_FOLDER" in json.loads(raw)["error"], raw
+            finally:
+                server.shutdown()
+        finally:
+            done(w)
+    print("ok: spam refuses, naming MAIL_JUNK_FOLDER, where the mailbox has no Junk folder")
+
+
+def test_the_spam_endpoint():
+    w = spam_world(CHAT_ERASE_TOKEN=ERASE)
+    try:
+        gw, box, mirror = w.gw, w.box, w.mirror
+        thread_of_three(w)
+        server, base = t.serve(gw)
+
+        def post(body, token=t.TOKEN):
+            status, _h, raw = t.call(base + "/chats/spam", token=token,
+                                     body=json.dumps(body).encode())
+            return status, json.loads(raw)
+        try:
+            ours = {"chat": "a@x.org", "account": ACCOUNT}
+            # The gateway's token, as for /chats/archive — and no other.
+            assert post(ours, token=None)[0] == 401
+            assert post(ours, token="wrong")[0] == 401
+            for account in ("other@example.org", "", None):
+                assert post({"chat": "a@x.org", "account": account})[0] == 404
+            assert post({"account": ACCOUNT})[0] == 400
+            assert post({**ours, "message_ids": "a@x.org"})[0] == 400
+            assert held_in(box, "Junk") == []
+            assert post({**ours, "message_ids": ["<a@x.org>"]}) == (
+                200, {"ok": True, "moved": 1, "flagged": 0})
+            assert held_in(box, "Junk") == ["a@x.org"]
+            assert post(ours) == (200, {"ok": True, "moved": 1, "flagged": 0})
+            assert held_in(box, "Junk") == ["a@x.org", "b@x.org"]
+            assert post({"chat": "nope@x.org", "account": ACCOUNT}) == (
+                200, {"ok": True, "moved": 0, "flagged": 0})
+        finally:
+            server.shutdown()
+    finally:
+        done(w)
+    print("ok: POST /chats/spam: the gateway's token, its account, the mails named")
+
+
+def test_a_spam_move_stopped_before_the_index_followed_is_put_right():
+    """A stop between the server's move to Junk and the index following it,
+    at each write from the server's answer on: the next start puts it right
+    — one copy in Junk, the INBOX leftover (a server without MOVE) known as
+    moved, never moved or mirrored again, and no mail lost."""
+    for expunge in (True, False):
+        # (The index's two writes: the source place, then the note's end.)
+        for after in range(2):
+            w = spam_world()
+            try:
+                gw, box, mirror = w.gw, w.box, w.mirror
+                box.put("INBOX", t.msg("a@x.org", day=1))
+                mirror.poll()
+                box.can_expunge = expunge
+                index, real_move = mirror.index, box.move
+                real = {name: getattr(index, name) for name in ("run", "atomic")}
+                writes = []
+
+                def stops(name):
+                    def write(*args, **kwargs):
+                        if len(writes) >= after:
+                            raise _Kill()
+                        writes.append(name)
+                        return real[name](*args, **kwargs)
+                    return write
+
+                def move(*args, **kwargs):
+                    moved = real_move(*args, **kwargs)
+                    for name in real:
+                        setattr(index, name, stops(name))
+                    if after == 0:
+                        raise _Kill()
+                    return moved
+                box.move = move
+                try:
+                    mirror.spam("a@x.org")
+                    raise AssertionError("not stopped")
+                except _Kill:
+                    pass
+                finally:
+                    box.move = real_move
+                    for name, write in real.items():
+                        setattr(index, name, write)
+                mirror = w.restart()
+                for _ in range(2):
+                    mirror.poll()
+                assert mirror.index.get("moving") is None, (expunge, after)
+                assert len(box.uids_of("Junk", "a@x.org")) == 1, (expunge, after)
+                if expunge:
+                    assert box.uids_of("INBOX", "a@x.org") == (), (expunge, after)
+                else:
+                    (kept,) = box.uids_of("INBOX", "a@x.org")
+                    assert _places_of(mirror, "inbox", "a@x.org") == {kept: "moved"}, after
+                # Asked again: nothing to move, nothing copied a second time.
+                assert mirror.spam("a@x.org") == {"moved": 0, "flagged": 0}, (expunge, after)
+                assert len(box.uids_of("Junk", "a@x.org")) == 1
+                # One record, never two; the mail is in the mailbox, in Junk.
+                assert [r["message_id"] for r in t.records(gw)] == ["a@x.org"], (expunge, after)
+            finally:
+                done(w)
+    print("ok: a spam move stopped before the index followed it is put right at the next start")
 
 
 def main():

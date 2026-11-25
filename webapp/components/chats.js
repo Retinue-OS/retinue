@@ -35,28 +35,66 @@
 // in front of the user — not a list only Ara can edit.
 //
 //   Unread tab    swipe right  mark read at once
-//                 swipe left   archive at once
+//                 swipe left   reveal the tray; a full swipe (or a fling)
+//                              archives at once
 //   Read tab      swipe right  nothing (there is nothing to mark)
-//                 swipe left   archive at once
+//                 swipe left   reveal the tray; a full swipe (or a fling)
+//                              archives at once
 //   Archived tab  swipe right  restore at once
-//                 swipe left   reveal Star · Restore · Mute (Unmute) · Delete
+//                 swipe left   reveal the tray
+//
+// The tray offers the same actions on every tab and every channel: Star ·
+// Mark read (Unread only) · Archive · Mute — on Archived, Restore · Mute or
+// Unmute in their place — · Spam · Delete. **Spam** is the one exception: it
+// is on mail threads only (a messenger chat has no Junk folder; it is muted
+// instead). POST /chats/<id>/spam has the mailbox move the thread's inbound
+// mails to its Junk folder, and only then mutes and archives the chat.
+// Restore brings a spam chat back like any muted one; its mails stay in Junk.
+// Right-click and the context-menu key open the tray too (the keyboard's way
+// to everything a swipe does). **Star** keeps a chat at the top of whichever
+// list it is in, and does nothing else.
+//
+// Every action that takes a row out of view offers Undo for UNDO_MS (15 s;
+// the toast stays while a finger or the pointer is on it). Mark read,
+// Archive and Mute are made at once, and their Undo writes the previous state
+// back (Mark read's the previous read mark). **Spam** is deferred instead:
+// the row leaves at once ("Marked as spam · Undo") and NOTHING is sent until
+// the window ends; Undo within it sends nothing and puts the row back; a page
+// hidden or left meanwhile sends it at once (fetch keepalive) — leaving never
+// cancels what the user did. **Delete** has no Undo: it asks for a second
+// tap, its armed button saying what that does — "Delete for good?", and on a
+// mail thread "Move mails to Trash?" — and erases the chat from the whole
+// system (every message and file in the ledger, its companion thread; a later
+// message from the peer starts a new chat). On a mail thread it first moves
+// the thread's mails to the mailbox's Trash (nothing is expunged there). An
+// action that fails brings the row back, marked failed, with the server's
+// own one-sentence reason in place of its preview, and — for Delete and Spam
+// — a Retry in its tray (opened). The chat page's ⋮ has Delete (two taps
+// there too) and Spam, which it hands over to this list (HANDOFF_KEY): it
+// leaves for chats.html, which takes the Spam up with the same Undo.
+//
+// **Multi-select.** A long press on a row (or the list's Select) starts
+// selection mode with that row selected — so the long press no longer opens
+// the tray; the partial swipe, right-click and the context-menu key still
+// do. In the mode a tap (Space on a focused row) toggles a row, Shift-click
+// on a wide screen selects a range, and a bar says how many are selected and
+// offers what the tab's tray offers, for all of them: Mark read, Archive,
+// Mute, Restore / Unmute (Archived), Star / Unstar, Spam (only when every
+// selected chat is a mail thread) and Delete. Esc, Cancel, the back gesture
+// (the mode is a history entry) and a tab switch leave it; a selection is one
+// tab's, and a row that leaves the tab (a poll) leaves the selection. A bulk
+// action is one request per chat (BULK_CONCURRENCY at a time, no bulk
+// endpoint) and ONE Undo for the batch ("Archived 7 · Undo") that writes
+// every chat's previous state back; chats whose request failed come back
+// marked failed with their reasons, and the toast says so ("Archived 5 of 7
+// — 2 failed"). A bulk Delete keeps the two taps (the bar's Delete arms:
+// "Delete 7 chats? Mails move to the Trash"); a bulk Spam is deferred like a
+// single one.
 //
 // The full page's **＋** starts a new conversation: a short menu of what GET
 // /chats/compose offers (today *New e-mail*, where a mail gateway runs), each
 // opening the compose sheet (components/compose-sheet.js), which goes to the
 // new chat once it is sent or queued. With nothing offered there is no ＋.
-//
-// On Unread and Read the tray — Star · (Mark read) · Archive · Mute — opens by
-// a long press, a right-click or the context-menu key; on every tab that is
-// also how the keyboard reaches what a swipe does. **Star** keeps a chat at
-// the top of whichever list it is in, and does nothing else. A swipe or tray
-// action that takes a row out of view offers Undo for a few seconds — Mark
-// read's puts the previous read mark back. **Delete** erases the chat from the
-// whole system — every message and file in the ledger, its companion thread —
-// and a later message from the peer starts a new chat; it asks for a second
-// tap, and cannot be undone. On a mail thread it first moves the thread's
-// mails to the mailbox's Trash (nothing is expunged there), and its armed
-// button says so ("Move mails to Trash?") rather than "Delete for good?".
 //
 // The list comes from the gateway's GET /chats (the default `src`, still
 // overridable by attribute) — SPARQL over the message ledgers merged with the
@@ -70,7 +108,7 @@ import {
   RetinueCard, esc, fmtAge, isWideFrame, onFrameChange, starredFirst, deepActiveElement, onPressOutside,
 } from './base.js';
 import { shelf } from './shelf-store.js';
-import { SwipeRows, SWIPE_CSS, STAR_MARK, offerUndo, starButtonHtml } from './swipe-rows.js';
+import { SwipeRows, SWIPE_CSS, STAR_MARK, offerUndo, showNotice, starButtonHtml, UNDO_MS } from './swipe-rows.js';
 import { openComposeSheet } from './compose-sheet.js';
 
 const LIST_URL = '/chats';
@@ -85,6 +123,153 @@ const MAX_CARD_CHATS = 5;
 // cadence than the conversations card's 4s poll is enough (the server caches
 // the SPARQL skeleton between polls anyway).
 const REFRESH_MS = 15000;
+
+// Where the chat page leaves a Spam from its menu for this list to carry
+// out, with the list's Undo: {id, kind: 'spam', name, at}.
+export const HANDOFF_KEY = 'retinue-chat-pending-action';
+
+// The one action made only once its Undo window has ended (offerUndo's
+// `commit`): Spam. Delete asks for a second tap instead, and is made then.
+const DEFERRED = { spam: true };
+
+// What each action is called: in the toast (`done`), on a row whose action
+// failed (`failed`), and on the button that tries it again (`retry`).
+const ACTIONS = {
+  read: { done: 'Marked read', failed: 'Not marked read' },
+  archive: { done: 'Archived', failed: 'Not archived' },
+  mute: { done: 'Muted', failed: 'Not muted' },
+  unmute: { done: 'Unmuted', failed: 'Not unmuted' },
+  restore: { done: 'Restored', failed: 'Not restored' },
+  star: { done: 'Starred', failed: 'Not starred' },
+  unstar: { done: 'Unstarred', failed: 'Not unstarred' },
+  spam: { done: 'Marked as spam', failed: 'Not marked as spam', retry: 'Retry spam' },
+  delete: { done: 'Deleted', failed: 'Not deleted', retry: 'Retry delete' },
+};
+
+// The flags each flag action writes, exactly as a conversation has them.
+const FLAGS = {
+  archive: { archived: true },
+  mute: { muted: true },
+  // Stays archived — it only lets the next message bring the chat back.
+  unmute: { muted: false },
+  restore: { archived: false, muted: false },
+  star: { starred: true },
+  unstar: { starred: false },
+};
+
+// A bulk action runs one request per chat, this many at a time.
+export const BULK_CONCURRENCY = 4;
+
+// `fn` over `items`, at most `limit` at once; the results in item order (a
+// throw is a result too: {ok: false, reason}). With `control`, its `rush()`
+// is set: called, it starts every item not yet started at once —
+// synchronously, so a page on its way out still sends them.
+export async function eachBounded(items, limit, fn, control = null) {
+  const out = new Array(items.length);
+  let next = 0;
+  const worker = async () => {
+    while (next < items.length) {
+      const k = next;
+      next += 1;
+      try {
+        out[k] = await fn(items[k], k);
+      } catch (err) {
+        out[k] = { ok: false, reason: String((err && err.message) || err) };
+      }
+    }
+  };
+  const workers = Array.from({ length: Math.min(limit, items.length) }, worker);
+  if (control) {
+    control.rush = () => {
+      while (next < items.length) workers.push(worker());
+    };
+  }
+  await Promise.all(workers);
+  // (Workers a rush started after Promise.all was called are awaited too.)
+  await Promise.all(workers);
+  return out;
+}
+
+// Deferred commits still going out, a few at a time: when the page is hidden
+// or left, what has not gone yet goes at once, with keepalive — a bounded
+// queue would issue the rest only on answers a page that is gone never gets.
+const draining = new Set();
+let drainWired = false;
+function wireDrain() {
+  if (drainWired || typeof document === 'undefined') return;
+  drainWired = true;
+  const rushAll = () => {
+    for (const drain of draining) {
+      drain.keepalive = true;
+      if (drain.rush) drain.rush();
+    }
+  };
+  if (typeof window !== 'undefined' && window.addEventListener) window.addEventListener('pagehide', rushAll);
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'hidden' || document.hidden === true) rushAll();
+  });
+}
+
+// Hand a Spam to the chat list (the chat page's menu): true when it was put
+// where the list will find it — the caller then goes there.
+export function handOffChatAction(id, kind, name) {
+  if (!id || !DEFERRED[kind]) return false;
+  try {
+    localStorage.setItem(HANDOFF_KEY, JSON.stringify({ id, kind, name: name || '', at: Date.now() }));
+    return localStorage.getItem(HANDOFF_KEY) !== null;
+  } catch (_e) {
+    return false;
+  }
+}
+
+// The action a chat page handed over, taken (it is this caller's now); null
+// for none.
+function takeHandoff() {
+  try {
+    const raw = localStorage.getItem(HANDOFF_KEY);
+    if (raw === null) return null;
+    localStorage.removeItem(HANDOFF_KEY);
+    const h = JSON.parse(raw);
+    return h && typeof h.id === 'string' && DEFERRED[h.kind] ? h : null;
+  } catch (_e) {
+    return null;
+  }
+}
+
+// The one sentence a failed POST answers with (`error`), as the user is
+// shown it; `fallback` where the answer gives none.
+export async function reasonOf(res, fallback) {
+  try {
+    const doc = await res.json();
+    const said = doc && typeof doc.error === 'string' ? doc.error.trim() : '';
+    if (said) return said.charAt(0).toUpperCase() + said.slice(1);
+  } catch (_e) { /* no JSON: the fallback */ }
+  return fallback;
+}
+
+// Send a chat's Delete or Spam: POST /chats/<id>/<kind>. `{ok, doc}` or `{ok:
+// false, reason, unconfigured}` — never throws. `keepalive` for a page on its
+// way out. Shared with the chat page (its fallback when nothing can be handed
+// over).
+export async function commitChatAction(id, kind, keepalive = false) {
+  let res;
+  try {
+    res = await fetch(`/chats/${encodeURIComponent(id)}/${kind}`, { method: 'POST', keepalive: !!keepalive });
+  } catch (_e) {
+    return { ok: false, reason: 'The dashboard could not be reached — nothing was changed.', unconfigured: false };
+  }
+  if (res.ok) {
+    let doc = {};
+    try { doc = await res.json(); } catch (_e) { /* an empty answer is still a yes */ }
+    return { ok: true, doc: doc || {} };
+  }
+  // A 503 on Delete is a deployment without the erase capability: retrying
+  // will not help, and the reason says so.
+  const unconfigured = kind === 'delete' && res.status === 503;
+  const fallback = unconfigured ? 'Delete not set up'
+    : `The server answered ${res.status} — nothing was changed.`;
+  return { ok: false, reason: await reasonOf(res, fallback), unconfigured };
+}
 
 // Channel marks: no brand assets in the shell, so a lettered dot in the
 // channel's recognisable colour does the telling.
@@ -268,11 +453,36 @@ class RetinueChats extends RetinueCard {
     // The full page's rows swipe (swipe-rows.js): a committed swipe is the
     // row's quick action for that side — Mark read or Restore to the right,
     // Archive to the left.
+    // A deferred Spam (id → 'spam'): rows that left the list and whose
+    // action is not sent yet; and the rows whose action failed (id → {kind,
+    // reason, unconfigured}), shown back with the server's reason.
+    this._pending = new Map();
+    this._failed = new Map();
+    // Multi-select (full page): whether the list is selecting, which rows,
+    // the row a Shift-click range runs from, and whether the bar's Delete is
+    // armed (its second tap deletes).
+    this._selecting = false;
+    this._selected = new Set();
+    this._anchor = null;
+    this._bulkArmed = false;
+    this._shownIds = [];
     this._swipe = new SwipeRows(this, {
       onQuick: (id, action, el) => (action === 'read'
         ? this._markRead(id, el) : this._setFlags(id, action, el)),
       isBusy: () => !!this._flagging,
+      onLongPress: (id) => this._enterSelect(id),
+      selecting: () => this._selecting,
+      onSelect: (id, _el, e) => this._toggleSelect(id, e),
     });
+    // The back gesture leaves selection mode (the mode is a history entry).
+    this._onPop = () => { if (this._selecting) this._exitSelect(false); };
+    this._onKey = (e) => {
+      if (e.key === 'Escape' && this._selecting) { e.preventDefault(); this._exitSelect(); }
+    };
+    if (this._full) {
+      window.addEventListener('popstate', this._onPop);
+      document.addEventListener('keydown', this._onKey);
+    }
     // Crossing the layout breakpoint changes how many rows fit (cap vs all).
     this._offFrame = onFrameChange(() => {
       if (this._data) this.renderState({ state: 'ok', data: this._data });
@@ -283,9 +493,28 @@ class RetinueChats extends RetinueCard {
     this._newOpen = false;
     super.connectedCallback();
     this._timer = setInterval(() => this.load(), REFRESH_MS);
+    // A Spam the chat page's menu handed over, with its Undo here.
+    if (this._full) this._adoptHandoff();
+  }
+
+  // Take up what a chat page left (handOffChatAction): the row is hidden at
+  // once and the action waits for its Undo window like one made here. One
+  // left long ago — the page that would have carried it out never loaded —
+  // is what the user did all the same: made now.
+  _adoptHandoff() {
+    const h = takeHandoff();
+    if (!h) return;
+    const age = Date.now() - Number(h.at || 0);
+    if (!(age >= 0 && age < UNDO_MS + 60000)) {
+      this._commitMany([h.id], h.kind, false);
+      return;
+    }
+    this._defer(h.id, h.kind, h.name);
   }
 
   disconnectedCallback() {
+    window.removeEventListener('popstate', this._onPop);
+    document.removeEventListener('keydown', this._onKey);
     if (this._newAway) this._newAway();
     this._newAway = null;
     if (this._offFrame) this._offFrame();
@@ -320,6 +549,10 @@ class RetinueChats extends RetinueCard {
       // and one under the open ＋ menu the item about to be pressed; the
       // next tick picks the change up.
       if (this._swipe.dragging || this._newOpen) return;
+      // A failed row whose chat the list no longer has is nothing to show.
+      for (const id of [...this._failed.keys()]) {
+        if (!(data.chats || []).some((c) => c.id === id)) this._failed.delete(id);
+      }
       this._sig = sig;
       this._dirty = false;
       this.renderState({ state: 'ok', data });
@@ -354,8 +587,17 @@ class RetinueChats extends RetinueCard {
         const id = el.getAttribute('data-flag');
         const action = el.getAttribute('data-set');
         if (action === 'delete') this._confirmDelete(id, el);
+        else if (DEFERRED[action]) this._defer(id, action);
         else if (action === 'read') this._markRead(id);
         else this._setFlags(id, action);
+      }));
+    this.shadowRoot.querySelectorAll('[data-bulk]').forEach((el) =>
+      el.addEventListener('click', (e) => {
+        e.preventDefault();
+        const what = el.getAttribute('data-bulk');
+        if (what === 'cancel') this._exitSelect();
+        else if (what === 'start') this._enterSelect(null);
+        else this._bulk(what);
       }));
     if (this._full) this._swipe.wire(this.shadowRoot);
     this._wireNew();
@@ -485,13 +727,82 @@ class RetinueChats extends RetinueCard {
   // Switch the full page's tab; the list is already here, so no fetch.
   _setScope(scope) {
     if (!LIST_GROUPS.includes(scope) || scope === this._scope) return;
+    // A selection is one tab's: switching tabs ends it.
+    if (this._selecting) this._exitSelect(true, false);
     this._scope = scope;
     this._swipe.reset();
     if (this._data) this.renderState({ state: 'ok', data: this._data });
   }
 
-  // Delete cannot be undone, so the first tap only arms it (swipe-rows.js);
-  // the second erases.
+  _chat(id) {
+    return (this._data && this._data.chats || []).find((c) => c.id === id) || null;
+  }
+
+  // Spam, deferred: the row leaves now, and the action is sent only when the
+  // Undo window ends (or the page is hidden or left: then at once,
+  // keepalive). Undo within it sends nothing and puts the row back.
+  _defer(id, kind, name = '') {
+    if (!id || !DEFERRED[kind] || this._pending.has(id)) return;
+    const chat = this._chat(id);
+    // Spam is a mail thread's alone (the server refuses it for any other).
+    if (kind === 'spam' && chat && !isMail(chat)) return;
+    this._pending.set(id, kind);
+    this._failed.delete(id);
+    // Hidden by body() itself, so a list on the wire may still land: no new
+    // epoch (it would drop the first list of a page that took a handoff).
+    this._hidden();
+    offerUndo(`${ACTIONS[kind].done} · ${chat ? chat.name : name}`, () => {
+      this._pending.delete(id);
+      this._hidden();
+    }, { commit: (keepalive) => this._commitMany([id], kind, keepalive) });
+  }
+
+  // Deferred actions go out, one request per chat (bounded). Each that
+  // succeeded is in Archived, muted (Spam); each that failed comes back,
+  // marked failed with the server's reason — and a single row's tray, with
+  // Retry, is opened. A page on its way out (`keepalive`) sends every request
+  // at once, unbounded: a bounded queue issues the next one only once an
+  // answer comes, which a page that is gone never gets — and one left while
+  // the queue still drains sends the rest at once (wireDrain).
+  async _commitMany(ids, kind, keepalive = false) {
+    ids.forEach((id) => this._pending.set(id, kind));
+    const bound = keepalive ? ids.length : BULK_CONCURRENCY;
+    const drain = { keepalive: !!keepalive, rush: null };
+    wireDrain();
+    draining.add(drain);
+    let outs;
+    try {
+      outs = await eachBounded(ids, bound, (id) => commitChatAction(id, kind, drain.keepalive), drain);
+    } finally {
+      draining.delete(drain);
+    }
+    ids.forEach((id, k) => {
+      this._pending.delete(id);
+      const out = outs[k] || { ok: false, reason: 'No answer' };
+      if (out.ok) {
+        const chat = this._chat(id);
+        if (chat) {
+          chat.archived = out.doc.archived !== false;
+          chat.muted = out.doc.muted !== false;
+          chat.list_group = deriveListGroup(chat);
+        }
+        this._failed.delete(id);
+        shelf.muted(`chat:${id}`);
+      } else {
+        this._failed.set(id, { kind, reason: out.reason, unconfigured: !!out.unconfigured });
+      }
+    });
+    this._changed();
+    if (ids.length === 1 && !outs[0].ok) {
+      const li = this._swipe.rowEl(ids[0]);
+      if (li) this._swipe.open(li, false);
+    }
+    return outs;
+  }
+
+  // Delete cannot be undone, so the first tap only arms it (swipe-rows.js):
+  // the button then says what a second tap does — "Delete for good?", or on
+  // a mail thread "Move mails to Trash?" — and the second deletes.
   _confirmDelete(id, btn) {
     if (this._swipe.confirm(id, btn)) this._deleteChat(id);
   }
@@ -502,35 +813,287 @@ class RetinueChats extends RetinueCard {
     const busy = this._swipe.rowEl(id);
     if (busy) busy.classList.add('busy');
     try {
-      const res = await fetch(`/chats/${encodeURIComponent(id)}/delete`, { method: 'POST' });
-      if (!res.ok) throw new Error(res.status === 503 ? 'unconfigured' : String(res.status));
-      if (this._data && Array.isArray(this._data.chats)) {
-        this._data.chats = this._data.chats.filter((c) => c.id !== id);
-      }
-      this._swipe.reset();
-      this._sig = '';
-      this._epoch += 1;
-      if (this._data) this.renderState({ state: 'ok', data: this._data });
-    } catch (err) {
-      // The chat stays whole enough to retry (the gateway answers 502 and
-      // touches none of its own state when the messages cannot all go). A 503
-      // is a deployment without the erase capability: retrying will not help,
-      // and the button says so.
-      const li = this._swipe.rowEl(id);
-      if (li) {
-        li.classList.remove('busy');
-        li.classList.add('failed');
-        const btn = li.querySelector('[data-set="delete"]');
-        if (btn) {
-          btn.classList.remove('confirm');
-          const off = err && err.message === 'unconfigured';
-          btn.textContent = off ? 'Delete not set up' : 'Retry delete';
-          if (off) btn.title = "Chat deletion needs CHAT_ERASE_TOKEN on retinue and on the chat's gateway";
-        }
-      }
+      await this._deleteMany([id]);
     } finally {
       this._flagging = false;
     }
+    if (this._failed.has(id)) {
+      const li = this._swipe.rowEl(id);
+      if (li) this._swipe.open(li, false);
+    }
+  }
+
+  // Erase chats, one request each (bounded): the ones erased leave the list;
+  // each that was not stays, marked failed with the server's reason (the
+  // gateway answers 502 and touches nothing of the chat when its messages
+  // cannot all go; a 503 is a deployment without the erase capability).
+  async _deleteMany(ids) {
+    const outs = await eachBounded(ids, BULK_CONCURRENCY, (id) => commitChatAction(id, 'delete'));
+    const gone = new Set();
+    ids.forEach((id, k) => {
+      const out = outs[k] || { ok: false, reason: 'No answer' };
+      if (out.ok) {
+        gone.add(id);
+        this._failed.delete(id);
+        shelf.muted(`chat:${id}`);
+      } else {
+        this._failed.set(id, { kind: 'delete', reason: out.reason, unconfigured: !!out.unconfigured });
+      }
+    });
+    if (gone.size && this._data && Array.isArray(this._data.chats)) {
+      this._data.chats = this._data.chats.filter((c) => !gone.has(c.id));
+    }
+    this._changed();
+    return outs;
+  }
+
+  // ── Multi-select ───────────────────────────────────────────────────────────
+  // A long press on a row (or the list's Select) starts it, with that row
+  // selected; a tap — or Space on a focused row — then toggles a row, and a
+  // Shift-click on a wide screen selects the range from the last one. The
+  // bar says how many and offers what the tab's tray offers, for all of
+  // them. Esc, Cancel, the back gesture and a tab switch end it; a row that
+  // leaves the tab (a poll) leaves the selection.
+  _enterSelect(id) {
+    if (!this._full) return;
+    if (!this._selecting) {
+      this._selecting = true;
+      this._selected = new Set();
+      try { history.pushState({ ...(history.state || {}), chatsSelect: true }, ''); } catch (_e) { /* none */ }
+    }
+    if (id) {
+      this._selected.add(id);
+      this._anchor = id;
+    }
+    this._bulkArmed = false;
+    this._swipe.reset();
+    this._rerender();
+  }
+
+  // `back`: take the mode's history entry off too (not when the back
+  // gesture already did); `render` false for a caller that renders next.
+  _exitSelect(back = true, render = true) {
+    if (!this._selecting) return;
+    this._selecting = false;
+    this._selected = new Set();
+    this._anchor = null;
+    this._bulkArmed = false;
+    try {
+      if (back && history.state && history.state.chatsSelect) history.back();
+    } catch (_e) { /* none */ }
+    if (render) this._rerender();
+  }
+
+  _toggleSelect(id, e) {
+    if (!this._selecting || !id) return;
+    const range = e && e.shiftKey && this._anchor && isWideFrame()
+      && this._shownIds.includes(this._anchor) && this._shownIds.includes(id);
+    if (range) {
+      const a = this._shownIds.indexOf(this._anchor);
+      const b = this._shownIds.indexOf(id);
+      this._shownIds.slice(Math.min(a, b), Math.max(a, b) + 1).forEach((x) => this._selected.add(x));
+    } else if (this._selected.has(id)) {
+      this._selected.delete(id);
+    } else {
+      this._selected.add(id);
+    }
+    this._anchor = id;
+    this._bulkArmed = false;
+    this._rerender();
+  }
+
+  // A row hidden or shown again by a deferred action: the tabs count rows.
+  _hidden() {
+    this._dirty = true;
+    this._swipe.reset();
+    this._rerender();
+  }
+
+  _rerender() {
+    if (this._data) this.renderState({ state: 'ok', data: this._data });
+  }
+
+  // What the bar offers on this tab for these chats: what the tray offers.
+  _bulkActions(chats) {
+    const all = (f) => chats.length > 0 && chats.every(f);
+    const out = [];
+    if (this._scope === 'archived') {
+      out.push('restore', all((c) => c.muted) ? 'unmute' : 'mute');
+    } else {
+      if (this._scope === 'unread') out.push('read');
+      out.push('archive', 'mute');
+    }
+    out.push(all((c) => c.starred) ? 'unstar' : 'star');
+    // Spam only where every chat selected is a mail thread.
+    if (all(isMail)) out.push('spam');
+    out.push('delete');
+    return out;
+  }
+
+  _barHtml(inScope) {
+    if (!this._full) return '';
+    if (!this._selecting) {
+      return '<button type="button" class="sel-start" data-bulk="start" ' +
+        'title="Select several chats to act on them together">Select</button>';
+    }
+    const chats = inScope.filter((c) => this._selected.has(c.id));
+    const n = chats.length;
+    const LABEL = { read: 'Mark read', archive: 'Archive', mute: 'Mute', unmute: 'Unmute', restore: 'Restore',
+      star: '&#9733; Star', unstar: 'Unstar', spam: 'Spam', delete: 'Delete' };
+    const btn = (what) => {
+      if (what === 'delete' && this._bulkArmed) {
+        const mails = chats.some(isMail);
+        return `<button type="button" class="bulk delete confirm" data-bulk="delete">Delete ${n} chat${
+          n === 1 ? '' : 's'}? ${mails ? 'Mails move to the Trash' : 'For good'}</button>`;
+      }
+      return `<button type="button" class="bulk ${what}" data-bulk="${what}"${n ? '' : ' disabled'}>${LABEL[what]}</button>`;
+    };
+    return `<div class="select-bar" role="toolbar" aria-label="Selected chats">` +
+      `<span class="sel-count" role="status">${n} selected</span>` +
+      `<span class="sel-acts">${this._bulkActions(chats).map(btn).join('')}</span>` +
+      `<button type="button" class="bulk cancel" data-bulk="cancel">Cancel</button></div>`;
+  }
+
+  // One action on every selected chat: one request per chat (bounded), and
+  // ONE Undo for the batch that writes every chat's previous state back.
+  // Delete arms first (the bar's button says what the second tap does);
+  // Spam is deferred like a single one. The chats whose request failed come
+  // back marked failed, each with its reason, and the toast says how many.
+  async _bulk(what) {
+    if (!this._selecting || this._flagging) return;
+    const inScope = this._scopeChats();
+    const chats = inScope.filter((c) => this._selected.has(c.id));
+    if (!chats.length || !this._bulkActions(chats).includes(what)) return;
+    const ids = chats.map((c) => c.id);
+    if (what === 'delete') {
+      if (!this._bulkArmed) {
+        this._bulkArmed = true;
+        this._rerender();
+        return;
+      }
+      this._exitSelect(true, false);
+      this._flagging = true;
+      try {
+        await this._deleteMany(ids);
+      } finally {
+        this._flagging = false;
+      }
+      return;
+    }
+    this._exitSelect(true, false);
+    if (what === 'spam') {
+      ids.forEach((id) => { this._pending.set(id, 'spam'); this._failed.delete(id); });
+      this._hidden();
+      offerUndo(`${ACTIONS.spam.done} ${ids.length}`, () => {
+        ids.forEach((id) => this._pending.delete(id));
+        this._hidden();
+      }, {
+        commit: async (keepalive) => {
+          const outs = await this._commitMany(ids, 'spam', keepalive);
+          const ok = outs.filter((o) => o && o.ok).length;
+          // A page on its way out has no one to tell.
+          if (!keepalive && ok < ids.length) {
+            showNotice(`${ACTIONS.spam.done} ${ok} of ${ids.length} — ${ids.length - ok} failed`);
+          }
+        },
+      });
+      return;
+    }
+    this._rerender();
+    this._flagging = true;
+    let outs;
+    try {
+      outs = await eachBounded(ids, BULK_CONCURRENCY, (id) => this._applyOne(id, what));
+    } finally {
+      this._flagging = false;
+    }
+    ids.forEach((id, k) => {
+      if (outs[k] && outs[k].ok) this._failed.delete(id);
+      else this._failed.set(id, { kind: what, reason: (outs[k] && outs[k].reason) || 'No answer' });
+    });
+    this._changed();
+    const undos = outs.filter((o) => o && o.ok && o.undo).map((o) => o.undo);
+    const ok = outs.filter((o) => o && o.ok).length;
+    const said = ok === ids.length ? `${ACTIONS[what].done} ${ok}`
+      : `${ACTIONS[what].done} ${ok} of ${ids.length} — ${ids.length - ok} failed`;
+    if (!undos.length) {
+      if (ok < ids.length) showNotice(said);
+      return;
+    }
+    offerUndo(said, async () => {
+      this._flagging = true;
+      try {
+        await eachBounded(undos, BULK_CONCURRENCY, (undo) => undo());
+      } finally {
+        this._flagging = false;
+      }
+      this._changed();
+    });
+  }
+
+  // One chat of a bulk action: `{ok, undo}` (undo writes its previous state
+  // back) or `{ok: false, reason}` — the server's sentence where it gave one.
+  async _applyOne(id, what) {
+    const chat = this._chat(id);
+    if (what === 'read') {
+      const seen = chat ? chat.inbound_seq : undefined;
+      const before = chat ? { unread: chat.unread } : { unread: 0 };
+      const res = await fetch(`/chats/${encodeURIComponent(id)}/read`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(Number.isInteger(seen) ? { seen } : {}),
+      });
+      if (!res.ok) {
+        return { ok: false, reason: await reasonOf(res, res.status === 409
+          ? 'A message came in since — nothing was marked read.' : `The server answered ${res.status}.`) };
+      }
+      const doc = await res.json();
+      if (chat) this._adoptRead(chat, doc, 0);
+      shelf.observe(`chat:${id}`, { unread: chat ? Number(chat.unread) || 0 : 0 });
+      const undo = Object.prototype.hasOwnProperty.call(doc || {}, 'previous')
+        ? async () => {
+          const r = await fetch(`/chats/${encodeURIComponent(id)}/read`, {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ restore: doc.previous == null ? null : doc.previous, marked: doc.last_read }),
+          });
+          const c = this._chat(id);
+          if (r.ok && c) this._adoptRead(c, await r.json(), Number(before.unread) || 0);
+          return { ok: r.ok };
+        } : null;
+      return { ok: true, undo };
+    }
+    const flags = FLAGS[what];
+    const before = chat ? { archived: !!chat.archived, muted: !!chat.muted, starred: !!chat.starred } : null;
+    const out = await this._postFlags(id, flags);
+    if (!out.ok) return out;
+    return {
+      ok: true,
+      undo: before ? async () => this._postFlags(id, before) : null,
+    };
+  }
+
+  // POST /chats/<id>/flags, and the answer onto the row and the shelf:
+  // `{ok}` or `{ok: false, reason}`.
+  async _postFlags(id, flags) {
+    const res = await fetch(`/chats/${encodeURIComponent(id)}/flags`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(flags),
+    });
+    if (!res.ok) return { ok: false, reason: await reasonOf(res, `The server answered ${res.status}.`) };
+    const doc = await res.json();
+    const chat = this._chat(id);
+    if (chat) {
+      chat.archived = !!doc.archived; chat.muted = !!doc.muted; chat.starred = !!doc.starred;
+      chat.list_group = deriveListGroup(chat);
+    }
+    if (doc.muted) shelf.muted(`chat:${id}`);
+    else if (doc.archived) shelf.archived(`chat:${id}`, true);
+    return { ok: true, doc };
+  }
+
+  // The chats of the tab showing, as body() lists them.
+  _scopeChats() {
+    const all = (this._data && Array.isArray(this._data.chats) ? this._data.chats : [])
+      .filter((c) => !this._pending.has(c.id));
+    return all.filter((c) => listGroup(c) === this._scope);
   }
 
   // Three actions over the same two flags, exactly as a conversation has:
@@ -549,15 +1112,6 @@ class RetinueChats extends RetinueCard {
   // button's: the two are independent, so a chat can be a news source and
   // still sit in the list.
   async _setFlags(id, action, li = null) {
-    const FLAGS = {
-      archive: { archived: true },
-      mute: { muted: true },
-      // Stays archived — it only lets the next message bring the chat back.
-      unmute: { muted: false },
-      restore: { archived: false, muted: false },
-      star: { starred: true },
-      unstar: { starred: false },
-    };
     const flags = typeof action === 'string' ? FLAGS[action] : action;
     if (!id || !flags || this._flagging) return;
     const chat0 = (this._data && this._data.chats || []).find((c) => c.id === id);
@@ -584,6 +1138,7 @@ class RetinueChats extends RetinueCard {
       // whatever put it there; archiving drops only what was parked by itself.
       if (doc.muted) shelf.muted(`chat:${id}`);
       else if (doc.archived) shelf.archived(`chat:${id}`, true);
+      this._failed.delete(id);
       this._changed();
       // What took the row out of view (or brought it back) can be taken back.
       const said = { archive: 'Archived', mute: 'Muted', restore: 'Restored' }[action];
@@ -710,6 +1265,31 @@ class RetinueChats extends RetinueCard {
          background of its own to hide them while it rests. */
       ${SWIPE_CSS}
       li.swipe { border-radius: 12px; }
+      /* Up to six actions in the tray: narrower buttons than the threads
+         page's three, so most of a phone-wide row still shows beside them. */
+      li.swipe .tray button { min-width: 48px; padding: 0 8px; font-size: .72rem; }
+      .prev .pv-failed { color: #ff8a80; font-style: normal; }
+      /* Multi-select: the bar over the list, and a check in place of the
+         avatar on every row while selecting. */
+      .sel-start { display: block; margin: 0 0 8px auto; background: transparent; border: 0;
+                   color: var(--accent, #6ea8fe); font: inherit; font-size: .8rem; cursor: pointer; }
+      .select-bar { position: sticky; top: 0; z-index: 4; display: flex; flex-wrap: wrap; align-items: center;
+                    gap: 6px; padding: 6px 8px; margin-bottom: 8px; border-radius: 12px;
+                    background: var(--card-2, #1c2230); }
+      .sel-count { font-weight: 600; font-size: .85rem; margin-right: auto; }
+      .sel-acts { display: flex; flex-wrap: wrap; gap: 4px; }
+      .bulk { border: 0; border-radius: 8px; padding: 6px 9px; cursor: pointer; font: inherit;
+              font-size: .76rem; font-weight: 600; background: var(--card, #151922); color: var(--fg, #e7ebf2); }
+      .bulk:disabled { opacity: .45; cursor: default; }
+      .bulk.delete { background: #d0564f; color: #fff; }
+      .bulk.delete.confirm { background: #a8322c; }
+      .bulk:focus-visible, .sel-start:focus-visible { outline: 2px solid var(--fg, #e7ebf2); outline-offset: 1px; }
+      .sel-mark { grid-row: 1 / 3; width: 40px; height: 40px; border-radius: 50%; display: inline-flex;
+                  align-items: center; justify-content: center; border: 2px solid var(--muted, #8b93a3);
+                  box-sizing: border-box; color: #0b0d12; font-weight: 800; }
+      .row.has-people .sel-mark { grid-row: 1 / 4; }
+      .sel-mark.on { background: var(--accent, #6ea8fe); border-color: var(--accent, #6ea8fe); }
+      li.swipe.selected .row { background: rgba(110, 168, 254, .14); }
       li.swipe .row { background: var(--card, #151922); }
       li.swipe .row:hover { background: var(--card-2, #1c2230); }
       .row { display: grid; grid-template-columns: auto minmax(0, 1fr) auto;
@@ -836,7 +1416,8 @@ class RetinueChats extends RetinueCard {
 
   body(d) {
     this._data = d;
-    const all = Array.isArray(d.chats) ? d.chats.slice() : [];
+    // A row whose Spam waits for its Undo window is out of view.
+    const all = (Array.isArray(d.chats) ? d.chats : []).filter((c) => !(this._pending && this._pending.has(c.id)));
     // The API contract returns the list ordered by last activity; keep that
     // guarantee client-side too, so a hand-edited fixture cannot scramble it.
     all.sort((a, b) => String((b.last || {}).ts || '').localeCompare(String((a.last || {}).ts || '')));
@@ -848,10 +1429,16 @@ class RetinueChats extends RetinueCard {
     const inScope = (c) => (scope ? listGroup(c) === scope : listGroup(c) !== 'archived');
     // Starred chats first, each group still by last activity.
     const chats = starredFirst(all.filter(inScope));
+    // A selected row that left the tab (a poll, a write) leaves the selection.
+    if (this._selecting) {
+      const here = new Set(chats.map((c) => c.id));
+      for (const id of [...this._selected]) if (!here.has(id)) this._selected.delete(id);
+    }
     // The tabs, and beside them the ＋ where there is something to start.
     const filter = this._filterHtml(this._full ? this._counts(d, all) : null);
     const plus = this._newHtml();
-    const tabs = plus ? `<div class="list-head">${filter}${plus}</div>` : filter;
+    const tabs = (plus ? `<div class="list-head">${filter}${plus}</div>` : filter) +
+      this._barHtml(chats);
     // The tabs' panel: what the selected tab shows, rows or its empty line.
     const panel = (inner) => (this._full
       ? `<div role="tabpanel" id="chats-panel" aria-labelledby="chats-tab-${scope}">${inner}</div>`
@@ -860,6 +1447,7 @@ class RetinueChats extends RetinueCard {
       return `${tabs}${panel(`<p class="muted">${this._emptyText(all.length > 0)}</p>`)}${this._footHtml()}`;
     }
     const shown = (this._full || isWideFrame()) ? chats : chats.slice(0, MAX_CARD_CHATS);
+    this._shownIds = shown.map((c) => c.id);
     // Two accounts of one channel talking to the same peer are two chats with
     // the same name (and so is a peer's unattributed history beside its
     // account-named chat; and so is one mail thread that reached two of the
@@ -887,7 +1475,12 @@ class RetinueChats extends RetinueCard {
       // A staged draft outranks the last message in the preview — it is what
       // this chat is waiting on.
       const draft = c.draft && c.draft.text;
-      const prev = draft
+      // A Delete or Spam that failed: the server's reason, where the preview
+      // was, until the next attempt.
+      const failed = this._full && this._failed ? this._failed.get(c.id) : null;
+      const prev = failed
+        ? `<span class="pv-failed" role="alert">${esc((ACTIONS[failed.kind] || ACTIONS.delete).failed)}: ${esc(failed.reason)}</span>`
+        : draft
         ? `<span class="pv-draft">${c.draft.author === 'agent'
           ? `Draft by ${esc(c.draft.agent || 'Ara')}` : 'Draft'}:</span> ${esc(c.draft.text)}`
         : previewHtml(c);
@@ -897,14 +1490,29 @@ class RetinueChats extends RetinueCard {
       const act = (label, set, title, confirm = '') =>
         `<button type="button" class="${set}" data-flag="${esc(c.id)}" data-set="${set}" ` +
         `title="${esc(title)}"${confirm ? ` data-confirm="${esc(confirm)}"` : ''}>${label}</button>`;
+      // A failed Delete or Spam: its button retries, and says why it failed.
+      const again = (kind, label, title, confirm = '') => {
+        if (!failed || failed.kind !== kind) return act(label, kind, title, confirm);
+        const off = failed.unconfigured;
+        return act(off ? 'Delete not set up' : ACTIONS[kind].retry, kind,
+          off ? "Chat deletion needs CHAT_ERASE_TOKEN on retinue and on the chat's gateway" : failed.reason,
+          confirm);
+      };
       // Deleting a mail thread does something in the mailbox too, and the
       // button says what before the second tap: the mails move to the
       // mailbox's Trash (nothing is expunged), then the chat is erased here.
+      const mailbox = c.account || 'the mailbox';
       const del = isMail(c)
-        ? act('Delete', 'delete',
-            `Move this thread's mails to the Trash of ${c.account || 'the mailbox'}, then erase the chat here`,
+        ? again('delete', 'Delete',
+            `Moves the thread's mails to the Trash of ${mailbox}, then erases the chat here`,
             'Move mails to Trash?')
-        : act('Delete', 'delete', 'Erase this chat and all its messages from the system');
+        : again('delete', 'Delete', 'Erase this chat and all its messages from the system');
+      // Spam: a mail thread's alone — its mails go to the Junk folder, and
+      // the chat is muted and archived. A messenger chat is muted instead.
+      const spam = isMail(c)
+        ? again('spam', 'Spam',
+            `Moves the thread's mails to the Junk folder of ${mailbox}, then mutes and archives the chat`)
+        : '';
       const star = starButtonHtml(!!c.starred,
         (set) => `data-flag="${esc(c.id)}" data-set="${set}"`);
       // What a swipe does is in the tray too — Mark read and Archive beside
@@ -915,15 +1523,17 @@ class RetinueChats extends RetinueCard {
           (c.muted
             ? act('Unmute', 'unmute', 'Stay archived, but come back when it speaks')
             : act('Mute', 'mute', 'Keep it out of the list, even when it speaks')) +
-          del
+          spam + del
         : (scope === 'unread'
           ? act('Mark read', 'read', 'Mark everything in this chat as read') : '') +
           act('Archive', 'archive', 'Out of the list until the next message') +
           act('Mute', 'mute',
-              'Out of the list, and the next message does not bring it back'));
+              'Out of the list, and the next message does not bring it back') +
+          spam + del);
       // The two sides of a swipe, per tab: right marks read (Unread),
       // restores (Archived) or does nothing (Read — nothing to mark); left
-      // archives on Unread and Read, and on Archived uncovers the tray.
+      // uncovers the tray everywhere, and on Unread and Read a full swipe
+      // left archives.
       const quick = { unread: 'read', archived: 'restore' }[scope] || '';
       const quickLeft = archived ? '' : 'archive';
       const QUICK_LABEL = { read: 'Mark read', restore: 'Restore' };
@@ -932,15 +1542,19 @@ class RetinueChats extends RetinueCard {
           (quickLeft ? `<div class="quick-left ${quickLeft}" aria-hidden="true">Archive</div>` : '') +
           `<div class="tray">${tray}</div>`;
       const people = participantsText(c);
+      const picked = this._selecting && this._selected.has(c.id);
       return (this._full
-        ? `<li class="swipe" data-id="${esc(c.id)}"` +
+        ? `<li class="swipe${failed ? ' failed' : ''}${picked ? ' selected' : ''}" data-id="${esc(c.id)}"` +
           (quick ? ` data-quick="${quick}"` : '') +
           (quickLeft ? ` data-quick-left="${quickLeft}"` : '') + '>'
         : '<li>') + under +
         `<a class="row${unread ? ' has-unread' : ''}${people ? ' has-people' : ''}"` +
         (this._full ? ' draggable="false" ' : ' ') +
+        (this._selecting ? `aria-pressed="${picked}" ` : '') +
         `href="/chat.html?id=${encodeURIComponent(c.id)}">` +
-        `${avatarHtml(c)}` +
+        (this._selecting
+          ? `<span class="sel-mark${picked ? ' on' : ''}" aria-hidden="true">${picked ? '&#10003;' : ''}</span>`
+          : `${avatarHtml(c)}`) +
         `<span class="name">${c.starred ? STAR_MARK : ''}${esc(c.name)}` +
         (accountsOf[nameKey(c)].size > 1
           ? `<span class="acct" title="${c.account

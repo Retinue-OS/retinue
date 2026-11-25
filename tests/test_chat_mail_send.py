@@ -47,6 +47,11 @@ Signal gateway for a messenger. Covers:
   mailbox", and 404 on a messenger, but not a mail gateway's 404;
 - delete: through the gateway first, with the erase capability; nothing here
   is erased while the gateway has not said all of it is done;
+- spam: the gateway moves the mails first, and only on its success is the
+  chat muted and archived (its attention item settled); on a failure the
+  chat is untouched and the gateway's sentence is the answer; refused
+  cross-site and from inside the container; 400 for a messenger chat;
+  Restore brings the chat back and asks the mailbox for nothing;
 - the rail: a mail that went out settles the send that waited, and a reply
   made elsewhere is passed on to the mailbox.
 
@@ -126,6 +131,9 @@ def _gateway_state(account: str) -> dict:
             # and archive; "ok" | "errors" | "http" for delete — or, for
             # delete, a sentence: nothing was erased, and the gateway says why.
             "read": 200, "archive": 200, "delete": "ok", "on_delete": None,
+            # /chats/spam: "ok", or the sentence of a refusal (502), as the
+            # gateway answers when the mailbox has no Junk folder.
+            "spam": "ok", "on_spam": None,
             "slow": 0.0, "down": False, "ignore_filter": False,
             # The SMTP side. `smtp`: None, or why nothing can be sent (no
             # SMTP server: /health can_send false, /send 503). `send`: how
@@ -549,6 +557,15 @@ def _mail_gateway(gw: dict):
                     return self._json(gw[what], {"error": f"{what} answered {gw[what]}"})
                 return self._json(200, {"ok": True, "seen": 1} if what == "read" else
                                   {"ok": True, "moved": 1, "flagged": 0})
+            if self.path == "/chats/spam":
+                if str(body.get("account") or "").strip().lower() != gw["account"]:
+                    return self._json(404, dict(NOT_OURS))
+                if gw["on_spam"]:
+                    gw["on_spam"]()
+                if gw["spam"] != "ok":
+                    return self._json(502, {"error": gw["spam"]})
+                return self._json(200, {"ok": True, "moved": len(body.get("message_ids") or []),
+                                        "flagged": 0})
             if self.path == "/chats/delete":
                 if self.headers.get("X-Chat-Erase-Token", "") != "erase-token":
                     return self._json(403, {"error": "chat erasure needs X-Chat-Erase-Token"})
@@ -3407,6 +3424,110 @@ def test_delete_goes_through_the_gateway_first(base, wg, work_url):
     print("PASS test_delete_goes_through_the_gateway_first")
 
 
+def test_spam_goes_through_the_gateway_first(base, wg):
+    wg._mailbox_none.clear()
+    _rail(base, chat=ROOT_B, sender=BOB, sender_name="Bob", message_id="b-spam@y.org",
+          ts=time.time(), text="cheap watches", chat_name="Street party", group=True,
+          participants=B_PARTIES, peer={"address": BOB, "name": "Bob"})
+    _flags(base, CHAT_B, archived=False, muted=False)
+    _settle(wg)
+    quoted = "/chats/" + _quote(CHAT_B) + "/spam"
+
+    def untouched():
+        doc = wg._CHAT_STATE.get(CHAT_B)
+        return not doc.get("archived") and not doc.get("muted")
+    held: list = []
+    GW["on_spam"] = lambda: held.append(untouched())
+    try:
+        # Another site's page, and a caller inside the container: refused,
+        # nothing asked, nothing changed.
+        GW["requests"].clear()
+        for site in ("cross-site", "same-site"):
+            status, out = _http(base, "POST", quoted, None, {"Sec-Fetch-Site": site})
+            assert (status, out) == (403, {"error": "cross-site request rejected"}), out
+        saved = wg._EDGE_PEER_NETS
+        wg._EDGE_PEER_NETS = wg._parse_edge_peers("10.9.9.9")
+        try:
+            status, out = _http(base, "POST", quoted)
+            assert status == 403 and "reverse proxy" in out["error"], out
+        finally:
+            wg._EDGE_PEER_NETS = saved
+        assert _posts(GW) == [] and untouched()
+        # A messenger chat has no Junk folder: 400, nothing asked.
+        status, out = _http(base, "POST", "/chats/" + _quote(CHAT_S) + "/spam")
+        assert status == 400 and "mute" in out["error"], out
+        status, out = _http(base, "POST", "/chats/nonsense/spam")
+        assert status == 404
+        assert _posts(GW) == []
+        # The gateway refuses (no Junk folder): its sentence is the answer,
+        # and the chat stays as it was — not muted, not archived.
+        no_junk = ("the mailbox has no Junk folder — none the server marks as its Junk, "
+                   "and none named 'Junk': set MAIL_JUNK_FOLDER to the name of the "
+                   "account's junk (spam) folder")
+        GW["spam"] = no_junk
+        status, out = _http(base, "POST", quoted, None, {"Sec-Fetch-Site": "same-origin"})
+        assert (status, out) == (502, {"error": no_junk}), out
+        assert untouched() and _chats(base)[CHAT_B]["list_group"] != "archived"
+        # A gateway that is away: the same, in its own words.
+        GW["spam"], GW["down"] = "ok", True
+        status, out = _http(base, "POST", quoted)
+        assert status == 502 and out["error"] == "mailbox unreachable", out
+        GW["down"] = False
+        assert untouched()
+        # A sentence is one bounded line, and text.
+        GW["spam"] = "no\r\nJunk\x00 <b>here</b> " + "x" * 2000
+        status, out = _http(base, "POST", quoted)
+        assert status == 502 and "\n" not in out["error"] and "\x00" not in out["error"]
+        assert out["error"].startswith("no Junk <b>here</b> xx") and len(out["error"]) <= 300
+        assert untouched()
+        # Done: the mails first, with the ids the chat holds; then muted and
+        # archived, its attention item settled like a mute's.
+        GW["spam"] = "ok"
+        GW["requests"].clear()
+
+        def late():
+            # A mail that lands while the gateway moves the others: the
+            # user's Spam was not about it, and the archive leaves it too.
+            held.append(untouched())
+            _rail(base, chat=ROOT_B, sender=BOB, sender_name="Bob",
+                  message_id="b-late@y.org", ts=time.time(), text="a real question",
+                  chat_name="Street party", group=True, participants=B_PARTIES,
+                  peer={"address": BOB, "name": "Bob"})
+        GW["on_spam"] = late
+        status, out = _http(base, "POST", quoted, None, {"Sec-Fetch-Site": "same-origin"})
+        GW["on_spam"] = lambda: held.append(untouched())
+        assert status == 200, out
+        assert (out["spam"], out["muted"], out["archived"]) == (True, True, True), out
+        assert out["moved"] >= 1
+        assert _posts(GW, "/chats/spam") == [{"chat": ROOT_B, "account": ACCOUNT,
+                                              "message_ids": _scopes(GW, "/chats/spam")[0]}]
+        assert "b-spam@y.org" in _scopes(GW, "/chats/spam")[0]
+        assert held and all(held), "the chat was changed before the gateway answered"
+        doc = wg._CHAT_STATE.get(CHAT_B)
+        assert doc.get("muted") and doc.get("archived")
+        assert _chats(base)[CHAT_B]["list_group"] == "archived"
+        block = doc.get("attention") or {}
+        assert not block or block.get("state") == "done", block
+        _settle(wg)
+        spammed = _scopes(GW, "/chats/spam")[0]
+        assert "b-late@y.org" not in spammed
+        archived = _scopes(GW, "/chats/archive")
+        assert archived and all(sorted(a) == sorted(spammed) for a in archived), archived
+        # Restore: the chat comes back; the mailbox is asked for nothing —
+        # the mails stay in Junk (it follows the chat, never back).
+        GW["requests"].clear()
+        out = _flags(base, CHAT_B, archived=False, muted=False)
+        assert out["archived"] is False and out["muted"] is False
+        _settle(wg)
+        assert _posts(GW) == []
+        assert _chats(base)[CHAT_B]["list_group"] != "archived"
+    finally:
+        GW["on_spam"] = None
+        GW["spam"] = "ok"
+        GW["down"] = False
+    print("PASS test_spam_goes_through_the_gateway_first")
+
+
 def main():
     sparql = mail._serve(mail._MockSparql)
     gw_main = mail._serve(_mail_gateway(GW))
@@ -3471,6 +3592,7 @@ def main():
         test_companion_is_told_the_gateway_and_the_policy(base, wg, work_url)
         test_an_unsent_chat_is_forgotten_with_its_send(base, wg)
         test_delete_goes_through_the_gateway_first(base, wg, work_url)
+        test_spam_goes_through_the_gateway_first(base, wg)
         # Every mail here arrives held (mail.GATE): the gate's own tests are
         # tests/test_chat_mail_gate.py.
         assert not mail.TURNS, "a model turn ran for a mail that is neither a VIP's nor instructed"

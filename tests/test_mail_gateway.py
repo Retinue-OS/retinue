@@ -172,7 +172,8 @@ class FakeMailbox:
         self.gw = gw
         self.boxes = {name: {"validity": 100 + i, "next": 1, "mails": {}}
                       for i, name in enumerate(folders)}
-        self.roles = {"inbox": "INBOX", "sent": "Sent", "archive": "Archive", "trash": "Trash"}
+        self.roles = {"inbox": "INBOX", "sent": "Sent", "archive": "Archive", "trash": "Trash",
+                      "junk": "Junk"}
         self.fetched = []     # (folder, uid, limit) of every fetch
         self.found = []       # (folder, message id) of every find
         self.listed = []      # (folder, since, first_uid, dates) of every listing

@@ -346,6 +346,13 @@ MAIL_ARCHIVE_FOLDER_SET = bool(os.environ.get("MAIL_ARCHIVE_FOLDER", "").strip()
 MAIL_TRASH_FOLDER_SET = bool(os.environ.get("MAIL_TRASH_FOLDER", "").strip())
 MAIL_ARCHIVE_FOLDER = os.environ.get("MAIL_ARCHIVE_FOLDER", "").strip() or "Archive"
 MAIL_TRASH_FOLDER = os.environ.get("MAIL_TRASH_FOLDER", "").strip() or "Trash"
+# The Junk folder a chat marked as spam sends its inbound mails to (POST
+# /chats/spam), resolved like the Trash: the name set here is the folder;
+# unset, the one the server marks \Junk, else a folder called "Junk". Never
+# made — a folder the gateway invents is one no client or server treats as
+# junk, so "marked as spam" would not be true of a mail in it.
+MAIL_JUNK_FOLDER_SET = bool(os.environ.get("MAIL_JUNK_FOLDER", "").strip())
+MAIL_JUNK_FOLDER = os.environ.get("MAIL_JUNK_FOLDER", "").strip() or "Junk"
 
 MAIL_POLL_SECONDS = _env_float("MAIL_POLL_SECONDS", 60.0, 5.0)
 MAIL_BACKFILL_DAYS = _env_int("MAIL_BACKFILL_DAYS", 90)
@@ -2610,9 +2617,10 @@ def _parse_list_entry(item) -> tuple[set, str] | None:
 
 
 def resolve_folders(entries, sent: str, archive: str, trash: str, *,
-                    archive_explicit: bool = False, trash_explicit: bool = False) -> dict:
-    """Which folder plays each role: ``{inbox, sent, archive, trash}``, a name
-    or None each.
+                    archive_explicit: bool = False, trash_explicit: bool = False,
+                    junk: str = "Junk", junk_explicit: bool = False) -> dict:
+    """Which folder plays each role: ``{inbox, sent, archive, trash, junk}``,
+    a name or None each.
 
     The server's own SPECIAL-USE attributes (RFC 6154) are honoured first —
     they survive a localised or renamed folder — and the given names are
@@ -2623,7 +2631,9 @@ def resolve_folders(entries, sent: str, archive: str, trash: str, *,
     (``archive_explicit``, ``trash_explicit`` — see MAIL_ARCHIVE_FOLDER_SET):
     that name is the folder, and no other stands in for it. While the server
     has no folder of that name the role has none — the archive is then made
-    by the first Archive, the Trash is never made (Mirror._destination)."""
+    by the first Archive, the Trash is never made (Mirror._destination).
+    The Junk folder (``\\Junk``, else ``junk``; ``junk_explicit`` as for the
+    Trash) is resolved, and never made, like the Trash."""
     usable = [(flags, name) for flags, name in entries
               if "\\noselect" not in flags and "\\nonexistent" not in flags]
 
@@ -2646,6 +2656,7 @@ def resolve_folders(entries, sent: str, archive: str, trash: str, *,
         "archive": named(archive) if archive_explicit
         else special("\\archive", "\\all") or named(archive),
         "trash": named(trash) if trash_explicit else special("\\trash") or named(trash),
+        "junk": named(junk) if junk_explicit else special("\\junk") or named(junk),
     }
 
 
@@ -2820,7 +2831,9 @@ class Mailbox:
             return resolve_folders(entries, self._cfg.sent_folder,
                                    MAIL_ARCHIVE_FOLDER, MAIL_TRASH_FOLDER,
                                    archive_explicit=MAIL_ARCHIVE_FOLDER_SET,
-                                   trash_explicit=MAIL_TRASH_FOLDER_SET)
+                                   trash_explicit=MAIL_TRASH_FOLDER_SET,
+                                   junk=MAIL_JUNK_FOLDER,
+                                   junk_explicit=MAIL_JUNK_FOLDER_SET)
         return self._run(command)
 
     def list_uids(self, folder: str, *, since: float | None = None,
@@ -7823,21 +7836,26 @@ class Mirror:
         server's own, else the default name) — made, and subscribed, if it
         has none and ``make`` allows.
 
-        The archive is made. A Trash never is: a folder the gateway invents
-        is one no mail client treats as the trash and no server ever
-        empties, so "moved to the Trash" would not be true of it — the
-        delete fails instead, and says what to set."""
+        The archive is made. A Trash never is, nor a Junk folder: a folder
+        the gateway invents is one no mail client treats as the trash (or as
+        junk) and no server ever empties, so "moved to the Trash" or "marked
+        as spam" would not be true of it — the delete (the spam) fails
+        instead, and says what to set."""
         self._folders = self.mailbox.folders()
         name = self._folders.get(role)
         if name:
             return name
         if not make:
+            label, variable, explicit, kind = (
+                ("Junk", "MAIL_JUNK_FOLDER", MAIL_JUNK_FOLDER_SET, "junk (spam)")
+                if role == "junk" else
+                ("Trash", "MAIL_TRASH_FOLDER", MAIL_TRASH_FOLDER_SET, "trash"))
             raise MailboxError(
-                f"the mailbox has no Trash folder — "
-                + (f"none named {configured!r}, as MAIL_TRASH_FOLDER says"
-                   if MAIL_TRASH_FOLDER_SET else
-                   f"none the server marks as its Trash, and none named {configured!r}")
-                + ": set MAIL_TRASH_FOLDER to the name of the account's trash folder")
+                f"the mailbox has no {label} folder — "
+                + (f"none named {configured!r}, as {variable} says"
+                   if explicit else
+                   f"none the server marks as its {label}, and none named {configured!r}")
+                + f": set {variable} to the name of the account's {kind} folder")
         self.mailbox.create(configured)
         self._folders = self.mailbox.folders()
         name = self._folders.get(role)
@@ -7907,10 +7925,77 @@ class Mirror:
                       f"the server offers neither MOVE nor UIDPLUS", flush=True)
             return {"moved": len(result.moved) + len(result.left), "flagged": len(result.left)}
 
+    def spam(self, chat: str, only=None) -> dict:
+        """The user's "Spam": move the thread's INBOUND mails that lie in
+        INBOX or the archive folder to the account's Junk folder. Never a
+        mail in Sent, and never the user's own (``out``, or From one of their
+        addresses wherever its copy lies): what the user wrote is no spam. ``{"moved", "flagged"}`` as for :meth:`archive`.
+
+        The Junk folder is the server's ``\\Junk``, else the name
+        MAIL_JUNK_FOLDER gives (``Junk``) — and never made: without one the
+        call fails with a sentence that names the variable, and nothing is
+        moved. ``only`` as for :meth:`archive`: the mails the chat held when
+        the user acted.
+
+        The same move machinery as the Trash's (:meth:`_to_trash`): noted
+        before the server is asked (:meth:`_note_move`, so a stop between the
+        server's move and the index is put right by :meth:`_recover_move`),
+        followed by the index at once. The Junk folder is not mirrored, so a
+        mail moved there has no place left the mirror reads: like a mail a
+        client moved to its junk, the next pass finds it in no mirrored
+        folder and tombstones it — the mailbox holds it, in Junk, and a mail
+        taken out of Junk again comes back to the chat. The chat's own state
+        (muted, archived) is the web gateway's."""
+        with self.exclusive():
+            self._folders = self.mailbox.folders()
+            self._recover_move()
+            # (A mail that came in From one of the user's own addresses — a
+            # mail to oneself, a list's copy of their post — is theirs too.)
+            inbound = {row["message_id"] for row in self.index.rows(
+                "SELECT message_id, sender FROM mails WHERE chat = ? AND direction = 'in' "
+                "AND removed = 0", (chat,)) if (row["sender"] or "") not in OWN_ADDRESSES}
+            places = {role: {uid: mid for uid, mid in uids.items() if mid in inbound}
+                      for role, uids in self._places(chat, ("inbox", "archive"), only).items()}
+            places = {role: uids for role, uids in places.items() if uids}
+            if not places:
+                return {"moved": 0, "flagged": 0}
+            junk = self._destination("junk", MAIL_JUNK_FOLDER, make=False)
+            moved = flagged = missed = 0
+            for role, uids in places.items():
+                folder = self._folder(role)
+                if folder["name"] == junk:
+                    continue    # (a mailbox whose Junk is one of the mirrored folders)
+                self._note_move(role, uids, None)
+                try:
+                    result = self.mailbox.move(folder["name"], list(uids), junk,
+                                               validity=folder["uidvalidity"])
+                except MailboxError:
+                    self._moved_noted()
+                    raise
+                if result is None:
+                    # The folder went between the listing and the move: its
+                    # mails are not in Junk. Unlike the Trash's, this is no
+                    # success — the next pass follows the folder's going.
+                    self._moved_noted()
+                    missed += len(uids)
+                    continue
+                self._follow_move(role, uids, result)
+                self._moved_noted()
+                moved += len(result.moved) + len(result.left)
+                flagged += len(result.left)
+            print(f"[mail-gateway] spam: {moved} mail(s) of chat {chat!r} moved to {junk!r}",
+                  flush=True)
+            if missed:
+                raise MailboxError(
+                    f"A folder of this thread changed while it was being marked as spam: "
+                    f"{missed} mail(s) were not moved to {junk!r} ({moved} were). "
+                    f"Try again.")
+            return {"moved": moved, "flagged": flagged}
+
     def _note_move(self, source: str, uids: dict, target: str | None) -> None:
         """Before the server is asked to move mails (``{UID: Message-ID}`` in
         the folder of ``source``, to the folder of ``target``, a role or None
-        for the Trash): what is being done, so that a stop between the
+        for the Trash and the Junk folder): what is being done, so that a stop between the
         server's move and the index following it (_follow_move) is put
         right by the next pass (:meth:`_recover_move`). One move at a time:
         each is made, and followed, under the mirror's lock."""
@@ -10464,7 +10549,7 @@ def _mirror_loop(mirror: Mirror) -> None:
 # Who may be named as a mail's author, by a send or by a note: whoever wrote
 # it. ("device" is the mirror's own word for a mail some client sent.)
 _NOTE_AUTHORS = ("agent", "user")
-_CHAT_ACTIONS = ("/chats/read", "/chats/archive", "/chats/delete")
+_CHAT_ACTIONS = ("/chats/read", "/chats/archive", "/chats/spam", "/chats/delete")
 _NOT_OURS = {"error": "not this gateway's account"}
 
 
@@ -10655,7 +10740,9 @@ class _Handler(BaseHTTPRequestHandler):
                   flush=True)
 
     def _chat_action(self, action: str) -> None:
-        """POST /chats/read|archive|delete — the mailbox follows the chat."""
+        """POST /chats/read|archive|spam|delete — the mailbox follows the
+        chat. Read, archive and spam need the gateway's token and no more;
+        delete the erase capability as well."""
         if action == "delete":
             # The separate capability, checked before anything is read, as on
             # every gateway: unset, the endpoint refuses.
@@ -10699,6 +10786,8 @@ class _Handler(BaseHTTPRequestHandler):
                 answer = {"ok": True, "seen": MIRROR.mark_read(chat, only)}
             elif action == "archive":
                 answer = {"ok": True, **MIRROR.archive(chat, only)}
+            elif action == "spam":
+                answer = {"ok": True, **MIRROR.spam(chat, only)}
             else:
                 answer = {"status": "deleted", **MIRROR.delete_chat(chat)}
         except Busy as exc:
