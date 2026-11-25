@@ -1138,12 +1138,16 @@ class RetinueChats extends RetinueCard {
     this._triTimer = null;
     if (!this._triage) return;
     const wasRunning = triageBusy(this._tri);
+    let got = false;
     try {
       const res = await fetch(TRIAGE_URL, { cache: 'no-store' });
-      if (res.ok) this._tri = await res.json();
+      if (res.ok) { this._tri = await res.json(); got = true; }
     } catch (_err) {
       // The next poll asks again.
     }
+    // A view with nothing yet to show (a restore whose answer failed) says so
+    // and asks again (_triageSchedule), rather than sitting empty.
+    this._triLoadFailed = !got && !this._tri;
     if (!this._triage) return;
     // Sorting done or a note landed: the list too (a staged draft shows on
     // the row).
@@ -1155,7 +1159,9 @@ class RetinueChats extends RetinueCard {
   }
 
   _triageSchedule() {
-    if (this._triTimer || !this._triage || !triageBusy(this._tri)) return;
+    // While a run sorts or a note is on its way — or while the view still
+    // has nothing to show because its last ask failed.
+    if (this._triTimer || !this._triage || !(triageBusy(this._tri) || this._triLoadFailed)) return;
     this._triTimer = setTimeout(() => this._pollTriage(), TRIAGE_POLL_MS);
   }
 
@@ -1189,6 +1195,7 @@ class RetinueChats extends RetinueCard {
   _triageStatus() {
     const t = this._tri;
     if (this._triMsg) return { text: this._triMsg, err: true };
+    if (!t && this._triLoadFailed) return { text: 'The last sorting could not be loaded — trying again…', err: true };
     if (!t) return { text: this._triRestoring ? 'Loading the last sorting…' : 'Starting…' };
     if (t.enabled === false) return { text: 'Triage is switched off on this deployment (CHAT_TRIAGE).', err: true };
     const run = t.run || {};

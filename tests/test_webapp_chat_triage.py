@@ -393,6 +393,28 @@ await ok('back from a chat opened in the view: restored from the last sorting, n
   }
 });
 
+await ok('a restore whose answer fails says so and asks again', async () => {
+  history.stack = [null, { chatsTriage: true, triageEntry: true }];
+  location.hash = '#triage';
+  keepHistory = true;
+  try {
+    const el = await mount(payload(LIST));
+    takeTri('GET', 'the restore').answer({ error: 'down' }, 502);
+    await settle(); await settle();
+    assert.ok(html(el).includes('The last sorting could not be loaded — trying again…'), html(el));
+    assert.ok(el._triTimer, 'another ask is scheduled');
+    clearTimeout(el._triTimer); el._triTimer = null;
+    el._pollTriage();
+    takeTri('GET', 'the retry').answer(JSON.parse(JSON.stringify(DONE)));
+    await settle(); await settle();
+    assert.deepEqual(ids(sectionOf(html(el), 'archive')), ['u2']);
+    assert.equal(el._triTimer, null, 'loaded and nothing open: no further ask');
+  } finally {
+    location.hash = '';
+    keepHistory = false;
+  }
+});
+
 await ok('opened cold on #triage: closing drops the hash in place instead of leaving the app', async () => {
   history.stack = [null];
   location.hash = '#triage';
