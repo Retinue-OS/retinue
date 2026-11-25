@@ -313,7 +313,11 @@ await ok('feedback: the saved notes, a send that saves one and sorts again, a âœ
   h = html(el);
   assert.equal(el._triFb, '', 'the field is emptied once the server has it');
   assert.ok(h.includes('Invoices are always action.') && h.includes('<span class="tri-n">2</span>'));
-  assert.ok(/data-triage="feedback" disabled/.test(h));
+  assert.ok(/data-triage="feedback" disabled/.test(h), 'the field is empty again');
+  // Busy (sorting): a typed note can still be saved, for the next sort.
+  el._triFb = 'Receipts are archive.';
+  el._rerender();
+  assert.ok(/data-triage="feedback">Save for the next sort</.test(html(el)), html(el));
   // A refused save keeps the words.
   el._triFb = 'x'.repeat(5);
   el._sendTriageFeedback();

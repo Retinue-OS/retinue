@@ -696,7 +696,7 @@ class RetinueChats extends RetinueCard {
       fb.addEventListener('input', () => {
         this._triFb = fb.value;
         const send = this.shadowRoot.querySelector('[data-triage="feedback"]');
-        if (send) send.disabled = !fb.value.trim() || triageBusy(this._tri);
+        if (send) send.disabled = !fb.value.trim();
       });
     }
     const fbBox = this.shadowRoot.querySelector('[data-tri-fb-box]');
@@ -1086,8 +1086,10 @@ class RetinueChats extends RetinueCard {
       list +
       `<textarea data-tri-fb rows="2" maxlength="400" aria-label="Feedback on the sorting" ` +
       `placeholder="Say what it got wrong — e.g. &quot;Mails from my bank are never to be deleted.&quot;">${esc(draft)}</textarea>` +
+      // While a run is busy the note is still saved, and applies to the
+      // next sort: the button says so rather than being shut.
       `<div class="tri-fb-row"><button type="button" class="tri-fb-send" data-triage="feedback"` +
-      `${!draft.trim() || busy ? ' disabled' : ''}>Save and sort again</button>` +
+      `${!draft.trim() ? ' disabled' : ''}>${busy ? 'Save for the next sort' : 'Save and sort again'}</button>` +
       `<span class="tri-fb-hint">Notes apply to every sorting from now on.</span></div>` +
       `</details>`;
   }

@@ -18998,6 +18998,12 @@ class Handler(BaseHTTPRequestHandler):
         if body is None:
             self._send_json(400, {"error": "invalid JSON"})
             return
+        # A `feedback` that is present must be text — an explicit null too,
+        # which .get() could not tell from an absent one and would take for
+        # a plain press that spends a run.
+        if "feedback" in body and not isinstance(body["feedback"], str):
+            self._send_json(400, {"error": "feedback must be text"})
+            return
         self._send_json(*_triage_start(body.get("again") is True, body.get("feedback")))
 
     def _handle_chats_triage_notes(self) -> None:

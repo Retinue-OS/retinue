@@ -171,6 +171,11 @@ def main() -> int:
                      "the run to be over")
             status, doc = mail._http(base, "POST", "/chats/triage", {"feedback": ""})
             assert status == 400, (status, doc)
+            calls_null = len(CALLS)
+            for bad in (None, 3, ["x"]):
+                status, doc = mail._http(base, "POST", "/chats/triage", {"feedback": bad})
+                assert status == 400, (bad, status, doc)
+            assert len(CALLS) == calls_null and not wg._TRIAGE.busy, "a bad feedback starts no run"
             status, doc = mail._http(base, "POST", "/chats/triage",
                                      {"feedback": "x"}, {"Sec-Fetch-Site": "cross-site"})
             assert status == 403
