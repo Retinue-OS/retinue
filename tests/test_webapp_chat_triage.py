@@ -193,6 +193,89 @@ await ok('Delete all takes two taps and deletes every row of the section', async
   assert.ok(!html(el).includes('tri-sec delete'), 'an empty section is not shown');
 });
 
+await ok('without a follow-up an action row opens on its messages, and the heading names no Ara', async () => {
+  const el = await mount(payload(LIST));
+  const plain = JSON.parse(JSON.stringify(DONE));
+  delete plain.entries.u1.followup;
+  await openTriage(el, plain);
+  const action = sectionOf(html(el), 'action');
+  assert.ok(action.includes('href="/chat.html?id=u1"'), action);
+  assert.ok(!action.includes('pane=ara'));
+  assert.ok(/<h3 id="tri-action">Action suggested <span/.test(action), action);
+  assert.ok(!action.includes('Ara is looking') && !action.includes('<b>Ara:</b>'));
+  // With a follow-up: the pane, and "see Ara".
+  const el2 = await mount(payload(LIST));
+  await openTriage(el2, DONE);
+  assert.ok(sectionOf(html(el2), 'action').includes('Action suggested — see Ara'));
+});
+
+await ok('a follow-up that left no note neither links to Ara nor heads the section with her', async () => {
+  for (const state of ['skipped', 'failed', 'interrupted']) {
+    const el = await mount(payload(LIST));
+    const gone = JSON.parse(JSON.stringify(DONE));
+    gone.entries.u1.followup = { state };
+    await openTriage(el, gone);
+    const action = sectionOf(html(el), 'action');
+    assert.ok(action.includes('href="/chat.html?id=u1"') && !action.includes('pane=ara'), `${state}: ${action}`);
+    assert.ok(!action.includes('see Ara'), state);
+  }
+});
+
+await ok('a row that leaves the delete section and comes back must be armed for again', async () => {
+  const el = await mount(payload(LIST));
+  await openTriage(el, DONE);
+  await el._triageAll('delete');
+  assert.equal(el._triArmed, 'delete');
+  // u3 is archived elsewhere: the section is gone…
+  const u3 = el._data.chats.find((c) => c.id === 'u3');
+  u3.archived = true; u3.list_group = 'archived';
+  el._rerender();
+  assert.ok(!html(el).includes('tri-sec delete'));
+  // …and its Undo brings it back: disarmed, one tap arms, nothing deleted.
+  u3.archived = false; u3.list_group = 'unread';
+  el._rerender();
+  assert.ok(sectionOf(html(el), 'delete').includes('>Delete all</button>'));
+  await el._triageAll('delete');
+  assert.ok(!wire.some((w) => w.url.endsWith('/delete')), 'the tap after the return only arms');
+});
+
+await ok('the armed Delete all says what happens to a mix of mails and messenger chats', async () => {
+  const { deleteManyText } = await import('./chats.js');
+  const mailChat = { channel: 'email' };
+  const sig = { channel: 'signal' };
+  assert.equal(deleteManyText([mailChat, mailChat]), 'Delete 2 chats? Mails move to the Trash');
+  assert.equal(deleteManyText([sig]), 'Delete 1 chat? For good');
+  assert.equal(deleteManyText([mailChat, sig, sig]),
+    'Delete 3 chats? Mails move to the Trash, other chats are deleted for good');
+});
+
+await ok('an armed Delete all is disarmed when a poll changes its rows, and never deletes unseen rows', async () => {
+  const el = await mount(payload(LIST));
+  await openTriage(el, DONE);
+  await el._triageAll('delete');
+  assert.ok(sectionOf(html(el), 'delete').includes('Delete 1 chat? For good'));
+  // A poll sorts u2 into delete too.
+  const more = JSON.parse(JSON.stringify(DONE));
+  more.entries.u2.bucket = 'delete';
+  el._tri = more;
+  el._rerender();
+  const sec = sectionOf(html(el), 'delete');
+  assert.deepEqual(ids(sec), ['u2', 'u3']);
+  assert.ok(sec.includes('>Delete all</button>'), 'disarmed: the rows changed');
+  // A tap on a stale arm (rows changed, not yet re-rendered) only re-arms.
+  el._triArmed = 'delete';
+  el._triArmedKey = 'u3';
+  await el._triageAll('delete');
+  assert.ok(!wire.some((w) => w.url.endsWith('/delete')), 'nothing deleted');
+  assert.ok(sectionOf(html(el), 'delete').includes('Delete 2 chats? For good'));
+  const run = el._triageAll('delete');
+  await settle();
+  take((w) => w.url === '/chats/u2/delete', 'u2').answer({ deleted: true });
+  await settle();
+  take((w) => w.url === '/chats/u3/delete', 'u3').answer({ deleted: true });
+  await run;
+});
+
 await ok('Sort again presses with again; a refused press says why', async () => {
   const el = await mount(payload(LIST));
   await openTriage(el, DONE);

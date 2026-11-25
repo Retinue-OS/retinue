@@ -334,10 +334,11 @@ docstring). Pieces:
   ambient cadence and keeps its last rendered state over a failed fetch.
 
   **Triage** (beside the tabs; [docs/chat-triage.md](../docs/chat-triage.md))
-  opens a view of the chats sorted three ways: *Action suggested — see Ara*,
+  opens a view of the chats sorted three ways: *Action suggested* (*— see Ara* where follow-ups run),
   *No action — proposed archive* (with **Archive all**, one Undo for the
   section) and *No action — proposed delete* (with **Delete all**, two taps,
-  no Undo), then *Not sorted* (an unread chat with no word yet, one whose
+  no Undo; armed for the rows it was armed over — a poll that changes them
+  disarms it), then *Not sorted* (an unread chat with no word yet, one whose
   sorting failed, one spoken in since it was sorted). Opening the view is the
   press: `POST /chats/triage {}` sorts the unread chats that have no fresh
   word, and **Sort again** posts `{again: true}`. Every row is the list's own
@@ -345,7 +346,8 @@ docstring). Pieces:
   sorting's one-line note under it, and on an action chat — where follow-ups
   are switched on (`CHAT_TRIAGE_FOLLOWUPS`, off by default) — Ara's note from her
   follow-up in the chat's companion ("Ara is looking at it…" until it lands);
-  an action row opens the chat on Ara's pane (`chat.html?id=…&pane=ara`).
+  an action row with such a note opens the chat on Ara's pane
+  (`chat.html?id=…&pane=ara`), any other on its messages.
   The view polls `GET /chats/triage` while a run sorts or a note is on its
   way, and is a history entry (back closes it); there is no multi-select
   inside it. A chat archived or deleted leaves the view.
