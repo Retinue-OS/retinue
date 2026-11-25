@@ -1,0 +1,10 @@
+{
+  "inboxes": [
+    {
+      "id": "routine-log",
+      "path": "inbox",
+      "description": "Session logs the routine app submits: one JSON file per finished or skipped session."
+    }
+  ],
+  "destinations": []
+}

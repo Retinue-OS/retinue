@@ -66,6 +66,9 @@ to a subagent) or runs a shell `command`.
 }
 ```
 
+Instead of `interval_seconds`, a job may be timed by the calendar — see
+"Calendar triggers" below.
+
 `interval_seconds` is measured **completion to next start**, not start to
 start: the scheduler writes a job's state once it has finished running, so a
 job's own run time is extra spacing on top of the interval, not part of it.
@@ -145,6 +148,60 @@ uses `SCHEDULER_JOB_TIMEOUT`. A present-but-unparseable or non-positive value
 is treated as a malformed manifest: the scheduler logs a warning and falls back
 to the global timeout rather than disabling the kill, because one un-killable
 job would wedge the single-threaded tick loop behind it.
+
+### Calendar triggers
+
+A job that names `at` runs at times of day rather than on an interval, and
+needs no `interval_seconds` (`scripts/calendar_trigger.py`):
+
+```json
+{
+  "id": "<chamber>-weekly-review",
+  "prompt": "Dispatch the <chamber>'s subagent for the weekly review.",
+  "at": "08:40",
+  "days": "mon",
+  "tz": "Europe/Zurich",
+  "lead": "2h"
+}
+```
+
+| Field | |
+|---|---|
+| `at` | `"HH:MM"`, or a list of them |
+| `days` | weekdays as the focus schedule writes them — `"mon-fri"`, `"mon,wed,fri"`, `"sat, sun"`, `"weekend"`, a list; default every day |
+| `date` | instead of `days`: a one-off `"YYYY-MM-DD"`, or a list |
+| `tz` | an IANA zone; default the instance's (`ATTENTION_TZ`, else `RETINUE_DISPLAY_TZ`, else `TZ`) |
+| `lead` | how late a slot may still fire: `30m`, `2h`, `1d` (at most `7d`); default `15m` |
+
+Times are wall-clock times in the zone, so a daily 07:00 stays 07:00 across
+a daylight-saving change. A time inside the spring-forward gap (02:30 in most
+of Europe) fires once, the gap's length later (03:30); a time that occurs
+twice in autumn fires once, at its first occurrence.
+
+**The missed-slot rule.** Each slot fires once. A slot the scheduler finds
+within its `lead` fires — so a container that was down over 07:00 and is
+back at 07:10 fires it on start — while one found later is skipped, logged
+as `[missed]` and recorded (`status: "missed"`), never fired late. Slots from
+before the job was first seen never fire (for an app job, before it was
+registered). State adds `since` and `last_slot` to the job's state file.
+The other optional fields (`model`, `timeout_seconds`, …) apply as for any
+job; `retry_after_seconds` and `resume_after_seconds` are interval notions
+and are not consulted.
+
+**App jobs.** Chamber apps (`docs/chamber-apps.md`) register reminders and
+prompt jobs through the dashboard; each app's jobs live in
+`$CHAMBER_APPS_STATE_DIR/<chamber>/<app>/schedule.json` (default
+`/root/.retinue/apps/`), which the scheduler loads beside the manifests with
+ids `app:<chamber>:<app>:<id>`. A reminder runs no agent: firing it is one
+request to the gateway (`/internal/apps/reminders/fire`), which makes it an
+attention item; if the gateway does not take it, the slot is tried again
+while within its lead. Reminders run on a loop of their own
+(`SCHEDULER_REMINDER_TICK_SECONDS`, default 15), beside the one that runs
+prompt and command jobs inline, so a long job never holds a reminder back
+past its lead. App jobs never run a `command`.
+`python3 /workspace/scripts/scheduler.py --list` prints every job — id,
+kind, trigger, next run, owner (`base`, `chamber <name>`, `app
+<chamber>/<app>`).
 
 Besides the per-chamber manifests, the scheduler always loads a **framework base
 manifest** at `/workspace/.schedule.json` for cross-cutting jobs that belong to

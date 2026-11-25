@@ -784,7 +784,8 @@ class RetinueAttentionSheet extends HTMLElement {
       // A screened stranger leads with the card — naming them is the whole
       // question, and the corrections below only make sense afterwards.
       const contactField = this._contactField(item, spheres);
-      const openLabel = item.kind === 'chat' ? 'Open the chat' : item.kind === 'thread' ? 'Open the thread' : 'Open the project';
+      const openLabel = item.kind === 'chat' ? 'Open the chat' : item.kind === 'thread' ? 'Open the thread'
+        : item.kind === 'reminder' ? 'Open the app' : 'Open the project';
       let actions;
       if (item.state !== 'open') {
         actions = `<div class="note">Handled.</div><div class="actions">` +

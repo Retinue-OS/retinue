@@ -528,6 +528,8 @@ from requester_identity import normalize_requester_identity
 import attention as attention_policy
 import attention_store
 import build_stamp
+import calendar_trigger
+import chamber_apps
 import claude_auth
 import agent_models
 import content_policy
@@ -16379,7 +16381,7 @@ def _attention_items(profile: dict, now: datetime) -> tuple[list[dict], list[str
     """Every item from the three sources, plus the names of the sources that
     could not be read (the store down): the list is served with what there
     is and says so, rather than failing whole."""
-    items = _attention_thread_items(profile)
+    items = _attention_thread_items(profile) + _reminders_open_items(profile)
     degraded = []
     for name, fetch in (("chats", lambda: _attention_chat_items(profile)),
                         ("projects", lambda: _attention_project_items(profile, now))):
@@ -16418,6 +16420,12 @@ def _attention_item(item_id: str, profile: dict, now: datetime) -> dict | None:
         if conv is None or (conv.get("kind") or "chat") != "chat":
             return None
         return attention_store.thread_item(conv, profile)
+    if item_id.startswith("reminder:"):
+        rid = item_id[len("reminder:"):]
+        rec = _REMINDERS.get(rid)
+        if not rec or not rec.get("occurrence"):
+            return None
+        return _reminder_item(rid, rec, profile)
     if item_id.startswith("chat:"):
         chat_id = item_id[len("chat:"):]
         state = _CHAT_STATE.get(chat_id)
@@ -16459,6 +16467,8 @@ def _attention_persist(item: dict, attended: int | None = None) -> None:
     elif kind == "chat":
         _CHAT_STATE.set_attention(item["source_id"], block, attended=attended)
         _chats_cache_invalidate()
+    elif kind == "reminder":
+        _REMINDERS.update(item["source_id"], lambda rec: rec.update(attention=block))
     else:
         _ATTENTION.save_project(item["source_id"], block)
 
@@ -16842,6 +16852,8 @@ def _attention_push_item(item: dict, reason: str = "") -> int:
     if kind == "thread":
         conv = _load_conv(item["source_id"])
         return _push_conv_notification(conv, item.get("preview") or item["title"], urgency="high") if conv else 0
+    if kind == "reminder":
+        return _reminder_push(item)
     title = item["title"]
     body = " ".join(str(item.get("preview") or reason or "").split())[:160]
     tag = item["source_id"]
@@ -17061,12 +17073,383 @@ def _attention_tick_loop() -> None:
             _attention_tick()
         except Exception as exc:  # noqa: BLE001 - the loop must survive a bad minute
             print(f"[web-gateway] attention tick failed: {exc!r}", flush=True)
+        try:
+            _reminders_tick()
+        except Exception as exc:  # noqa: BLE001
+            print(f"[web-gateway] reminder tick failed: {exc!r}", flush=True)
         _contacts_sync_policy()
         try:
             _chats_autolink(force=False)
         except Exception as exc:  # noqa: BLE001 - the loop must survive
             print(f"[web-gateway] contacts: autolink failed ({exc})", flush=True)
         time.sleep(ATTENTION_TICK_SECONDS)
+
+
+# ── Chamber apps (docs/chamber-apps.md) ──────────────────────────────────────
+# A chamber ships Progressive Web Apps in <chamber>/.retinue/apps/<app>/; the
+# gateway serves them at /apps/<chamber>/<app>/ under the dashboard's policy,
+# lists them at /apps/index.json, and answers the small client API under
+# /apps/api/ that webapp/apps/retinue.js wraps. What the gateway and the
+# scheduler share — discovery, schedule files, job checks — is
+# scripts/chamber_apps.py. A reminder an app declares is fired by the
+# scheduler (a calendar trigger) through /internal/apps/reminders/fire and
+# becomes an attention item of kind "reminder", one per reminder: its latest
+# occurrence, replaced by the next one, cleared when it is opened, done,
+# skipped or snoozed.
+
+_REMINDERS = chamber_apps.ReminderStore(ATTENTION_DIR / "reminders.json")
+# A shell that arms reminders as local alarms (the Android app, which Web
+# Push does not reach) says so when it fetches them; for this long after, a
+# reminder that is to ring waits APPS_SHELL_GRACE_SECONDS for the shell's
+# delivery confirmation before the server pushes it to the other devices.
+APPS_SHELL_ARM_WINDOW = timedelta(hours=float(os.environ.get("APPS_SHELL_ARM_WINDOW_HOURS", "36")))
+APPS_SHELL_GRACE_SECONDS = float(os.environ.get("APPS_SHELL_GRACE_SECONDS", "90"))
+# What Retinue.submit may write in one file.
+APPS_FILE_MAX_BYTES = int(os.environ.get("APPS_FILE_MAX_BYTES", str(25 * 1024 * 1024)))
+APPS_SNOOZE_DEFAULT_MINUTES = 15
+# What an app directory answers with. Its files are the chamber's code,
+# reviewed with it (Tier 3 there), so scripts are served as scripts — only
+# from inside an app directory; nothing a sender chose ever lands there
+# (Retinue.submit refuses every dot path, .retinue/ included). Any other
+# suffix is a download, as on /data/.
+_APP_CONTENT_TYPES = dict(_STATIC_CONTENT_TYPES, **{
+    ".mjs": "text/javascript; charset=utf-8",
+    ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".webp": "image/webp", ".gif": "image/gif",
+    ".mp3": "audio/mpeg", ".ogg": "audio/ogg", ".wav": "audio/wav", ".m4a": "audio/mp4",
+    ".txt": "text/plain; charset=utf-8", ".csv": "text/csv; charset=utf-8",
+})
+_APPS_SCHEDULE_RE = re.compile(
+    r"^/apps/api/schedule/([^/?#]+)/([^/?#]+)/?(?:([^/?#]+)/?(?:(opened|done|skip|snooze|delivered)/?)?)?$")
+_APPS_FILES_PREFIX = "/apps/api/files/"
+_AGENT_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+
+
+def _app_sphere(chamber: str, app: str) -> str | None:
+    directory = chamber_apps.app_dir(CHAMBERS_DIR, chamber, app)
+    if directory is None:
+        return None
+    return chamber_apps.index_entry({"chamber": chamber, "id": app, "dir": directory,
+                                     "manifest": chamber_apps.read_manifest(directory)})["sphere"]
+
+
+def _app_name(chamber: str, app: str) -> str:
+    directory = chamber_apps.app_dir(CHAMBERS_DIR, chamber, app)
+    if directory is None:
+        return app
+    return chamber_apps.index_entry({"chamber": chamber, "id": app, "dir": directory,
+                                     "manifest": chamber_apps.read_manifest(directory)})["short_name"]
+
+
+def _reminder_item(rid: str, rec: dict, profile: dict) -> dict:
+    """A reminder record as a policy item, display fields included."""
+    doc = {"id": f"reminder:{rid}", "title": rec.get("title") or "Reminder",
+           "attention": dict(rec.get("attention") or {})}
+    item = attention_policy.item_from_doc(doc, "reminder", profile)
+    item.update({
+        "source_id": rid, "own": False, "project": None, "project_title": None,
+        "project_href": None, "preview": rec.get("body") or "",
+        "agent": rec.get("app_name") or rec.get("app"), "unread": True, "pending": False,
+        "count": 1, "href": rec.get("href") or "/apps.html", "channel": None,
+        "occurrence": rec.get("occurrence"),
+        "app": {"chamber": rec.get("chamber"), "id": rec.get("app"), "job": rec.get("job_id")},
+    })
+    return item
+
+
+def _reminder_block(job: dict, occurrence: datetime, sphere: str | None) -> dict:
+    """The attention block of a fresh occurrence: what the app declared,
+    with the deadline its lead sets (the slot plus the lead: the item climbs
+    as the lead runs out, which is how the lead bounds a hold)."""
+    trigger = chamber_apps.trigger_of(job)
+    lead = trigger.lead if trigger else timedelta(minutes=calendar_trigger.DEFAULT_LEAD_MINUTES)
+    block = {"kind": "reminder", "state": "open", "released": False,
+             "due": (occurrence + lead).isoformat(), "lead": lead.total_seconds() / 60,
+             "lead_from": "app", "tags": list(job.get("tags") or []),
+             "sphere": job.get("sphere") or sphere or "admin",
+             "sphere_from": "app"}
+    if job.get("importance") is not None:
+        block["importance"] = float(job["importance"])
+        block["importance_from"] = "app"
+    return block
+
+
+def _reminders_open_items(profile: dict) -> list[dict]:
+    items = []
+    for rid, rec in _REMINDERS.all().items():
+        if not rec.get("occurrence"):
+            continue  # a confirmation that arrived before its occurrence fired
+        item = _reminder_item(rid, rec, profile)
+        if item.get("state", "open") == "open":
+            items.append(item)
+    return items
+
+
+def _reminder_push(item: dict) -> int:
+    """Push one reminder: it opens the app's deep link, and carries the two
+    actions the dashboard's service worker posts without opening anything."""
+    if not push_notify.enabled():
+        return 0
+    app = item.get("app") or {}
+    api = (f"/apps/api/schedule/{app.get('chamber')}/{app.get('id')}/{app.get('job')}"
+           if app.get("job") else None)
+    extra = {"kind": "reminder"}
+    if api:
+        extra.update(api=api, occurrence=item.get("occurrence"),
+                     actions=[{"action": "snooze", "title": f"In {APPS_SNOOZE_DEFAULT_MINUTES} min"},
+                              {"action": "skip", "title": "Skip today"}])
+    body = " ".join(str(item.get("preview") or "").split())[:160]
+    push_notify.notify_async(item["title"], body or "Reminder", url=item["href"], tag=item["id"],
+                             urgency="high", extra=extra)
+    return push_notify.subscription_count()
+
+
+def _reminder_fire(chamber: str, app: str, job_id: str, occurrence: datetime) -> tuple[int, dict]:
+    """The scheduler fired one occurrence: make it the reminder's item,
+    replacing the one before, and deliver it by the attention model. Firing
+    the same occurrence twice changes nothing."""
+    job = chamber_apps.get_job(chamber, app, job_id)
+    if job is None or job.get("kind", "reminder") != "reminder" \
+            or chamber_apps.app_dir(CHAMBERS_DIR, chamber, app) is None:
+        return 404, {"error": "no such reminder"}
+    rid = chamber_apps.full_id(chamber, app, job_id)
+    key = calendar_trigger.occurrence_key(occurrence)
+    push_now = None
+    with _attention_lock:
+        now = _attention_now()
+        focus = _ATTENTION.focus()
+        profile = _ATTENTION.profile()
+        prev = _REMINDERS.get(rid) or {}
+        if prev.get("occurrence") == key:
+            return 200, {"status": "already fired", "id": f"reminder:{rid}"}
+        rec = {"chamber": chamber, "app": app, "job_id": job_id, "app_name": _app_name(chamber, app),
+               "title": job.get("title") or "Reminder", "body": job.get("body") or "",
+               "href": chamber_apps.deep_link(chamber, app, job), "occurrence": key,
+               "fired_at": now.isoformat(), "delivered": list(prev.get("delivered") or []),
+               "attention": _reminder_block(job, occurrence, _app_sphere(chamber, app))}
+        if prev.get("occurrence") and (prev.get("attention") or {}).get("state", "open") == "open":
+            rec["replaced"] = prev["occurrence"]
+        item = _reminder_item(rid, rec, profile)
+        decision = attention_policy.on_arrival(item, focus, profile, now)
+        if decision["deliver"] == "push":
+            armed = _REMINDERS.shell_armed_at()
+            if key in rec["delivered"]:
+                decision["reason"] += "; a shell showed it already"
+            elif armed is not None and now - armed <= APPS_SHELL_ARM_WINDOW \
+                    and APPS_SHELL_GRACE_SECONDS > 0:
+                rec["push_pending_until"] = (now + timedelta(seconds=APPS_SHELL_GRACE_SECONDS)).isoformat()
+                decision["reason"] += "; waiting for the shell's confirmation first"
+            else:
+                push_now = item
+        rec["attention"] = attention_store.block_for(item)
+        _REMINDERS.put(rid, rec)
+    if push_now is not None:
+        _reminder_push(push_now)
+    body = _attention_decision_body(decision, item)
+    print(f"[web-gateway] reminder {rid} {key}: {decision['deliver']} — {decision.get('reason', '')}", flush=True)
+    return 200, body
+
+
+def _reminders_tick(now: datetime | None = None) -> list[str]:
+    """Push the reminders whose wait for a shell's confirmation ran out."""
+    now = now or _attention_now()
+    due = []
+    with _attention_lock:
+        for rid, rec in _REMINDERS.all().items():
+            until = attention_policy.parse_dt(rec.get("push_pending_until"))
+            if until is None or until > now:
+                continue
+            def clear(r):
+                r.pop("push_pending_until", None)
+            rec = _REMINDERS.update(rid, clear) or rec
+            if rec.get("occurrence") in (rec.get("delivered") or []):
+                continue
+            item = _reminder_item(rid, rec, _ATTENTION.profile())
+            if item.get("state", "open") == "open":
+                due.append(item)
+    for item in due:
+        _reminder_push(item)
+        print(f"[web-gateway] reminder {item['source_id']}: no shell confirmed it, pushed", flush=True)
+    return [i["source_id"] for i in due]
+
+
+def _reminder_settle(rid: str, how: str) -> bool:
+    """Clear a reminder's open item (opened, done, skipped, snoozed,
+    unscheduled). False when nothing was open."""
+    with _attention_lock:
+        rec = _REMINDERS.get(rid)
+        if not rec or not rec.get("occurrence"):
+            return False
+        item = _reminder_item(rid, rec, _ATTENTION.profile())
+        if item.get("state", "open") != "open":
+            return False
+        item["state"] = "done"
+        item["done_at"] = _attention_now().isoformat()
+        item["done_how"] = how
+
+        def change(r):
+            r["attention"] = attention_store.block_for(item)
+            r.pop("push_pending_until", None)
+        _REMINDERS.update(rid, change)
+        return True
+
+
+def _reminder_action(chamber: str, app: str, job_id: str, action: str, payload: dict) -> tuple[int, dict]:
+    """What the app, the service worker or the shell reports of a reminder:
+
+    - ``opened``: the user opened it — the item is cleared;
+    - ``done``: the session is done — the item is cleared, or, when none is
+      open, the next occurrence is skipped if it falls today (done ahead);
+    - ``skip``: not today — the item is cleared and nothing more fires today;
+    - ``snooze``: once more in ``minutes`` (default 15) or ``at`` — an extra
+      one-off occurrence; the item is cleared until it fires;
+    - ``delivered``: a shell showed ``occurrence`` — it is not pushed again.
+    """
+    job = chamber_apps.get_job(chamber, app, job_id)
+    rid = chamber_apps.full_id(chamber, app, job_id)
+    if job is None or job.get("kind", "reminder") != "reminder":
+        return 404, {"error": "no such reminder"}
+    now = _attention_now()
+    if action == "opened":
+        return 200, {"status": "opened", "cleared": _reminder_settle(rid, "opened")}
+    if action == "done":
+        if _reminder_settle(rid, "done"):
+            return 200, {"status": "done", "cleared": True}
+        trigger = chamber_apps.trigger_of(job)
+        nxt = trigger.next_after(now, horizon=timedelta(days=1)) if trigger else None
+        if nxt is not None and nxt.astimezone(trigger.tz).date() == now.astimezone(trigger.tz).date():
+            key = []
+            chamber_apps.update_job(chamber, app, job_id,
+                                    lambda j: key.append(chamber_apps.skip_slot(j, nxt, now)))
+            return 200, {"status": "done", "cleared": False, "skipped": key[0]}
+        return 200, {"status": "done", "cleared": False}
+    if action == "skip":
+        # "Not today" means the day of the occurrence the user skipped, not
+        # the day the request arrives: a phone that was offline sends its
+        # skip later (the Android shell names the occurrence).
+        at = calendar_trigger.parse_instant(payload.get("occurrence")) if payload.get("occurrence") else None
+        if payload.get("occurrence") and at is None:
+            return 400, {"error": "occurrence must be an ISO instant"}
+        if at is not None and not now - timedelta(days=7) <= at <= now + timedelta(days=2):
+            return 400, {"error": "occurrence is too far from now"}
+        day = chamber_apps.skip_day(job, at or now)
+        rec = _REMINDERS.get(rid) or {}
+        open_at = calendar_trigger.parse_instant(rec.get("occurrence"))
+        # Only the item of that day is cleared: a late skip of yesterday
+        # leaves today's reminder on the list.
+        cleared = (_reminder_settle(rid, "skipped")
+                   if open_at is None or chamber_apps.skip_day(job, open_at) == day else False)
+        chamber_apps.update_job(chamber, app, job_id, lambda j: chamber_apps.skip_today(j, now, at))
+        return 200, {"status": "skipped", "cleared": cleared, "date": day}
+    if action == "snooze":
+        when = calendar_trigger.parse_instant(payload.get("at")) if payload.get("at") else None
+        if when is None:
+            try:
+                minutes = float(payload.get("minutes") or APPS_SNOOZE_DEFAULT_MINUTES)
+            except (TypeError, ValueError):
+                return 400, {"error": "minutes must be a number"}
+            if not 1 <= minutes <= 24 * 60:
+                return 400, {"error": "minutes must be between 1 and 1440"}
+            when = now + timedelta(minutes=minutes)
+        elif not now - timedelta(minutes=1) <= when <= now + timedelta(days=1):
+            return 400, {"error": "at must lie within the next 24 hours"}
+        cleared = _reminder_settle(rid, "snoozed")
+        key = []
+        chamber_apps.update_job(chamber, app, job_id, lambda j: key.append(chamber_apps.snooze_job(j, when, now)))
+        return 200, {"status": "snoozed", "cleared": cleared, "occurrence": key[0] if key else None}
+    if action == "delivered":
+        occ = calendar_trigger.parse_instant(payload.get("occurrence"))
+        if occ is None:
+            return 400, {"error": "occurrence must be an ISO instant"}
+        key = calendar_trigger.occurrence_key(occ)
+        with _attention_lock:
+            rec = _REMINDERS.get(rid)
+            if rec is None:
+                # Confirmed before the server fired it: the fire sees this.
+                _REMINDERS.put(rid, {"chamber": chamber, "app": app, "job_id": job_id,
+                                     "delivered": [key]})
+                return 200, {"status": "delivered", "occurrence": key}
+
+            def change(r):
+                if key not in (r.get("delivered") or []):
+                    r.setdefault("delivered", []).append(key)
+                if r.get("occurrence") == key and r.get("push_pending_until"):
+                    r.pop("push_pending_until", None)
+                    block = r.setdefault("attention", {})
+                    block.setdefault("pushed", []).append(now.isoformat())
+            _REMINDERS.update(rid, change)
+        return 200, {"status": "delivered", "occurrence": key}
+    return 404, {"error": "unknown action"}
+
+
+def _reminders_for_shell(now: datetime, horizon_hours: float = 48) -> dict:
+    """Every app reminder with its next occurrences, for a shell that arms
+    them as local alarms. ``ring`` says whether the occurrence would break
+    through the focus mode scheduled for its time (a shell shows the others
+    quietly); ``open`` names an occurrence whose item is open now."""
+    focus = _ATTENTION.focus()
+    profile = _ATTENTION.profile()
+    horizon = timedelta(hours=max(1.0, min(horizon_hours, 24 * 7)))
+    out = []
+    records = _REMINDERS.all()
+    for chamber, app, _path in chamber_apps.all_schedules():
+        if chamber_apps.app_dir(CHAMBERS_DIR, chamber, app) is None:
+            continue
+        sphere = _app_sphere(chamber, app)
+        for job in chamber_apps.load_schedule(chamber, app)["jobs"]:
+            if job.get("kind", "reminder") != "reminder" or job.get("enabled") is False:
+                continue
+            trigger = chamber_apps.trigger_of(job)
+            if trigger is None:
+                continue
+            rid = chamber_apps.full_id(chamber, app, job["id"])
+            rec = records.get(rid) or {}
+            occurrences = []
+            for when in trigger.upcoming(now, horizon=horizon, limit=20):
+                probe = {"title": job.get("title"), "attention": _reminder_block(job, when, sphere)}
+                item = _reminder_item(rid, probe, profile)
+                ring = attention_policy.breaks_through(
+                    item, attention_policy.mode_at(focus, when), profile, when)
+                occurrences.append({"at": calendar_trigger.occurrence_key(when), "ring": bool(ring)})
+            open_item = None
+            if rec.get("occurrence"):
+                if _reminder_item(rid, rec, profile).get("state", "open") == "open":
+                    open_item = rec["occurrence"]
+            out.append({"id": rid, "chamber": chamber, "app": app, "job": job["id"],
+                        "title": job.get("title") or "Reminder", "body": job.get("body") or "",
+                        "url": chamber_apps.deep_link(chamber, app, job),
+                        "importance": job.get("importance"), "sphere": job.get("sphere") or sphere,
+                        "occurrences": occurrences, "open": open_item,
+                        "delivered": list(rec.get("delivered") or [])[-10:]})
+    return {"now": calendar_trigger.occurrence_key(now), "horizon_hours": horizon.total_seconds() / 3600,
+            "snooze_minutes": APPS_SNOOZE_DEFAULT_MINUTES, "reminders": out}
+
+
+def _app_jobs_payload(chamber: str, app: str, now: datetime) -> dict:
+    records = _REMINDERS.all()
+    jobs = []
+    for job in chamber_apps.load_schedule(chamber, app)["jobs"]:
+        rid = chamber_apps.full_id(chamber, app, job["id"])
+        trigger = chamber_apps.trigger_of(job)
+        nxt = trigger.next_after(now) if trigger else None
+        rec = records.get(rid) or {}
+        is_open = bool(rec.get("occurrence")) and \
+            (rec.get("attention") or {}).get("state", "open") == "open"
+        jobs.append(dict({k: v for k, v in job.items() if not k.startswith("_")},
+                         full_id=rid, next=nxt.isoformat() if nxt else None,
+                         open=rec.get("occurrence") if is_open else None))
+    return {"jobs": jobs}
+
+
+def _sparql_endpoint_url(name: str) -> str | None:
+    """The store an app names: ``life`` (the framework's) or a deployment's
+    SPARQL_ENDPOINT_<NAME>."""
+    name = (name or "life").strip()
+    if name.lower() == "life":
+        return QLEVER_LIFE_URL
+    if not re.fullmatch(r"[A-Za-z0-9_]{1,40}", name):
+        return None
+    url = os.environ.get(f"SPARQL_ENDPOINT_{name.upper()}", "").strip()
+    return url or None
 
 
 def _attention_row(item: dict, focus: dict, profile: dict, now: datetime) -> dict:
@@ -17249,9 +17632,10 @@ class Handler(BaseHTTPRequestHandler):
     def end_headers(self):
         self._ended_headers = True  # an answer is under way (_handle_chats_inbound)
         page, self._csp_for = getattr(self, "_csp_for", None), None
+        app, self._csp_app = getattr(self, "_csp_app", False), False
         if getattr(self, "_csp_page", False):
             self._csp_page = False
-            for name, value in content_policy.headers(page):
+            for name, value in (content_policy.app_headers() if app else content_policy.headers(page)):
                 super().send_header(name, value)
         super().end_headers()
 
@@ -17300,7 +17684,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def _serve_static_file(self, path: Path, base: Path, cache: str = "no-cache",
                            transform=None, headers: dict | None = None,
-                           types: dict | None = None) -> bool:
+                           types: dict | None = None, csp_app: bool = False) -> bool:
         """Serve a file from within ``base``, guarding against path traversal.
 
         ``transform`` rewrites the bytes on the response only (the instance
@@ -17324,8 +17708,10 @@ class Handler(BaseHTTPRequestHandler):
             return False
         if transform is not None:
             data = transform(data)
-        # Which page of webapp/ this is, for its policy (end_headers).
+        # Which page of webapp/ this is, for its policy (end_headers); a
+        # chamber app's page has the apps' own (content_policy.app_headers).
         self._csp_for = full.name if full.parent == WEBAPP_DIR.resolve() else None
+        self._csp_app = csp_app
         headers = dict(headers or {})
         if types is None:
             ctype = _STATIC_CONTENT_TYPES.get(full.suffix.lower(), "application/octet-stream")
@@ -17587,6 +17973,307 @@ class Handler(BaseHTTPRequestHandler):
     # built-in letterbox (scripts/letterbox.py). Behind the same edge auth as
     # the rest of the dashboard; the share adds no login of its own.
 
+    # ── Chamber apps (docs/chamber-apps.md) ────────────────────────────────
+    # /apps/<chamber>/<app>/… are the apps' own files; /apps/index.json the
+    # list; /apps/retinue.js the client; /apps/api/… the client's API. Behind
+    # the dashboard's sign-in like every path; there is no token and no
+    # per-app permission. Every call that changes something refuses another
+    # site's page (Sec-Fetch-Site), as the conversation endpoints do.
+
+    def _serve_apps_get(self) -> bool:
+        path, _, query = self.path.partition("?")
+        if path != "/apps" and not path.startswith("/apps/"):
+            return False
+        if path in ("/apps", "/apps/"):
+            self._redirect("/apps.html")
+            return True
+        if path == "/apps/index.json":
+            self._send_json(200, chamber_apps.index(CHAMBERS_DIR), {"Cache-Control": "no-store"})
+            return True
+        if path == "/apps/retinue.js":
+            if not self._serve_static_file(WEBAPP_DIR / "apps" / "retinue.js", WEBAPP_DIR):
+                self._send_json(404, {"error": "not found"})
+            return True
+        if path.startswith("/apps/api/"):
+            if path.rstrip("/") == "/apps/api/schedule":
+                params = urllib.parse.parse_qs(query)
+                now = _attention_now()
+                if (params.get("arm") or [""])[0] in ("1", "true") and self._claude_auth_same_origin():
+                    # A shell (the Android app) arms these as local alarms:
+                    # a reminder to ring now waits for its confirmation.
+                    # Recorded only from a native caller or this origin:
+                    # another site's page (an <img> pointed here) must not
+                    # hold every reminder push behind a shell that never
+                    # confirms.
+                    _REMINDERS.mark_shell_armed(now)
+                try:
+                    hours = float((params.get("hours") or ["48"])[0])
+                except ValueError:
+                    hours = 48.0
+                self._send_json(200, _reminders_for_shell(now, hours), {"Cache-Control": "no-store"})
+                return True
+            m = _APPS_SCHEDULE_RE.match(path)
+            if m and not m.group(3):
+                if chamber_apps.app_dir(CHAMBERS_DIR, m.group(1), m.group(2)) is None:
+                    self._send_json(404, {"error": "no such app"})
+                else:
+                    self._send_json(200, _app_jobs_payload(m.group(1), m.group(2), _attention_now()),
+                                    {"Cache-Control": "no-store"})
+                return True
+            self._send_json(405 if m else 404, {"error": "not found" if not m else "method not allowed"})
+            return True
+        parts = path[len("/apps/"):].split("/", 2)
+        if len(parts) < 2 or not parts[1]:
+            self._send_json(404, {"error": "not found"})
+            return True
+        chamber, app = urllib.parse.unquote(parts[0]), urllib.parse.unquote(parts[1])
+        if chamber_apps.app_dir(CHAMBERS_DIR, chamber, app) is None:
+            self._send_json(404, {"error": "no such app"})
+            return True
+        if len(parts) == 2:
+            # The app's own relative links need its directory as the base.
+            self._redirect(f"/apps/{chamber}/{app}/" + (f"?{query}" if query else ""))
+            return True
+        rel = urllib.parse.unquote(parts[2])
+        target = chamber_apps.app_file(CHAMBERS_DIR, chamber, app, rel)
+        base = chamber_apps.app_dir(CHAMBERS_DIR, chamber, app)
+        if target is None or not self._serve_static_file(
+                target, base, types=_APP_CONTENT_TYPES, csp_app=True):
+            self._send_json(404, {"error": "not found"})
+        return True
+
+    def _apps_refuse_cross_site(self) -> bool:
+        if self._claude_auth_same_origin():
+            return False
+        self._send_json(403, {"error": "cross-site request rejected"})
+        return True
+
+    def _handle_apps_post(self) -> bool:
+        path = self.path.split("?", 1)[0]
+        if not path.startswith("/apps/api/"):
+            return False
+        if self._apps_refuse_cross_site():
+            return True
+        if path.rstrip("/") == "/apps/api/sparql":
+            self._handle_apps_sparql()
+            return True
+        if path.rstrip("/") == "/apps/api/ask":
+            self._handle_apps_ask()
+            return True
+        m = _APPS_SCHEDULE_RE.match(path)
+        if not m:
+            self._send_json(404, {"error": "not found"})
+            return True
+        chamber, app, job_id, action = m.groups()
+        if chamber_apps.app_dir(CHAMBERS_DIR, chamber, app) is None:
+            self._send_json(404, {"error": "no such app"})
+            return True
+        payload = self._read_json_body()
+        if payload is None:
+            self._send_json(400, {"error": "invalid JSON"})
+            return True
+        if job_id is None:
+            now = _attention_now()
+            try:
+                job = chamber_apps.normalize_job(payload, now)
+                chamber_apps.put_job(chamber, app, job)
+            except ValueError as exc:
+                self._send_json(400, {"error": str(exc)})
+                return True
+            trigger = chamber_apps.trigger_of(job)
+            nxt = trigger.next_after(now) if trigger else None
+            self._send_json(201, {"job": job, "full_id": chamber_apps.full_id(chamber, app, job["id"]),
+                                  "next": nxt.isoformat() if nxt else None})
+            return True
+        if not action:
+            self._send_json(405, {"error": "method not allowed"})
+            return True
+        status, body = _reminder_action(chamber, app, job_id, action, payload)
+        self._send_json(status, body)
+        return True
+
+    def _handle_apps_delete(self) -> bool:
+        path = self.path.split("?", 1)[0]
+        if not path.startswith("/apps/api/"):
+            return False
+        if self._apps_refuse_cross_site():
+            return True
+        m = _APPS_SCHEDULE_RE.match(path)
+        if not m or not m.group(3) or m.group(4):
+            self._send_json(404, {"error": "not found"})
+            return True
+        chamber, app, job_id, _ = m.groups()
+        if not chamber_apps.remove_job(chamber, app, job_id):
+            self._send_json(404, {"error": "no such job"})
+            return True
+        rid = chamber_apps.full_id(chamber, app, job_id)
+        _reminder_settle(rid, "unscheduled")
+        self._send_json(200, {"status": "removed", "id": rid})
+        return True
+
+    def _handle_apps_put(self) -> bool:
+        """PUT /apps/api/files/<chamber>/[<dir>/…]<name>: Retinue.submit. One
+        segment writes into the chamber's inbox; an existing file is
+        replaced only with ?replace=1. See chamber_apps.submit_target for
+        what is refused."""
+        path, _, query = self.path.partition("?")
+        if not path.startswith(_APPS_FILES_PREFIX):
+            if path.startswith("/apps/"):
+                self._send_json(405, {"error": "method not allowed"})
+                return True
+            return False
+        if self._apps_refuse_cross_site():
+            return True
+        segments = path[len(_APPS_FILES_PREFIX):].split("/")
+        chamber = urllib.parse.unquote(segments[0]) if segments else ""
+        target, why = chamber_apps.submit_target(CHAMBERS_DIR, chamber, segments[1:])
+        if target is None:
+            self._send_json(404 if why == "unknown chamber" else 400, {"error": why})
+            return True
+        if self.headers.get("Transfer-Encoding"):
+            self._send_json(411, {"error": "send the file with a Content-Length"})
+            return True
+        raw_length = (self.headers.get("Content-Length") or "").strip()
+        if not raw_length.isascii() or not raw_length.isdigit():
+            self._send_json(411, {"error": "send the file with a Content-Length"})
+            return True
+        length = int(raw_length) if len(raw_length) <= 18 else APPS_FILE_MAX_BYTES + 1
+        if length > APPS_FILE_MAX_BYTES:
+            self._send_json(413, {"error": f"larger than {APPS_FILE_MAX_BYTES} bytes"})
+            return True
+        replace = (urllib.parse.parse_qs(query).get("replace") or [""])[0] in ("1", "true")
+        if target.exists() and not replace:
+            self._send_json(409, {"error": "a file of that name exists (send ?replace=1 to replace it)"})
+            return True
+        data = self.rfile.read(length)
+        if len(data) != length:
+            # The client left mid-body: nothing is published.
+            self._send_json(400, {"error": "the body ended before its Content-Length"})
+            return True
+        tmp = None
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            fd, tmp = tempfile.mkstemp(prefix=".upload-", dir=str(target.parent))
+            with os.fdopen(fd, "wb") as fh:
+                fh.write(data)
+            if replace:
+                os.replace(tmp, target)
+            else:
+                # Exclusive: a link fails if the name exists, so two uploads
+                # racing for the same new name cannot both succeed.
+                os.link(tmp, target)
+                os.unlink(tmp)
+            tmp = None
+        except FileExistsError:
+            self._send_json(409, {"error": "a file of that name exists (send ?replace=1 to replace it)"})
+            return True
+        except OSError as exc:
+            self._send_json(500, {"error": f"not written: {exc.strerror or exc}"})
+            return True
+        finally:
+            if tmp is not None:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+        rel = target.relative_to(CHAMBERS_DIR / chamber).as_posix()
+        print(f"[web-gateway] app file written: {chamber}/{rel} ({len(data)} bytes)", flush=True)
+        self._send_json(201, {"status": "written", "chamber": chamber, "path": rel, "bytes": len(data)})
+        return True
+
+    def _handle_apps_sparql(self) -> None:
+        """POST /apps/api/sparql {"query", "endpoint"}: one read-only query,
+        answered as SPARQL JSON results. The same refusals as /sparql:
+        updates, SERVICE and another site's request."""
+        payload = self._read_json_body()
+        if payload is None or not isinstance(payload.get("query"), str):
+            self._send_json(400, {"error": "send {\"query\": \"…\"}"})
+            return
+        query = payload["query"]
+        if not query.strip() or len(query) > SPARQL_MAX_BODY:
+            self._send_json(400, {"error": "the query is empty or too long"})
+            return
+        if _sparql_cross_site(self.headers):
+            self._send_json(403, {"error": "a query sent from another site is not run"})
+            return
+        if _sparql_calls_out(query):
+            self._send_json(403, {"error": "federated queries (SERVICE) are not allowed"})
+            return
+        url = _sparql_endpoint_url(str(payload.get("endpoint") or "life"))
+        if url is None:
+            self._send_json(404, {"error": "no such endpoint"})
+            return
+        req = urllib.request.Request(
+            url, data=urllib.parse.urlencode({"query": query}).encode("utf-8"),
+            headers={"Accept": "application/sparql-results+json",
+                     "Content-Type": "application/x-www-form-urlencoded"}, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=SPARQL_PROXY_TIMEOUT) as resp:
+                body = resp.read(16 * 1024 * 1024 + 1)
+                status = resp.getcode()
+        except urllib.error.HTTPError as exc:
+            self._send_json(exc.code if 400 <= exc.code < 600 else 502,
+                            {"error": "the store refused the query",
+                             "detail": exc.read(2000).decode("utf-8", "replace")})
+            return
+        except (urllib.error.URLError, OSError, ValueError) as exc:
+            self._send_json(502, {"error": "store unreachable", "detail": str(exc)})
+            return
+        try:
+            result = json.loads(body)
+        except ValueError:
+            self._send_json(502, {"error": "the store did not answer JSON"})
+            return
+        self._send_json(status, result if isinstance(result, dict) else {"result": result},
+                        {"Cache-Control": "private, no-store"})
+
+    def _handle_apps_ask(self) -> None:
+        """POST /apps/api/ask: open or continue a dashboard thread addressed
+        to an agent. Body {"agent", "text", "thread"?, "title"?, "app":
+        {"chamber", "id"}?, attention fields (importance, due, lead, sphere,
+        tags, kind)}. The thread is the user's own (the app speaks for them,
+        as the composer does), with a note to Ara naming the app and the
+        agent to route to; it is never via the edge, so no turn it starts
+        may type on the paired device."""
+        payload = self._read_json_body()
+        if payload is None:
+            self._send_json(400, {"error": "invalid JSON"})
+            return
+        agent = str(payload.get("agent") or "ara").strip()
+        text = str(payload.get("text") or "").strip()
+        if not _AGENT_NAME_RE.match(agent):
+            self._send_json(400, {"error": "agent must be an agent's name"})
+            return
+        if not text or len(text) > 20000:
+            self._send_json(400, {"error": "text is empty or too long"})
+            return
+        app = payload.get("app") if isinstance(payload.get("app"), dict) else {}
+        chamber, app_id = str(app.get("chamber") or ""), str(app.get("id") or "")
+        source = (f"the chamber app {chamber}/{app_id}"
+                  if chamber_apps.app_dir(CHAMBERS_DIR, chamber, app_id) else "a chamber app")
+        context = (f"Sent from {source} on the user's behalf, addressed to the agent "
+                   f"'{agent}'. Route it to that agent (or answer as Ara when it is 'ara').")
+        spec = {k: payload[k] for k in ("importance", "due", "lead", "sphere", "tags", "kind")
+                if k in payload}
+        thread = str(payload.get("thread") or "").strip()
+        if thread:
+            if not _CONV_ID_RE.match(thread):
+                self._send_json(400, {"error": "invalid thread"})
+                return
+            conv = _conv_add_message(thread, "user", text, unread=False, context=context)
+            if conv is None:
+                self._send_conv_missing(thread)
+                return
+        else:
+            title = str(payload.get("title") or "").strip()[:120] or None
+            conv = _new_conv("user", DEFAULT_SESSION_KEY, title, "user", text, context=context)
+        if spec:
+            _attention_arrive_thread(conv, spec)
+        _start_conv_turn(conv["id"])
+        _conv_set_flags(conv["id"], pending=True)
+        self._send_json(201 if not thread else 200, {"thread": conv["id"],
+                                                     "href": f"/#conversation-{conv['id']}"})
+
     def _serve_inbox(self) -> bool:
         if not webdav_share.handles(self.path):
             return False
@@ -17594,10 +18281,14 @@ class Handler(BaseHTTPRequestHandler):
         return True
 
     def do_PUT(self):
+        if self._handle_apps_put():
+            return
         if not self._serve_inbox():
             self._send_json(405, {"error": "method not allowed"})
 
     def do_DELETE(self):
+        if self._handle_apps_delete():
+            return
         if not self._serve_inbox():
             self._send_json(405, {"error": "method not allowed"})
 
@@ -17666,6 +18357,11 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         if self._serve_inbox():
+            return
+        if self.path.split("?", 1)[0].rstrip("/") == "/internal/apps/reminders/fire":
+            self._handle_internal_reminder_fire()
+            return
+        if self._handle_apps_post():
             return
         if self.path.split("?", 1)[0] == content_policy.REPORT_PATH:
             self._handle_csp_report()
@@ -21674,6 +22370,22 @@ class Handler(BaseHTTPRequestHandler):
             return
         self._send_json(200, {"status": "redacted", "message_id": mid})
 
+    def _handle_internal_reminder_fire(self) -> None:
+        """The scheduler fires a reminder occurrence (scripts/scheduler.py,
+        fire_reminder). Token-gated like the agent conversation calls. Body
+        {"chamber", "app", "id", "occurrence"}."""
+        payload = self._agent_conversation_payload()
+        if payload is None:
+            return
+        occ = calendar_trigger.parse_instant(payload.get("occurrence"))
+        chamber, app, job_id = (str(payload.get(k) or "") for k in ("chamber", "app", "id"))
+        if occ is None or not (chamber_apps.NAME_RE.match(chamber) and chamber_apps.NAME_RE.match(app)
+                               and chamber_apps.JOB_ID_RE.match(job_id)):
+            self._send_json(400, {"error": "send chamber, app, id and an ISO occurrence"})
+            return
+        status, body = _reminder_fire(chamber, app, job_id, occ)
+        self._send_json(status, body)
+
     def _send_conv_missing(self, cid: str) -> None:
         """The answer for a thread that is not there: 410 Gone when the user
         deleted it (see _conv_deleted_at), 404 when it never was. The
@@ -21976,6 +22688,8 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(405, {"error": "POST only"}, {"Allow": "POST"})
             return
         if self._serve_inbox():
+            return
+        if self._serve_apps_get():
             return
         if self.path == "/health":
             state = _load_state()

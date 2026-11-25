@@ -199,7 +199,8 @@ def subscription_count() -> int:
 
 def notify(title: str, body: str, url: str = "/", tag: str | None = None,
            archived: bool = False,
-           urgency: str | None = None, topic: str | None = None) -> int:
+           urgency: str | None = None, topic: str | None = None,
+           extra: dict | None = None) -> int:
     """Push a notification to every device whose preferences match. Returns how
     many got it.
 
@@ -215,12 +216,18 @@ def notify(title: str, body: str, url: str = "/", tag: str | None = None,
     same topic instead of stacking up. Both are optional; absent, the push
     service's defaults apply, as before.
 
+    `extra` adds members to the payload the service worker reads beside
+    title, body, url and tag — a reminder's `actions` and the `api` path its
+    snooze and skip post to (webapp/sw.js); the four fixed members win.
+
     Best effort by contract: callers invoke this from request handlers and must
     not fail because a push service is down.
     """
     if not enabled():
         return 0
-    payload = json.dumps({"title": title, "body": body, "url": url, "tag": tag or url})
+    payload = dict(extra or {})
+    payload.update({"title": title, "body": body, "url": url, "tag": tag or url})
+    payload = json.dumps(payload)
     headers = {}
     if urgency in ("very-low", "low", "normal", "high"):
         headers["Urgency"] = urgency
@@ -256,13 +263,14 @@ def notify(title: str, body: str, url: str = "/", tag: str | None = None,
 
 def notify_async(title: str, body: str, url: str = "/", tag: str | None = None,
                  archived: bool = False,
-                 urgency: str | None = None, topic: str | None = None) -> None:
+                 urgency: str | None = None, topic: str | None = None,
+                 extra: dict | None = None) -> None:
     """Fan out in the background so the triggering HTTP response isn't delayed."""
     if not enabled():
         return
     threading.Thread(
         target=notify,
-        args=(title, body, url, tag, archived, urgency, topic),
+        args=(title, body, url, tag, archived, urgency, topic, extra),
         name="push-notify",
         daemon=True,
     ).start()
