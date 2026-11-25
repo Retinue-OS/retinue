@@ -202,7 +202,7 @@ def test_one_run_at_a_time():
         r = ct.TriageRunner(store, classify=slow, digest=lambda c: digest(c, "t"))
         assert r.start([{"id": "a", "seq": 1}])["started"]
         assert r.running
-        assert r.start([{"id": "b", "seq": 1}]) == {"started": False, "running": True}
+        assert r.start([{"id": "b", "seq": 1}]) == {"started": False, "running": True, "busy": True}
         gate.set()
         r.join(10)
         assert not r.running
@@ -237,6 +237,38 @@ def test_action_chats_get_a_bounded_followup():
         assert e["a4"]["followup"] == {"state": "skipped", "why": "over this run's limit"}
 
 
+def test_no_new_run_while_followups_work():
+    """Sorting is done, a follow-up still works: a press then starts
+    nothing, or two turns would work one companion and the new entry would
+    orphan the old note."""
+    with tempfile.TemporaryDirectory() as d:
+        store = ct.TriageStore(Path(d) / "t.json")
+        gate = threading.Event()
+        entered = threading.Event()
+
+        def followup(cid, entry):
+            entered.set()
+            gate.wait(5)
+            return "note"
+
+        r, _ = _runner(store, {"a": "action"}, followup=followup)
+        r.start([{"id": "a", "seq": 1}])
+        assert entered.wait(5)
+        deadline = time.time() + 5
+        while r.running and time.time() < deadline:
+            time.sleep(0.01)
+        assert not r.running and r.busy, "sorted, but a note is on its way"
+        assert store.snapshot()["run"]["state"] == "done"
+        assert r.start([{"id": "a", "seq": 1}], again=True) == {
+            "started": False, "running": False, "busy": True}
+        gate.set()
+        r.join(10)
+        assert not r.busy
+        assert store.snapshot()["entries"]["a"]["followup"]["text"] == "note"
+        assert r.start([{"id": "a", "seq": 1}], again=True)["started"]
+        r.join(10)
+
+
 def test_a_followup_never_writes_onto_a_later_runs_entry():
     with tempfile.TemporaryDirectory() as d:
         store = ct.TriageStore(Path(d) / "t.json")
@@ -268,6 +300,7 @@ if __name__ == "__main__":
     test_a_failed_batch_leaves_its_chats_unsorted()
     test_one_run_at_a_time()
     test_action_chats_get_a_bounded_followup()
+    test_no_new_run_while_followups_work()
     test_a_followup_never_writes_onto_a_later_runs_entry()
     test_followup_prompt_quotes_the_note_as_data()
     print(f"all chat-triage tests passed ({time.time() - t0:.1f}s)")

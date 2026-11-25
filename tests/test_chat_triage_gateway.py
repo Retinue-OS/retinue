@@ -74,6 +74,17 @@ def main() -> int:
         wg.send_message = lambda *a, **k: TURNS.append((a, k)) or {
             "response": "Pay the invoice by Friday; I staged a short reply.",
             "model_name": "stub", "cost_usd": 0.0}
+        # Another turn's reply lands in the companion right after the
+        # follow-up's own: the triage entry must keep the follow-up's.
+        real_add = wg._conv_add_message
+
+        def add_then_another(cid, role, text, **kw):
+            conv = real_add(cid, role, text, **kw)
+            if role == "assistant" and text.startswith("Pay the invoice"):
+                real_add(cid, "assistant", "Some other turn's reply.", unread=True)
+            return conv
+
+        wg._conv_add_message = add_then_another
         wg.CHAT_TRIAGE_MODEL = "fast-model"
         wg.CHAT_TRIAGE_FOLLOWUP_MODEL = "frontier-model"
         wg.contacts_mod.commit = lambda *a, **k: None
@@ -139,6 +150,8 @@ def main() -> int:
             assert conv["messages"][-1]["role"] == "assistant"
             assert "archive" not in [e["bucket"] for e in [entries[action[0]]]]
 
+            wait_for(lambda: not mail._http(base, "GET", "/chats/triage")[1]["busy"],
+                     "the follow-ups to be over")
             # A second press: everything is fresh, nothing is sorted again.
             status, doc = mail._http(base, "POST", "/chats/triage", {})
             assert status == 202 and doc["total"] == 0 and doc["skipped"] == len(unread), doc

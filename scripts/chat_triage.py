@@ -316,22 +316,34 @@ class TriageRunner:
         self.log = log
         self._lock = threading.Lock()
         self._running = False
+        # Follow-ups queued or working, of this run or the one before: a new
+        # run waits for them, or two turns would work one companion (and its
+        # draft) at once, and the new entries would orphan the old notes.
+        self._open = 0
         self._followups = None  # the pool of the run in progress
         self._thread: threading.Thread | None = None
 
     @property
     def running(self) -> bool:
+        """Sorting: a run's batches are not all answered yet."""
         with self._lock:
             return self._running
+
+    @property
+    def busy(self) -> bool:
+        """Sorting, or a follow-up still queued or working: no new run."""
+        with self._lock:
+            return self._running or self._open > 0
 
     def start(self, chats: list[dict], *, again: bool = False) -> dict:
         """Start a run over ``chats`` (``[{id, seq}]``, the chats in scope,
         newest first). A chat whose stored result is fresh is skipped unless
         ``again``. Returns ``{started, total, skipped}``; ``started`` False
-        while a run is already going (the caller shows that run)."""
+        while a run is sorting or its follow-ups still work (the caller
+        shows that run)."""
         with self._lock:
-            if self._running:
-                return {"started": False, "running": True}
+            if self._running or self._open > 0:
+                return {"started": False, "running": self._running, "busy": True}
             todo = [c for c in chats
                     if again or not is_fresh(self.store.entry(c["id"]), c.get("seq"))]
             run_id = f"{int(time.time() * 1000):x}"
@@ -425,6 +437,8 @@ class TriageRunner:
                 counted["sorted"] += 1
                 self.store.set_run(sorted=counted["sorted"])
             if follow:
+                with self._lock:
+                    self._open += 1
                 self._followups.submit(self._follow, c["id"], dict(entry))
 
     def _unsorted(self, run_id: str, c: dict, why: str, counted: dict, count_lock) -> None:
@@ -435,6 +449,13 @@ class TriageRunner:
             self.store.set_run(failed=counted["failed"])
 
     def _follow(self, chat_id: str, entry: dict) -> None:
+        try:
+            self._follow_one(chat_id, entry)
+        finally:
+            with self._lock:
+                self._open -= 1
+
+    def _follow_one(self, chat_id: str, entry: dict) -> None:
         run = entry.get("run")
         self.store.set_followup(chat_id, run, state="working", started=_now())
         text = None

@@ -51,7 +51,10 @@ the view is the press: `POST /chats/triage {}` sorts every chat on the
 *Unread* tab that has no fresh word — a chat sorted before and not spoken in
 since (same `inbound_seq`) is not sorted again, so pressing twice spends
 nothing the second time. **Sort again** (`{again: true}`) sorts them all.
-One run at a time; a press while one runs shows that run.
+One run at a time, and a run lasts until its follow-ups are over too: a
+press while one sorts or while Ara's notes are still on their way starts
+nothing and shows that run (`busy`; *Sort again* is disabled meanwhile), so
+two turns never work one companion and its draft at once.
 
 Why only the *Unread* tab: that is the backlog. A read chat triage sorted
 before stays in its section until it is archived, deleted or spoken in; a
@@ -119,7 +122,9 @@ in the draft where one is wanted — and nothing else: no send, no flag, no
 calendar entry, nothing queued; such steps are offered as chips. The turn
 carries no user-turn proof and may not type on a paired device (it is an
 arrival-style turn, `_conv_worker(arrival=…)`), and it pushes nothing: the
-triage view shows it. Its reply, as words, is copied onto the triage entry
+triage view shows it. Its own reply — handed back by the worker that stored it, never read off
+the thread, where another turn may have answered since — is copied, as
+words, onto the triage entry
 (600 characters; the full note is in the companion).
 
 A follow-up is a full-tool turn on a correspondent's words — the same
@@ -138,12 +143,13 @@ follow-up writes only onto the entry of its own run.
 
 ## API
 
-- `GET /chats/triage` → `{enabled, running, model, run, entries}`. Which
+- `GET /chats/triage` → `{enabled, running, busy, model, run, entries}`
+  (`running`: sorting; `busy`: sorting or a follow-up still open). Which
   entries are shown is the page's to decide against its list (archived chats
   and chats with a newer `inbound_seq` are not in a bucket).
 - `POST /chats/triage` (body `{again?}`) → `202 {started: true, total,
   skipped, …payload}` for a run started (`total` 0: nothing new to sort),
-  `200 {started: false, running: true, …}` while one runs, `409` with
+  `200 {started: false, busy: true, …}` while one sorts or its follow-ups work, `409` with
   `CHAT_TRIAGE` off, `502` with the life store down, `403` cross-site (the
   press spends model calls on the user's behalf).
 

@@ -141,6 +141,20 @@ await ok('the poll: buckets, Ara\'s note escaped, not sorted with reasons, the l
   assert.equal(el._triTimer, null, 'nothing open: no further poll');
 });
 
+await ok('no second press while Ara still writes a note, though the sorting is done', async () => {
+  const el = await mount(payload(LIST));
+  const writing = JSON.parse(JSON.stringify(DONE));
+  writing.entries.u1.followup = { state: 'working' };
+  writing.busy = true;
+  await openTriage(el, writing);
+  assert.ok(html(el).includes('data-triage="again" disabled'), html(el));
+  const idle = JSON.parse(JSON.stringify(DONE));
+  idle.busy = false;
+  el._tri = idle;
+  el._rerender();
+  assert.ok(!html(el).includes('data-triage="again" disabled'));
+});
+
 await ok('Archive all: one request per row, one Undo for all', async () => {
   const el = await mount(payload(LIST));
   await openTriage(el, DONE);

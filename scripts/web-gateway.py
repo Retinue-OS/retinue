@@ -5088,7 +5088,8 @@ _conv_pending_lock = threading.Lock()
 
 def _conv_worker(cid: str, session_key: str, *, arrival: str | None = None,
                  push: bool = True, error_reply: bool = True,
-                 arrival_turn: str | None = None, model: str | None = None) -> bool:
+                 arrival_turn: str | None = None, model: str | None = None,
+                 reply_sink: list | None = None) -> bool:
     """Background worker: ask Ara for the next turn in a thread and store it.
 
     `arrival` runs the turn on a chat message instead of on something the user
@@ -5096,7 +5097,9 @@ def _conv_worker(cid: str, session_key: str, *, arrival: str | None = None,
     itself already notified the user's devices, and a second push for the same
     message would say the same thing twice. `model` runs this one turn on the
     model named, whatever the thread's own choice (chat triage's follow-up
-    asks for the frontier tier: docs/chat-triage.md). `error_reply` False stores nothing
+    asks for the frontier tier: docs/chat-triage.md), and `reply_sink` gets
+    the reply this turn stored — its own, never another turn's that landed in
+    the thread meanwhile. `error_reply` False stores nothing
     for a turn that failed (a mail's arrival turn, which is retried by design).
     `arrival_turn` is that turn's token (send_message). A turn without
     `arrival` is the user's own conversation with Ara: its sessions are
@@ -5323,6 +5326,8 @@ def _conv_worker(cid: str, session_key: str, *, arrival: str | None = None,
         # this turn. Saying otherwise would let a gateway mark an inbound
         # message delivered against a reply that does not exist.
         return False
+    if reply_sink is not None:
+        reply_sink.append(reply)
     if push:
         # A reply that is only shell actions still says something: a fixed
         # phrase, never the text to type, which may be a sensitive one and must
@@ -15067,15 +15072,14 @@ def _triage_followup(chat_id: str, entry: dict) -> str | None:
     except Exception as exc:  # noqa: BLE001
         print(f"[web-gateway] chat triage: no companion for {chat_id} ({exc})", flush=True)
         return None
+    stored: list = []
     ok = _conv_worker(cid, f"conv:{cid}", arrival=chat_triage.followup_prompt(entry),
-                      push=False, model=CHAT_TRIAGE_FOLLOWUP_MODEL or None)
+                      push=False, model=CHAT_TRIAGE_FOLLOWUP_MODEL or None,
+                      reply_sink=stored)
     if not ok:
         return None
-    conv = _load_conv(cid) or {}
-    for m in reversed(conv.get("messages") or []):
-        if isinstance(m, dict) and m.get("role") == "assistant":
-            return attention_store.markup_words(str(m.get("text") or ""))
-    return ""
+    # This turn's own reply, as words; none (a turn another one covered).
+    return attention_store.markup_words(str(stored[-1] or "")) if stored else ""
 
 
 _TRIAGE_STORE = chat_triage.TriageStore(CHAT_STATE_DIR / "triage.json")
@@ -15094,7 +15098,7 @@ def _triage_payload() -> dict:
     what it said per chat. Which of those chats are still to be shown (not
     archived, no newer message) is the page's to decide against its list."""
     doc = _TRIAGE_STORE.snapshot()
-    return {"enabled": CHAT_TRIAGE, "running": _TRIAGE.running,
+    return {"enabled": CHAT_TRIAGE, "running": _TRIAGE.running, "busy": _TRIAGE.busy,
             "model": CHAT_TRIAGE_MODEL, "run": doc.get("run"),
             "entries": doc.get("entries") or {}}
 

@@ -459,7 +459,7 @@ export function listGroup(chat) {
 // Whether triage has work open: a run sorting, or a note Ara still writes.
 export function triageBusy(doc) {
   if (!doc) return false;
-  if (doc.running || (doc.run && doc.run.state === 'running')) return true;
+  if (doc.running || doc.busy || (doc.run && doc.run.state === 'running')) return true;
   return Object.values(doc.entries || {}).some((e) =>
     e && e.followup && ['queued', 'working'].includes(e.followup.state));
 }
@@ -1078,10 +1078,13 @@ class RetinueChats extends RetinueCard {
     const secs = this._triageSections(d);
     const st = this._triageStatus();
     const sorting = !!(this._tri && (this._tri.running || (this._tri.run || {}).state === 'running'));
+    // No second press while a run sorts or Ara's notes are on their way: the
+    // server refuses it then (a new run would set two turns on one chat).
+    const busy = triageBusy(this._tri);
     const head = '<div class="tri-head">' +
       '<button type="button" class="tri-back" data-triage="close" title="Back to all chats">&#8249; Chats</button>' +
       '<h2 class="tri-title">Triage</h2>' +
-      `<button type="button" class="tri-again" data-triage="again"${sorting ? ' disabled' : ''} ` +
+      `<button type="button" class="tri-again" data-triage="again"${busy ? ' disabled' : ''} ` +
       'title="Sort every unread chat again, also those sorted before">Sort again</button></div>' +
       `<p class="tri-status${st.err ? ' err' : ''}${st.busy ? ' busy' : ''}" role="status">${esc(st.text)}</p>`;
     const shownIds = [];
