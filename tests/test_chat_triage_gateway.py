@@ -249,10 +249,18 @@ def main() -> int:
             wg._triage_from_arrival(target, moved, "x")
             assert target not in mail._http(base, "GET", "/chats/triage")[1]["entries"] or \
                 mail._http(base, "GET", "/chats/triage")[1]["entries"][target].get("source") != "arrival"
+            # Part of a batch too big to quote whole: no word.
+            wg._triage_from_arrival(target, record, "x", partial=True)
+            got = mail._http(base, "GET", "/chats/triage")[1]["entries"].get(target) or {}
+            assert got.get("source") != "arrival", got
             wg._triage_from_arrival(target, record, "Ara's  note.")
             e = mail._http(base, "GET", "/chats/triage")[1]["entries"][target]
             assert e["source"] == "arrival" and e["seq"] == seq and e["bucket"] == "archive", e
             assert e["followup"]["text"] == "Ara's note.", e
+            # An older turn's word (an earlier message) does not replace it.
+            older = dict(record, seqs=[seq - 1], triage={"bucket": "delete", "note": "old"})
+            wg._triage_from_arrival(target, older, "y")
+            assert mail._http(base, "GET", "/chats/triage")[1]["entries"][target]["bucket"] == "archive"
             calls_before = len(CALLS)
             wait_for(lambda: not mail._http(base, "GET", "/chats/triage")[1]["busy"], "idle")
             status, doc = mail._http(base, "POST", "/chats/triage", {"again": True})

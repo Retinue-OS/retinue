@@ -309,6 +309,21 @@ class TriageStore:
             self._doc["entries"][chat_id] = entry
             self._save()
 
+    def put_arrival(self, chat_id: str, entry: dict) -> bool:
+        """An arrival turn's word, unless the entry there describes a newer
+        message (a sorting that ran while the turn did, a later turn's
+        word): the check and the write under one lock. True when written."""
+        seq = entry.get("seq")
+        with self.lock:
+            cur = self._doc["entries"].get(chat_id)
+            have = cur.get("seq") if isinstance(cur, dict) else None
+            if (isinstance(have, int) and not isinstance(have, bool)
+                    and isinstance(seq, int) and have > seq):
+                return False
+            self._doc["entries"][chat_id] = entry
+            self._save()
+            return True
+
     def put_unless_arrival(self, chat_id: str, entry: dict) -> bool:
         """A sorting's entry, unless an arrival turn's word for the same
         message is there: the check and the write under one lock, so a word

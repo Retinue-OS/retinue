@@ -435,6 +435,17 @@ def test_a_sorting_never_overwrites_an_arrival_word_in_one_write():
         assert store.entry("b")["source"] == "arrival"
 
 
+def test_an_arrival_word_never_replaces_an_entry_for_a_newer_message():
+    with tempfile.TemporaryDirectory() as d:
+        store = ct.TriageStore(Path(d) / "t.json")
+        store.put("a", {"bucket": "archive", "seq": 6, "run": "r"})
+        assert not store.put_arrival("a", ct.arrival_entry("delete", "old", 5))
+        assert store.entry("a")["seq"] == 6 and store.entry("a").get("source") is None
+        assert store.put_arrival("a", ct.arrival_entry("action", "same", 6)), "the same message: the word wins"
+        assert store.entry("a")["source"] == "arrival"
+        assert store.put_arrival("b", ct.arrival_entry("archive", "new chat", 1))
+
+
 if __name__ == "__main__":
     t0 = time.time()
     test_prompt_numbers_and_escapes_every_chat()
@@ -455,4 +466,5 @@ if __name__ == "__main__":
     test_a_note_changed_mid_run_waits_for_the_next_run()
     test_an_arrival_turns_word_stands_until_a_newer_message()
     test_a_sorting_never_overwrites_an_arrival_word_in_one_write()
+    test_an_arrival_word_never_replaces_an_entry_for_a_newer_message()
     print(f"all chat-triage tests passed ({time.time() - t0:.1f}s)")

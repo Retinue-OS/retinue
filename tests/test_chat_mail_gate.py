@@ -2214,7 +2214,10 @@ def test_a_chain_of_deferred_turns_archives_its_thread(base, wg):
                     if job in wg._INSTRUCTED_RINGS:
                         wg._instructed_ring_timeout(job)
             if len(TURNS) != 2 or second != "none":
-                _verdict(base, chat, 0)(prompt)
+                # Each half of the split batch also gives a triage word
+                # (docs/chat-triage.md, "Arrival turns") — which neither may
+                # leave, having seen only part of the thread.
+                _verdict(base, chat, 0, triage="archive", triage_note="half")(prompt)
 
         TURNS.clear()
         GW["requests"].clear()
@@ -2243,6 +2246,11 @@ def test_a_chain_of_deferred_turns_archives_its_thread(base, wg):
         assert "FINAL NOTICE" not in _instruction_part(TURNS[1]["prompt"])
         assert "FINAL NOTICE" in _instruction_part(TURNS[2]["prompt"])
         doc = wg._CHAT_STATE.get(chat)
+        # No half of the split batch left a triage word: what the store holds
+        # (if anything) is not the halves' "archive" for the thread as it is.
+        word = wg._TRIAGE_STORE.entry(chat)
+        assert not (word and word.get("source") == "arrival"
+                    and word.get("seq") == int(doc.get("inbound_seq") or 0)), word
         out = dict(answers=answers, doc=doc, mids=mids, hooks=_hooks("/chats/archive"),
                    home=chat in mail._home(base), worked=worked, pushes=len(PUSHES))
         wg._CONTACTS.delete(firm["key"])

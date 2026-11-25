@@ -11445,7 +11445,12 @@ def _chat_arrival_worker(chat_id: str, cid: str, worker: object = None) -> None:
         if ok:
             # The turn's word for the Chats page's Triage (its --triage), so a
             # later press spends no second judgement on these messages.
-            _triage_from_arrival(live, record, replies[-1] if replies else None)
+            # A batch too big to quote whole is worked in turns, and no one of
+            # them has seen every mail: none leaves a word, and the next press
+            # judges the thread (a turn's "archive" must not cover a mail it
+            # was told to leave for another turn).
+            _triage_from_arrival(live, record, replies[-1] if replies else None,
+                                 partial=bool(deferred) or any(a.get("deferred") for a in arrivals))
             # Durably: a mail whose turn completed is worked, also for the
             # process that comes after this one (_start_chat_arrival_turn).
             with _chat_turns_lock:
@@ -11835,7 +11840,8 @@ def _parse_triage_verdict(payload: dict) -> dict | None:
     return {"bucket": bucket, "note": " ".join(note.split())[:chat_triage.NOTE_CHARS]}
 
 
-def _triage_from_arrival(chat_id: str, record: dict, reply: str | None) -> None:
+def _triage_from_arrival(chat_id: str, record: dict, reply: str | None, *,
+                         partial: bool = False) -> None:
     """Write a completed arrival turn's triage word into the triage store
     (docs/chat-triage.md, "Arrival turns"), for the message count it judged:
     the newest arrival it worked. A chat spoken in since reads as stale
@@ -11846,9 +11852,14 @@ def _triage_from_arrival(chat_id: str, record: dict, reply: str | None) -> None:
     the turn ran renumbers the count; by the place they had at the start
     only where the chat was not merged. A message placed neither way leaves
     no word — the next press judges the chat, rather than trusting a count
-    that may name another message."""
+    that may name another message.
+
+    ``partial``: the turn worked part of a batch too big to quote whole (the
+    newest mails, or the older ones deferred to it) — it leaves no word. And
+    a word never replaces an entry for a newer message (put_arrival): a
+    sorting that ran meanwhile, or a later turn's word."""
     triage = record.get("triage")
-    if not triage:
+    if not triage or partial:
         return
     doc = _CHAT_STATE.get(chat_id)
     unmoved = chat_id in (record.get("names") or ())
@@ -11860,7 +11871,7 @@ def _triage_from_arrival(chat_id: str, record: dict, reply: str | None) -> None:
     if not places or None in places:
         return
     try:
-        _TRIAGE_STORE.put(chat_id, chat_triage.arrival_entry(
+        _TRIAGE_STORE.put_arrival(chat_id, chat_triage.arrival_entry(
             triage["bucket"], triage.get("note") or "", max(places),
             attention_store.markup_words(reply) if reply else None))
     except OSError as exc:
@@ -15348,7 +15359,8 @@ def _triage_start(again: bool, feedback=None) -> tuple[int, dict]:
     run started, 200 while one is already running (that run's state).
     ``feedback`` is a note from the user on how to sort: saved for every
     run from now on, and the run it comes with sorts every unread chat again
-    (``again``) so the note applies to all of them. A note is saved even
+    (``again``) — but one an arrival turn judged — so the note applies to
+    all of them. A note is saved even
     while a run is busy; the answer then says no run started."""
     if not CHAT_TRIAGE:
         return 409, {"error": "chat triage is switched off (CHAT_TRIAGE)"}

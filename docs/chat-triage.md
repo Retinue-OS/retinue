@@ -191,6 +191,13 @@ chat-verdict.py --chat <id> --triage <action|archive|delete> --triage-note "<one
   A newer message makes it stale, and the next press sorts the chat as any
   other. A batch that was out when the word landed does not overwrite it:
   the check and the write are one operation under the store's lock.
+- A word never replaces an entry for a **newer** message — a sorting that
+  ran while the turn did, a later turn's word — the same compare-and-write.
+- A mail batch too big to quote whole is worked in turns (the newest mails
+  first, the older ones deferred to a turn of their own). No one of those
+  turns has seen every mail, so **none leaves a word**: a first turn's
+  `archive` must not cover an older mail it was told to leave alone. The
+  next press judges the thread.
 
 ### Feedback
 
@@ -199,7 +206,8 @@ what the sorting got wrong, in the user's own words ("Mails from my bank
 are never to be deleted", "a school newsletter is action"), and the notes
 saved so far, each with ✕ to take it back. **Save and sort again** keeps the
 note for every run from now on and sorts every unread chat again with it
-(`again`), so the correction applies to the whole list at once. While a run
+(`again`) — but one an arrival turn judged and nobody has spoken in since
+(*Arrival turns*) — so the correction applies to the whole list at once. While a run
 is busy the note is still saved, and the next press uses it.
 
 The notes reach the sorting pass as a `<guidance>` block between the
