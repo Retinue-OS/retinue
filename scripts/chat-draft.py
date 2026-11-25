@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Stage a messenger chat's shared draft from a retinue agent.
+"""Stage a chat's shared draft from a retinue agent.
 
-Every chat (see the web-gateway's /chats API) carries one shared draft — the
-chat composer's text area. An agent composes *into* it rather than sending:
-under the `verify` send policy the user's send button is the approval, so
-staging the draft is exactly how an agent's proposed reply reaches the wire —
-with the user's tap, in the user's name, editable up to the last moment.
+Every chat (see the web-gateway's /chats API) — a messenger chat or a mail
+thread — carries one shared draft: the chat composer's text area. An agent
+composes *into* it rather than sending: under the `verify` send policy the
+user's send button is the approval, so staging the draft is exactly how an
+agent's proposed reply reaches the wire — with the user's tap, in the user's
+name, editable up to the last moment.
 
     chat-draft.py --chat "signal:+41791234567" \
         "Samstag passt — ich bin um 18:30 da. Soll ich etwas mitbringen?"
@@ -13,11 +14,21 @@ with the user's tap, in the user's name, editable up to the last moment.
     chat-draft.py --chat "whatsapp:4179555@s.whatsapp.net" --agent Coach \
         "Training bestätigt für Donnerstag 18:00."
 
+    chat-draft.py --chat "email:~me@example.org:root-id@example.org" \
+        "Thank you — Thursday at ten suits me."
+
     chat-draft.py --chat "telegram:774301992" --clear
 
 The chat id is ``<channel>:<chat-key>`` — the same id the chat surface shows;
 it is percent-encoded into the URL here, so keys containing '/', '@' or ':'
 need no quoting beyond the shell's.
+
+A mail thread's draft is a reply to that thread: the user's send press hands
+it to the mail gateway, which addresses it from the thread and sends it under
+the e-mail send policy (docs/mail-chats.md, "Writing"). Staging is all this
+script does on any channel. Where a mail is to be *sent* by an agent — the
+user asked for it in the thread's companion, or a standing instruction says
+so — that is scripts/mail-push.py with `--chat <id>`, under the same policy.
 
 The write is refused (HTTP 409) when the draft currently holds non-empty text
 the *user* typed — an agent must never clobber what the user is composing. Pass
@@ -51,7 +62,7 @@ DEFAULT_TIMEOUT = float(os.environ.get("CONVERSATION_BACKEND_TIMEOUT", "30"))
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Stage (or clear) a messenger chat's shared draft."
+        description="Stage (or clear) a chat's shared draft."
     )
     parser.add_argument("text", nargs="?", default="",
                         help="the draft text to stage")

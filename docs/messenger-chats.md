@@ -8,6 +8,15 @@ path now lands in the chat, not in triage.** Phases 5 and 6 (summaries, forking,
 the polish list) are still the target picture. This supersedes the "one
 dashboard conversation per inbound message" model for messenger channels.
 
+**E-mail has since joined it.** A mail thread is a chat in every sense this
+document defines — the same ledger, list, page, state and companion — and
+only what differs is stated in [mail-chats.md](mail-chats.md): the identity
+(a thread's root `Message-ID`), a name that is a subject, the trimmed bubble
+with its original, and a mailbox behind the chat. Where this document says
+"messenger", read "channel"; where it leaves e-mail out, that document picks
+it up. What the web gateway serves for a mail chat is in
+[dashboard.md](dashboard.md), "Mail threads as chats".
+
 ## Problem
 
 Messenger support today routes every inbound message through triage into
@@ -164,7 +173,8 @@ because of what the store buys:
 - **The merged view is a query, not a program.** The chats list — every chat
   across every channel with its latest message — is one `GROUP BY`; a thread
   page is a filter on `kb:chat` with `ORDER BY`/`LIMIT`; an unread badge is a
-  `COUNT` above `last_read`. The raw path re-implements all of that as
+  `COUNT` above the chat's read cut-off (see *Unread · Read · Archived*). The
+  raw path re-implements all of that as
   directory scans over one-file-per-message stores that will grow to tens of
   thousands of files, on every dashboard poll.
 - **One parser, not two.** `inbound_store`'s deliberately minimal N-Triples
@@ -197,7 +207,9 @@ anyway: arrivals (and own-device echoes) flow through
 `POST /internal/chats/inbound`, and sends flow through the web-gateway itself.
 Each such event also drops an entry into a small in-memory overlay; the chat
 API serves the store's answer plus whatever overlay entries the store has not
-caught up to, deduplicated on `kb:messageId`. Entries expire after a minute or
+caught up to, deduplicated on the chat and `kb:messageId` (an id is unique
+within a conversation, not across them: one mail to two of the user's
+addresses is one id in two chats). Entries expire after a minute or
 so — by then the store holds them — and the overlay is disposable: a restart
 loses nothing but a few seconds of freshness. The message a push announced is
 *by construction* in the view the tap opens, because the same event produced
@@ -243,7 +255,22 @@ persistent volume — high-churn disposable data, the news-store precedent):
 
 - `draft` + a version counter (sha-guard style, like project-file writes) — the
   shared text area;
-- `last_read` — the user's read watermark, from which unread badges derive;
+- `last_read` — the user's **read mark**: up to here the chat is dealt with.
+  Set by a reply and by *Mark as read*, never by opening the chat; forward
+  only, but for the guarded undo of a *Mark as read* (see *Unread · Read ·
+  Archived* below);
+- `inbound_seq`, `read_inbound` — how many inbound messages have landed on
+  the rail, and how many of them the newest read covered. The mark says
+  *when*; these say in which order things happened here, which is what
+  decides whether a message came after the user last dealt with the chat
+  (same section). `inbound_recent` holds the message ids of the newest
+  arrivals with their place in the count, so that a message is counted once
+  however often its event is delivered; `inbound_gone` holds the places of
+  counted arrivals that are gone from where they came from (a mail deleted
+  in a client), which are no unread messages;
+- `inbound_ahead`, `read_ahead` — the latest stamp an arrival carried from a
+  little ahead of the gateway's clock, and how far past `last_read` the
+  newest read reaches because of it (same section);
 - `archived`, `muted` — the conversation model's pair, adopted verbatim so
   both rails share one mental model. A chat never *ends*, but the semantics
   transfer exactly: `archived` drops the chat from the card and the default
@@ -259,7 +286,34 @@ persistent volume — high-churn disposable data, the news-store precedent):
 - `summary`, `summary_watermark` — the rolling summary and the timestamp up to
   which it has folded both rails;
 - `companion` — the companion thread's conversation id, once created;
+- `pending` — a copy of the sends of this chat that are not over in its
+  gateway's queue (a mail chat's only; see *Trust model*, "E-mail"): each
+  waiting for approval, being sent, or failed — with the reason, and whether
+  the mail may have gone out all the same — until the user dismisses it.
+  The gateway's queue is the truth and the copy follows it; it is what the
+  chat list counts from and what the chat page shows while the gateway is
+  away. An entry its gateway answers for as dismissed, or no longer holds
+  (a send that failed for certain is removed when it is dismissed), is
+  over and leaves the copy, whatever else it says;
+- `refused` — whom a mail of the user's did not reach: the recipients the
+  mail server refused while it took the mail for the others, by the mail's
+  `Message-ID` (a mail chat's only);
+- `unsent` — true for a chat that so far is nothing but a mail of the user's
+  own that has not gone out (a queued new mail). Such a chat is forgotten
+  when that send is denied, retracted, dismissed or gone — a new mail that
+  failed for certain, its chat made by a poll while its SMTP session
+  lasted, included;
 - display metadata (resolved name, group flag) cached from the gateway.
+
+Beside the documents sit two small files of their own. `mailbox/owed.json`
+is the durable queue of calls a chat's gateway is still owed — a read mark or
+an archive that did not reach the mailbox (`chat_state.OwedCalls`; see "The
+mailbox follows the chat" below) — kept on disk so a restart of the
+web-gateway forgets none. And one small index, `merged/into.json`: which chat ids
+were folded into which chat. Only mail threads merge
+([mail-chats.md](mail-chats.md), "Threading"); the index is what lets an id
+from before a merge be answered with where the chat went, and it forgets a
+chat that is deleted.
 
 Single-writer: only the web-gateway writes chat state (user edits and the
 token-gated agent endpoints both go through it).
@@ -288,22 +342,265 @@ with). Without it configured, deletion is refused. The
 dashboard's Archived tab is where the action lives (swipe left → Delete, two
 taps).
 
+A **mail thread** is deleted by the same call, which means more to its
+gateway ([mail-chats.md](mail-chats.md), "The mailbox follows the chat"):
+the thread's mails are moved to the mailbox's Trash — nothing is expunged —
+and only then is the mirror erased, the thread's queued sends with it; a
+move that failed is reported like a file that could not be erased, and
+nothing is — with the gateway's own sentence as the reason where it gives
+one (a mailbox without a Trash folder, and which variable names one),
+passed on as one bounded line of text. Only the gateway that serves the
+thread's mailbox is asked: a
+mail ledger, its mailbox and its queue are per account. The order is the
+same on both sides — the web-gateway erases its state, its copy of the
+queued sends and the companion only after that gateway has answered that all
+of it is done.
+
+**The mailbox follows the chat** in two more ways, which are not erasures and
+need no capability: a read mark or a reply is passed on to the chat's gateway
+as `POST /chats/read`, an archive as `POST /chats/archive`, each
+`{chat, account}`. Generic by contract — the call goes to the chat's own
+gateway on every channel, and one with no mailbox behind it answers 404 (the
+messenger gateways do) and is owed nothing. (A *mail* gateway's 404 is its
+word about one thread — "not this gateway's account" — and never read as "no
+mailbox".) Best-effort, after the state change and never part of it; the
+undo of a mark and an un-archive call nothing. A call that could not be made
+is owed: kept on disk, and made again on a timer until it goes through or no
+longer says what the chat says. The mechanics are in
+[dashboard.md](dashboard.md), "Writing mail".
+
+Because they reach a real mailbox now, **the read mark and the flags are the
+user's own act like a send**: `POST /chats/<id>/read` and
+`POST /chats/<id>/flags` answer 403 to a request another site's page made the
+browser send (a `Sec-Fetch-Site` other than `same-origin` or `none`), on
+every channel and for every body — the undo and a star included. The flags,
+like a send and a delete, are accepted only through the reverse proxy too —
+refusing a caller inside the container where `EDGE_PROXY_PEERS` names the
+proxy, and without it only a loopback peer and one that is the address the
+caller dialled ([dashboard.md](dashboard.md), "Who is asking"): an agent sets
+a chat's flags by its own door (`POST /internal/chats/<id>/flags`,
+`chat-flags.py`).
+
+### Unread · Read · Archived
+
+Every chat is in exactly one of three groups, on every channel:
+
+- **Unread** — its latest inbound message has neither been replied to nor
+  marked read.
+- **Read** — it has: by a reply the gateway sees, or by **Mark as read**. A
+  reply from the dashboard's composer is seen on every channel. One from the
+  user's own phone or another client is seen on Signal, WhatsApp and
+  Telegram, which echo the user's own messages. **SMS has no such echo** (the
+  SMS gateway receives only `sms:received` and records only what it sends
+  itself), so an SMS answered in the phone's own SMS app stays *Unread* until
+  it is marked read.
+- **Archived** — the `archived` flag, as before. Archived wins: a muted chat
+  stays there however much arrives.
+
+**Opening a chat does not mark it read.** Looking is not dealing with: a chat
+the user glanced at on the way to something else must still be in *Unread*
+when they come back. A new inbound message moves a read chat back to *Unread*
+(and un-archives it unless it is muted), whatever its timestamp says: it
+landed after everything that made the chat read.
+
+**The derivation.** A chat's `unread` is taken in two ways, and is the larger
+of the two.
+
+*By timestamp:* the number of inbound messages stamped later than the chat's
+*read cut-off*:
+
+```
+max( last_read,  the chat's latest outbound message authored `user` or `device` )
+```
+
+(`last_read` as far as it reaches: where the newest read covered a message
+stamped ahead of the gateway's clock, up to that stamp — `read_ahead`, see
+*Mark as read* below.)
+
+Both halves are needed. `last_read` is advanced by the paths that see a reply
+as it happens — the dashboard send, and an own-device echo on the rail — and
+by *Mark as read*. But an outbound record can reach the store without passing
+the rail (a backfilled one), so the chat list also asks the ledgers for each
+chat's latest `user`/`device` outbound message (`_CHATS_REPLIED_SPARQL`, one
+lean query beside the heads and the unread count), and the live overlay
+contributes replies the store has not indexed yet. That query is a
+refinement: when it fails or runs out of its share of the rebuild's time, the
+list is built without it, from the read marks and whatever the last skeleton
+knew of the replies — nothing, on the first build after a restart, which the
+log line then says. Its share is half of what the rebuild's budget
+(`CHAT_LIST_REBUILD_TIMEOUT`) has left when it is asked, so the unread count
+after it keeps the other half, and never more than one query's timeout
+(`QLEVER_TIMEOUT`) — some ten seconds with both at their default of 20; a
+ledger that makes this query slower than that wants a larger budget.
+**An agent-authored outbound message is not a reply**:
+an agent answering on its own must not hide a message the user never saw, so
+`kb:author "agent"` moves nothing, on the rail and in the ledger alike.
+Timestamps are whole seconds and the comparison is strict, so in this view an
+inbound message stamped in the very second of a reply or a mark counts as
+covered by it. A record that carries `kb:removedAt` — a mail gone from the
+mailbox, a tombstone ([mail-chats.md](mail-chats.md)) — is not counted: it
+keeps its place in the thread and can be neither read nor answered.
+
+*By arrival order:* the number of inbound messages that have landed since the
+newest read. A timestamp says when a message was stamped, and by whose clock
+— the sender's on Signal, the receiving phone's on SMS, where a webhook can
+also be delayed or retried — so a message can land after a read and be
+stamped at or before it: a late delivery, a slow clock, the read's own
+second. No comparison of stamps finds such a message. The chat state
+therefore counts every arrival on the rail (`inbound_seq`) and records at
+each read how many it covered (`read_inbound`); what has been counted since
+is unread, wherever its stamp puts it (`chat_state.arrived_since_read`).
+Every arrival, not every event: the rail delivers at least once — a gateway
+retries a POST that timed out and redelivers what it was never told was
+taken — and an event whose message id is among the chat's newest counted
+arrivals (`inbound_recent`, the last 64, kept in the state document and so
+across a restart) is a repeat. It is answered as before, with the same
+acceptance and the same job handle, and counted no second time; the
+attention model and a ring held for the message are given the place the
+message was counted at. An event that carries no message id cannot be told
+from a new message and is counted. An arrival that is gone again — the mail
+gateway says which (`POST /internal/chats/removed`) — stays in the count, so
+that every remembered place and a client's `seen` stay true, and is left out
+of what is unread (`inbound_gone`); announced again, it has come back and is
+a new arrival.
+
+A read covers what has landed when it is *Mark as read* with `{}` or
+`{seen}`, or the dashboard's own send; an own-device echo and a `{ts}` mark
+cover it when their instant is not behind the mark they find — a stale
+client, or a late echo of an old reply, says nothing about what landed after
+a newer read.
+
+The two views count the same messages, hence the larger and not the sum. The
+arrival view is used only while the read mark is the newest word about the
+chat: where the ledger or the overlay holds a reply of the user's later than
+`last_read`, no read was recorded for that reply (it never passed the rail),
+so nothing says which arrivals it followed, and the timestamps alone decide.
+
+No stamp from ahead of the gateway's clock enters the overlay from the rail:
+an arrival stamped later than now is taken as now (a message cannot have been
+written after it landed), so a peer whose clock runs fast neither heads the
+chat until that instant nor sits beyond a mark the user sets today. Its
+ledger record keeps the stamp it was given, though, and the store answers
+with that — which is what `read_ahead` is for (*Mark as read*, below).
+
+`GET /chats` states the result so that no client derives it: every chat
+carries `unread`, `list_group` (`"unread"` | `"read"` | `"archived"`),
+`last_read` and `inbound_seq`, and the payload carries `counts` — the number
+of chats per group. (`group` on a chat is, as it always was, the boolean
+"this is a group chat".) A chat's `last.text` is a preview of its newest
+message, at most 300 characters; the message is read whole from the chat's
+own endpoint. The chat summary inside `GET /chats/<id>/messages`
+carries the same four fields, so an open chat page shows and clears its own
+state from its poll; its `inbound_seq` is read before the page's messages are
+collected, so every arrival it counts is among them. With the store away the
+list is served from its last skeleton, corrected by the marks written since:
+a chat read past its head message counts nothing by timestamp, and one whose
+head is an inbound message later than its cut-off counts at least that one.
+The arrival count is in the chat state and needs no store; where no list can
+be built at all, it is what the read endpoint answers with.
+
+**Mark as read** is `POST /chats/<id>/read` (same-origin only — see "The
+mailbox follows the chat" above):
+
+- Body `{"seen": n}` is what both dashboard clients send: `n` is the
+  `inbound_seq` of the summary they rendered — the list's row, or on the chat
+  page the last poll whose messages are in the thread. If the chat's count
+  has moved past it, a message has landed that the user was never shown:
+  nothing is marked, and the answer is **409** with `{error, id, last_read,
+  unread, list_group}` as they stand. The client then shows the message (the
+  list is fetched again, the chat page polls) and the user marks what they
+  now see. Otherwise the chat is read as it stands. The check and the mark
+  are one decision under the state's lock
+  (`ChatStateStore.mark_read_unless_arrived`), and an arrival counts itself
+  under the same lock: it is either seen by the check or lands after the
+  mark, and is then unread by its place in the count.
+- Body `{}` is the same without the check, for a caller that vouches for
+  itself. `{"ts": …}` reads only up to that instant: what is stamped later
+  stays unread, and the answer says so. `seen` and `ts` may be combined.
+- The mark is an instant of the gateway's own clock: now, or `ts` where that
+  is earlier. It is never later, and never a message's stamp — a mark lifted
+  to a stamp from a fast clock would count as read whatever arrives before
+  the gateway's clock catches up. A `ts` that names no real instant (30
+  February, an epoch no calendar holds) or one more than two minutes ahead
+  (`CHAT_READ_SKEW_SECONDS`) is answered 400; within that reach it is a fast
+  clock's "now", and now is where the mark goes.
+- A message the mark covers can still be stamped later than the mark: a
+  phone whose clock runs fast, on SMS, stamps the ledger record with its own
+  time, and by timestamp that record would be unread again once the store
+  has indexed it. So the rail notes an arrival's stamp where it lies ahead
+  of the gateway's clock by no more than `CHAT_READ_SKEW_SECONDS`
+  (`inbound_ahead`), and a read of the chat as it stands — `{seen}`, `{}`,
+  or the dashboard's own send — reaches up to that stamp: it is kept beside
+  the mark as `read_ahead`, and the read cut-off is the later of the two
+  (`chat_state.read_cut`). The mark itself stays the gateway's now, which is
+  what a later reply or mark is compared with, and a message that lands
+  afterwards is unread by its place in the count wherever its stamp lies. A
+  `{ts}` mark and an own-device echo reach no further than their instant.
+  The case left over is a stamp *further* ahead than that reach, which is
+  not taken for a clock's error: the mark reads such a message while only
+  the overlay holds it, stamped as now, and it is unread again once the
+  store answers with its record, until a mark made after the gateway's
+  clock has passed the stamp. A record from ahead of the clock that never
+  passed the rail is likewise read only by a mark made after that.
+- The answer is `{id, last_read, previous, unread, list_group}`; `previous`
+  is the mark before the call (null for none). `unread` and `list_group` are
+  the chat's state right after the mark, as `GET /chats` would state it —
+  normally 0 and `read`, but a client takes both from the answer rather than
+  assuming them.
+- Body `{"restore": <that previous, or null>, "marked": <that last_read>}` is
+  the **undo**: the mark goes back to `restore` only while it is still exactly
+  `marked`. A reply or a later mark in between is newer word about the chat,
+  and the undo then answers 409 with the state as it stands and changes
+  nothing. This is the one way `last_read` moves backwards
+  (`ChatStateStore.restore_last_read`), and it can never move it past
+  `marked`. `read_inbound` and `read_ahead` go back with it, to what the
+  mark being undone found, so the messages that had landed unread before the
+  mark are unread again — one stamped by a fast clock included — with any
+  that came since. It cannot make an answered chat unread:
+  the reply stands in the ledger whatever the mark says, and where a reply
+  fell into the mark's own second its cover of what had landed stands too.
+  Both timestamps are parsed as strictly as `ts`.
+
+**Attention.** Marking read is the user saying "dealt with", so it settles the
+chat's attention item exactly as *Mark handled* does (`done_how: "marked"`) —
+when the mark leaves nothing unread and nothing has landed since it was
+taken; a mark that a newer message outran settles nothing, and a refused one
+(409) touches nothing at all. The undo reopens the item only if that mark is
+what settled it, the mirror of un-archiving: the mark records the `done_at`
+of the item it closed (`read_settled` in the chat state), and an item that a
+new message reopened and something else settled since carries another. The
+reverse does not hold: *Mark handled* on the home screen settles the item and
+leaves the chat's read state alone.
+
+**An instructed sender's held ring** (see *Inbound flow*) is dropped when the
+user has dealt with the chat while the turn worked. With no read-on-open that
+means a reply or an explicit mark: a message merely looked at still rings by
+the verdict, and so does one whose mark the user took back before the ring
+was due, or whose mark was refused because the page had not shown the
+message. A mark taken back *after* the turn ended — the message was delivered
+as seen, and never listed — puts the message on the attention list, with the
+verdict's judgement and without a ring.
+
 ## The chat surface (UI)
 
-- A **Chats card** on the dashboard (finally replacing the static
-  `messages.js` mock): the messenger home screen — every **non-archived**
-  chat, ordered by last activity, with unread badge, last-message preview
-  (a staged draft outranks it) and channel glyph. Deliberately not filtered
-  to unread: the card is also the launchpad for *writing*, and with archive
-  in place the list self-curates. The phone caps it (five rows plus an
-  "All chats →" link); on the wide frame the card sits in **its own region
-  above the Conversations card, behind a draggable splitter** (the
-  `layout.js` set: drag, double-click reset, snap closed, per-device
-  persistence), scrolling internally. A `pinned` flag (pin-to-top, as the
-  clients have) is a possible later addition to the chat state; deferred
-  until recency-plus-archive proves insufficient. A dedicated `chats.html`
-  lists every chat behind an Active/Archived filter; each chat has its own
-  page/panel.
+- The **Chats page** (`chats.html`, a tab of the navigation row) is the
+  messenger home screen: every chat of every channel, ordered by last
+  activity, with avatar, channel glyph, last-message preview (a staged draft
+  outranks it) and an unread badge (how many messages have arrived since the
+  user last dealt with the chat). The dashboard home carries no Chats card:
+  chats that want attention are rows of its attention list, and the
+  component's capped card mode (every non-archived chat, five rows plus
+  "All chats →", the `layout.js` splitter region) is unused. Pin-to-top, as
+  the clients have it, is the `starred` flag the chat state carries (shared
+  with the dashboard threads): a starred chat leads whichever list it is in.
+  The page sorts every chat into **Unread · Read · Archived** (see that
+  section above; the *Unread* tab carries the number of unread chats, its
+  rows the count of unread messages). A swipe right marks an unread chat
+  read, with an Undo; a swipe left archives it. The row's tray (long press,
+  right-click or the context-menu key) holds star, mark read (*Unread* only),
+  archive and mute — so a keyboard reaches what a swipe does — and on
+  *Archived* star, restore, mute or unmute, and delete. Each chat has its own
+  page/panel, where **Mark as read** sits under the latest inbound message.
 - The **chat pane** renders like a messenger client: bubbles left/right, day
   separators, sender labels in groups, media inline. Outbound bubbles carry
   their author — the user, *Ara* (agent-sent), or *phone* (own-device echo) — a
@@ -342,14 +639,18 @@ see *Context* below — and SPARQL covers anything older); **stage the draft**
 (`POST /internal/chats/<id>/draft`, with a thin `chat-draft.py` CLI, token-gated
 like `conversation-push.py`); **send** only as the channel's policy allows (see
 *Trust model*); **fork** a topic into a normal conversation; **link projects**
-exactly as triage does today. Before composing any draft it reads the Secretary
-persona plus the chambers' style overrides — the existing per-action compose
-rule, unchanged.
+exactly as triage does today; **archive or mute the chat** — when the user
+asks, or when a standing instruction told its turn to
+(`POST /internal/chats/<id>/flags`, `chat-flags.py`: the user's own flags by
+an agent's door, with no delete). Before composing any draft it reads the
+Secretary persona plus the chambers' style overrides — the existing per-action
+compose rule, unchanged.
 
 **What triggers a companion turn** (this is the whole "lightweight" point):
 
 - the user writes in the companion pane, or taps a quick pattern;
-- an inbound message the delivery gate forwards (see *Inbound flow*);
+- an inbound message from a VIP or from a sender with a standing instruction
+  (see *Inbound flow*);
 - nothing else. The user's own sends, draft edits, read events and scrolling
   never spend a turn.
 
@@ -373,9 +674,11 @@ problem for good: however old the chat, an engage prompt has a fixed ceiling.
 ## Inbound flow — where triage changes
 
 The **delivery gate is untouched**: same policy axes, same classes, same
-never-drop persist-before-anything, same news rail, same daily drain, same
+never-drop persist-before-anything, same news rail, same recovery drain, same
 at-least-once delivery confirmation. What changes is where a message *lands*
-and what a model turn is *for*:
+and what a model turn is *for*. (E-mail takes this flow too, with the
+differences a mailbox makes: *Mail takes the same flow*, at the end of this
+section.)
 
 1. **Persist** (as today, now with `kb:chat` + `kb:messageId`).
 2. **Gate** (as today).
@@ -438,6 +741,19 @@ and what a model turn is *for*:
    a VIP's would be. A VIP with an instruction rings on arrival, as ever, and
    the same single turn works the message as instructed; the chat page shows
    that a draft is on its way, then the verdict and what the turn flagged.
+   A message the user answered or marked read while its turn worked is not
+   rung afterwards; opening the chat is neither (*Unread · Read · Archived*).
+   The timeout only rings: what the turn did by then stands — a chat it
+   archived (`chat-flags.py --archive`, which the instruction asked for)
+   stays archived, also once its verdict comes. A turn can only archive: a
+   mute it asks for is taken as an archive, its unmute, unarchive and star
+   change nothing, and the answer says so. A flags call is the turn's only
+   when it carries the token the turn's session was handed
+   (`RETINUE_ARRIVAL_TURN`, which `chat-flags.py` sends); on a messenger
+   chat one without it is Ara on the user's word and mutes, also while a
+   turn runs. (A mail thread is stricter: there a call without the token,
+   while a mail's turn runs, is that turn's unless it carries a dashboard
+   thread turn's proof — docs/dashboard.md, "The gate for mail".)
 
    As built, five things are worth naming:
 
@@ -496,6 +812,63 @@ cost for a strictly better result.
 
 Control-mode accounts are out of scope: their messages are prompts, not mail,
 and keep today's ask-and-answer path.
+
+### Mail takes the same flow
+
+A mail thread is a chat ([mail-chats.md](mail-chats.md)), and a mail that
+just arrived goes through the four steps above: the mail gateway persists it
+undelivered, gates it — the group axis on the `List-Id` or the sender, the
+sender axis as VIP / instructed, by address or by an e-mail domain — and
+offers it to this rail with `handover`. The web gateway's side is the same
+code, and five things differ because the channel is a mailbox
+([dashboard.md](dashboard.md), "The gate for mail", has each in full):
+
+- **A mail pushes nothing by default; a contact can say otherwise.** The
+  arrival goes through the attention model like a message, but an unjudged
+  mail is passive (`attention_store.CHANNEL_DEFAULT_IMPORTANCE`): listed,
+  never pushed, in no digest. The item is about the person the mail is from —
+  the holder of the address, else whoever's domain covers it — so their
+  prior and permits apply; a VIP rings, an instruction's verdict decides.
+  There is no daily sweep: mail from anyone else is listed under *Unread*
+  and judged by nobody.
+- **The turn is worded for a mail and has a mail thread's means.** The
+  mail's sender, subject, id and trimmed text are quoted as data; the turn
+  may link a project, store a memory, hand a document to the Archivist,
+  stage a reply (the Secretary's words), and — an instructed turn, where the
+  instruction asks — send one with `mail-push.py --chat <id>` under the
+  mailbox's send policy, add a calendar event under its policy, and
+  **archive the thread** with `chat-flags.py`. It ends with the verdict. A
+  turn can only archive (a mute it asks for is an archive; an unmute, an
+  unarchive or a star changes nothing). A thread its turn
+  archived rings nothing; a turn that archived and did not finish — it
+  failed, set no verdict, or, for a mail unlike a messenger message, ran
+  past the timeout — has the chat brought back and the mail rung. A turn's
+  archive reaches only the mail it was given: a mail that arrived while it
+  worked, or waits for a turn of its own, keeps the thread in view and in
+  the inbox, and the mailbox hears of the turn's own mails by `Message-ID`.
+  A batch too big to quote whole is worked in turns: the oldest of it wait
+  for a turn of their own, and nothing the first turn settles is about
+  them. A merge of the thread while its turn runs moves the turn with it.
+- **There is no triage fallback.** Step 4's "forwards to triage exactly as
+  it always has" does not exist for mail: a mail the rail did not accept
+  stays `delivered: false` and the mail gateway offers it again on a later
+  poll — the mailbox is the backlog. So the rail takes a mail **once**, by
+  its `Message-ID`, and keeps per arrival whether the user was told of it:
+  a repeated offer of a mail they were told of un-archives nothing, reopens
+  no settled item and rings nothing, one of a mail whose first offer never
+  got that far does what it owed. The handle of a turn that failed is
+  handed back only for `CHAT_ARRIVAL_RETRY_SECONDS` before the next offer
+  starts the turn anew, and a mail gets at most `MAIL_ARRIVAL_TURN_ATTEMPTS`
+  turns — counted on the chat's state, with the mails whose turns are over,
+  so a restart buys a mail no further turn.
+- **`CHAT_ARRIVAL_TURNS=0` still accepts a mail** — its gateway has nowhere
+  else to take it — and runs no turn for it.
+- **The timeout is longer.** `MAIL_INSTRUCTION_TIMEOUT` (600 s) bounds how
+  long an instruction can hold a mail's ring — not the messengers'
+  `CHAT_INSTRUCTION_TIMEOUT` (60 s): a mail is not a chat message, and a
+  turn that files a document with the Archivist runs longer than one that
+  drafts a reply. Past it the mail rings as a VIP's, whatever the turn
+  decides afterwards; the failure rule is otherwise the same.
 
 ## Summaries — unbounded time, bounded context
 
@@ -564,6 +937,69 @@ the chat surface maps onto them rather than around them:
   user-send path, origins recorded on every outbound message) and adds no new
   bypass.
 
+**E-mail** is the one channel where the first point does not hold
+([mail-chats.md](mail-chats.md), Decisions): a send from the composer goes
+through `EMAIL_SEND_POLICY` like anyone's. The press is passed to the mail
+gateway as `user_approved`, so under `trust` and `allow` it sends; under
+`verify` the mail is queued although the user typed it, and the web-gateway
+does not release it — `_chat_send_via_gateway` approves a queued send for
+the messengers only; a mail goes through `_mail_send`. The send answers
+`202` with the pending send, the chat shows it as a pending bubble with its
+approval link, and `/sends` is where it is allowed, with recipients, subject
+and text on one card. So for mail the draft area does not replace `/sends`;
+the two meet in the chat, which lists every send of its thread that is not
+over, whoever made it — waiting, being sent, or failed with its reason. The
+companion of a mail thread stages drafts like any companion and, unlike a
+messenger chat's, has a send path that is the thread's own:
+`scripts/mail-push.py`, under the same policy, when the user asks for it
+there — its note names the thread's gateway where that is not the default
+one, and the mailbox's policy with the rule that goes with it.
+
+These rules hold for a mail send that a messenger's does not need
+([dashboard.md](dashboard.md), "Writing mail", has the endpoints):
+
+- **The recipients a user sees are the recipients the gateway will use.**
+  The page draws a reply's To and Cc from `GET /chats/<id>/reply-preview`,
+  which is the mail gateway's own addressing, asked without sending; nothing
+  on this side computes an address.
+- **A mail that may have gone out is never reported as not sent.** A hop to
+  the gateway that timed out or lost its connection after the request was
+  written, and the gateway's own "the mail server never confirmed", answer
+  the browser `202 {unconfirmed: true}` — never an error that hands the
+  words back for a second send. Every press carries an idempotency key
+  (`request_key`), so the same press can be retried and sends nothing twice.
+  The gateway's answer is read whole before it is judged: its "it may have
+  gone out" carries two `Message-ID`s and is longer than any cut made for
+  display.
+- **A kept key is dropped only on the mail gateway's own word about that
+  key.** A mail that did not go is answered with `"sent": false`, a
+  sentence, and who said so: `"by": "gateway"` where the mail gateway
+  answered this request itself — `424` where it took the request and the
+  mail server would not have the mail, its `400`/`409`/`413` refusals, its
+  `503` where it cannot send — and `"by": "dashboard"` where the web
+  gateway answered without it: never reached (`502`), no gateway for that
+  mailbox, a request that does not validate. The page keeps the words; it
+  drops the key on the gateway's word only, since a "not sent" of this
+  request says nothing of an earlier one under the same key. A `5xx` is
+  "not sent" only with `"sent": false`; one without it, or a body cut
+  short, is not confirmed.
+- **A repeat is not a reply.** A press answered again from the mail it sent
+  earlier (the gateway says `"repeat": true`) is only reconciled: the
+  Message is returned and the chat's copy of the queue brought in line.
+  Nothing is marked read, no attention item is settled and the mailbox is
+  told nothing — the rail did that when the mail went out, and what arrived
+  since has not been answered. The shared draft is cleared only where it
+  still holds this press's words (the page put them back when the first
+  answer was lost); a draft written since stays.
+- **Nothing the user queued or sent disappears without a word.** An allowed
+  send that then fails stays in its chat as failed, with the gateway's
+  reason, until the user dismisses it; recipients the mail server refused
+  are named on the sent message. A dismissed entry is over — the gateway
+  removes one that failed for certain, and answers for one of unknown
+  outcome by id as dismissed — and one whose outcome is unknown is never
+  worded as "failed": not in the chat, the list, the companion's note, on
+  `/sends`, or in the note to the thread that queued it.
+
 ## What this replaces, what it keeps
 
 **Replaced:** per-message dashboard conversations for messenger traffic; the
@@ -572,11 +1008,17 @@ in-chat replies; the model turn spent on mere notification; the `messages.js`
 mock card.
 
 **Kept unchanged:** the delivery gate and its policy files; the never-drop
-ledger and `delivered` semantics; the news rail; the daily drain; reply tokens
-and the push CLIs (still the right tool for headless sends and escalations);
-the conversation concept, dashboard, and push machinery for everything that is
-not a messenger chat; e-mail triage in full (pull channel, own flow — it can
-adopt this pattern later, but nothing here depends on it).
+ledger and `delivered` semantics; the news rail; the recovery drain; reply
+tokens and the push CLIs (still the right tool for headless sends and
+escalations); the conversation concept, dashboard, and push machinery for
+everything that is not a messenger chat. E-mail was kept out at first (a pull
+channel with a flow of its own) and has since adopted the pattern:
+[mail-chats.md](mail-chats.md) mirrors the mailbox into this same ledger and
+shows a mail thread as a chat. Replies and new mail leave from the chat
+surface under the e-mail send policy, the mailbox follows the chat (read,
+archive, delete), and an arriving mail is gated as a message is (*Mail takes
+the same flow*, above). E-mail triage, its whitelist and its daily run are
+retired; triage remains for a messenger message this rail could not take.
 
 **Converges with:** issue #130 — the message-id plumbing is shared, and the
 chat page is the missing answer to where reactions and quoted replies surface.
@@ -604,8 +1046,8 @@ serving logic, `webapp/`, `scripts/`). Phases 1–4 have shipped.
 5. **Summaries & forking:** the summarizer job, summary on the chat page,
    fork actions on both sides, `--origin-chat`.
 6. **Polish:** reactions & quoted replies in the UI (#130), archive/mute
-   controls on the chat page, a per-chat assist setting, optional `pinned`,
-   group niceties.
+   controls on the chat page (✅), a per-chat assist setting, ✅ `starred`
+   (pin-to-top, shared with the threads), group niceties.
 
 ## Open questions
 
@@ -627,7 +1069,10 @@ serving logic, `webapp/`, `scripts/`). Phases 1–4 have shipped.
 4. **Pending sends in the mirror.** A `verify`-queued push-CLI send targeting a
    chat is invisible on the chat page until approved; showing it as a
    pending bubble (approvable in place) would fold `/sends` into the chat for
-   those too. Deferred to phase 6.
+   those too. Deferred to phase 6. *Built for e-mail:* a mail chat lists its
+   sends that are not over (`pending` on `GET /chats/<id>/messages`) — each
+   waiting with the link to its approval page, being sent, or failed with
+   its reason; the messengers' chats do not yet.
 5. **SMS.** Resolved: `sms-gateway` (opt-in, `sms` compose profile) writes
    the same store shape, so SMS chats appear here with no serving-code change —
    as this design predicted. See `docs/messaging.md`, "SMS".

@@ -20,10 +20,10 @@
     }
   </style>
 
-  <!-- The same chats component the dashboard card uses, in `full` mode: every
-       messenger chat (Signal / WhatsApp / Telegram) from the gateway's
-       GET /chats, no cap, with an Active/Archived filter. Each row opens that
-       chat's own page (chat.html) with the mirror and the companion pane. -->
+  <!-- The chats component (components/chats.js) in `full` mode: every chat
+       of every channel from the gateway's GET /chats, no cap, in three tabs:
+       Unread, Read, Archived. Each row opens that chat's own page
+       (chat.html) with the mirror and the companion pane. -->
   <script type="module" src="/components/chats.js"></script>
   <script type="module" src="/components/nav.js"></script>
   <!-- The minimized pages: threads, chats and projects parked one tap away

@@ -17,7 +17,7 @@ be built without re-deriving the reasoning.
 
 There is no long-lived Ara process. Every entry point spawns a fresh
 `claude -p`: each scheduler prompt job, each dashboard conversation turn, each
-triage run, each `ask_ara` question from the MCP connector. "Switching models"
+turn on an arriving message, each `ask_ara` question from the MCP connector. "Switching models"
 is therefore not an agent handoff but a launch parameter — the same persona
 (`CLAUDE.md`), started on a different model. Nothing needs to be summarised
 across a tier boundary, because no Ara turn carries hidden state: escalating a
@@ -31,8 +31,7 @@ Most of the plumbing predates this design:
 - Dashboard threads carry a per-thread model choice, switchable mid-thread
   (`web-gateway.py`, `POST /conversations/<id>/model`).
 - Subagents pin their model in frontmatter (`.claude/agents/*.md`).
-- Triage has its own `RETINUE_TRIAGE_MODEL`; transcript cleanup already runs on
-  a cheap model by default.
+- Transcript cleanup already runs on a cheap model by default.
 
 ## The two tiers
 
@@ -82,14 +81,15 @@ their difficulty before any model runs:
 |---|---|---|
 | Scheduler prompt jobs (mailbox checks, dispatch turns) | router | Routine by construction; the real work is done by the dispatched subagent on its own pinned model. |
 | `news-curate.py` spawn | router | The turn only dispatches the Herald. |
+| Mail model trim (web gateway) | router | One judgement per mail the deterministic trim left `wanting` — a tool-less turn choosing the lines that are the author's own, at most `MAIL_MODEL_TRIM_ATTEMPTS` turns per mail — on first view only (`MAIL_MODEL_TRIM_MODEL` overrides; docs/dashboard.md, "The model trim"). |
 | `agent-self-review.py` spawn | frontier | Supervision by construction, and rare — the free SPARQL gate means it usually spawns nothing. |
 | `memory-compact.py` spawn | frontier | Deciding what of a topic still holds is judgement, and `memory.py compact` refuses a lower tier; weekly, behind a free SPARQL gate. |
 | Main remote-control session | frontier | Interactive system administration and development — Ara senior's desk. |
 | Dashboard threads, messenger inbound (`POST /message`), `ask_ara` | phase 2 | Difficulty unknown before a model reads the message; needs the escalation flow below. Dashboard threads take `RETINUE_DASHBOARD_MODEL` when the deployment sets one; the other two stay on the router tier. |
 
 A job manifest can still pin any prompt job explicitly
-(`"model": "${RETINUE_TRIAGE_MODEL:-sonnet}"`); the per-job field always wins
-over the tier defaults.
+(`"model": "${RETINUE_REVIEW_MODEL:-sonnet}"`, a variable of the chamber's own
+naming); the per-job field always wins over the tier defaults.
 
 ## The door: who speaks, and under which name
 
@@ -191,15 +191,17 @@ mid-task; they return "I need a decision on X" and Ara opens a decision thread
 with chips — which is the interaction model the dashboard already uses.
 
 The dispatch is also how a role's model reaches work that is not composing.
-Inbox triage is the Secretary's own job (the skill is titled for her), and its
-weakest step is judgement: deciding whether the gathered facts settle a reply
-or the user must. That decision now goes to the `secretary` subagent, so it
-runs at the Secretary's weight without any model plumbing — no tier variable
-for triage, no reading a model out of an agent definition to re-use elsewhere.
-The dispatching session keeps the mechanical half (drains, contact lookup,
-status files, threads), which is exactly what a router-tier Ara is for, and
-the compose-only boundary stays intact because the subagent never gains the
-tools that send.
+Working an inbound message is the Secretary's own job, and its weakest step
+is judgement: deciding whether the gathered facts settle a reply or the user
+must. That decision goes to the `secretary` subagent, so it runs at the
+Secretary's weight without any model plumbing — no tier variable for it (the
+retired e-mail triage had one, `RETINUE_TRIAGE_MODEL`, which nothing reads
+any more), no reading a model out of an agent definition to re-use elsewhere.
+The dispatching session — a chat's companion turn, or the triage skill for a
+messenger message the chat rail could not take — keeps the mechanical half
+(contact lookup, the recovery drain, threads, drafts), which is exactly what
+a router-tier Ara is for, and the compose-only boundary stays intact because
+the subagent never gains the tools that send.
 
 As shipped (Secretary only; Academic and Publisher remain personas for now):
 `.claude/agents/secretary.md` defines a compose-only subagent (Read, Glob,
@@ -211,7 +213,7 @@ the system's own voice (alerts and briefings to the owner, dashboard thread
 replies). Contact lookup and sending stay with the dispatching session, where
 the send policies already apply. The persona file gained a usage note marking
 which of its sections address the composing subagent (style) and which the
-dispatcher (tooling, triage, send control).
+dispatcher (tooling, inbound messages, send control).
 
 ### Phase 4 — presentation enforcement at the choke point (shipped)
 

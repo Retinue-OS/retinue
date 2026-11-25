@@ -21,7 +21,7 @@
 //   POST /conversations        -> quick edit command ({kind:"edit", project})
 //   GET  /conversations?all&project=…      -> the project's threads (kind chat)
 
-import { esc, fmtAge, visibleHeight } from './base.js';
+import { esc, fmtAge, starredFirst, visibleHeight } from './base.js';
 import { renderMarkdown, renderInline, MD_CSS } from './markdown.js';
 import { canRecord, micErrorText, recordingRowHtml, statusRowHtml, Waveform, VOICE_CSS } from './voice.js';
 import { shelf, goLive, takeRestore } from './shelf-store.js';
@@ -746,16 +746,19 @@ class RetinueProjectPage extends HTMLElement {
       + lists.join('') + `</div>`;
   }
 
-  // The project's conversations: open ones as rows, archived ones folded.
+  // The project's conversations: open ones as rows, archived ones folded,
+  // starred ones first in each.
   _threadsHtml() {
-    const active = this._threads.filter((t) => !t.archived);
-    const archived = this._threads.filter((t) => t.archived);
+    const active = starredFirst(this._threads.filter((t) => !t.archived));
+    const archived = starredFirst(this._threads.filter((t) => t.archived));
     if (!active.length && !archived.length) return '';
     const row = (t) => {
       const age = fmtAge(t.updated);
       const unread = t.unread ? '<span class="dot" aria-label="Unread"></span>' : '';
+      const star = t.starred
+        ? '<span class="star-mark" role="img" aria-label="Starred" title="Starred">&#9733;</span>' : '';
       return `<a class="thread-row" href="/conversations.html#conversation-${esc(t.id)}">`
-        + `${unread}<span class="t-title">${esc(t.title || 'Conversation')}</span>`
+        + `${star}${unread}<span class="t-title">${esc(t.title || 'Conversation')}</span>`
         + (age ? `<span class="t-age">${esc(age)}</span>` : '')
         + `</a>`;
     };
@@ -950,6 +953,7 @@ const CSS = `
   .t-title { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .t-age { flex: none; color: var(--muted, #8b93a3); font-size: .72rem; }
   .dot { flex: none; width: 8px; height: 8px; border-radius: 50%; background: var(--accent, #6ea8fe); }
+  .star-mark { flex: none; color: #e3b341; font-size: .9em; line-height: 1; }
 
   .body { padding: 10px 2px 14px; }
 

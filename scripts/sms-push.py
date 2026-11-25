@@ -3,7 +3,7 @@
 
 The retinue-side client for the gateway's `/send` endpoint — the SMS sibling of
 telegram-push.py. The gateway holds the SMS server's credentials, so this CLI
-carries only a capability token. SMS is text only (no --image).
+carries only a capability token. SMS is text only (no --attach).
 
 Outbound is gated by SMS_SEND_POLICY (keyed by the gateway's own sending number,
 not the recipient): a `verify` account queues the message as a pending send that

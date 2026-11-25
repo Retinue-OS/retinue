@@ -199,7 +199,7 @@ REPLY_TOKENS = ReplyTokenStore(
 def _attach_reply_tokens(messages: list) -> None:
     """Give each drained /undelivered message a reply token for its origin.
 
-    The drain hands raw ledger rows to the daily triage; without a token those
+    The drain hands raw ledger rows to triage; without a token those
     replies fall back to name resolution — the exact failure that by-token
     routing exists to prevent and that live forwards already avoid. The stored
     sender *is* the chat_id here (and for a group the stored group is that
@@ -330,7 +330,7 @@ def _confirm_delivery(job_path: str, store_path, label: str,
     started taking messages.
 
     Polls in the background (see job_delivery): a job that errors, expires or
-    never finishes leaves delivered=False, so the daily drain retries it.
+    never finishes leaves delivered=False, so the recovery drain retries it.
     """
     if store_path is None:
         return
@@ -914,7 +914,7 @@ def _handle_inbound(text: str, lang: str, chat_id: str, sender: str,
     if not text and not files and not attachment_urls:
         if store_path is not None:
             # A voice note whose transcription failed: not dropped — it is on disk
-            # (delivered=False, audio retained) for the daily drain / a re-transcribe.
+            # (delivered=False, audio retained) for the recovery drain / a re-transcribe.
             print(f"[telegram-gateway] voice note from {sender} not transcribed; "
                   f"retained for retry (not dropped)", flush=True)
         else:
@@ -1074,7 +1074,7 @@ async def _on_new_message(event) -> None:
                     # Never-drop: retain the audio and persist the message up front,
                     # THEN transcribe. A failed or crashed STT run leaves a durable,
                     # re-transcribable record (delivered=False, media set) for the
-                    # daily drain — instead of vanishing at the skip-return in
+                    # recovery drain — instead of vanishing at the skip-return in
                     # _handle_inbound, downstream of where _forward_to_inbox
                     # persists. Only in inbox mode: a control account has no triage
                     # drain that would pick a persisted record back up.
@@ -1209,9 +1209,10 @@ async def _on_outgoing_message(event) -> None:
             _record_outbound(chat_key, text, "device",
                              message_id=msg_id, timestamp=sent_at,
                              attachment_urls=refs)
-            # Chats rail: an own-device send advances the chat's read watermark
-            # on the dashboard (the user was visibly in that chat on their
-            # phone).
+            # Chats rail: an own-device send is the user's reply, and a
+            # reply reads the chat — so it advances the chat's read mark on
+            # the dashboard. (Opening or viewing a chat, here or on the
+            # phone, reads nothing.)
             _chats.notify_chat_event_async(
                 direction="out", channel=INBOUND_CHANNEL, chat=chat_key,
                 account=TELEGRAM_ACCOUNT, author="device",
@@ -1473,7 +1474,7 @@ def _forward_to_inbox(question: str, lang: str, chat_id: str,
     # inbound event has already been consumed from the Telegram session, so if it
     # is lost here it is gone for good. Writing it up front as delivered=False
     # means any later failure (a throwing gate, a crash mid-forward, a killed
-    # container) leaves the message on disk for the daily drain instead of
+    # container) leaves the message on disk for the recovery drain instead of
     # silently dropping it. The flag is flipped to true below once the message is
     # accounted for (forwarded to triage, or held in a fully-resolved class).
     if store_path is None:
@@ -1517,7 +1518,7 @@ def _forward_to_inbox(question: str, lang: str, chat_id: str,
     # the gate made of it. The mirror shows it, the user is pushed unless the
     # gate says to stay quiet, and the record says delivered. So every message
     # is offered to the rail, not only the ones that used to buy a triage
-    # session: that is what empties the undelivered backlog the daily drain
+    # session: that is what empties the undelivered backlog the recovery drain
     # existed to sweep, because there is no longer anything left un-handled.
     #
     # The call is synchronous because its answer decides what happens next, and
@@ -1683,7 +1684,7 @@ def _forward_to_inbox(question: str, lang: str, chat_id: str,
 
     # Flip the persisted message's delivered flag only once triage has actually
     # run. The POST answers 202 (accepted), not "handled": marking delivered on
-    # acceptance would hide a job that later fails from the daily drain, losing
+    # acceptance would hide a job that later fails from the recovery drain, losing
     # the message. So an async forward waits for `status: done` in the
     # background; a failed forward, and any job that errors, expires or times
     # out, stays delivered=False so the drain retries it. At-least-once: a
@@ -1961,7 +1962,7 @@ def _execute_approved_send(path: Path, entry: dict) -> None:
     timeout.
 
     What the send produced — the channel's message id, the send time, and the
-    ledger media references for any images — is written onto the entry beside
+    ledger media references for any attachments — is written onto the entry beside
     the status. The status alone used to be all that survived, so an approved
     send's identity was simply lost; the chat surface needs it, because a chat
     send is now queued and approved rather than skipping the queue, and it
@@ -2050,32 +2051,22 @@ def _complete_pending_send(request_id: str, approved: bool,
 
 # ── Outbound push ─────────────────────────────────────────────────────────────
 
-def _decode_image(image: dict) -> Path:
-    """Materialize one inbound base64 image to a temp file for sending."""
-    if not isinstance(image, dict):
-        raise ValueError("each images entry must be an object with base64 'data'")
-    data_b64 = image.get("data")
-    if not data_b64:
-        raise ValueError("image entry missing base64 'data'")
-    try:
-        raw = base64.b64decode(data_b64, validate=True)
-    except ValueError as exc:  # binascii.Error subclasses ValueError
-        raise ValueError(f"invalid base64 image data: {exc}") from exc
-    suffix = Path(image.get("filename") or "image.jpg").suffix or ".jpg"
-    fd, out = tempfile.mkstemp(suffix=suffix, prefix="tg-push-", dir=str(TELEGRAM_TMP_DIR))
-    with os.fdopen(fd, "wb") as fh:
-        fh.write(raw)
-    return Path(out)
+def _decode_attachment(entry: dict) -> tuple[Path, str, str | None]:
+    """Materialize one /send attachment — a file of any type — for the channel.
+
+    Returns ``(path, content_type, name)``; see
+    :func:`inbound_store.materialize_outbound`."""
+    return _ibstore.materialize_outbound(entry, TELEGRAM_TMP_DIR)
 
 
 def _push(recipient: str, message: str, lang: str | None = None,
           images: list[dict] | None = None, voice: bool = True,
           author: str = "agent") -> tuple[str | None, float | None, list[str]]:
-    """Send an outbound message: text body plus optional image attachments.
+    """Send an outbound message: text body plus optional attachments (files of any type).
 
     `lang`/`voice` are accepted for parity with the other gateways' _push
     signature (persisted in the pending store) but are ignored here. ``author``
-    is carried through to the ledger record; each image is also persisted into
+    is carried through to the ledger record; each attachment is also persisted into
     the ledger media store (inbox mode) so the sent message mirrors with its
     media. Returns ``(message_id, sent_at, media_refs)``; the /send response
     surfaces all three (see :func:`_tg_send`).
@@ -2083,17 +2074,15 @@ def _push(recipient: str, message: str, lang: str | None = None,
     images = images or []
     message = (message or "").strip()
     if not message and not images:
-        raise ValueError("push requires a non-empty message or at least one image")
+        raise ValueError("push requires a non-empty message or at least one attachment")
     temp_paths: list[Path] = []
     media_refs: list[str] = []
     try:
         for image in images:
-            path = _decode_image(image)
+            path, ctype, name = _decode_attachment(image)
             temp_paths.append(path)
             if TELEGRAM_GATEWAY_MODE == "inbox":
-                ctype = ((image.get("content_type") if isinstance(image, dict) else None)
-                         or mimetypes.guess_type(str(path))[0] or "image/jpeg")
-                ref = _store_media_ref(path.read_bytes(), ctype)
+                ref = _store_media_ref(path.read_bytes(), ctype, name)
                 if ref:
                     media_refs.append(ref)
         msg_id, sent_at = _tg_send(recipient, message or None,
@@ -2102,7 +2091,7 @@ def _push(recipient: str, message: str, lang: str | None = None,
         return msg_id, sent_at, media_refs
     finally:
         for path in temp_paths:
-            path.unlink(missing_ok=True)
+            _ibstore.discard_outbound(path)
 
 
 def _erase_chat(chat: str, account: str | None) -> dict:
@@ -2228,7 +2217,7 @@ class _PushHandler(BaseHTTPRequestHandler):
                 self._reply(502, {"error": f"recent-chats lookup failed: {exc}"})
             return
         if self.path.split("?", 1)[0].rstrip("/") == "/undelivered":
-            # The daily triage drain: return every inbound message not yet handed
+            # The triage recovery drain: return every inbound message not yet handed
             # to triage and mark it delivered in one pass (inbound_store owns the
             # flag). Optional ?since=<ISO|epoch> bounds the window.
             if not self._authorized():
@@ -2347,7 +2336,9 @@ class _PushHandler(BaseHTTPRequestHandler):
             self._reply(400, {"error": "empty body"})
             return
         if length > MAX_PUSH_BODY_BYTES:
-            self._reply(413, {"error": "payload too large"})
+            self._reply(413, {"error": "payload too large: one send carries at most "
+                                       f"about {MAX_PUSH_BODY_BYTES * 3 // 4 // (1024 * 1024)} MB "
+                                       "of attachments"})
             return
         try:
             payload = json.loads(self.rfile.read(length).decode("utf-8"))
@@ -2375,6 +2366,8 @@ class _PushHandler(BaseHTTPRequestHandler):
             self._reply(400, {"error": "no recipient given and TELEGRAM_DEFAULT_RECIPIENT is unset"})
             return
         message = payload.get("message") or payload.get("text") or ""
+        # "images" is the key's historical name: each entry is a file of any
+        # type — an image, a video, a PDF — as {data, filename?, content_type?}.
         images = payload.get("images") or []
         if not isinstance(images, list):
             self._reply(400, {"error": "'images' must be a list"})
@@ -2428,7 +2421,7 @@ class _PushHandler(BaseHTTPRequestHandler):
         # account's policy allows directly. Authorship is provenance, so it is
         # reported rather than branched on.
         print(f"[telegram-gateway] sent to {recipient} (author={author})"
-              + (f" ({len(images)} image(s))" if images else ""), flush=True)
+              + (f" ({len(images)} attachment(s))" if images else ""), flush=True)
         body = {"status": "sent", "recipient": recipient}
         # Surface the recorded ledger identity — id, timestamp and the stored
         # media references — so the caller (the dashboard's chat view) can show

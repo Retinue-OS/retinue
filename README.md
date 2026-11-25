@@ -7,10 +7,77 @@ of personal agents, coordinated by Ara. The core is a small generic harness
 agents/skills, each of which can be a Claude Code plugin (scoped to its
 `.retinue/` subdirectory).
 
+Retinue is designed [accessibility first](#accessibility-first): it adapts to
+people with ADHD by deciding what deserves attention and when, and it supports
+spoken language on every surface, aspiring to completely hands-free use.
+
 Retinue is content-neutral: which chambers exist is declared by the
 **deployment**, not baked into the framework. Two runnable example chambers ship
 under [`examples/chambers/`](examples/chambers/) (Westworld/Dolores and
 Hitchhiker/Marvin) as the canonical "how to author a chamber" reference.
+
+## Accessibility first
+
+Retinue is built to be usable by people for whom the usual personal-software
+stack — an inbox per channel, a bell per arrival, a keyboard for everything —
+does not work. Two properties run through the whole system rather than sitting
+in a settings page.
+
+### Adaptive to ADHD
+
+The system carries the load that executive function would otherwise have to:
+deciding what matters now, remembering what is parked, and coming back to it
+at the right time.
+
+- **Interruptions are decided, not delivered on arrival.** Every thread, chat
+  and project has an importance, an optional deadline with a lead time, and a
+  sphere. From those and the current focus mode the gateway decides whether an
+  item rings now, waits for the next digest, or is merely listed. Only what is
+  time-sensitive or critical breaks through
+  ([`docs/attention-model.md`](docs/attention-model.md)).
+- **Modes describe how interruptible you are**, not what hour it is: *Chores*,
+  *Focused* (scoped to nothing, one sphere or one project), *Social*, *Rest &
+  relax*. A deployment renames and adds its own.
+- **A digest instead of a firehose or a mute button.** Held items arrive
+  batched at breakpoints — mode changes and a few fixed times a day — and a
+  deadline bounds how long anything may wait, so deferring never becomes
+  forgetting.
+- **One list of what wants attention**, across messengers, e-mail, threads and
+  projects, each row with a reason for its rank and a one-tap correction the
+  system learns from.
+- **Nothing depends on you remembering it.** Projects are parked on whoever
+  they wait for and wake by themselves when their date comes; recurring ones
+  return on their cadence; an inbox is a letterbox that gets emptied and
+  filed, not a shelf to keep tidy.
+- **Decisions come as choices.** Agents look up what is already known before
+  asking, and what they do ask is answered with a tap on a chip rather than by
+  composing a reply.
+
+### Spoken language everywhere — aspiring to completely hands-free use
+
+Voice is a first-class way in and out on every surface, not an add-on to a
+text interface:
+
+- **Dictation in every composer**, transcribed by the stack's own `stt`
+  service and tidied by a cleanup pass; detection is constrained to the
+  languages the user actually speaks, with no language privileged.
+- **Answers read aloud**, per thread or always.
+- **Continuous conversation**: a per-thread loop of listen → answer → read
+  aloud → listen again, with voice-activity detection ending each take, and
+  ended by simply telling Ara to switch it off.
+- **A wake phrase** in the Ara Android app opens that loop without touching
+  the phone; the app can also place a phone call the conversation asked for,
+  on speakerphone.
+- **Messengers speak too**: incoming voice notes are transcribed on all
+  gateways, and a Signal control channel answers in audio.
+
+Completely hands-free operation is the goal, not yet the state: some steps
+still deliberately or incidentally need a tap — approving a queued send,
+confirming keystrokes on a paired device, pairing and settings. Mechanics:
+[`docs/dashboard.md`](docs/dashboard.md), "Speech-to-text (the `stt` service)
+and voice input".
+
+## Services
 
 Defines these core compose services:
 
@@ -23,7 +90,9 @@ Defines these core compose services:
   for one Signal account. Depending on the account's configured mode
   (see [Messaging accounts](#messaging-accounts)) it either runs incoming
   messages as prompts to `retinue` and replies in audio (**control** mode), or
-  hands them to the user's triage as incoming mail (**inbox** mode). Incoming
+  hands them to the dashboard's chat surface as the user's incoming mail
+  (**inbox** mode; a model turn works one only for a sender the user marked a
+  VIP or wrote an instruction for). Incoming
   voice notes are transcribed via the `stt` service, and incoming images are
   forwarded to the agent alongside the message text (all three messenger
   gateways do this — the image travels with the `POST /message` forward and is
@@ -32,6 +101,28 @@ Defines these core compose services:
   exposes an outbound `/send` HTTP endpoint so `retinue` can *initiate*
   Signal messages (alerts, escalations, daily briefings) via
   `scripts/signal-push.py`, each with a spoken rendering and optional images.
+- **`mail-gateway`** — mirrors one mailbox over IMAP into the chat ledger, so
+  each mail thread is a chat on the dashboard, trimmed to its new text with
+  the full mail a tap away (`scripts/mail-gateway.py`;
+  [`docs/mail-chats.md`](docs/mail-chats.md)). It writes back: replies and
+  new mail leave through it under `EMAIL_SEND_POLICY` (a queued one is shown
+  pending in its chat, with its approval link, and a failed one stays there
+  with its reason; the To/Cc line of a reply is the gateway's own answer, and a
+  mail that may have gone out is never reported as not sent; agents send with
+  `scripts/mail-push.py`), and Mark as read, Archive and Delete reach the
+  mailbox (Delete moves the thread to the Trash, which it never creates). It
+  gates each arriving mail like a messenger message: nothing is pushed by
+  default (a contact's importance and the modes they may interrupt can say
+  otherwise), a model turn works the mail only for a sender whose contact
+  carries the VIP flag or an instruction, and a mailing list flagged `news`
+  goes to the feed (a VIP's or instructed sender's mail in it still gets its
+  chat and its turn). There is no e-mail triage beside it.
+  Opt-in: it mirrors nothing until `MAIL_GATEWAY_TOKEN` is set, so an upgrade
+  that changes nothing in `.env` mirrors nothing — and, with e-mail triage
+  retired, nobody handles e-mail until it is set: the boot says so in a
+  dashboard thread, and the one-time triage migration waits for it. With no
+  mailbox configured it idles. See
+  [`docs/messaging.md`](docs/messaging.md), "E-mail (the mail gateway)".
 - **`stt`** — a small speech-to-text microservice that owns the single Whisper
   model in the stack and exposes `POST /transcribe`. Shared by the
   `signal-gateway` (inbound voice notes) and the web gateway (dashboard voice
@@ -213,13 +304,13 @@ inferred from a message's content. Set it with `SIGNAL_GATEWAY_MODE` (Signal),
 | Mode | The account is… | Inbound handling | Reply to sender? |
 |------|-----------------|------------------|------------------|
 | `control` | a control channel for operating Retinue (the classic gateway) | run as a prompt to Ara | yes — voice/text on the same channel |
-| `inbox` *(default)* | one of the user's own message sources, like an e-mail inbox | forwarded to triage as the user's incoming mail, surfaced on the dashboard as a push notification | no |
+| `inbox` *(default)* | one of the user's own message sources, like an e-mail inbox | shown in its chat on the dashboard and pushed as the user's incoming mail; a model turn only for a VIP or an instructed sender (the triage skill is the fallback when the chat surface cannot take a message) | no |
 
 The default is `inbox`, so an account left unconfigured **cannot drive the
 system** — exposure defaults closed. Turning an account into a control channel is
 an explicit opt-in (`SIGNAL_GATEWAY_MODE=control`) and still requires the sender
 to be on the accepted-requesters allowlist (below). Because the mode is a
-property of the account, the triage skill never has to decide whether an incoming
+property of the account, no session ever has to decide whether an incoming
 message is a system instruction or user mail.
 
 ### Linking a Signal account
@@ -280,14 +371,14 @@ user's personal number as an `inbox` source:
 ```yaml
 # docker-compose.override.yml
 services:
-  # Account #2: the user's personal number, an inbox source that feeds triage.
+  # Account #2: the user's personal number, an inbox source shown as chats.
   signal-gateway-personal:
     extends:
       file: docker-compose.yml
       service: signal-gateway
     environment:
       - SIGNAL_ACCOUNT=+15557654321      # this account's own number (E.164)
-      - SIGNAL_GATEWAY_MODE=inbox        # forward to triage, no reply
+      - SIGNAL_GATEWAY_MODE=inbox        # the user's own mail: no reply
     volumes:
       - signal-data-personal:/root/.local/share/signal-cli   # its OWN volume
       - piper-data:/models
@@ -344,7 +435,7 @@ Telegram is reached through the sibling `telegram-gateway` service, which logs i
 as the user's **own Telegram account** — an MTProto user client (Telethon), not a
 bot. Acting as the user is what makes it fit for purpose: it can message any of
 the user's contacts *as them*, read the user's own incoming DMs (so `inbox` mode
-genuinely triages the user's Telegram mail), and enumerate the real contact
+genuinely mirrors the user's Telegram mail), and enumerate the real contact
 directory — the same account access an MCP user client has, but with the
 credentials isolated in the container. Same `control`/`inbox` mode model
 (`TELEGRAM_GATEWAY_MODE`, default `inbox`) and the same email-style send-control
@@ -524,10 +615,16 @@ that gap:
   (`WHATSAPP_IQ_PROBE_SECONDS`, default 60; `WHATSAPP_IQ_PROBE_FAILURES`,
   default 2; on a sustained wedge the gateway also tears its connection down to
   force a reconnect, at most once per `WHATSAPP_IQ_RECONNECT_BACKOFF` seconds,
-  default 600) — and Telegram from the MTProto connection plus a
+  default 600, and exits for a container restart when `WHATSAPP_IQ_EXIT_AFTER`
+  teardowns, default 2, brought no probe back) — and Telegram from the MTProto connection plus a
   periodic session probe (which catches a session revoked from another device).
+  The mail gateway reports whether its last IMAP login and poll succeeded —
+  and, when it is not the mailbox that holds it (the mirror waiting for the
+  e-mail policy file, or stopped on a fault of its own), names that in
+  `blocked`.
   An unconfigured channel reports `configured: false` and idles instead of
-  crash-looping.
+  crash-looping — the mail gateway too while `MAIL_GATEWAY_TOKEN` is unset or
+  `MESSENGER_BUILTIN_CHANNELS` leaves out `email`, its `/health` saying which.
 - **The monitor.** `scripts/gateway-monitor.py` (forked by the entrypoint in
   the `retinue` container) polls every configured gateway's `/health` once a
   minute. After two consecutive failures it notifies the user through the
@@ -540,9 +637,16 @@ that gap:
   `GATEWAY_MONITOR_REMIND_SECONDS`, `GATEWAY_MONITOR_IGNORE` (comma-separated
   slugs to skip, e.g. a deliberately unlinked channel). It watches the same
   registry `/sends` uses — the built-in channels named in
-  `MESSENGER_BUILTIN_CHANNELS` (default: all four — SMS only where
-  `SMS_GATEWAY_BASE_URL` is set) plus any
-  `MESSENGER_GATEWAYS` extras.
+  `MESSENGER_BUILTIN_CHANNELS` (default: all five — SMS only where
+  `SMS_GATEWAY_BASE_URL` is set, e-mail's mail gateway where
+  `MAIL_GATEWAY_BASE_URL` is, which the base compose sets; a deployment that
+  pins the set must add `email` to it, in `.env`, to get mail chats) plus any
+  `MESSENGER_GATEWAYS` extras. A mail gateway's notices say the mail server
+  refused the login or cannot be reached, never to re-pair a phone — and
+  where its `/health` says what else holds it (`blocked`), that it is waiting
+  for its setup or stopped on a fault of its own, with the gateway's own
+  reason; an outage that turns from one kind into another is told when it
+  does, in the same thread.
 - **Re-pairing from the phone.** The dashboard page **`/gateways`** (behind the
   same edge auth as the rest) shows each gateway's live state and, for a
   disconnected one, the pairing QR code — proxied from the gateway's
@@ -910,6 +1014,8 @@ retinue/
   scripts/             ← operational scripts (ingestion, hooks, refresh)
   Dockerfile           ← image for the `retinue` service
   signal-gateway/      ← image definition for the `signal-gateway` service
+  whatsapp-gateway/, telegram-gateway/, sms-gateway/, mail-gateway/,
+  caldav-gateway/      ← image definitions for the other channel gateways
   docker-compose.yml   ← deployment-neutral base composition
   docker-compose.override.example.yml ← deployment-specific wiring template
   qlever-static/       ← single-file SPARQL service (optional, deployment override)

@@ -215,7 +215,7 @@ REPLY_TOKENS = ReplyTokenStore(
 def _attach_reply_tokens(messages: list) -> None:
     """Give each drained /undelivered message a reply token for its origin.
 
-    The drain hands raw ledger rows to the daily triage; without a token those
+    The drain hands raw ledger rows to triage; without a token those
     replies fall back to name resolution — the exact failure that by-token
     routing exists to prevent and that live forwards already avoid. The origin
     is the group chat when there is one, else the stored sender. For a 1:1 that is the
@@ -357,7 +357,7 @@ def _confirm_delivery(job_path: str, store_path, label: str,
     started taking messages.
 
     Polls in the background (see job_delivery): a job that errors, expires or
-    never finishes leaves delivered=False, so the daily drain retries it.
+    never finishes leaves delivered=False, so the recovery drain retries it.
     """
     if store_path is None:
         return
@@ -519,6 +519,7 @@ _conn: dict = {
     "iq_error": None,
     "iq_fails": 0,        # consecutive failed probes
     "iq_checked": None,
+    "iq_teardowns": 0,    # wedge teardowns since the last successful probe
     # Outcome of the last outbound delivery's recipient resolution (issue
     # #120). Kept separate from the probe state: the probe usyncs our OWN JID,
     # which can succeed while an arbitrary recipient's device-list lookup times
@@ -537,6 +538,13 @@ WHATSAPP_IQ_PROBE_SECONDS = float(os.environ.get("WHATSAPP_IQ_PROBE_SECONDS", ""
 WHATSAPP_IQ_PROBE_FAILURES = int(os.environ.get("WHATSAPP_IQ_PROBE_FAILURES", "") or "2")
 # Minimum seconds between automatic reconnect attempts while IQ stays wedged.
 WHATSAPP_IQ_RECONNECT_BACKOFF = float(os.environ.get("WHATSAPP_IQ_RECONNECT_BACKOFF", "") or "600")
+# Teardowns that may pass without a successful probe before the gateway gives
+# up on in-process recovery and exits, so the container restart policy starts
+# a fresh process (0 disables). A teardown can be a no-op: once whatsmeow's own
+# autoreconnect has given up (e.g. after a dial or DNS failure), disconnect()
+# on the already-dead socket fires no event and connect() never returns, so the
+# outer loop in main() never reconnects — only a process restart recovers.
+WHATSAPP_IQ_EXIT_AFTER = int(os.environ.get("WHATSAPP_IQ_EXIT_AFTER", "") or "2")
 # Outbound usync/device-list failures (issue #120): how many extra attempts a
 # send gets after the candidate JIDs are exhausted, and the pause before each.
 WHATSAPP_SEND_USYNC_RETRIES = int(os.environ.get("WHATSAPP_SEND_USYNC_RETRIES", "") or "1")
@@ -590,6 +598,7 @@ def _note_iq_result(ok: bool, error: str | None = None) -> bool:
             _conn["iq_ok"] = True
             _conn["iq_error"] = None
             _conn["iq_fails"] = 0
+            _conn["iq_teardowns"] = 0
             return False
         _conn["iq_fails"] = int(_conn.get("iq_fails", 0)) + 1
         _conn["iq_error"] = (error or "info query failed")[:500]
@@ -1230,11 +1239,22 @@ def _run_send_op(jid, op: dict):
             path = op["path"]
             data = path.read_bytes()
             mime = mimetypes.guess_type(str(path))[0] or "application/octet-stream"
+            msg = None
             if mime.startswith("image/"):
                 # build_image_message derives the mime type from the bytes itself
                 # and takes no mime keyword — passing one raises TypeError.
                 msg = client.build_image_message(data, caption=op["caption"] or "")
-            else:
+            elif mime.startswith("video/"):
+                # A video goes out as one — playable in the chat — rather than
+                # as a file to download. The builder probes it with ffmpeg
+                # (duration, thumbnail); a container ffmpeg cannot read is
+                # still delivered, as a document.
+                try:
+                    msg = client.build_video_message(data, caption=op["caption"] or "")
+                except Exception as exc:  # noqa: BLE001 - degrade to a document
+                    print(f"[whatsapp-gateway] could not build a video message for "
+                          f"{path.name} ({exc}); sending it as a document", flush=True)
+            if msg is None:
                 # neonize's document builder spells the parameter `mimetype`
                 # (not `mime_type`); the wrong spelling crashed every PDF send.
                 msg = client.build_document_message(
@@ -1524,6 +1544,10 @@ class _IQProbeUnsupported(RuntimeError):
 
 _IQ_RECONNECT_LOCK = threading.Lock()
 _last_iq_reconnect = 0.0
+# os._exit, not sys.exit: this runs on the probe thread, and the bridge's
+# blocking connect() on the main thread must not keep the process alive.
+# Module-level so tests can substitute it.
+_exit_process = os._exit
 # The (method, style) call shape that completed a probe, discovered on the
 # first successful round and cached so later failures are never re-classified
 # as API-shape issues.
@@ -1605,6 +1629,19 @@ def _maybe_iq_reconnect() -> None:
         _last_iq_reconnect = now
     client = _wa_client
     if client is None:
+        return
+    with _CONN_LOCK:
+        teardowns = int(_conn.get("iq_teardowns", 0))
+        if not (WHATSAPP_IQ_EXIT_AFTER > 0 and teardowns >= WHATSAPP_IQ_EXIT_AFTER):
+            _conn["iq_teardowns"] = teardowns + 1
+    if WHATSAPP_IQ_EXIT_AFTER > 0 and teardowns >= WHATSAPP_IQ_EXIT_AFTER:
+        # Earlier teardowns did not bring a single probe back, so the client is
+        # stuck past what an in-process reconnect can fix (see
+        # WHATSAPP_IQ_EXIT_AFTER). Exit non-zero; Compose restarts the container
+        # and the fresh process reconnects from the stored session.
+        print(f"[whatsapp-gateway] info queries still wedged after {teardowns} teardown(s) — "
+              "exiting so the container restarts with a fresh connection", flush=True)
+        _exit_process(1)
         return
     print("[whatsapp-gateway] info queries are wedged — tearing the connection down to force a reconnect", flush=True)
     try:
@@ -1746,7 +1783,7 @@ def _handle_message_event(event) -> None:
                     # Never-drop: retain the audio and persist the message up
                     # front, THEN transcribe. A failed or crashed STT run leaves a
                     # durable, re-transcribable record (delivered=False, media set)
-                    # for the daily drain — instead of vanishing at the skip-return
+                    # for the recovery drain — instead of vanishing at the skip-return
                     # below, downstream of where _forward_to_inbox persists.
                     #
                     # The retained copy is the *retry* artifact and is dropped once
@@ -1793,7 +1830,7 @@ def _handle_message_event(event) -> None:
     if not text and not files and not attachment_urls:
         if voice_store_path is not None:
             # A voice note whose transcription failed: not dropped — it is on disk
-            # (delivered=False, audio retained) for the daily drain / a re-transcribe.
+            # (delivered=False, audio retained) for the recovery drain / a re-transcribe.
             print(f"[whatsapp-gateway] voice note from {sender} not transcribed; "
                   f"retained for retry (not dropped)", flush=True)
         else:
@@ -1913,8 +1950,10 @@ def _finish_own_device_record(chat: str, text: str, msg_id: str | None,
     _record_outbound(chat, text, "device", message_id=msg_id, timestamp=ts,
                      attachment_urls=refs)
     if WHATSAPP_GATEWAY_MODE == "inbox":
-        # Chats rail: an own-device send advances the chat's read watermark on
-        # the dashboard (the user was visibly in that chat on their phone).
+        # Chats rail: an own-device send is the user's reply, and a reply
+        # reads the chat — so it advances the chat's read mark on the
+        # dashboard. (Opening or viewing a chat, here or on the phone, reads
+        # nothing.)
         _chats.notify_chat_event_async(
             direction="out", channel=INBOUND_CHANNEL, chat=chat,
             account=WHATSAPP_ACCOUNT, author="device", message_id=msg_id,
@@ -1991,7 +2030,7 @@ def _forward_to_inbox(question: str, lang: str, sender: str,
     # inbound event has already been consumed from the WhatsApp session, so if it
     # is lost here it is gone for good. Writing it up front as delivered=False
     # means any later failure (a throwing gate, a crash mid-forward, a killed
-    # container) leaves the message on disk for the daily drain instead of
+    # container) leaves the message on disk for the recovery drain instead of
     # silently dropping it. The flag is flipped to true below once the message is
     # accounted for (forwarded to triage, or held in a fully-resolved class).
     # A voice note was already persisted before transcription; reuse that record.
@@ -2031,7 +2070,7 @@ def _forward_to_inbox(question: str, lang: str, sender: str,
     # the gate made of it. The mirror shows it, the user is pushed unless the
     # gate says to stay quiet, and the record says delivered. So every message
     # is offered to the rail, not only the ones that used to buy a triage
-    # session: that is what empties the undelivered backlog the daily drain
+    # session: that is what empties the undelivered backlog the recovery drain
     # existed to sweep, because there is no longer anything left un-handled.
     #
     # The call is synchronous because its answer decides what happens next, and
@@ -2192,7 +2231,7 @@ def _forward_to_inbox(question: str, lang: str, sender: str,
 
     # Flip the persisted message's delivered flag only once triage has actually
     # run. The POST answers 202 (accepted), not "handled": marking delivered on
-    # acceptance would hide a job that later fails from the daily drain, losing
+    # acceptance would hide a job that later fails from the recovery drain, losing
     # the message. So an async forward waits for `status: done` in the
     # background; a failed forward, and any job that errors, expires or times
     # out, stays delivered=False so the drain retries it. At-least-once: a
@@ -2229,7 +2268,7 @@ def _forward_status_to_inbox(text: str, lang: str, sender: str,
 
     # A status post is no-action-class: with the delivery gate on it never gets
     # a model turn, and it is persisted already accounted for (delivered:true) so
-    # the daily drain never re-surfaces it. History stays browsable in the store.
+    # the recovery drain never re-surfaces it. History stays browsable in the store.
     if INBOUND_GATE_ENABLED:
         _persist_inbound(text or "", sender, None, delivered=True)
         print(
@@ -2251,8 +2290,8 @@ def _forward_status_to_inbox(text: str, lang: str, sender: str,
         f"Invoke the triage skill scoped to this single status update (channel: "
         f"WhatsApp, kind: status_update, sender: {sender_label}). Handle it per the "
         f"skill's status-update policy: the default disposition is to file it "
-        f"silently — record it in the triage status store but raise NO dashboard "
-        f"conversation and send NO notification — unless a configured rule (e.g. a "
+        f"silently — the gateway's ledger already holds the post, so write nothing "
+        f"down; raise NO dashboard conversation and send NO notification — unless a configured rule (e.g. a "
         f"watched contact, or a news-agent feed) says otherwise. Do not reply to "
         f"the sender."
     )
@@ -2563,7 +2602,7 @@ def _execute_approved_send(path: Path, entry: dict) -> None:
     timeout.
 
     What the send produced — the channel's message id, the send time, and the
-    ledger media references for any images — is written onto the entry beside
+    ledger media references for any attachments — is written onto the entry beside
     the status. The status alone used to be all that survived, so an approved
     send's identity was simply lost; the chat surface needs it, because a chat
     send is now queued and approved rather than skipping the queue, and it
@@ -2652,33 +2691,23 @@ def _complete_pending_send(request_id: str, approved: bool,
 
 # ── Outbound push ─────────────────────────────────────────────────────────────
 
-def _decode_image(image: dict) -> Path:
-    """Materialize one inbound base64 image to a temp file for the bridge."""
-    if not isinstance(image, dict):
-        raise ValueError("each images entry must be an object with base64 'data'")
-    data_b64 = image.get("data")
-    if not data_b64:
-        raise ValueError("image entry missing base64 'data'")
-    try:
-        raw = base64.b64decode(data_b64, validate=True)
-    except ValueError as exc:  # binascii.Error subclasses ValueError
-        raise ValueError(f"invalid base64 image data: {exc}") from exc
-    suffix = Path(image.get("filename") or "image.jpg").suffix or ".jpg"
-    fd, out = tempfile.mkstemp(suffix=suffix, prefix="wa-push-", dir=str(WHATSAPP_TMP_DIR))
-    with os.fdopen(fd, "wb") as fh:
-        fh.write(raw)
-    return Path(out)
+def _decode_attachment(entry: dict) -> tuple[Path, str, str | None]:
+    """Materialize one /send attachment — a file of any type — for the channel.
+
+    Returns ``(path, content_type, name)``; see
+    :func:`inbound_store.materialize_outbound`."""
+    return _ibstore.materialize_outbound(entry, WHATSAPP_TMP_DIR)
 
 
 def _push(recipient: str, message: str, lang: str | None = None,
           images: list[dict] | None = None, voice: bool = True,
           author: str = "agent") -> tuple[str | None, float | None, list[str]]:
-    """Send an outbound message: text body plus optional image attachments.
+    """Send an outbound message: text body plus optional attachments (files of any type).
 
     `lang`/`voice` are accepted for parity with the Signal gateway's _push
     signature (the pending store persists them) but WhatsApp has no voice
     pipeline, so they are ignored here. ``author`` is carried through to the
-    ledger record; each image is also persisted into the ledger media store
+    ledger record; each attachment is also persisted into the ledger media store
     (inbox mode) so the sent message mirrors with its media. Returns
     ``(message_id, sent_at, media_refs)``; the /send response surfaces all
     three (see :func:`_wa_send`).
@@ -2686,18 +2715,16 @@ def _push(recipient: str, message: str, lang: str | None = None,
     images = images or []
     message = (message or "").strip()
     if not message and not images:
-        raise ValueError("push requires a non-empty message or at least one image")
+        raise ValueError("push requires a non-empty message or at least one attachment")
 
     temp_paths: list[Path] = []
     media_refs: list[str] = []
     try:
         for image in images:
-            path = _decode_image(image)
+            path, ctype, name = _decode_attachment(image)
             temp_paths.append(path)
             if WHATSAPP_GATEWAY_MODE == "inbox":
-                ctype = ((image.get("content_type") if isinstance(image, dict) else None)
-                         or mimetypes.guess_type(str(path))[0] or "image/jpeg")
-                ref = _store_media_ref(path.read_bytes(), ctype)
+                ref = _store_media_ref(path.read_bytes(), ctype, name)
                 if ref:
                     media_refs.append(ref)
         msg_id, ts = _wa_send(recipient, message or None, media_paths=temp_paths,
@@ -2705,7 +2732,7 @@ def _push(recipient: str, message: str, lang: str | None = None,
         return msg_id, ts, media_refs
     finally:
         for path in temp_paths:
-            path.unlink(missing_ok=True)
+            _ibstore.discard_outbound(path)
 
 
 def _erase_chat(chat: str, account: str | None) -> dict:
@@ -2841,7 +2868,7 @@ class _PushHandler(BaseHTTPRequestHandler):
                 self._reply(502, {"error": f"recent-chats lookup failed: {exc}"})
             return
         if self.path.split("?", 1)[0].rstrip("/") == "/undelivered":
-            # The daily triage drain: return every inbound message not yet handed
+            # The triage recovery drain: return every inbound message not yet handed
             # to triage and mark it delivered in one pass (inbound_store owns the
             # flag). Optional ?since=<ISO|epoch> bounds the window.
             if not self._authorized():
@@ -2937,7 +2964,9 @@ class _PushHandler(BaseHTTPRequestHandler):
             self._reply(400, {"error": "empty body"})
             return
         if length > MAX_PUSH_BODY_BYTES:
-            self._reply(413, {"error": "payload too large"})
+            self._reply(413, {"error": "payload too large: one send carries at most "
+                                       f"about {MAX_PUSH_BODY_BYTES * 3 // 4 // (1024 * 1024)} MB "
+                                       "of attachments"})
             return
         try:
             payload = json.loads(self.rfile.read(length).decode("utf-8"))
@@ -2967,6 +2996,8 @@ class _PushHandler(BaseHTTPRequestHandler):
             self._reply(400, {"error": "no recipient given and WHATSAPP_DEFAULT_RECIPIENT is unset"})
             return
         message = payload.get("message") or payload.get("text") or ""
+        # "images" is the key's historical name: each entry is a file of any
+        # type — an image, a video, a PDF — as {data, filename?, content_type?}.
         images = payload.get("images") or []
         if not isinstance(images, list):
             self._reply(400, {"error": "'images' must be a list"})
@@ -3020,7 +3051,7 @@ class _PushHandler(BaseHTTPRequestHandler):
         # account's policy allows directly. Authorship is provenance, so it is
         # reported rather than branched on.
         print(f"[whatsapp-gateway] sent to {recipient} (author={author})"
-              + (f" ({len(images)} image(s))" if images else ""), flush=True)
+              + (f" ({len(images)} attachment(s))" if images else ""), flush=True)
         body = {"status": "sent", "recipient": recipient}
         # Surface the recorded ledger identity — id, timestamp and the stored
         # media references — so the caller (the dashboard's chat view) can show

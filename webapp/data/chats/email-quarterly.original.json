@@ -1,0 +1,14 @@
+{
+ "id": "BN7PR02MB4152.revised@outlook.example",
+ "headers": {
+  "from": "Bob Builder <bob@builder.example>",
+  "to": "me@example.org, Ann Example <ann@example.com>",
+  "cc": "carla@example.net",
+  "date": "Wed, 26 Aug 2026 09:40:12 +0200",
+  "subject": "Re: Quarterly numbers (revised table)"
+ },
+ "header_block": "From: Bob Builder <bob@builder.example>\nTo: me@example.org, Ann Example <ann@example.com>\nCc: carla@example.net\nSubject: Re: Quarterly numbers (revised table)\nDate: Wed, 26 Aug 2026 09:40:12 +0200\nMessage-ID: <BN7PR02MB4152.revised@outlook.example>\nIn-Reply-To: <20260825172204.4F1A@me.example.org>\nReferences: <CAJx8kQ2v7Lr3n@mail.example.com> <20260825172204.4F1A@me.example.org>\nMIME-Version: 1.0\nContent-Type: multipart/alternative; boundary=\"_000_BN7PR02MB4152_\"",
+ "text": "Yes — revised table below, row 4 now shows the corrected figure.\n\nRegion | Q2 | Q3\nNorth | 120 | 134\nSouth | 98 | 112\n\nBob\n\n________________________________\nFrom: me@example.org\nSent: Tuesday, 25 August 2026 17:22\nTo: Ann Example; Bob Builder\nSubject: Re: Quarterly numbers\n\nLooks right to me except row 4 — Bob, wasn't that the revised figure?",
+ "html_url": "/chats/email%3A~me%40example.org%3ACAJx8kQ2v7Lr3n%40mail.example.com/messages/c3d2e1f0a9b8c7d6e5f4a3b2c1d0e9f8/original.html",
+ "attachments": []
+}

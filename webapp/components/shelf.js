@@ -312,7 +312,9 @@ class RetinueShelf extends HTMLElement {
   async _readThread(key, id, companion) {
     try {
       const res = await fetch(`/conversations/${encodeURIComponent(id)}`, { cache: 'no-store' });
-      if (res.status === 404) { if (!companion) shelf.muted(key); return; }
+      // Gone: never there (404), or deleted by the user (410) — nothing to
+      // go back to.
+      if (res.status === 404 || res.status === 410) { if (!companion) shelf.muted(key); return; }
       if (!res.ok) return;
       const t = await res.json();
       if (isLive(key)) return; // a page took over meanwhile

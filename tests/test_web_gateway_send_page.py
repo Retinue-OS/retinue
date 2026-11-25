@@ -18,6 +18,8 @@ import contextlib
 import html.parser
 import importlib.util
 import os
+import shutil
+import subprocess
 import sys
 import tempfile
 import types
@@ -131,7 +133,8 @@ def test_approved_page_shows_check_and_advances():
         assert "else if (status === 'approved') { setTimeout(advance, 1500); }" in SENDS_JS
         # With nothing left, back to the page the link was tapped on: the
         # latest history entry that is not a /sends page.
-        assert "nav.traverseTo(entries[i].key)" in SENDS_JS
+        assert "return { entry: entries[i], url: u };" in SENDS_JS
+        assert "window.navigation.traverseTo(o.entry.key)" in SENDS_JS
         assert ("if (u.origin !== location.origin || /^\\/sends(\\/|$)/.test(u.pathname)) continue;"
                 in SENDS_JS)
         # Opened on its own: close, else the dashboard — never the /sends list.
@@ -608,6 +611,212 @@ def test_empty_list_after_a_decision_goes_back():
         assert "if (nextUrl) { location = nextUrl; return; }\n    leave();" in SENDS_JS
 
 
+def _write_thread(tmp: Path, cid: str, title: str) -> None:
+    import json as _json
+    convs = tmp / "convs"
+    convs.mkdir(parents=True, exist_ok=True)
+    (convs / f"{cid}.json").write_text(_json.dumps({"id": cid, "title": title, "messages": []}))
+
+
+def test_approval_page_links_back_to_the_asking_thread():
+    """The way back to the thread that queued the send: the browser's own Back
+    when that thread is where the tab came from, else a link to it — and both
+    hand over the place in the thread the approval link was tapped at."""
+    with tempfile.TemporaryDirectory() as tmp:
+        wg = _load_gateway(Path(tmp))
+        cid = "c" * 32
+        _write_thread(Path(tmp), cid, "Party <RSVP>")
+        out = wg._render_channel_send_html(_detail("pending", thread=cid),
+                                           "whatsapp-gateway", "a" * 32, None)
+        link = (f'<a href="/conversations.html#conversation-{cid}" id="back-thread" '
+                f'data-thread="{cid}">‹ Back to Party &lt;RSVP&gt;</a>')
+        assert f"<nav>{link}{wg._NAV_HOME}" in out
+        assert SENDS_SCRIPT_TAG in out
+        # The script: Back when the latest non-/sends entry is this thread,
+        # else the plain link; the place is handed over in the shelf's restore
+        # format, by the return after a decision too.
+        assert "var back = document.getElementById('back-thread');" in SENDS_JS
+        assert "if (!o || threadOf(o.url) !== backId) return;" in SENDS_JS
+        assert "primeReturn(backId);" in SENDS_JS
+        assert "var SHELF_RESTORE_KEY = 'retinue.shelf.restore';" in SENDS_JS
+        assert "{ key: 'thread:' + id, location: r.location, at: Date.now() }" in SENDS_JS
+        assert "primeReturn(threadOf(o.url));" in SENDS_JS
+        # No script in the page itself (the Content-Security-Policy).
+        assert "<script>" not in out
+        # E-mail approval, and the status page after the decision, alike.
+        email = wg._render_send_single_html({"request_id": "42", "thread": cid}, "ari", None)
+        assert link in email
+        status = wg._render_channel_send_html(_detail("error", thread=cid, error="x"),
+                                              "whatsapp-gateway", "a" * 32, None)
+        assert link in status
+
+
+def test_no_backlink_without_a_live_thread():
+    with tempfile.TemporaryDirectory() as tmp:
+        wg = _load_gateway(Path(tmp))
+        none = wg._render_channel_send_html(_detail("pending"), "whatsapp-gateway", "a" * 32, None)
+        gone = wg._render_channel_send_html(_detail("pending", thread="d" * 32),
+                                            "whatsapp-gateway", "a" * 32, None)
+        bogus = wg._render_channel_send_html(_detail("pending", thread="../x"),
+                                             "whatsapp-gateway", "a" * 32, None)
+        for out in (none, gone, bogus):
+            assert 'id="back-thread"' not in out
+            assert f'<nav>{wg._NAV_HOME}<a href="/sends">' in out
+
+
+def test_thread_notes_where_an_approval_link_was_tapped():
+    src = (REPO_ROOT / "webapp" / "components" / "conversation.js").read_text(encoding="utf-8")
+    assert "const SENDS_RETURN_KEY = 'retinue.sends.return';" in src
+    assert "var SENDS_RETURN_KEY = 'retinue.sends.return';" in SENDS_JS
+    assert "if (link) this._noteSendsReturn(link);" in src
+    assert "location: this.shelfLocation()," in src
+    # The note is for that visit only: used up by the way back, and lapsing
+    # when left behind.
+    assert "if (Date.now() - (r.at || 0) < SENDS_RETURN_TTL_MS) return r;" in SENDS_JS
+    assert "try { sessionStorage.removeItem(SENDS_RETURN_KEY); }" in SENDS_JS
+
+
+# The return note's life, run for real (node): sends.js is loaded into a stub
+# page with a sessionStorage, a history and a clock the harness controls.
+_RETURN_HARNESS = r"""
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import vm from 'node:vm';
+
+const SRC = fs.readFileSync(process.argv[2], 'utf8');
+const ID = 'c'.repeat(32), OTHER = 'd'.repeat(32);
+const NOTE = 'retinue.sends.return', RESTORE = 'retinue.shelf.restore';
+const MIN = 60 * 1000, NOW = 1700000000000;
+const ORIGIN = 'https://dash.example';
+const PLACE = { anchor: 'm7', offset: 12 };
+
+// One page load of a /sends page. opts: note (the stored return note), leave
+// (the empty list after a decision), backId (the page's #back-thread), from
+// (the thread the tab came from, null for none). Returns what the page did.
+function load(opts) {
+  const store = new Map();
+  if (opts.note) store.set(NOTE, JSON.stringify(opts.note));
+  const sessionStorage = {
+    getItem: (k) => (store.has(k) ? store.get(k) : null),
+    setItem: (k, v) => { store.set(k, String(v)); },
+    removeItem: (k) => { store.delete(k); },
+  };
+  const out = { store, traversed: [], prevented: false, back: null };
+  let click = null;
+  if (opts.backId) {
+    out.back = {
+      href: '/conversations.html#conversation-' + opts.backId,
+      getAttribute: (n) => (n === 'data-thread' ? opts.backId : null),
+      addEventListener: (type, fn) => { if (type === 'click') click = fn; },
+    };
+  }
+  const entries = [];
+  if (opts.from) {
+    entries.push({ key: 'k-thread', url: ORIGIN + '/conversations.html#conversation-' + opts.from });
+  }
+  entries.push({ key: 'k-send', url: ORIGIN + '/sends/acct/1' });
+  const navigation = {
+    currentEntry: { index: entries.length - 1 },
+    entries: () => entries,
+    traverseTo: (key) => { out.traversed.push(key); return { committed: Promise.resolve() }; },
+  };
+  class FakeDate extends Date { static now() { return NOW; } }
+  const window = { navigation, close() {} };
+  const context = {
+    window, sessionStorage, navigation, URL, JSON, Date: FakeDate,
+    location: { origin: ORIGIN, href: ORIGIN + '/sends/acct/1', replace() {} },
+    document: {
+      body: { hasAttribute: (n) => n === 'data-sends-leave' && !!opts.leave },
+      getElementById: (id) => (id === 'back-thread' ? out.back : null),
+    },
+    setTimeout: () => 0, fetch: () => new Promise(() => {}),
+  };
+  vm.runInNewContext(SRC, context);
+  out.click = () => click({
+    defaultPrevented: false, button: 0,
+    preventDefault() { out.prevented = true; },
+  });
+  out.restore = () => JSON.parse(store.get(RESTORE) || 'null');
+  return out;
+}
+const note = (ageMs, id = ID) => ({
+  id, location: PLACE, href: '/?x=1#conversation-' + id, at: NOW - ageMs,
+});
+let passed = 0;
+function check(name, fn) { fn(); passed++; }
+
+check('Back link, live note, thread is where the tab came from', () => {
+  const p = load({ note: note(5 * MIN), backId: ID, from: ID });
+  assert.equal(p.back.href, '/?x=1#conversation-' + ID);
+  assert.ok(p.store.has(NOTE), 'reading the note does not use it up');
+  p.click();
+  assert.deepEqual(p.restore(), { key: 'thread:' + ID, location: PLACE, at: NOW });
+  assert.ok(!p.store.has(NOTE), 'the way back uses the note up');
+  assert.deepEqual(p.traversed, ['k-thread']);
+  assert.ok(p.prevented);
+});
+
+check('Back link, live note, opened on its own: the plain link, place handed over', () => {
+  const p = load({ note: note(5 * MIN), backId: ID, from: null });
+  p.click();
+  assert.deepEqual(p.restore(), { key: 'thread:' + ID, location: PLACE, at: NOW });
+  assert.ok(!p.store.has(NOTE));
+  assert.deepEqual(p.traversed, []);
+  assert.ok(!p.prevented);
+});
+
+check('the note lives up to 30 minutes, not at 30', () => {
+  const live = load({ note: note(30 * MIN - 1), backId: ID, from: ID });
+  live.click();
+  assert.ok(live.restore());
+  const gone = load({ note: note(30 * MIN), backId: ID, from: ID });
+  assert.equal(gone.back.href, '/conversations.html#conversation-' + ID,
+    'an expired note does not move the link');
+  assert.ok(!gone.store.has(NOTE), 'an expired note is cleared when read');
+  gone.click();
+  assert.equal(gone.restore(), null, 'no place handed over');
+  assert.deepEqual(gone.traversed, ['k-thread'], 'Back still goes back');
+});
+
+check('a note of another thread is left alone', () => {
+  const p = load({ note: note(MIN, OTHER), backId: ID, from: ID });
+  p.click();
+  assert.equal(p.restore(), null);
+  assert.ok(p.store.has(NOTE));
+});
+
+check('the automatic return hands the place over and uses the note up', () => {
+  const p = load({ note: note(5 * MIN), leave: true, from: ID });
+  assert.deepEqual(p.restore(), { key: 'thread:' + ID, location: PLACE, at: NOW });
+  assert.ok(!p.store.has(NOTE));
+  assert.deepEqual(p.traversed, ['k-thread']);
+});
+
+check('the automatic return with an expired note just goes back', () => {
+  const p = load({ note: note(31 * MIN), leave: true, from: ID });
+  assert.equal(p.restore(), null);
+  assert.ok(!p.store.has(NOTE));
+  assert.deepEqual(p.traversed, ['k-thread']);
+});
+
+console.log(`${passed} return-note checks passed`);
+"""
+
+
+def test_return_note_lapses_and_is_used_up():
+    node = shutil.which("node")
+    if not node:
+        print("SKIP: node is not installed; the return-note behaviour test needs it")
+        return
+    with tempfile.TemporaryDirectory() as tmp:
+        harness = Path(tmp) / "harness.mjs"
+        harness.write_text(_RETURN_HARNESS, encoding="utf-8")
+        proc = subprocess.run(
+            [node, str(harness), str(REPO_ROOT / "webapp" / "gateway" / "sends.js")],
+            capture_output=True, text=True)
+        assert proc.returncode == 0, proc.stderr or proc.stdout
+
+
 def main() -> int:
     tests = [test_sending_page_polls_with_spinner,
              test_sending_page_with_next_shows_button,
@@ -635,7 +844,11 @@ def main() -> int:
              test_index_row_names_the_event_time,
              test_messenger_page_is_unchanged,
              test_email_outcome_page_ends_like_a_messenger_send,
-             test_empty_list_after_a_decision_goes_back]
+             test_empty_list_after_a_decision_goes_back,
+             test_approval_page_links_back_to_the_asking_thread,
+             test_no_backlink_without_a_live_thread,
+             test_thread_notes_where_an_approval_link_was_tapped,
+             test_return_note_lapses_and_is_used_up]
     failures = 0
     for test in tests:
         try:

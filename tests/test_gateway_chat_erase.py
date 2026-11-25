@@ -5,7 +5,8 @@ Deleting a chat in the dashboard asks the channel's gateways to erase it: the
 ledger records and their media (inbound_store.delete_chat, tested on its own in
 test_inbound_store.py), and each gateway's own traces — pending-send files and
 the recent-senders entry. What differs per gateway is only what "this chat"
-means for those two files, so that is what this pins, for all three: the
+means for those two files, so that is what this pins, for all three (and
+that the blobs the ledger unlinks, a mail part among them, are reported): the
 peer's traces go, other peers' stay, a send on the wire right now is left to
 finish, and a chat of *another* account leaves this gateway's own files alone.
 
@@ -36,8 +37,12 @@ def _check(gw, prefix, chat, recent_hit, recent_miss, recipient=None):
     recipient = recipient or chat
     store = Path(gw.INBOUND_STORE_DIR)
     ist = gw._ibstore
+    # A stored part (a mail's body blob, on the mail gateway) goes with its
+    # record and is reported — the counts are what the web gateway reads.
+    part = ist.store_media(store, b"hello", "text/plain")
     ist.write_message(store, channel=gw.INBOUND_CHANNEL, sender=chat, chat=chat,
-                      account=ACCOUNT, text="hello", timestamp=100.0)
+                      account=ACCOUNT, text="hello", timestamp=100.0,
+                      body_part=f"urn:retinue:media:{gw.INBOUND_CHANNEL}:{part}")
     ist.write_outbound(store, channel=gw.INBOUND_CHANNEL, chat=chat, account=ACCOUNT,
                        text="hi back", author="device", timestamp=101.0)
     keep = ist.write_message(store, channel=gw.INBOUND_CHANNEL, sender="x", chat="other",
@@ -61,6 +66,7 @@ def _check(gw, prefix, chat, recent_hit, recent_miss, recipient=None):
 
     got = gw._erase_chat(chat, ACCOUNT)
     assert got["messages"] == 2 and got["errors"] == 0, got
+    assert got["media"] == 1 and got["parts"] == 1 and ist.load_media(store, part) is None, got
     assert got["pending_sends"] == 1 and got["recent"] == 1, got
     assert [p.name for p in (store / "messages").glob("*.nt")] == [keep.name]
     assert sorted(p.stem for p in pend.glob("*.json")) == ["b" * 32, "c" * 32], \

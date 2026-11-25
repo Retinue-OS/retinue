@@ -173,7 +173,7 @@ REPLY_TOKENS = ReplyTokenStore(
 def _attach_reply_tokens(messages: list) -> None:
     """Give each drained /undelivered message a reply token for its origin.
 
-    The drain hands raw ledger rows to the daily triage; without a token those
+    The drain hands raw ledger rows to triage; without a token those
     replies fall back to name resolution — the exact failure that by-token
     routing exists to prevent and that live forwards already avoid. The origin
     is the group (in the ``group:<id>`` form ``_signal_send`` accepts) when
@@ -340,7 +340,7 @@ def _confirm_delivery(job_path: str, store_path, label: str,
     started taking messages.
 
     Polls in the background (see job_delivery): a job that errors, expires or
-    never finishes leaves delivered=False, so the daily drain retries it.
+    never finishes leaves delivered=False, so the recovery drain retries it.
     """
     if store_path is None:
         return
@@ -1592,8 +1592,10 @@ def _record_sync_sent(sent: dict) -> None:
                      timestamp=(int(ts) / 1000.0) if ts else None,
                      attachment_urls=attachment_urls)
     if SIGNAL_GATEWAY_MODE == "inbox":
-        # Chats rail: an own-device send advances the chat's read watermark on
-        # the dashboard (the user was visibly in that chat on their phone).
+        # Chats rail: an own-device send is the user's reply, and a reply
+        # reads the chat — so it advances the chat's read mark on the
+        # dashboard. (Opening or viewing a chat, here or on the phone, reads
+        # nothing.)
         _notify_chat_event_async(
             group_id=str(group_id) if group_id else None,
             direction="out", channel=INBOUND_CHANNEL, chat=chat,
@@ -1634,7 +1636,7 @@ def _handle_event(event: dict) -> None:
         print(f"[signal-gateway] processing voice message from {sender}", flush=True)
         # Never-drop: retain the audio and persist the message up front, THEN
         # transcribe. A failed or crashed STT run leaves a durable, re-
-        # transcribable record (delivered=False, media set) for the daily drain —
+        # transcribable record (delivered=False, media set) for the recovery drain —
         # instead of vanishing at the skip-return below, downstream of where
         # _forward_to_inbox persists. Only in inbox mode: a control account has no
         # triage drain that would pick a persisted record back up, so the never-
@@ -1680,7 +1682,7 @@ def _handle_event(event: dict) -> None:
     if not question and not files and not attachment_urls:
         if voice_store_path is not None:
             # A voice note whose transcription failed: not dropped — it is on disk
-            # (delivered=False, audio retained) for the daily drain / a re-transcribe.
+            # (delivered=False, audio retained) for the recovery drain / a re-transcribe.
             print(f"[signal-gateway] voice note from {sender} not transcribed; "
                   f"retained for retry (not dropped)", flush=True)
             return
@@ -1769,7 +1771,7 @@ def _forward_to_inbox(question: str, lang: str, sender: str,
     # signal-cli has already drained (acked) this message from the server, so if
     # it is lost here it is gone for good. Writing it up front as delivered=False
     # means that any later failure — a throwing gate, a crash mid-forward, a
-    # killed container — leaves the message on disk for the daily drain to catch
+    # killed container — leaves the message on disk for the recovery drain to catch
     # instead of silently dropping it. The flag is flipped to true below once the
     # message is actually accounted for (forwarded to triage, or held in a
     # fully-resolved class). A voice note was already persisted before
@@ -1818,7 +1820,7 @@ def _forward_to_inbox(question: str, lang: str, sender: str,
     # the gate made of it. The mirror shows it, the user is pushed unless the
     # gate says to stay quiet, and the record says delivered. So every message
     # is offered to the rail, not only the ones that used to buy a triage
-    # session: that is what empties the undelivered backlog the daily drain
+    # session: that is what empties the undelivered backlog the recovery drain
     # existed to sweep, because there is no longer anything left un-handled.
     #
     # The call is synchronous because its answer decides what happens next, and
@@ -1989,7 +1991,7 @@ def _forward_to_inbox(question: str, lang: str, sender: str,
 
     # Flip the persisted message's delivered flag only once triage has actually
     # run. The POST answers 202 (accepted), not "handled": marking delivered on
-    # acceptance would hide a job that later fails from the daily drain, losing
+    # acceptance would hide a job that later fails from the recovery drain, losing
     # the message. So an async forward waits for `status: done` in the
     # background; a failed forward, and any job that errors, expires or times
     # out, stays delivered=False so the drain retries it. At-least-once: a
@@ -2016,24 +2018,14 @@ def _strip_markdown(text: str) -> str:
 # Lets retinue (Ara) initiate Signal messages — alerts, escalations, daily
 # briefings — rather than only replying to inbound ones. A push carries a text
 # body, a spoken rendering of that body (Piper, same pipeline as replies), and
-# any number of images.
+# any number of attached files (images, videos, documents).
 
-def _decode_image(image: dict) -> Path:
-    """Materialize one inbound base64 image to a temp file for signal-cli."""
-    if not isinstance(image, dict):
-        raise ValueError("each images entry must be an object with base64 'data'")
-    data_b64 = image.get("data")
-    if not data_b64:
-        raise ValueError("image entry missing base64 'data'")
-    try:
-        raw = base64.b64decode(data_b64, validate=True)
-    except ValueError as exc:  # binascii.Error subclasses ValueError
-        raise ValueError(f"invalid base64 image data: {exc}") from exc
-    suffix = Path(image.get("filename") or "image.jpg").suffix or ".jpg"
-    fd, out = tempfile.mkstemp(suffix=suffix, prefix="signal-push-")
-    with os.fdopen(fd, "wb") as fh:
-        fh.write(raw)
-    return Path(out)
+def _decode_attachment(entry: dict) -> tuple[Path, str, str | None]:
+    """Materialize one /send attachment — a file of any type — for the channel.
+
+    Returns ``(path, content_type, name)``; see
+    :func:`inbound_store.materialize_outbound`."""
+    return _ibstore.materialize_outbound(entry)
 
 
 # ── Outbound send-control ─────────────────────────────────────────────────────
@@ -2217,7 +2209,7 @@ def _get_pending_send_detail(request_id: str) -> dict | None:
 
 
 def _list_pending_sends_store() -> list:
-    """List all pending sends from disk (omits image data for compactness)."""
+    """List all pending sends from disk (omits attachment data for compactness)."""
     items = []
     try:
         for path in sorted(SIGNAL_PENDING_SENDS_DIR.glob("*.json")):
@@ -2246,7 +2238,7 @@ def _execute_approved_send(path: Path, entry: dict) -> None:
     timeout.
 
     What the send produced — the channel's message id, the send time, and the
-    ledger media references for any images — is written onto the entry beside
+    ledger media references for any attachments — is written onto the entry beside
     the status. The status alone used to be all that survived, so an approved
     send's identity was simply lost; the chat surface needs it, because a chat
     send is now queued and approved rather than skipping the queue, and it
@@ -2336,11 +2328,11 @@ def _complete_pending_send(request_id: str, approved: bool,
 def _push(recipient: str, message: str, lang: str | None = None,
           images: list[dict] | None = None, voice: bool = True,
           author: str = "agent") -> tuple[str | None, float | None, list[str]]:
-    """Send an outbound message: text body + spoken audio + optional images.
+    """Send an outbound message: text body + spoken audio + optional attachments.
 
-    Images precede the voice note. When voice synthesis fails the message is
-    still delivered as text (plus any images) rather than lost. ``author`` is
-    carried through to the ledger record; each image is also persisted into
+    Attachments (files of any type) precede the voice note. When voice synthesis fails the message is
+    still delivered as text (plus any attachments) rather than lost. ``author`` is
+    carried through to the ledger record; each attachment is also persisted into
     the ledger media store (inbox mode) so the sent message mirrors with its
     media — the spoken rendering is deliberately not stored, since the text it
     reads out already is. Returns ``(message_id, sent_at, media_refs)``; the
@@ -2349,20 +2341,18 @@ def _push(recipient: str, message: str, lang: str | None = None,
     images = images or []
     message = (message or "").strip()
     if not message and not images:
-        raise ValueError("push requires a non-empty message or at least one image")
+        raise ValueError("push requires a non-empty message or at least one attachment")
 
     attachments: list[Path] = []
     temp_paths: list[Path] = []
     media_refs: list[str] = []
     try:
         for image in images:
-            path = _decode_image(image)
+            path, ctype, name = _decode_attachment(image)
             temp_paths.append(path)
             attachments.append(path)
             if SIGNAL_GATEWAY_MODE == "inbox":
-                ctype = ((image.get("content_type") if isinstance(image, dict) else None)
-                         or mimetypes.guess_type(str(path))[0] or "image/jpeg")
-                ref = _store_media_ref(path.read_bytes(), ctype)
+                ref = _store_media_ref(path.read_bytes(), ctype, name)
                 if ref:
                     media_refs.append(ref)
 
@@ -2388,7 +2378,7 @@ def _push(recipient: str, message: str, lang: str | None = None,
         return msg_id, ts, media_refs
     finally:
         for path in temp_paths:
-            path.unlink(missing_ok=True)
+            _ibstore.discard_outbound(path)
 
 
 # ── Re-link flow ──────────────────────────────────────────────────────────────
@@ -2628,7 +2618,7 @@ class _PushHandler(BaseHTTPRequestHandler):
             return
         if self.path.split("?", 1)[0].rstrip("/") == "/undelivered":
             # Drain the backlog: return messages held for triage AND mark them
-            # delivered (the only mutator of that flag). The daily triage skill
+            # delivered (the only mutator of that flag). The triage skill
             # calls this per gateway; a plain SPARQL read of the store never
             # touches the flag, so browsing history does not consume anything.
             if not self._authorized():
@@ -2730,7 +2720,9 @@ class _PushHandler(BaseHTTPRequestHandler):
             self._reply(400, {"error": "empty body"})
             return
         if length > MAX_PUSH_BODY_BYTES:
-            self._reply(413, {"error": "payload too large"})
+            self._reply(413, {"error": "payload too large: one send carries at most "
+                                       f"about {MAX_PUSH_BODY_BYTES * 3 // 4 // (1024 * 1024)} MB "
+                                       "of attachments"})
             return
         try:
             payload = json.loads(self.rfile.read(length).decode("utf-8"))
@@ -2758,6 +2750,8 @@ class _PushHandler(BaseHTTPRequestHandler):
             self._reply(400, {"error": "no recipient given and SIGNAL_DEFAULT_RECIPIENT is unset"})
             return
         message = payload.get("message") or payload.get("text") or ""
+        # "images" is the key's historical name: each entry is a file of any
+        # type — an image, a video, a PDF — as {data, filename?, content_type?}.
         images = payload.get("images") or []
         if not isinstance(images, list):
             self._reply(400, {"error": "'images' must be a list"})
@@ -2811,7 +2805,7 @@ class _PushHandler(BaseHTTPRequestHandler):
         # account's policy allows directly. Authorship is provenance, so it is
         # reported rather than branched on.
         print(f"[signal-gateway] sent to {recipient} (author={author})"
-              + (f" ({len(images)} image(s))" if images else ""), flush=True)
+              + (f" ({len(images)} attachment(s))" if images else ""), flush=True)
         body = {"status": "sent", "recipient": recipient}
         # Surface the recorded ledger identity — id, timestamp and the stored
         # media references — so the caller (the dashboard's chat view) can show

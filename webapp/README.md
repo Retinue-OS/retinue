@@ -148,7 +148,14 @@ The same gateway also backs the conversation-tabs card with a small JSON API
   body, MediaRecorder MIME type in `Content-Type`); returns `{"text","lang"}`.
 - `POST /conversations/<id>/read`     — clear a thread's unread badge.
 - `POST /conversations/<id>/archive`  — archive a thread (drop from active list).
-- `POST /conversations/<id>/unarchive`— restore an archived thread.
+- `POST /conversations/<id>/unarchive`— restore an archived thread (and clear
+  `muted`, as the list's Restore does).
+- `POST /conversations/<id>/flags`    — the Threads page's swipe and tray:
+  `{archived?, muted?, starred?}` (booleans, at least one); answers the
+  thread's summary.
+- `POST /conversations/<id>/delete`   — erase a thread for good (no body);
+  accepted only through the reverse proxy, never for a chat's companion. A
+  deleted thread answers 410 Gone from then on.
 
 Ara answers asynchronously, so the open conversation polls itself until the
 reply lands (faster while a turn is pending), and the card polls the list.
@@ -159,10 +166,34 @@ persistent `/root` volume (`/root/.retinue/conversations`); the
 
 On the home the element is a `viewer` only — threads open from the attention
 list's rows. *Threads* in the navigation row leads to `conversations.html`, a
-dedicated page that lists every thread with an Active/Archived filter (the
-same `retinue-conversations` element with the `full` attribute). Archiving is done from inside a thread; archived threads
-leave the active list but remain on that page and via
-`GET /conversations?archived=1`.
+dedicated page that lists every thread with an Active/Archived/Edits/Cowork
+filter (the same `retinue-conversations` element with the `full` attribute).
+Its tiles swipe with the chats page's rows' gesture — one implementation,
+`components/swipe-rows.js`, so the two lists cannot drift apart; the chats
+page's Unread and Read tabs opt into a full swipe left that commits beyond the
+one that reveals the tray (a row's `data-quick-left`), and into selection by
+long press, which threads do not:
+
+| Tab | Swipe right | Swipe left (tray) |
+|---|---|---|
+| Active | archive at once | Star · Archive · Mute |
+| Archived | restore at once | Star · Restore · Mute *or* Unmute · Delete |
+| Edits, Cowork | archive or restore, as the row's state calls for | the tray for the row's state |
+
+A long press, a right-click or the context-menu key opens the tray without
+swiping; the click a swipe ends in never opens the thread, and a tap on an
+open tile closes its tray. **Archive** is the thread bar's button (out of the
+list until something new is filed into it), **Mute** keeps it out
+(`{archived, muted}` together), **Unmute** lets the next message bring it
+back, **Restore** brings it back and clears the mute — and so does the thread
+bar's *Unarchive*. A commit that takes a row out of view offers **Undo** for
+15 s (`UNDO_MS`; the toast stays while a finger or the pointer is on it),
+writing back exactly the flags the row had.
+**Delete** asks for a second tap and cannot be undone. **Star** keeps a thread
+at the top of whichever list it is in — `starredFirst` in `base.js` sorts the
+client side, starred first, each group still newest first — and does nothing
+else; the open thread's bar has a ☆/★ for it too. Archived threads stay
+reachable on that page and via `GET /conversations?archived=1`.
 
 The wide layout itself is resizable, VS Code style (`layout.js`): the
 boundaries between conversations, news and the projects column are draggable
@@ -183,10 +214,20 @@ pages). Inside the Android shell from RetinueShell/4 the gear opens the app's
 own settings page instead, which embeds *This instance* from
 `settings-instance.html` (docs/dashboard.md, "The settings page"). The address book (`contacts.html`,
 `components/contacts.js`; docs/contacts.md) is the *Contacts* tab — people,
-their handles on every channel, their attention settings, the VIP flag and
-the instruction their messages are worked by — over the live `/contacts` API. The outbox icon opens the gateway's `/sends`
+their handles on every channel, the e-mail domains they write from (sent as
+`domains` on a new contact, `add_domains` / `remove_domains` on a change),
+their attention settings, the VIP flag and
+the instruction their messages are worked by, mail included — over the live `/contacts` API
+(`tests/test_webapp_contacts.py`). The outbox icon opens the gateway's `/sends`
 page, the queue of messages waiting for approval: a queue that wants action,
-one tap away from every page.
+one tap away from every page. Those pages are the gateway's own; their one
+script is `gateway/sends.js`, which on the status page of a decided send
+polls `GET /sends/<account>/<id>/status` (`{status, error?,
+outcome_unknown?, note?, next?}`) and says how it ended. An `error` with
+`outcome_unknown: true` is no failure — the mail server was handed the mail
+and its answer was lost — and reads "Not confirmed — it may have gone out"
+with a question mark, never the cross and never "could not deliver"; the
+gateway's own sentence (`note`) is shown where it sends one.
 
 Shell updates apply themselves (`components/update.js`): when a new service
 worker activates, controlled pages reload once — never while a thread or the
@@ -209,37 +250,95 @@ the entrypoint) so only in-container agents can post on the user's behalf.
 ## Messenger chats
 
 The chat surface of the messenger-chats redesign: each messenger conversation
-(Signal / WhatsApp / Telegram, one peer or group) is a **chat** — a
+(Signal / WhatsApp / Telegram / SMS, one peer or group — and on e-mail one
+mail thread, see *Mail threads* below) is a **chat** — a
 deterministic mirror rendered like the messenger client — with its
 **companion pane** (the conversation-with-Ara rail) beside it. It runs against
 the gateway's chat API (SPARQL over the message ledgers plus a live overlay;
 the endpoints and their rationale live in `scripts/web-gateway.py`'s module
 docstring). Pieces:
 
-- `components/chats.js` — the Chats card on the dashboard and, with `full`,
-  the whole `chats.html` page: avatar, channel mark, last-message preview,
-  unread badge, non-archived chats ordered by last activity; the full page
-  adds an Active/Archived filter like the conversations page, and rows that
-  swipe (pointer events, so touch, pen and mouse drag alike; a long press,
-  right-click or the context-menu key opens the same shelf). On *Active*, a
-  swipe right archives at once and a swipe left uncovers **Archive** (out of
-  the list until it speaks again) and **Mute** (out of the list, and the next
-  message does not bring it back), both `POST /chats/<id>/flags`. Muting
-  archives — the server's rule — so both land under *Archived*, where a swipe
-  right restores at once and a swipe left uncovers **Restore**, **Mute** /
-  **Unmute** (stays archived) and **Delete** (`POST /chats/<id>/delete`,
-  armed by a first tap, done by a second). The dashboard card stays a glance
-  and carries none of it. In the wide
-  layout the card has its own fixed-height region above the conversations
-  (`--chats-h`), resizable and snap-closable at a third `layout.js` splitter
-  (`data-splitter="chats"`). The card refreshes on an ambient cadence and
-  keeps its last rendered state over a failed fetch.
+- `components/chats.js` — the list, with `full` the whole `chats.html` page
+  (the dashboard no longer carries a Chats card; the element's card mode, a
+  capped glance at every chat that is not archived, is unused): avatar,
+  channel mark, last-message preview and unread badge, ordered by last
+  activity, in three tabs — **Unread · Read · Archived** — by each chat's
+  `list_group` (below). The *Unread* tab carries the number of unread chats;
+  each row keeps its badge with the number of unread messages, since one new
+  message and twelve read differently. Rows swipe
+  (`components/swipe-rows.js`, shared with the threads page: pointer events,
+  so touch, pen and mouse drag alike):
+
+  | Tab | Swipe right | Swipe left |
+  |---|---|---|
+  | Unread | mark read at once | uncover the tray; a full swipe (or a fling) archives at once |
+  | Read | nothing (the row does not move) | uncover the tray; a full swipe (or a fling) archives at once |
+  | Archived | restore at once | uncover the tray |
+
+  The tray offers the same actions on every tab and every channel — **Star**,
+  on *Unread* **Mark read**, **Archive** (out of the list until it speaks
+  again) and **Mute** (out of the list, and the next message does not bring
+  it back), on *Archived* **Restore** and **Mute** / **Unmute** (stays
+  archived) in their place, then **Spam** and **Delete**. Spam is the one
+  exception: mail threads only (`POST /chats/<id>/spam`: the mailbox moves the
+  thread's inbound mails to its Junk folder, then the chat is muted and
+  archived; a messenger chat has no junk folder and is muted instead). A
+  right-click or the context-menu key opens the tray too, which is how a
+  keyboard reaches what a swipe does. Muting archives — the server's rule —
+  so both land under *Archived*. **Delete** (`POST /chats/<id>/delete`) is
+  armed by a first tap and done by a second; the armed button reads "Delete
+  for good?", and on a mail thread "Move mails to Trash?" — its mails go to
+  the mailbox's Trash before the chat is erased, and its title says so.
+  Everything else that takes a row out of view offers Undo for 15 s
+  (`UNDO_MS`, the toast staying while a finger is on it): Mark read, Archive
+  and Mute are made at once and Undo writes the previous state back (Mark
+  read's the previous read mark, `POST /chats/<id>/read`, below); **Spam** is
+  deferred — the row leaves, nothing is sent until the window ends, Undo
+  sends nothing, and a page hidden or left sends it at once (`fetch`
+  `keepalive`). An action that fails brings the row back, marked failed,
+  with the server's one-sentence `error` in place of its preview (and for
+  Delete and Spam a Retry in its opened tray; a 503 on Delete reads "Delete
+  not set up").
+
+  **Multi-select**: a long press on a row (or the list's *Select*) starts
+  selection mode with that row selected — the long press no longer opens
+  the tray. A tap (Space on a focused row) toggles a row, Shift-click on a
+  wide screen selects a range, and a bar counts the selection and offers the
+  tab's actions for all of it: Mark read, Archive, Mute, Restore / Unmute,
+  Star / Unstar, Spam (only when every selected chat is a mail thread) and
+  Delete. Esc, Cancel, the back gesture and a tab switch end the mode; a row
+  that leaves the tab leaves the selection. One request per chat, four at a
+  time (no bulk endpoint), and one Undo for the batch ("Archived 7 · Undo")
+  that writes every chat's previous state back; failures are counted
+  ("Archived 5 of 7 — 2 failed") and each failed row says why. A bulk Delete
+  takes two taps ("Delete 7 chats? Mails move to the Trash"); a bulk Spam is
+  deferred like a single one — a page left in its window sends every chat's
+  request at once, with keepalive, not four at a time, and one left while the
+  batch still goes out four at a time sends what has not gone yet at once — and where some of it fails once the window
+  ends a notice — no Undo, it waits for any Undo toast on screen — counts
+  them ("Marked as spam 5 of 7 — 2 failed"). The chat page's ⋮ has **Spam** (mail only:
+  handed to the list, which carries it out with its Undo) and **Delete** (two
+  taps; the page leaves for the list once the chat is erased, and shows the
+  reason where it is not).
+  A Mark read is about the row as shown: it names the row's `inbound_seq`,
+  and where a message has landed that the list has not fetched yet (it
+  refreshes every 15 s) the server marks nothing — the row slides back and
+  the list is fetched again, showing what came in;
+  a starred chat leads whichever list it is in. The tabs are a tablist
+  (arrow keys move between them); the choice holds across refreshes and
+  writes, and a fresh page opens on *Unread*. The list refreshes on an
+  ambient cadence and keeps its last rendered state over a failed fetch.
 - `chat.html?id=<chat id>` (`components/chat-page.js`) — one chat: bubbles
-  with day separators and an unread waterline, sender labels in groups, the
+  with day separators and a "new" waterline (before the first message that
+  was unread when the chat was opened — the last `unread` inbound messages of
+  the page — and staying there while the page is open), a **Mark as read**
+  button under the latest inbound message while the chat is unread (below),
+  sender labels in groups, the
   author on every outbound bubble (you / Ara / your phone), inline media
   (images with a lightbox, voice-note and video players — see the Message
   contract below), a live composer (send, shared draft, one-tap clear ✕,
-  dictation, image attach — picked or pasted — with client-side downscale),
+  dictation, file attach — any type, picked or pasted; images are downscaled
+  client-side),
   quick-pattern chips,
   and the companion pane — swipe between panes on a phone, a draggable
   splitter on a wide screen. The composer row is the conversation composer's
@@ -260,9 +359,10 @@ docstring). Pieces:
   the chat is a row of — for a chat opened cold (a notification, a
   bookmark). The header's ⋮ menu holds
   *Attention details* — the chat's attention sheet, with the contact card —
-  and the **Archive** / **Mute** switches, the same `POST /chats/<id>/flags`
-  the list's swipe actions use; a dot on the ⋮ shows an archived or muted
-  chat with the menu shut. What the companion pane does sits behind a **?**
+  and the **Star** / **Archive** / **Mute** switches, the same
+  `POST /chats/<id>/flags` the list's swipe actions use; a starred chat's
+  name carries a ★, and a dot on the ⋮ shows an archived or muted chat with
+  the menu shut. What the companion pane does sits behind a **?**
   in its bar rather than on a row of its own. While the phone keyboard is up —
   `data-keyboard` on `<html>`, which `viewport.js` sets when a text field
   has focus and the visible frame is well short of its keyboard-less height
@@ -294,12 +394,34 @@ docstring). Pieces:
   whole pane at its full width (the thread and the chips step aside, the mic
   and send sit under its corners) until the control is pressed again, Escape
   is pressed, a recording starts or the draft is sent. Shrunk again by the
-  control or Escape, the thread is back at the message it was left at; while
-  it is hidden nothing arriving is marked read. A tap on the control leaves
-  the focus where it was, so the phone keyboard stays as it was.
-  The open chat polls on the conversations cadence,
-  appending only unseen messages, and posts the read watermark on open, on
-  arrivals while at the bottom, and when the page becomes visible again.
+  control or Escape, the thread is back at the message it was left at. A tap
+  on the control leaves the focus where it was, so the phone keyboard stays
+  as it was.
+  The open chat polls on the conversations cadence, appending only unseen
+  messages. **Opening a chat, looking at it or scrolling it reads nothing.**
+  A chat is read by a reply — a send from the composer (the server reads the
+  chat with it, so the page posts nothing for it), or, on Signal, WhatsApp
+  and Telegram, one from the phone or any other client, which the next poll
+  shows (an SMS sent outside Retinue is never seen, so such a chat needs
+  Mark as read) — or by **Mark as read**: the button under the latest
+  inbound message, there whenever the chat is unread. It posts
+  `POST /chats/<id>/read` `{seen}` — the `inbound_seq` of the last poll whose
+  messages are in the thread — and gives way to *Marked as read* with an
+  **Undo** for a few seconds (the restore call below; "nothing to undo" when
+  the mark has moved on since). A 409 means a message landed that the page
+  had not shown: nothing was marked, a note says so, and the poll brings the
+  message with the button under it. The Undo ignores a press in its first
+  half second, since it appears where the button was and with its focus — a
+  double tap or a double Enter would otherwise undo the read it made. Focus
+  stays on the row, and moves to the message it sat under when the row goes
+  with nothing in its place (the Undo lapsed, or failed).
+  Every poll takes the chat summary's `unread`, `list_group`, `last_read`,
+  `inbound_seq` and flags from the answer rather than keeping the ones from
+  the first load, so the button moves under a newer inbound message, goes
+  when the chat was read elsewhere, and the ★, the ⋮ switches and its dot
+  follow a flag changed elsewhere. A poll that left before a read or a flag
+  switch made on this page does not draw the older state back over it. A
+  minimized chat on the shelf carries the server's unread count.
   The companion pane is the chat's own conversation with Ara (see the
   `companion` field below), and it *is* `<retinue-conversation>` — the same
   element the conversations card embeds, so the two surfaces cannot drift
@@ -320,12 +442,305 @@ docstring). Pieces:
   — into an empty box, or over the text she was asked to rework, whenever
   nothing unsaved is in it (unsaved keystrokes meet the newer draft at
   their own save, as a conflict) — and the send press stays the user's.
+- **Mail threads** (channel `email`, `docs/mail-chats.md` for the whole
+  design) are chats in every sense above; what differs is this. The **row**
+  carries the thread's subject as its name, an `@` channel mark, and a third
+  line between name and preview: the participants by name (the address where
+  neither the address book nor the mail gave one), with "+n" past the
+  server's cap. Its avatar is keyed on the summary's `peer` address rather
+  than the chat key — the key is the thread's root Message-ID, so keying on
+  it would give one person a colour per thread — and shows the peer's
+  initials. The preview reads "Name: text" for every inbound mail (the row's
+  name is a subject, so nothing else says who wrote), "You (mail client)" for
+  a mail sent from another client, and "Removed in a mail client" where the
+  latest mail is gone. The account label follows the rule every channel now
+  has: a name repeated **across accounts** carries the account; two threads
+  on one account that share a subject carry none (the label would be the
+  same on both). The **header** shows the subject, the participants and
+  `via <account>` on two lines — never the Message-ID key. **Bubbles**: an
+  inbound mail in a group carries its sender's name (the address without a
+  display name), in a 1:1 none, as on every channel; a mail whose own subject
+  is not the thread's shows it as a small line above the text, reply and
+  forward markers aside (told by their shape — a short token and a colon, a
+  bracketed list tag — so no language's "Re:" is privileged); a mail sent
+  from another client is "You · mail client". The text is the server's
+  trimmed text, rendered like any message (escaped, http(s) links, line
+  breaks kept), attachments under the rules below. **Original**: a bubble
+  whose message names an `original` offers a control that expands the whole
+  mail in the bubble — From, To, Cc, Date and Subject, the full header block
+  behind an *All headers* disclosure, then the HTML part in a sandboxed frame
+  (`<iframe sandbox="allow-popups allow-popups-to-escape-sandbox">`, plus
+  `allow-top-navigation-by-user-activation` inside the Android app, whose
+  WebView opens no new windows — a tapped link there goes to the phone's
+  browser, docs/dashboard.md; built by
+  DOM calls, sized by an estimate from the text within a cap, resizable, with
+  its own scroll) or the full plain text when there is no HTML part, then
+  every attachment; a second tap gives the trimmed text back. It is fetched
+  on the first tap and cached per message, with a loading line and an error
+  line with *Try again*; the open state, and the disclosure's, live on the
+  element, so neither a poll nor a re-render collapses it. The page takes the
+  `original` URL only when it is exactly this chat's own
+  `/chats/<id>/messages/<token>/original` (the id segment, decoded, is the
+  open chat's id; the token one URL-safe segment that is no dot segment), and
+  frames only `html_url` equal to that URL plus `.html`; anything else gets no
+  control and no frame. A **tombstone** — a mail deleted or moved away in a
+  mail client (`removed`) — is a quiet outlined bubble saying so, with who it
+  was from and when (the removal time on hover), and no text, Original or
+  attachment. The poll **reconciles**: a message already on screen whose
+  removal, text, trim, attachments, subject or original changed is
+  re-rendered in its place, the rest of the thread, the scroll position and
+  an Original that still applies left as they are. **The model trim**
+  (`docs/mail-chats.md`, "The model trim (phase 4)"): a mail whose `trim` is
+  `wanting` is asked for on first view — its bubble watched by an
+  IntersectionObserver (the viewport as root, so a phone's pane scrolled
+  aside does not count) and asked for once it has been at least half
+  visible (half the thread's view, for a bubble taller than that) for
+  600 ms without a break — never while the page is hidden, the companion's
+  pane is the one on a phone, or one of the page's full-screen layers (the
+  image lightbox, the attention sheet, a modal) covers the thread, and the
+  time starts again whenever the page comes back (shown again, restored
+  from the back-forward cache, or thawed from a freeze, which a look that
+  comes far too late betrays). One `POST` per
+  mail per page life to the sibling of its accepted `original` URL
+  (`…/<token>/trim`, never built from parts); an answer `wanting` names
+  when it may be asked again (`retry_after`, held to 30 s – 24 h, ten
+  minutes where it names none), no answer at all (offline, a 5xx) a minute.
+  A settled answer replaces the text in place like a poll's change — held
+  over a poll whose document predates it — and a `202` (`queued`/`running`)
+  shows a quiet "Tidying up…" under the text, the page's own words, until a
+  poll shows the record settled or for two minutes at most — put into the
+  bubble's own node and taken out of it, never a bubble drawn anew (a
+  selection, the focus and every frame stay), and nothing at all while the
+  bubble's Original is open, which shows no such line. A server without the
+  endpoint — `405`, `501`, or a `404` that is not the endpoint's own (the
+  route fallback's `{error: "not found"}`, or no JSON) — switches the
+  feature off for the page's life, quietly; the endpoint's own `404` (a
+  token that names nothing in this chat) and `410` (a mail gone from the
+  mailbox) end that one mail, and the others stay watched. Nothing is watched on a messenger chat, a settled mail, a
+  tombstone or a page that stopped polling; the observer lets go of a
+  bubble re-rendered or removed and of everything on a chat switch, and an
+  answer that comes back after one touches nothing. The Original of a mail
+  whose `trim` is `model` is headed by one line, "Shortened by a model —
+  this is the full mail."; nothing else marks it. And a chat whose summary
+  says `can_send: false` (its gateway unknown or not connected) shows
+  `cannot_send_reason` in one line where the composer, its chips, the draft
+  and the grip would be; nothing is loaded into, adopted by or saved from a
+  draft there. That is one switch (`_canSend`), followed on every poll.
+- **Writing mail** (`docs/mail-chats.md`, "Writing"). The **composer** of a
+  mail chat says where the reply goes — and that line is the server's word,
+  never the page's. `GET /chats/<id>/reply-preview` answers how the gateway
+  would address a reply right now, for Reply all and for Sender only
+  (`replyPreview` reads it whole or not at all); the page works out nothing
+  of it — no Reply-To, no "the user's own mail is the latest", no alias — and
+  asks on load, after every poll that changed the thread (a mail added,
+  changed, removed or gone, a pending send, the participants) and again at
+  the press. The line reads "To <name> <address> · Cc …": every recipient
+  with its **address**, a name only beside it (the address book's before the
+  mail's own, and none at all where a display name reads as an address
+  itself), and a To that is not where the latest mail came from saying why
+  ("the Reply-To of the mail from …"). It wraps, so no recipient is out of
+  sight; the send button's label names them too. **Reply all / Sender only**
+  (two radio buttons under the line, Reply all by default) is offered
+  exactly when the preview's `choice` is true, and is put on the page and
+  taken off it as that changes. Until the server has answered — or where it
+  has no such answer (an older server: "Recipients unavailable"), cannot be
+  reached, or says no reply is possible (409/400 with its sentence, e.g. a
+  chat that holds only a queued mail) — the line says so, the send button is
+  off, and **no reply is sent**: recipients are never guessed. The box reads
+  "Write your reply …"; **Enter** breaks a line, the send button or
+  **Ctrl/⌘+Enter** sends (an input method's Enter only commits) — as on every
+  chat, which the field's label says on mail. Files are staged as on every
+  chat and go as the mail's attachments.
+- **The press.** The reply mode is the one on screen at the press (read
+  before anything is awaited; the choice resets to Reply all there and comes
+  back with the words if the mail does not go). The recipients are then asked
+  for once more, and the mail is posted only if that answer is there, is not
+  older than the thread on screen, and addresses the reply as the line did;
+  otherwise nothing is posted, the words come back and the line shows what
+  the server now says. The request carries `reply` and a **`request_key`** —
+  one per press — and its answer is read strictly: **200** is the mail;
+  **202** `{pending}` a send that waits for approval; **202**
+  `{unconfirmed, message_id?, request_key}` a mail handed over whose outcome
+  nobody knows yet (below). The server's word that **nothing went out**
+  with this request — any **4xx** (its own refusal; **424** where the mail
+  server refused the mail) and any answer that carries **`"sent": false`**
+  (a 502 for a mail gateway that was never reached, a 503 for one that
+  cannot send) — is "Not sent: <its sentence>", and the words stay in the
+  box. Whose word it is decides what becomes of the key (**`"by"`**):
+  `"gateway"` is the mail gateway's own answer about this request, made
+  after it looked the key up — the press is over, and the next press is a
+  new attempt under a new key; `"dashboard"` is the web gateway answering
+  for itself (the mail gateway never reached, no gateway for the mailbox, a
+  sign-in run out) — the key stays with the words, which costs nothing,
+  since the gateway takes a key it never saw as a new attempt. An answer
+  without `"by"` (an older server, a proxy) counts as the gateway's for a
+  first press. A press **made again** under a kept key whose first outcome
+  nobody knows is told "Not sent" only by the mail gateway: refused by anyone
+  else, the request was never put to it, so the note says the server could
+  not be asked and that it is still not known whether the first attempt went
+  out, and the key stays — dropping it there could send the mail twice.
+  Anything else — no answer, a 5xx that does not say `"sent": false` (a
+  proxy, a crash), a 200 that is no document — says nothing about whether
+  the mail went out and is never reported as "not sent": the words come back
+  with the key they went under (kept on the device with them, for twelve
+  hours), so the same words sent again are the same mail to the gateway and
+  not a second one; a press made again whose first mail had gone out says
+  so. Messenger sends are as they were.
+- **The key's life.** One key per press, never the next mail's. It is kept
+  (`_retry`) while the box still holds its words as they were sent — with a
+  mark (`sure`) where it is known that nothing went out under it, so that a
+  press made again under it is not told "not known". It is dropped on the
+  mail gateway's word (`"by": "gateway"` with `"sent": false` or a 4xx;
+  for a first press also an answer without `"by"`); as soon as the box
+  holds other words, even for a moment (typed, cleared, dictated, a draft
+  from elsewhere — the same words typed again later are a new mail); and
+  when the press turns up in the thread (`_settleRetry`, on every load and
+  poll; never for a key marked `sure`): the server lists a send
+  under its key, or the thread holds one more of the user's mails with those
+  words than at the press. Then the words leave the box too, offered back as
+  after a ✕ — left there, one press would send them a second time — unless
+  the listed send failed for certain, which is the server's word that the
+  press did *not* go: the key is dropped and the words stay. While a press
+  is on its way, a poll that lists it (`sending`, under its `request_key`)
+  draws no second bubble beside the optimistic one.
+- **A mail that was never confirmed** (202 `{unconfirmed}`). Its bubble
+  stays, "Sending — not confirmed yet"; the words are **never** put back in
+  the box unasked. They are then in no box and no draft, so the press is
+  kept on the device (`chat-unsure:<chat id>` in drafts.js: its words, reply
+  mode, the recipients its line named, its key and Message-ID) and the
+  bubble **comes back after a reload**, in its place by time, until it is
+  accounted for: the mail shows in the thread (by `message_id`), the server
+  lists the send (by `message_id` or `request_key` — being sent, or failed
+  with its reason — and that bubble takes over, with the focus the old one
+  had), or the user asks. **Check again** posts the very same body under the
+  same key — but since a gateway that never had the key would *send* on that
+  request, it is held to what the press was held to: the recipients are
+  asked for first, and nothing is posted unless a reply in the press's mode
+  still reaches exactly whom the line named then ("Not asked: the thread has
+  changed …", and the bubble no longer offers the question). Its answer is
+  the mail (200), the pending bubble (202 `{pending}`), still unknown (202
+  `{unconfirmed}`), or the mail gateway's word on this very press (`"by":
+  "gateway"`, with `"sent": false` or a 4xx) — "Not sent: …", with the
+  words back in the box. Any other answer (the dashboard's own — a gateway
+  that could not be reached *now*, a sign-in that ran out —, a proxy, a
+  server too old to say `"by"`) is about the question, not the mail, and
+  leaves it unconfirmed. Check again is offered where the server echoed the
+  key, the body can be rebuilt (no attachments after a reload) and the press
+  is not older than twelve hours. Once asking has settled nothing, or cannot
+  be done, the bubble offers the two ways out a failed send has: **Copy
+  text back to the composer** and **Dismiss** (the page's own bubble;
+  nothing is asked of the server). Where the chat cannot be written to there
+  is no composer: the control reads **Copy text** and puts the words on the
+  clipboard, saying whether that worked; the bubble keeps them until it is
+  dismissed. A mail nobody can account for never ends in silence. The
+  record is shared by every tab on the chat: each tab writes it as it
+  stands, less what that tab let go, with its own mails in it — never its
+  own list alone, which would erase another tab's mail. What it holds is
+  read as data (a key that is none, a time before the epoch or ahead of the
+  clock are not used), and a record that still cannot be read leaves the
+  chat to open without those bubbles, the record kept.
+- **Pending sends.** A mail goes under its account's send policy, and a send
+  the policy queues answers **202** `{pending}`: the optimistic bubble gives
+  way at once to a **pending bubble** at the thread's end — the words, "You
+  · not sent yet", "Waiting for approval" in words (and in its accessible
+  name; the note line, a live region, says it was queued) and an **Approve
+  or reject** link to its page on `/sends`. The link is built by DOM calls,
+  and only from an `approval_url` that is exactly a path `/sends/<slug>/<id>`
+  (each segment one run of URL-safe characters, not starting with a dot; no
+  query, fragment, host or escape); anything else gets a plain sentence
+  instead. The messages document's `pending` carries every queued send of
+  the chat, whoever queued it (composer, companion, `mail-push.py`), oldest
+  first, and the page follows it on every load and poll: new entries join at
+  the end (messages arriving go in above them), a changed one is redrawn in
+  place, one no longer listed leaves — unless it was queued from here after
+  that poll left — and focus on its link goes to the mail it became, else to
+  the thread. Pending bubbles are matched by `request_id`, and to the mail a
+  released one became by its `message_id` (the Message-ID the gateway minted
+  when it queued it) — never by their words, which on mail are long and come
+  back trimmed. An entry also says what became of a send that was let go
+  (`status`): **`sending`** ("Sending — not confirmed yet", nothing to
+  approve) and **`failed`**, which stays until the user dismisses it — "Not
+  sent" with the server's reason (`error`, as text), or, with
+  `outcome_unknown`, "Not confirmed — this mail may have gone out" — and two
+  controls: **Copy text back to the composer** (after what the box holds,
+  never over it; **Copy text**, to the clipboard, where the chat cannot be
+  written to) and **Dismiss** (`POST
+  /chats/<id>/pending/<request id>/dismiss`; a refusal leaves the bubble
+  with the reason). Recipients the mail server refused (`refused`) are named
+  on the pending bubble and on the sent mail's. An entry marked
+  `dismissed` is over — the gateway keeps one for a day so that its key
+  stays known — and is never drawn, whoever passes it on. A page left while
+  a send was on its way does not put a mail that was queued back into the
+  box. A chat
+  in the list whose latest entry is a queued send previews it as "Waiting
+  for approval: …" (or "Sending:", "Not sent:", "Not confirmed:" where
+  `last.status` says so).
+- **New mail.** The Chats page's **＋** (only where `GET /chats/compose`
+  offers something; the mailboxes it names are asked for again each time
+  the ＋ is opened) opens a short menu — *New e-mail* — and that the
+  **compose sheet** (`components/compose-sheet.js`): a modal dialog (the page
+  behind inert, focus in To, Tab kept inside; Escape, ✕ or a press on the
+  dimmed page closes it and gives the focus back to the ＋) with From (a choice only when the offer names
+  several mailboxes), **To** and **Cc** as removable chips — typed (a comma,
+  a semicolon, Enter or leaving the field makes one; Backspace in an empty
+  field takes the last back), pasted (`"Doe, Jane" <jane@x.org>, b@y.org`
+  is two), or picked from the address book's suggestions (`GET
+  /contacts?q=`, the matching people's e-mail addresses, a combobox walked
+  with the arrow keys; leaving the field ends them, and an answer never
+  opens a list under a field that does not have the focus) — Subject and the
+  text. Addresses are checked by shape only; what is not one stays in the
+  field with its error under it, and so do the addresses past the cap of 50,
+  which the error names. An input method's Enter only commits what it
+  composes (also WebKit's, told by keyCode 229). Send (or Ctrl/⌘+Enter in
+  the text) posts `POST /chats/compose` with a `request_key` and, on 200 or
+  202 with the new chat's id, goes to the new chat (`/chat.html?id=<id>`),
+  which may hold only the pending bubble. **One press is one mail**: while
+  the request is on its way nothing starts a second one — closing the sheet
+  and opening it again brings back the same sheet, still sending — and a
+  send that fails after the sheet was closed opens it again with what
+  happened. The server's word that nothing went out — a 4xx, or any answer
+  with `"sent": false` — shows as "Not sent: …" with everything still
+  there, and ends the press where it is the mail gateway's (`"by":
+  "gateway"`; for a first press also one without `"by"`): the next one is a
+  new attempt under a new key. The dashboard's own keeps the key with the
+  mail, known to have sent nothing. A press made again under a key whose
+  outcome nobody knows, refused by anyone but the mail gateway, says that
+  the server could not be asked and that it is still not known whether the
+  first attempt went out, and keeps the key. An answer that leaves open
+  whether the mail went out (202 `{unconfirmed}` without a chat, a 5xx that
+  does not say `"sent": false`, none) says exactly that, and the press stays
+  with the mail, so that sent again unchanged within twelve hours (the chat
+  page's bound) it goes out under the same key; a press older than that is
+  dropped — the gateway knows a key for a day, and the same request would be
+  a second mail — and the sheet says only to look in the chat list before
+  sending it again, as a new mail. Closing keeps what the sheet
+  holds on the device (`compose:<channel>:<mailbox>` in drafts.js, with the
+  unanswered press) for the next opening **from that mailbox**: a kept mail
+  never comes back into a sheet writing from another one, and changes its
+  sender only where the user picks another mailbox under From. A mail kept
+  for another mailbox is not forgotten either: the index
+  (`compose:<channel>`: `{account, waiting}`) remembers which mailboxes hold
+  one beside the mailbox written from last, and every opening names each —
+  "It comes back when that mailbox can send again" for one that is not
+  offered now, "Choose that mailbox under From to go on with it" for one
+  that is — and opens on such a mailbox when the one written from last has
+  nothing waiting. A mail whose mailbox is not offered at all may never be
+  again, so the sheet shows it ("Show the mail from …": its recipients,
+  subject and words, as text) with **Copy into this mail** (into the form,
+  after what it holds — recipients joining the chips, its words after the
+  form's, its subject where the form has none — leaving from the mailbox
+  under From; the kept one goes) and **Discard it**. Every opening renews
+  each kept mail it names, so drafts.js never drops one for its age while
+  the sheet still speaks of it. Discard empties a mail; a send that went
+  through drops it.
 
 The API, as the components consume it:
 
-- `GET /chats` — `{generated, chats: [ChatSummary]}`, ordered by last
-  activity. A `ChatSummary` is `{id, channel, account, key, name, group,
-  members?, unread, archived, muted, companion, instructed, last, draft,
+- `GET /chats` — `{generated, counts: {unread, read, archived}, chats:
+  [ChatSummary]}`, ordered by last activity; `counts` is how many chats each
+  tab holds. A `ChatSummary` is `{id, channel, account, key, name, group,
+  members?, unread, list_group, last_read, inbound_seq, archived, muted,
+  starred, contact, unknown_sender, companion, instructed, last, draft,
   messages}`.
 
   A chat is one peer **on one account**, and `id` names both:
@@ -335,11 +750,29 @@ The API, as the components consume it:
   `account` the gateway account, or null for that older history. Both are
   surfaced because the name identifies neither: two accounts talking to the
   same person are two chats called the same thing, so the client labels a
-  repeated name with its account, and keys the avatar colour on the *peer* so
-  one person keeps one colour across all of them. Clients must treat the id as
+  name repeated across accounts with its account (not one repeated on a single
+  account, where the label would be the same on each), and keys the avatar
+  colour on the *peer* so one person keeps one colour across all of them. Clients must treat the id as
   opaque and read `key`/`account` rather than splitting it.
 
-  `unread` derives from the user's `last_read` watermark, `last` is
+  `unread` is the number of inbound messages the user has neither answered
+  nor marked read: those stamped later than both the read mark (`last_read`,
+  set only by Mark as read and by a reply; null for a chat never marked) and
+  the chat's latest outbound message of the user's own — so a reply that
+  reached the ledger without the dashboard still reads the chat — or, where
+  that is more, those that have landed since the newest read, whatever they
+  are stamped (a delayed delivery is stamped before a mark it arrived
+  after). `inbound_seq` is how many arrivals this summary includes — one per
+  message, however often the channel delivered it; a client
+  hands it back as `seen` with Mark as read (below) and does nothing else
+  with it. `list_group` is the tab the chat belongs
+  in: `archived` when archived, else `unread` while `unread > 0`, else
+  `read`; a new inbound message moves a read chat back to `unread`. (It is
+  not `group`, which stays the boolean "this is a group chat".) A client
+  meeting a payload without `list_group` derives it by that same rule.
+  `contact` is the address-book card the chat is linked to (or null), and
+  `unknown_sender` whether its peer is a stranger: nothing on the rail
+  vouched for the last sender, and no card names them. `last` is
   the preview `{ts, direction, author?, sender_name?, text, kind}`, `draft`
   is the shared draft `{text, author, agent?, ts, version}` or null, and
   `companion` is the conversation id of this chat's companion thread (null
@@ -356,15 +789,32 @@ The API, as the components consume it:
 
   `messages` is the URL of the chat's message document — the client follows
   it and never constructs message URLs. `archived` and `muted` carry the
-  dashboard-conversation semantics verbatim: an archived chat leaves the card
-  and the Active list (the full page's Archived filter keeps it reachable),
+  dashboard-conversation semantics verbatim: an archived chat leaves the
+  Unread and Read tabs (the Archived tab keeps it reachable),
   and a new inbound message **un-archives** an archived chat unless it is
   muted — the server's rule, applied on the notify rail. `muted` silences
   that chat's Web Push and keeps an archived chat archived; setting it also
-  sets `archived`, so a caller never has to send both. `POST
-  /chats/<id>/flags` (body `{archived?, muted?}`, either or both) is the one
-  way in, and the answer carries the flags as they ended up — a client reads
-  them back rather than assuming what it asked for.
+  sets `archived`, so a caller never has to send both. `starred` is the
+  user's mark: the chat sorts first in whichever list it is in, and nothing
+  else changes — mute, restore and an arrival all leave it. `POST
+  /chats/<id>/flags` (body `{archived?, muted?, starred?}`, any of them) is
+  the one way in, and the answer carries the flags as they ended up — a
+  client reads them back rather than assuming what it asked for. Like a
+  send, it is accepted only through the reverse proxy: `403` from inside the
+  container where `EDGE_PROXY_PEERS` names the proxy — without it only from
+  loopback and from the address the caller dialled, so a caller coming in
+  from another of the container's addresses, or through a sibling that
+  relays, passes. An agent uses `scripts/chat-flags.py`.
+
+  `POST /chats/<id>/spam` (no body; mail chats only, 400 for a messenger
+  chat) asks the thread's mail gateway to move the thread's inbound mails in
+  INBOX and the archive to the account's Junk folder (`POST /chats/spam`
+  `{chat, account, message_ids}`) and, only once it has, mutes and archives
+  the chat on the user's word: `{id, spam: true, moved, archived, muted,
+  starred}`. On any failure nothing changes and the answer is `{error}` —
+  one sentence (no Junk folder: it names `MAIL_JUNK_FOLDER`), 502 or 503.
+  Same-origin and through the reverse proxy only, like delete. The mails
+  stay in Junk when the chat is restored.
 
   `POST /chats/<id>/delete` (no body) is not a flag but an erasure: every
   inbox gateway of the channel is asked to erase the chat (its own
@@ -394,9 +844,10 @@ The API, as the components consume it:
 
   These two flags replaced the messenger **sender blacklist**: not wanting to
   hear from someone is a chat one mutes, in the interface, on the chat one is
-  looking at — not an entry in a policy file only Ara can edit. (E-mail keeps
-  its own whitelist, which decides something else: frequent versus daily
-  triage on a pull channel.) Ara can set either flag too, through the same
+  looking at — not an entry in a policy file only Ara can edit. (E-mail has
+  no whitelist either: a mail chat is archived or muted like any other, and
+  whose mail is worked on arrival is a contact's VIP flag or instruction.)
+  Ara can set either flag too, through the same
   endpoint, but the user never has to go through her.
 
   Both are **independent of the triage delivery gate**, on purpose. Whether a
@@ -406,13 +857,17 @@ The API, as the components consume it:
   user wants the chat in their list is this flag's. A subscribed channel one
   keeps only for its content is `news` + `ignored` **and** muted — three
   separate statements, because a list one both reads as news and answers in is
-  `news` + `quieted` and stays visible. No pinning yet: favourites-on-top would
-  be a later `pinned` flag, deliberately deferred. A store outage is answered
+  `news` + `quieted` and stays visible. Favourites-on-top is the `starred`
+  flag above, shared with the threads. A store outage is answered
   from the last good list for up to `CHAT_LIST_STALE_SECONDS` (10 min by
   default), then with an honest 502 (the page shows it; the card keeps its
   last state).
 - `GET /chats/<id>/messages` — `{generated, chat: ChatSummary, messages:
-  [Message]}`, ascending by `ts`, the newest page by default;
+  [Message]}`, ascending by `ts`, the newest page by default. Its `chat`
+  carries `unread`, `list_group`, `last_read` and `inbound_seq` on every
+  poll — what the page's Mark as read button and waterline follow, and what
+  its mark names: the count is taken before the messages are collected, so
+  every arrival it includes is on the page;
   `?before=<ISO ts>` pages older history (the page renders the newest page —
   a load-older affordance is future work). A `Message` is `{id, chat,
   direction, author? (out: user|agent|device, plus agent name),
@@ -450,7 +905,8 @@ The API, as the components consume it:
   it is an ordinary conversation, named by the summary's `companion` id and
   read through `/conversations`.
 - `POST /chats/<id>/send` `{text?, images?}` — sends through the chat's own
-  gateway and returns the sent `Message`. It does not skip the account's send
+  gateway and returns the sent `Message` (a mail chat's send can come back
+  queued instead: *Mail additions*, "Writing", below). It does not skip the account's send
   policy: under `allow` the gateway sends outright, and otherwise the send is
   **queued and then released** through that gateway's own approve endpoint in
   the same request — the press IS the approval `verify` exists for, but it is
@@ -460,9 +916,12 @@ The API, as the components consume it:
   agent that also calls approve has simulated the press, which nothing inside a
   shared container can stop.) The page shows an optimistic bubble and reconciles
   it with the response, and a failed send puts the words back into the composer.
-  `images` is `[{content_type, data(base64)}]`, at most 5, each at most
-  ~8 MB decoded (400 on violations); `text` may be absent when images are
-  sent. The returned `Message` (and later polls) carries the sent
+  `images` — the key predates the other file types — is the message's
+  attachments, files of any type (a photo, a video, a PDF):
+  `[{content_type, data(base64), filename?}]`, at most 5 and at most 16 MB
+  decoded together (`CHAT_SEND_MAX_BYTES`; 400 on violations); `filename` is
+  the name a document goes out under; `text` may be absent when attachments
+  are sent. The returned `Message` (and later polls) carries the sent
   attachments with proxied URLs and their sniffed dimensions. The client
   downscales picked photos before upload — longest edge 1600 px, JPEG — as
   the native clients do; animated GIFs pass through unchanged under the size
@@ -511,7 +970,29 @@ The API, as the components consume it:
   words to the user about to send them in their own name — and one guarded
   step, so it cannot race the clear that produced it whichever order the two
   requests arrive in.
-- `POST /chats/<id>/read` `{ts}` — advances the read watermark, forward-only.
+- `POST /chats/<id>/read` `{seen: <inbound_seq>}` — **Mark as read**, about
+  what the client showed: `seen` is the `inbound_seq` of the summary it
+  rendered. If a message has landed since, nothing is marked and the answer
+  is **409** `{error, id, last_read, unread, list_group}` — the chat as it
+  stands; the client fetches and shows it before the user marks again.
+  Otherwise the chat is read as it stands and the answer is `{id, last_read,
+  previous, unread, list_group}`: `previous` is the mark it replaced (null
+  when there was none), and `unread` / `list_group` are the chat's state
+  right after the mark, as `GET /chats` would state it — normally 0 and
+  `read`, but a client takes both from the answer rather than assuming them.
+  The mark is the server's clock, never a message's timestamp and never in
+  the future; a message it covers that a fast clock stamped up to two
+  minutes ahead is read with it, and stays read. `{}` is the same without
+  the check (for a caller that vouches
+  for itself), and `{ts}` reads only up to that instant; a `ts` that is no
+  real instant, or lies more than two minutes ahead of the server's clock,
+  is a 400 (one a little ahead is taken as now).
+  `{restore: <previous>, marked: <last_read>}` is its Undo: the mark
+  goes back to `previous` only while it is still the one that read set, and
+  the answer is 409 otherwise (a reply or another read moved it since, and
+  that stands). The list's swipe and tray and the chat page's button are the
+  only callers; nothing posts a read when a chat is opened, looked at or
+  scrolled, and a send reads the chat server-side.
 - `POST /chats/<id>/companion` — `{id}`, the chat's companion conversation.
   Idempotent: it creates the thread on the first call and returns the same id
   afterwards. The page calls it lazily — on the user's first turn or chip, so
@@ -519,6 +1000,74 @@ The API, as the components consume it:
   the pane is a plain conversation client: `GET /conversations/<id>` for the
   thread (`pending` is Ara writing), the reply POST for a turn, the read POST
   when the pane shows it.
+- **Mail additions** (`docs/mail-chats.md`). An e-mail `ChatSummary` also
+  carries `participants` (`[{address, name, contact}]`, at most 6),
+  `participants_more` (how many the cap left out), `peer` (`{address, name}`:
+  the latest inbound sender, or whom a thread the user started went to),
+  `last.removed`, and — on the messages document's `chat` — `can_send` and
+  `cannot_send_reason` (absent or true on every other chat). An e-mail
+  `Message` also carries `subject` (its own), `recipients` and `cc`, `trim`
+  (`deterministic` | `wanting` | `model`), `removed` and `removed_at`, and
+  `original` — the URL of its full form, present exactly when there is one to
+  show (never on a tombstone, which has empty `text` and no attachments).
+  `GET <original>` answers `{id, headers: {from, to, cc, date, subject},
+  header_block, text, html_url, attachments}`: the full, untrimmed plain
+  text, and `html_url` either null or the original URL plus `.html`, which
+  serves the sanitised HTML part as a document of its own under a policy
+  that lets nothing load or run (the chat page's own policy gains
+  `frame-src 'self'` for it). `POST /chats/<id>/messages/<token>/trim`
+  (same-origin, and only through the reverse proxy like a chat's flags; the
+  original URL with `/trim` for `/original`) asks for a
+  `wanting` mail's model trim: `200 {state: model | deterministic, text}`
+  (settled), `202 {state: queued | running}` (a turn on its way; asking
+  again never queues twice) or `200 {state: wanting, retry_after}` (nothing
+  started; not asked again before `retry_after` seconds); `404 {error: "no
+  such mail in this chat"}` for a token that names nothing and `410` for a
+  mail gone from the mailbox (a tombstone, an erased record), or for a chat
+  merged away (`merged_into`).
+
+  Writing: `GET /chats/<id>/reply-preview` → `{all: Addressing, sender:
+  Addressing, choice, subject}`, `Addressing` being `{to: [Party], cc:
+  [Party]}` and `Party` `{address, name, contact, contact_id}` — exactly what
+  a reply would be addressed to right now in either mode, `name` the display
+  name on record or null, `contact` the address book's **name** for the
+  person who holds the address (a string, or `{name}`) and `contact_id` that
+  person's id (null for nobody's address: then there is no address-book
+  name). With `contact_id` in the answer the name is shown as it is filed,
+  also a lowercase one-word one ("mum"); only an answer without the field
+  can carry an id in `contact`, and a string that reads as an identifier is
+  then not shown as a name. `choice` is whether the two modes differ;
+  `409`/`400` `{error}` where no reply is possible, and a `404` is taken as
+  a server that cannot say (the page then sends no reply). `POST
+  /chats/<id>/send` takes `reply: "all" | "sender"` and `request_key` (an
+  opaque token of at most 64 characters, one per press) on a mail chat and
+  answers `200` with the Message (sent; `refused: [addresses]` where the
+  mail server took only some recipients), `202 {pending: Pending}` (queued)
+  or `202 {unconfirmed: true, message_id?, request_key}` (handed over,
+  outcome unknown). An error answer is `{error, sent?, request_key?, by?}`:
+  a **4xx** (424 where the send failed for certain at the mail server) and
+  any status with **`"sent": false`** mean nothing went out with this
+  request; a 5xx without it means nobody knows. `by` says whose word that
+  is — `"gateway"` (the mail gateway's own answer, after it looked the key
+  up: the key is over) or `"dashboard"` (the web gateway's, the mail gateway
+  not having spoken: it says nothing about the key). `Pending` is `{request_id, approval_url, text, ts,
+  author, agent?, to, cc, subject, message_id?, request_key?, status?,
+  error?, outcome_unknown?, refused?, dismissed?}` (`approval_url`
+  path-only, `/sends/<slug>/<id>`; `status` `pending` — the default —
+  `sending` or `failed`; an entry with `dismissed: true` is over and is not
+  drawn). `POST /chats/<id>/pending/<request id>/dismiss` takes a failed
+  one off the list. `GET /chats/<id>/messages` carries top-level `pending:
+  [Pending]` (oldest first; `[]` on other channels, and a document without
+  the field leaves what the page shows), every mail Message `reply_to:
+  [addresses]`, and a `GET /chats` entry `pending: n`, its `last` a queued
+  send's with `pending: true` where that is the latest. `GET /chats/compose`
+  → `{channels: [{channel, label, accounts}]}`, what ＋ offers (a 404 is
+  taken as nothing); `POST /chats/compose` `{channel, account?, to, cc,
+  subject, text, request_key}` → `200 {id, message}`, `202 {id, pending}` or
+  `202 {unconfirmed: true, id?, message_id?, request_key}`, an error
+  `{error, sent?, request_key?}` read as on a reply otherwise. Mark as read, Archive and Delete on a mail
+  chat are the same calls as on every chat; the server carries them into the
+  mailbox.
 
 **Reference documents:** `data/chats.json` and `data/chats/<slug>.json` are
 static documents in the API's response shapes — the contract drafts the API
@@ -533,7 +1082,14 @@ link's url is the proxy's or an http(s) URL); the origin's
 Content-Security-Policy allows no `data:` media on the chat page, since no
 record the gateway serves carries one, so the corpus shows its media only
 where it is served without that policy. It covers both companion states: one chat names an
-existing thread, the rest carry `companion: null`. Companion messages
+existing thread, the rest carry `companion: null`. It holds a mail thread
+too (`data/chats/email-quarterly.json`): a group thread with an inline image
+and an attached sheet, a mail sent from another client, an HTML mail whose
+subject is not the thread's, a tombstone and a reply waiting for approval
+(`pending`), with the Original of its HTML mail beside it
+(`email-quarterly.original.json`) and the reply preview the composer's
+recipients line is drawn from (`email-quarterly.reply-preview.json`).
+Companion messages
 themselves are conversation documents, not chat ones, so the corpus holds
 none — the suite mocks `/conversations/<id>` for those.
 
@@ -597,12 +1153,14 @@ load of this device and browser:
 - **Drafts** (`components/drafts.js`). Every composer, command bar and editor
   writes what it holds to `localStorage` as it changes (`retinue-draft:<key>`:
   `conv:<thread id | new | new:<project>>` for the conversation composer,
-  `chat:<chat id>` for a messenger chat's composer, `project-cmd:<id>` and
+  `chat:<chat id>` for a chat's composer, `chat-unsure:<chat id>` for a mail
+  chat's unconfirmed sends, `compose:<channel>[:<mailbox>]` for the new-mail
+  sheet, `project-cmd:<id>` and
   `project-edit:<id>` for a project's command bar and raw editor), and reads
   it back when its place opens again. Synchronous storage, so a write made as
   the page unloads (`pagehide`) is not lost; written on every change, so a page
   the system kills without an unload loses nothing either. Attachments (a
-  thread's picked files, a chat's staged images) are too large for it and go
+  thread's picked files, a chat's staged attachments) are too large for it and go
   to IndexedDB (`retinue-drafts`) when they are picked or dropped. A project
   edit is kept with the file version it was started from, so saving it on a
   later visit still answers 409 when the file changed meanwhile. A chat's
@@ -653,7 +1211,7 @@ load of this device and browser:
   all, the note hedges and the mark stays for the next visit to look again.
   A first message, which has no thread to read, is looked for in the threads
   the user opened from that moment on. A chat message is looked for in the chat's own mirror on the
-  next visit; one carrying images is too large for a keepalive request and is
+  next visit; one carrying attachments is too large for a keepalive request and is
   the likelier to need it. A project command is taken as delivered.
 
 The page-side guard that held a tab or a Home press on such a page is gone,
