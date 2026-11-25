@@ -11,7 +11,10 @@ driven through the CLI helper exactly as an agent would:
     the pending list, and a later approve cannot revive it;
   * a send the user already approved cannot be retracted ("too late", exit 1);
   * a send the user already denied reports that nothing was sent (exit 0);
-  * an unknown id is a 404 (exit 1), a malformed one never reaches the gateway.
+  * an unknown id is a 404 (exit 1), a malformed one never reaches the gateway;
+  * the mail gateway's queue: a send that failed after it was allowed is "too
+    late … failed; nothing was sent", and one whose outcome nobody knows is
+    never worded as failed.
 
     python3 tests/test_pending_retract.py
 """
@@ -158,6 +161,66 @@ def test_unknown_and_malformed_ids():
     print("ok: unknown id is 404, malformed id never sent")
 
 
+def test_the_mail_gateways_outcomes():
+    """The mail gateway tells a send that failed from one of which nobody
+    knows whether it went out (``outcome_unknown``): the second is never
+    reported as "failed" — whoever read that would send the mail again."""
+    send = _test_module("test_mail_gateway_send")
+    t = send.t
+    w = send.world(policy="verify")
+    try:
+        gw, smtp = w.gw, w.smtp
+        server, base = t.serve(gw)
+        token = t.TOKEN
+
+        def retract(request_id):
+            out, err = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                code = pending_retract.retract("mail-push", base + "/send", request_id,
+                                               token, 10)
+            return code, out.getvalue(), err.getvalue()
+        try:
+            # Queued, and taken back: nothing is sent.
+            _s, queued = w.send(to=["ann@x.org"], message="One.")
+            code, out, err = retract(queued["request_id"])
+            assert code == 0 and "retracted; nothing was sent" in out and err == ""
+            assert gw.SENDS.get(queued["request_id"])["status"] == "retracted"
+            # Allowed, and refused by the mail server: failed, for certain.
+            _s, queued = w.send(to=["ann@x.org"], message="Two.")
+            smtp.reject_data = "554 5.7.1 content rejected"
+            gw._decide_send(queued["request_id"], "approve")
+            smtp.reject_data = None
+            code, out, err = retract(queued["request_id"])
+            assert code == 1 and out == "" and "too late" in err, err
+            assert "the send failed; nothing was sent" in err and "NOT KNOWN" not in err
+            # Allowed, handed over, and the server's answer lost: nobody
+            # knows — and that is what is said, not "failed".
+            _s, queued = w.send(to=["ann@x.org"], message="Three.")
+            smtp.drop = "dot"
+            gw._decide_send(queued["request_id"], "approve")
+            smtp.drop = None
+            entry = gw.SENDS.get(queued["request_id"])
+            assert entry["status"] == "error" and entry["outcome_unknown"] is True
+            code, out, err = retract(queued["request_id"])
+            assert code == 1 and out == "" and "too late" in err, err
+            assert "NOT KNOWN whether it went out" in err and "Do not send it again" in err
+            assert "failed" not in err, err
+            # Dismissed from its chat, it is still that: over, not "failed".
+            gw.SENDS.update(queued["request_id"], request_key="k-1")
+            gw.SENDS.dismiss(queued["request_id"])
+            assert gw.SENDS.get(queued["request_id"])["dismissed"] is True
+            code, out, err = retract(queued["request_id"])
+            assert code == 1 and "NOT KNOWN whether it went out" in err and "failed" not in err
+            assert len(smtp.mails) == 1, "the one that was handed over"
+        finally:
+            server.shutdown()
+    finally:
+        send.done(w)
+    # A gateway that does not say either way is read as before.
+    assert pending_retract._OUTCOMES["error"][1].endswith("the send failed")
+    print("ok: mail: a send of unknown outcome is never reported as failed")
+
+
 def test_gateway_base():
     assert pending_retract.gateway_base("http://signal-gateway:8090/send") == \
         "http://signal-gateway:8090"
@@ -172,4 +235,5 @@ if __name__ == "__main__":
     test_retract_after_approval_is_too_late()
     test_retract_after_denial_reports_nothing_sent()
     test_unknown_and_malformed_ids()
+    test_the_mail_gateways_outcomes()
     print("all pending-retract tests passed")

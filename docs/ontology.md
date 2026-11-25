@@ -31,7 +31,7 @@ results appear right below it.
 | Documents and their metadata (title, date, creator, format) | **Dublin Core Terms** | `http://purl.org/dc/terms/` |
 | Labels and simple classification | RDFS / **SKOS** | `http://www.w3.org/2000/01/rdf-schema#`, `http://www.w3.org/2004/02/skos/core#` |
 | Where a fact came from | **PROV-O** | `http://www.w3.org/ns/prov#` |
-| Retinue's own concepts (projects, memories, data-quality flags) | `kb:` | `https://w3id.org/retinue/kb#` |
+| Retinue's own concepts (projects, memories, the message ledger, data-quality flags) | `kb:` | `https://w3id.org/retinue/kb#` |
 | **Fallback** — nothing above fits | schema.org | `http://schema.org/` |
 
 Mint a term of your own only when none of these (nor a chamber's declared domain
@@ -283,15 +283,46 @@ PREFIX kb: <https://w3id.org/retinue/kb#>
 PREFIX dcterms: <http://purl.org/dc/terms/>
 
 # The dashboard's threads with Ara, newest first: their state and the project
-# each is about. Only the list fields are in the store (scripts/thread_index.py),
-# never what a thread says; the dashboard's Archived tab pages through the same
-# summaries.
-SELECT ?thread ?title ?modified ?archived ?messages ?project WHERE {
+# each is about. Only state is in the store (scripts/thread_index.py) — no
+# title and nothing a thread says; the dashboard's Archived tab pages through
+# the same summaries.
+SELECT ?thread ?modified ?archived ?messages ?project WHERE {
   ?thread a kb:Thread ;
-          dcterms:title ?title ;
           dcterms:modified ?modified ;
           kb:archived ?archived ;
           kb:messageCount ?messages .
   OPTIONAL { ?thread kb:project ?project }
 } ORDER BY DESC(?modified) LIMIT 50
+```
+
+The message ledger (`scripts/inbound_store.py`, one file per message under
+`_generated/messenger/<channel>/messages/`) is `kb:` too: `kb:InboundMessage`
+and `kb:OutboundMessage`, keyed by `kb:chat` and `kb:account`. A mail adds
+`kb:subject`, `kb:senderName`, `kb:recipient` and `kb:cc` (one triple per
+address), `kb:inReplyTo`, `kb:references` (one literal, the ids in header
+order), `kb:listId`, its parts as blob IRIs (`kb:bodyPart`, `kb:htmlPart`,
+`kb:headerPart`, never `kb:attachment`), `kb:contentId` on an inline
+attachment's IRI, `kb:trim`, and `kb:removedAt` once the mail is gone from the
+mailbox. `kb:text` is the trimmed reading text, empty on such a tombstone.
+
+```sparql
+PREFIX kb: <https://w3id.org/retinue/kb#>
+
+# One mail thread, oldest first: every mail the ledger holds under the chat
+# key (the thread root's Message-ID, without brackets — edit it), both
+# directions, with who wrote it and whether it is still in the mailbox.
+SELECT ?when ?direction ?from ?name ?subject ?text ?removed WHERE {
+  ?mail kb:channel "email" ;
+        kb:chat "root@example.org" ;
+        a ?type ;
+        kb:text ?text .
+  OPTIONAL { ?mail kb:receivedAt ?received }
+  OPTIONAL { ?mail kb:sentAt ?sent }
+  OPTIONAL { ?mail kb:sender ?from }
+  OPTIONAL { ?mail kb:senderName ?name }
+  OPTIONAL { ?mail kb:subject ?subject }
+  OPTIONAL { ?mail kb:removedAt ?removed }
+  BIND (COALESCE(?received, ?sent) AS ?when)
+  BIND (IF(?type = kb:InboundMessage, "in", "out") AS ?direction)
+} ORDER BY ?when
 ```

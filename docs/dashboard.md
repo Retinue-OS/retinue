@@ -77,12 +77,13 @@ distraction-free list of what wants attention, so the news lives only on its
 own page (`news.html`), one tap away in the navigation row. *Threads* is `conversations.html`, which lists
 every thread with an Active/Archived/Edits/Cowork filter — the last two being
 where the otherwise hidden kinds (project edit commands, and the Ask-Ara
-connector's cowork audit threads) are reachable. Its tiles swipe like the
-Chats page's rows — one gesture for both lists (`components/swipe-rows.js`):
+connector's cowork audit threads) are reachable. Its tiles swipe by the
+mechanism the Chats page's rows use (`components/swipe-rows.js`; what a
+swipe does there is in "Chats: unread, read, archived" below):
 a swipe right archives an active thread or restores an archived one at once,
 a swipe left (or a long press) opens a tray of Star · Archive · Mute, or
 Star · Restore · Mute/Unmute · Delete. A commit that takes a row out of view
-offers Undo for a few seconds. The open thread's bar keeps its Archive button
+offers Undo for 15 s (the toast stays while a finger is on it). The open thread's bar keeps its Archive button
 and has a ☆/★ beside it. Archived threads drop off the active list but stay
 on that page; what each action means is in "Archived, muted, starred,
 deleted" below.
@@ -104,11 +105,14 @@ the gateway's escaping and its media rules (#402, #404; "Attachments" and
 "Media in a messenger chat" below) see to that. The Content-Security-Policy is
 the second line behind them: should markup from outside reach a page all the
 same, it cannot run script there, because scripts run only from the
-dashboard's own files. Every HTML response of the gateway carries it — the
+dashboard's own files. Every page of the gateway carries it — the
 pages of `webapp/`, the pages the gateway builds itself (`/sends`,
 `/gateways`, `/claude-auth`, the session log) and its error pages. It is
 added where the handler's headers end, for any answer of type `text/html`, so
-no code path can forget it. The policy is built in one place,
+no code path can forget it. (One answer of that type is no page of the
+dashboard and opts out by name: a mail's HTML part, which is served as a
+sandboxed document under a stricter policy of its own — "The frame on the chat
+page" below.) The policy is built in one place,
 `scripts/content_policy.py`, with the page that needs each source:
 
 ```
@@ -127,7 +131,7 @@ shows an attachment that is a web link as a link to open (see
 "Attachments"), and the session log shows an image an answer names (a web
 address or a `data:` URL) as a link to it, or as its alt text, never as an
 image, as the dashboard's Markdown renderer does. Every page but one plays
-no audio or video, and every page but one frames nothing, so `media-src`
+no audio or video, and every page but two frames nothing, so `media-src`
 and `frame-src` are `'none'`: markup that slipped into a page can then not
 frame another page of this origin either (an approval card, under a click
 meant for something else). No page loads a font.
@@ -135,12 +139,14 @@ Three pages get more, each for itself alone (`PAGE_SOURCES` in the module;
 a source added to a directive that is `'none'` takes its place):
 the chat page (`/chat.html`) adds `blob:` to `img-src`, for its previews of
 the images about to be sent, which it makes itself as object URLs (no other
-page makes one), and gets `media-src 'self'`, for the messenger media it
-plays; it is the only page that plays any. (The briefing card would play
-audio on the start page, but `index.html` leaves it out for now; bringing it
-back means giving `index.html` `media-src 'self'` there.) The file viewer
-(`/viewer.html`) gets `frame-src 'self'`, for the attachment it shows in a
-frame; it is the only page that frames anything. `/sparql` (also served as
+page makes one), gets `media-src 'self'`, for the messenger media it
+plays — it is the only page that plays any — and gets `frame-src 'self'`,
+for the one thing it frames: a mail's HTML part (below). (The briefing card
+would play audio on the start page, but `index.html` leaves it out for now;
+bringing it back means giving `index.html` `media-src 'self'` there.) The
+file viewer (`/viewer.html`) gets `frame-src 'self'`, for the attachment it
+shows in a frame; it and the chat page are the only pages that frame
+anything. `/sparql` (also served as
 `/sparql.html`) adds `data:` to `img-src`, for the icons in YASGUI's
 stylesheet. It needs nothing else: the vendored YASGUI compiles no strings.
 Two other policies stay as they were, separate and always enforced:
@@ -148,6 +154,55 @@ Two other policies stay as they were, separate and always enforced:
 settings page") and the file viewer's own `frame-src 'self'`. Inside the
 Android shell, the bridge the app injects (`window.RetinueShell`) and the
 scripts it evaluates are the app's, not governed by a page's policy.
+
+**The frame on the chat page.** The chat page frames one thing: the HTML part
+of a mail, when the user opens a mail's *Original* ("Mail threads as chats"
+below; `GET /chats/<id>/messages/<mid>/original.html`). That is markup from
+outside shown on purpose, so it is given nothing of the origin, by three
+lines that each hold without the others:
+
+- it is **sanitised** before it is served (`mail_trim.sanitize_html`): an
+  allow-list of tags and attributes re-serialised from the token stream — no
+  script, no handler attribute, no form control, no frame, no `meta`, nothing
+  that loads. Its own inline (`cid:`) images are embedded as `data:` URLs,
+  from that message's own attachments only, raster types only, up to
+  `MAIL_ORIGINAL_INLINE_MAX_BYTES` (8 MiB) a mail; every other image source
+  is dropped, so a tracking pixel never loads;
+- it is **its own document under its own policy**, always enforced, whatever
+  `RETINUE_CSP` says:
+  `sandbox allow-popups allow-popups-to-escape-sandbox; default-src 'none'; img-src data:; style-src 'unsafe-inline'`.
+  `sandbox` gives it an opaque origin — no script, no form submission, no
+  access to the dashboard's cookies, storage or API, no navigating the page
+  around it — and the two `allow-popups` tokens let exactly one thing
+  through: a link the user clicks opens as an ordinary tab. It also goes out
+  with `X-Content-Type-Options: nosniff`, `Cache-Control: no-store`,
+  `X-Frame-Options: SAMEORIGIN` (only a page of this origin frames it) and
+  `Referrer-Policy: no-referrer` (the site a link leads to learns no address
+  of the dashboard). The dashboard's own policy is left off this one answer:
+  that policy describes the dashboard's pages, which this document is not —
+  its `img-src 'self'` would stop the embedded pictures, and report each of
+  them in `report` mode;
+- the page frames it with the `sandbox` attribute as well
+  (`allow-popups allow-popups-to-escape-sandbox`), so the same holds where a
+  client ignores the header;
+- **in the Android app** (a request whose user agent carries
+  `RetinueShell/`) the shell's WebView opens no new windows, so a link meant
+  for a new tab would go nowhere. There the sanitiser targets links at the
+  top frame (`target="_top"`) and both the header and the frame's attribute
+  add one token, `allow-top-navigation-by-user-activation`: a link the user
+  taps navigates the top frame, which the app hands to the phone's browser
+  for any address off the dashboard's origin, the dashboard staying where it
+  was. Nothing navigates without the tap, and no script runs either way. The
+  answer carries `Vary: User-Agent`.
+
+A source list cannot name that one path family — a chat id is part of it —
+so the directive is `'self'`, and what the frame holds is the page's doing:
+it sets the frame's address from the `html_url` the gateway answered, never
+from anything a message said. What `'self'` gives up is stated plainly: on
+the chat page alone, markup that slipped into the page could frame another
+page of this origin. The page renders what a message says as text, and
+`tests/test_chat_mail.py` pins the answer's headers and what the sanitiser
+leaves of a hostile mail.
 
 The policy decides what a page loads and runs, not where a link takes the
 user: following a link is a navigation, which none of its directives
@@ -226,8 +281,11 @@ render: listeners are added in script. No `javascript:` URLs, no `eval`,
 `new Function` or string timers, nothing from another origin. A page that
 cannot work without more gets it for that page alone, stated in
 `PAGE_SOURCES` of `scripts/content_policy.py` (as the chat page's `blob:`
-images, `/sparql`'s `data:` images and the file viewer's frame are), rather
-than a weaker policy for every page.
+images and its frame, `/sparql`'s `data:` images and the file viewer's frame
+are), rather than a weaker policy for every page. And markup from outside
+that is to be *shown* — a mail's HTML — is never put into a page: it is
+sanitised and served as a sandboxed document of its own, which a page frames
+("The frame on the chat page" above).
 `tests/test_webapp_no_inline_script.py` checks the pages, the components'
 markup and every page the gateway builds (its builders rendered, and its
 source for the error pages it writes in place), and that every script a page
@@ -282,8 +340,8 @@ Focused does *health*; where none does, the rule that would), and the
 actions *Later* (next breakpoint / tomorrow), *Pull into the list now* and
 *Mark done* — the last also a gesture: a row swiped right on the home is
 marked done, with an Undo for a few seconds. Done is the attention item's
-state, not the source's: it never archives the thread or the chat, and the
-next message opens a fresh item. A chat shows its sender's spheres, as the contact card and the
+state, not the source's: it never archives the thread or the chat, nor marks
+the chat read, and the next message opens a fresh item. A chat shows its sender's spheres, as the contact card and the
 corrections taught them, unless the triage judged its message to be about a
 sphere in particular (or named further spheres alone) — a customer who is
 also a friend, asking about Saturday's barbecue, is *friends* for that
@@ -324,10 +382,23 @@ shows an *Instruction* field: the turn's state, its verdict, what it did and
 what it flagged.
 
 The **Contacts page** (`contacts.html`, the *Contacts* tab of the navigation
-row) is the address book itself: every person, searchable by name
-and e-mail address, each editable in place — their handles on every channel,
-their spheres, importance prior, the Focus modes they may interrupt, the VIP
-flag and the instruction (with *Copy instruction from…*, for a team). A new contact names the chamber it is kept in. Rows open where the item lives: a thread in place (the conversations
+row) is the address book itself: every person, searchable by name,
+e-mail address and e-mail domain, each editable in place — their handles on
+every channel, the e-mail domains they write from, their spheres, importance
+prior, the Focus modes they may interrupt, the VIP flag and the instruction
+(with *Copy instruction from…*, for a team). A new contact names the chamber
+it is kept in. Over HTTP a person's domains are `domains` on every contact
+`GET /contacts` lists; `POST /contacts` takes `domains`, and `POST
+/contacts/<id>` takes `domains` (the whole list), `add_domains` and
+`remove_domains` — `example.org`, or `*.example.org` for a domain and
+everything below it. The address book reads and refuses them: `400` for what
+is no domain (an address, a single label, a public suffix), `409` for one
+another person files. `GET /contacts?channel=email&handle=<address>` answers
+the holder of the address, or — for an address nobody holds — the person
+whose domain covers it, marked `exact: false`, `match: "domain"` and
+`match_domain` ([contacts.md](contacts.md), "E-mail domains").
+
+Rows open where the item lives: a thread in place (the conversations
 element on the home is a `viewer` — invisible until a `#conversation-<id>`
 hash opens a thread or `#new` the composer), a chat on `chat.html`, a project
 on `project.html`. The old chats, conversations and projects cards are gone
@@ -380,7 +451,9 @@ judgement) where it carries one, else from the profile's priors for the
 sender, else the default — a person writing directly is *active* (held for the
 next digest, rung at once where the sender holds a permit), a group is chatter
 (passive). `attention-set.py chat:<id> …` revises it; a reply (from the
-dashboard or the phone), *Mark handled* or archiving the chat settles it.
+dashboard, or from the phone on the channels that echo it — not SMS), *Mark
+handled*, *Mark as read* or archiving the chat settles it. Undoing a *Mark as
+read* reopens the item only where that mark settled it.
 The chat page carries **Archive** and **Mute** switches in its header's ⋮ menu
 (`POST /chats/<id>/flags {archived?, muted?}`), with the thread flags'
 meaning: an archived chat leaves the chats list and comes back when a
@@ -427,8 +500,11 @@ knowing nothing of VIP or critical, what it had just released — a second
 message into a chat with something unread counted as a *reply*, and the
 default setting dropped it. A device is notified or disabled, nothing in
 between. `ATTENTION_PUSH_GATE=0` is the rollback: every
-arrival pushes as before the model, while the list, the digest and the sweep
-keep working.
+messenger arrival pushes as before the model, while the list, the digest and
+the sweep keep working. It does not apply to mail, which pushed nothing
+before the model: a mail pushes only on the model's word (a VIP, a prior or
+a permit, an instruction's verdict or its failure rule), and the rail's
+answer and the chat's status say it rang only where it did.
 
 **The digest** is that one push, and it is ranked as the list is — level,
 importance, the nearest deadline (`attention.rank_key`) — with a line per
@@ -989,6 +1065,1204 @@ still work exactly as before. Set `VAPID_SUBJECT` to the operator's contact
 address; deleting the stored key invalidates every existing subscription, so
 devices would need to re-enable.
 
+## Chats: unread, read, archived
+
+The Chats page (`chats.html`) sorts every messenger chat into three groups,
+**Unread · Read · Archived**, and the gateway says which: every chat in
+`GET /chats` carries `list_group`, `unread` and `inbound_seq` (the count of
+arrivals the summary includes), and the payload `counts` — chats per group,
+for the tabs. (`group` on a chat is the boolean "a group chat", as before.)
+
+- A chat is **unread** while its latest inbound message has neither been
+  replied to nor marked read, and **read** once it has — by a reply from the
+  dashboard, or from the user's own phone on the channels that echo it
+  (Signal, WhatsApp, Telegram; not SMS, where a chat answered on the phone
+  stays unread until it is marked), or by **Mark as read**: the button under
+  the latest inbound message on the chat page, and a swipe right on the Chats
+  page.
+- **Opening a chat does not mark it read.** The pages post no read on open,
+  on scroll or on a poll; `POST /chats/<id>/read` is the user's explicit word
+  and nothing calls it for them.
+- **A mark is about what was shown.** Both pages post `{seen}`, the
+  `inbound_seq` of the summary they rendered. A message that has landed
+  since is one the user has not seen: the gateway marks nothing and answers
+  409, and the page shows the message instead (the list is fetched again,
+  the chat page polls and says a new message came in).
+- A new inbound message moves a read chat back to *Unread* and brings an
+  archived one back unless it is muted — by the order it landed in, so also
+  when it is stamped before the mark (a delayed delivery, a sender's slow
+  clock). A message is one arrival however often its channel delivers it,
+  and one a fast clock stamped a little ahead of the mark that read it stays
+  read. An agent's own outbound message changes nothing: it is no reply.
+- On the page's rows a **swipe right marks as read** (on *Unread*), a
+  **partial swipe left reveals the tray** and a **full swipe left (or a
+  fling) archives** at once (on *Unread* and *Read*); on the *Archived* tab a
+  swipe right restores and a swipe left reveals the tray. The tray is the
+  same on every tab and every channel — Star, on *Unread* Mark read, Archive
+  and Mute (on *Archived* Restore and Mute or Unmute), Spam and Delete — with
+  one exception: **Spam** is for mail threads only (a messenger has no junk
+  folder; mute the chat instead). Right-click and the context-menu key open
+  the tray too, so a keyboard reaches what a swipe does.
+- **Delete** takes two taps (the armed button says what the second does:
+  "Delete for good?", "Move mails to Trash?" on mail) and has no Undo. Every
+  other action that takes a chat out of view offers **Undo for 15 s**; Spam
+  is deferred — nothing is sent until the window ends, and a page hidden or
+  left sends it at once (`keepalive`). A failed action brings the row back
+  with the server's own reason.
+- **Multi-select**: a long press starts it (a tap then toggles a row, Space
+  on a focused row, Shift-click a range on a wide screen); a bar offers the
+  tab's actions for every selected chat — Spam only when all are mail — with
+  one request per chat, one Undo for the batch, failures counted and each
+  failed row saying why, and a bulk Delete in two taps. Esc, Cancel, the
+  back gesture or a tab switch end it.
+- **Spam** (`POST /chats/<id>/spam`, mail only) moves the thread's inbound
+  mails to the mailbox's Junk folder (`MAIL_JUNK_FOLDER`), and only then mutes
+  and archives the chat. Restore or Unmute bring it back like any muted
+  chat; the mails stay in Junk — the mailbox follows the chat, never back
+  (docs/mail-chats.md).
+- The badge on a row is the number of messages that have arrived since the
+  user last dealt with the chat; the *Unread* tab carries the number of
+  unread chats.
+- *Mark as read* settles the chat's attention item as *Mark handled* does and
+  offers **Undo** for a few seconds. The undo
+  (`POST /chats/<id>/read {restore, marked}`) puts the read mark back only if
+  nothing has moved it since — a reply sent in between stands — and reopens
+  the item only if that mark is what settled it.
+- A mark, a reply and an archive are passed on to the chat's gateway, where a
+  channel with a mailbox behind it follows (the thread's mails seen, or moved
+  out of the inbox); the undo and an un-archive are not. See "Writing mail",
+  *The mailbox follows the chat*.
+- **Both endpoints are same-origin only**, like a send: `POST
+  /chats/<id>/read` (the mark and its undo) and `POST /chats/<id>/flags`
+  answer `403` to a request another site's page made the browser send
+  (`Sec-Fetch-Site` other than `same-origin`/`none`). They are the user's
+  word about their chat, and on a mail chat they reach the real mailbox —
+  the dashboard's credential is ambient, and a `text/plain` form whose body
+  is valid JSON needs no preflight. The dashboard's own fetches are
+  same-origin; a caller that sends no such header (a script in the
+  container) passes the read mark, as on the other guarded routes. The
+  flags, like a send, are also accepted only through the reverse proxy:
+  `403` from inside the container where `EDGE_PROXY_PEERS` names the
+  proxy; without it, only from loopback and from the address the caller
+  dialled — a caller coming in from another of the container's addresses,
+  or through a sibling that relays, passes (an agent has `POST
+  /internal/chats/<id>/flags`; "The gate for mail", "Who is asking").
+
+The derivation, the endpoint's request and answer shapes, and what the store
+being away does to the counts are in
+[messenger-chats.md](messenger-chats.md), "Unread · Read · Archived".
+
+## Mail threads as chats
+
+A mail thread is a chat like any other — the same list, page, state document
+and companion ([mail-chats.md](mail-chats.md) is the design; this is what the
+web gateway serves of it). The channel is `email`, the chat key the thread
+root's `Message-ID`, the account the mailbox address:
+`email:~<account>:<message-id>`. The mirror reads the mailbox, and since the
+writing phase the chat writes to it: replies and new mail leave from here
+under the e-mail send policy, and the mailbox follows what the user does to
+the chat ("Writing mail" below). An arriving mail is gated like a messenger
+message ("The gate for mail" below): it pushes nothing by default, a contact
+can say otherwise, and only a VIP's or an instructed sender's buys a model
+turn. E-mail triage is retired; nothing else looks at mail.
+
+**Routing.** The mail gateway's service is `mail-gateway` and its channel
+`email`, which no reading of the slug says, so a registry entry may state its
+`channel` and the web gateway reads that before it reads a slug or a label
+(`_gateway_in_channel`, `_slug_channel`); an entry without the field is read
+as before. The blobs are `urn:retinue:media:email:<id>` and go through the
+media proxy like a messenger's (`/chats/media/mail-gateway/<id>`).
+
+**A name that is a subject.** A mail chat's `name` is its thread's subject
+(`(no subject)` when there is none; never the key), so who it is with is kept
+beside it: the state document's `participants` and `peer`, which the rail
+writes. Nothing that names a *person* writes the name — not a sender's name
+on the rail, not the contact card, the autolink or a renamed person, not the
+name backfill (which asks the mail gateway's `GET /recent-chats` for what a
+state lacks). Everything about a person works on the peer's address instead:
+the contact card and the autolink (`_chat_handle` answers
+`("email", <peer address>)` for a one-to-one thread and nothing for a
+group), and the attention item, whose sender — the key the profile's priors,
+spheres and permits are filed under — is the linked contact, else the person
+the address book gives the peer's address to — its holder, else whoever's
+e-mail domain covers it most closely — else the address. Never the
+subject, and never the display name a mail carried: anyone can type the name
+of someone the user gave a permit, so that name is only the item's title.
+
+A domain says who a mail is *from*, not whose address it is, so the two are
+kept apart everywhere but in the attention item. A party the gateway
+resolves (`_mail_party`) carries `name` and `contact` for the **holder** of
+the address only, and, for an address nobody holds, `by_domain`:
+`{contact, name, domain}` of the person whose domain covers it. The item is
+filed under that person (`attention_store.mail_peer_person`) — an
+organisation's prior, permits and sphere apply to all its mail, and such a
+sender is not screened — while the thread gets no contact card from a domain
+(the autolink asks for the exact holder) and the list goes on showing the
+name the mail carried.
+
+**A card is about one address.** A thread's people change with every mail,
+and its card was filed for the peer it had while it was one-to-one. So the
+card speaks for the thread only while that is still who it is with
+(`attention_store.chat_card`): not for a **group** — a thread a third address
+has joined, which takes nothing but a `Message-ID` to cite — and not where
+the address book gives the thread's peer to someone else or to nobody. Such
+a thread's entry in `GET /chats` has `contact: null`, and its attention item
+takes no sender, sphere or tags from the card: the newcomer is judged as
+whoever their own address makes them. The card stays in the state document
+(nothing is rewritten on a mail's say-so), and applies again once the thread
+is one-to-one with its person. A write follows what is shown: the contact
+card's save (`POST /chats/<id>/contact`) acts on the card that speaks for the
+thread. A group is refused, as any group chat is; a thread whose peer is no
+longer the card's person files that peer's address — under the person who
+holds it, else as a new one — and neither rewrites the person on the hidden
+card nor moves what the profile learned under their name.
+
+**A mail pushes nothing by default; a contact can say otherwise.** A mail
+that just arrived goes through the attention model like any arrival, and the
+model is what keeps a mailbox off the phone: an unjudged mail is passive —
+listed, never pushed, in no digest — whether the thread is one-to-one or not
+(`attention_store.CHANNEL_DEFAULT_IMPORTANCE`). What raises it is the person
+it is from: their importance prior (active: held for the digest), a permit
+for the mode in force (rings), the VIP flag (rings in every mode), or the
+verdict of the turn their instruction buys. "The gate for mail" below has
+the flow.
+
+**The home list.** A mail chat is an attention item **while it holds unread
+mail the user has not settled** — one rule, whether or not the chat has an
+attention block (`attention_store.chat_wants_attention`). Not every mail is
+judged on arrival — one of a held group is not, nor is history the mirror is
+catching up on, nor an instructed sender's while its turn works — so it is
+the unread mail that lists the thread, not a block: unread mail lists it; a
+reply or *Mark as read* (nothing unread any more), an archive, or *Mark
+handled* settles it; a mail that is gone from the mailbox is not unread, so
+the thread leaves by itself; and the next mail brings a settled thread back
+— the model opens its block for a mail it judges, and the rail reopens it
+for every other mail it counts, listed and never pushed
+(`_attention_relist_chat`) — once per mail however often the event is
+delivered. A thread somebody put on the list stays until the user settles
+it, read or not: one they put back by hand (`pulled`), and one an agent
+declared attention on and left open — `attention-set.py chat:<id> …` with a
+deadline, an actor, an importance, or just `--reopen` — which the block
+records as `declared`. That one is an item like any other until then: its
+deadline is swept, and *Later* holds it for the digest instead of taking it
+off the list.
+
+**The list.** A mail chat's entry in `GET /chats` carries, beyond every
+chat's, `participants` (`[{address, name, contact}]`, resolved through the
+address book — the name of the person who holds the address, else the name
+the mail carried, else the address, with `by_domain` beside it where a
+person's domain covers an address nobody holds; at most six,
+`participants_more` counting the rest), `peer`, and in
+`last` the sender's name on either direction and `removed`: a head mail that
+is gone from the mailbox previews as removed, not as an empty line. The
+subject, the sender's name and the removal come with the head message's
+record, which the list reads whole anyway — no pattern is added to its
+queries. `last.text` is a **preview** on every channel: the first
+`CHAT_PREVIEW_CHARS` (300) characters, ending in an ellipsis where it was
+cut. The list is every chat in one answer and a mail's text can be its whole
+body; the message itself is served by `GET /chats/<id>/messages`.
+
+**A tombstone is not unread.** A mail that is gone from the mailbox keeps
+its record and its place in the thread, and counts for nothing: the unread
+query leaves out a record that carries `kb:removedAt` (one
+`FILTER NOT EXISTS` in `_CHATS_UNREAD_SPARQL`, no further query), and the
+chat state's own count of arrivals forgets it (`inbound_gone`). So a chat
+whose unread mail was deleted in a client leaves *Unread* and its badge
+counts live mail only.
+
+**The messages.** A mail's Message is its **trimmed** text (`kb:text`) and,
+beyond every message's: `sender` and `sender_name` on either direction,
+`subject`, `recipients`, `cc`, `trim` (`deterministic` · `wanting` · `model`),
+`removed` / `removed_at`, and `original` — the address of the full mail,
+present exactly when there is one to show. The attachments are the mail's
+files, an inline (`cid:`) picture among them; the mail's own parts — its
+plain body, its HTML, its header block — are blobs of the same store and are
+never listed as attachments. A tombstone (a mail deleted or moved away in a
+client) keeps its place — who, when, which mail — and shows no text, no
+attachment and no original. A mail thread's page is read like the list: one
+lean query for the page's message IRIs, then their records as
+`(message, predicate, object)` rows, rather than one more `OPTIONAL` per
+field in the messenger query.
+
+**The original.** `GET <original>` answers
+`{id, headers: {from, to, cc, date, subject}, header_block, text, html_url, attachments}`:
+the headline headers from the record, the whole header block and the whole
+plain text read from the gateway that keeps the parts, and `html_url`
+(`<original>.html`) when the mail has an HTML part. Both answer only for a
+mail of the chat the path names — 404 for any other, and for a tombstone —
+and sit behind the dashboard's sign-in like the media proxy. The message
+segment of the path is a token the gateway mints; the client follows the
+address it was given and never builds one. The HTML is served as a sandboxed
+document of its own: see "The frame on the chat page" under "The
+Content-Security-Policy". Each text part is read up to
+`MAIL_ORIGINAL_MAX_BYTES` (4 MiB).
+
+**The model trim.** A mail whose `trim` is `wanting` — the deterministic
+trim left it HTML-only, still long, with a quote marker or a rule held back
+for want of evidence (docs/mail-chats.md, "Trimmed bubbles") — gets one turn
+on the router tier that picks the lines which are the author's own message.
+The chat page asks for it once the bubble has been in view:
+`POST /chats/<id>/messages/<token>/trim`, `<token>` being the segment of the
+message's `original`, resolved as the Original resolves it. Same-origin, like
+the user's other acts on a chat (it spends a turn of the day's budget), and,
+like a chat's flags and send, only through the reverse proxy: `403` from
+inside the container where `EDGE_PROXY_PEERS` names the proxy — without it
+only from loopback and from the address the caller dialled. It answers
+
+- `200 {state: "model" | "deterministic", text}` — settled: from the record,
+  or just now;
+- `202 {state: "queued" | "running"}` — a turn is queued or under way; asking
+  again answers the same and never queues twice;
+- `200 {state: "wanting", retry_after}` — nothing was started: the feature is
+  off (`MAIL_MODEL_TRIM=0`), the day's budget is spent (until the local
+  midnight of the attention schedule's zone), the queue is full, or the mail
+  or the whole feature is backing off; the page does not ask again for that
+  mail before `retry_after` seconds;
+- `410` for a mail that is gone — from the mailbox (a tombstone), or with its
+  chat (erased with a deleted chat); `404 {error: "no such mail in this
+  chat"}` for a token that names no mail of this chat (and a plain `404` for
+  a chat that is no mail thread); `502` when the store cannot say what the
+  mail is. The token is resolved — chat, account, erasure, tombstone —
+  before anything is answered, also from what this process settled lately.
+  Each of these is about one mail: the page ends that mail and keeps
+  watching the others; only `405`, `501` or a `404` that is not this
+  endpoint's (the route fallback's `{error: "not found"}`, or no JSON) tells
+  it the server has no such endpoint.
+
+Nothing else starts a turn: not ingest, not the backfill, not a GET of the
+messages, not an agent reading the thread (the companion and the arrival turn
+read what is on the record), and not an agent that calls the endpoint from
+inside the container where `EDGE_PROXY_PEERS` names the reverse proxy — the
+day's budget bounds whatever still gets through. `GET /chats/<id>/messages`
+keeps carrying each mail's `trim`; for the seconds until the store has
+indexed a record the trim rewrote, the poll and the chat list's preview show
+the settled text this process holds, so a bubble that took it does not fall
+back — and the mail's
+arrival entry in the live overlay, which still carries the text from before,
+is forgotten when a model trim settles. What is held names the text the trim
+was asked about: a record the store shows with neither that text nor the
+settled one was written again by its gateway since (in its own place: another
+copy read, a placeholder read at last), and is shown — and asked about — as
+the reading it is. A mail the arrival turn is offered only after it was
+viewed (the rail was down, a turn failed) carries `trim: "model"` on the
+rail, and the turn's quote of it is marked as the companion's note marks it.
+
+*The worker.* One thread runs one turn at a time from a queue of
+`MAIL_MODEL_TRIM_QUEUE` (30) mails, oldest first. A turn is counted against
+`MAIL_MODEL_TRIM_DAILY_MAX` (200) before it is spawned, in the model trim's
+state file beside the conversations (`mail-trim-state.json`, which replaces
+`mail-trim-budget.json` and reads its count until it is first written), so a
+restart does not hand out the day a second time; a spawn that never reached
+the model (below) is given back — the budget counts turns that ran. What is
+queued is spoken for: a page asking while the rest of the day is spoken for
+is told to ask again in two minutes, and only one asking once it is spent is
+told to wait for the local midnight. For each mail the worker asks the chat's
+own mail gateway — the account the chat id names, as a send does — for the
+mail's source (`POST /messages/trim-source`: the deterministic trim's own
+lines, uncapped, with their digest), runs the turn, and hands the judgement
+back (`POST /messages/trim-result` with the digest). The gateway validates
+the ranges, assembles the bubble from its own copy of the lines and writes the
+record (`kb:trim "model"`, or `"deterministic"` with the text unchanged); it
+tells the rail nothing — open pages see the change through their poll, and
+this process has the new text in the answer. The record's original parts are
+never touched; `kb:text` is replaced by design. A `409` whose `state` is still
+`wanting` (the source is not what the turn was shown any more) settles
+nothing here and counts against nothing but that mail, which waits
+`MAIL_MODEL_TRIM_RETRY_SECONDS` before it is asked again; so does a mail the
+gateway no longer has (`404`/`410`). A `409` whose `state` is `model` or
+`deterministic` is the mail settled meanwhile, and is taken as a `200` is
+(below). A placeholder — a mail the gateway could not read yet — answers
+`state: "unread"` (from `trim-source`, or in a `409` when the record became
+one meanwhile): nothing to choose from and nothing settled, so it is taken
+as a stale source is, and the record written in its place once the mail
+reads is asked about as the mail's first reading. A gateway that could not say what the
+mail is (away, or a part it could not read just now) costs nothing and that
+mail waits five minutes.
+
+*A paid judgement is never thrown away.* When the gateway cannot take a
+judgement just now — busy (`503`: a pass holds its lock), another 5xx, the hop
+timed out or the gateway away — this process holds it (the digest and the
+ranges, in memory) and offers it again, first after five seconds and then
+twice as long each time up to two minutes, with no new turn and no new
+charge, until it is taken, refused (`409`, `404`, `410`) or about fifteen
+minutes have passed; meanwhile the mail answers `202 queued`. Offering
+it again is safe: the gateway rebuilds the source and compares the digest, so
+a judgement about lines that are no longer the mail's is refused, never
+applied. A `409` whose `state` says the mail is settled — by this judgement,
+when an earlier offer was written and its answer lost on the way — is taken
+as a `200` is: the chat list is rebuilt without the arrival's overlay entry
+and the mail counts no attempts any more.
+
+*Only a judgement settles a mail — at most `MAIL_MODEL_TRIM_ATTEMPTS` turns
+without one.* A judgement is an answer: the ranges (`keep`, which the gateway
+may still refuse — then the mail is `deterministic`), an answer that is no
+strict JSON, the empty answer included (`failed: "unparseable"`), and a mail
+too long to hand over within `PROMPT_MAX_BYTES` (`failed: "too_long"`, without
+a turn; the gateway settles one beyond its own bounds itself). **No
+judgement** — the turn timed out (`MAIL_MODEL_TRIM_TIMEOUT`, 60 s), exited
+non-zero, printed no envelope, or reported an error in it (`is_error`, a
+subtype other than `success`) — sends nothing and leaves the record `wanting`.
+The mail can steer its turn there (an answer spun out past the timeout), so
+it costs the mail an attempt: it waits `MAIL_MODEL_TRIM_RETRY_SECONDS` (3600)
+after the first and four times as long after the second (a day after any
+further one, where `MAIL_MODEL_TRIM_ATTEMPTS` allows more), and the
+`MAIL_MODEL_TRIM_ATTEMPTS`-th (3: with the default, the third turn, after an
+hour's and a four hours' wait) makes this process send
+`failed: "gave_up"` and the mail is settled as the rules trimmed it — without
+another turn, and also by a process that only finds the count in the state
+file after a restart. The count is per mail and durable (the state file, at
+most 2000 mails, the oldest dropped; a file that is lost or will not read is
+taken as empty, but never hands out what this process counted itself). What
+plainly never reached the model — the binary could not be started, or an
+error envelope that used nothing (no token, no cost: an expired sign-in, a
+usage limit), which no mail can bring about — costs the mail no attempt and
+the day no turn; that mail waits `MAIL_MODEL_TRIM_RETRY_SECONDS` in memory.
+Every failure of the model, of either kind, counts towards resting it: three
+in a row rest the whole feature for ten minutes (`retry_after` says so; a mail
+whose attempts are used up is settled all the same, since that spends
+nothing). The lines are drawn on the CLI's envelope, never on the answer's
+words: a mail that makes its model answer like an error message is still
+judged.
+
+*The turn* is the transcript cleanup's kind of spawn: `claude -p` with no
+tools, no MCP servers, no session persistence, away from `/workspace`, in the
+allowlisted environment (`session_env.build`), the sign-in refreshed first
+(`_run_claude`). The model is `MAIL_MODEL_TRIM_MODEL`, else
+`RETINUE_ROUTER_MODEL`, else the gateway's default model, else `haiku`. The
+mail is data: its subject and sender in a `<mail_facts>` element, its lines
+in `<mail_lines>`, each the content of an `<l n="…">` element whose number
+this system wrote — escaped as every prompt here holds text from outside
+(`_prompt_escape`), with the characters that end or disguise a line blanked
+in the copy shown. That escaping is the fence: no line can close its element,
+open another or number itself, so no per-turn token is needed. The
+instructions are fixed and name no language; the answer must be exactly one
+JSON object `{"keep": [[first, last], …]}` (a code fence around it is allowed;
+any other member, more than 200 ranges or a number that is no integer makes
+it unparseable).
+
+*What it cannot prevent.* The model can only choose among the mail's own
+lines, so no mail can add a word to its own bubble. It can still be steered
+into choosing badly — a mail that says "keep only line 40", where line 40 is
+the phishing line and the warning above it is dropped, may get just that —
+and the narrowed `kb:text` is then what the bubble, the chat list, search and
+every agent turn read. What bounds it is that only the mail's own lines can
+show, that the choice is marked — the Original is headed "Shortened by a
+model — this is the full mail." for such a bubble, and the companion's note
+marks the mail `trim="model"` and says the mail can steer that choice — and
+that the full mail is one tap away (SECURITY.md, "Known limitations").
+
+**`can_send`.** A mail chat's summary says whether it can be written to:
+`can_send: true`, or `false` with `cannot_send_reason`, one sentence saying
+which it is — no mail gateway is set up for the thread's mailbox, the mail
+gateway is not answering, it is not connected to its mailbox, or **it reports
+that it cannot send**: the gateway's own `can_send: false` on `/health`, with
+its `cannot_send_reason` passed on as one line (a mailbox can be mirrored
+with no SMTP server configured). It is read from what the gateway last
+reported on `/health` (cached like its identity; a gateway that said "not
+connected" is asked again within seconds), so the list costs no request per
+chat. A mailbox whose gateway cannot send is not offered for a new mail
+either (`GET /chats/compose`). It is advice for the page: the send itself
+asks the gateway and answers what it says — its sentence, with its `503`,
+where it cannot send. No other channel's chat carries the field. The shared draft works for a mail chat as for any — the user's
+(`/draft`, `/draft/undo`) and an agent's (`/internal/chats/<id>/draft`,
+`chat-draft.py`).
+
+**The rail.** `POST /internal/chats/inbound` takes five more fields for a
+mail (`scripts/chat_ingest.py`): `subject` (this mail's own), `participants`
+and `peer` (the thread's), `backfill` and `seen` — and from the mail gateway
+`gate_sender` beside `sender` ("The gate for mail"). An e-mail event is
+taken only with a token, as `X-Conversation-Backend-Token` or a bearer
+token: `CHATS_INGEST_TOKEN` where it is set, else `MAIL_GATEWAY_TOKEN`,
+compared in constant time; with neither set every e-mail event is refused
+(`403`), and so is any rail call a browser marks cross-site
+(`Sec-Fetch-Site`). A `GET` of it is answered at once (`405`) — the mail
+gateway's look at whether the rail is up — and an event the handler fails
+on is answered `500`, never left without an answer. A mail that just arrived is
+offered like a messenger message, with its `gate` verdict, `handover` and —
+for a VIP's or an instructed sender's — its `files` ("The gate for mail"
+below). A **backfilled** mail —
+history the mirror is catching up on — is filed and nothing more: no push, no
+turn, no attention arrival, no overlay entry, and an archived chat stays
+archived. `seen` on it says the mailbox had it marked read, and moves the
+chat's read mark up to that mail (forward only) — the one place the
+mailbox's `\Seen` is ever honoured; a backfilled mail that was not read
+counts as an arrival like any other — once, by its message id, like a live
+one: the mirror delivers every event at least once. Two further calls,
+authorized as an e-mail event is (the token above, never open), keep the
+chats in step with the mailbox. They are a mailbox's operations and are
+**refused for any other channel** (`400`): no messenger chat merges or loses
+messages, and the rail — open to a messenger event unless
+`CHATS_INGEST_TOKEN` is set — must not be a way to fold one correspondent's
+chat into another's or to archive one. The gateway retries each on its own,
+so either may name a chat that has been folded away since it was queued; it
+is then about the chat that one is part of now.
+
+- `POST /internal/chats/merge` `{channel, account, from: [key…], into}` —
+  threads a later mail linked are one chat. The absorbed chat's state is
+  folded into the survivor's (`ChatStateStore.merge`): the later read mark,
+  with what had landed unread in either still unread; starred or muted if
+  either was, archived only if both were (or muted); its draft and its
+  companion only where the survivor has none — a second companion becomes an
+  ordinary conversation that still points at the surviving chat — and its
+  attention block where that is the open one. Overlay entries move with it.
+  Idempotent; answers `{ok, id, merged}`. The absorbed chat's **id** is
+  remembered (`ChatStateStore.note_merged`, until either chat is deleted):
+  the store goes on answering with rows under the old key until it has
+  reindexed, and the list leaves those out rather than show a stateless
+  ghost; and every `/chats/<absorbed id>/…` endpoint — `messages` first of
+  all — answers **`410`** with
+  `{"error", "id", "merged_into": "<surviving id>", "messages": "<its messages address>"}`
+  and writes nothing. Not a redirect: the page has to learn that its chat
+  has another id, or its next write goes to the dead one. An id that has a
+  state document again (a new mail arrived under it) is a chat again.
+- `POST /internal/chats/removed` `{channel, account, chat, message_ids, live}`
+  — mails are gone from the mailbox. The overlay lets go of them, they stop
+  counting as unread (above; a mail that comes back is announced again and
+  counts again), and the list is rebuilt; `live: 0` — no mail of the thread
+  left — **archives** the chat, without muting it, and settles its open
+  attention item as archiving does. Its tombstones, state and companion
+  stay; the next mail brings it back. Answers `{ok, id, archived}`.
+
+**The companion.** A mail thread's note names the thread by its id where it
+gives instructions and carries the subject and the participants as data, in
+a block beside the mails — a subject is the first thing a stranger writes.
+Both are elements of their own, everything in them escaped so nothing a mail
+says can close them: `<mail_thread_facts>` holds the subject and the
+participants, and `<mail_thread>` the mails, one `<mail>` element each, its
+content the mail's text and its attributes `at`, `from` (who a mail sent to
+the user says it is from), `by` (who of the user's side sent one — this
+system's label, which no mail can write), `attachments`, `removed`, `cut`
+and `trim="model"` (also this system's word: a model chose the text from the
+mail's own lines, a choice the mail can steer — "The model trim").
+It says the texts are the trimmed ones — and, of a mail marked
+`trim="model"`, that lines of it may be missing and the full mail is in its
+parts — and lists attachments by type under
+the rule in "Attachments". Then the draft, as in every chat's note: what the
+shared draft holds, that the `secretary` writes the words, and the
+`chat-draft.py` command that stages them. Where a messenger chat's note ends
+in "you do not send, under any circumstances", a mail thread's says how a
+mail leaves it: by the user's press on the draft, or — only when the user
+asks for it there — through `scripts/mail-push.py --chat <id> --reply
+all|sender --file <path>`, under the mailbox's send policy, the approval link
+of a queued send relayed, and no other tool (not `email_client.py send` or
+`reply`, not a messenger's push script). Two things a session cannot know
+are said outright:
+
+- **Which gateway.** `mail-push.py` posts to the default mailbox's gateway
+  (`MAIL_GATEWAY_SEND_URL`), which refuses a thread of another mailbox (`404`,
+  "not this gateway's account"). For such a thread the command — the send and
+  the `--retract` — carries `--url <that gateway>/send`, taken from the
+  gateway registry, never from a mail.
+- **Which policy**, with the rule that goes with it (CLAUDE.md, "When to
+  send"): `verify` — send when asked, it queues, relay the link; `trust` —
+  `--user-approved` only on the permission phrase or a tapped send chip for
+  that very text, otherwise it queues; `allow` — the mail goes out at once,
+  so send only once the user has seen the exact text and given the phrase or
+  tapped a send chip. `EMAIL_SEND_POLICY` is not in a session's environment;
+  the note resolves it for the thread's mailbox as the gateway does
+  (`email_client.resolve_category`), or takes the gateway's own word where
+  its `/health` states `send_policy`. A policy nobody can read is treated as
+  `allow`: the strictest rule for the agent.
+
+It says that the quick patterns' words — the last message, the draft, the
+composer — mean the thread's mails and its shared draft, and how many sends
+of the thread wait for approval, are on the way out, or failed, so a turn
+does not send one twice. A send whose outcome is not known — handed to the
+mail server, never confirmed — is counted apart from those that failed and
+said as that: "it failed" is what gets a mail sent a second time.
+
+`tests/test_chat_mail.py` covers all of the above against real ledger
+records.
+
+### The gate for mail
+
+The mail gateway persists a new mail undelivered, gates it, and offers it to
+the rail with `handover: true` and
+`gate: {forward, vip, instructed, reason}` — `forward` false for a `quieted`
+or `ignored` group, `vip` and `instructed` for the sender, by address or by
+an e-mail domain ([mail-chats.md](mail-chats.md), "The gate";
+[messenger-chats.md](messenger-chats.md), "Inbound flow", is the flow this
+adopts). What the web gateway does with the event, by who sent the mail:
+
+| The sender is | Rings | A model turn | The rail answers |
+|---|---|---|---|
+| nobody in particular | no: passive — listed, in no digest | none | `200 {accepted}` |
+| a contact with a prior or a permit | as the attention model decides from them | none | `200 {accepted}` |
+| a **VIP** | at once, in every mode | one, in the thread's companion | `202 {accepted, job_url}` |
+| **instructed**, not a VIP | when the turn ends, as its verdict decides | one, briefed by the instruction | `202 {accepted, job_url}` |
+| VIP and instructed | at once | one, briefed by the instruction | `202 {accepted, job_url}` |
+| any of them, in a held group or a muted chat | no | as above — a held group stops no turn | as above |
+
+- **The item is the person's.** The arrival is judged as the sender of that
+  very mail — the one the gate took it for (`gate_sender`) — the holder of
+  the address, else the person whose domain covers it, else the address
+  (above, "A name that is a subject"). The push reads as a mail client's —
+  who, then the subject and the text — and names the holder by the address
+  book's name; for a sender known by a domain it is the name the mail
+  carried with the organisation's beside it. A mail with no gate sender is
+  **nobody's**, everywhere its item is shown or judged. One helper decides
+  whom a mail chat's item is about from its newest mail's gate sender
+  (`_mail_item_peer`), for the arrival the model judges and for the mail
+  that only reopens a settled thread (`_attention_relist_chat`: one the
+  gate holds, history the mirror catches up on) alike, and its block says
+  so (`nobody`), so the item rebuilt for the home list, the sweep or a
+  correction is "Unknown sender" with no card, prior or permit — never the
+  thread's peer on record, who is whoever last wrote with an address — until
+  a mail with a sender is the newest. A gate sender is lower-cased in its
+  ASCII letters only, and is nobody's where one of its characters maps to an
+  ASCII one, one for one, under NFKC or case folding (KELVIN SIGN, a
+  fullwidth letter); an internationalized address's own letters (ß, ı, ü)
+  stay.
+- **One channel value.** Whether a rail event is a mail is read off the
+  chat id it composes, and the event's `channel` must be that id's channel:
+  a field such as `email:~<account>`, which would compose a real mail
+  thread's id, is refused (`403` without the rail's token, `400` with it),
+  so the token check, the chat id and everything after see one channel.
+- **The turn** is the messengers' (`_start_chat_arrival_turn`, the verdict
+  endpoint, the failure rule), worded for a mail (`_mail_arrival_prompt`),
+  with a timeout of its own (`MAIL_INSTRUCTION_TIMEOUT`, below). Everything a mail says of itself — its sender's
+  name and address, its subject, its `Message-ID`, its trimmed text, the
+  first `MAIL_ARRIVAL_QUOTE_CHARS` (8000) characters of it — stands in one
+  quoted block, escaped — at most `MAIL_ARRIVAL_BATCH_BYTES` (48 KiB) for
+  all the mails of one turn, header lines included: a batch that would not
+  fit is worked in turns. The turn takes the newest mails that fit and is
+  told how many older ones wait; those stay on the chat's queue, untouched
+  by anything that turn's outcome settles (its archive, its verdict, the
+  rings, "told", the turns being over), and get a turn of their own next —
+  a turn is for the mails it was shown, and only for those. Which mails those
+  are is decided once, by the worker (`_mail_arrival_quotes` over the whole
+  batch), and the prompt quotes exactly the quotes it decided: every mail a
+  turn takes is quoted in its prompt, and every mail the prompt says gets a
+  turn of its own gets one. None of it stands in a
+  sentence that tells the turn
+  what to do: those name the person by the address book's name alone, and
+  the sender's address stands in the one command that needs it (the memory
+  recall by `sender:<address>` and `sender:<domain>`) only when it is
+  plainly an address — ASCII letters, digits and `._%+-` around one `@`. The
+  files the rail handed over are listed by the path they were stored under,
+  their bare type and their size ("Attachments"), and the turn is told how
+  many the mail carries that it was not handed. A prompt that would still
+  be longer than one argument carries (`PROMPT_MAX_BYTES`) sheds data, the
+  oldest first and each cut said: a replayed transcript, then the thread's
+  oldest mails in the note, one whole `<mail>` at a time — never the
+  instruction, the commands or the arrival the turn is for.
+- **What a VIP's turn does:** files what the mail changes — a project link
+  (a mail is named `mid:<Message-ID>`), a memory, a document for the
+  `archivist` — and stages a reply where one is wanted. It sends nothing and
+  leaves the thread where it is.
+- **What an instructed turn may do**, each only where the instruction asks:
+  the same filing; a reply written by the `secretary` and staged in the
+  shared draft; a reply *sent* — by `scripts/mail-push.py --chat <id>
+  --reply all|sender --file <path>` and nothing else (there is no reply
+  token for a mail; `--url` names the thread's own gateway where that is not
+  the default one), under the mailbox's send policy: `verify` queues and the
+  turn flags the waiting mail; `trust` and `allow` send unseen only where
+  the instruction itself carries the permission phrase, and otherwise queue
+  (`trust`) or fall back to the draft (`allow`, and a policy nobody can
+  read); a calendar event or anything else a send policy gates, under its
+  gate; **archiving the thread** with `scripts/chat-flags.py`; and, last,
+  the verdict (`scripts/chat-verdict.py`). Nothing deletes or pays.
+- **`POST /internal/chats/<id>/flags`** — body `{archived?, muted?,
+  starred?}`, token-gated like the internal draft
+  (`X-Conversation-Backend-Token`) — is the user's `POST /chats/<id>/flags`
+  by another door: one function sets the flags for both
+  (`_set_chat_flags`), so muting archives, archiving settles the attention
+  item, and the mailbox follows through the same hook and the same durable
+  queue of owed calls. `scripts/chat-flags.py --chat <id> --archive |
+  --unarchive | --mute | --unmute` is its CLI (`--star` / `--unstar` only on
+  the user's word, as for a thread). There is no delete: erasing a chat is
+  the user's own act. A merged thread's id answers `410` here as everywhere
+  — unless a running turn answers to it (below).
+- **Who is asking** is the web gateway's to decide, not the turn's
+  cooperation. It hands each arrival turn's session a token of its own
+  (`RETINUE_ARRIVAL_TURN`, one of the turn's unguessable job ids), and each
+  session of a dashboard thread's turn the user started — by a message
+  sent from the dashboard itself (`via_edge`, the rule that decides who may
+  type), never an arrival's or a scheduled job's turn, and never one a
+  "user" message posted from inside the container started — a proof of that
+  (`RETINUE_USER_TURN`, minted per turn and valid while it runs and answers
+  the user's own message); both are
+  set per spawn by `scripts/session_env.py` and never inherited, so a
+  session another one spawns carries neither. `scripts/chat-flags.py` sends
+  them as `X-Arrival-Turn` and `X-User-Turn`. In this order:
+  1. a call with a turn's token is that turn's (`_turn_by_token`) while it
+     runs on the chat named — on it, or on the chat a merge folded it into;
+     a token that names no turn running there (a turn asking about another
+     chat, one whose turn is over) is refused, `403`, and changes nothing;
+  2. a call with a valid user-turn proof has the user's meaning, the mute
+     included, even while an arrival turn runs on the chat; a stale or
+     invented proof is no proof;
+  3. a call with neither, on a mail thread while a mail's turn runs on it,
+     is taken as that turn's (below), and the answer's `reason` begins `a
+     turn is running on this chat; the call was taken as the turn's` and
+     ends `ask again once it is over` — for a scheduled job or another
+     session, which `chat-flags.py` tells so;
+  4. any other call — no turn running on the chat, a messenger chat — has
+     the user's meaning, as before the gate. A messenger chat's turns are as
+     they were: a call with the turn's token is the turn's, one without it
+     the user's word.
+
+  The user's own `POST /chats/<id>/flags`, which needs no token, is no way
+  round this order: like a chat's delete and send it is accepted only
+  through the reverse proxy (`_request_from_edge`, `403` otherwise, with
+  `chat-flags.py` named as the agent's door) — where `EDGE_PROXY_PEERS`
+  names the reverse proxy, which refuses every peer it does not name, a
+  caller inside the container included. Without that setting
+  (`_classify_request_origin`) the gateway refuses only a loopback peer
+  and a peer that is the very address the caller dialled, and takes any
+  other for the dashboard: a caller inside the container that comes in
+  from another of the container's addresses (the documented deployment
+  puts it on two networks), or through a sibling that relays (the
+  egress-audit proxy), has the user's meaning — a mail's turn too. Where
+  the proxy itself arrives on loopback (host networking,
+  `EDGE_PROXY_PEERS` including it) the gateway cannot tell the dashboard
+  from a caller inside the container at all. A deployment sets
+  `EDGE_PROXY_PEERS` (`docker-compose.override.example.yml`).
+
+  This holds for the turn's own chat while the turn runs, and no further.
+  It is a guard against a turn that was talked into something, not a
+  sandbox: an arrival turn's session holds the backend token every agent
+  session holds, so without its token it can set another chat's flags with
+  the user's meaning, and a process it leaves behind can act on its own
+  chat once the turn has ended. And while a dashboard turn the user started
+  runs, its proof sits in that turn's process environment, which another
+  session of the same uid can read — sessions are not sandboxed from one
+  another. What keeps a turn to its brief there is the brief, as on the
+  messengers.
+- **A turn can only archive its own mails.** A mute keeps every later
+  message of the chat out of view and unrung, a VIP's included — the user's
+  to decide, never a turn's that one message started — and so are taking a
+  mute off, bringing an archived chat back, and the star. So `{muted: true}`
+  from a turn is taken as the archive it also is (the same archive as
+  `{archived: true}`, below); `{muted: false}`, `{archived: false}` and
+  `starred` change nothing. The answer says what was refused and then what
+  was done, worded from the outcome: `{"muted": false, "reason": "a turn
+  cannot mute; archived instead"}` where the archive was made, `"a turn
+  cannot mute; newer mail arrived"` (and `"archived": false`) where it was
+  not, `"a turn cannot unmute or unarchive"` for a turn asked to undo the
+  user's mute — and `chat-flags.py` prints what the answer says, no more.
+  The chat's next message brings an archived chat back, as after any
+  archive.
+- **A turn's archive reaches the mail it was given.** In a mail thread a
+  turn's archive is made only if no mail has arrived in the chat since the
+  turn's own (`ChatStateStore.archive_through`, one decision under the state
+  lock) and none waits on the chat's queue for a turn of its own (an older
+  one its batch could not quote, another person's under another brief), and
+  the mailbox hook carries exactly the `Message-ID`s the turn worked, named
+  at that decision — never a mail the mirror has stored but the rail has not
+  counted yet. Where one has arrived — a reply-all that landed while the
+  turn filed the invoice — or waits, the chat is **not** archived, that mail
+  stays unread on the list and in the inbox, only the mails the turn worked
+  leave the inbox, and the answer says so: `{"archived": false, "reason":
+  "newer mail arrived"}` (or `"an earlier mail of the thread waits for a
+  turn of its own"`). (That hook, if the gateway is away, is not owed for
+  later: an archive is owed only while the chat is archived.) What a turn
+  asked is remembered on its mails once it completes, made or refused
+  (`archive_asked` beside `turns_done` in the chat's state, durable): newer
+  mail every piece of which a completed turn worked and asked to archive
+  too is no reason to stay (`chat_state.asked_through`). So the chain of
+  turns a batch too big to quote whole leaves — the newest mails' turn
+  first, refused while the older ones wait, then theirs, refused before by
+  "newer mail arrived" — archives the thread with its last turn, and the
+  instruction's "then archive the mail" is carried out. A mail that arrived
+  since and has had no turn, or whose turn did not ask, still keeps the
+  thread on the list; a later turn of a mail that did not ask takes the
+  ask off it, and so does the user bringing the thread back while the turn
+  runs. An instructed turn's ask is remembered only where the turn is
+  trusted with its put-away — it set a verdict, and the timeout had not
+  rung for it (`_instructed_settle` decides both) — so a turn that ended
+  without a verdict, or whose mails the timeout rang, leaves no ask behind.
+  And the user bringing the thread back (`archived: false` on their own
+  endpoint, or Ara's call with the user's meaning) forgets every ask made
+  until then, in the same write (`set_flags` `forget_asked`): only a turn
+  asking after the user's last unarchive can archive the thread over a
+  newer mail. That holds for a turn wrapping up as the unarchive lands,
+  its ask not yet written, too: the write moves the chat's `asked_epoch`
+  on, a turn notes it when it asks, and its ask is written only while that
+  note still stands — decided in the write that records the ask
+  (`note_turn_done` `epoch`). (A merge that lands in that same moment
+  finds no record to carry the note along: the ask is then dropped where
+  the merged chat's epoch differs from the one the turn noted — where the
+  other half was ever brought back by the user — and kept where neither
+  was.) The undo of a
+  turn that did not finish forgets nothing.
+- **A thread its turn archived rings nothing.** What the turn archived is
+  noted as its own. If the turn then ends with a verdict, the ring that
+  waited on it is not delivered — whatever importance the verdict gives —
+  and the chat's status says `quiet`, "the turn archived the chat", with the
+  verdict and its actions. If the turn does not finish (it fails, or sets no
+  verdict), or the timeout rings it first, its archive is undone before the
+  failure rule rings the mail: a turn that did not finish is not trusted
+  with having put a mail away. What the user set meanwhile is theirs: their
+  archive or mute during a turn takes the flag off the turn's record,
+  stays, and changes nothing about the ring beyond what it does on every
+  channel (a muted chat is quiet). (A messenger chat's timeout only rings,
+  as it always did: [messenger-chats.md](messenger-chats.md).)
+- **The same failure rule, a longer timeout.** A turn that errors, ends
+  without a verdict or runs past `MAIL_INSTRUCTION_TIMEOUT` (600 s; the
+  messengers' `CHAT_INSTRUCTION_TIMEOUT` stays 60 s) has the mail rung as a
+  VIP's. A mail is not a chat message: ten minutes is a ring in time, and a
+  turn that files the document a mail carried needs them.
+- **A merge while a turn runs.** The mail gateway may fold the thread into
+  another while its mail's turn works. Every registry the turns keep by
+  chat id — the queue, the running turns, the rings that wait, the handles
+  minted per message — moves to the surviving chat (`_rekey_turns`); the
+  turn, which calls back with the id its prompt named, has its verdict and
+  archive taken for the survivor, and nothing is written under the dead
+  id.
+- **A mail offered again.** The mail gateway has no triage to fall back on:
+  a mail the rail did not accept — the turn could not be started, or failed;
+  the answer was lost — stays undelivered and is offered again on a later
+  poll. Each mail is counted once, by its `Message-ID`, and whether the user
+  has been **told** of it is kept per arrival on the chat's state
+  (`untold`): owed in the write that counts it, told once its attention step
+  and push have run to the end — or, for an instructed sender's, once the
+  ring that waited on its turn went out. A repeated offer of a mail that was
+  told un-archives nothing, reopens no settled item and rings nothing; one
+  of a mail that never was — the first request died between the count and
+  the push, or the ring died with the process, whatever later mail of the
+  thread was attended meanwhile — is that first offer, and does what it
+  owed (a death right after the push tells twice rather than never). It is
+  answered with the handle of the turn that is running or done; the handle
+  of a turn that **failed** is handed back for `CHAT_ARRIVAL_RETRY_SECONDS`
+  (900) and then gives way to a turn anew, so the work is done once an
+  outage is over without a failing turn being run once a poll. Such a turn
+  is told the user already knows of the mail (the failure rule rang it), and
+  its verdict records; a ring waits on it only where the mail is still
+  owed and no read covers it — the case after a restart mid-turn. An owed
+  ring whose turn is over (its outcome could not be written) rings at the
+  next offer by the failure rule, and where that turn completed its handle
+  then answers done: the mail is accepted, and no second turn runs for it.
+  A mail gets at most `MAIL_ARRIVAL_TURN_ATTEMPTS` (3) turns: after the last
+  one fails it is accepted as it stands — it rang once, by the failure rule
+  or on arrival — and the companion holds **one** note saying the turns gave
+  up; a failed mail turn posts no apology of its own. Both are kept on the
+  chat's state, not only in this process: the count of turns
+  (`turn_attempts`) and the mails whose turns are over (`turns_done` — one
+  completed, or they gave up), so an offer after a restart — even one in the
+  middle of the last attempt — buys the mail no further turn and the
+  companion no second note.
+- **With `CHAT_ARRIVAL_TURNS` off** a mail is accepted all the same, since
+  its gateway has nowhere else to take it, and no turn runs: a VIP's mail
+  still rings, an instructed sender's is delivered like anyone's. (A
+  messenger gateway is told nothing and forwards to triage, as before.)
+
+`tests/test_chat_mail_gate.py` covers this section.
+
+### Writing mail
+
+[mail-chats.md](mail-chats.md), "Writing", is the contract; this is the web
+gateway's side of it. `tests/test_chat_mail_send.py` covers it against a mock
+mail gateway that answers as `scripts/mail-gateway.py` does (real-length
+`Message-ID`s, `"sent": false` on a 5xx that nothing was sent, a dismissed
+keyed entry of unknown outcome kept and answered by id while one that failed
+for certain is removed, `repeat`, a failed key tried afresh), and
+`tests/test_chat_mail_e2e.py` across the seam with no mock of either side:
+the real mail gateway's HTTP handler, over a fake mailbox and SMTP server,
+behind the real web gateway.
+
+**A reply** is `POST /chats/<id>/send`, as on every chat, with two more
+fields: `reply`, `"all"` or `"sender"` (optional; the gateway's default is
+all), and `request_key`, the idempotency key of the press (below). The
+gateway is handed `{recipient: <chat key>, reply, message, author: "user",
+user_approved: true, request_key}` and builds the mail from its own records
+of the thread — this side names no recipient and no subject.
+
+**The recipients a user sees are the recipients the gateway will use.**
+`GET /chats/<id>/reply-preview` answers to whom a reply would go right now:
+
+```json
+{"all":    {"to": [Recipient], "cc": [Recipient]},
+ "sender": {"to": [Recipient], "cc": []},
+ "choice": true, "subject": "Re: …"}
+Recipient = {"address": "bob@y.org", "name": "Bob" | null,
+             "contact": "Bob Meier" | null, "contact_id": "<id>" | null}
+```
+
+It is the mail gateway's own answer (`POST <gateway>/reply-preview {chat,
+account}` — the function its `/send` addresses a reply with, asked without
+sending), passed on; nothing here and nothing in the page computes an
+address. `all` and `sender` are the two reply modes and `choice` says whether
+they differ. Every recipient has its `address`, spelled as the gateway will
+use it; `name` is the display name the thread's mails gave it — text from
+outside, one bounded line, to be shown beside the address and never in its
+place; `contact` is the name of the person in the address book who holds the
+address (`contact_id` their id), null where it is nobody's. An answer that
+does not say in full where both modes go is `502`: part of a preview would
+show other recipients than the mail gets. `409 {"error"}` where no reply is
+possible — the gateway's own sentence for a thread with no mail to answer (a
+chat that holds only a queued mail), or the reason no gateway can be asked;
+`404` for a chat that is no mail thread. Behind the dashboard's sign-in like
+every chat read. A mail's Message carries `reply_to`, the addresses of its
+`Reply-To` header (`[]` without one): why a reply may go to somebody the mail
+is not from.
+
+**The send press is not the approval here.** On the messengers a send the
+policy queues is released by the web gateway in the same request: the press
+*is* the approval `verify` exists for. On e-mail it is not
+(mail-chats.md, Decisions). The press is passed on as `user_approved`, which
+is what `trust` asks for; under `verify` the mail is queued even though the
+user typed it, and the web gateway leaves it queued — it never calls
+`approve` for a mail. So the endpoint has three answers that are no error:
+
+- **sent** → `200` and the Message, as on every chat: the overlay has it,
+  the draft is cleared, the chat is read, its attention item settled. Where
+  the mail server took the mail for some recipients and refused others, the
+  Message carries `refused`, the addresses it did not reach;
+- **queued** → `202 {"pending": Pending}`. The draft is cleared — the words
+  are in the queue — and nothing else moves: no reply has been made, so the
+  chat is not read and its attention item stands;
+- **not known** → `202 {"unconfirmed": true, "request_key", "since",
+  "message_id"?, "id", "note"?}` (below).
+
+```json
+Pending = {"request_id": "…", "approval_url": "/sends/mail-gateway/<id>",
+           "text": "…", "ts": "…", "author": "user" | "agent",
+           "to": ["a@x.org"], "cc": [], "subject": "Re: …",
+           "message_id": "<the Message-ID the mail will go out under>",
+           "request_key": "<the key of the press, where it had one>",
+           "status": "pending" | "sending" | "failed",
+           "error": "<why it failed>" | null, "outcome_unknown": false,
+           "refused": []}
+```
+
+**A mail that may have gone out is never reported as not sent.** "Not sent"
+puts the words back in front of the user with a button that sends them
+again. So the hop to the mail gateway's `/send` (`_mail_send`) waits
+`MAIL_SEND_TIMEOUT` (120 s — under `allow`, or `trust` with the press, the
+gateway answers only once the SMTP server has taken the mail) and tells its
+endings apart by what they prove:
+
+| The hop ended with | Answer to the browser |
+|---|---|
+| the gateway's `200 sent` / `202 pending_approval` | `200` Message / `202 {pending}` |
+| no connection — the request was never written | `502 {error, sent: false, by: "dashboard", request_key}`: nothing was asked |
+| the gateway's word on the request itself: `400`, `409`, `413` | that status, `{error, sent: false, by: "gateway", request_key}` with **its sentence** |
+| the gateway's `503` that says `"sent": false` (it cannot send, could not queue) | `503 {error, sent: false, by: "gateway", request_key}` with its sentence |
+| the gateway took the request and the mail did not go: its `502` (or any other `5xx`) that says `"sent": false` ("send failed: …" — the SMTP server refused the mail, the login failed) | **`424`** `{error, sent: false, by: "gateway", request_key}` with its sentence |
+| any other `4xx` — a status the gateway answers before it reads a send (`401`, a route it does not have), or one from whatever stands in front of it | `502 {error, sent: false, by: "dashboard", request_key}`: the request was not made |
+| a timeout, or a connection lost, after the request was written | `202 {unconfirmed}` |
+| the gateway's `502 {unconfirmed: true}` / `{outcome_unknown: true}` (the SMTP server's answer was never seen), or its `202 sending` for a queued mail that is being sent | `202 {unconfirmed}` with its `message_id` and its sentence as `note` |
+| a `5xx` **without** `"sent": false` — an older gateway's "send failed", a proxy's page, a body that is no JSON or was cut short — and any answer nobody planned for (a `500`, a `504`, a body that is no object) | `202 {unconfirmed}` |
+
+A gateway's error answer is read **whole** before any of this is decided
+(`_gateway_hop`): its `502 {unconfirmed, outcome_unknown, request_id,
+message_id, chat}` carries two `Message-ID`s — a correspondent chooses the
+length of one of them — and is longer than any cut made for display. Only a
+body that is no JSON at all is cut, and passed on as the error. A body that
+ended before its `Content-Length` (the gateway stopped while it wrote its
+answer) is no answer: the hop raises, and the send is `unconfirmed` — what
+was cut off may have been the very field that said the mail may be out. A
+`5xx` is "not sent" only on the gateway's explicit `"sent": false`, because
+its `502` is also the answer of a mail handed over and not confirmed: the
+two are never told apart by their wording.
+
+**A kept key is dropped only on the mail gateway's own word about that
+key** (decision H, [mail-chats.md](mail-chats.md)). Every answer that says
+the mail did not go carries `"sent": false` beside its sentence and the
+press's `request_key` — this request sent nothing — and says who said so,
+`by`:
+
+- `"gateway"` — the mail gateway's own answer about this request, given
+  once it had looked up the key: its certain failure (`424`), its
+  `400`/`409`/`413` refusals, its `503`s. That is its word on the key too:
+  the press is over, and a page drops the key.
+- `"dashboard"` — the web gateway answered by itself, the mail gateway not
+  having spoken: it was never reached, no gateway serves that mailbox, the
+  gateway has not said which mailbox it serves, what was sent does not
+  validate, a `403` (not same-origin, not through the proxy), a `410` (a
+  merged chat), a status the gateway answers before it reads a send. This
+  request was not made; what an earlier request under the same key did is
+  as open as it was, and a page that pressed again under a kept key keeps
+  it. (Keeping a key is harmless: the mail gateway treats a key it never
+  saw, or whose send failed for certain, as a new attempt.)
+
+Every refusal of `POST /chats/<id>/send` for a mail chat and of `POST
+/chats/compose` carries `by` — the validation `400`s and the `403`/`409`/
+`410`s too; a messenger send's answers are as they were. `424` is the
+answer for a mail the gateway took and could not send; `502 {sent: false}`
+is "the gateway was never reached" (or did not take the request), `503`
+"it cannot send". A `5xx` **without** `"sent": false` proves nothing — a
+proxy, a crash, or the web gateway's own `502` for a send the gateway
+queued but named no usable request id for (the mail waits in its queue) —
+and a page keeps the key for it. Anything whose outcome is open is `202
+{unconfirmed}`, never a `4xx` or `5xx`. After a `424`, the chat's copy of
+the queue is brought in line at once, so a send a poll had listed as
+`sending` while its SMTP session lasted does not stand there after the
+answer — for a new mail, in the chat the poll made of it, found by the
+press's key (`_settle_failed_new_mail`), which is then forgotten with the
+send.
+
+An error answer leaves the draft in the composer. An unconfirmed one clears
+it — the words are with the gateway — and marks nothing read: no reply is
+known to have been made, and the rail does that when the mail goes out. No
+message is made of it either (a mail not known to have gone out is no entry
+of the thread). Instead the gateway's queue is asked once for the send — by
+the key of the press, or the `Message-ID` the gateway named — and its entry
+goes into the chat's pending sends as `sending`, so the chat shows it after
+a reload too; `message_id` in the answer is what the page matches its own
+bubble to the mail by, `since` the instant from which it may match by the
+words where no id is known.
+
+`request_key` is the **idempotency key** of one press of Send: an opaque
+token of at most 64 printable characters that the page mints, sent in the
+body of `/send` and of `POST /chats/compose` and passed on to the gateway.
+The gateway answers a repeat of a key whose mail went out, waits, is being
+sent or may have gone out with what became of that send, and sends nothing;
+a key whose send failed for certain is a new attempt. So the same press can
+be retried safely. A request without one gets a key minted here; the answers
+of the hop that are not `sent` or `queued` — "not sent", and `unconfirmed` —
+name the key.
+
+**A repeat is not a reply.** An answer the gateway gave from an earlier
+entry of the key says so (`"repeat": true`), and the web gateway then only
+reconciles: it returns the Message (or the Pending, or `unconfirmed`) and
+brings the chat's copy of the queue in line. It advances no read mark,
+settles no attention item and tells the mailbox nothing: the rail did all of
+that when the mail went out, and what has arrived since has not been
+answered by anyone. **A repeat clears the draft it repeats** (decision I):
+the shared draft is cleared exactly when it still holds this press's words
+(compared trimmed, guarded by the draft's version —
+`ChatStateStore.clear_draft(only_text=…)`) and left as it is when it holds
+others. Where the answer to the first request was lost, the page put the
+words back into the box and autosaved them as the draft; left there, the
+next opening, another device or an agent would be handed a mail that went
+out, to send a second time. A draft of other words was written since. A gateway built
+before it said `repeat` is read by what its answer proves (`_mail_repeated`):
+the chat knew that `Message-ID` before this request began (as a mail, or as
+a send in its copy of the queue), or the instant the gateway gives for the
+mail lies more than `MAIL_REPEAT_SLACK_SECONDS` (2) before it. *Before* is
+the point: the rail may announce a direct send, and a page's poll may list
+it, while the request that made it still waits for its answer — that is a
+reply.
+
+`approval_url` is the path of this dashboard's own approval page, built here
+from the gateway's registry slug and the request id. What a gateway states
+as its approval URL (absolute, where `SEND_APPROVAL_BASE_URL` is set) is
+never passed on, and the chat state keeps a queued send only with a link of
+exactly that form (`chat_state.clean_pending`).
+
+**Pending sends in the chat.** `GET /chats/<id>/messages` carries top-level
+`pending`: every send of that chat that is not over, whoever made it — the
+composer, the companion, an agent with `mail-push.py` — oldest first; `[]`
+on every other channel. A chat's entry in `GET /chats` carries the count as
+`pending`. **Nothing the user queued or sent leaves the chat without a
+word**, so a send is there in one of three states (`status`):
+
+- `pending` — it waits for the user's decision, with its approval link;
+- `sending` — allowed on `/sends`, or sent directly and not confirmed yet:
+  on its way, the outcome not seen;
+- `failed` — it ended without going out for certain. `error` is the
+  gateway's reason (it may repeat what a mail server said: one bounded line,
+  shown as text) and `outcome_unknown` says the mail may have gone out all
+  the same. It keeps its text, so the page can offer it back to the
+  composer, and stays until the user dismisses it:
+  `POST /chats/<id>/pending/<request id>/dismiss` → `200 {id, dismissed,
+  pending}`. Same-origin only; only a send of that very chat (`404`
+  otherwise) and only one that failed (`409` for one that waits or is being
+  sent); the gateway forgets the entry (`POST
+  <gateway>/pending-sends/<id>/dismiss`), and an entry it no longer holds is
+  answered as dismissed.
+
+`refused` on an entry are the recipients the mail server would not take. For
+a mail that went out all the same they are kept with the chat
+(`chat_state.note_refused`, by `Message-ID`) and stand on its Message as
+`refused` on every later read: the mail's record lists whom it reached, the
+Message also whom it did not. They are learned from the direct send's
+answer, from the gateway's entry of a queued send once its mail shows, or
+from an outbound rail event that carries `refused`.
+
+The gateway's queue is the truth (`GET <gateway>/pending-sends?chat=<key>`,
+which lists the three states); the chat's state keeps a copy for the list
+and for when the gateway is away, and the copy follows the queue from three
+sides:
+
+- the chat page's poll asks the gateway about its chat and brings the copy in
+  line (a gateway that could not answer is left alone for
+  `CHAT_PENDING_RETRY_SECONDS`, 15, and the copy stands in);
+- the chat list has every mail gateway's whole queue read in the background,
+  at most every `CHAT_PENDING_SYNC_SECONDS` (20) — so a send queued past the
+  dashboard shows in the list without its chat being opened;
+- a decision on `/sends` is noted at once: denied or retracted, the entry
+  leaves; **allowed, it stays, as `sending`** — the approval is carried out
+  off the approving request, and a mail the SMTP server then refuses must
+  not have left its chat a moment earlier. The rail's word that the mail
+  went out (an outbound event under the queued send's `Message-ID`) takes
+  it out.
+
+An entry the copy holds and the queue no longer lists is asked after once,
+by id (`GET <gateway>/pending-sends/<id>`), before it goes: sent, denied,
+retracted, dismissed or gone (`404`), it leaves; still being sent, or
+failed, it stays as that — so a gateway whose list left it out loses
+nothing. A send whose mail is among the
+page's messages is never also listed as pending, whatever a queue that lags
+says.
+
+**A dismissed entry is over.** The mail gateway removes a send that failed
+for certain when it is dismissed — by the user, or by itself when a direct
+send failed for certain and its caller has that as the answer — and one a
+new attempt under its key replaced: asked by id it answers `404`, which
+reads here as *gone*. Only a send of unknown outcome that named its
+`request_key` is kept, for as long as the key is remembered (24 h), so that
+a repeat is still told the mail may have gone out: not listed, and still
+answered by id as `{status: "error", dismissed: true}`. Every reader here
+takes either as ended, whatever else the entry says (`_pending_ended`, and
+a list that still names a dismissed entry): it leaves the chat's copy, and
+a chat that was only that mail is forgotten with it. Read as a failure it
+would stand in the chat as a failed bubble the user had already put away,
+or for words the composer was just handed back, and return with every
+poll.
+
+**An unknown outcome is never worded as "failed".** An entry that ended as
+`error` with `outcome_unknown: true` may have gone out, and "it failed" is
+what makes a person or an agent send it again. Every reader of an entry
+asks (`_send_outcome_unknown`) before it words one: the chat's Pending
+(`outcome_unknown`), the chat list (`last.outcome_unknown`), the companion's
+note (which counts such sends apart from failed ones), the approval page and
+what it polls, and the note into the thread that queued the send (below).
+
+**A new mail that is only queued is listed.** The `Message-ID` that keys a
+new thread is minted when the send is accepted, so a queued new mail has its
+chat id before any mail exists. Such a chat is in no ledger; its state — the
+copy of the queued send — lists it: `last` is that send
+(`{direction: "out", text, author, pending: true, status}` — `status` is the
+Pending's: `"pending"`, `"sending"` or `"failed"`), `list_group` is
+`"read"`, its name is the subject and its participants are who the mail is
+to. Allowed, it is a chat of messages. A send of it that failed keeps it
+listed (`last.failed: true`, and `last.outcome_unknown` — true where the
+mail may have gone out all the same) until the user dismisses it. Denied,
+retracted, dismissed or gone from the gateway's queue (a send that failed
+for certain, also one a page's poll listed while its SMTP session lasted),
+it is no longer listed — **and nothing is kept of it**: the
+state document of a chat that was only ever a mail that never went out
+(`unsent`, cleared by the first mail of it that exists) is deleted with its
+last send, unless a draft or a companion thread is in it
+(`_forget_unsent_chat`). No list would show such a chat, so nothing could
+delete it, and its subject and recipients would stay for good.
+
+**On `/sends`.** The mail gateway is a registry gateway, so its queue is on
+`/sends` with every other: listed by the mail's subject and its recipients,
+and the approval card shows *From* (the mailbox), *To*, *Cc*, *Subject*, the
+category, the names of attached files and the text — the recipients in full,
+since a reply's are built from the thread and nobody typed them. A queue
+entry is addressed by the gateway's registry slug whatever it says its own
+account is. Only what waits for a decision is listed there: a send that is
+being sent or has failed shows in its chat. A decision is in the chat at
+once (above), and a mail that was allowed appears as a message. The status
+page of a mail the server took for only some recipients says so — a *Not
+delivered to* row, and "Sent — but the mail server refused …" in place of
+"Sent." (also as `refused` and `note` in the JSON the page polls). The note
+a decision leaves in the dashboard thread that queued the send names such a
+mail by the addresses it goes to and nothing else — that note is replayed to
+Ara's sessions as her own words, and a reply's subject and its recipients'
+display names are a stranger's; where recipients were refused it names them
+too, and badges the thread.
+
+A send that was allowed and ended with its **outcome unknown** (the entry's
+`outcome_unknown`: the mail server was handed the mail and its answer was
+never seen) is not shown as a failure anywhere on this path. The status
+page draws a question mark in a neutral disc — never the cross, the mark of
+a send that did not go — and "Not confirmed — it is not known whether
+this went out, so do not send it again unchecked: …" with the gateway's
+sentence, where a failure reads "The gateway could not deliver the message:
+…". `GET /sends/<gateway>/<id>/status` always states `outcome_unknown`
+(`{status, error, outcome_unknown, next?}`), and for such an entry carries
+`note`, the whole sentence the page shows in place of its "could not
+deliver" line (the status row carries that sentence's lead-in as
+`data-note-unknown`, beside the other notes). The
+note into the queuing thread says "It was handed over and never confirmed:
+it is not known whether it went out. Do not send it again before checking",
+never "sending it failed"; the turn context it leaves says the same — "NOT
+a failed send … must not be sent again unless the user, having checked,
+asks for that" — with the gateway's sentence as one bounded line, and the
+thread is badged and woken as for a failure, since the user has not seen
+the end of it.
+
+**A new mail.** `GET /chats/compose` answers what the ＋ of the Chats page
+can offer: `{"channels": [{"channel": "email", "label": "E-mail",
+"accounts": ["me@example.org"]}]}` — a channel for each whose gateway takes a
+new conversation (today e-mail), with the mailboxes whose gateway is up; no
+such gateway, no entry. `POST /chats/compose`
+`{channel: "email", account?, to: [...], cc?: [...], subject, text,
+request_key?}` hands the mail to that mailbox's gateway (`account` is needed
+only where several are mirrored) under the same policy as a reply, and
+answers `200 {id, message}` or `202 {id, pending}` with the new chat's id —
+or, where the outcome is not known, `202 {unconfirmed: true, request_key,
+id?, message_id?, …}` exactly as a reply does (the chat's id is the
+gateway's word, or found in its queue by the press's key; without either the
+chat appears when the mail does). It is the
+user's own act and gated like a send: same-origin only, and only through the
+reverse proxy. Recipients are passed on as the strings that were typed — the
+gateway parses them and its `400` for one that is no address is passed back
+— each one line; the subject is collapsed to one line before it leaves.
+
+**The mailbox follows the chat.** After the chat's state has changed, its
+gateway is told, each call `{chat, account}` — and, for a mail thread,
+`message_ids`: which mails the call is about (below):
+
+| In the chat | Call |
+|---|---|
+| *Mark as read* that leaves nothing unread; a reply, from here or from anywhere the rail sees | `POST <gateway>/chats/read` |
+| `archived: true` (muting archives) | `POST <gateway>/chats/archive` |
+| the undo of a mark, un-archive, a star | nothing |
+
+The hooks are generic: the call goes to the chat's own gateway on every
+channel, and a gateway that answers `404` or `501` has no mailbox — no error,
+and it is not asked again for `MAILBOX_NONE_SECONDS` (600). **A mail
+gateway's `404` is not that**: it has a mailbox, and its `404` is its word
+about one request ("not this gateway's account"). It switches nothing off —
+the gateway is asked anew which mailbox it serves, and that call stays owed.
+A mail chat id that names no mailbox is put to no gateway at all.
+
+**A call about a mail thread names its mails.** `message_ids` are the
+`Message-ID`s of the mails the chat held when the user acted: the store's (up
+to five pages of the thread) and what the rail announced a moment ago,
+without the arrivals that landed after the action — after what the read
+covers, or after the archive. The gateway serves the call when it gets to it
+(after the pass over the mailbox that may be running), and by then the
+thread can hold a mail that has arrived since, which the chat counts as
+unread or which has just brought an archived chat back; "the whole thread"
+at that later moment would be marked seen, or moved, with it. How far the
+action reaches is read while it is the newest word about the chat; an owed
+call keeps its list, and where the store cannot name the thread's mails the
+call is owed rather than made without one. A messenger's call carries no
+list.
+
+They never block and never fail the user's action: the call runs on a thread
+of its own after the state is written. The chat's state is the truth; a call
+that could not be made — the gateway failed or was away, or no gateway was
+known for the thread's mailbox just then — is logged and **owed**. Owed
+calls are kept in a small durable queue beside the chats' state
+(`<CHAT_STATE_DIR>/mailbox/owed.json`, `chat_state.OwedCalls`), so a restart
+of the web gateway forgets none, and are made again by a timer
+(`MAILBOX_RETRY_SECONDS`, 120; first soon after a start) and after every
+hook call that goes through — the user could not repeat the action
+themselves: a read chat offers no *Mark as read*, an archived one no
+*Archive*. A round leaves a gateway that fails again alone until the next
+one; a single call's refusal holds nothing up. An owed call is dropped, not
+made, once it no longer says what the chat says (the user un-archived, undid
+the mark, or new mail has landed since), and given up after
+`MAILBOX_OWED_KEEP_SECONDS` (a week). A *Mark as read* that leaves mail
+unread (a `{ts}` mark a newer mail outran) calls nothing: the chat is not
+read.
+
+**Delete** is no hook. `POST /chats/<id>/delete` asks the thread's own
+gateway — the one that serves its mailbox, and no other mail gateway — with
+the erase capability (`CHAT_ERASE_TOKEN`), and that gateway moves the
+thread's mails to the Trash before it erases its mirror. Only when it
+answers that all of it is done (`errors: 0`) does the web gateway erase its
+own state, the copy of the queued sends and the companion; otherwise the
+answer is `502` and the chat is as it was. The report carries `trashed`.
+A gateway that erased nothing says why in a sentence of its own (`error`
+beside `errors`: the mailbox has no Trash folder and which variable names
+one; mails moved since the mirror last looked, try again in a minute), and
+that sentence is the reason in the `502` — "the chat's messages could not
+be completely erased (`<gateway>`: `<its sentence>`)" — in place of a count
+of files: the remedy is in it. It is a gateway's text and may repeat a mail
+server's, so it is passed on as one line of at most
+`CHAT_DELETE_REASON_MAX` (300) characters, control characters removed, in a
+JSON string the page shows as text.
+
 ## Archived, muted, starred, deleted
 
 Archived and unread is a contradiction: the thread claims
@@ -1056,6 +2330,19 @@ Agents set the flags through `POST /internal/conversations/<id>/flags`:
 python3 /workspace/scripts/conversation-push.py --thread <id> --archive --mute
 # also: --unarchive, --unmute, --star/--unstar (only on the user's word);
 # flags are their own call, never mixed with a message. There is no --delete.
+```
+
+A **chat's** flags have the same door for agents, `POST
+/internal/chats/<id>/flags`, with the semantics of the user's own endpoint —
+muting archives, an archive settles the attention item, and a mail thread's
+mails move out of the inbox ("The gate for mail"):
+
+```bash
+# what a turn runs that a standing instruction told to archive the mail,
+# and what to run when the user says "archive this chat" (add --mute for good)
+python3 /workspace/scripts/chat-flags.py --chat <chat id> --archive
+# also: --unarchive, --mute, --unmute, --star/--unstar (only on the user's
+# word). There is no --delete.
 ```
 
 The behavioural rules this implies for Ara — Archive-click vs "archive this",

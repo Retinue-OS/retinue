@@ -1,8 +1,8 @@
 # The news feed
 
 Broadcast-style inbound — a channel announcement, a newsletter blurb, a feed
-item — needs no reply and fits no project, so triage has nowhere to put it and it
-gets archived and lost. The news feed is the home for exactly that class: a page
+item — needs no reply and fits no project, so among chats and threads it has
+no place and gets lost. The news feed is the home for exactly that class: a page
 of **references to sources**, ranked by how much each one matters to *this user*
 right now, read aloud on request, and taught by the user's own taps.
 
@@ -137,8 +137,8 @@ reported as such instead of as a parse error. `defusedxml` would cover the same
 ground more thoroughly, at the cost of the stdlib-only design; one text scan
 closes the vector that is actually reachable here.
 
-**Non-feed sources** — a Telegram channel post, a newsletter the Secretary meets
-during triage, a link someone sent — go in through `scripts/news-add.py`:
+**Non-feed sources** — a Telegram channel post, a newsletter an agent meets
+while working a chat, a link someone sent — go in through `scripts/news-add.py`:
 
 ```bash
 python3 /workspace/scripts/news-add.py \
@@ -153,16 +153,23 @@ a second inbound pipeline. `--url` has to be a web link (an absolute `http://`
 or `https://` URL); anything else is refused with exit code 2 and nothing is
 filed.
 
-**Newsletters (e-mail)** are the automatic version of that ad-hoc path. An
-address or `*@domain` declared a **news sender** in the triage policy is filed by
-the credit-free e-mail gate on arrival — Subject as the title, a body excerpt as
-the summary, the mail's own `Archived-At`/`List-Archive` as the link — and the
-mail is archived out of the INBOX. No model turn is spent, and the item reaches
-the Herald on the next curation tick like any other. The address-level twin of
-the messenger `news` group flag:
+**Newsletters (e-mail)** are the automatic version of that ad-hoc path. A
+mailing list (its `List-Id`), an address or a `*@domain` flagged **`news`** in
+the e-mail policy is filed by the **mail gateway** on arrival — Subject as the
+title, an excerpt of the text as the summary, the mail's own `Archived-At`
+as the link (never `List-Archive`: it names the list's archive, the same on
+every issue, and the feed keys an item on its link — a mail without
+`Archived-At` is filed with no link, keyed on its text). Such a mail starts
+no chat, and where the group is also flagged `ignored` it is marked seen and
+moved out of the INBOX once the feed has it — unless its sender is a VIP or
+instructed: then it is filed *and* in its chat, worked like any of their
+mail, and left in the INBOX. No model turn is spent on news, and the item reaches
+the Herald on the next curation tick like any other. The e-mail twin of the
+messenger `news` group flag:
 
 ```bash
 python3 /workspace/scripts/triage_policy.py email-news-add '*@substack.com'
+python3 /workspace/scripts/triage_policy.py email-ignore-add '*@substack.com'   # read-only: out of the INBOX too
 ```
 
 See `docs/triage-delivery-gate.md` (*The news rail on e-mail*).

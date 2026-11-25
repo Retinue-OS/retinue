@@ -629,8 +629,8 @@ def _summary_from_headers(uid, header_bytes, flags):
         # Message-ID without a second round-trip per message.
         "message_id": (hdr.get("Message-ID") or "").strip() or None,
         # Same reasoning for List-Id (RFC 2919): it is what tells a listing
-        # which mailing list a message came in on, and the triage gate keys its
-        # per-list policy off it — a second fetch per message just for one
+        # which mailing list a message came in on, and the delivery gate keys
+        # its per-list flags off it — a second fetch per message just for one
         # header would double the round-trips of every scan.
         "list_id": _decode(hdr.get("List-Id")) or None,
         "flags": [f.decode() if isinstance(f, bytes) else f for f in flags],
@@ -677,10 +677,9 @@ def _search_by_message_id(M, message_id):
     return data[0].split() if typ == "OK" else []
 
 
-# Reply/forward prefixes across the locales this mailbox sees. The triage
-# gate's nomination (scripts/triage-gate.py, _SUBJECT_PREFIX) strips the same
-# set: a prefix that nominates a mail there but does not strip here would
-# make the exact check reject every reply written in that locale.
+# Reply/forward prefixes across the locales this mailbox sees: a prefix that
+# does not strip here would make the exact check reject every reply written in
+# that locale.
 _RE_PREFIX = re.compile(
     r"^\s*(re|aw|fwd?|wg|tr|antw|sv|vs)\s*(\[\d+\])?\s*:\s*", re.I)
 _MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun",
@@ -1131,11 +1130,11 @@ def cmd_read(cfg, args):
         # The bulk-mail headers a newsletter sets on itself. Archived-At
         # (RFC 5064) and List-Archive (RFC 2369) are the *declared* web version
         # of this message — the only non-guessed URL an e-mail carries, which is
-        # what the triage gate's news rail files as the item's link.
+        # what the news rail files as the item's link.
         "archived_at": _decode(msg.get("Archived-At")),
         "list_archive": _decode(msg.get("List-Archive")),
         # List-Id (RFC 2919) names the list itself, stably across senders — the
-        # identity the triage gate groups a mailing list by.
+        # identity the delivery gate groups a mailing list by.
         "list_id": _decode(msg.get("List-Id")),
         "flags": [f.decode() if isinstance(f, bytes) else f for f in flags],
         "body": body,
@@ -1267,7 +1266,10 @@ def cmd_flag(cfg, args):
 # message construction / sending
 # --------------------------------------------------------------------------- #
 def _build_message(cfg, to, subject, body, cc=None, bcc=None, attachments=None,
-                   in_reply_to=None, references=None):
+                   in_reply_to=None, references=None, message_id=None):
+    """Build an outgoing message. ``message_id`` (angle brackets included) is
+    for a caller that minted the id before the message existed — the mail
+    gateway names a queued send by it; by default one is made here."""
     msg = EmailMessage()
     msg["From"] = formataddr((cfg.from_name, cfg.user)) if cfg.from_name else cfg.user
     msg["To"] = ", ".join(to)
@@ -1277,7 +1279,7 @@ def _build_message(cfg, to, subject, body, cc=None, bcc=None, attachments=None,
         msg["Bcc"] = ", ".join(bcc)
     msg["Subject"] = subject or ""
     if "Message-Id" not in msg:
-        msg["Message-Id"] = make_msgid()
+        msg["Message-Id"] = message_id or make_msgid()
     if in_reply_to:
         msg["In-Reply-To"] = in_reply_to
     if references:
@@ -1296,7 +1298,19 @@ def _build_message(cfg, to, subject, body, cc=None, bcc=None, attachments=None,
     return msg
 
 
-def _smtp_send(cfg, msg, recipients):
+def _smtp_send(cfg, msg, recipients, on_data=None, on_taken=None):
+    """Submit *msg* to the account's SMTP server; returns the addresses the
+    server refused (``{address: (code, text)}``; empty when it took them all).
+
+    Two optional hooks, for a caller that journals its sends (the mail
+    gateway), mark the two moments a journal needs, each called once with no
+    arguments. ``on_data``: just before the message itself is handed to the
+    server (the DATA command), after the server accepted the envelope — up to
+    that call a failure means nothing was sent, from it on only the server's
+    own refusal does; whatever the hook raises aborts the send before any of
+    the message is transmitted. ``on_taken``: as soon as the server has
+    answered that it took the message, before the session is closed.
+    """
     ctx = ssl.create_default_context()
     try:
         with smtplib.SMTP(cfg.smtp_host, cfg.smtp_port, timeout=30) as s:
@@ -1304,6 +1318,17 @@ def _smtp_send(cfg, msg, recipients):
             s.starttls(context=ctx)
             s.ehlo()
             s.login(cfg.user, cfg.password)
+            if on_data is not None or on_taken is not None:
+                hand_over = s.data
+
+                def data(payload):
+                    if on_data is not None:
+                        on_data()
+                    answer = hand_over(payload)
+                    if on_taken is not None and answer[0] == 250:
+                        on_taken()
+                    return answer
+                s.data = data
             # A partial refusal does not raise: the server took the mail for
             # the others and send_message() hands back the refused addresses.
             refused = s.send_message(msg, from_addr=cfg.user, to_addrs=recipients) or {}
@@ -1313,28 +1338,45 @@ def _smtp_send(cfg, msg, recipients):
         print(f"[email_client] warning: the server refused "
               f"{', '.join(sorted(refused))}; the mail went to the others",
               file=sys.stderr)
-    # Only an address the server accepted is a correspondent: whitelisting a
-    # refused one would let unrelated mail from it into the frequent tick.
-    _whitelist_recipients([r for r in recipients if r not in refused])
+    return refused
 
 
-def _whitelist_recipients(recipients):
-    """Whitelist every address this system just sent to, for the triage gate.
+def _note_outbound(cfg, msg):
+    """Tell the mail gateway whose mail this was (docs/mail-chats.md, "Writing").
 
-    A reply to mail sent from here must reach the frequent triage tick at once;
-    the gate's daily refresh from the Sent folder only backs up mail sent by
-    other clients. Best-effort: the mail is already out, so a policy write
-    failure is reported and never fails the send.
+    A mail sent from here reaches the mail gateway's mirror as any client's
+    does: as a copy in the Sent folder, recorded as the own-device echo. This
+    says it was an agent's — ``POST <MAIL_GATEWAY_BASE_URL>/outbound-note
+    {"message_id", "author": "agent", "account": <the From address>}`` — so
+    the chat credits the bubble rightly. A gateway serves one mailbox and
+    answers 404 for another account's address: that is why the address goes
+    along, and why that answer is no error.
+
+    Best-effort, and silent where no gateway is configured: the mail is out,
+    and nothing here may fail the send that produced it.
     """
-    addrs = [a.strip().lower() for a in recipients if a and "@" in a]
-    if not addrs:
+    base = os.environ.get("MAIL_GATEWAY_BASE_URL", "").strip().rstrip("/")
+    message_id = str(msg.get("Message-Id") or "").strip()
+    if not base or not message_id:
         return
+    headers = {"Content-Type": "application/json"}
+    token = os.environ.get("MAIL_GATEWAY_TOKEN", "").strip()
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    body = json.dumps({"message_id": message_id, "author": "agent",
+                       "account": cfg.user}).encode("utf-8")
     try:
-        import triage_policy
-        triage_policy._mutate_email(add_addresses=addrs)
+        request = urllib.request.Request(base + "/outbound-note", data=body,
+                                         headers=headers, method="POST")
+        with urllib.request.urlopen(request, timeout=5) as resp:
+            resp.read()
+    except urllib.error.HTTPError as e:
+        if e.code != 404:   # 404: not the mailbox that gateway serves
+            print(f"[email_client] warning: the mail gateway did not take the "
+                  f"outbound note (HTTP {e.code})", file=sys.stderr)
     except Exception as e:  # noqa: BLE001 — never fail a send that went out
-        print(f"[email_client] warning: could not whitelist recipients: {e}",
-              file=sys.stderr)
+        print(f"[email_client] warning: could not tell the mail gateway of the "
+              f"sent mail: {e}", file=sys.stderr)
 
 
 _APPENDUID_RE = re.compile(rb"APPENDUID\s+\d+\s+(\d+)")
@@ -1675,6 +1717,7 @@ def approve_pending_send(cfg, request_id):
         del msg["Bcc"]  # never expose Bcc in the dispatched / stored copy
         stripped = strip_provider_headers(msg)
         _smtp_send(cfg, msg, recipients)
+        _note_outbound(cfg, msg)
         if cfg.save_sent:
             _append(cfg, cfg.sent_folder, msg, seen=True)
         M.uid("store", uid, "+FLAGS", "(\\Deleted)")
@@ -1711,8 +1754,7 @@ def _dispatch_message(cfg, msg, to, cc=None, bcc=None, attachments=None,
     request for web approval. `send` and `reply` both go through here so a
     reply can never bypass the verify/trust/allow gate. The direct-send path
     captures the Sent-folder UID and echoes the outgoing Message-Id so the
-    caller can record them (e.g. in the triage status store) and later verify
-    the message really went out.
+    caller can record them and later verify the message really went out.
     """
     policy = load_send_policy()
     category = resolve_category(cfg.user, policy)
@@ -1723,6 +1765,7 @@ def _dispatch_message(cfg, msg, to, cc=None, bcc=None, attachments=None,
     if send_directly:
         recipients = list(to) + list(cc or []) + list(bcc or [])
         _smtp_send(cfg, msg, recipients)
+        _note_outbound(cfg, msg)
         saved_sent = False
         sent_uid = None
         if cfg.save_sent:
@@ -1848,10 +1891,11 @@ def cmd_reply(cfg, args):
     The whole point of this verb: In-Reply-To / References are computed from
     the source message's own Message-ID and References chain, so a reply is
     always correctly threaded without the caller having to remember to pass
-    --in-reply-to. That threading is what the "already-answered" check relies
-    on; omitting it (as happened once in a free-form dashboard reply) caused a
-    duplicate proposal. Recipient and subject default to the source too, and
-    can be overridden. Goes through the same send-control policy as `send`.
+    --in-reply-to. That threading is what files the reply into its thread —
+    in the recipient's client, in the mirrored chat, and for `answered`; a
+    reply sent without it starts a thread of its own. Recipient and subject
+    default to the source too, and can be overridden. Goes through the same
+    send-control policy as `send`.
     """
     M = imap_connect(cfg)
     imap_select(M, args.folder, readonly=True)

@@ -160,11 +160,17 @@ So every image says what it is, on its `/health`:
   rather than guessed at.
 - **`framework`** — a digest of the shared modules *as baked in*, computed at
   runtime by `scripts/build_stamp.py`. It needs nothing from the build
-  pipeline, so it is always there. The retinue container and all three
-  messenger gateways copy the same modules, so **a gateway whose digest
+  pipeline, so it is always there. The retinue container and every channel
+  gateway — Signal, WhatsApp, Telegram, SMS and the mail gateway — copy the
+  same modules (`build_stamp.FRAMEWORK_MODULES`), so **a gateway whose digest
   differs from the dashboard's was not rebuilt** — which the `/gateways` page
   says on the card, in as many words, even while the gateway is connected and
-  otherwise looks well.
+  otherwise looks well. The mail gateway also bakes modules no messenger
+  carries (`email_client.py`, `mail_threads.py`, `mail_trim.py`); those are
+  outside the digest, so a mail gateway stale in them alone shows only by its
+  `sha`. A new gateway image copies every module in `FRAMEWORK_MODULES` and
+  joins the lists `tests/test_build_stamp.py` pins (its Dockerfile, its compose
+  service, the health loop).
 
 To check a deployment: open `/gateways`, or compare by hand —
 
@@ -230,7 +236,8 @@ starting one by hand beside the live system, run
 Every `claude -p` the framework spawns — dashboard turns, the transcript
 cleanup and the presentation lint (`scripts/web-gateway.py`), scheduler jobs
 and the sessions the base-job scripts start themselves (`scripts/scheduler.py`,
-`agent-self-review.py`, `news-curate.py`, `triage-gate.py`), Ask-Ara answers
+`agent-self-review.py`, `news-curate.py`, `inbox-sweep.py`,
+`memory-compact.py`, `migrate-triage.py`), Ask-Ara answers
 (`scripts/ara-mcp-server.py`) — gets its environment from
 `scripts/session_env.py`, never from a copy of the spawning daemon's. The
 daemons are forked before the entrypoint's scrub and hold whatever `.env` put
@@ -243,11 +250,16 @@ in the script that reads it.
 What passes: process basics (`PATH`, `HOME`, locale, `TZ`), the egress-proxy
 and CA variables, `ANTHROPIC_*` (the model credential and endpoint —
 gateway-spawned sessions run in API-key mode), `CLAUDE_*`, `RETINUE_*` (minus
-`RETINUE_LITELLM_KEY`), `SPARQL_ENDPOINT_*`, `NEWS_*`, `TRIAGE_*`, the
+`RETINUE_LITELLM_KEY`), `SPARQL_ENDPOINT_*`, `NEWS_*`, the two delivery-gate
+policy locations (`TRIAGE_MESSENGER_DIR`, `TRIAGE_EMAIL_WHITELIST_PATH` — named
+one by one, not by a prefix; the second is the e-mail policy file's path, whose
+variable name predates the whitelist's retirement), the
 capability tokens with their service URLs (`EMAIL_BACKEND_*`,
 `CONVERSATION_BACKEND_*`, `NEWS_INGEST_*`, `CHATS_INGEST_*`, `UPDATER_*`), the
-messenger and calendar gateways' client side (`*_GATEWAY_TOKEN`,
-`*_GATEWAY_BASE_URL`, `*_GATEWAY_SEND_URL`, `*_DEFAULT_RECIPIENT`, …).
+messenger, mail and calendar gateways' client side (`*_GATEWAY_TOKEN`,
+`*_GATEWAY_BASE_URL`, `*_GATEWAY_SEND_URL`, `*_DEFAULT_RECIPIENT`, …;
+`MAIL_GATEWAY_*` among them — the mail gateway's own `MAIL_*` settings are
+not, and live on its service only).
 Everything else is dropped — `EMAIL_PASS*`,
 `LITELLM_*`, `OPENROUTER_API_KEY`, `TRAEFIK_BASIC_AUTH_USERS`, `GITHUB_TOKEN`
 (`git` keeps working through the credential helper the entrypoint configures;
@@ -273,3 +285,148 @@ this way: it keeps the entrypoint's own scrub (mail credentials and the API
 key, for OAuth). What the allowlist cannot do is stop a session from reading a
 daemon's `/proc/<pid>/environ`, since everything runs as one uid; that is the
 sidecar work tracked separately (`SECURITY.md`, "Known limitations").
+
+## The triage migration (one-time)
+
+`scripts/migrate-triage.py` moves what e-mail triage knew — the whitelist and
+the `sender:` memories — onto contacts, as their instruction. What it does and
+why is `docs/mail-chats.md`, "The migration"; this is how an operator runs it.
+
+**It runs by itself.** The entrypoint secures the legacy whitelist triples
+first thing (`--step snapshot`, which also fixes the cutoff: only `sender:`
+memories recorded before the new code first ran are triage's; it is kept in
+the marker, in `.migration-cutoff` beside it and in the snapshot) and starts the
+migration in the background once the daemons are up (`--boot`): the pending
+steps, a few tries where the life store or the model is not there yet, polls
+while the mail mirror does its first backfill (at most
+`MIGRATE_TRIAGE_MIRROR_WAIT`, 6 h by default), then one dashboard thread with
+the report — followed up in the same thread if it had to say "not finished".
+A boot that finds it complete does nothing. Its log lines carry
+`[migrate-triage]`. A `--step snapshot` that exits non-zero with "not secured
+in full" means a policy file is there and cannot be read: both steps wait
+until it reads, and nothing is taken for "no whitelist".
+
+**Set `MAIL_GATEWAY_TOKEN` as part of this upgrade.** Triage retires whether
+or not the mail gateway runs, and the gateway mirrors and gates nothing until
+the token is set (`docs/messaging.md`, "E-mail (the mail gateway)"): a
+deployment without it has **no e-mail handling at all** after the upgrade.
+The migration then moves nothing (it needs the mirror), the report says so
+first, a job left calling `triage-gate.py` says so in its log, and the boot
+run opens one dashboard thread about it (on a deployment that had e-mail
+triage). Set the token (`openssl rand -hex 32`) and restart; the migration
+runs once the mirror has its first backfill.
+
+**To look before it acts**, keep the boot run from doing anything and read a
+dry run — which writes nothing and spawns no model:
+
+```bash
+# before the upgrade's first start: either the file …
+docker compose run --rm --entrypoint sh retinue -c \
+  'mkdir -p /root/.retinue/triage && touch /root/.retinue/triage/.migration-hold'
+# … or RETINUE_TRIAGE_MIGRATION=off on the retinue service (override file)
+
+docker exec <retinue> python3 /workspace/scripts/migrate-triage.py --dry-run
+```
+
+Remove the hold and restart, or run it by hand:
+
+```bash
+docker exec <retinue> python3 /workspace/scripts/migrate-triage.py            # what is pending, then the report
+docker exec <retinue> python3 /workspace/scripts/migrate-triage.py --step report [--json]
+docker exec <retinue> python3 /workspace/scripts/migrate-triage.py --step memories [--no-model]
+```
+
+Run it with `docker exec` on the `retinue` container rather than from an
+agent session where you can: the user's own addresses get no contact, and the
+script knows them by the mailbox variables a session's environment does not
+carry (a session gets `TRIAGE_STATE_DIR`, `MAIL_OWN_ADDRESSES`, the
+script's tunables and the two verdict timeouts its report states,
+`MAIL_INSTRUCTION_TIMEOUT` and `CHAT_INSTRUCTION_TIMEOUT` — enough for the
+thread's "show the report" — but never
+`EMAIL_USER*`; beyond those the script knows them only by what the mirror
+shows: its accounts, and the addresses the user's mail went out under). A run
+by hand opens no thread; it prints the report. The memories step starts a
+`claude` process the way every framework spawner does — it refreshes the
+sign-in under the shared lock first — so it needs no `claude_auth.py refresh`
+beforehand.
+
+- **A full run skips the steps the marker has complete; `--step <name>` runs
+  that step again whatever the marker says.** That is how to have it look
+  again after fixing something: `--step memories` re-reads the store and puts
+  what a model verdict left alone to the model once more — only memories
+  from before the cutoff, never a later one. A whitelist entry that was
+  settled and a memory that was moved are never touched twice; a rule that
+  is on a contact and whose memory waits to be superseded is not written
+  again, so an edit on the contact meanwhile stands.
+- **Exit status** 0: everything asked for is complete; 75: something is
+  pending, and the report says what; 1: the marker, the cutoff file or the
+  snapshot could not be read — nothing was changed, and the log line names
+  the file and its way out:
+  - **the marker** (`.migrated-to-contacts.json`): move it aside to start
+    its journal afresh (every step is safe to repeat), but **keep
+    `.migration-cutoff` and `.legacy-email-whitelist.json`**: the cutoff they
+    hold is what keeps the sender memories stored since the upgrade out of
+    the migration, and a marker that is missing adopts it from them;
+  - **the cutoff file** (`.migration-cutoff`): where the marker or the
+    snapshot still holds the cutoff (the log line says so, with the time),
+    move it aside — the next run writes it back from them; where neither
+    does, restore it from a backup (one line, the time it held), since a run
+    with none of the three takes a new cutoff;
+  - **the snapshot** (`.legacy-email-whitelist.json`): restore it from a
+    backup rather than move it aside — it holds the legacy whitelist, which
+    the policy file loses on its next write; moved aside, only what the
+    policy files still hold is secured again.
+- **The model only classifies.** Either way an instruction's text is the
+  memory's own, first — for a filing memory whose text names a document and
+  filing it, followed by one fixed line that yields to those words
+  ("Unless the note above says otherwise: file the document …"), placed as
+  the instruction's last paragraph — a later note goes in front of it, and
+  it is never added twice. It is known by its exact text (as a line of its
+  own, or at the very end whatever stands before it), and, on a person the
+  migration's journal records it placed the line on, by that opening at the
+  start of any line however you edit or move it (there, a line of yours
+  that begins with those words, also inside a paragraph, is taken for the
+  line too — a later note goes in front of it; of several, the exact one,
+  then the last; a marker moved aside forgets on whom the line was placed,
+  and an edited line is then no longer known: a later filing note adds the
+  line again); on anyone else a paragraph of yours that
+  begins with those words is yours — notes go after it, and a filing note
+  adds the real line. A line you delete stays deleted: a later filing note
+  for that person adds its own words alone. Nothing the model writes
+  reaches a contact, and nothing but a later note in front of that line is
+  ever put in front of the user's words or in their place.
+- **`--no-model`** carries every sender rule over verbatim. Nothing then
+  judges whether a memory's text was the user's instruction or something a
+  message said: read the instructions it wrote (the report lists them).
+- **An instruction is the person's, on every channel.** A person the
+  migration briefed — an existing contact who held a whitelisted address, the
+  owner of a whitelisted domain — has each Signal, WhatsApp, Telegram and SMS
+  message worked by a model turn from then on, its ring waiting up to
+  `CHAT_INSTRUCTION_TIMEOUT`; a mail's ring waits up to
+  `MAIL_INSTRUCTION_TIMEOUT` (600 s by default; raise it where filing turns
+  run longer). Briefed means the migration set the person's first
+  instruction, as its journal recorded at the write (a contact it created
+  by the creation time it journaled: one you file by hand after a kill is
+  read as it stands). The report names the
+  briefed people who hold messenger handles or a phone, and lists apart
+  those of them whose instruction the user has edited since (taking it off
+  would take those edits too). A person who already carried an instruction
+  of the user's is not among them: where a rule was appended to it, the
+  report lists them apart again — take such a rule back off by editing the
+  instruction, never with `--no-instruction`, which takes the user's own
+  words too.
+- **What is left for a person:** the scheduled jobs that run `triage-gate.py`
+  (to remove) and the prompt jobs that only mention triage (to check — a
+  messenger recovery job still belongs), both named in the report; a rule the
+  report lists as left alone that should stand (`contacts.py update <id>
+  --instruction …`, then `memory.py store --supersedes <memory id> …`); two
+  contacts the report says share a name; and taking the instruction off any
+  contact the migration briefed whose messages do not need a model turn each
+  time (`contacts.py update <id> --no-instruction`, or the Contacts page).
+- **Nothing is deleted, and the way back is by hand.** A contact it created
+  is deleted on the Contacts page; an instruction is edited there. A
+  superseded memory is still in the log (`memory.py recall --tag
+  'sender:<address>' --include-superseded`) but cannot be made live again —
+  store it anew if it is wanted. The snapshot
+  (`.legacy-email-whitelist.json`), the marker and the old status store stay
+  in the state directory (`TRIAGE_STATE_DIR`, default `/root/.retinue/triage`).

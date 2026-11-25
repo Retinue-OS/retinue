@@ -73,6 +73,10 @@ services:
       - messenger-whatsapp:/workspace/chambers/_generated/messenger/whatsapp
       - messenger-telegram:/workspace/chambers/_generated/messenger/telegram
       - messenger-sms:/workspace/chambers/_generated/messenger/sms
+      # The mail gateway's ledger, the same way. Its policy/ also holds the
+      # e-mail policy file (email-policy.nt: the e-mail group flags), which
+      # the retinue side writes and the gateway reads.
+      - messenger-email:/workspace/chambers/_generated/messenger/email
       # RW mount of the project tree itself. Agents can branch/commit/push
       # infra changes (Tier 3 in CLAUDE.md) straight from this live checkout
       # instead of `git clone … /tmp` — the container already carries the
@@ -151,6 +155,18 @@ services:
       - SMS_GATEWAY_SEND_URL=http://sms-gateway:8095/send
       - SMS_GATEWAY_BASE_URL
       - SMS_GATEWAY_TOKEN
+      # The mail gateway (docs/messaging.md, "E-mail (the mail gateway)"):
+      # its base URL enrols the e-mail channel on /gateways, the chat surface
+      # and the connection monitor. Wired by default like the messengers — an
+      # unconfigured mail gateway reports configured: false and idles. The
+      # token is the operator's opt-in: until MAIL_GATEWAY_TOKEN is set in
+      # .env (compose passes the one value to both sides) the gateway
+      # mirrors and serves nothing. The send URL is scripts/mail-push.py's;
+      # the base URL is also where email_client.py tells the gateway whose
+      # mail it just sent (POST /outbound-note).
+      - MAIL_GATEWAY_SEND_URL=http://mail-gateway:8096/send
+      - MAIL_GATEWAY_BASE_URL=http://mail-gateway:8096
+      - MAIL_GATEWAY_TOKEN
       # Voice input for the dashboard: the web gateway proxies recorded audio to
       # the shared STT service for transcription. Unset STT_SERVICE_URL to disable
       # (the dashboard then hides its microphone button).
@@ -213,11 +229,16 @@ services:
       # would resurrect every read message as unread and drop staged drafts.
       - CHAT_STATE_DIR=/root/.retinue/chats
       # Optional shared secret for the gateways' chats notify rail
-      # (POST /internal/chats/inbound). Open when unset — the news-rail model;
-      # set it here and on the gateways to lock the endpoint down. Worth a
-      # thought now that the rail also starts companion turns: an open endpoint
-      # can spend a model turn, though still nothing that reaches a
-      # correspondent — only the user's send press does that.
+      # (POST /internal/chats/inbound). Unset, a messenger event is taken
+      # open — the news-rail model — and an e-mail event only with
+      # MAIL_GATEWAY_TOKEN, which the mail gateway presents instead; set it
+      # here and on the gateways to lock the rail down. Worth setting once a
+      # messenger contact is a VIP or carries an instruction: an open rail
+      # lets anything on the internal network ring the phone in every mode
+      # with a "VIP's" message, or start a turn briefed by a person's
+      # instruction, which may act — a calendar entry, a message — as far as
+      # that instruction approves, unseen (SECURITY.md, "The chats rail is a
+      # second way in"). A call a browser marks cross-site is always refused.
       - CHATS_INGEST_TOKEN
       # Required for deleting a chat (POST /chats/<id>/delete): the capability
       # the gateways demand before erasing a chat's messages. Set the same
@@ -230,21 +251,43 @@ services:
       # turn on top only for a sender the user marked a VIP in the triage
       # policy. Set it to "0" and the rail accepts nothing, so each gateway
       # falls back to the held/forward path it had before: the switch off,
-      # without a revert (docs/messenger-chats.md, phase 4).
+      # without a revert (docs/messenger-chats.md, phase 4). A mail is the
+      # exception — its gateway has no path to fall back to — and is accepted
+      # either way; "0" only stops the turns for it.
       - CHAT_ARRIVAL_TURNS=1
       # How long (seconds, default 60) the ring of a message from a sender with
       # a standing instruction may wait for the turn that works it by that
       # instruction (docs/contacts.md, "The instruction"). Past it the message
       # rings as a VIP's would; the turn goes on, and its draft still lands.
+      # A messenger's message; a mail's is the next one.
       - CHAT_INSTRUCTION_TIMEOUT
+      # The same for a mail (seconds, default 600; docs/dashboard.md, "The
+      # gate for mail"): a mail is not a chat message, and a turn that files
+      # the document a mail carried with the Archivist needs the time.
+      - MAIL_INSTRUCTION_TIMEOUT
+      # A mail whose VIP or instructed turn failed is offered to the rail again
+      # by the mail gateway on its later polls (docs/dashboard.md, "The gate
+      # for mail"). How old (seconds, default 900) the failed turn must be
+      # before such an offer starts the turn anew…
+      - CHAT_ARRIVAL_RETRY_SECONDS
+      # …and how many turns (default 3) one mail gets: after the last fails it
+      # is accepted as it stands — it rang by the failure rule — with one note
+      # in the thread's companion.
+      - MAIL_ARRIVAL_TURN_ATTEMPTS
       # Which TCP peers count as "arrived through the reverse proxy" for the
-      # endpoints that act with the user's own authority: the chat send press
-      # and approving a pending send. Defence in depth only — no send skips an
-      # account's policy any more, whoever calls. Unset (the default) means anything that
-      # is neither loopback nor this container's own address — which is what
-      # Traefik in its own container looks like. Set it (addresses or CIDRs)
-      # to pin the proxy explicitly, and set it to include loopback only in a
-      # host-networking topology, where the distinction is unavailable.
+      # endpoints that act with the user's own authority: a chat's send, flags
+      # and delete, a new mail, a thread's delete, a shell action's outcome,
+      # approving a pending send — and for marking a dashboard message as the
+      # user's own (which decides whether its turn may type). Defence in
+      # depth only — no send skips an account's policy any more, whoever
+      # calls. Unset (the default) refuses only a loopback peer and a peer
+      # that is the very address the caller dialled: Traefik in its own
+      # container passes, but so does a caller inside this container that
+      # comes in from its other network's address, or is relayed by a sibling
+      # (the egress-audit proxy). So set it (addresses or CIDRs) to the
+      # proxy's address — see docker-compose.override.example.yml — and to
+      # include loopback only in a host-networking topology, where the
+      # distinction is unavailable.
       - EDGE_PROXY_PEERS
       # scripts/self-update.py pokes the updater sidecar (below) to rebuild
       # and restart the whole stack; must match the updater's own token.
@@ -257,7 +300,7 @@ services:
       # by scripts/gen-egress-ca.sh and trusted by clients.
       - HTTP_PROXY=http://egress-audit:8080
       - HTTPS_PROXY=http://egress-audit:8080
-      - NO_PROXY=localhost,127.0.0.1,retinue,litellm,signal-gateway,whatsapp-gateway,telegram-gateway,sms-gateway,stt,qlever-life,updater,egress-audit,egress-log-viewer,egress-anomaly-agent,host.docker.internal,${SPARQL_NO_PROXY:-}
+      - NO_PROXY=localhost,127.0.0.1,retinue,litellm,signal-gateway,whatsapp-gateway,telegram-gateway,sms-gateway,mail-gateway,stt,qlever-life,updater,egress-audit,egress-log-viewer,egress-anomaly-agent,host.docker.internal,${SPARQL_NO_PROXY:-}
       - NODE_EXTRA_CA_CERTS=/etc/egress-audit/certs/egress-ca-cert.pem
       - SSL_CERT_FILE=/etc/egress-audit/certs/egress-ca-cert.pem
       - REQUESTS_CA_BUNDLE=/etc/egress-audit/certs/egress-ca-cert.pem
@@ -286,7 +329,6 @@ services:
       # Overrides the router tier for unpinned dashboard threads only, so the
       # door in front of the user can be strong while dispatch stays cheap.
       - RETINUE_DASHBOARD_MODEL
-      - RETINUE_TRIAGE_MODEL
       # Per-subagent model overrides (scripts/agent_models.py): the deployment
       # default; the dashboard's Settings › Agent models card writes the file
       # (RETINUE_AGENT_MODELS_FILE, default on the persistent /root volume).
@@ -341,7 +383,10 @@ services:
       # behalf — the credentials never reach a session), the send policy, and
       # the backend token (auto-generated by the entrypoint when unset). A
       # NAMED account (EMAIL_USER_ARI, EMAIL_PASS_ARI, IMAP_HOST_ARI, …) is
-      # deployment content: list its variables in the override.
+      # deployment content: list its variables in the override. The mail
+      # gateway (below) holds the same mailbox credentials for its mirror, but
+      # they stay here too: email_client.py's backend and the /sends approval
+      # of e-mail drafts still run in this container (docs/mail-chats.md).
       - EMAIL_USER
       - EMAIL_FROM_NAME
       - EMAIL_PASS
@@ -356,7 +401,6 @@ services:
       - SEND_STRIP_HEADERS
       - EMAIL_BACKEND_TOKEN
       - EMAIL_ENV_FILE
-      - EMAIL_PROCESSING_INTERVAL
       # Dashboard: the conversation backend token (auto-generated when unset),
       # the public base URLs links are built with, Web Push (the VAPID key
       # pair itself is a file on the /root volume, never an env var), the
@@ -425,6 +469,33 @@ services:
       - CHAT_SEND_CONFIRM_TIMEOUT
       - CHAT_SEND_MAX_IMAGES
       - CHAT_SEND_TIMEOUT
+      # Mail chats (scripts/web-gateway.py): the hop to the mail gateway's
+      # /send (MAIL_SEND_TIMEOUT, long enough for an SMTP hand-over), the queue
+      # reads (CHAT_PENDING_*), how long a gateway with no mailbox is left
+      # alone (MAILBOX_NONE_SECONDS) and the caps on the original view.
+      - MAIL_SEND_TIMEOUT
+      - CHAT_PENDING_TIMEOUT
+      - CHAT_PENDING_RETRY_SECONDS
+      - CHAT_PENDING_SYNC_SECONDS
+      - MAILBOX_NONE_SECONDS
+      # A mailbox call that failed is owed: kept on disk, tried again on this
+      # timer, and given up after this long.
+      - MAILBOX_RETRY_SECONDS
+      - MAILBOX_OWED_KEEP_SECONDS
+      - MAIL_ORIGINAL_MAX_BYTES
+      - MAIL_ORIGINAL_INLINE_MAX_BYTES
+      # The model trim of a mail the deterministic trim left wanting
+      # (docs/dashboard.md, "The model trim"): on/off, its model (else the
+      # router tier), its timeout, turns a local day, the queue, the
+      # per-mail wait after a turn without a judgement and how many such
+      # turns a mail gets.
+      - MAIL_MODEL_TRIM
+      - MAIL_MODEL_TRIM_MODEL
+      - MAIL_MODEL_TRIM_TIMEOUT
+      - MAIL_MODEL_TRIM_DAILY_MAX
+      - MAIL_MODEL_TRIM_QUEUE
+      - MAIL_MODEL_TRIM_RETRY_SECONDS
+      - MAIL_MODEL_TRIM_ATTEMPTS
       - GATEWAY_HEALTH_TIMEOUT
       # Gateway auth (scripts/gateway_auth.py) beyond the three above.
       - GATEWAY_BASIC_AUTH_USERS
@@ -446,6 +517,7 @@ services:
       - TELEGRAM_GATEWAY_TIMEOUT
       - SMS_DEFAULT_RECIPIENT
       - SMS_GATEWAY_TIMEOUT
+      - MAIL_GATEWAY_TIMEOUT
       - MESSENGER_GATEWAYS
       - MESSENGER_BUILTIN_CHANNELS
       - GATEWAY_MONITOR_IGNORE
@@ -471,8 +543,8 @@ services:
       - ARA_MCP_RATE_LIMIT
       - ARA_MCP_RATE_WINDOW
       - ARA_MCP_JOB_RETENTION
-      # News feed and triage tunables (scripts/news_store.py, news-fetch.py,
-      # news-curate.py, triage-gate.py), the project-deadline lead
+      # News feed tunables (scripts/news_store.py, news-fetch.py,
+      # news-curate.py), the project-deadline lead
       # (scripts/recurring-projects.py), the self-update call timeout
       # (scripts/self-update.py), the chamber plugin watcher's interval
       # (scripts/sync-plugins.py) and the session-side scripts' backend
@@ -482,17 +554,6 @@ services:
       - NEWS_MAX_ITEMS
       - NEWS_FETCH_TIMEOUT
       - NEWS_CURATE_BATCH
-      - TRIAGE_STATE_DIR
-      - TRIAGE_INBOX_SCAN_LIMIT
-      - TRIAGE_INBOX_SCAN_MAX
-      - TRIAGE_PROMPT_LIST_LIMIT
-      - TRIAGE_STALL_DAYS
-      - TRIAGE_SENT_DERIVE_LIMIT
-      - TRIAGE_BATCH_SIZE
-      - TRIAGE_SENT_RECONCILE
-      - TRIAGE_ANSWERED_FOLDER
-      - TRIAGE_NEWS_FOLDER
-      - TRIAGE_NEWS_EXCERPT_CHARS
       - PROJECT_DEADLINE_LEAD_DAYS
       - UPDATER_TIMEOUT
       - PLUGIN_SYNC_INTERVAL
@@ -501,7 +562,7 @@ services:
       # workspace, the chambers, the credential file and the in-container
       # backends are (scripts/entrypoint.sh, scheduler.py, memory.py,
       # claude_auth.py, ara-mcp-server.py, conversation-push.py,
-      # chat-draft.py, recurring-projects.py, triage-gate.py,
+      # chat-draft.py, recurring-projects.py,
       # triage_policy.py, discover-agents.py, emit-conversation-models.py,
       # web-gateway.py, git-serialize.sh). A deployment rarely sets one;
       # listed so that the audit above holds without exception.
@@ -522,9 +583,21 @@ services:
       - CONVERSATION_BACKEND_URL
       - CHAT_DRAFT_BACKEND_URL
       - CONVERSATION_PUSH
-      - EMAIL_CLIENT_PATH
       - TRIAGE_MESSENGER_DIR
       - TRIAGE_EMAIL_WHITELIST_PATH
+      # The one-time migration of e-mail triage onto contacts
+      # (scripts/migrate-triage.py, docs/mail-chats.md): where its marker and
+      # the retired status store live (default /root/.retinue/triage), the
+      # user's own addresses (they get no contact; the same value the mail
+      # gateway reads), a switch that holds the boot run, how long its one
+      # model turn may take, and how long it waits for the mail mirror's
+      # first backfill before it migrates without it (default 21600 s). It
+      # reads MAIL_GATEWAY_TOKEN and MAIL_GATEWAY_BASE_URL, set above.
+      - TRIAGE_STATE_DIR
+      - MAIL_OWN_ADDRESSES
+      - RETINUE_TRIAGE_MIGRATION
+      - MIGRATE_TRIAGE_MODEL_TIMEOUT
+      - MIGRATE_TRIAGE_MIRROR_WAIT
       - WEBAPP_DIR
       - DASHBOARD_DATA_DIR
       - DOCS_DIR
@@ -664,8 +737,10 @@ services:
       # held/forward path it had before). Own-device echoes are the one
       # fire-and-forget call left: nothing is being handed over. Empty to
       # disable the rail entirely. Open unless CHATS_INGEST_TOKEN is set on both
-      # sides — worth setting now that an unauthenticated caller could spend a
-      # model turn and stage a draft.
+      # sides — worth setting once a contact is a VIP or carries an
+      # instruction: an unauthenticated caller could ring the phone in every
+      # mode or start a turn briefed by that instruction (see the retinue
+      # service's CHATS_INGEST_TOKEN).
       - CHATS_INGEST_URL=http://retinue:8080/internal/chats/inbound
       - CHATS_INGEST_TOKEN
       # Required by POST /chats/delete (a chat's erasure, relayed by the
@@ -769,8 +844,10 @@ services:
       # held/forward path it had before). Own-device echoes are the one
       # fire-and-forget call left: nothing is being handed over. Empty to
       # disable the rail entirely. Open unless CHATS_INGEST_TOKEN is set on both
-      # sides — worth setting now that an unauthenticated caller could spend a
-      # model turn and stage a draft.
+      # sides — worth setting once a contact is a VIP or carries an
+      # instruction: an unauthenticated caller could ring the phone in every
+      # mode or start a turn briefed by that instruction (see the retinue
+      # service's CHATS_INGEST_TOKEN).
       - CHATS_INGEST_URL=http://retinue:8080/internal/chats/inbound
       - CHATS_INGEST_TOKEN
       # Required by POST /chats/delete (a chat's erasure, relayed by the
@@ -875,8 +952,10 @@ services:
       # held/forward path it had before). Own-device echoes are the one
       # fire-and-forget call left: nothing is being handed over. Empty to
       # disable the rail entirely. Open unless CHATS_INGEST_TOKEN is set on both
-      # sides — worth setting now that an unauthenticated caller could spend a
-      # model turn and stage a draft.
+      # sides — worth setting once a contact is a VIP or carries an
+      # instruction: an unauthenticated caller could ring the phone in every
+      # mode or start a turn briefed by that instruction (see the retinue
+      # service's CHATS_INGEST_TOKEN).
       - CHATS_INGEST_URL=http://retinue:8080/internal/chats/inbound
       - CHATS_INGEST_TOKEN
       # Required by POST /chats/delete (a chat's erasure, relayed by the
@@ -1097,6 +1176,168 @@ services:
     networks:
       - agents
 
+  # Mail gateway — mirrors one mailbox into the ledger so its threads are chats
+  # (scripts/mail-gateway.py; design: docs/mail-chats.md; operation:
+  # docs/messaging.md, "E-mail (the mail gateway)"). Polls INBOX, Sent and the
+  # archive folder over IMAP, writes one ledger record per mail with every MIME
+  # part kept as a blob, and serves /health, /recent-chats, /threads and the
+  # token-gated /media/<id>. It also writes: /send (a reply, a new mail, an
+  # agent's mail) under EMAIL_SEND_POLICY, with its own pending sends on
+  # /sends, and the mailbox follows the chat (read, archive, delete to the
+  # Trash). And it is mail's delivery gate: a mail that arrives is persisted
+  # undelivered, gated (its group: news / quieted / ignored; its sender: VIP /
+  # instructed / anyone) and offered to the chats rail, which alone decides
+  # whether it rings and — for a VIP or an instructed sender — runs the turn
+  # that works it. A mail the rail did not take is offered again; nothing is
+  # forwarded to triage. News mail is filed to the feed from here.
+  #
+  # Not behind a profile, but opt-in: it mirrors nothing and serves nothing
+  # until MAIL_GATEWAY_TOKEN is set (in .env; compose passes it to both
+  # sides), and the default account's gateway idles where
+  # MESSENGER_BUILTIN_CHANNELS is set without `email`. Until then — and with
+  # no mailbox configured — its /health answers alone and says why, as an
+  # unlinked messenger does. It needs no public route — IMAP is outbound only.
+  mail-gateway:
+    build:
+      context: .
+      dockerfile: mail-gateway/Dockerfile
+      args:
+        RETINUE_BUILD_SHA: ${RETINUE_BUILD_SHA:-}
+    depends_on:
+      - retinue
+    # No env_file: .env holds every secret in the deployment, and this
+    # container needs one of them, the mailbox password. It gets exactly the
+    # variables it reads, named below; value-less entries take their value
+    # from .env as usual.
+    environment:
+      # The mailbox — the variables scripts/email_client.py's Config reads,
+      # the default (unsuffixed) account. A named account is a second service
+      # with MAIL_ACCOUNT_NAME set and its own suffixed variables
+      # (docker-compose.override.example.yml). These credentials ALSO stay on
+      # the retinue service, whose e-mail backend still uses them.
+      - EMAIL_USER
+      - EMAIL_PASS
+      - EMAIL_FROM_NAME
+      - IMAP_HOST
+      - IMAP_PORT
+      - SMTP_HOST
+      - SMTP_PORT
+      - SENT_FOLDER
+      - DRAFTS_FOLDER
+      - SMTP_SAVE_SENT
+      # The send policy, keyed by this account's address as email_client.py
+      # reads it, and the approval links a queued send returns (the slug
+      # defaults to this service's name, as on the other gateways).
+      - EMAIL_SEND_POLICY
+      - SEND_APPROVAL_BASE_URL
+      - SEND_APPROVAL_SLUG
+      # The erase capability: the user's delete presents it before the gateway
+      # moves a chat's mails to the Trash and erases the mirror. Never handed
+      # to a session (scripts/session_env.py). Unset, /chats/delete answers
+      # 503.
+      - CHAT_ERASE_TOKEN
+      # Empty: the default account. A name: read the _<NAME>-suffixed set.
+      - MAIL_ACCOUNT_NAME
+      # The built-in channel set, as on the retinue service: the default
+      # account's gateway idles as not configured when this is set and does
+      # not list `email`. Read from .env — a value set only on the retinue
+      # service in an override does not reach this service.
+      - MESSENGER_BUILTIN_CHANNELS
+      # Every address of the user's that may appear on this mailbox's mail,
+      # comma-separated — the aliases on this mailbox AND the addresses of the
+      # user's other mirrored accounts: never listed as a thread's
+      # participants, never its peer. One value listing all of them serves
+      # every mail gateway (each also knows its own account).
+      - MAIL_OWN_ADDRESSES
+      # Optional tunables (defaults in scripts/mail-gateway.py and
+      # docs/messaging.md): the archive and trash folders, how long a mail the
+      # gateway sent waits for its Sent copy before it counts as gone
+      # (MAIL_SENT_GRACE_SECONDS), the poll interval,
+      # the backfill window in days (0 mirrors only new mail), the backfill's
+      # batch size and the pause between batches, the IMAP socket timeout,
+      # the size caps for one part and one mail, the seconds reading one
+      # mail may take before it is a placeholder, the trim's "wanting"
+      # threshold, the limit on waiting for the e-mail policy file before the
+      # mirror starts (unset or 0: no limit), how many chats /recent-chats
+      # answers, the timeout of the chats rail's POSTs, the size up to which
+      # one attachment travels with the offer of a VIP's or an instructed
+      # sender's mail (MAIL_RAIL_FILE_BYTES; the web gateway's own per-file
+      # cap is CONVERSATION_MAX_ATTACHMENT_BYTES), how long the job of a
+      # turn that works a mail is waited for before the mail is offered again
+      # (MAIL_RAIL_JOB_TIMEOUT), and how long a VIP's or an instructed
+      # sender's mail that arrived unreadable waits for its reading before
+      # it is offered as the placeholder it is (MAIL_UNREAD_OFFER_WAIT).
+      - MAIL_ARCHIVE_FOLDER
+      - MAIL_TRASH_FOLDER
+      - MAIL_JUNK_FOLDER
+      - MAIL_SENT_GRACE_SECONDS
+      - MAIL_POLL_SECONDS
+      - MAIL_BACKFILL_DAYS
+      - MAIL_BACKFILL_BATCH
+      - MAIL_BACKFILL_PAUSE_SECONDS
+      - MAIL_IMAP_TIMEOUT
+      - MAIL_MAX_PART_BYTES
+      - MAIL_MAX_MAIL_BYTES
+      - MAIL_READ_SECONDS
+      - MAIL_TRIM_WANTING_CHARS
+      - MAIL_POLICY_WAIT_SECONDS
+      - MAIL_RECENT_CHATS_MAX
+      - MAIL_RAIL_TIMEOUT
+      - MAIL_RAIL_FILE_BYTES
+      - MAIL_RAIL_JOB_TIMEOUT
+      - MAIL_UNREAD_OFFER_WAIT
+      # News mail: where a mail of a group that is both `news` and `ignored`
+      # is moved once the feed has it. Unset: the archive folder. Set and
+      # EMPTY (MAIL_NEWS_FOLDER= in .env): marked read, left in the INBOX —
+      # which is why this one is passed only when .env names it. And how
+      # much of a mail's text its feed item carries. The retired triage
+      # gate's names for the two, passed the same way: read where the new
+      # name is not set (an upgrade keeps an operator's value; rename it).
+      - MAIL_NEWS_FOLDER
+      - MAIL_NEWS_EXCERPT_CHARS
+      - TRIAGE_NEWS_FOLDER
+      - TRIAGE_NEWS_EXCERPT_CHARS
+      - MAIL_DATA_DIR=/root/.local/share/mail
+      - MAIL_GATEWAY_HTTP_PORT=8096
+      # The operator's opt-in: unset, the gateway neither mirrors nor serves.
+      # The same value as on the retinue service (one line in .env).
+      - MAIL_GATEWAY_TOKEN
+      # Chats rail — as on telegram-gateway above: every mail that arrives is
+      # offered here, and the job of a turn that works one is polled on the
+      # same host. The merge and removal rails are derived from
+      # CHATS_INGEST_URL. Emptied, mail is mirrored and offered to nobody.
+      # The rail takes mail only with a token: CHATS_INGEST_TOKEN where .env
+      # sets one (then on the retinue service too), else MAIL_GATEWAY_TOKEN
+      # above, which both sides already hold.
+      - CHATS_INGEST_URL=http://retinue:8080/internal/chats/inbound
+      - CHATS_INGEST_TOKEN
+      # News rail — as on telegram-gateway above: a mail of a `news` sender or
+      # list is filed to the feed, and starts no chat unless it joins one or
+      # its sender is a VIP or instructed (then it is in its chat as well,
+      # and stays in the INBOX). The endpoint is open
+      # unless NEWS_INGEST_TOKEN is set on both sides. Emptied, the `news`
+      # flag does nothing here and such mail is mirrored like any other.
+      - NEWS_INGEST_URL=http://retinue:8080/internal/news
+      - NEWS_INGEST_TOKEN
+      # The ledger, and the two policy files in it. The retinue side writes
+      # both into chambers/_generated/messenger/email/policy/, which is this
+      # volume's policy/ here: the e-mail group flags (email-policy.nt) and
+      # the sender policy the address book projects (policy.nt: who is a VIP,
+      # who is instructed — read at <store>/policy/policy.nt, as on every
+      # gateway). The first is named explicitly because the two sides see the
+      # volume under different paths (scripts/triage_policy.py,
+      # email_whitelist_path); a deployment that moves the file moves it here
+      # too.
+      - INBOUND_STORE_DIR=/inbound
+      - TRIAGE_EMAIL_WHITELIST_PATH=/inbound/policy/email-policy.nt
+    volumes:
+      # Thread index, mailbox index, outbound notes.
+      - mail-data:/root/.local/share/mail
+      - messenger-email:/inbound
+    restart: unless-stopped
+    networks:
+      - agents
+
   # CalDAV gateway — reads and writes the user's real calendar (see
   # scripts/caldav-gateway.py). Provider-agnostic by design (issue #13): the
   # backend is selected purely by configuration (CALDAV_SERVER_URL/USERNAME/
@@ -1106,8 +1347,8 @@ services:
   #
   # Outbound writes are gated by CALDAV_SEND_POLICY, the same allow/trust/verify
   # model as the messenger gateways, with pending events approvable at /sends.
-  # This gateway is not one of the three hardcoded built-in channels
-  # (signal/whatsapp/telegram); enrol it into /sends the same way an extra
+  # This gateway is not one of the built-in channels
+  # (messenger_gateways.BUILTIN_CHANNELS); enrol it into /sends the same way an extra
   # messenger account is enrolled — by declaring it in MESSENGER_GATEWAYS on the
   # retinue service (see docker-compose.override.example.yml). That mechanism
   # is already channel-agnostic (any base_url exposing /pending-sends + /health
@@ -1240,6 +1481,7 @@ services:
       - /chambers/_generated/messenger/whatsapp
       - /chambers/_generated/messenger/telegram
       - /chambers/_generated/messenger/sms
+      - /chambers/_generated/messenger/email
       # The dashboard threads' life-store summaries (scripts/thread_index.py):
       # created before qlever-life starts watching, so the first summary
       # written into it is indexed (qlever-dir#10).
@@ -1270,6 +1512,7 @@ services:
       - messenger-whatsapp:/data/_generated/messenger/whatsapp:ro
       - messenger-telegram:/data/_generated/messenger/telegram:ro
       - messenger-sms:/data/_generated/messenger/sms:ro
+      - messenger-email:/data/_generated/messenger/email:ro
       # Persist both blue-green index slots so a restart resumes serving the
       # last completed build immediately instead of 502ing for the whole
       # duration of a fresh rebuild (qlever-dir still always rebuilds on
@@ -1362,6 +1605,10 @@ volumes:
   whatsapp-data:
   telegram-data:
   sms-data:
+  # The mail gateway's own state: thread index, mailbox index, outbound notes.
+  # Rebuildable from the ledger if lost (the backfill then re-reads the
+  # mailbox's window), but keep it: the rebuild costs a full mailbox scan.
+  mail-data:
   sms-db:
   # Triage delivery-gate stores — one per inbox-mode messenger gateway. Each holds
   # the gateway-written per-message `.nt` files (messages/) and the Ara-written
@@ -1373,6 +1620,10 @@ volumes:
   messenger-whatsapp:
   messenger-telegram:
   messenger-sms:
+  # The mail gateway's ledger. Besides policy/policy.nt (the channel's sender
+  # policy, from the gate phase) its policy/ holds email-policy.nt, the e-mail
+  # group flags.
+  messenger-email:
   # qlever-life's two blue-green index slots — see the qlever-life service
   # above for why these are persisted.
   life-index-a:
