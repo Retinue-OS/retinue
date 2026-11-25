@@ -318,6 +318,29 @@ def test_gateway(gw: Gateway, out: Path, store: Store):
     check("a summary without its thread is removed", not (out / f"{stray}.nt").exists() and removed == 1)
     check("a second run finds nothing to do", wg._thread_index_reconcile() == (0, 0))
 
+    print("past 500: Load more widens the window without a cap")
+    import uuid
+    before = len(gw.page("archived=1")["conversations"])
+    with wg._conversations_lock:
+        for n in range(501):
+            stamp = f"2020-01-01T00:{n // 60:02d}:{n % 60:02d}+00:00"   # older than the rest
+            wg._save_conv({"id": uuid.uuid4().hex, "title": f"Old {n}", "kind": "chat",
+                           "initiator": "user", "created": stamp, "updated": stamp,
+                           "archived": True, "messages": []})
+    total = before + 501
+    body = gw.page(f"archived=1&limit={total - 1}")
+    check("a window past 500 is honoured, with more to come",
+          len(body["conversations"]) == total - 1 and body["has_more"] is True,
+          f'{len(body["conversations"])} {body["has_more"]}')
+    body = gw.page(f"archived=1&limit={total + 50}")
+    check("the last window reaches the oldest thread",
+          len(body["conversations"]) == total and body["has_more"] is False
+          and body["conversations"][-1]["title"] == "Old 0", f'{len(body["conversations"])}')
+    store.down = True
+    body = gw.page(f"archived=1&limit={total + 50}")
+    check("…from the files too", body["source"] == "files" and len(body["conversations"]) == total)
+    store.down = False
+
 
 def main() -> int:
     tmp = Path(tempfile.mkdtemp(prefix="thread-index-"))

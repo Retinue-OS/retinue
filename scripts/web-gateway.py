@@ -1447,10 +1447,13 @@ CONVERSATION_ATTACHMENTS_DIR.mkdir(parents=True, exist_ok=True)
 # every thread file. Only list fields go there — no message text.
 THREADS_EMIT_DIR = Path(os.environ.get(
     "THREADS_EMIT_DIR", str(CHAMBERS_DIR / "_generated" / "threads")))
-# One page of the Archived list (GET /conversations?archived=1&limit=N): the
-# default and the most one request may ask for.
+# One page of the Archived list (GET /conversations?archived=1&limit=N). No
+# upper bound on `limit`: the Threads page's "Load more" widens one window
+# from the top (limit 50, 100, …) rather than fetching further offsets, so a
+# cap would leave every archived thread past it unreachable — the unpaged
+# list this replaced returned them all. A request costs what it asks for: one
+# store query and the files of the rows it returns.
 ARCHIVED_PAGE_DEFAULT = 50
-ARCHIVED_PAGE_MAX = 500
 # How many store reads one page may take when rows the store still lists turn
 # out deleted or restored (it is seconds behind at most, so one is the rule).
 _ARCHIVED_PAGE_ROUNDS = 5
@@ -22035,7 +22038,7 @@ class Handler(BaseHTTPRequestHandler):
             project = (params.get("project") or [None])[0]
             if scope == "archived" and "limit" in params and not project:
                 # The Archived page, a page at a time (see _archived_page).
-                limit = _page_param(params, "limit", ARCHIVED_PAGE_DEFAULT, 1, ARCHIVED_PAGE_MAX)
+                limit = _page_param(params, "limit", ARCHIVED_PAGE_DEFAULT, 1, 10 ** 9)
                 offset = _page_param(params, "offset", 0, 0, 10 ** 9)
                 self._send_json(200, _archived_page(kind, limit, offset))
                 return
