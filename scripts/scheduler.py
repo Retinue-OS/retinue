@@ -41,15 +41,15 @@ A prompt job may pin the model its `claude -p` session runs on with an optional
 supports `${VAR:-default}` shell-style expansion, so a chamber can default a job
 to a model while letting the deployment override it via one env var — without
 naming the chamber in this framework file. Example:
-  {"id": "triage", "prompt": "...", "model": "${RETINUE_TRIAGE_MODEL:-sonnet}"}
+  {"id": "weekly-review", "prompt": "...", "model": "${RETINUE_REVIEW_MODEL:-sonnet}"}
 
 A job may pin its own wall-clock budget with an optional `"timeout_seconds"`,
 overriding the global SCHEDULER_JOB_TIMEOUT for that job alone. One global
 default cannot fit both a 10-second health check and a catch-all that has to
-work through a whole mailbox: the long job is killed mid-flight every run, and
+work through a whole backlog: the long job is killed mid-flight every run, and
 because it never finishes it never reduces its own backlog, so the next run is
 slower still. Give such a job the budget its work actually needs. Example:
-  {"id": "triage-daily", "command": "...", "interval_seconds": 86400,
+  {"id": "inbox-sweep", "command": "...", "interval_seconds": 3600,
    "timeout_seconds": 3600}
 
 A job may also carry an optional `"retry_after_seconds"`, consulted only when
@@ -74,8 +74,8 @@ the strength of a knob meant for resuming honest work, which is why this is
 not simply `retry_after_seconds` (that one still covers "partial" too, as any
 non-success, for a job that wants one knob for both). Without either, a
 partial run waits its interval like any other. Example:
-  {"id": "triage-daily", "command": "...", "interval_seconds": 86400,
-   "resume_after_seconds": 600}
+  {"id": "memory-compact", "command": "...", "interval_seconds": 604800,
+   "resume_after_seconds": 3600}
 
 A job may instead be timed by the **calendar** (scripts/calendar_trigger.py):
 `at` (a time of day, or a list), with `days` (weekdays, as the focus schedule
@@ -175,7 +175,7 @@ def expand_env(value: str) -> str:
     """Expand `${VAR}` / `${VAR:-default}` against the environment.
 
     Lets a job manifest carry a self-defaulting model reference like
-    `${RETINUE_TRIAGE_MODEL:-sonnet}` — the deployment can override via the env
+    `${RETINUE_REVIEW_MODEL:-sonnet}` — the deployment can override via the env
     var, and with nothing set *or set empty* the default applies, matching real
     shell `:-` semantics (a plain `dict.get` default only fires when the key is
     absent, not when it is present-but-empty). Unknown `${VAR}` with no default

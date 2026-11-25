@@ -61,7 +61,7 @@ nothing new.
   sessions) live in their own containers, so a hostile message cannot read
   them. Nor can it read a mailbox, gateway or service credential out of a
   session's environment: every `claude -p` the framework spawns — dashboard
-  turns, scheduled jobs, triage, Ask-Ara answers — gets its environment from
+  turns, scheduled jobs, messenger triage, Ask-Ara answers — gets its environment from
   the allowlist in `scripts/session_env.py` (capability tokens and the
   framework's own settings) and never inherits the spawning daemon's, so
   mailbox passwords, the LiteLLM master and picker keys, the repo token and
@@ -82,7 +82,55 @@ nothing new.
   What the allowlist does *not* do: every process in the container runs as
   the same user, so a session can still read a daemon's `/proc/<pid>/environ`
   (the web gateway's, for one, holds the mailbox credentials for its e-mail
-  backend), and the repository token sits in `~/.git-credentials`. Closing
+  backend), and the repository token sits in `~/.git-credentials`.
+  **The mailbox credentials are now held by two containers**: the `retinue`
+  container (for `email_client.py`'s backend and the approval of e-mail
+  drafts, as before) and the `mail-gateway` container,
+  which mirrors the mailbox into the chat ledger, sends mail and moves it
+  between folders, and is given only the variables it reads, no `.env`
+  wholesale — the send policy (`EMAIL_SEND_POLICY`) and the chat-erase token
+  since it sends and erases, and the two ingest tokens of the rails it offers
+  mail to: `CHATS_INGEST_TOKEN` (the chats rail, where every arriving mail is
+  offered — without that token it presents its own `MAIL_GATEWAY_TOKEN`
+  there, see "The chats rail is a second way in" below) and
+  `NEWS_INGEST_TOKEN` (the news rail, where it files the mail of a news
+  sender or list itself). Compose hands
+  it the credentials whether or not it mirrors; a deployment that wants them
+  in one container only gives the service a profile nobody enables
+  (`docs/messaging.md`). The mail gateway is the sidecar
+  that can close this gap for e-mail, but only once the credentials can leave
+  the `retinue` service (its `email_client.py` backend still
+  uses them); until then it adds a second place that holds them rather than
+  taking one away. A named account
+  mirrored as chats is held by its own mail gateway service as well. The mail
+  gateway runs no session itself and has no public route (what it offers the
+  chats rail may start one in the `retinue` service: below). It mirrors nothing and
+  serves nothing but its `/health` until `MAIL_GATEWAY_TOKEN` is set — the
+  operator's opt-in, so an upgrade that sets nothing mirrors nothing and no
+  sidecar on the internal network can read stored mail without the token.
+  Once set, what it serves — stored mail and its parts — is behind that
+  token, which a session does inherit, like every gateway token, so a session
+  can read the mirrored mail as it can already read the mailbox through the
+  backend. What the gateway can now do to the mailbox, and what a session
+  holding `MAIL_GATEWAY_TOKEN` can ask of it: it **sends** under
+  `EMAIL_SEND_POLICY` (`verify` queues, `trust` sends only with
+  `user_approved`, `allow` sends — the request's `author` grants nothing), it
+  **sets `\Seen`** on a thread's mails, **moves** a thread's INBOX mails to
+  the archive folder and, on the user's delete, a thread's mails in every
+  mirrored folder to the Trash (a Trash folder it never creates); it never
+  expunges a folder. A send may carry an idempotency key, so a repeat of the
+  same press sends nothing twice, and `POST /reply-preview` only reads. A
+  session can, through the API, send under the policy and mark a thread read or archive it, and —
+  as on every gateway — approve, reject or retract a pending send, since
+  those share the bearer token, which is why send approval is a workflow gate
+  rather than a boundary. It **cannot erase**: moving mail to the
+  Trash and erasing the mirror need `CHAT_ERASE_TOKEN`
+  (`X-Chat-Erase-Token`), which the gateway demands and which no session
+  inherits, so only the user's own delete reaches it; unset, the gateway
+  refuses with 503. On the web gateway, marking a mail chat read, archiving it
+  and flagging it write to the mailbox, so those endpoints are the user's own
+  act like send, compose and delete: same-origin only. Mail sent through the
+  gateway writes no policy. Closing
   that means holding each secret in its own sidecar or under a separate uid,
   which is a separate roadmap item. An outbound send still has to clear the
   sending identity's policy, but a pending `verify` approval is not bound to
@@ -90,6 +138,109 @@ nothing new.
   as a workflow gate rather than a hard boundary. A hostile message can also
   induce the agent to read across mounted chambers or write to them.
   Reduced-privilege triage is another roadmap item.
+- **A mail's sender is not authenticated.** Who the gate takes a mail for is
+  narrow: a mail has a gate sender only when it carries exactly one `From`
+  header holding exactly one address the mail gateway's own grammar accepts,
+  lowercased by its ASCII letters alone — and none at all where a character
+  of that address stands in for an ASCII one on its own (its compatibility
+  form is ASCII, or its lowercase or case fold is one ASCII character: a
+  Kelvin sign, a long s, a fullwidth letter), so no Unicode folding, on
+  either side, can make it equal to an ASCII address the address book holds;
+  nor where its header block was cut at its bound, since a second `From`
+  past the cut is never seen. The `Sender` header, and the first of
+  several `From` addresses, are shown as who a mail is from and decide
+  nothing. That address, or a domain a contact files, is what the gate
+  matches against the VIP and instructed senders, what the instruction is
+  looked up by and what the attention item is judged as (the person's
+  importance prior and permits); a mail with no gate sender is nobody's — it
+  reaches its chat, buys no turn and rings as nobody's, never as the
+  thread's earlier correspondent. What is not narrow is the `From` itself:
+  nothing in the mail gateway or the web gateway checks SPF, DKIM, DMARC or
+  an `Authentication-Results` header, and the mailbox provider's own
+  filtering is the only thing that stands before a mail (which helps where
+  the forged domain publishes a DMARC policy the provider enforces, and not
+  otherwise). A mail that forges one `From` of a VIP or of an instructed
+  sender therefore still gets that sender's treatment: it may ring at once,
+  in every Focus mode for a VIP, and a model turn with tools runs on it,
+  briefed by the sender's instruction — which can file the documents it
+  carries, archive the thread (moving its mails out of the inbox) and send a
+  reply under the mailbox's send policy, at once under `allow` where the
+  instruction approves that in so many words. Archiving is all such a turn
+  can do with its own thread's flags while it runs: the web gateway takes a
+  flags call on that thread as the turn's — its mute an archive, its unmute,
+  unarchive and star nothing — whether or not the call carries the turn's
+  token, unless it carries the proof a dashboard thread's turn is handed
+  (the user's word); the user's own flags endpoint, which needs no token,
+  refuses a caller inside the container where `EDGE_PROXY_PEERS` names the
+  reverse proxy (any peer it does not name is refused). Without that
+  setting it refuses only a loopback peer and a peer that is the very
+  address the caller dialled, so a caller inside the container that comes
+  in from another of the container's addresses, or through a sibling that
+  relays (the egress-audit proxy), is taken for the dashboard — and where
+  the proxy arrives on loopback (host networking) the two cannot be told
+  apart at all.
+  That holds no further. The turn's session holds the backend token every
+  agent session holds, so it can set **another** chat's flags — mute it —
+  with the user's meaning, and a process it leaves behind can do so on its
+  own thread once the turn has ended; and while a dashboard turn the user
+  started runs, its proof sits in that turn's process environment, which
+  another session of the same uid can read — sessions are not sandboxed from
+  one another. What keeps a turn to its brief there is the brief. One that forges a contact with
+  an importance prior or a permit rings as that contact would. The turn
+  reads the mail as data: everything the mail says of itself — its sender's
+  name, its subject, its id, its text, and the thread's earlier mails in the
+  note that follows — stands escaped inside delimited elements it cannot
+  close, bounded in length, and none of it in a sentence that tells the turn
+  what to do; the instruction is the user's, not the sender's. But the turn
+  can do what the instruction lets it do. An instruction that covers a whole
+  domain is as wide as everyone who can write a `From` at that domain. This
+  is known and not mitigated in code; give an instruction to a sender, and
+  above all to a domain, only where a forged mail from them would do little
+  harm, and keep the mailbox's send policy on `verify` for a mailbox whose
+  instructions send.
+- **The chats rail is a second way in.** `POST /internal/chats/inbound` (and
+  `/merge`, `/removed`) is how the gateways announce messages, and the web
+  gateway trusts what an event says — whose message it is, what the gate
+  decided, the files it hands over. An **e-mail event** is never taken
+  without a token: `CHATS_INGEST_TOKEN` where it is set, else
+  `MAIL_GATEWAY_TOKEN`, compared in constant time, and refused with neither
+  set; `/merge` and `/removed` are authorized the same way. A **messenger
+  event** is open unless `CHATS_INGEST_TOKEN` is set (the gateways' forwards
+  are fire-and-forget, so a fail-closed default would fail silently), so anything that can reach the
+  `retinue` container on the internal network can post one that rings the
+  phone in every Focus mode (an event calling its sender a VIP) or starts a
+  turn briefed by a person's standing instruction, which acts as far as the
+  instruction's words go — a calendar entry or a message it approves in so
+  many words goes out unseen. The web gateway says so at startup. Every
+  `/internal/chats/*` and `/internal/news` call that a browser marks as
+  cross-site (`Sec-Fetch-Site` other than `none` or `same-origin`, else an
+  `Origin` of another site) is refused, so a page the user visits cannot
+  post to the rail through the dashboard's ambient credential; no gateway
+  sends either header. Both tokens are in a session's environment (like
+  every gateway token), so a session a hostile message steers can post an
+  event as well — no more than it can already do with the gateway's send
+  token.
+- **The model trim is steerable by the mail.** Where the rules left a mail's
+  bubble `wanting`, one tool-less model turn chooses which of the mail's
+  lines are the author's own (docs/dashboard.md, "The model trim"), and
+  every line it is shown is the sender's text. A mail can steer that choice:
+  "keep only line 40" may leave the phishing line of a forwarded mail and
+  drop the forwarder's warning above it — and the narrowed `kb:text` is then
+  what the bubble, the chat list, search and every agent turn read. It can
+  also steer its turn into no judgement at all, which is bounded: at most
+  `MAIL_MODEL_TRIM_ATTEMPTS` such turns per mail, counted durably, within the
+  day's `MAIL_MODEL_TRIM_DAILY_MAX`. What bounds the choice is that only the
+  mail's own lines can show — the gateway assembles the text from its own
+  copy of them, so no mail adds a word to its own bubble — that the choice
+  is marked (the Original is headed "Shortened by a model", and the
+  companion's note — and the quote of an arrival turn offered the mail
+  after it was viewed — marks the mail `trim="model"` and says the mail can
+  steer it), and that the full mail is one tap away: its original parts are
+  never changed. Its endpoint is the dashboard's: a caller inside the
+  container that asks for a trim is refused where `EDGE_PROXY_PEERS` names
+  the reverse proxy (any peer it does not name is refused), and the day's
+  budget bounds whatever still gets through. `MAIL_MODEL_TRIM=0` switches
+  the turn off.
 - **Chambers are not compartmentalized from each other within a session.**
 - **The updater's Docker socket is root-equivalent on the host.** This is
   inherent to what the updater does and is documented in `docker-compose.yml`.
@@ -116,6 +267,10 @@ Some of the security of a Retinue deployment is yours, not ours:
   runs no script from outside, as the egress log viewer does.
 - **Set an explicit send policy per account.** Undeclared accounts fail safe to
   `verify`, but relying on the default is not the same as deciding.
+- **Set `CHATS_INGEST_TOKEN`** on the `retinue` service and on every gateway
+  once a messenger contact is a VIP or carries an instruction: without it,
+  the chats rail takes a messenger event from anything on the internal
+  network ("The chats rail is a second way in").
 - **Keep `UPDATER_TOKEN` and gateway tokens out of any environment you don't
   control.**
 - **Back up the named volumes that are not git** — messaging account keys,

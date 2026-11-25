@@ -8,9 +8,12 @@ so the discovery lives here instead of being duplicated.
 
 The built-in channels enrol when their ``*_GATEWAY_BASE_URL`` is set
 **and** their name is listed in ``MESSENGER_BUILTIN_CHANNELS`` (comma-separated
-subset of ``signal``, ``whatsapp``, ``telegram``, ``sms`` — defaults to all of
-them; SMS then still needs its base URL, see below). ``docker-compose.yml``
-wires the first three ``*_GATEWAY_BASE_URL`` vars unconditionally, so a deployment that never runs
+subset of ``signal``, ``whatsapp``, ``telegram``, ``sms``, ``email`` — defaults
+to all of them; SMS then still needs its base URL, see below). E-mail's gateway
+is the mail gateway, enrolled by ``MAIL_GATEWAY_BASE_URL`` — the one built-in
+whose variables are not named after its channel. ``docker-compose.yml``
+wires the Signal, WhatsApp, Telegram and mail ``*_GATEWAY_BASE_URL`` vars
+unconditionally, so a deployment that never runs
 one of the built-in gateway containers at all (not even unpaired) would
 otherwise still enrol a gateway pointed at a host that doesn't exist —
 indistinguishable, by URL alone, from that same container having crashed. Such
@@ -19,7 +22,7 @@ a deployment names only the channels it actually runs, e.g.
 registry entirely — same as a chamber that was never mounted — with no need to
 separately blank their base URLs. A deployment adds any further gateways
 (extra accounts, extra channels) via ``MESSENGER_GATEWAYS`` — a JSON array of
-``{base_url, token?, label?}`` objects. The slug (the ``/sends/<slug>/<id>``
+``{base_url, token?, label?, channel?}`` objects. The slug (the ``/sends/<slug>/<id>``
 URL segment, also used on ``/gateways``) is the **Docker service hostname**
 from ``base_url``, verbatim (``http://signal-gateway-personal:8090`` →
 ``signal-gateway-personal``). The
@@ -36,6 +39,24 @@ deployment that sets it — an unset base URL keeps it out of the registry the
 same way for every channel. ``MESSENGER_BUILTIN_CHANNELS``, when set, still
 has the final say: a deployment that names its channels explicitly names
 ``sms`` among them to enrol it.
+
+E-mail is the fifth, and wired by default like the first three: the mail
+gateway runs in every deployment, and one with no mailbox configured answers
+``configured: false`` and idles, as an unlinked messenger does — skipped by
+every consumer, never an outage.
+
+Every registry entry is ``{base_url, token, label, channel}``. ``channel`` is
+the chat channel the gateway serves (``signal``, ``email``, …), stated because
+it cannot always be read off the slug: the e-mail channel's gateway is the
+service ``mail-gateway``, and a deployment names its extra accounts as it
+likes. The built-ins carry their own; an extra carries the ``channel`` key of
+its ``MESSENGER_GATEWAYS`` object, lowercased, or ``None`` when it declares
+none (the calendar gateway serves no chat channel) — a reader then falls back
+to reading the slug and the label, as it did before the field existed. The
+registry never guesses a channel from a name: a wrong guess would route a
+chat to a gateway that cannot hold it, where ``None`` merely leaves the
+reader's own fallback in charge. A mail account added as an extra must
+therefore say ``"channel": "email"``.
 
 Older links used shortened slugs (``signal``, ``signal-personal`` — the
 hostname with the redundant ``-gateway`` infix dropped); ``resolve()`` still
@@ -111,22 +132,45 @@ def _extra_channel_gateways(log_prefix: str) -> dict:
         if not slug:
             print(f"{log_prefix} could not derive a slug for {base_url}, skipping", flush=True)
             continue
+        channel = entry.get("channel")
+        if channel is not None and not isinstance(channel, str):
+            print(f"{log_prefix} MESSENGER_GATEWAYS entry {base_url}: 'channel' must be a "
+                  f"string, ignoring {channel!r}", flush=True)
+            channel = None
         out[slug] = {
             "base_url": base_url,
             "token": str(entry.get("token", "")).strip(),
             "label": str(entry.get("label", "")).strip() or slug.replace("-", " ").title(),
+            "channel": (channel or "").strip().lower() or None,
         }
     return out
 
 
 # The built-in channels this deployment actually runs. Comma-separated subset
-# of "signal", "whatsapp", "telegram", "sms"; unset means all of them (and SMS
-# then enrols exactly when SMS_GATEWAY_BASE_URL is set, which the base compose
-# does not do). Lets a deployment that never starts one of the built-in gateway
-# containers drop it from the registry with one variable, instead of having to
-# blank that channel's *_GATEWAY_BASE_URL to the same effect. The full tuple
-# is also the set of channel names a registry slug is read against.
-BUILTIN_CHANNELS = ("signal", "whatsapp", "telegram", "sms")
+# of "signal", "whatsapp", "telegram", "sms", "email"; unset means all of them
+# (and SMS then enrols exactly when SMS_GATEWAY_BASE_URL is set, which the base
+# compose does not do). Lets a deployment that never starts one of the built-in
+# gateway containers drop it from the registry with one variable, instead of
+# having to blank that channel's *_GATEWAY_BASE_URL to the same effect. The
+# full tuple is also the set of channel names a registry slug is read against
+# (the web gateway's slug → channel fallback, for an entry with no channel).
+# The mail gateway reads the same variable (compose passes it from .env): its
+# default account idles as not configured when the variable is set and leaves
+# `email` out, so a deployment that pinned its channel set before e-mail was
+# one runs no unenrolled mirror. A named mail account, enrolled through
+# MESSENGER_GATEWAYS, is not affected.
+BUILTIN_CHANNELS = ("signal", "whatsapp", "telegram", "sms", "email")
+
+# Each built-in: its channel, the prefix of its *_GATEWAY_BASE_URL and
+# *_GATEWAY_TOKEN variables, and its label. The prefix is the channel's name
+# for every messenger, and MAIL for e-mail, whose gateway is the mail gateway.
+_BUILTINS = (
+    ("signal", "SIGNAL", "Signal"),
+    ("whatsapp", "WHATSAPP", "WhatsApp"),
+    ("telegram", "TELEGRAM", "Telegram"),
+    ("sms", "SMS", "SMS"),
+    ("email", "MAIL", "E-mail"),
+)
 
 
 def _enabled_builtin_channels() -> set:
@@ -146,23 +190,16 @@ def channel_gateways(log_prefix: str = "[messenger-gateways]") -> dict:
     to.
     """
     enabled = _enabled_builtin_channels()
-    registry = {
-        slug_from_base_url(base_url): {"base_url": base_url, "token": token, "label": label}
-        for name, base_url, token, label in (
-            ("signal", os.environ.get("SIGNAL_GATEWAY_BASE_URL", "").rstrip("/"),
-             os.environ.get("SIGNAL_GATEWAY_TOKEN", "").strip(),
-             "Signal"),
-            ("whatsapp", os.environ.get("WHATSAPP_GATEWAY_BASE_URL", "").rstrip("/"),
-             os.environ.get("WHATSAPP_GATEWAY_TOKEN", "").strip(),
-             "WhatsApp"),
-            ("telegram", os.environ.get("TELEGRAM_GATEWAY_BASE_URL", "").rstrip("/"),
-             os.environ.get("TELEGRAM_GATEWAY_TOKEN", "").strip(),
-             "Telegram"),
-            ("sms", os.environ.get("SMS_GATEWAY_BASE_URL", "").rstrip("/"),
-             os.environ.get("SMS_GATEWAY_TOKEN", "").strip(),
-             "SMS"),
-        )
-        if name in enabled and base_url and slug_from_base_url(base_url)
-    }
+    registry = {}
+    for channel, prefix, label in _BUILTINS:
+        base_url = os.environ.get(f"{prefix}_GATEWAY_BASE_URL", "").rstrip("/")
+        if channel not in enabled or not base_url or not slug_from_base_url(base_url):
+            continue
+        registry[slug_from_base_url(base_url)] = {
+            "base_url": base_url,
+            "token": os.environ.get(f"{prefix}_GATEWAY_TOKEN", "").strip(),
+            "label": label,
+            "channel": channel,
+        }
     registry.update(_extra_channel_gateways(log_prefix))
     return registry

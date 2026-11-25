@@ -9,14 +9,14 @@ retinue gateway with ``async: true``. The answer is **202 Accepted** carrying a
 ``job_url`` — acceptance, not completion. Flipping the message's ``delivered``
 flag on that 202 therefore asserts something that has not happened yet: if the
 job's model turn later fails (an upstream outage, a crashed session), the
-message is on record as delivered, the daily ``GET /undelivered`` drain skips
+message is on record as delivered, the ``GET /undelivered`` recovery drain skips
 it, and nothing ever looks at it again. The message is silently lost — which is
 precisely the failure the never-drop invariant exists to prevent.
 
 So the flag is flipped only when ``GET <job_url>`` reports ``status: "done"``.
 Every other outcome — ``status: "error"``, a 404 (the in-memory job record
 expired before the turn finished), or the poll deadline running out — leaves
-``delivered=False``, which is exactly what the daily drain reads to retry. The
+``delivered=False``, which is exactly what the recovery drain reads to retry. The
 bias stays at-least-once: a duplicate triage beats a lost message.
 
 Polling runs on a daemon thread, so a triage turn that takes minutes never

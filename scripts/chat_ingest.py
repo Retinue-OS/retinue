@@ -23,10 +23,16 @@ another.
 **Inbound events are synchronous, because the caller needs the answer.** An
 arrival is offered to the rail with ``handover``, and what comes back decides
 what the gateway does next: an acceptance means the chat has the message and
-the gateway marks it delivered; a job handle with it means a VIP's message is
-also being worked, and the gateway waits for that job first; neither means the
-rail could not take it — switched off, unreachable, an older web-gateway — and
-the caller falls back to everything it did before the chat surface existed.
+the gateway marks it delivered; a job handle with it means a VIP's or an
+instructed sender's message is also being worked, and the gateway waits for
+that job first; neither means the rail could not take it — switched off,
+unreachable, an older web-gateway — and the caller falls back to everything
+it did before the chat surface existed. The mail gateway has no such fallback
+(docs/mail-chats.md, "The gate"): a mail the rail did not accept stays
+undelivered in its ledger and is offered here again on a later poll, as often
+as it takes. The web-gateway takes each message once, by its ``message_id``,
+so a repeated offer rings nothing twice and only starts the turn a message is
+still owed.
 
 :func:`notify_chat_event_async` remains for the events with no answer worth
 waiting for — the own-device echoes that advance a read watermark. It runs the
@@ -80,6 +86,11 @@ def notify_chat_event(
     gate: dict | None = None,
     files: list[dict] | None = None,
     handover: bool = False,
+    subject: str | None = None,
+    participants: list[dict] | None = None,
+    peer: dict | None = None,
+    backfill: bool = False,
+    seen: bool = False,
     timeout: float = 3.0,
 ) -> dict | None:
     """Synchronous rail POST; returns the answer body, or None if it failed.
@@ -100,9 +111,10 @@ def notify_chat_event(
     before the answer was lost, and treating that as "did not land" would have
     the caller forward the same message to triage as well — two turns racing
     over one draft, and a dashboard conversation the switch exists to stop. The
-    caller must neither confirm delivery nor fall back on it: leaving the
-    message undelivered hands it to the daily drain, which is where an unknown
-    outcome belongs.
+    caller must neither confirm delivery nor fall back on it: the message
+    stays undelivered, which is where an unknown outcome belongs — a
+    messenger gateway's recovery (``GET /undelivered``) finds it there, and
+    the mail gateway offers it to the rail again on a later poll.
 
     ``direction`` is ``in`` for an arrival, ``out`` for an outbound echo (the
     user's own send from another device). ``account`` is this gateway's own
@@ -117,7 +129,10 @@ def notify_chat_event(
     group exactly as in a 1:1. ``files``
     are the message's attachments in the ``POST /message`` shape
     (``{"filename", "content_type", "data"}``, base64) so a turn started there
-    can open them; they ride along only for a forwarded message.
+    can open them; they ride along only for a message that buys a turn — a
+    VIP's or an instructed sender's. For a mail the turn is told how many
+    of the ``attachments`` it was not handed, so the caller leaves out what
+    is too large rather than the whole list.
 
     ``handover`` is the caller's offer: *if you take this message, I will not
     forward it to triage myself.* Only a call that makes that offer is accepted
@@ -126,6 +141,23 @@ def notify_chat_event(
     starting a turn on its event would have the message handled twice. During
     a rollout where the web-gateway is rebuilt before the gateways, the absent
     offer is what keeps the old behaviour whole instead of doubling it.
+
+    Five fields are a mail thread's (docs/mail-chats.md) and are sent only
+    where given, so a messenger event is byte for byte what it was. A mail
+    chat is named by its subject — ``chat_name`` is the thread's — and says
+    who is in it beside that: ``subject`` is this mail's own subject,
+    ``participants`` the thread's people as ``[{"address", "name"}]`` and
+    ``peer`` the one it is with (the latest inbound sender, or the first
+    recipient of a thread the user started). A mail that just arrived is
+    offered like a message — with its ``gate`` verdict (``forward`` false for
+    a quieted or ignored group, ``vip`` and ``instructed`` for the sender, by
+    address or by domain) and ``handover``. ``backfill`` marks a mail the
+    mirror is catching up on rather than one that just arrived: the chat
+    takes it without pushing, starting a turn or bringing an archived chat
+    back. ``seen``, with it, says the mailbox had the mail marked read
+    already, which is where the chat's read mark starts from. Like every
+    event it may be delivered more than once and is taken once, by its
+    ``message_id`` — which a backfilled mail therefore always carries.
     Never raises.
     """
     if not CHATS_INGEST_URL:
@@ -152,6 +184,16 @@ def notify_chat_event(
         "files": files or None,
         "handover": True if handover else None,
     }
+    # The mail fields, only where a caller gave them.
+    if subject is not None:
+        payload["subject"] = subject
+    if participants is not None:
+        payload["participants"] = participants
+    if peer is not None:
+        payload["peer"] = peer
+    if backfill:
+        payload["backfill"] = True
+        payload["seen"] = bool(seen)
     body = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
         CHATS_INGEST_URL,

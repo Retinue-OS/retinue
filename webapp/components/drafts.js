@@ -21,9 +21,13 @@
 // browser. A draft nobody came back to within a month is dropped.
 //
 // A key names a place: `conv:<thread id | new | new:<project>>` (the
-// conversation composer), `chat:<chat id>` (a messenger chat's composer),
-// `project-cmd:<id>` and `project-edit:<id>` (a project's command bar and
-// raw editor).
+// conversation composer), `chat:<chat id>` (a chat's composer),
+// `chat-unsure:<chat id>` (the mails of a mail chat that were handed over
+// and never confirmed — not a draft, but words that are in no other place
+// until they are accounted for), `compose:<channel>` and
+// `compose:<channel>:<mailbox>` (the new-mail sheet: which mailboxes hold a
+// kept mail, and each one's mail), `project-cmd:<id>` and
+// `project-edit:<id>` (a project's command bar and raw editor).
 
 const PREFIX = 'retinue-draft:';
 const MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;

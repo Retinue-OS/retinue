@@ -14,8 +14,8 @@ That combination is covered in tests/test_signal_send_policy.py and, end to
 end, in tests/test_chat_api.py.
 
 What is covered here is the second, lesser layer: POST /chats/<id>/send and the
-/sends approve action refuse a request that did not arrive through the reverse
-proxy, decided on the TCP peer address and failing closed on anything it cannot
+/sends approve action — and a chat's delete and its flags — refuse a request
+that did not arrive through the reverse proxy, decided on the TCP peer address and failing closed on anything it cannot
 classify, and one another site's page made the browser send through it
 (Sec-Fetch-Site). This was once meant to be the guarantee and is not — the endpoint's
 old justification ("it sits behind the edge auth") was simply false, since that
@@ -49,6 +49,8 @@ SCRIPTS_DIR = REPO_ROOT / "scripts"
 
 CHAT = "signal:+41794456312"
 GW_SEEN: list = []
+# What the gateway was asked besides a send: (path, body).
+GW_OTHER: list = []
 
 
 class _MockGateway(BaseHTTPRequestHandler):
@@ -76,6 +78,13 @@ class _MockGateway(BaseHTTPRequestHandler):
     def do_POST(self):
         length = int(self.headers.get("Content-Length", 0))
         payload = json.loads(self.rfile.read(length).decode("utf-8"))
+        if self.path.rstrip("/") != "/send":
+            # As every messenger gateway answers a route it does not have —
+            # the mailbox hooks among them (POST /chats/read after a reply):
+            # a messenger has no mailbox, and says so.
+            GW_OTHER.append((self.path, payload))
+            self._json(404, {"error": "not found"})
+            return
         GW_SEEN.append(payload)
         self._json(200, {"status": "sent", "message_id": "1", "ts": 1756000000.0})
 
@@ -247,6 +256,36 @@ def test_delete_from_inside_the_container_is_refused(base, wg):
     print("PASS test_delete_from_inside_the_container_is_refused")
 
 
+def test_flags_from_inside_the_container_are_refused(base, wg):
+    """A chat's archive, mute and star on POST /chats/<id>/flags are the
+    user's own, like a send (decision AT): from inside the container the
+    call is refused and changes nothing — an agent has the internal
+    endpoint (scripts/chat-flags.py), whose rules decide who it is — and
+    through the reverse proxy it is the user's, as it always was. A
+    messenger chat's endpoint is the same handler as a mail thread's."""
+    GW_SEEN.clear()
+    for sent in ({"archived": True}, {"muted": True}, {"starred": True},
+                 {"archived": False, "muted": False}):
+        status, body = _http(base, "POST", f"/chats/{_quote(CHAT)}/flags", sent)
+        assert status == 403, (sent, status, body)
+        answer = json.loads(body)
+        assert "reverse proxy" in answer["error"] and "loopback" in answer["detail"], answer
+        assert "chat-flags.py" in answer["remedy"], answer
+        doc = wg._CHAT_STATE.get(CHAT)
+        assert not (doc.get("archived") or doc.get("muted") or doc.get("starred")), doc
+    saved = wg._EDGE_PEER_NETS
+    try:
+        wg._EDGE_PEER_NETS = wg._parse_edge_peers("127.0.0.1")
+        for starred in (True, False):
+            status, body = _http(base, "POST", f"/chats/{_quote(CHAT)}/flags",
+                                 {"starred": starred})
+            assert status == 200 and json.loads(body)["starred"] is starred, (status, body)
+    finally:
+        wg._EDGE_PEER_NETS = saved
+    assert GW_SEEN == [], GW_SEEN
+    print("PASS test_flags_from_inside_the_container_are_refused")
+
+
 def test_approving_a_pending_send_is_refused(base, wg):
     """Otherwise an agent queues its own send and approves it."""
     status, body = _http(base, "POST", "/sends/signal-gateway/deadbeef/approve")
@@ -280,6 +319,13 @@ def test_dashboard_send_still_works(base, wg):
     # carries nothing that asks the gateway to skip its policy.
     assert sent["author"] == "user", sent
     assert "edge_verified" not in sent and "user_approved" not in sent, sent
+    # A reply is passed on to the chat's gateway as "read" (the mailbox
+    # hook, generic by contract). A messenger gateway has no such route:
+    # its 404 is no error, the send stands, and it is not asked again for a
+    # while.
+    wg._mailbox_wait()
+    assert GW_OTHER == [("/chats/read", {"chat": "+41794456312", "account": ""})], GW_OTHER
+    assert not wg._mailbox_owed, "a gateway without a mailbox is owed nothing"
     print("PASS test_dashboard_send_still_works")
 
 
@@ -308,14 +354,35 @@ def test_another_sites_request_is_refused(base, wg):
             status, body = _http(base, "POST", f"/chats/{_quote(CHAT)}/delete",
                                  None, cross)
             assert status == 403, (site, status, body)
+            # The read mark and the flags are the user's word about their
+            # chat too — and, on a mail chat, reach the real mailbox — and
+            # so is taking a failed send out of it.
+            for path, sent in (("read", {}), ("flags", {"archived": True, "muted": True}),
+                               ("pending/deadbeef/dismiss", {})):
+                status, body = _http(base, "POST", f"/chats/{_quote(CHAT)}/{path}", sent, cross)
+                assert status == 403, (site, path, status, body)
+                assert json.loads(body)["error"] == "cross-site request rejected", body
+            doc = wg._CHAT_STATE.get(CHAT)
+            assert not doc.get("archived") and not doc.get("muted"), doc
         assert GW_SEEN == [], "a gateway was asked to act for another site"
         # The dashboard's own page still sends.
         status, body = _http(base, "POST", f"/chats/{_quote(CHAT)}/send",
                              {"text": "geht raus"}, {"Sec-Fetch-Site": "same-origin"})
         assert status == 200, (status, body)
+        # Starting a conversation is the user's own act too.
+        compose = {"channel": "email", "to": ["a@x.org"], "subject": "s", "text": "t"}
+        status, body = _http(base, "POST", "/chats/compose", compose,
+                             {"Sec-Fetch-Site": "cross-site"})
+        assert status == 403 and json.loads(body)["error"] == "cross-site request rejected", body
     finally:
         wg._EDGE_PEER_NETS = saved
+    # ... and, like a send, only through the reverse proxy.
+    status, body = _http(base, "POST", "/chats/compose", compose)
+    assert status == 403 and "reverse proxy" in json.loads(body)["error"], (status, body)
     assert len(GW_SEEN) == 1, GW_SEEN
+    # The second reply's hook found the gateway known to have no mailbox.
+    wg._mailbox_wait()
+    assert len(GW_OTHER) == 1, GW_OTHER
     print("PASS test_another_sites_request_is_refused")
 
 
@@ -334,6 +401,7 @@ def main():
         try:
             test_send_from_inside_the_container_is_refused(base, wg)
             test_delete_from_inside_the_container_is_refused(base, wg)
+            test_flags_from_inside_the_container_are_refused(base, wg)
             test_approving_a_pending_send_is_refused(base, wg)
             test_dashboard_send_still_works(base, wg)
             test_another_sites_request_is_refused(base, wg)

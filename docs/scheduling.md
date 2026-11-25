@@ -105,8 +105,8 @@ code **75** (sysexits' `EX_TEMPFAIL`) to say "this slice is done, more remains".
 The scheduler records that as `status: "partial"` — logged as `[partial]`, not
 `[fail]`. A job pairs it with `"resume_after_seconds"`: after a partial run it
 is due again after that many seconds rather than after its full interval. That
-is how the e-mail triage sweep drains a backlog: each run takes the oldest
-`TRIAGE_BATCH_SIZE` messages, records what it did, and comes back for the rest,
+is how `memory-compact` drains a backlog: each run writes at most its per-run
+cap of topic summaries, records what it did, and comes back for the rest,
 so no single run has to fit the whole backlog into one budget.
 `resume_after_seconds` is consulted for `partial` **only**. It is deliberately
 not `retry_after_seconds`: a run whose model session *fails* must not be
@@ -114,15 +114,16 @@ re-spawned every few minutes on a knob meant for resuming honest work, and a
 day of ten-minute retries of a failing session is a lot of credits. (A
 `partial` run is still "not success", so `retry_after_seconds` alone also
 brings it forward, for a job that wants one knob for both.) A job with neither
-simply waits its interval. The framework's own base manifest carries no such
-job; a chamber opts its e-mail sweep in, for example:
+simply waits its interval. The framework's base manifest carries one such job,
+and a chamber's own command job may opt in the same way:
 
 ```json
 {
-  "id": "triage-daily",
-  "command": "python3 /workspace/scripts/triage-gate.py daily",
-  "interval_seconds": 86400,
-  "resume_after_seconds": 600
+  "id": "memory-compact",
+  "command": "python3 /workspace/scripts/memory-compact.py",
+  "interval_seconds": 604800,
+  "resume_after_seconds": 3600,
+  "timeout_seconds": 3600
 }
 ```
 
@@ -135,9 +136,9 @@ slices and `resume_after_seconds` where the work divides.
 
 ```json
 {
-  "id": "triage-daily",
-  "command": "python3 /workspace/scripts/triage-gate.py daily",
-  "interval_seconds": 86400,
+  "id": "inbox-sweep",
+  "command": "python3 /workspace/scripts/inbox-sweep.py",
+  "interval_seconds": 3600,
   "timeout_seconds": 3600
 }
 ```
@@ -204,10 +205,17 @@ manifest** at `/workspace/.schedule.json` for cross-cutting jobs that belong to
 the framework itself rather than any single chamber. A chamber manifest cannot
 shadow a base job id (first-seen wins).
 
+**A retired job: e-mail triage.** Chambers used to declare jobs that ran
+`scripts/triage-gate.py frequent` / `daily`. E-mail triage is retired — mail
+is mirrored and gated on arrival by the mail gateway (docs/mail-chats.md) —
+and the script is a stub that prints a one-line notice and exits 0, so a job
+still declared succeeds and does nothing. Remove such jobs from the chamber's
+`.schedule.json`; `scripts/migrate-triage.py` reports the ones it finds.
+
 ## Agent self-review (proactivity over own backlog)
 
-Every other scheduled job is **reactive** — it fires on inbound mail, an inbound
-message, or a calendar date. Nothing wakes an agent to work down projects where
+Every other scheduled job is **reactive** — it fires on something that
+arrived (a file in an inbox, a feed to fetch), or on a calendar date. Nothing wakes an agent to work down projects where
 the ball is already in *its* court, so such a project stays invisible until a
 human pokes it. The **`agent-self-review`** base job closes that gap.
 

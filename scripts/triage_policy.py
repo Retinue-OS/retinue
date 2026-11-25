@@ -1,47 +1,50 @@
 #!/usr/bin/env python3
-"""Triage delivery-gate policy: e-mail whitelist, VIP senders, group flags as N-Triples.
+"""Delivery-gate policy: VIP and instructed senders, group flags as N-Triples.
 
-This is the single source of truth for *who is worth a model turn* in the triage
-delivery gate (see `docs/triage-delivery-gate.md`). It is deliberately
-stdlib-only so the messenger gateways can import a byte-identical copy and read
-policy straight off their mounted volume, without the ~15 s SPARQL reindex lag on
-their classify hot path.
+This is the single source of truth for *who is worth a model turn* in the
+delivery gate (see `docs/triage-delivery-gate.md`, and `docs/mail-chats.md` for
+mail). It is deliberately stdlib-only so the gateways can import a
+byte-identical copy and read policy straight off their mounted volume, without
+the ~15 s SPARQL reindex lag on their classify hot path.
 
 Two kinds of policy live here:
 
-  * **E-mail whitelist** — exact addresses (auto-derived from the Sent folder) and
-    hand-added `*@domain` / `*@*.domain` wildcards. Only exact addresses are ever
-    auto-added; a whole domain is trusted only when someone writes the wildcard.
-    That is what keeps freemail safe: sending to one `person@gmail.com` whitelists
-    that address, never all of `gmail.com`.
   * **E-mail groups** — the e-mail counterpart of the messenger *group* flags,
     on the same three orthogonal axes (``news`` / ``quieted`` / ``ignored``).
     What plays the part of a messenger group is the **mailing list**: a mail's
     group id is its ``List-Id`` (RFC 2919) when it carries a usable one, and
     otherwise its own sender address, so a listless newsletter is simply a group
-    of one. Membership takes the same two shapes as the whitelist (an exact
-    entry, a `*@domain` wildcard) and the same matcher, extended so a wildcard's
-    domain also covers a `List-Id` under it — `*@substack.com` therefore matches
-    both `no-reply@substack.com` and the list `sgcarney.substack.com`.
+    of one. Membership takes two shapes — an exact entry, or a `*@domain` /
+    `*@*.domain` wildcard — and a wildcard's domain also covers a `List-Id`
+    under it: `*@substack.com` therefore matches both `no-reply@substack.com`
+    and the list `sgcarney.substack.com`.
 
     The three flags mean:
 
       - ``news`` — the group is a broadcast source: its mail is filed into the
-        news feed for the Herald to score. Independent of everything below; a
-        mail can be news *and* triaged.
-      - ``ignored`` — a mail from this group never reaches triage at all.
-      - ``quieted`` — a mail from this group is triaged, but only by the daily
-        sweep, never by the frequent run. On a pull channel that is already the
-        default for an unflagged group, so declaring it changes no behaviour; it
-        is the explicit opposite of ``ignored``, worth stating on a ``news``
-        group to record that this list is read *and* answered.
+        news feed for the Herald to score, and starts no chat. Independent of
+        the two below.
+      - ``quieted`` / ``ignored`` — the group's mail is shown in its chat
+        silently: it notifies nobody. The two differ where the group is also
+        ``news``: an ``ignored`` news mail is consumed once the feed has it
+        (the mail gateway marks it seen and moves it out of the INBOX), a
+        ``quieted`` one stays where it arrived — a list one both reads and
+        answers.
 
-    The whitelist is the sender-level axis and wins over the group flags, the
-    way the messenger side's VIP axis wins over its group: mail from a
-    whitelisted address is triaged immediately whatever list it arrived on.
-    ``news`` membership is checked against the group id *and* the sender address,
-    so address-level entries written before list detection keep working.
-  * **Messenger policy** — per channel, on two orthogonal axes. There is no
+    The sender axis is independent of the group flags, as on a messenger: a
+    VIP's or an instructed sender's mail is worked whatever list it arrived
+    on. ``news`` membership is checked against the group id *and* the sender
+    address, so address-level entries written before list detection keep
+    working.
+
+    There is no e-mail whitelist any more. It decided which mail e-mail
+    triage worked at once; e-mail triage is retired, mail is gated like a
+    messenger message (the sender axis below, on the ``email`` channel), and
+    what the whitelist knew lives in instructions on contacts
+    (docs/mail-chats.md, "What retires").
+  * **Messenger policy** — per channel, on two orthogonal axes; ``email`` is
+    one of the channels for the **sender** axis (its group axis is the e-mail
+    groups above, in a file of their own). There is no
     sender whitelist or blacklist here: every message reaches the user through
     the chat surface, and a chat they want off their screen is archived or muted
     in the dashboard, not decided by a policy file.
@@ -52,6 +55,10 @@ Two kinds of policy live here:
         sender can be **instructed**: the user wrote a brief for the person,
         each message of theirs is worked by it, and the verdict of that turn
         decides whether the message rings (a VIP rings regardless).
+        A handle is compared exactly — except on ``email``, where a handle
+        may also be a `*@domain` / `*@*.domain` wildcard (a contact's
+        domain) and a sender matches an exact address or falls under one.
+        On every other channel such a string is just a handle nobody has.
       - **Group** (three independent flags): ``news`` — its messages are also
         forwarded to the news feed (Herald), a rail parallel to the chat;
         ``quieted`` — the message is stored and shown but nothing is owed to a
@@ -66,29 +73,28 @@ triggers a qlever-dir rebuild, and the very same file the gateway reads raw is
 indexed in the life store for `who is a VIP?` queries.
 
 The retinue side writes, the gateways read. There are two writers there: Ara,
-through this module's CLI (and the Sent-folder derivation in triage-gate.py),
-and the web gateway, which projects the address book's VIPs on every contact
-write and on its tick (:func:`sync_contacts`). Every read-modify-write holds
-the file's :func:`policy_lock`, so neither can drop the other's change. The
-`_generated` paths are framework-owned, in no chamber's git repo.
+through this module's CLI, and the web gateway, which projects the address
+book's VIPs on every contact write and on its tick (:func:`sync_contacts`).
+Every read-modify-write holds the file's :func:`policy_lock`, so neither can
+drop the other's change. The `_generated` paths are framework-owned, in no
+chamber's git repo.
 
 **Contact-owned members.** A person filed in the address book
 (`scripts/contacts.py`, docs/contacts.md) can be a VIP; the person, not a
 handle, is then the truth, and :func:`sync_contacts` projects every handle of
-every VIP person into these files — messenger accounts as VIP handles, e-mail
-addresses as whitelisted addresses — and every messenger handle of every
-person who carries an instruction as an instructed handle. They are written under a subject of their
-own (``…:contacts``), so the projection is rewritten wholesale without touching
-what was set by hand or learned from the Sent folder, and a reader that does
-not know the split (a gateway built before it) still sees every member: the
-loaders read the predicate and ignore the subject.
+every VIP person into the channels' policy files as VIP handles — messenger
+accounts, and on ``email`` their addresses and domain wildcards — and every
+handle of every person who carries an instruction as an instructed handle.
+They are written under a subject of their own (``…:contacts``), so the
+projection is rewritten wholesale without touching what was set by hand, and
+a reader that does not know the split (a gateway built before it) still sees
+every member: the loaders read the predicate and ignore the subject.
 """
 
 from __future__ import annotations
 
 import argparse
 import contextlib
-import email.utils
 import fcntl
 import os
 import re
@@ -99,8 +105,6 @@ from pathlib import Path
 KB = "https://w3id.org/retinue/kb#"
 
 # Predicates. One flat subject per policy file, repeated predicates for members.
-P_ADDRESS = KB + "triageWhitelistAddress"
-P_WILDCARD = KB + "triageWhitelistWildcard"
 # E-mail group flags. The news pair keeps its original `…Address` names because
 # policy files already carry them; it is a *group* predicate now like the other
 # two, since a listless sender's group id is its own address. The quieted and
@@ -114,8 +118,12 @@ P_NEWS_WILDCARD = KB + "triageNewsWildcard"
 # entry at all. The blacklist said "do not bother me about this person", which is
 # muting their chat — a thing the user does in the interface, on the chat, where
 # they are looking at it. Both are simply no longer read; existing triples in a
-# policy file are inert and drop out on the next write. E-mail keeps its own
-# whitelist (P_ADDRESS / P_WILDCARD), which still decides frequent-vs-daily.
+# policy file are inert and drop out on the next write.
+# Retired on e-mail with e-mail triage: triageWhitelistAddress /
+# triageWhitelistWildcard, and the address book's projection into them under
+# the subject `…email-whitelist:contacts`. Not read either, and gone from the
+# e-mail policy file on its next write; scripts/migrate-triage.py moves what
+# they held onto contacts, reading the file raw.
 # The VIP axis: a person whose message is worked by a model the moment it
 # arrives, wherever it arrives. Keyed on the sender and only on the sender, so
 # it holds in a group exactly as in a 1:1 — being one of forty people in a room
@@ -146,27 +154,32 @@ P_BLOCKED_GROUP = KB + "triageBlockedGroup"
 EMAIL_SUBJECT = "urn:retinue:triage:email-whitelist"
 # The messenger channels the framework runs gateways for.
 MESSENGER_CHANNELS = ("signal", "whatsapp", "telegram", "sms")
+# Mail's channel: gated on the sender axis like a messenger (its policy file
+# is messenger_policy_path("email"), read by the mail gateway), and the one
+# channel whose handles may be domain wildcards.
+EMAIL_CHANNEL = "email"
 # The subject suffix of the contact-owned members (see the module docstring).
 CONTACTS_SUFFIX = ":contacts"
 
-# The loaded e-mail policy: the whitelist pair plus one (exact, wildcard) pair
-# per group flag. One file holds all four classes, so every write goes through
-# save_email_policy() — a writer that renders only some of them erases the rest.
-# The group pairs default to empty for callers written before the group axis
-# landed, which makes a short positional call a silent eraser exactly as the
-# news arguments already were: construct from `_replace` or name every field.
+# The loaded e-mail policy: one (exact, wildcard) pair per group flag. One file
+# holds all three classes, so every write goes through save_email_policy() — a
+# writer that renders only some of them erases the rest. Every field defaults
+# to empty, so `EmailPolicy()` is the empty policy. Name the fields you set (or
+# `_replace`), never pass them by position: the tuple lost its two leading
+# whitelist fields, and a positional caller written before that would now put
+# its sets under the wrong flags.
 EmailPolicy = namedtuple(
     "EmailPolicy",
-    "addresses wildcards news news_wildcards "
-    "quieted quieted_wildcards ignored ignored_wildcards contact_addresses",
-    defaults=(frozenset(),) * 7,
+    "news news_wildcards quieted quieted_wildcards ignored ignored_wildcards",
+    defaults=(frozenset(),) * 6,
 )
 
 # The loaded messenger policy: the three group-flag sets plus the sender sets
 # that still decide anything — VIP, set by hand (`vip`) or projected from the
 # VIP persons of the address book (`vip_contacts`), a sender being a VIP if
 # either says so; and the handles of the persons who carry an instruction
-# (`instructed_contacts`, projected only).
+# (`instructed_contacts`, projected only). On the `email` channel a member of
+# a sender set may be a `*@domain` wildcard.
 MessengerPolicy = namedtuple("MessengerPolicy",
                              "ignored quieted news vip vip_contacts instructed_contacts",
                              defaults=(frozenset(), frozenset()))
@@ -179,12 +192,120 @@ def _channel_subject(channel: str) -> str:
 CHAMBERS_DIR = Path(os.environ.get("CHAMBERS_DIR") or "/workspace/chambers")
 
 
+def _messenger_root() -> Path:
+    base = os.environ.get("TRIAGE_MESSENGER_DIR")
+    return Path(base) if base else (CHAMBERS_DIR / "_generated" / "messenger")
+
+
 def email_whitelist_path() -> Path:
-    """Where the e-mail whitelist `.nt` lives (retinue side, indexed by qlever)."""
-    return Path(
-        os.environ.get("TRIAGE_EMAIL_WHITELIST_PATH")
-        or (CHAMBERS_DIR / "_generated" / "triage" / "email-whitelist.nt")
-    )
+    """Where the e-mail policy `.nt` lives: the e-mail group flags.
+
+    The function and its override variable keep the name of the whitelist the
+    file once also held, because deployments and the mail gateway's compose
+    service name the variable.
+
+    On the mail gateway's ledger volume, in its ``policy/`` folder beside the
+    one ``messenger_policy_path("email")`` names, because the mail gateway
+    reads the group flags at ingest and mounts no other part of the retinue
+    side (docs/mail-chats.md). qlever indexes it there like every messenger
+    policy. ``TRIAGE_EMAIL_WHITELIST_PATH`` overrides the path, and is how the
+    gateway container, which sees the volume at ``/inbound``, names the same
+    file. The file used to live at :func:`legacy_email_policy_path`;
+    :func:`ensure_email_policy_location` moves it.
+    """
+    override = os.environ.get("TRIAGE_EMAIL_WHITELIST_PATH")
+    if override:
+        return Path(override)
+    return _messenger_root() / "email" / "policy" / "email-policy.nt"
+
+
+def legacy_email_policy_path() -> Path:
+    """Where the e-mail policy lived before the mail gateway had to read it."""
+    return CHAMBERS_DIR / "_generated" / "triage" / "email-whitelist.nt"
+
+
+def ensure_email_policy_location(path: Path | None = None,
+                                 legacy: Path | None = None) -> dict:
+    """Make sure the e-mail policy file exists where it now lives.
+
+    Retinue side only: the gateway never writes policy. Holds the policy lock
+    of the new file (and of the old one, so a writer still on the old path
+    cannot slip a change in between) and then, in this order:
+
+      * the new file exists — nothing to do. If the old one exists too and
+        differs, the new one wins and the old is left alone and reported: it
+        may hold a flag the new one lacks, which only a person can judge, and
+        deleting it would lose that. The same bytes in both is a move that
+        crashed after its write; the old one is then removed.
+      * only the old file exists — its content moves to the new path (one
+        atomic write there; the volumes differ, so it is a copy) and the old
+        file is removed only after the new one is in place: a crash between
+        the two leaves both, which the case above resolves.
+      * neither exists — the new file is created empty, so a reader can tell
+        "no flags" (an empty file) from "not set up yet" (no file); the mail
+        gateway waits on the latter before its first backfill.
+
+    The old path is moved only when ``TRIAGE_EMAIL_WHITELIST_PATH`` is unset:
+    an explicit path is the operator's statement of where the file lives, and
+    the default location is then not this function's to empty. Idempotent.
+    Returns ``{"path", "action": "present" | "moved" | "created",
+    "legacy_left": <old path> | None}``; raises OSError when the new path
+    cannot be written (the caller reports it).
+    """
+    explicit = path is not None or bool(os.environ.get("TRIAGE_EMAIL_WHITELIST_PATH"))
+    path = Path(path) if path is not None else email_whitelist_path()
+    if legacy is not None:
+        old = Path(legacy)
+    elif explicit:
+        old = None
+    else:
+        old = legacy_email_policy_path()
+    if old is not None and old.resolve() == path.resolve():
+        old = None
+    with contextlib.ExitStack() as locks:
+        locks.enter_context(policy_lock(path))
+        if old is not None and old.exists():
+            locks.enter_context(policy_lock(old))
+        if path.exists():
+            left = None
+            if old is not None and old.exists():
+                # The same bytes on both sides is a move that crashed after
+                # its write: finishing it loses nothing.
+                if old.read_bytes() == path.read_bytes():
+                    old.unlink()
+                else:
+                    left = str(old)
+            return {"path": str(path), "action": "present", "legacy_left": left}
+        if old is not None and old.exists():
+            # Bytes, not text: the file moves exactly as it is, whatever it
+            # holds — this is a move, not a rewrite.
+            _atomic_write_bytes(old.read_bytes(), path)
+            old.unlink()
+            return {"path": str(path), "action": "moved", "legacy_left": None}
+        _atomic_write_bytes(b"", path)
+        return {"path": str(path), "action": "created", "legacy_left": None}
+
+
+def _email_policy_read_path() -> Path:
+    """The file a default read of the e-mail policy reads.
+
+    The new location, except while it does not exist yet and the old one
+    still does, before :func:`ensure_email_policy_location` has run: a reader
+    then sees the policy that is in force, never an empty one, and a writer
+    that loads, changes and saves to the new path carries the old flags
+    along instead of stranding them. An explicit path is read as given."""
+    path = email_whitelist_path()
+    if os.environ.get("TRIAGE_EMAIL_WHITELIST_PATH") or path.exists():
+        return path
+    old = legacy_email_policy_path()
+    return old if old.exists() else path
+
+
+def _atomic_write_bytes(data: bytes, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_bytes(data)
+    tmp.replace(path)
 
 
 def messenger_policy_path(channel: str) -> Path:
@@ -246,11 +367,20 @@ def _unescape(value: str) -> str:
     return "".join(out)
 
 
-def _parse(path: Path) -> list[tuple[str, str, str]]:
-    """Parse our own deterministic N-Triples into (subject, predicate, literal)."""
+def _parse(path: Path, *, strict: bool = False) -> list[tuple[str, str, str]]:
+    """Parse our own deterministic N-Triples into (subject, predicate, literal).
+
+    A file that cannot be read is an empty policy — unless ``strict``, where
+    only a file that is not there is: one that is there and will not open
+    then raises, for a caller that has to tell "no policy" from "no answer".
+    """
     try:
         text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return []
     except OSError:
+        if strict:
+            raise
         return []
     triples: list[tuple[str, str, str]] = []
     for line in text.splitlines():
@@ -293,56 +423,37 @@ def write_if_changed(content: str, path: Path) -> bool:
 
 
 # --------------------------------------------------------------------------- #
-# E-mail whitelist                                                            #
+# E-mail policy: the group flags                                             #
 # --------------------------------------------------------------------------- #
 
 def load_email_policy(path: Path | None = None) -> EmailPolicy:
-    """Return the whole e-mail policy: whitelist pair + one pair per group flag."""
-    path = path or email_whitelist_path()
-    buckets: dict[str, set[str]] = {
-        key: set() for key in
-        ("addresses", "wildcards", "news", "news_wildcards",
-         "quieted", "quieted_wildcards", "ignored", "ignored_wildcards")
-    }
+    """Return the whole e-mail policy: one (exact, wildcard) pair per group
+    flag. Triples of the retired whitelist that a file still holds are not
+    read."""
+    path = path or _email_policy_read_path()
+    buckets: dict[str, set[str]] = {key: set() for key in EmailPolicy._fields}
     by_predicate = {
-        P_ADDRESS: "addresses",
-        P_WILDCARD: "wildcards",
         P_NEWS_ADDRESS: "news",
         P_NEWS_WILDCARD: "news_wildcards",
         P_QUIETED_GROUP: "quieted",
         P_QUIETED_WILDCARD: "quieted_wildcards",
         P_IGNORED_GROUP: "ignored",
         P_IGNORED_WILDCARD: "ignored_wildcards",
-        # A policy file written before the ignored/quieted split spelled "never
-        # reaches triage" this way; read it as `ignored` so it keeps its meaning.
+        # A policy file written before the ignored/quieted split spelled its
+        # one "blocked" flag this way; read it as `ignored` so it keeps its
+        # meaning.
         P_BLOCKED_GROUP: "ignored",
     }
-    buckets["contact_addresses"] = set()
-    for subj, pred, lit in _parse(path):
-        low = lit.strip().lower()
+    for _subj, pred, lit in _parse(path):
+        low = lit.strip().translate(_ASCII_LOWER)
         key = by_predicate.get(pred)
-        if key == "addresses" and subj.endswith(CONTACTS_SUFFIX):
-            key = "contact_addresses"
         if low and key:
             buckets[key].add(low)
     return EmailPolicy(**buckets)
 
 
-def load_email_whitelist(path: Path | None = None) -> tuple[set[str], set[str]]:
-    """Return (exact addresses, wildcards), both lower-cased.
-
-    The whitelist half of :func:`load_email_policy`, kept because that is all
-    the frequent gate's hot path needs. **Never pair it with a write** — see
-    :func:`save_email_policy`.
-    """
-    pol = load_email_policy(path)
-    return pol.addresses | pol.contact_addresses, pol.wildcards
-
-
 def render_email_policy(pol: EmailPolicy) -> str:
     pairs = (
-        (P_ADDRESS, pol.addresses),
-        (P_WILDCARD, pol.wildcards),
         (P_NEWS_ADDRESS, pol.news),
         (P_NEWS_WILDCARD, pol.news_wildcards),
         (P_QUIETED_GROUP, pol.quieted),
@@ -351,22 +462,8 @@ def render_email_policy(pol: EmailPolicy) -> str:
         (P_IGNORED_WILDCARD, pol.ignored_wildcards),
     )
     lines = [_triple(EMAIL_SUBJECT, pred, v) for pred, values in pairs for v in values]
-    lines += [_triple(EMAIL_SUBJECT + CONTACTS_SUFFIX, P_ADDRESS, v) for v in pol.contact_addresses]
     lines.sort()
     return "".join(line + "\n" for line in lines)
-
-
-def render_email_whitelist(addresses: set[str], wildcards: set[str], *rest) -> str:
-    """Render a policy file from its parts, in :class:`EmailPolicy` field order.
-
-    Every class beyond the two required ones defaults to empty, which makes a
-    short positional call a **silent eraser** of the classes it omits. Nothing in
-    this repo may call it that way: go through :func:`save_email_policy`, which
-    round-trips the whole policy.
-    """
-    return render_email_policy(
-        EmailPolicy(set(addresses), set(wildcards), *(set(r) for r in rest))
-    )
 
 
 def save_email_policy(pol: EmailPolicy, path: Path | None = None) -> bool:
@@ -383,21 +480,11 @@ def _domain_matches_wildcard(domain: str, wildcard: str) -> bool:
     if pattern.startswith("*."):
         base = pattern[2:]
         # A subdomain wildcard also covers the apex, so `*@*.epfl.ch` trusts both
-        # alice@epfl.ch and bob@cs.epfl.ch — the friendlier reading for a
-        # whitelist.
+        # alice@epfl.ch and bob@cs.epfl.ch — the friendlier reading, and the
+        # one contacts.py gives a person's `*.domain` (its _domain_rank): the
+        # two must agree on who a wildcard covers.
         return domain == base or domain.endswith("." + base)
     return domain == pattern
-
-
-def email_whitelisted(addr: str, addresses: set[str], wildcards: set[str]) -> bool:
-    """True if `addr` is an exact whitelist entry or falls under a wildcard."""
-    low = (addr or "").strip().lower()
-    if not low or "@" not in low:
-        return False
-    if low in addresses:
-        return True
-    domain = low.split("@", 1)[1]
-    return any(_domain_matches_wildcard(domain, w) for w in wildcards)
 
 
 def email_news_sender(addr: str, news: set[str], news_wildcards: set[str]) -> bool:
@@ -406,7 +493,7 @@ def email_news_sender(addr: str, news: set[str], news_wildcards: set[str]) -> bo
     The address-keyed special case of :func:`email_group_member`, kept because
     that is all a caller holding only a sender address needs.
     """
-    low = (addr or "").strip().lower()
+    low = (addr or "").strip().translate(_ASCII_LOWER)
     if not low or "@" not in low:
         return False
     return email_group_member(low, news, news_wildcards)
@@ -432,7 +519,7 @@ def email_list_id(raw: str) -> str:
     if not value:
         return ""
     match = _LIST_ID_BRACKETED.search(value)
-    candidate = (match.group(1) if match else value).strip().lower()
+    candidate = (match.group(1) if match else value).strip().translate(_ASCII_LOWER)
     if not candidate or len(candidate) > 200:
         return ""
     if any(c.isspace() for c in candidate) or "." not in candidate:
@@ -448,20 +535,20 @@ def email_group_id(list_id: str, sender: str) -> str:
     stated about a newsletter that carries no ``List-Id`` just as about a real
     list, with no second mechanism.
     """
-    return email_list_id(list_id) or (sender or "").strip().lower()
+    return email_list_id(list_id) or (sender or "").strip().translate(_ASCII_LOWER)
 
 
 def email_group_member(group: str, entries: set[str], wildcards: set[str]) -> bool:
     """True if `group` is in a class, by exact entry or by domain wildcard.
 
-    For an address-shaped group the wildcard is matched exactly as in the
-    whitelist, against the part after the `@`. For a `List-Id` group the id
+    For an address-shaped group the wildcard is matched against the part
+    after the `@` (:func:`_domain_matches_wildcard`). For a `List-Id` group the id
     *is* the domain, and a wildcard also covers ids **beneath** it: a List-Id is
     a namespace a platform hands out per publication, so `*@substack.com` reads
     as "that platform" and has to catch `sgcarney.substack.com` too, without
     thereby trusting a mailbox at that subdomain.
     """
-    low = (group or "").strip().lower()
+    low = (group or "").strip().translate(_ASCII_LOWER)
     if not low:
         return False
     if low in entries:
@@ -482,34 +569,26 @@ def email_gate_decision(
     pol: EmailPolicy | None = None,
     path: Path | None = None,
 ) -> dict:
-    """Route one inbound e-mail against the policy — the pull-side twin of
-    :func:`gate_decision`.
+    """Place one inbound e-mail on the **group axis** of the policy.
 
-    Returns a dict with:
+    The sender axis — VIP, instructed — is :func:`gate_decision` on the
+    ``email`` channel; the mail gateway asks both (docs/mail-chats.md, "The
+    gate"). Returns a dict with:
 
-    - ``triage_now`` — worth a model turn on the frequent run.
-    - ``daily`` — reaches triage on the daily sweep.
-    - ``news`` — file it into the news feed for the Herald. Independent of both
-      of the above: a mail can be news-only, news-and-triaged, or neither.
-    - ``group`` / ``reason`` — the group id it was keyed on, and a short label.
+    - ``group`` — the group id the mail was keyed on: its ``List-Id``, else
+      its sender address.
+    - ``news`` — the group is a news source: file the mail into the feed for
+      the Herald. Independent of the two below.
+    - ``ignored`` / ``quieted`` — the group's attention flag: the chat shows
+      the mail silently. At most one is true; a group a file puts in both
+      classes (an exact entry in one, a wildcard in the other) reads as
+      ``ignored``, the order this function has always decided in.
 
-    Triage rail (the news rail is orthogonal, driven only by group ∈ news):
-
-    | class                     | triage_now | daily |
-    |---------------------------|------------|-------|
-    | whitelisted sender        | yes        | yes   |
-    | unknown, ignored group    | no         | no    |
-    | unknown, quieted group    | no         | yes   |
-    | unknown, normal group     | no         | yes   |
-
-    The last two rows are deliberately identical: on a pull channel the daily
-    sweep already *is* the quiet tier, so ``quieted`` changes nothing by itself.
-    It earns its keep as the explicit opposite of ``ignored`` — "in the feed
-    **and** in the triage" for a list one both reads and writes to, stated so
-    the intent survives someone later wondering why that list carries no flag.
+    Nothing here says whether the mail is worth a model turn: that is the
+    sender's doing alone, whatever group the mail arrived on.
     """
     pol = pol if pol is not None else load_email_policy(path)
-    addr = (sender or "").strip().lower()
+    addr = (sender or "").strip().translate(_ASCII_LOWER)
     group = email_group_id(list_id, addr)
     # News is checked against the group *and* the bare sender address so an
     # address-level entry written before list detection keeps matching mail that
@@ -517,56 +596,64 @@ def email_gate_decision(
     news = (email_group_member(group, pol.news, pol.news_wildcards)
             or email_news_sender(addr, pol.news, pol.news_wildcards))
 
-    if email_whitelisted(addr, pol.addresses | pol.contact_addresses, pol.wildcards):
-        dec = {"triage_now": True, "daily": True, "reason": "whitelisted"}
-    elif email_group_member(group, pol.ignored, pol.ignored_wildcards):
-        dec = {"triage_now": False, "daily": False, "reason": "group-ignored"}
-    elif email_group_member(group, pol.quieted, pol.quieted_wildcards):
-        dec = {"triage_now": False, "daily": True, "reason": "group-quieted"}
-    else:
-        dec = {"triage_now": False, "daily": True, "reason": "unknown"}
-
-    dec["news"] = news
-    dec["group"] = group
-    return dec
-
-
-def recipients_from_sent(messages: list[dict]) -> set[str]:
-    """Extract every recipient address from a Sent-folder listing.
-
-    `messages` is the `messages` array from `email_client.py list`, each carrying
-    `to`/`cc`/`bcc` as raw address-list headers.
-    """
-    out: set[str] = set()
-    for msg in messages:
-        for field in ("to", "cc", "bcc"):
-            raw = msg.get(field)
-            if not raw:
-                continue
-            for _name, addr in email.utils.getaddresses([raw]):
-                addr = (addr or "").strip().lower()
-                if addr and "@" in addr:
-                    out.add(addr)
-    return out
+    ignored = email_group_member(group, pol.ignored, pol.ignored_wildcards)
+    quieted = not ignored and email_group_member(group, pol.quieted, pol.quieted_wildcards)
+    return {"group": group, "news": news, "quieted": quieted, "ignored": ignored}
 
 
 # --------------------------------------------------------------------------- #
 # Messenger policy                                                            #
 # --------------------------------------------------------------------------- #
 
+_ASCII_LOWER = str.maketrans("ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz")
+
+
 def _norm_handle(handle: str) -> str:
     # Phone numbers/JIDs are case-insensitive digits; usernames case-insensitive.
-    return (handle or "").strip().lower()
+    # Only ASCII letters are folded: a full Unicode lowercasing would turn a
+    # sender's KELVIN SIGN (U+212A) into "k", so that a mail from "<U+212A>ate@…"
+    # matched the VIP kate@… — a class is never reached by a look-alike.
+    return (handle or "").strip().translate(_ASCII_LOWER)
+
+
+# A mail sender a domain wildcard may be matched against: one "@", and nothing
+# an address cannot hold — the shape contacts.py files an address in, so the
+# address book finds the person behind every sender the gate matched by domain.
+_EMAIL_SENDER_RE = re.compile(r'^[^@\s<>"]+@([^@\s<>"]+)$')
+
+
+def _sender_member(channel: str, sender: str, handles) -> bool:
+    """Whether a sender is in a sender class (``handles``) of a channel.
+
+    Exact, case-insensitive membership — and on the ``email`` channel also by
+    domain: a member spelled `*@domain` / `*@*.domain` covers every address
+    under it (:func:`_domain_matches_wildcard`). Only there: a messenger
+    handle is opaque, and the same string in a messenger's policy is a handle
+    like any other, which no sender has.
+    """
+    low = _norm_handle(sender)
+    if not low:
+        return False
+    if low in handles:
+        return True
+    if channel != EMAIL_CHANNEL:
+        return False
+    match = _EMAIL_SENDER_RE.match(low)
+    if not match:
+        return False
+    domain = match.group(1)
+    return any(h.startswith("*@") and _domain_matches_wildcard(domain, h) for h in handles)
 
 
 def load_messenger_policy(
-    channel: str, path: Path | None = None
+    channel: str, path: Path | None = None, *, strict: bool = False
 ) -> MessengerPolicy:
     """Return a :class:`MessengerPolicy` for one channel.
 
     The legacy ``triageBlockedGroup`` predicate is folded into ``ignored`` so a
     policy file written before the news/quieted/ignored split keeps its old
-    behaviour (blocked == never reaches triage).
+    behaviour (blocked == never reaches triage). ``strict`` raises for a file
+    that exists and cannot be read (:func:`_parse`).
     """
     path = path or messenger_policy_path(channel)
     ignored: set[str] = set()
@@ -575,7 +662,7 @@ def load_messenger_policy(
     vip: set[str] = set()
     vip_contacts: set[str] = set()
     instructed: set[str] = set()
-    for subj, pred, lit in _parse(path):
+    for subj, pred, lit in _parse(path, strict=strict):
         val = lit.strip()
         if not val:
             continue
@@ -663,6 +750,17 @@ def gate_decision(
 
     ``enabled=False`` forwards everything (the gate turned off). May raise if the
     policy file is present but unreadable; the caller decides fail-open.
+
+    **Mail** (``channel="email"``) is gated on the sender axis here and on the
+    group axis by :func:`email_gate_decision`, whose flags live in a file of
+    their own; the caller reads ``vip`` and ``instructed`` off this answer.
+    A sender matches an exact address, then a domain wildcard
+    (:func:`_sender_member`). And an unreadable policy does not raise there:
+    the answer is nobody special — ``vip`` and ``instructed`` false, reason
+    ``policy-unreadable`` for the caller to log. A messenger gateway fails
+    open because a message it cannot classify must still reach the user,
+    which costs one turn; a mail reaches the chat either way, and must not
+    buy a model turn because a file could not be read.
     """
     if not enabled:
         # The gate off has always meant "forward everything", i.e. every message
@@ -675,11 +773,17 @@ def gate_decision(
         # VIP's instruction off the address book itself.
         return {"forward": True, "delivered_if_held": True, "news": False,
                 "vip": True, "instructed": False, "reason": "gate-disabled"}
-    pol = load_messenger_policy(channel, path=path)
+    try:
+        pol = load_messenger_policy(channel, path=path, strict=channel == EMAIL_CHANNEL)
+    except Exception:  # noqa: BLE001 - whatever made the file unreadable
+        if channel != EMAIL_CHANNEL:
+            raise
+        return {"forward": True, "delivered_if_held": True, "news": False,
+                "vip": False, "instructed": False, "reason": "policy-unreadable"}
     grp = group_id.strip() if group_id else None
     news = bool(grp and grp in pol.news)
-    vip = _norm_handle(sender) in (set(pol.vip) | set(pol.vip_contacts))
-    instructed = _norm_handle(sender) in pol.instructed_contacts
+    vip = _sender_member(channel, sender, set(pol.vip) | set(pol.vip_contacts))
+    instructed = _sender_member(channel, sender, pol.instructed_contacts)
 
     if grp and grp in pol.ignored:
         dec = {"forward": False, "delivered_if_held": True,
@@ -696,43 +800,54 @@ def gate_decision(
     return dec
 
 
-def _mutate_email(*args, **kwargs) -> None:
+def _ensure_before_write() -> None:
+    """Place the e-mail policy file before a retinue-side write of it.
+
+    Outside the lock the write then takes (flock does not nest across two
+    opens, even in one process). Best effort: the write reports its own
+    failure."""
+    try:
+        ensure_email_policy_location()
+    except OSError:
+        pass
+
+
+def _mutate_email(**kwargs) -> None:
+    _ensure_before_write()
     with policy_lock(email_whitelist_path()):
-        _mutate_email_locked(*args, **kwargs)
+        _mutate_email_locked(**kwargs)
 
 
-def _mutate_email_locked(add_addresses=(), add_wildcards=(), remove=(),
-                  news_add=(), news_remove=(),
-                  quiet_add=(), quiet_remove=(),
-                  ignore_add=(), ignore_remove=()) -> None:
-    """Add/remove e-mail policy entries, preserving every class not touched.
+def _mutate_email_locked(*, news_add=(), news_remove=(),
+                         quiet_add=(), quiet_remove=(),
+                         ignore_add=(), ignore_remove=()) -> None:
+    """Add/remove e-mail group flags, preserving every class not touched.
 
-    Every group-flag argument sorts each entry by shape — a leading `*@` makes it
-    a wildcard, anything else an exact entry (an address or a `List-Id`) — so the
+    Every argument sorts each entry by shape — a leading `*@` makes it a
+    wildcard, anything else an exact entry (an address or a `List-Id`) — so the
     caller passes what the user said ("*@substack.com", "sgcarney.substack.com")
-    without picking a subcommand per shape.
+    without picking a subcommand per shape. Keyword-only: the three leading
+    positional arguments were the whitelist's mutations, and a caller still
+    passing them must fail loudly rather than flag a group.
     """
     pol = load_email_policy()
     sets = {name: set(getattr(pol, name)) for name in EmailPolicy._fields}
 
     def _add(entries, exact_key, wildcard_key):
         for entry in entries:
-            e = entry.strip().lower()
+            e = entry.strip().translate(_ASCII_LOWER)
             if e:
                 sets[wildcard_key if e.startswith("*@") else exact_key].add(e)
 
     def _drop(entries, *keys):
         for entry in entries:
-            e = entry.strip().lower()
+            e = entry.strip().translate(_ASCII_LOWER)
             for key in keys:
                 sets[key].discard(e)
 
-    sets["addresses"] |= {a.strip().lower() for a in add_addresses if a.strip()}
-    sets["wildcards"] |= {w.strip().lower() for w in add_wildcards if w.strip()}
     _add(news_add, "news", "news_wildcards")
     _add(quiet_add, "quieted", "quieted_wildcards")
     _add(ignore_add, "ignored", "ignored_wildcards")
-    _drop(remove, "addresses", "wildcards")
     _drop(news_remove, "news", "news_wildcards")
     _drop(quiet_remove, "quieted", "quieted_wildcards")
     _drop(ignore_remove, "ignored", "ignored_wildcards")
@@ -788,24 +903,36 @@ def messenger_policy_channels() -> list[str]:
         return []
 
 
-def sync_contacts(vip_handles: dict[str, set[str]], emails: set[str],
+def sync_contacts(vip_handles: dict[str, set[str]], *,
                   instructed_handles: dict[str, set[str]] | None = None) -> list[str]:
     """Project the address book's VIP persons into the gate: ``vip_handles``
-    maps a channel to the handles of every VIP person on it, ``emails`` holds
-    their addresses, and ``instructed_handles`` maps a channel to the handles
-    of every person who carries an instruction (None: nobody does). Replaces
-    the contact-owned members wholesale — hand-set VIPs and the Sent-derived
-    whitelist stay as they are — and writes a file only when its bytes
-    change. A channel with no policy directory yet is written only when it has
-    members and is one of MESSENGER_CHANNELS. Returns the files written."""
+    maps a channel to the handles of every VIP person on it, and
+    ``instructed_handles`` maps a channel to the handles of every person who
+    carries an instruction (None: nobody does). ``email`` is a channel like
+    the others — its handles are addresses and `*@domain` wildcards, written
+    to the mail gateway's policy file in the messenger shape. Replaces the
+    contact-owned members wholesale — hand-set VIPs stay as they are — and
+    writes a file only when its bytes change. A channel with no policy
+    directory yet is written only when it has members and is one the
+    framework runs a gateway for (MESSENGER_CHANNELS, and ``email``).
+    Returns the files written.
+
+    ``instructed_handles`` is keyword-only: the second positional argument
+    used to be the e-mail addresses projected into the whitelist, and a
+    caller still passing them must fail loudly rather than instruct them."""
     instructed_handles = instructed_handles or {}
     written = []
+    # The file of the e-mail *group* flags sits in the same folder as the
+    # `email` channel's policy, and the mail gateway waits for it before its
+    # first backfill: this is one of the retinue-side writers that puts it
+    # there (and moves an old one), though it no longer writes into it.
+    _ensure_before_write()
     # A channel no gateway reads (a person's Matrix account, say) gets no
     # policy directory of its own: only the ones already there, and the
-    # messenger services the framework runs gateways for.
+    # services the framework runs gateways for.
     channels = set(messenger_policy_channels()) | (
         {c for table in (vip_handles, instructed_handles) for c, hs in table.items() if hs}
-        & set(MESSENGER_CHANNELS))
+        & set(MESSENGER_CHANNELS + (EMAIL_CHANNEL,)))
     for channel in sorted(channels):
         want = {_norm_handle(h) for h in vip_handles.get(channel, ()) if h.strip()}
         briefed = {_norm_handle(h) for h in instructed_handles.get(channel, ()) if h.strip()}
@@ -816,11 +943,6 @@ def sync_contacts(vip_handles: dict[str, set[str]], emails: set[str],
                     render_messenger_policy(channel, pol._replace(vip_contacts=want,
                                                                   instructed_contacts=briefed)), path):
                 written.append(str(path))
-    want = {e.strip().lower() for e in emails if e.strip()}
-    with policy_lock(email_whitelist_path()):
-        pol = load_email_policy()
-        if set(pol.contact_addresses) != want and save_email_policy(pol._replace(contact_addresses=want)):
-            written.append(str(email_whitelist_path()))
     return written
 
 
@@ -829,9 +951,13 @@ def main(argv: list[str] | None = None) -> int:
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     sub.add_parser("show-email")
-    p = sub.add_parser("email-add-address"); p.add_argument("address", nargs="+")
-    p = sub.add_parser("email-add-wildcard"); p.add_argument("wildcard", nargs="+")
-    p = sub.add_parser("email-remove"); p.add_argument("entry", nargs="+")
+    # Only the placement every command does first (below), and its result on
+    # stdout; the entrypoint runs it before anything slow at start.
+    sub.add_parser("place-email-policy")
+    # The e-mail commands edit the group flags only. A sender whose mail is to
+    # be worked is a contact with an instruction or the VIP flag
+    # (contacts.py update <id> --instruction … / --vip; --add-domain for a
+    # whole domain): the address book projects it, nothing is set here.
     p = sub.add_parser("email-news-add"); p.add_argument("entry", nargs="+")
     p = sub.add_parser("email-news-remove"); p.add_argument("entry", nargs="+")
     p = sub.add_parser("email-quiet-add"); p.add_argument("entry", nargs="+")
@@ -861,22 +987,34 @@ def main(argv: list[str] | None = None) -> int:
 
     args = parser.parse_args(argv)
 
-    if args.cmd == "show-email":
+    # This CLI runs on the retinue side only, so it is one of the places that
+    # puts the e-mail policy file where the mail gateway reads it. A failure
+    # is reported and the command still runs: reading or editing a messenger
+    # policy does not depend on it, and an e-mail edit fails on its own write.
+    try:
+        placed = ensure_email_policy_location()
+    except OSError as exc:
+        print(f"triage_policy: could not place the e-mail policy file: {exc}", file=sys.stderr)
+        placed = None
+    if placed is not None:
+        note = (f"left the old file at {placed['legacy_left']} (it differs; the new "
+                f"one is used)" if placed["legacy_left"] else placed["action"])
+        if args.cmd == "place-email-policy":
+            print(f"{placed['path']}: {note}")
+        elif placed["action"] != "present" or placed["legacy_left"]:
+            print(f"triage_policy: e-mail policy {placed['path']}: {note}", file=sys.stderr)
+
+    if args.cmd == "place-email-policy":
+        return 0 if placed is not None else 1
+    elif args.cmd == "show-email":
+        # The group flags; the sender classes of mail are `show --channel email`.
         pol = load_email_policy()
-        for a in sorted(pol.addresses | pol.contact_addresses | pol.wildcards):
-            print(f"whitelist\t{a}")
         for a in sorted(pol.news | pol.news_wildcards):
             print(f"news\t{a}")
         for a in sorted(pol.quieted | pol.quieted_wildcards):
             print(f"quiet\t{a}")
         for a in sorted(pol.ignored | pol.ignored_wildcards):
             print(f"ignore\t{a}")
-    elif args.cmd == "email-add-address":
-        _mutate_email(add_addresses=args.address)
-    elif args.cmd == "email-add-wildcard":
-        _mutate_email(add_wildcards=args.wildcard)
-    elif args.cmd == "email-remove":
-        _mutate_email(remove=args.entry)
     elif args.cmd == "email-news-add":
         _mutate_email(news_add=args.entry)
     elif args.cmd == "email-news-remove":
@@ -891,13 +1029,17 @@ def main(argv: list[str] | None = None) -> int:
         _mutate_email(ignore_remove=args.entry)
     elif args.cmd == "check-email":
         dec = email_gate_decision(args.address, args.list_id)
-        # One line per rail, so the two axes stay visibly independent.
+        sender = gate_decision(EMAIL_CHANNEL, args.address)
+        # One line per question, so the axes stay visibly independent: the
+        # group and its flags, then who the sender is to the gate.
         print(f"group\t{dec['group']}")
         print(f"news\t{'yes' if dec['news'] else 'no'}")
-        print(f"triage\t{dec['reason']}"
-              f" (frequent: {'yes' if dec['triage_now'] else 'no'},"
-              f" daily: {'yes' if dec['daily'] else 'no'})")
-        return 0 if dec["triage_now"] else 3
+        print(f"attention\t{'ignored' if dec['ignored'] else 'quieted' if dec['quieted'] else 'open'}")
+        classes = [name for name in ("vip", "instructed") if sender[name]]
+        print(f"sender\t{'+'.join(classes) or 'neither'}"
+              + ("\t(the policy file could not be read)" if sender["reason"] == "policy-unreadable" else ""))
+        # As check-handle answers: 0 for a sender whose mail buys a turn.
+        return 0 if classes else 3
     elif args.cmd == "show":
         pol = load_messenger_policy(args.channel)
         for h in sorted(pol.vip):
@@ -930,14 +1072,23 @@ def main(argv: list[str] | None = None) -> int:
         _mutate_messenger(args.channel, news_del=args.group)
     elif args.cmd == "check-handle":
         # One question left about a sender: does a model work their messages?
-        pol = load_messenger_policy(args.channel)
-        vip = _norm_handle(args.handle) in (set(pol.vip) | set(pol.vip_contacts))
+        # Yes for a VIP and for an instructed sender alike (exit 0), as
+        # check-email answers; the lines say which.
+        if args.channel == EMAIL_CHANNEL:
+            # Mail reads the policy as its gate does: unreadable is nobody special.
+            sender = gate_decision(EMAIL_CHANNEL, args.handle)
+            vip, instructed = sender["vip"], sender["instructed"]
+        else:
+            pol = load_messenger_policy(args.channel)
+            vip = _sender_member(args.channel, args.handle, set(pol.vip) | set(pol.vip_contacts))
+            instructed = _sender_member(args.channel, args.handle, pol.instructed_contacts)
         print("vip" if vip else "not-vip")
-        # The second question, asked only when it is answered yes: is there a
-        # brief the turn works their messages by?
-        if _norm_handle(args.handle) in pol.instructed_contacts:
+        # The second question: is there a brief the turn works their messages by?
+        if instructed:
             print("instructed")
-        return 0 if vip else 3
+        if args.channel == EMAIL_CHANNEL and sender["reason"] == "policy-unreadable":
+            print("(the policy file could not be read)")
+        return 0 if (vip or instructed) else 3
     return 0
 
 

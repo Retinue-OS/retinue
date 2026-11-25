@@ -542,7 +542,7 @@ class RetinueAttentionSheet extends HTMLElement {
       this._learned = data.learned_now || [];
       this._effect = data.effect || null;
       if (data.item) this._data = data;
-      // The name, the sphere and the whitelist all changed at once: every
+      // The name, the sphere and the sender's standing all changed at once: every
       // open list is now showing a stranger that no longer is one.
       window.dispatchEvent(new CustomEvent('retinue-attention-change', { detail: { action: 'contact', id: this._id } }));
       if (!data.item) await this.load();
@@ -624,7 +624,7 @@ class RetinueAttentionSheet extends HTMLElement {
       this._instructionForm(form, book, busy) +
       `<div class="f-ctl"><button class="btn primary" data-act="contact-save"${busy}>Save the contact</button>` +
       `<button class="btn" data-act="contact-cancel"${busy}>Cancel</button>` +
-      `<span class="f-note">Their next message reaches triage as a known sender.</span></div>` +
+      `<span class="f-note">Their next message is filed under them: their prior, VIP flag and instruction apply.</span></div>` +
       `</div></div>`;
   }
 
