@@ -16326,9 +16326,14 @@ def _attention_thread_items(profile: dict) -> list[dict]:
         if not _CONV_ID_RE.match(path.stem):
             continue
         conv = _load_conv(path.stem)
-        if conv is None or not attention_store.thread_wants_attention(conv):
+        if conv is None:
             continue
-        items.append(attention_store.thread_item(conv, profile))
+        if attention_store.thread_wants_attention(conv):
+            items.append(attention_store.thread_item(conv, profile))
+        elif attention_store.own_project_thread(conv):
+            # Listed beside its project on the home only: never pushed,
+            # digested or emitted (attention_store.fold_projects).
+            items.append(dict(attention_store.thread_item(conv, profile), listed_for_project=True))
     return items
 
 
@@ -16377,10 +16382,14 @@ def _attention_project_items(profile: dict, now: datetime) -> list[dict]:
             for row in _attention_project_rows()]
 
 
-def _attention_items(profile: dict, now: datetime) -> tuple[list[dict], list[str]]:
+def _attention_items(profile: dict, now: datetime,
+                     listing: bool = True) -> tuple[list[dict], list[str]]:
     """Every item from the three sources, plus the names of the sources that
     could not be read (the store down): the list is served with what there
-    is and says so, rather than failing whole."""
+    is and says so, rather than failing whole. ``listing`` False is what
+    pushes, digests and the life-store emit act on: without the user's read
+    project threads the home keeps listed, and with every thread in its own
+    spheres (attention_store.fold_projects)."""
     items = _attention_thread_items(profile) + _reminders_open_items(profile)
     degraded = []
     for name, fetch in (("chats", lambda: _attention_chat_items(profile)),
@@ -16390,7 +16399,8 @@ def _attention_items(profile: dict, now: datetime) -> tuple[list[dict], list[str
         except Exception as exc:  # noqa: BLE001 - transport/parse: degrade, do not fail
             print(f"[web-gateway] attention: {name} unavailable ({exc})", flush=True)
             degraded.append(name)
-    return attention_store.fold_projects(items), degraded
+    return attention_store.fold_projects(items, projects_known="projects" not in degraded,
+                                         listing=listing), degraded
 
 
 def _attention_chat_row_from_state(chat_id: str, state: dict,
@@ -17042,7 +17052,7 @@ def _attention_tick(now: datetime | None = None) -> dict:
             _attention_tick_state["minute"] = stamp
             return {}
         key = stamp.strftime("%Y-%m-%d %H:%M")
-        items, _degraded = _attention_items(profile, now)
+        items, _degraded = _attention_items(profile, now, listing=False)
         report: dict = {"at": key, "events": sorted(events), "pushed": [], "digest": 0,
                         "expired": expired}
         if events & {"digest", "mode", "break", "end"}:
@@ -21686,8 +21696,9 @@ class Handler(BaseHTTPRequestHandler):
                                                     breaks=None if breaks is None else bool(breaks))
         _ATTENTION.save_focus(focus)
         if is_breakpoint:
-            items, degraded = _attention_items(profile, now)
+            items, _degraded = _attention_items(profile, now, listing=False)
             _attention_breakpoint(items, focus, now, "the mode change")
+            items, degraded = _attention_items(profile, now)
         else:
             # Into Focused: no digest. What the focus lets through rings; the
             # rest stays held for the focus's breaks, its end, or a change.
@@ -21700,7 +21711,7 @@ class Handler(BaseHTTPRequestHandler):
         """After a rule change, push what it releases; returns their ids.
         ``skip``: items a digest has just carried, which must not ring again
         one by one."""
-        items, _degraded = _attention_items(profile, now)
+        items, _degraded = _attention_items(profile, now, listing=False)
         pushed = []
         for item in items:
             if skip and item["id"] in skip:
@@ -21757,7 +21768,7 @@ class Handler(BaseHTTPRequestHandler):
             if payload.get("enabled") is not None and any(c.startswith("focus modes ") for c in changes):
                 # Focus turned on or off is a change of mode like any other:
                 # a breakpoint, what was held arriving as one digest.
-                items, _degraded = _attention_items(profile, now)
+                items, _degraded = _attention_items(profile, now, listing=False)
                 digest = _attention_breakpoint(items, focus, now, "focus turned " + ("on" if payload["enabled"] else "off"))
                 carried = {i["id"] for i in (digest or {}).get("items") or []}
             else:
