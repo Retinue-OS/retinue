@@ -288,6 +288,48 @@ await ok('Sort again presses with again; a refused press says why', async () => 
   assert.ok(html(el).includes('Triage could not start: chat triage is switched off (CHAT_TRIAGE).'), html(el));
 });
 
+await ok('feedback: the saved notes, a send that saves one and sorts again, a ✕ that takes one back', async () => {
+  const el = await mount(payload(LIST));
+  const withNotes = JSON.parse(JSON.stringify(DONE));
+  withNotes.notes = [{ id: 'n1', text: 'Bank mails <never> delete', at: '2026-11-25T10:00:00Z' }];
+  await openTriage(el, withNotes);
+  let h = html(el);
+  assert.ok(h.includes('Feedback on the sorting <span class="tri-n">1</span>'), h);
+  assert.ok(h.includes('Bank mails &lt;never&gt; delete'));
+  assert.ok(h.includes('data-tri-note-rm="n1"'));
+  assert.ok(/data-triage="feedback" disabled/.test(h), 'nothing typed: nothing to send');
+  el._triFb = '  Invoices are always action.  ';
+  el._rerender();
+  assert.ok(!/data-triage="feedback" disabled/.test(html(el)));
+  el._sendTriageFeedback();
+  const post = takeTri('POST', 'the feedback');
+  assert.deepEqual(post.body, { feedback: 'Invoices are always action.' });
+  const after = JSON.parse(JSON.stringify(RUNNING));
+  after.started = true;
+  after.notes = [...withNotes.notes, { id: 'n2', text: 'Invoices are always action.', at: 'x' }];
+  post.answer(after, 202);
+  await settle();
+  clearTimeout(el._triTimer); el._triTimer = null;
+  h = html(el);
+  assert.equal(el._triFb, '', 'the field is emptied once the server has it');
+  assert.ok(h.includes('Invoices are always action.') && h.includes('<span class="tri-n">2</span>'));
+  assert.ok(/data-triage="feedback" disabled/.test(h));
+  // A refused save keeps the words.
+  el._triFb = 'x'.repeat(5);
+  el._sendTriageFeedback();
+  takeTri('POST', 'the second feedback').answer({ error: 'the feedback is empty' }, 400);
+  await settle(); await settle();
+  assert.equal(el._triFb, 'xxxxx');
+  assert.ok(html(el).includes('Feedback not saved: the feedback is empty.'));
+  // ✕
+  el._removeTriageNote('n1');
+  const rm = take((w) => w.method === 'POST' && w.url === '/chats/triage/notes', 'the removal');
+  assert.deepEqual(rm.body, { remove: 'n1' });
+  rm.answer({ ...after, notes: after.notes.slice(1) });
+  await settle(); await settle();
+  assert.ok(!html(el).includes('data-tri-note-rm="n1"'));
+});
+
 await ok('no multi-select in the view; Close and back return to the tabs', async () => {
   history.stack = [null];  // the earlier checks' views were never closed
   const el = await mount(payload(LIST));

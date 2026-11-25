@@ -154,26 +154,50 @@ prompt forbids. Follow-ups become the default once the backend enforces a
 triage-turn capability that refuses those calls; until then a deployment
 that accepts the exposure opts in with a number.
 
+### Feedback
+
+Under the status line the view has **Feedback on the sorting**: a field for
+what the sorting got wrong, in the user's own words ("Mails from my bank
+are never to be deleted", "a school newsletter is action"), and the notes
+saved so far, each with ✕ to take it back. **Save and sort again** keeps the
+note for every run from now on and sorts every unread chat again with it
+(`again`), so the correction applies to the whole list at once. While a run
+is busy the note is still saved, and the next press uses it.
+
+The notes reach the sorting pass as a `<guidance>` block between the
+instruction and the chats — each escaped on a line of its own, and said to
+outrank the default rules where they disagree. They are the user's words,
+set apart from the chats', which stay data whatever they say. At most
+`MAX_NOTES` (30) are kept, the oldest giving way, each at most
+`NOTE_TEXT_CHARS` (400) characters. Notes are guidance to the fast model,
+not rules the gateway enforces: a note that the model reads differently
+than meant shows in the next sorting, and is fixed by another note or by
+taking that one back.
+
 ### The store
 
 `<CHAT_STATE_DIR>/triage.json`: the last run (`state`: running, done,
-failed, interrupted; `total`, `sorted`, `failed`, times) and per chat
-`{bucket, note, reply, seq, at, run, error?, followup?: {state, text?}}`.
+failed, interrupted; `total`, `sorted`, `failed`, times) per chat
+`{bucket, note, reply, seq, at, run, error?, followup?: {state, text?}}`,
+and the feedback notes `[{id, text, at}]`.
 Atomic writes; a run or follow-up a dead process left running reads as
 interrupted; entries of chats that are gone are pruned on the next press. A
 follow-up writes only onto the entry of its own run.
 
 ## API
 
-- `GET /chats/triage` → `{enabled, running, busy, model, run, entries}`
+- `GET /chats/triage` → `{enabled, running, busy, model, run, entries, notes}`
   (`running`: sorting; `busy`: sorting or a follow-up still open). Which
   entries are shown is the page's to decide against its list (archived chats
   and chats with a newer `inbound_seq` are not in a bucket).
-- `POST /chats/triage` (body `{again?}`) → `202 {started: true, total,
+- `POST /chats/triage` (body `{again?, feedback?}`; `feedback` saves a note
+  and implies `again`, `400` for one empty or over 400 characters) → `202 {started: true, total,
   skipped, …payload}` for a run started (`total` 0: nothing new to sort),
   `200 {started: false, busy: true, …}` while one sorts or its follow-ups work, `409` with
   `CHAT_TRIAGE` off, `502` with the life store down, `403` cross-site (the
   press spends model calls on the user's behalf).
+- `POST /chats/triage/notes` (body `{remove: <note id>}`) → `200` with the
+  payload, `404` for no such note, `403` cross-site. It starts no run.
 
 ## Configuration
 
@@ -195,7 +219,8 @@ follow-up writes only onto the entry of its own run.
   the Chats list only by a staged draft's preview. Surfacing her note on
   the list and on the home's attention row, for archived chats too, is the
   next design ([dashboard.md](dashboard.md), the instruction line).
-- Moving a row to another section by hand, and learning from it.
+- Moving a row to another section by hand, and learning from it (feedback
+  is said in words, not by moving rows).
 - Triage of the *Read* tab.
 
 ## Tests

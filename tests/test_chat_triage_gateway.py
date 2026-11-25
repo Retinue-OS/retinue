@@ -165,6 +165,31 @@ def main() -> int:
             wg._TRIAGE.join(15)
             assert len(CALLS) == 2
 
+            # Feedback: saved, quoted into the next run, and that run sorts
+            # every unread chat again.
+            wait_for(lambda: not mail._http(base, "GET", "/chats/triage")[1]["busy"],
+                     "the run to be over")
+            status, doc = mail._http(base, "POST", "/chats/triage", {"feedback": ""})
+            assert status == 400, (status, doc)
+            status, doc = mail._http(base, "POST", "/chats/triage",
+                                     {"feedback": "x"}, {"Sec-Fetch-Site": "cross-site"})
+            assert status == 403
+            calls_before = len(CALLS)
+            status, doc = mail._http(base, "POST", "/chats/triage",
+                                     {"feedback": "Mails from Zoe are never to be deleted."})
+            assert status == 202 and doc["started"] and doc["total"] == len(unread), doc
+            assert [n["text"] for n in doc["notes"]] == ["Mails from Zoe are never to be deleted."]
+            wg._TRIAGE.join(15)
+            assert len(CALLS) == calls_before + 1
+            assert "- Mails from Zoe are never to be deleted." in CALLS[-1]["cmd"][-1]
+            note_id = doc["notes"][0]["id"]
+            status, _ = mail._http(base, "POST", "/chats/triage/notes", {"remove": "nope"})
+            assert status == 404
+            status, doc = mail._http(base, "POST", "/chats/triage/notes", {"remove": note_id})
+            assert status == 200 and doc["notes"] == [], doc
+            wait_for(lambda: not mail._http(base, "GET", "/chats/triage")[1]["busy"],
+                     "the follow-ups to be over")
+
             # Off is off.
             wg.CHAT_TRIAGE = False
             status, doc = mail._http(base, "POST", "/chats/triage", {})

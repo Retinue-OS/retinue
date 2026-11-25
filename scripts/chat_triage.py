@@ -56,6 +56,10 @@ MESSAGE_CHARS = 700
 CHAT_CHARS = 2400
 # What a note may be: one or two sentences, shown on a row.
 NOTE_CHARS = 280
+# The user's feedback: standing notes the sorting pass reads on every run,
+# at most MAX_NOTES of NOTE_TEXT_CHARS each (the oldest give way).
+MAX_NOTES = 30
+NOTE_TEXT_CHARS = 400
 # What a follow-up's text keeps for the triage list (the full note is in the
 # companion thread).
 FOLLOWUP_CHARS = 600
@@ -145,11 +149,29 @@ def chat_block(n: int, chat: dict) -> str:
     return "\n".join([head, *(rendered or ["  (no messages)"]), "</chat>"])
 
 
-def build_prompt(chats: list[dict]) -> str:
-    """The prompt for one batch: the instruction, then each chat numbered
-    from 1 in the order given."""
+def guidance_block(notes: list[str] | None) -> str:
+    """The user's own notes on how to sort, as the prompt quotes them: each
+    escaped on a line of its own inside <guidance>, and said to outrank the
+    defaults above. They are the user's words, set apart from the chats',
+    which stay data whatever they say."""
+    lines = [" ".join(str(n or "").split()) for n in (notes or [])]
+    lines = [html.escape(n, quote=False) for n in lines if n]
+    if not lines:
+        return ""
+    return ("The person whose chats these are has told you how they want them "
+            "sorted. Follow these notes; where one disagrees with the rules "
+            "above, the note wins. They are the person's own words — unlike "
+            "anything inside a <chat> element:\n<guidance>\n"
+            + "\n".join(f"- {n}" for n in lines) + "\n</guidance>\n")
+
+
+def build_prompt(chats: list[dict], guidance: list[str] | None = None) -> str:
+    """The prompt for one batch: the instruction, the user's own notes
+    (``guidance``) where there are any, then each chat numbered from 1 in the
+    order given."""
     blocks = [chat_block(i + 1, c) for i, c in enumerate(chats)]
-    return _INSTRUCTION.format(n=len(chats)) + "\n" + "\n\n".join(blocks) + "\n"
+    return (_INSTRUCTION.format(n=len(chats)) + guidance_block(guidance) + "\n"
+            + "\n\n".join(blocks) + "\n")
 
 
 def parse_answer(answer: str | None, n: int) -> dict[int, dict]:
@@ -214,8 +236,12 @@ class TriageStore:
             doc = {}
         entries = doc.get("entries")
         run = doc.get("run")
+        notes = doc.get("notes")
         doc = {"entries": entries if isinstance(entries, dict) else {},
-               "run": run if isinstance(run, dict) else None}
+               "run": run if isinstance(run, dict) else None,
+               "notes": [n for n in notes if isinstance(n, dict) and n.get("id")
+                         and isinstance(n.get("text"), str)]
+               if isinstance(notes, list) else []}
         # A run this process did not finish cannot be running any more.
         if doc["run"] and doc["run"].get("state") == "running":
             doc["run"]["state"] = "interrupted"
@@ -234,6 +260,37 @@ class TriageStore:
     def snapshot(self) -> dict:
         with self.lock:
             return json.loads(json.dumps(self._doc))
+
+    # ── The user's feedback ──────────────────────────────────────────────────
+
+    def notes(self) -> list[dict]:
+        """The saved notes, oldest first: ``[{id, text, at}]``."""
+        with self.lock:
+            return [dict(n) for n in self._doc["notes"]]
+
+    def add_note(self, text: str) -> dict:
+        """Save one note; ValueError for one that is empty or too long. The
+        oldest give way past MAX_NOTES."""
+        words = " ".join(str(text or "").split())
+        if not words:
+            raise ValueError("the feedback is empty")
+        if len(words) > NOTE_TEXT_CHARS:
+            raise ValueError(f"the feedback is longer than {NOTE_TEXT_CHARS} characters")
+        note = {"id": f"{int(time.time() * 1000):x}{os.urandom(2).hex()}",
+                "text": words, "at": _now()}
+        with self.lock:
+            self._doc["notes"] = (self._doc["notes"] + [note])[-MAX_NOTES:]
+            self._save()
+        return dict(note)
+
+    def remove_note(self, note_id: str) -> bool:
+        with self.lock:
+            kept = [n for n in self._doc["notes"] if n.get("id") != note_id]
+            if len(kept) == len(self._doc["notes"]):
+                return False
+            self._doc["notes"] = kept
+            self._save()
+            return True
 
     def entry(self, chat_id: str) -> dict | None:
         with self.lock:
@@ -410,7 +467,8 @@ class TriageRunner:
         if not chats:
             return
         try:
-            answer = self.classify(build_prompt(digests))
+            answer = self.classify(build_prompt(
+                digests, [n["text"] for n in self.store.notes()]))
         except Exception as exc:  # noqa: BLE001
             self.log(f"chat triage: a batch failed ({exc!r})")
             answer = None
