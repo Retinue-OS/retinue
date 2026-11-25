@@ -1602,7 +1602,8 @@ def test_instructed_arrival(base, wg):
     PUSHES.clear()
     TURNS.clear()
     hold = threading.Event()
-    TURN_GATE.update(hold=hold, during=verdict(4, actions=["staged a reply"], flags=["asks for the door code"]))
+    TURN_GATE.update(hold=hold, during=verdict(4, actions=["staged a reply"], flags=["asks for the door code"],
+                                                triage="action", triage_note="Spitex moves the visit — confirm it."))
     try:
         status, body = _http(base, "POST", rail, event)
         assert status == 202 and body["accepted"] is True, body
@@ -1627,6 +1628,14 @@ def test_instructed_arrival(base, wg):
     block = wg._CHAT_STATE.get(chat)["attention"]
     assert block["importance"] == 4 and block["importance_from"] == "instruction", block
     assert not block["vip"], "a verdict is no VIP"
+    # The turn's triage word is in the triage store, for the message count it
+    # judged, with the turn's reply as Ara's note (docs/chat-triage.md,
+    # "Arrival turns"): the next Triage press does not sort this chat.
+    entry = wg._TRIAGE_STORE.entry(chat)
+    assert entry and entry["source"] == "arrival" and entry["bucket"] == "action", entry
+    assert entry["note"] == "Spitex moves the visit — confirm it.", entry
+    assert entry["seq"] == summary()["inbound_seq"], (entry, summary()["inbound_seq"])
+    assert entry["followup"]["state"] == "done" and entry["followup"]["text"], entry
 
     # The prompt: the instruction is the brief, the limits the system holds
     # are stated, the verdict command names this chat, and nothing calls the
@@ -1634,6 +1643,7 @@ def test_instructed_arrival(base, wg):
     prompt = TURNS[0]["prompt"]
     assert "<user_instruction>" in prompt and "Ring me only if a visit moves to today." in prompt
     assert "chat-verdict.py --chat telegram:888001 --importance" in prompt, prompt
+    assert "--triage <action|archive|delete> --triage-note" in prompt, prompt
     assert "--user-approved" in prompt and "never sent" in prompt
     assert "credentials" in prompt and "sender:888001" in prompt
     assert "until you set it, the user has not been told" in prompt

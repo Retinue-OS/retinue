@@ -10410,18 +10410,42 @@ def _instruction_brief(briefed: list[dict], chat_id: str, mail: bool = False) ->
         "3. Set the verdict, once, as the last thing you do:\n"
         "  python3 /workspace/scripts/chat-verdict.py --chat "
         f"{shlex.quote(chat_id or '<chat id>')} --importance <0-5> "
+        "--triage <action|archive|delete> --triage-note '<one sentence>' "
         "[--due <when>] [--action '<what you did>' ...] "
         "[--flag '<what the user must look at>']\n"
         + _VERDICT_SCALE + "Give "
         "--due only for a real deadline the message carries (an ISO "
         "date-time, or YYYY-MM-DD). Name each thing you did as an --action "
         "(\"staged a reply\", \"added the visit on Friday 10:00 to the "
-        "calendar\") and each thing the user must look at as a --flag. " + ring,
+        "calendar\") and each thing the user must look at as a --flag. " + ring + " " + _TRIAGE_SCALE,
         "4. Open a dashboard conversation (conversation-push.py) only for "
         "something that needs the user's decision and is not \"send this "
         "reply\". A flag belongs in the verdict, not in a thread.",
     ]
     return lines
+
+
+# What the triage word every arrival turn gives means (docs/chat-triage.md,
+# "Arrival turns"): the Chats page's Triage lists the chat by it and spends
+# no second judgement on it until a newer message arrives.
+_TRIAGE_SCALE = (
+    "The triage word says how the Chats page's Triage lists this chat, so "
+    "the user's next sort spends no second judgement on it: `action` — the "
+    "user should do or decide something (answer, pay, sign, confirm, meet a "
+    "deadline; also when you staged a reply that still needs their send "
+    "press); `archive` — nothing to do, worth keeping; `delete` — nothing to "
+    "do, nothing worth keeping. The --triage-note is one short sentence for "
+    "the row, in the language of the chat: what it is and, for action, what "
+    "the user should do. ")
+
+
+def _triage_step(chat_id: str, n: int) -> str:
+    """The last step of a VIP's turn: its triage word, alone."""
+    return (f"{n}. Say how the user's triage should list it, as the last thing "
+            "you do:\n"
+            f"  python3 /workspace/scripts/chat-verdict.py --chat "
+            f"{shlex.quote(chat_id or '<chat id>')} --triage <action|archive|delete> "
+            "--triage-note '<one sentence>'\n" + _TRIAGE_SCALE)
 
 
 # What a verdict's importance means, as every instructed turn is told it.
@@ -10567,13 +10591,14 @@ def _mail_instruction_steps(chat_id: str, recall: str, ring: str) -> list[str]:
         "mail more important by saying so.",
         "3. Set the verdict, once, as the last thing you do:\n"
         f"  python3 /workspace/scripts/chat-verdict.py --chat {quoted} "
-        "--importance <0-5> [--due <when>] [--action '<what you did>' ...] "
+        "--importance <0-5> --triage <action|archive|delete> "
+        "--triage-note '<one sentence>' [--due <when>] [--action '<what you did>' ...] "
         "[--flag '<what the user must look at>']\n"
         + _VERDICT_SCALE + "Give --due only for a real deadline the mail "
         "carries (an ISO date-time, or YYYY-MM-DD). Name each thing you did "
         "as an --action (\"linked it to the tax project\", \"filed the "
         "invoice with the Archivist\", \"archived the mail\") and each thing "
-        "the user must look at as a --flag. " + ring,
+        "the user must look at as a --flag. " + ring + " " + _TRIAGE_SCALE,
         "4. Open a dashboard conversation (conversation-push.py) only for "
         "something that needs the user's decision and is not \"send this "
         "reply\". A flag belongs in the verdict, not in a thread.",
@@ -10780,6 +10805,7 @@ def _mail_arrival_prompt(arrivals: list[dict], chat_id: str = "", deferred: int 
         "question you cannot answer from what you know. Never open one to "
         "announce a draft you staged or a memory you stored: the thread is "
         "where the user sees that.",
+        _triage_step(chat_id, 5),
     ]
     lines.append(
         "Then answer here in one or two sentences: what arrived, what you "
@@ -10896,6 +10922,7 @@ def _chat_arrival_prompt(arrivals: list[dict], chat_id: str = "", deferred: int 
         "announce a draft you staged or a memory you stored: the chat is where "
         "the user sees that, and a thread per message is exactly what this "
         "replaced.",
+        _triage_step(chat_id, 5),
     ]
     lines.append(
         "Then answer here in one or two sentences: what arrived, what you "
@@ -11384,9 +11411,11 @@ def _chat_arrival_worker(chat_id: str, cid: str, worker: object = None) -> None:
             prompt += _message_files_note(stored)
         ok = False
         error = "the chat's companion turn did not complete"
+        replies: list = []
         try:
             ok = _conv_worker(cid, f"conv:{cid}", arrival=prompt, push=False,
-                              error_reply=not mail, arrival_turn=record["token"])
+                              error_reply=not mail, arrival_turn=record["token"],
+                              reply_sink=replies)
         except Exception as exc:  # noqa: BLE001 - a failed turn is a job result
             print(f"[web-gateway] companion turn for {key} failed: {exc!r}",
                   flush=True)
@@ -11414,6 +11443,9 @@ def _chat_arrival_worker(chat_id: str, cid: str, worker: object = None) -> None:
                         _instructed_ring_fire(arrival["ring"], None,
                                               "the turn's outcome could not be applied")
         if ok:
+            # The turn's word for the Chats page's Triage (its --triage), so a
+            # later press spends no second judgement on these messages.
+            _triage_from_arrival(live, record, replies[-1] if replies else None)
             # Durably: a mail whose turn completed is worked, also for the
             # process that comes after this one (_start_chat_arrival_turn).
             with _chat_turns_lock:
@@ -11785,6 +11817,38 @@ def _parse_verdict(payload: dict) -> dict:
 
     return {"importance": importance, "due": due, "actions": lines("actions"),
             "flags": lines("flags"), "at": chat_state_mod.iso_z()}
+
+
+def _parse_triage_verdict(payload: dict) -> dict | None:
+    """The triage word an arrival turn gives (chat-verdict.py --triage):
+    ``{bucket, note}`` or None when it gives none. Raises ValueError."""
+    bucket = payload.get("triage")
+    if bucket in (None, ""):
+        return None
+    if bucket not in chat_triage.BUCKETS:
+        raise ValueError(f"triage is one of {', '.join(chat_triage.BUCKETS)}, not {bucket!r}")
+    note = payload.get("triage_note") or ""
+    if not isinstance(note, str):
+        raise ValueError("triage_note is text")
+    return {"bucket": bucket, "note": " ".join(note.split())[:chat_triage.NOTE_CHARS]}
+
+
+def _triage_from_arrival(chat_id: str, record: dict, reply: str | None) -> None:
+    """Write a completed arrival turn's triage word into the triage store
+    (docs/chat-triage.md, "Arrival turns"), for the message count it judged:
+    the newest arrival it worked. A chat spoken in since reads as stale
+    there, and the next press sorts it as any other."""
+    triage = record.get("triage")
+    seqs = [s for s in record.get("seqs") or [] if isinstance(s, int) and not isinstance(s, bool)]
+    if not triage or not seqs:
+        return
+    try:
+        _TRIAGE_STORE.put(chat_id, chat_triage.arrival_entry(
+            triage["bucket"], triage.get("note") or "", max(seqs),
+            attention_store.markup_words(reply) if reply else None))
+    except OSError as exc:
+        print(f"[web-gateway] chat triage: could not keep the arrival's word for "
+              f"{chat_id} ({exc})", flush=True)
 
 
 # How long to wait for a gateway to report back what an approved send actually
@@ -20237,26 +20301,48 @@ class Handler(BaseHTTPRequestHandler):
         payload = self._agent_conversation_payload()
         if payload is None:
             return
+        # What the payload says is checked first, whoever may set it.
         try:
-            verdict = _parse_verdict(payload)
+            triage = _parse_triage_verdict(payload)
+            verdict = (_parse_verdict(payload)
+                       if payload.get("importance") is not None else None)
         except ValueError as exc:
             self._send_json(400, {"error": str(exc)})
             return
         # The turn calls with the id its prompt named; a merge may have folded
         # that chat into another since, and the verdict is the turn's all the
-        # same, applied to the chat it is part of now (_turn_record).
+        # same, applied to the chat it is part of now (_turn_record). Any
+        # arrival turn may give the triage word (a VIP's turn gives only
+        # that); the importance verdict is an instructed turn's alone.
         with _chat_turns_lock:
-            record = _turn_record(chat_id, instructed=True)
-            if record is not None:
-                record["verdict"] = verdict
-                batch, live = set(record["jobs"]), record["chat"]
+            record = _turn_record(chat_id)
+            instructed = bool(record and record["instructed"])
         if record is None:
             self._send_json(409, {
-                "error": "no turn working on this chat by a standing instruction: "
-                         "a verdict belongs to that turn alone"})
+                "error": "no arrival turn working on this chat: a verdict belongs "
+                         "to that turn alone"})
             return
-        _instructed_note(live, jobs=batch, verdict=verdict)
-        self._send_json(200, {"id": live, "verdict": verdict})
+        if verdict is not None and not instructed:
+            self._send_json(409, {
+                "error": "no turn working on this chat by a standing instruction: "
+                         "an importance verdict belongs to that turn alone — "
+                         "give only --triage"})
+            return
+        if instructed and verdict is None:
+            self._send_json(400, {"error": "importance (0–5) is required"})
+            return
+        if verdict is None and triage is None:
+            self._send_json(400, {"error": "give the triage word (--triage)"})
+            return
+        with _chat_turns_lock:
+            if verdict is not None:
+                record["verdict"] = verdict
+            if triage is not None:
+                record["triage"] = triage
+            batch, live = set(record["jobs"]), record["chat"]
+        if verdict is not None:
+            _instructed_note(live, jobs=batch, verdict=verdict)
+        self._send_json(200, {"id": live, "verdict": verdict, "triage": triage})
 
     def _handle_chat_companion(self, raw_id: str) -> None:
         """Open (or re-open) this chat's companion conversation.

@@ -340,6 +340,24 @@ class TriageStore:
                 self._save()
 
 
+def from_arrival(entry: dict | None, seq) -> bool:
+    """Whether an arrival turn's own judgement describes the chat as it is."""
+    return is_fresh(entry, seq) and entry.get("source") == "arrival"
+
+
+def arrival_entry(bucket: str, note: str, seq: int, reply: str | None = None) -> dict:
+    """The entry an arrival turn's triage verdict leaves (docs/chat-triage.md,
+    "Arrival turns"): its bucket and note for the message count it judged, and
+    the turn's own reply in the companion as Ara's note on the row."""
+    entry = {"bucket": bucket, "note": _cut(" ".join(str(note or "").split()), NOTE_CHARS)[0],
+             "reply": False, "seq": seq, "at": _now(), "run": "arrival", "source": "arrival"}
+    words = " ".join(str(reply or "").split())
+    if words:
+        entry["followup"] = {"state": "done", "finished": entry["at"],
+                             "text": _cut(words, FOLLOWUP_CHARS)[0]}
+    return entry
+
+
 def is_fresh(entry: dict | None, seq) -> bool:
     """Whether a stored result still describes the chat: sorted, and no
     message has come in since (the chat's ``inbound_seq`` is the same)."""
@@ -401,8 +419,13 @@ class TriageRunner:
         with self._lock:
             if self._running or self._open > 0:
                 return {"started": False, "running": self._running, "busy": True}
+            # `again` sorts the fresh ones too — but never one an arrival
+            # turn judged (source "arrival"): that judgement had the chat, the
+            # sender's instruction and the tools, and stands until a newer
+            # message makes it stale.
             todo = [c for c in chats
-                    if again or not is_fresh(self.store.entry(c["id"]), c.get("seq"))]
+                    if not is_fresh(e := self.store.entry(c["id"]), c.get("seq"))
+                    or (again and e.get("source") != "arrival")]
             run_id = f"{int(time.time() * 1000):x}"
             self.store.set_run(id=run_id, state="running", started=_now(), finished=None,
                                total=len(todo), sorted=0, failed=0,
@@ -488,6 +511,10 @@ class TriageRunner:
                 continue
             entry = {"bucket": v["bucket"], "note": v["note"], "reply": v["reply"],
                      "seq": c.get("seq"), "at": _now(), "run": run_id}
+            if from_arrival(self.store.entry(c["id"]), c.get("seq")):
+                # An arrival turn judged this very message while the batch ran:
+                # its word stands over the quick pass's.
+                continue
             # followup_max 0 (the default, CHAT_TRIAGE_FOLLOWUPS): no follow-up
             # at all, and no "skipped" mark on the row either.
             follow = (v["bucket"] == "action" and self.followup is not None

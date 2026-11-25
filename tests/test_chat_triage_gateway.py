@@ -207,6 +207,50 @@ def main() -> int:
             wait_for(lambda: not mail._http(base, "GET", "/chats/triage")[1]["busy"],
                      "the follow-ups to be over")
 
+            # An arrival turn's triage word (docs/chat-triage.md, "Arrival
+            # turns"): any arrival turn may give it, the importance verdict
+            # stays an instructed turn's; the word is written when the turn
+            # completes, for the message count it judged, and no press sorts
+            # that chat again until a newer message arrives.
+            target = next(iter(unread))
+            seq = unread[target]["inbound_seq"]
+            vurl = "/internal/chats/" + mail._quote(target) + "/verdict"
+            agent = {"X-Conversation-Backend-Token": "agent-token"}
+            status, _ = mail._http(base, "POST", vurl, {"triage": "archive"}, agent)
+            assert status == 409, "no turn running"
+            record = {"chat": target, "jobs": {"j"}, "names": {target}, "token": "j",
+                      "mids": [], "seqs": [seq], "instructed": False, "verdict": None,
+                      "flags": set(), "asked": False, "epoch": None}
+            wg._RUNNING_TURNS[target] = [record]
+            try:
+                status, body = mail._http(base, "POST", vurl, {"triage": "nope"}, agent)
+                assert status == 400, body
+                status, body = mail._http(base, "POST", vurl, {"importance": 3}, agent)
+                assert status == 409, "a VIP's turn gives no importance verdict"
+                status, body = mail._http(base, "POST", vurl, {}, agent)
+                assert status == 400, body
+                status, body = mail._http(base, "POST", vurl,
+                                          {"triage": "archive", "triage_note": " A  receipt. "}, agent)
+                assert status == 200 and body["triage"] == {"bucket": "archive", "note": "A receipt."}, body
+                record["instructed"] = True
+                status, body = mail._http(base, "POST", vurl, {"triage": "action"}, agent)
+                assert status == 400 and "importance" in body["error"], body
+            finally:
+                wg._RUNNING_TURNS.pop(target, None)
+            record["instructed"] = False
+            wg._triage_from_arrival(target, record, "Ara's  note.")
+            e = mail._http(base, "GET", "/chats/triage")[1]["entries"][target]
+            assert e["source"] == "arrival" and e["seq"] == seq and e["bucket"] == "archive", e
+            assert e["followup"]["text"] == "Ara's note.", e
+            calls_before = len(CALLS)
+            wait_for(lambda: not mail._http(base, "GET", "/chats/triage")[1]["busy"], "idle")
+            status, doc = mail._http(base, "POST", "/chats/triage", {"again": True})
+            assert status == 202 and doc["total"] == len(unread) - 1, doc
+            wg._TRIAGE.join(15)
+            assert mail._http(base, "GET", "/chats/triage")[1]["entries"][target]["source"] == "arrival"
+            assert len(CALLS) == calls_before + (1 if len(unread) > 1 else 0)
+            wait_for(lambda: not mail._http(base, "GET", "/chats/triage")[1]["busy"], "idle")
+
             # Off is off.
             wg.CHAT_TRIAGE = False
             status, doc = mail._http(base, "POST", "/chats/triage", {})

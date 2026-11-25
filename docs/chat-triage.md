@@ -56,11 +56,14 @@ nothing.
 
 ## When it runs
 
-**Only on the press** — there is no schedule and no arrival hook. Opening
+**Only on the press** — there is no schedule, and an arrival never starts a
+sorting (an arrival turn that runs anyway leaves its own word: *Arrival
+turns* below). Opening
 the view is the press: `POST /chats/triage {}` sorts every chat on the
 *Unread* tab that has no fresh word — a chat sorted before and not spoken in
 since (same `inbound_seq`) is not sorted again, so pressing twice spends
-nothing the second time. **Sort again** (`{again: true}`) sorts them all.
+nothing the second time. **Sort again** (`{again: true}`) sorts them all,
+except a chat an arrival turn judged and nobody has spoken in since.
 One run at a time, and a run lasts until its follow-ups are over too: a
 press while one sorts or while Ara's notes are still on their way starts
 nothing and shows that run (`busy`; *Sort again* is disabled meanwhile), so
@@ -154,6 +157,37 @@ prompt forbids. Follow-ups become the default once the backend enforces a
 triage-turn capability that refuses those calls; until then a deployment
 that accepts the exposure opts in with a number.
 
+### Arrival turns
+
+A message from a VIP or from a sender with a standing instruction already
+buys a model turn on arrival, in the chat's companion, with the sender's
+instruction, the chat and the tools ([messenger-chats.md](messenger-chats.md),
+*Inbound flow*; [contacts.md](contacts.md), "The instruction"). That turn
+also says how triage lists the chat, so the next press spends no second,
+weaker judgement on it:
+
+```
+chat-verdict.py --chat <id> --triage <action|archive|delete> --triage-note "<one sentence>"
+```
+
+- An instructed turn adds `--triage` and `--triage-note` to the verdict it
+  sets anyway (`--importance …`); a VIP's turn, which sets no importance,
+  gives the triage word alone, as the last step of its prompt. The endpoint
+  (`POST /internal/chats/<id>/verdict`) takes the triage word from any
+  running arrival turn, and the importance verdict, as before, only from an
+  instructed one (`409` for a VIP's; `400` for an instructed turn without
+  importance).
+- The word is kept when the turn **completes** — not when it is given — as
+  an entry with `source: "arrival"` for the newest message count the turn
+  worked (`seq`), and with the turn's own reply in the companion as Ara's
+  note on the row (`followup.state: done`), so an action row opens on her
+  pane. A turn that fails leaves no word; the chat is sorted by the next
+  press as any other.
+- A sorting skips such a chat while its word is fresh — *Sort again* and
+  feedback included: the arrival turn had more to go on than the quick pass.
+  A newer message makes it stale, and the next press sorts the chat as any
+  other. A batch that was out when the word landed does not overwrite it.
+
 ### Feedback
 
 Under the status line the view has **Feedback on the sorting**: a field for
@@ -196,6 +230,9 @@ follow-up writes only onto the entry of its own run.
   `200 {started: false, busy: true, …}` while one sorts or its follow-ups work, `409` with
   `CHAT_TRIAGE` off, `502` with the life store down, `403` cross-site (the
   press spends model calls on the user's behalf).
+- `POST /internal/chats/<id>/verdict` (the agent token; `chat-verdict.py`)
+  also takes `{triage, triage_note}` from a running arrival turn — *Arrival
+  turns*.
 - `POST /chats/triage/notes` (body `{remove: <note id>}`) → `200` with the
   payload, `404` for no such note, `403` cross-site. It starts no run.
 

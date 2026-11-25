@@ -548,8 +548,11 @@ def test_a_vip_mail_rings_and_is_worked(base, wg):
     assert "mid:" in own and "memory.py store" in own and "`archivist`" in own
     assert "conversation-push.py" in own
     assert "You send nothing in this turn" in own and "do not archive, mute or star" in own
-    assert "chat-verdict.py" not in prompt and "chat-flags.py" not in prompt
-    assert "triage" not in own.lower() and "whitelist" not in prompt.lower()
+    # Its one verdict is the triage word (docs/chat-triage.md, "Arrival
+    # turns"): no importance — that is an instruction's — and no flags.
+    assert "chat-verdict.py" in own and "--triage <action|archive|delete>" in own
+    assert "--importance" not in prompt and "chat-flags.py" not in prompt
+    assert "triage skill" not in own.lower() and "whitelist" not in prompt.lower()
     # The file it carried: the server's path, the bare type, the size — never
     # the sender's file name or the rest of what it declared.
     files_dir = os.environ["MESSAGE_FILES_DIR"]
