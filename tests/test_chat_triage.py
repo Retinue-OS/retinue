@@ -354,6 +354,33 @@ def test_a_run_sorts_with_the_saved_notes():
         assert "- Newsletters from the school are action." in prompts[0]
 
 
+def test_a_note_changed_mid_run_waits_for_the_next_run():
+    """The notes are taken once, when a run starts: one saved (or taken
+    back) while it sorts reaches no later batch of it."""
+    with tempfile.TemporaryDirectory() as d:
+        store = ct.TriageStore(Path(d) / "t.json")
+        kept = store.add_note("old note")
+        prompts = []
+
+        def classify(prompt):
+            prompts.append(prompt)
+            if len(prompts) == 1:
+                store.add_note("new note")
+                store.remove_note(kept["id"])
+            return json.dumps({"chats": [{"n": 1, "bucket": "archive", "note": "x"}]})
+
+        r = ct.TriageRunner(store, classify=classify, digest=lambda c: digest(c, "t"),
+                            batch_size=1, concurrency=1)
+        r.start([{"id": "a", "seq": 1}, {"id": "b", "seq": 1}])
+        r.join(10)
+        assert len(prompts) == 2
+        assert all("- old note" in p and "new note" not in p for p in prompts), prompts
+        prompts.clear()
+        r.start([{"id": "a", "seq": 1}], again=True)
+        r.join(10)
+        assert "- new note" in prompts[0] and "old note" not in prompts[0]
+
+
 if __name__ == "__main__":
     t0 = time.time()
     test_prompt_numbers_and_escapes_every_chat()
@@ -371,4 +398,5 @@ if __name__ == "__main__":
     test_followup_prompt_quotes_the_note_as_data()
     test_feedback_notes_are_kept_and_quoted_as_the_persons_guidance()
     test_a_run_sorts_with_the_saved_notes()
+    test_a_note_changed_mid_run_waits_for_the_next_run()
     print(f"all chat-triage tests passed ({time.time() - t0:.1f}s)")

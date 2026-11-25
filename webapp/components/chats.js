@@ -624,7 +624,9 @@ class RetinueChats extends RetinueCard {
       // A rebuild under a finger mid-swipe would drop the row it is dragging,
       // and one under the open ＋ menu the item about to be pressed; the
       // next tick picks the change up.
-      if (this._swipe.dragging || this._newOpen) return;
+      // …and one under typing in triage's feedback field would drop its
+      // focus (its words are kept in _triFb either way).
+      if (this._swipe.dragging || this._newOpen || this._typingFeedback()) return;
       // A failed row whose chat the list no longer has is nothing to show.
       for (const id of [...this._failed.keys()]) {
         if (!(data.chats || []).some((c) => c.id === id)) this._failed.delete(id);
@@ -1047,6 +1049,12 @@ class RetinueChats extends RetinueCard {
     this._triageSchedule();
   }
 
+  // Whether the user is typing in triage's feedback field: no rebuild then.
+  _typingFeedback() {
+    const a = this.shadowRoot && this.shadowRoot.activeElement;
+    return !!(a && a.matches && a.matches('[data-tri-fb]'));
+  }
+
   // Take a note back (POST /chats/triage/notes {remove}); it starts no run.
   async _removeTriageNote(id) {
     if (!id) return;
@@ -1100,9 +1108,7 @@ class RetinueChats extends RetinueCard {
     if (wasRunning && !triageBusy(this._tri)) this.load();
     // Not under a finger or under typing: the feedback field would lose
     // its focus (its words are kept either way).
-    const typing = this.shadowRoot && this.shadowRoot.activeElement
-      && this.shadowRoot.activeElement.matches && this.shadowRoot.activeElement.matches('[data-tri-fb]');
-    if (!this._swipe.dragging && !typing) this._rerender();
+    if (!this._swipe.dragging && !this._typingFeedback()) this._rerender();
     this._triageSchedule();
   }
 

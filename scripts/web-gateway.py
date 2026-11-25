@@ -15271,18 +15271,21 @@ def _triage_start(again: bool, feedback=None) -> tuple[int, dict]:
     while a run is busy; the answer then says no run started."""
     if not CHAT_TRIAGE:
         return 409, {"error": "chat triage is switched off (CHAT_TRIAGE)"}
+    if feedback is not None and not isinstance(feedback, str):
+        return 400, {"error": "feedback must be text"}
+    # The chats first: an answer that the press failed must mean the note
+    # was not saved either, or the page keeps the words and a second press
+    # saves the note twice.
+    try:
+        chats = _chats_payload()["chats"]
+    except Exception as exc:  # noqa: BLE001 - the store is down
+        return 502, {"error": "life store unreachable", "detail": str(exc)}
     if feedback is not None:
-        if not isinstance(feedback, str):
-            return 400, {"error": "feedback must be text"}
         try:
             _TRIAGE_STORE.add_note(feedback)
         except ValueError as exc:
             return 400, {"error": str(exc)}
         again = True
-    try:
-        chats = _chats_payload()["chats"]
-    except Exception as exc:  # noqa: BLE001 - the store is down
-        return 502, {"error": "life store unreachable", "detail": str(exc)}
     if not _TRIAGE.running:
         _TRIAGE_STORE.prune({c["id"] for c in chats})
     scope = [{"id": c["id"], "seq": c.get("inbound_seq")}

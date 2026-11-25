@@ -174,6 +174,18 @@ def main() -> int:
             status, doc = mail._http(base, "POST", "/chats/triage",
                                      {"feedback": "x"}, {"Sec-Fetch-Site": "cross-site"})
             assert status == 403
+            # The store down: the press fails, and the note is not saved
+            # either — or the page, keeping the words, would save it twice.
+            real_payload = wg._chats_payload
+
+            def down():
+                raise RuntimeError("life store down")
+
+            wg._chats_payload = down
+            status, doc = mail._http(base, "POST", "/chats/triage", {"feedback": "kept out"})
+            wg._chats_payload = real_payload
+            assert status == 502, (status, doc)
+            assert mail._http(base, "GET", "/chats/triage")[1]["notes"] == []
             calls_before = len(CALLS)
             status, doc = mail._http(base, "POST", "/chats/triage",
                                      {"feedback": "Mails from Zoe are never to be deleted."})

@@ -411,7 +411,11 @@ class TriageRunner:
                 self.store.set_run(state="done", finished=_now())
                 return {"started": True, "total": 0, "skipped": len(chats)}
             self._running = True
-            self._thread = threading.Thread(target=self._run, args=(run_id, todo),
+            # The notes the run sorts by, taken once: a note saved or taken
+            # back while it runs applies to the next run, never to part of
+            # this one.
+            guidance = [n["text"] for n in self.store.notes()]
+            self._thread = threading.Thread(target=self._run, args=(run_id, todo, guidance),
                                             name="chat-triage", daemon=True)
             self._thread.start()
             return {"started": True, "total": len(todo), "skipped": len(chats) - len(todo)}
@@ -424,7 +428,7 @@ class TriageRunner:
 
     # ── the run ──────────────────────────────────────────────────────────────
 
-    def _run(self, run_id: str, todo: list[dict]) -> None:
+    def _run(self, run_id: str, todo: list[dict], guidance: list[str] | None = None) -> None:
         followups = ThreadPoolExecutor(max_workers=self.followup_concurrency,
                                        thread_name_prefix="chat-triage-followup")
         self._followups = followups
@@ -434,7 +438,8 @@ class TriageRunner:
             batches = [todo[i:i + self.batch_size] for i in range(0, len(todo), self.batch_size)]
             with ThreadPoolExecutor(max_workers=self.concurrency,
                                     thread_name_prefix="chat-triage-batch") as pool:
-                for _ in pool.map(lambda b: self._batch(run_id, b, counted, count_lock),
+                for _ in pool.map(lambda b: self._batch(run_id, b, counted, count_lock,
+                                                        guidance),
                                   batches):
                     pass
             self.store.set_run(state="done", finished=_now(),
@@ -450,7 +455,8 @@ class TriageRunner:
             # soon as they are sorted, Ara's notes land as they come.
             followups.shutdown(wait=True)
 
-    def _batch(self, run_id: str, batch: list[dict], counted: dict, count_lock) -> None:
+    def _batch(self, run_id: str, batch: list[dict], counted: dict, count_lock,
+               guidance: list[str] | None = None) -> None:
         digests: list[dict] = []
         chats: list[dict] = []
         for c in batch:
@@ -468,7 +474,7 @@ class TriageRunner:
             return
         try:
             answer = self.classify(build_prompt(
-                digests, [n["text"] for n in self.store.notes()]))
+                digests, guidance))
         except Exception as exc:  # noqa: BLE001
             self.log(f"chat triage: a batch failed ({exc!r})")
             answer = None

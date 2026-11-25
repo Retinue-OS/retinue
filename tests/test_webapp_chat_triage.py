@@ -330,6 +330,22 @@ await ok('feedback: the saved notes, a send that saves one and sorts again, a âœ
   assert.ok(!html(el).includes('data-tri-note-rm="n1"'));
 });
 
+await ok('the list refresh does not rebuild the view under typing in the feedback field', async () => {
+  const el = await mount(payload(LIST));
+  await openTriage(el, DONE);
+  const before = html(el);
+  el.shadowRoot.activeElement = { matches: (sel) => sel === '[data-tri-fb]' };
+  el.load();
+  takeList().answer(payload([...LIST, chat('u9', { unread: 1, list_group: 'unread', last: { ts: '2026-11-22T09:00:00Z', direction: 'in', text: 'new' } })]));
+  await settle();
+  assert.equal(html(el), before, 'not rebuilt while typing');
+  el.shadowRoot.activeElement = null;
+  el.load();
+  takeList().answer(payload([...LIST, chat('u9', { unread: 1, list_group: 'unread', last: { ts: '2026-11-22T09:00:00Z', direction: 'in', text: 'new' } })]));
+  await settle();
+  assert.ok(ids(html(el)).includes('u9'), 'the next refresh shows it');
+});
+
 await ok('no multi-select in the view; Close and back return to the tabs', async () => {
   history.stack = [null];  // the earlier checks' views were never closed
   const el = await mount(payload(LIST));
