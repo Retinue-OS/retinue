@@ -621,6 +621,15 @@ def test_own_project_thread_stays_with_its_project():
     assert [i["id"] for i in S.fold_projects([thread(unread=True)])] == ["thread:t1"]
     assert [i["id"] for i in S.fold_projects([thread()], projects_known=False)] == ["thread:t1"]
 
+    # The input is never changed, and what acts on its own (listing False)
+    # sees neither the read thread nor the project's spheres.
+    t_in = thread()
+    S.fold_projects([t_in, proj])
+    assert t_in["sphere"] == "admin" and t_in["sphere_from"] is None
+    acting = S.fold_projects([thread(listed_for_project=True), thread(id="thread:t2", unread=True), proj],
+                             listing=False)
+    assert [(i["id"], i["sphere"]) for i in acting] == [("thread:t2", "admin"), ("urn:p", "plazi")], acting
+
     # Read, it is shown as its project is: Focused on plazi shows it, Focused
     # on nothing folds it; unread, it is never folded.
     focus, profile = A.default_focus(), A.default_profile()

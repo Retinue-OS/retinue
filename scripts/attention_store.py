@@ -280,8 +280,9 @@ def own_project_thread(conv: dict) -> bool:
     marked-done threads drop out as any thread does. The home keeps it on
     the list for as long as its project is listed (fold_projects), read or
     not, so a conversation about running work does not vanish once Ara's
-    reply has been read. Only the gateway's list asks; the life-store emit
-    keeps to thread_wants_attention."""
+    reply has been read. Only the gateway's list asks (its items carry
+    ``listed_for_project``); what acts on its own — pushes, digests, the
+    life-store emit — keeps to thread_wants_attention."""
     if conv.get("archived") or (conv.get("kind") or "chat") != "chat":
         return False
     if conv.get("initiator") == "agent" or not conv.get("project"):
@@ -726,7 +727,8 @@ def project_item(row: dict, state_block: dict | None, profile: dict, now: dateti
     return item
 
 
-def fold_projects(items: list[dict], projects_known: bool = True) -> list[dict]:
+def fold_projects(items: list[dict], projects_known: bool = True,
+                  listing: bool = True) -> list[dict]:
     """One row per thing: a project that an open thread is about — the
     wake-up recurring-projects opened, a question an agent asked about it —
     shows as that thread, not beside it. The thread carries the news and
@@ -742,21 +744,31 @@ def fold_projects(items: list[dict], projects_known: bool = True) -> list[dict]:
     work. When the project is done, paused or gone, the thread is listed only
     while Ara's reply lies unread. ``projects_known`` is False when the
     projects could not be read (the store down): then no thread is dropped
-    for a project the list cannot see."""
-    projects = {i["id"]: i for i in items if i.get("kind") == "project"}
-    kept = []
-    for i in items:
-        if i.get("kind") == "thread" and i.get("own") and i.get("project"):
-            listed = projects.get(i["project"])
-            if listed is None and projects_known and not i.get("unread"):
-                continue
-            # A sphere declared for the thread ("message") or corrected by the
-            # user ("you") wins over the project's.
-            if listed is not None and i.get("sphere_from") in (None, "project"):
-                i["sphere"] = listed.get("sphere") or i["sphere"]
-                i["tags"] = list(listed.get("tags") or [])
-                i["sphere_from"] = "project"
-        kept.append(i)
+    for a project the list cannot see.
+
+    That is the home list's view only. ``listing`` False folds for what acts
+    on its own — the tick's sweep and digests, a rule change's re-evaluation,
+    the life-store emit: a thread admitted only as the user's own project
+    thread (``listed_for_project``) is left out, and the rest keep their own
+    spheres, as thread_wants_attention has them. The items passed in are
+    never changed: a thread given the project's spheres is a copy, so that
+    view is never stored back on the thread."""
+    if not listing:
+        kept = [i for i in items if not i.get("listed_for_project")]
+    else:
+        projects = {i["id"]: i for i in items if i.get("kind") == "project"}
+        kept = []
+        for i in items:
+            if i.get("kind") == "thread" and i.get("own") and i.get("project"):
+                listed = projects.get(i["project"])
+                if listed is None and projects_known and not i.get("unread"):
+                    continue
+                # A sphere declared for the thread ("message") or corrected by
+                # the user ("you") wins over the project's.
+                if listed is not None and i.get("sphere_from") in (None, "project"):
+                    i = dict(i, sphere=listed.get("sphere") or i["sphere"],
+                             tags=list(listed.get("tags") or []), sphere_from="project")
+            kept.append(i)
     claimed = {i["project"] for i in kept
                if i.get("kind") == "thread" and i.get("project") and not i.get("own")
                and i.get("state", "open") == "open"}
