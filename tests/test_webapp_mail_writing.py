@@ -2794,6 +2794,28 @@ await ok('the sheet: a labelled modal dialog, focus in To, the page behind inert
   assert.equal(main.inert, false);
 });
 
+await ok('opened for an address (the Contacts page): an empty form takes it; a kept mail is never readdressed', async () => {
+  const first = openSheet({ ...ONE, to: { address: 'mara@example.org', name: 'Mara Keller' } });
+  assert.deepEqual(first.el._chips.to, [{ address: 'mara@example.org', name: 'Mara Keller' }]);
+  first.el.close();
+  // What is no address is not taken.
+  const junk = openSheet({ ...ONE, to: 'not an address' });
+  assert.deepEqual(junk.el._chips.to, []);
+  // A mail kept from earlier comes back as it was, and the sheet says the
+  // address is not in it.
+  write(junk.root, 'ann@example.com,', 'Earlier');
+  junk.el.close();
+  const back = openSheet({ ...ONE, to: { address: 'mara@example.org', name: 'Mara' } }, true);
+  assert.deepEqual(back.el._chips.to.map((r) => r.address), ['ann@example.com']);
+  assert.ok(back.root.innerHTML.includes('mara@example.org is not added to it'), back.root.innerHTML);
+  back.el.close();
+  // An address the kept mail already has is no news.
+  const same = openSheet({ ...ONE, to: 'ANN@example.com' }, true);
+  assert.deepEqual(same.el._chips.to.map((r) => r.address), ['ann@example.com']);
+  assert.ok(!same.root.innerHTML.includes('is not added to it'));
+  same.el.close();
+});
+
 await ok('chips from typing and pasting; what is no address stays, with its error; removal', async () => {
   const { el, root } = openSheet();
   let i = type(root, 'to', 'ann@example.com, bo');
