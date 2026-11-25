@@ -4,8 +4,8 @@ description: >
   Reference for working with the provider-independent email client
   (scripts/email_client.py). Use this skill whenever reading, replying to,
   forwarding, or managing email — regardless of which agent or account is
-  active. Covers command syntax, reply threading, and the universal best
-  practice of marking messages read before sending a reply.
+  active. Covers command syntax, reply threading, the send policy, and where
+  the mail gateway's mirror (mail threads as chats) takes over.
 ---
 
 # Using the Email Client (`email_client.py`)
@@ -26,6 +26,39 @@ Credentials defined this way are covered by the credential isolation described
 below. Avoid `--env-file` / `EMAIL_ENV_FILE`: a file loaded that way is readable
 by the agent and bypasses the isolation, giving it direct SMTP/IMAP access and
 allowing it to circumvent the send-control policy.
+
+## Mirrored threads: send with `mail-push.py`
+
+Where the **mail gateway** mirrors the mailbox (docs/messaging.md, "E-mail (the
+mail gateway)"), each mail thread is a chat. **A mail you reach as a chat** —
+you hold its chat id (a mail chat's companion thread names it, and the command
+to send with) — is answered, and a new mail from the account the gateway
+serves is written, with `scripts/mail-push.py`, the sibling of the messenger
+push CLIs, not with this client:
+
+```bash
+python3 /workspace/scripts/mail-push.py --chat <chat id or key> --reply all "..."   # or --reply sender
+python3 /workspace/scripts/mail-push.py --to a@b.ch --subject "..." --attach /tmp/x.pdf "..."
+python3 /workspace/scripts/mail-push.py --retract <id>
+```
+
+(`--reply-to <token>` also exists, for a gateway prompt that carries a token;
+nothing issues one for mail yet, so do not look for one.) It goes through the
+same `EMAIL_SEND_POLICY` (below) but a different queue: a `verify` send waits
+in the gateway's own pending store, shows in the chat as a pending bubble and
+is taken back with `mail-push.py --retract`, whereas a `send`/`reply` of this
+client waits as an IMAP draft and is taken back with `retract --request-id`.
+Both are approved on `/sends`.
+
+Do not guess a chat id from a UID: holding only a UID, answer with
+`email_client.py reply --uid <UID>` (below).
+
+Use this client for everything else too — reading, searching, flags, moving,
+drafts, attachments of a mail you have a UID for, and an account the gateway
+does not serve. A mail sent with it from a mirrored account still lands in its
+chat once it is in the Sent folder. Neither send makes the recipient known to
+the gate: whose mail is worked on arrival is decided by a contact's VIP flag or
+instruction alone (`contacts.py`, docs/contacts.md).
 
 ---
 
@@ -173,8 +206,9 @@ needs from it: `In-Reply-To` (the source Message-ID), `References` (the source's
 own chain plus its Message-ID), the recipient (source `Reply-To`/`From`), and the
 subject (`Re: …`). This removes the one manual step that has been silently
 skipped in the past — a reply sent without `In-Reply-To` breaks the thread on the
-recipient's side **and** defeats the already-answered check, which then
-re-proposes the message as unanswered (a duplicate).
+recipient's side **and** in the mirror: threading follows the headers and
+nothing else, so such a reply starts a chat of its own instead of joining its
+thread, and the mail it answers stays unread there.
 
 ```bash
 # The whole reply, threaded automatically:
@@ -189,8 +223,7 @@ python3 /workspace/scripts/email_client.py reply --uid 1234 --body "..." \
 allow) — a `verify` sender still returns an `approval_url`, `--user-approved`
 still only counts for `trust`. On a direct send it returns `"sent_uid"` (the
 Sent-folder UID) and `"message_id"` of the outgoing mail, so the caller can
-record them (e.g. in the triage status store) and later verify the reply really
-went out.
+record them and later verify the reply really went out.
 
 **Only hand-build a reply with `send --in-reply-to`/`--references`** when there
 is no source UID to reply to — e.g. threading onto a message you know the
@@ -222,28 +255,32 @@ one person only, so `add` refuses one that is already filed; `find` first.
 
 ---
 
-## Best practice: mark as read before sending a reply
+## Read state: the chat's, not the mailbox flag's
 
-**Always call `flag --read` before sending the reply** — not after.
+For an account the **mail gateway mirrors**, whether a mail has been dealt
+with is the chat's business: a reply — from the chat, from `mail-push.py`,
+from this client or from the user's own mail program — moves the thread to
+*Read*, as does the user's **Mark as read**. The mailbox follows the chat,
+never the reverse (docs/mail-chats.md, "The mailbox follows the chat"): the
+mirror ignores a `\Seen` set from outside, so `flag --read` on a mirrored
+account records nothing the system reads. Do not use it as bookkeeping there,
+and do not read "unread in the mailbox" as "not handled" — nothing keeps a
+status per mail any more (e-mail triage and its status store are retired;
+docs/mail-chats.md).
 
-Reason: if the session crashes between sending and marking, the message will
-still appear unread on the next run and will be answered again (duplicate reply).
-The reverse — marked but not sent — is a much smaller problem: on the next run
-the message is already marked read, but there is no reply in the Sent folder;
-this is noticeable and can be handled manually.
+**An account the gateway does not serve** — an agent persona's own mailbox,
+say — has no chat and no mirror. An agent that works such a mailbox by its
+unread flag marks a message read **before** it sends the reply, not after:
 
 ```bash
-# Correct order:
-# 1. Read
 python3 /workspace/scripts/email_client.py read --uid <UID>
-# 2. Mark as read — NOW, before sending
-python3 /workspace/scripts/email_client.py flag --uid <UID> --read
-# 3. Send the reply (headers derived from the source UID)
+python3 /workspace/scripts/email_client.py flag --uid <UID> --read     # now, before sending
 python3 /workspace/scripts/email_client.py reply --uid <UID> --body "..."
 ```
 
-This order applies to all agents, regardless of whether they send directly,
-save drafts, or do something else.
+If the session dies between the two steps, marked-but-not-sent is noticed (no
+reply in Sent) and repaired by hand; sent-but-not-marked is answered a second
+time by the next run.
 
 ---
 
@@ -263,5 +300,6 @@ save drafts, or do something else.
 | `EMAIL_SEND_POLICY` | JSON array mapping sender addresses to `verify`/`trust`/`allow` | unset → all addresses `verify` |
 | `SEND_APPROVAL_BASE_URL` | Public base URL for approval links (falls back to `CONVERSATION_BASE_URL`) | — |
 
-For named accounts: suffix versions, e.g. `EMAIL_USER_ARI`, `EMAIL_PASS_ARI` —
-the client falls back to the version without suffix when the suffixed one is missing.
+For named accounts: suffix versions, e.g. `EMAIL_USER_ARI`, `EMAIL_PASS_ARI`.
+A named account defines its own identity in full: the client never falls back
+to the unsuffixed variables for it, and a missing required one is an error.

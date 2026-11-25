@@ -60,19 +60,19 @@ Shall I confirm the party invitation and add it to your agenda, or decline?
   the end of the message it would have to name the item by number to stay
   unambiguous, which is exactly the noise to avoid.
 - **An enumerated list gets a chip per row _and_ a bulk chip.** In any list the
-  message asks the user to act on — a triage omnibus, search results, a set of
-  options — every row carries its own short inline details chip, and the bulk
-  answer is itself a chip ("Okay for all"), never a phrase to type out. After a
+  message asks the user to act on — a roundup of several mails, search
+  results, a set of options — every row carries its own short inline details
+  chip, and the bulk answer is itself a chip ("Okay for all"), never a phrase to type out. After a
   bulk action, offer the undo the same way.
 
 ## 2. An e-mail referred to but not shown gets a details chip
 
-An e-mail that is the **subject** of a thread is shown by default — a triage
-reply proposal quotes the original in full, so a "show me this mail" chip
+An e-mail that is the **subject** of a thread is shown by default — a reply
+proposal quotes the original in full, so a "show me this mail" chip
 there would be pointless. The details chip is for every e-mail a message
-**refers to without including its content**: each line of an archive/delete
-omnibus, an earlier message in the same correspondence, a mail mentioned in a
-briefing or summary. Its prefill asks for more details about **that specific
+**refers to without including its content**: each line of a message that
+lists several mails, an earlier message in the same correspondence, a mail
+mentioned in a briefing or summary. Its prefill asks for more details about **that specific
 e-mail**, identified unambiguously by sender and subject, so the follow-up
 works even after the thread has moved on:
 
@@ -82,9 +82,18 @@ She already floated the date in two earlier mails not shown here [[chip: show th
 [[chip: Send | Send the draft as proposed.]] · [[chip: Discard | Discard the draft, I'll handle it myself.]]
 ```
 
-When several unshown e-mails appear in one message (e.g. a triage omnibus),
-give each line its own inline details chip — right on the line, not collected
-at the end.
+When several unshown e-mails appear in one message (e.g. a summary of what
+arrived, or the mails a search found), give each line its own inline details
+chip — right on the line, not collected at the end — and put the bulk answer
+and its alternative on the answer row:
+
+```
+Three mails from the school arrived since Monday:
+- Class trip on 12 June, needs a signature [[chip: more | Show me the school's mail about the class trip.]]
+- Parents' evening moved to Thursday [[chip: more | Show me the school's mail about the parents' evening.]]
+- The lunch menu for June [[chip: more | Show me the school's mail with the lunch menu for June.]]
+[[chip: Archive all three | Archive the three school mails.]] · [[chip: Leave them | Leave the three school mails as they are.]]
+```
 
 ## 3. PR and issue labels link to GitHub
 

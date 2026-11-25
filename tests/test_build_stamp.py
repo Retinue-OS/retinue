@@ -43,6 +43,7 @@ GATEWAY_DOCKERFILES = {
     "telegram": REPO_ROOT / "telegram-gateway" / "Dockerfile",
     "whatsapp": REPO_ROOT / "whatsapp-gateway" / "Dockerfile",
     "sms": REPO_ROOT / "sms-gateway" / "Dockerfile",
+    "mail": REPO_ROOT / "mail-gateway" / "Dockerfile",
 }
 # Every image that reports a build, including the main one.
 STAMPED_DOCKERFILES = dict(GATEWAY_DOCKERFILES, retinue=REPO_ROOT / "Dockerfile")
@@ -57,7 +58,8 @@ ENV_FROM_ARG = "ENV RETINUE_BUILD_SHA=${RETINUE_BUILD_SHA}"
 # outright (`/models` is not creatable there), while as root it silently
 # succeeds — so the suite goes green locally and red in CI, which is how this
 # got pushed once already.
-IMPORT_TIME_DEFAULT_DIRS = (Path("/models"), Path("/tmp/signal-attachments"))
+IMPORT_TIME_DEFAULT_DIRS = (Path("/models"), Path("/tmp/signal-attachments"),
+                            Path("/inbound"))
 
 
 def _load_web_gateway(tmp: Path):
@@ -215,13 +217,13 @@ def test_compose_forwards_the_sha_to_every_stamped_image():
     try:
         import yaml  # noqa: PLC0415 - optional; the check degrades to a text scan
     except ImportError:
-        assert compose.count("RETINUE_BUILD_SHA: ${RETINUE_BUILD_SHA:-}") == 5, \
-            "all five stamped services must forward the build arg"
+        assert compose.count("RETINUE_BUILD_SHA: ${RETINUE_BUILD_SHA:-}") == 6, \
+            "all six stamped services must forward the build arg"
         print("PASS test_compose_forwards_the_sha_to_every_stamped_image (text scan)")
         return
     services = yaml.safe_load(compose)["services"]
     for service in ("retinue", "signal-gateway", "telegram-gateway", "whatsapp-gateway",
-                    "sms-gateway"):
+                    "sms-gateway", "mail-gateway"):
         build = services[service].get("build")
         assert isinstance(build, dict), f"{service}: build must be a mapping to carry args"
         assert build.get("args", {}).get("RETINUE_BUILD_SHA") == "${RETINUE_BUILD_SHA:-}", \
@@ -268,6 +270,13 @@ def _load_gateway(name: str, tmp: Path):
     # `{CHANNEL}_` naming the loop above covers, so they are set by name.
     os.environ["PIPER_DATA_DIR"] = str(tmp / "models")
     os.environ["SIGNAL_ATTACHMENTS_DIR"] = str(tmp / "attachments")
+    if name == "mail":
+        # The mail gateway's ledger and policy file default to the /inbound
+        # volume; and with no mailbox named it loads unconfigured, which is
+        # all a health snapshot needs.
+        os.environ["INBOUND_STORE_DIR"] = str(tmp / "inbound")
+        os.environ["TRIAGE_EMAIL_WHITELIST_PATH"] = str(tmp / "inbound" / "policy" / "email-policy.nt")
+        os.environ.pop("MAIL_ACCOUNT_NAME", None)
     if str(SCRIPTS_DIR) not in sys.path:
         sys.path.insert(0, str(SCRIPTS_DIR))
     spec = importlib.util.spec_from_file_location(
@@ -288,7 +297,13 @@ def test_every_messenger_gateway_publishes_its_build_on_health():
     """
     escaped_before = {d for d in IMPORT_TIME_DEFAULT_DIRS if d.exists()}
     stamps = {}
-    for name in ("signal", "telegram", "whatsapp", "sms"):
+    for name in GATEWAY_DOCKERFILES:
+        if not (SCRIPTS_DIR / f"{name}-gateway.py").exists():
+            # Only while the mail gateway's image and its module land in
+            # separate changes: its Dockerfile is pinned above either way.
+            print(f"SKIP {name}-gateway health: scripts/{name}-gateway.py is not "
+                  f"in this checkout")
+            continue
         with tempfile.TemporaryDirectory() as raw:
             gw = _load_gateway(name, Path(raw))
             snapshot = gw._health_snapshot()
@@ -300,6 +315,9 @@ def test_every_messenger_gateway_publishes_its_build_on_health():
                 f"{name}-gateway reports no framework digest from a full checkout"
             json.dumps(snapshot)  # it has to survive being a JSON body
             stamps[name] = build["framework"]
+    # Point no later test at a temp dir that is gone.
+    for key in ("INBOUND_STORE_DIR", "TRIAGE_EMAIL_WHITELIST_PATH"):
+        os.environ.pop(key, None)
     assert len(set(stamps.values())) == 1, \
         f"the gateways bake the same modules and must agree: {stamps}"
     escaped = {d for d in IMPORT_TIME_DEFAULT_DIRS if d.exists()} - escaped_before

@@ -656,20 +656,21 @@ def test_a_person_carries_attention_and_vip(base, wg):
     assert all("Pia Frei" not in names for names in profile["permits"].values()), profile["permits"]
     status, out = _http(base, "POST", f"/contacts/{person}", {"permits": ["no-such-mode"]})
     assert status == 400, out
-    # VIP reaches the gate on every channel she has, and her address is
-    # whitelisted — beside what was set by hand, which it leaves alone.
+    # VIP reaches the gate on every channel she has, e-mail among them: her
+    # address is a VIP handle of the `email` channel, not a whitelist entry —
+    # beside what was set by hand, which it leaves alone.
     import triage_policy as tp  # the gateway's scripts/ is on sys.path
     tp._mutate_messenger("signal", vip_add=["+41790000999"])
     wg._contacts_sync_policy()
     assert tp.gate_decision("signal", pia)["vip"] is True
     assert tp.gate_decision("whatsapp", pia)["vip"] is True
     assert tp.gate_decision("signal", "+41790000999")["vip"] is True, "a hand-set VIP stays"
-    assert tp.email_gate_decision("pia@example.org")["triage_now"] is True
+    assert tp.gate_decision("email", "pia@example.org")["vip"] is True
     status, out = _http(base, "POST", f"/contacts/{person}", {"vip": False})
     assert status == 200 and out["contact"]["vip"] is False, out
     assert tp.gate_decision("signal", pia)["vip"] is False
     assert tp.gate_decision("signal", "+41790000999")["vip"] is True
-    assert tp.email_gate_decision("pia@example.org")["triage_now"] is False
+    assert tp.gate_decision("email", "pia@example.org")["vip"] is False
     _http(base, "POST", "/attention/items/done", {"id": cid})
     print("ok test_a_person_carries_attention_and_vip")
 
@@ -735,6 +736,35 @@ def test_legacy_cards_are_filed(base, wg):
     assert wg._contacts_migrate() == 0, "a filed card is done"
     _http(base, "POST", "/attention/items/done", {"id": "chat:" + chat})
     print("ok test_legacy_cards_are_filed")
+
+
+def test_known_handle_links_itself(base, wg):
+    """A chat whose handle a person already owns is linked to them on arrival,
+    without the card; a card the user removed is not filled in again."""
+    real_commit = wg._contact_commit
+    wg._contact_commit = lambda record, verb: None
+    try:
+        num = "+41791000155"
+        wg._CONTACTS.create("private", "Ivo Brandt", [("signal", num)])
+        chat = "signal:" + num
+        _inbound(base, num, None, "Hi.", "2026-09-05T15:00:00Z",
+                 gate={"forward": True, "vip": False, "reason": "open"})
+        doc = wg._CHAT_STATE.get(chat)
+        assert doc["name"] == "Ivo Brandt" and doc["contact"]["person"], doc
+        # Removing the card takes the handle off the person: no relink.
+        status, out = _http(base, "POST", f"/chats/{urllib.parse.quote(chat, safe='')}/contact", {"name": ""})
+        assert status == 200, out
+        _inbound(base, num, None, "Again.", "2026-09-05T15:05:00Z",
+                 gate={"forward": True, "vip": False, "reason": "open"})
+        assert not wg._CHAT_STATE.get(chat)["contact"]
+        # A person filed later (the CLI) links the chat at the next sweep.
+        wg._CONTACTS.create("private", "Ivo B.", [("signal", num)])
+        assert wg._chats_autolink() == 1
+        assert wg._CHAT_STATE.get(chat)["name"] == "Ivo B."
+        _http(base, "POST", "/attention/items/done", {"id": "chat:" + chat})
+    finally:
+        wg._contact_commit = real_commit
+    print("ok test_known_handle_links_itself")
 
 
 def test_a_person_in_several_spheres(base, wg):
@@ -1658,6 +1688,7 @@ def main():
         test_a_person_carries_attention_and_vip(base, wg)
         test_review_fixes(base, wg)
         test_legacy_cards_are_filed(base, wg)
+        test_known_handle_links_itself(base, wg)
         test_a_message_judgement_is_its_own(base, wg)
         test_vip_always_rings(base, wg)
         test_spheres_are_a_word_away(base, wg)

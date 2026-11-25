@@ -19,8 +19,9 @@ Two identifiers, and they answer different questions:
 * **``framework``** — a digest of the shared framework modules *as they were
   actually baked in*, computed at runtime from the files on disk. It needs no
   cooperation from the build pipeline at all, so it is always there, and it is
-  the one that catches the failure above: the retinue container and the three
-  messenger gateways copy the **same** modules, so if their digests
+  the one that catches the failure above: the retinue container and every
+  channel gateway (the messengers' and the mail gateway) copy the **same**
+  modules, so if their digests
   differ, one of those images is older than the other. The web-gateway compares
   them on the ``/gateways`` page.
 
@@ -44,11 +45,15 @@ import hashlib
 import os
 from pathlib import Path
 
-# The modules every messenger gateway's Dockerfile copies, and which the
+# The modules every channel gateway's Dockerfile copies, and which the
 # retinue container carries under /workspace/scripts. Adding one here without
 # adding it to every gateway Dockerfile turns every gateway's digest into
 # None — tests/test_build_stamp.py fails the build for exactly that, so the
-# list and the COPY lines cannot drift apart silently.
+# list and the COPY lines cannot drift apart silently. A gateway may bake more
+# than these (the mail gateway's email_client, mail_threads and mail_trim),
+# but those stay outside the digest: a module the messenger images do not
+# carry would make their digest None. A mail gateway stale in those modules
+# alone is therefore told only by its sha.
 FRAMEWORK_MODULES: tuple[str, ...] = (
     # This module is one of them: it is copied into every gateway like the
     # rest, so a build in which *it* changed is a different build, and a digest

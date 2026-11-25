@@ -16,12 +16,15 @@ person's messenger handles, so a chat whose text never repeats the name is
 still found. Matching is case- and accent-insensitive. Read-only; prints
 compact, prompt-ready lines, newest first per source.
 
-Sources: chats (gateway message stores), threads (dashboard conversations,
+Sources: chats (gateway message stores — the messengers' and, once the mail
+gateway mirrors a mailbox, e-mail's), threads (dashboard conversations,
 including autonomous ones), memory (entries recorded in the window, read from
 the files so a fresh store is not needed), projects (project files changed in
 the window — the matching lines). Memory entries that were corrected,
-superseded, compacted away or have expired are left out. E-mail is not
-covered: use email_client.py search --text for that.
+superseded, compacted away or have expired are left out. E-mail is covered as
+far as the mail gateway mirrors it (INBOX and Sent, from its backfill window
+on); for older mail, other folders or a deployment without the mirror, use
+email_client.py search --text.
 """
 from __future__ import annotations
 
@@ -123,12 +126,50 @@ def scan_chats(root: Path, since: dt.datetime, needles: list[str], handles: set[
             if not when or when < since:
                 continue
             text = fields.get("text") or ""
+            if fields.get("channel") == "email":
+                row = _mail_row(fields, outbound, text, needles, handles)
+                if row:
+                    yield when, row
+                continue
             who = {_bare(fields.get("chat")), _bare(fields.get("sender"))} - {""}
             if not (who & handles or any(n in fold(text) for n in needles)):
                 continue
             arrow = "→" if outbound else "←"
             party = fields.get("chat") or fields.get("sender") or "?"
             yield when, f"{channel_dir.name} {arrow} {party}: {excerpt(text, needles) or '[media]'}"
+
+
+def _mail_row(fields: dict, outbound: bool, text: str, needles: list[str],
+              handles: set[str]) -> str | None:
+    """One mirrored mail as a line, or None when it does not match.
+
+    A mail chat's key is its thread's root Message-ID, which names nobody, so
+    the people are read off the addresses instead: From, To and Cc, so a mail
+    a person was copied on is found under them too. An address matches a
+    contact's e-mail in full and, like a messenger handle, a bare term by its
+    local part. The subject is searched with the text: it is often the only
+    place a subject word appears. A tombstone (the mail was deleted in a
+    client) still says that it existed. Every field shown is the mail's own
+    and is flattened to one line."""
+    sender = fields.get("sender") or ""
+    to = list(fields.get("recipients") or []) + list(fields.get("cc") or [])
+    addresses = [a for a in [sender, *to] if a]
+    who = {fold(a) for a in addresses} | {_bare(a) for a in addresses}
+    subject = " ".join((fields.get("subject_line") or "").split())
+    if not (who - {""}) & handles and not any(
+            n in fold(text) or n in fold(subject) for n in needles):
+        return None
+    if outbound:
+        party = ", ".join(" ".join(a.split()) for a in to) or "?"
+    else:
+        name = " ".join((fields.get("sender_name") or "").split())
+        sender = " ".join(sender.split()) or "?"
+        party = f"{name} <{sender}>" if name else sender
+    if fields.get("removed_at"):
+        body = "[deleted from the mailbox]"
+    else:
+        body = excerpt(text, needles) or "[attachment]"
+    return f"email {'→' if outbound else '←'} {party} «{subject or '(no subject)'}»: {body}"
 
 
 def scan_threads(root: Path, since: dt.datetime, needles: list[str], names: list[str]):

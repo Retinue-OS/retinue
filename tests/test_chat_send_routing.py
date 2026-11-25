@@ -21,7 +21,11 @@ The fix is identity-first, fail-closed routing, and this pins all of it:
   reported account. Mode alone would not do: the poisoned stamps named the
   built-in service, which may itself be inbox-mode, so an inbox check passes
   every one of them and the fix would be inert;
-- ambiguity refuses the send instead of guessing an identity.
+- ambiguity refuses the send instead of guessing an identity;
+- a registry entry that states its `channel` is read by that, so a gateway
+  whose service name is not its channel's (the mail gateway: `mail-gateway`,
+  channel `email`) still routes, and entries without the field are read by
+  slug and label as before.
 
 Standalone:
 
@@ -455,7 +459,61 @@ def test_channel_membership():
                                           {"label": "WhatsApp"}, "signal")
         assert not wg._gateway_in_channel("signalish-gateway",
                                           {"label": "Other"}, "signal")
+        # An entry that states its channel is read by that and nothing else:
+        # the mail gateway's service is `mail-gateway`, its channel `email`,
+        # and neither its slug nor its label says so.
+        mail = {"base_url": "http://mail-gateway:8096", "label": "E-mail", "channel": "email"}
+        assert wg._gateway_in_channel("mail-gateway", mail, "email")
+        assert not wg._gateway_in_channel("mail-gateway", dict(mail, channel=None), "email")
+        assert not wg._gateway_in_channel("mail-gateway", dict(mail, channel=" "), "email")
+        assert wg._gateway_in_channel("mail-gateway", dict(mail, channel=" EMail "), "email")
+        # The statement wins over what the slug would read as, both ways.
+        stated = {"label": "Signal", "channel": "sms"}
+        assert wg._gateway_in_channel("signal-gateway", stated, "sms")
+        assert not wg._gateway_in_channel("signal-gateway", stated, "signal")
+        # A slug is told its channel the same way, e-mail among them.
+        wg._CHANNEL_GATEWAYS = {"mail-gateway": mail, "signal-gateway-personal": gw,
+                                "email-gateway-work": {"label": "Work"},
+                                "odd-box": {"label": "Something"}}
+        assert wg._slug_channel("mail-gateway") == "email"
+        assert wg._slug_channel("signal-gateway-personal") == "signal"
+        assert wg._slug_channel("email-gateway-work") == "email"
+        assert wg._slug_channel("odd-box") is None and wg._slug_channel("nobody") is None
     print("PASS test_channel_membership")
+
+
+def test_a_mail_account_routes_by_its_address():
+    """A mail chat's account is a mailbox address: matched against what the
+    gateway reports for itself, whatever the case, and — like every account
+    — never routed anywhere else."""
+    with tempfile.TemporaryDirectory() as tmp:
+        wg = _load_gateway(Path(tmp))
+        wg._CHANNEL_GATEWAYS = {
+            "mail-gateway": {"base_url": "http://mail-gateway:8096", "token": "",
+                             "label": "E-mail", "channel": "email"},
+            "signal-gateway": {"base_url": "http://signal-gateway:8090", "token": "",
+                               "label": "Signal"}}
+        health = {"mail-gateway": _inbox("me@example.org"), "signal-gateway": _inbox(PERSONAL)}
+        wg._fetch_gateway_health = lambda gw: dict(
+            health[gw["base_url"].split("//", 1)[1].split(":", 1)[0]])
+        with wg._gw_identity_lock:
+            wg._gw_identity.clear()
+        assert wg._slug_for_account("email", "Me@Example.org") == "mail-gateway"
+        assert wg._rail_gateway_slug("email", "me@example.org") == "mail-gateway"
+        slug, gw, err = wg._chat_gateway({}, "email", "me@example.org")
+        assert err is None and slug == "mail-gateway" and gw is not None
+        slug, gw, err = wg._chat_gateway({}, "email", "other@example.org")
+        assert gw is None and "other@example.org" in err
+        # Channels do not leak into each other: the mail gateway serves no
+        # Signal chat, and the Signal account's case is not folded.
+        assert [s for s, _g in wg._inbox_gateways("signal")] == ["signal-gateway"]
+        assert [s for s, _g in wg._media_gateways("email")] == ["mail-gateway"]
+        assert wg._slug_for_account("signal", PERSONAL) == "signal-gateway"
+        shaped = wg._shape_chat_attachments(
+            ["urn:retinue:media:email:" + "ab" * 16],
+            serving_slug=wg._media_gateways("email", "me@example.org")[0][0])
+        assert shaped[0]["url"] == "/chats/media/mail-gateway/" + "ab" * 16, shaped
+    print("PASS test_a_mail_account_routes_by_its_address")
 
 
 if __name__ == "__main__":
@@ -475,4 +533,5 @@ if __name__ == "__main__":
     test_references_that_are_no_media_get_no_url()
     test_two_inbox_accounts_still_serve_media()
     test_channel_membership()
+    test_a_mail_account_routes_by_its_address()
     print("all chat send-routing tests passed")

@@ -273,7 +273,7 @@ def _mark_delivered(store_path) -> None:
 def _confirm_delivery(job_path: str, store_path, label: str,
                       base: str | None = None) -> None:
     """Mark a forwarded inbound delivered once the job that took it succeeds
-    (see telegram-gateway.py); a failed job leaves it for the daily drain."""
+    (see telegram-gateway.py); a failed job leaves it for the recovery drain."""
     if store_path is None:
         return
     from urllib.parse import urljoin

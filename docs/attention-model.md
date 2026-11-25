@@ -54,7 +54,7 @@ Products turned the same research into a few mechanisms Retinue can borrow:
 
 | Property | Values | Set by |
 |---|---|---|
-| `kb:importance` | 0–5, the Herald’s scale; unset counts as 2.5 | `--importance`, the Secretary in triage, frontmatter, a prior |
+| `kb:importance` | 0–5, the Herald’s scale; unset counts as 2.5 | `--importance`, a turn’s verdict (an instructed sender’s; triage’s for a messenger message the chat could not take), frontmatter, a prior |
 | `kb:due` | `xsd:dateTime`; urgency = time left ÷ lead time | `--due`, `expected_by` / `next_due`, a date the Secretary extracts |
 | `kb:leadTime` | `xsd:duration`; what this kind of item typically needs; default 3 days | per-kind defaults, a project’s `remind_before`, `--lead` |
 | `kb:sphere`, `kb:tag` | a main sphere from a small deployment-named set, and any further ones as tags — a person can be a customer and a friend, and every sphere counts for a mode alike; a sphere may lie *within* another (`focus.json` `within`, `scripts/attention-spheres.py`), and is then admitted wherever the outer one is | chamber instructions, contact groups, frontmatter |
@@ -128,11 +128,11 @@ interrupt stays the separate question a permit answers.
 
 1. **Fields and the list.** The five properties, the level table, the Attention list with its three-field explanation, the manual mode chip; badges and pushes obey the mode. No learning, no digest yet — and most of the value. Touches `web-gateway.py` (an `/attention` route), `conversation-push.py`, `push_notify.py`, and one `attention.js` in place of three cards.
 2. **Deferral.** Digests at breakpoints, `Urgency` and `Topic` headers, the half-hourly re-evaluation, schedules and quiet hours, the repeat policy.
-3. **Learning.** Priors, lead times and permits from the corrections and from the Secretary’s triage judgement, kept in an *attention profile* the user can read and edit, as `preferences.md` is for news; calendar-driven modes; Secretary replies to held senders.
+3. **Learning.** Priors, lead times and permits from the corrections and from the verdicts of instructed turns, kept in an *attention profile* the user can read and edit, as `preferences.md` is for news; calendar-driven modes; Secretary replies to held senders.
 
 **Measure** pushes per day by level, time from arrival to action for time-sensitive items, digest open rate, and corrections by field: an importance correction on an item that pushed is a false alarm, a permit granted after an item was held is a miss. Tune the digest times, the lead-time defaults and the *Now* cap from these.
 
-**Risks.** Over-filtering hides a real emergency: the band crossing, the undeferrable critical level and the existing daily catch-all keep that bounded. Complexity: four levels, one small sphere set, four named modes — no sliders, and the three fields are the whole explanation. Cost: the level is arithmetic; the only model judgement is the Secretary’s, which triage spends already. The defaults proposed here are assumptions; record them as memories when adopted, so later sessions inherit them.
+**Risks.** Over-filtering hides a real emergency: the band crossing, the undeferrable critical level, a VIP’s ring (no mode holds it back) and the failure rule (an instructed turn that does not finish rings its message) keep that bounded; a message from a sender who is neither VIP nor instructed is never held, only listed. Complexity: four levels, one small sphere set, four named modes — no sliders, and the three fields are the whole explanation. Cost: the level is arithmetic; the only model judgement is the verdict of an instructed turn, which the sender’s instruction already buys. The defaults proposed here are assumptions; record them as memories when adopted, so later sessions inherit them.
 
 **Decisions to take before slice 1.** The sphere set and the four mode names; which spheres and tags each mode admits by default; the lead time per kind of item; the digest times; the repeat policy per sender class; whether the Attention list replaces the three cards or sits above them; and whether the Secretary may answer held senders at all. Each becomes a memory once decided.
 

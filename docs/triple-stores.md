@@ -444,6 +444,8 @@ the same aggregate over literals works. Wrap the variable in `STR()` —
 `GROUP_CONCAT(STR(?att); separator=" ")` — whenever the values may be IRIs.
 Because an absent cell reads exactly like "no values", this fails silently;
 the chat media references (`kb:attachment`) were invisible for weeks this way.
+A mail's part references (`kb:bodyPart`, `kb:htmlPart`, `kb:headerPart`) are
+IRIs as well; its addresses (`kb:recipient`, `kb:cc`) are literals.
 Relatedly, `BIND` on a variable already in scope is an error: `FILTER` on it,
 or `BIND` inside a subquery where nothing binds it yet.
 

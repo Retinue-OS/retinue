@@ -8,5 +8,6 @@ RUN chmod +x /entrypoint.sh
 
 ENV EGRESS_AUDIT_LOG_DIR=/var/log/retinue/egress
 ENV EGRESS_AUDIT_BODY_LIMIT=65536
+ENV EGRESS_AUDIT_STREAM_THRESHOLD=4m
 
 ENTRYPOINT ["/entrypoint.sh"]
