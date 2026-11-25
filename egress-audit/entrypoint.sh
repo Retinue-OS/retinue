@@ -34,6 +34,13 @@ cp "$EGRESS_CERT_DIR/mitmproxy-ca.pem" /home/mitmproxy/.mitmproxy/mitmproxy-ca.p
 chmod 600 /home/mitmproxy/.mitmproxy/mitmproxy-ca.pem
 chown -R mitmproxy:mitmproxy /home/mitmproxy/.mitmproxy /var/log/retinue/egress
 
+# Bodies above this size are streamed through instead of held in memory (see
+# scripts/egress-audit-addon.py). Set it empty to buffer everything again.
+STREAM_THRESHOLD="${EGRESS_AUDIT_STREAM_THRESHOLD-4m}"
+if [ -n "$STREAM_THRESHOLD" ]; then
+  set -- --set "stream_large_bodies=$STREAM_THRESHOLD" "$@"
+fi
+
 echo "[egress-audit] Starting mitmdump ..."
 # The upstream mitmproxy image provides gosu, not su-exec.
 exec gosu mitmproxy mitmdump \

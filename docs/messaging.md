@@ -1,4 +1,4 @@
-# Outbound messaging — Signal, WhatsApp, Telegram, SMS
+# Messaging — Signal, WhatsApp, Telegram, SMS, e-mail
 
 *Reference depth for the "Messaging" digest in `CLAUDE.md`. Read this before
 sending on an unfamiliar channel or account, changing send policies, enrolling
@@ -127,6 +127,7 @@ python3 /workspace/scripts/signal-push.py   --retract <id>
 python3 /workspace/scripts/whatsapp-push.py --retract <id>
 python3 /workspace/scripts/telegram-push.py --retract <id>
 python3 /workspace/scripts/sms-push.py      --retract <id>
+python3 /workspace/scripts/mail-push.py     --retract <id>   # the mail gateway's queue
 python3 /workspace/scripts/caldav-push.py   --retract <id>   # a queued event
 python3 /workspace/scripts/email_client.py  retract --request-id <id>
 ```
@@ -135,9 +136,15 @@ Pass the same `--url` the send used when it went to a non-default gateway. On
 a messenger or calendar gateway this is `POST /pending-sends/<id>/retract`: the
 entry moves to the terminal status `retracted` (distinct from the user's
 `rejected`), leaves the `/sends` list, and its approval page says the agent
-took it back; e-mail deletes the pending draft. A retraction the user has
+took it back; e-mail's `email_client.py` deletes the pending draft (the mail gateway's own
+queue, `mail-push.py`, works like a messenger's). A retraction the user has
 already overtaken is not silent: approved (or being sent) exits non-zero with
-"too late", denied exits zero with "nothing was sent". After retracting, say
+"too late", denied exits zero with "nothing was sent". On the mail gateway's
+queue an allowed send that then failed says which kind of failure it was: "too
+late: … the send failed; nothing was sent" where the gateway knows nothing left
+it, and "too late: … it is NOT KNOWN whether it went out. Do not send it again"
+where the mail was handed to the mail server and its answer was never seen
+(`outcome_unknown`) — never "failed", which would invite a second mail. After retracting, say
 so wherever the approval link was relayed — the link now leads to a
 retracted entry, not a message waiting for the user.
 
@@ -157,28 +164,37 @@ that thread as a *Retinue* message:
   failed send marks the thread unread and wakes it; the other notes are a
   record of the user's own decision and badge nothing. A send still running
   after `SEND_DECISION_OUTCOME_TIMEOUT` seconds (default 120) is reported as
-  allowed with a link to its approval page.
+  allowed with a link to its approval page. A mail whose entry ends as `error`
+  with `outcome_unknown: true` is not reported as failed: the note — like the
+  approval page and its status JSON — says that it is not known whether the
+  mail went out, and that it must not be sent again.
 
 The note's agent context names the request (`<gateway>/<id>` and its status),
 so the next turn in the thread knows what became of the message it proposed.
 A job outside a thread turn that opened a thread for its proposal links the
-send explicitly with `--thread <id>` on the push CLI (`email_client.py` has no
-such flag: set `RETINUE_THREAD_ID=<id>` in its environment instead); a send
+send explicitly with `--thread <id>` on the push CLI (`mail-push.py` takes it too;
+`email_client.py` has no such flag: set `RETINUE_THREAD_ID=<id>` in its environment instead); a send
 with no thread is simply not reported. Retractions are the agent's own act and are not noted.
 
 ## Multiple gateways per channel
 
 The `/sends` page enrols the built-in
 gateways when their `*_GATEWAY_BASE_URL` is set and their name is included in
-`MESSENGER_BUILTIN_CHANNELS` (default: all four — `signal`, `whatsapp`,
-`telegram`, `sms`; SMS additionally needs `SMS_GATEWAY_BASE_URL`, which the base
-compose leaves unset — see "Gateway connection monitoring" below), but a deployment often runs
+`MESSENGER_BUILTIN_CHANNELS` (default: all five — `signal`, `whatsapp`,
+`telegram`, `sms`, `email`; SMS additionally needs `SMS_GATEWAY_BASE_URL`, which the base
+compose leaves unset — see "Gateway connection monitoring" below — and
+`email` is enrolled by `MAIL_GATEWAY_BASE_URL`, its gateway being the mail
+gateway, which reads the variable too — see "E-mail (the mail gateway)"), but a deployment often runs
 *more than one* gateway on a channel — most commonly a second Signal identity,
 the user's **personal** account (`signal-gateway-personal`) alongside the
 system one. Those extra gateways are enrolled by the deployment via
 **`MESSENGER_GATEWAYS`** (read by `web-gateway.py`), a JSON array of
-`{base_url, token?, label?}` objects; each becomes its own `/sends/<slug>/<id>`
-account on the approval page. The slug is the gateway's Docker **service name**
+`{base_url, token?, label?, channel?}` objects; each becomes its own `/sends/<slug>/<id>`
+account on the approval page. `channel` names the chat channel the gateway
+serves (`signal`, `email`, …) where its service name does not say it — every
+registry entry carries one (`scripts/messenger_gateways.py`), and one left
+unstated is read from the slug and the label as before; a mail account added
+this way must state `"channel": "email"`. The slug is the gateway's Docker **service name**
 and needs no configuration on either side: the web-gateway takes the hostname
 of each registered `base_url` verbatim, and the gateway derives the same name
 from the Host header of the `/send` request that queued the message — so
@@ -294,6 +310,14 @@ Two deliberate differences from the other channels:
   `SMS_WEBHOOK_SIGNING_KEY` is unset. Redeliveries are deduplicated by message
   id. The gateway registers the webhook with the server itself at startup.
 
+For the chat mirror this means two things. The gateway hears only
+`sms:received`, so an SMS the user sends from the phone's own SMS app is not
+seen: such a chat stays *Unread* on the dashboard until it is answered from
+there or marked read (docs/messenger-chats.md, "Unread · Read · Archived").
+And a received SMS carries the phone's receipt time, which a delayed or
+retried webhook delivers later — it is unread by the order it arrived in,
+whatever that stamp says.
+
 **Setup.**
 
 1. In `.env`: `COMPOSE_PROFILES=sms`, `SMS_GATEWAY_BASE_URL=http://sms-gateway:8095`
@@ -324,11 +348,663 @@ sends the event over the phone's own server-sent-events connection to
 registering (or re-register after switching). There is no QR re-pairing: a "not seen recently" on `/gateways` is fixed
 on the phone (is the app running, allowed in the background, online?).
 
+## E-mail (the mail gateway)
+
+The `mail-gateway` service (`scripts/mail-gateway.py`, image
+`mail-gateway/Dockerfile`, port 8096) mirrors **one mailbox** into the same
+per-message ledger the messenger gateways write, so each mail thread is a chat
+on the Chats page — trimmed to its own new text, with the full mail one tap
+away (**Original**) — and writes back: it sends under the e-mail send policy
+and the mailbox follows what the user does in the chat. It is also **mail's
+delivery gate**: every mail that arrives is offered to the chat surface, a
+model turn is bought only by a VIP or an instructed sender, and news mail goes
+to the feed ("The gate", below). The design and its rules (threading, the
+record, the trim, the gate) are `docs/mail-chats.md`; this section is how to
+run it. It is the `email`
+channel's gateway: a built-in of the registry, enrolled by
+`MAIL_GATEWAY_BASE_URL`, which the base compose sets, and **not** behind a
+profile — a deployment with no mailbox configured runs it idle.
+
+**Opt-in: `MAIL_GATEWAY_TOKEN`.** The container runs everywhere, but it
+mirrors nothing and serves nothing until `MAIL_GATEWAY_TOKEN` is set: one
+random value in `.env` (`openssl rand -hex 32`), which compose passes to both
+the gateway and the `retinue` service. Without it only `/health` answers, with
+`configured: false` and an `error` that names the token, so `/gateways` shows
+the channel as not set up and the monitor raises no outage. An upgrade that
+changes nothing in `.env` therefore mirrors nothing, although the mailbox
+credentials are already there; setting the token is the decision to mirror
+the mailbox (90 days back, by default) into the chat ledger and the life
+store.
+
+**Upgrading a deployment that pinned `MESSENGER_BUILTIN_CHANNELS`.** The
+default account's gateway reads that variable too and idles as not
+configured when it is set and does not list `email` — so a deployment that
+named its channels before e-mail was one gets no mail chats until it adds
+`email`. Set it in `.env`: a value set only on the `retinue` service in the
+override does not reach `mail-gateway` (or set it on both services). To run no
+mail gateway container at all, see "Never run the container at all" below.
+
+It reads the mailbox credentials `scripts/email_client.py` reads, in its own
+container, and uses `email_client.py` as its IMAP and MIME library. The same
+credentials stay on the `retinue` service as well: `email_client.py` and its
+backend go on running there (see `SECURITY.md`).
+
+**Writing.** The gateway sends, and the mailbox follows the chat. Replies,
+new mail and an agent's mail leave through its `POST /send` under the e-mail
+send policy (below); Mark as read, Archive and Delete in the chat reach the
+mailbox ("The mailbox follows the chat"). `email_client.py`'s own sends and
+their approvals on `/sends` keep working beside it (see "Two queues on
+/sends").
+
+### The gate
+
+E-mail triage is retired — the frequent and the daily run, the omnibus, the
+status store, the already-answered check, the whitelist. What takes its place
+is the messengers' inbound flow (`docs/messenger-chats.md`, "Inbound flow";
+`docs/triage-delivery-gate.md`), run by this gateway for every mail that
+arrives in INBOX:
+
+1. **Persist.** The record is written `delivered: false` before anything is
+   decided, so no later failure can lose the mail.
+2. **Gate**, on two independent axes, both read raw off the ledger volume's
+   `policy/` folder:
+   - the **group** — the mail's `List-Id`, else its sender address — from the
+     e-mail group flags (`email-policy.nt`; `triage_policy.py email-news-add`,
+     `email-quiet-add`, `email-ignore-add`): `quieted` or `ignored` makes the
+     arrival silent, `news` sends the mail to the feed;
+   - the **sender** — VIP, instructed, or neither — from `policy.nt`, which
+     the address book projects (`contacts.sync_policy`): a person's e-mail
+     addresses, and a person's e-mail domain as a wildcard. Set it on the
+     contact (`contacts.py update <id> --vip` / `--instruction "…"` /
+     `--add-domain example.org`, or the Contacts page); nothing is set here.
+
+   "Its sender" is the **gate sender** (`kb:gateSender` on the record,
+   `gate_sender` on the rail): the one address of a mail with exactly one
+   `From` header holding exactly one address — the only form the provider's
+   DMARC check of the `From` domain is sure to have looked at — lowercased by
+   its ASCII letters, and none where a character of it stands in for an
+   ASCII one on its own (a Kelvin sign, a long s, a fullwidth letter; `ß`,
+   `ı` and `İ` are letters like any other). A mail with none (no `From`, a
+   group, two addresses, two `From` headers, a header block cut at its
+   256 KiB bound or fetched short of its end) is from nobody: it reaches its
+   chat and buys no turn. The `Sender` header is for display only
+   (`docs/mail-chats.md`, "Who the sender is").
+3. **Offer the chats rail** the mail, with the verdict (`gate: {forward, vip,
+   instructed, reason}`) and `handover: true`. The web gateway decides what the
+   arrival does: **a mail pushes nothing by default; a contact can say
+   otherwise** — a VIP rings, an instructed sender's turn decides. For a VIP or
+   an instructed sender the mail's attachments ride along (`files`, each up to
+   `MAIL_RAIL_FILE_BYTES`; at most 20 files and 50 MiB an event), so the turn
+   can open them; for anyone else nothing travels, and the chat shows the
+   attachments from the ledger.
+4. **Deliver on acceptance.** `{"accepted": true}` marks the record delivered.
+   With a `job_url` beside it a model turn is working the mail: the gateway
+   polls that job (`job_delivery.py`, up to `MAIL_RAIL_JOB_TIMEOUT`) and marks
+   the record delivered only when it reports done. A `job_url` that is not a
+   path on the rail's own host — checked as it is parsed, and the joined URL
+   again — is no acceptance.
+
+**The rail takes mail only with a token.** The gateway posts every event
+with `CHATS_INGEST_TOKEN` where `.env` sets one (it must then be set for the
+`retinue` service too, as compose does), else with `MAIL_GATEWAY_TOKEN`, which
+both sides hold already; the web gateway refuses an e-mail event without it.
+
+**There is no triage forward for mail, and no daily sweep.** A mail the rail
+did not take — no acceptance, a refusal, no answer, a job that failed or never
+finished, a web gateway that is away — stays `delivered: false` and is
+offered again: the ledger's flag is the queue, so the wait survives a restart
+and a lost state volume. Offers leave in order with the other rail events
+(the user's reply from a mail client is never heard before the mail it
+answers); a mail that was answered for and not taken is retried after one
+minute, then twice as long each time, up to an hour, at most 20 offers a
+poll, the oldest first — a mail whose turn is still at work is passed over
+and takes none of them. While the web gateway does not answer at all (the
+connection refused, a `401`/`403`/`404`, or no answer and none to a `GET`
+either) nothing is tried for 30 seconds, doubling up to 15 minutes. An answer
+about **one** event — a `408`, `429` or `5xx` for it, or no answer for it while
+the rail answers otherwise — backs off that event alone, offer or not (the
+user's own mail, a held or backfilled one, a merge, a removal): it keeps its
+place, only its own chat's later events wait behind it, and every other chat's
+go on — one mail never holds back another. And not for long: after three of
+its own attempts (`RAIL_HOLD_ATTEMPTS`) the event steps aside — an offer is
+then retried among the re-offers, a told event on its own clock — and its
+chat's later events go on, so a mail the web gateway always fails on cannot
+stall its thread. Such an event is sent, when it goes, as the mirror has its
+mail then: a removal names only the mails still gone (none: it is dropped), a
+told mail that is gone by then is not told. A removal also waits while a merge
+of its chat queued before it is still queued, and holds nothing back meanwhile
+(one queued after it goes behind it, in order); and a merge that stepped
+aside queues, in the transaction that takes it, a removal of every removed mail
+of the chat each chat it absorbed is in by then that no queued removal names
+(`live` as then) — behind a chain of merges a removal can go while its mail is
+still under the chat a late merge folds in, and a removal of a mail already gone
+changes nothing.
+`/health` counts the events
+that stepped aside (`waiting.failing`, the oldest failure's time in
+`waiting.failing_since`) and says "N rail event(s) keep failing while others
+are taken" when the rail took an event after the newest of them began to fail,
+and that it "has taken nothing since" that time when it took none; an index
+from before the gateway kept its last take says neither ("N rail event(s) keep
+failing — the oldest for …") until the first take. A merge or removal that gets a `404` (an
+older web gateway without the endpoint) waits without holding anything
+back. Three calls in a row with no answer in time end the
+pass as a rail that does not answer would, so a web gateway too slow for every
+event costs a pass three `MAIL_RAIL_TIMEOUT`s. A record that cannot be read at
+that moment is offered again
+later, and a mailbox that does not answer holds back only new mail: what has
+arrived is offered all the same. The web gateway takes a repeated offer once,
+by its message id. Mail from a sender who is neither VIP nor instructed is
+listed under Unread and judged by nobody.
+
+What is **never offered**: backfilled mail (written delivered, told to the
+rail as history — it pushes nothing and starts no turn, whoever sent it), the
+user's own mail, and a mail that left the mailbox after the rail took it and
+came back. A mail that is gone before the rail took it is offered to nobody —
+its tombstone keeps `delivered: false`, so it is offered when it comes back;
+one whose thread was merged meanwhile is offered under the chat it is in now.
+
+**The policy unreadable.** The group flags unreadable: no flags — the mail is
+offered like any other (fail open). The sender policy unreadable: nobody is
+VIP or instructed until it can be read again (fail closed, for turns only —
+the mail still reaches its chat), and the gateway's log says so. The gate is
+never switched off for mail: there is no `INBOUND_GATE` on this service.
+
+**News.** A mail of a `news` group is filed to the news feed by the gateway
+(`news_ingest.py` → the web gateway's `POST /internal/news`; `NEWS_INGEST_URL`,
+`NEWS_INGEST_TOKEN`): its sender as the source (`email:<address>`), its
+subject as the title, the first `MAIL_NEWS_EXCERPT_CHARS` of its trimmed text,
+and the link the mail **declares for itself** — its `Archived-At` alone,
+http(s) only; never `List-Archive`, which is the list's and the same on every
+issue (the feed keys an item on its link), and never one picked out of the
+body. It starts no chat — except that a news mail that continues a thread
+already mirrored, or whose sender is a VIP or instructed, is filed *and* in
+its chat (written, offered and worked like any of that sender's mail, and
+never moved by the news rail). A news mail the reader could not read is read
+again with the placeholders, and filed once it reads. Where the group is also
+`ignored` and the feed took the
+item, the mail is marked `\Seen` and moved to `MAIL_NEWS_FOLDER` — the archive
+folder by default, by the folder rules below; set and empty, it is marked read
+and left in the INBOX — and the mirror follows its own move. Only a mail that
+is in no chat is moved: the mailbox copy of a mail in a chat is the chat's to
+deal with. **A feed that refuses leaves the mail untouched** and is asked
+again (the same backoff as above); the move never comes before the filing.
+Backfilled news mail is neither filed nor moved. With `NEWS_INGEST_URL`
+emptied the `news` flag does nothing here: such mail is mirrored like any
+other, since no feed could take it.
+
+**`/health`** says what waits: `waiting: {rail, since, news}` — how many
+mirrored mails the chats rail has not taken yet, since when the oldest of them
+has been in the mailbox, and how many news mails wait for the feed or for
+their move. While the web gateway has not answered three times running and
+mail waits, `error` carries a notice saying so (the gateway stays
+`connected`: the mailbox is fine) — and while it answers and takes no mail:
+once every offer and event of a pass (three at least) failed there, the notice
+says "the chats rail answers but takes no mail" until a mail is taken, and
+what waited over it is then offered again at once.
+
+### Sending
+
+Three ways in, one policy:
+
+- **The composer** on a mail chat, and ＋ → *E-mail* on the Chats page: the web
+  gateway posts `/chats/<id>/send` or `/chats/compose` to the gateway with
+  `author: "user"` and `user_approved: true`. A group thread offers *Reply all*
+  or *Sender only*.
+- **An agent**, with `scripts/mail-push.py` — the sibling of `sms-push.py`:
+
+  ```bash
+  # A reply in a mirrored thread (--chat takes the chat id or its key)
+  python3 /workspace/scripts/mail-push.py --chat <chat id> --reply all "Thanks, Tuesday works."
+  python3 /workspace/scripts/mail-push.py --chat <chat id> --reply sender --file /tmp/reply.txt
+  # A new mail
+  python3 /workspace/scripts/mail-push.py --to ann@example.org --cc bob@example.org \
+    --subject "Tuesday" --attach /tmp/plan.pdf "Hello Ann, ..."
+  # Take a queued one back
+  python3 /workspace/scripts/mail-push.py --retract <id>
+  ```
+
+  The text is the positional argument or `--file`; `--user-approved`,
+  `--thread <id>` and `--url` (another account's gateway) work as on the other
+  push CLIs. It reads `MAIL_GATEWAY_SEND_URL` and `MAIL_GATEWAY_TOKEN`, which
+  compose gives the `retinue` service and `scripts/session_env.py` passes on to
+  sessions. A queued send prints its approval URL, to be relayed as a labeled
+  link like any other. An agent addresses a reply by chat id: `--reply-to
+  <token>` is there for a gateway prompt that carries a token, and **no reply
+  token exists for mail** — the gateway forwards no mail to a session, so
+  nothing mints one. A mail reaches an agent as a chat (the companion of a
+  mail chat, and the turn the gate starts for a VIP or an instructed sender,
+  name the chat id and the command), and is answered with `mail-push.py
+  --chat <chat id>`, with `--url` for a thread on another account's gateway.
+  A chat id is never guessed from a UID.
+- **`email_client.py send/reply/forward`**, as before — see "Two queues on
+  /sends" for how it differs.
+
+A reply is built from the gateway's own records of the chat, never from the
+caller: `From` the account (with `EMAIL_FROM_NAME`), `Subject` `Re: <base
+subject>`, `In-Reply-To` the latest live mail of the thread that is not the
+user's own (else the latest mail), `References` its chain plus its id. *Reply
+all* (the default) goes to that mail's `Reply-To` or sender with everyone else
+on its `To`/`Cc` — the account's own addresses excepted — in `Cc`; *sender
+only* goes to the first alone. When the latest mail is the user's own, a
+reply-all goes to its recipients again. A `400` answers no recipient, an unknown chat or
+an address that does not parse; a `409` a chat with no live mail to reply to.
+The `Message-ID` is minted when the request is accepted, before anything is
+queued, so a new mail's chat is known at once.
+
+**The recipients the user sees are the recipients the gateway uses.** The
+browser does not work out a reply's addressing: the gateway says what `/send`
+would do, by the same function. `POST /reply-preview {chat, account}` (bearer
+token like `/send`; read-only, it never sends) answers `{all, sender, choice,
+subject}`, where `all` and `sender` are each `{to: [{address, name}], cc:
+[{address, name}]}` — exactly the addressing `/send` would use for that
+reply mode right now, `name` the display name on record or `null` — `choice`
+says whether the two modes differ, and `subject` is the `Re: …`. It answers
+`400` or `409` as `/send` does for a chat it cannot reply in, and the error
+sentence is shown. The web gateway serves the same body at `GET
+/chats/<id>/reply-preview` (behind the dashboard's auth like every chat read),
+with the names of people the address book knows added as `contact`; it
+answers `409 {error}` where no reply is possible (a chat that holds only a
+queued mail). Every mail message the web gateway serves also carries
+`reply_to` (the addresses of its `Reply-To`).
+
+The composer draws its To/Cc line and its send button's label from that
+answer. It asks on load, after every poll that changed the thread (a mail
+added, changed or removed, a pending change, new participants) and again at
+the press, and **refuses to send** if the answer is missing or older than the
+thread on screen. Every recipient is shown by its address, not only a name, and
+one that is not the `From` of the mail being answered says why (its
+`Reply-To`). *Reply all* / *Sender only* is offered exactly when `choice` is
+true, and the mode sent is the one on screen at the press.
+
+**A mail that may have gone out is never reported as not sent.** `POST /send`
+answers as soon as the SMTP server has taken the mail; the copy in the Sent
+folder is filed afterwards by the mirror loop, so a slow IMAP server or a
+busy mirror never holds the answer. Every `/send` may carry a `request_key`
+(an opaque token of at most 64 characters, minted per press by the caller):
+a repeat with a key the gateway has seen within 24 hours answers what became
+of the first — the same `message_id` — and sends nothing, unless the first
+failed for certain (below). The web gateway's
+hop to `/send` waits `MAIL_SEND_TIMEOUT` (120 s by default) and passes the
+browser's `request_key`; when the hop times out, drops after the request was
+written, or the gateway answers `502 {unconfirmed: true}`, the browser gets
+`202 {unconfirmed: true, message_id (when known), request_key}` — never a 5xx
+that reads as "not sent". The chat page keeps the bubble as *Sending — not
+confirmed yet*, does not put the words back into the composer, and reconciles
+the bubble by message id once the mail shows. One `request_key` serves one
+press of Send (a reply or a compose) and is reused while the outcome of that
+press is not known. `mail-push.py` mints one per run, asks once more under it
+when no answer came, and prints it with "NOT KNOWN whether this mail was sent"
+when it still does not know — also when the gateway took the request and could
+no longer be reached for the second ask; `--request-key <key>` with the same
+arguments asks about that send again.
+
+**A send that certainly failed ends its press; only an unknown outcome keeps
+its key.** What `POST /send` answers, and what a second request under the same
+`request_key` then does:
+
+| `/send` answers | The entry | A repeat under its `request_key` |
+|---|---|---|
+| `200 {status: "sent", message_id, chat, ts, …}` | `approved`, kept 24 h for the key | `200`, the same answer, `"repeat": true`; sends nothing |
+| `202 {status: "pending_approval", request_id, approval_url, …}` | `pending` | `202`, the same pending send, `"repeat": true` (`status: "sending"` once it was allowed) |
+| `502 {error, unconfirmed: true, request_id, message_id, chat}` | `sending`, handed to the SMTP server, no answer seen yet | the same, `"repeat": true`; sends nothing |
+| `502 {error: "send not confirmed: …", unconfirmed: true, outcome_unknown: true, …}` | `error`, `outcome_unknown: true` | the same, `"repeat": true`, dismissed or not, for 24 h; **never sent again** |
+| `502 {error: "send failed: …", "sent": false}` | `error`, `outcome_unknown: false` — removed at once when the caller was still on the line, else listed as failed | **a new attempt**: the old entry is removed, the mail composed, put to the policy and sent afresh |
+| `409 {error, status: "rejected" \| "retracted"}` | decided, not sent | `409`, `"repeat": true`; sends nothing |
+| `503 {error, "sent": false}` | none: the gateway cannot send, or could not write the send down | a new attempt |
+| `400` / `404` / `409` (no such chat, no address, no reply possible) | none | a new attempt |
+
+(A key names one press of Send: a request under a remembered key that asks for
+*another* mail is answered `409` without `repeat`, and sends nothing.) "For certain" is said only where the gateway knows it: the SMTP server refused
+the mail, or the send ended before the hand-over — the entry's mark of the
+hand-over is on disk before any of the message is on the wire. A direct send
+that a restart caught before that mark, and that named a `request_key`, ends as
+such a failure ("the mail gateway was stopped before this mail was handed to
+the mail server; it was not sent") and is listed in its chat, instead of being
+dropped; everything between the mark and the server's answer is *unknown*, and
+is never sent again by anything. `"repeat": true` says the answer tells of an
+earlier request — **a repeat is not a reply**: the web gateway then only hands
+back the Message or the Pending, marks nothing read, settles no attention item
+and calls no mailbox hook (the rail did all of that when the mail went out),
+and `mail-push.py` prints that it was a repeat. The one thing a repeat clears
+is the draft it repeats: the chat's shared draft goes exactly when it still
+holds this press's own words (a page whose answer never came saved them there
+again), and a draft written since stays. A fault nobody planned for is
+answered from what stands under the request's key, or — with no key to look
+under after an entry was made — as `unconfirmed`; never "failed" off the fault
+alone.
+
+Towards the browser the web gateway answers its certain "nothing was sent" as
+`424 {error, "sent": false, request_key}`; `502` remains "the gateway was never
+reached" and `503` "cannot send / could not queue", each with `"sent": false`
+when nothing was handed over; whatever is open is `202 {unconfirmed: true}`.
+A 5xx from the mail gateway counts as failed only on its explicit `"sent":
+false` — one without it, a body cut short and a body that is no JSON are
+*unconfirmed*. Every "not sent" answer names its speaker: `"by": "gateway"`
+where it hands on the mail gateway's own word about this request, `"by":
+"dashboard"` where the web gateway answers without the mail gateway having
+spoken (never reached, no gateway for that mailbox, validation, `403`/`410`).
+**A kept key is dropped only on the mail gateway's own word about it**: the
+pages drop it on a `"by": "gateway"` answer with `"sent": false` or a 4xx, on
+a change of the words, or when the press's mail shows — and keep it with the
+words on any other answer, since keeping a key costs nothing (a key the
+gateway never saw, or whose send failed for certain, is a new attempt) and
+dropping one of unknown outcome can send the mail twice. A first press (a
+fresh key) answered `"sent": false` or a 4xx reads *Not sent: <sentence>*; a
+press made again under a kept key and answered by the dashboard reads that the
+gateway could not be asked, and that it is still not known whether the first
+attempt went out. A 5xx without
+`"sent": false` is unknown, and keeps the key.
+
+**A send that failed, or was partly refused, does not disappear.** `GET
+/pending-sends` (and `?chat=<key>`) lists entries with status `pending`,
+`sending` and `error`; an `error` entry carries `error`, a sentence, and
+`outcome_unknown`, which says the SMTP hand-over may have happened. `POST
+/pending-sends/<id>/dismiss` takes a failed one out of the list: one that
+failed for certain is removed; one of unknown outcome that named a
+`request_key` is kept, unlisted, for the 24 hours its key is remembered, and
+`GET /pending-sends/<id>` answers it as `{status: "error", dismissed: true,
+outcome_unknown: true, …}`. **A dismissed entry is over** — nothing for a chat
+to show — and `outcome_unknown` is read by every reader of an entry: "it is not
+known whether the mail went out; do not send it again" is never worded as
+"failed". A send is never re-sent from
+an `error` entry by itself. Addresses the SMTP server refused while taking the rest are
+on the entry and in the `200` answer as `refused: [addresses]`, and the
+record's recipients are those the server took. In the chat the web gateway
+gives a pending entry `status` (`pending`, `sending` or `failed`), `error`,
+`outcome_unknown` and `refused`, a sent message carries `refused`, and `POST
+/chats/<id>/pending/<request id>/dismiss` (same-origin) clears a failed one.
+A failed bubble says so with the reason, offers *Copy text back to the
+composer* and *Dismiss*, and for `outcome_unknown` says the mail may have gone
+out; refused recipients are named on the bubble.
+
+**The policy** is `EMAIL_SEND_POLICY`, resolved for the account's own address
+(`email_client.resolve_category`; the same JSON array `email_client.py` reads,
+now also on the `mail-gateway` service): `verify` queues, `trust` sends when
+the request carries `user_approved` and queues otherwise, `allow` sends.
+`author: "user"` grants nothing by itself. So the user's own press in the
+composer sends under `trust` and `allow`, **and queues under `verify`** — on
+the messengers a press is the approval, on e-mail it is not — and the web
+gateway never approves a queued mail on the user's behalf. The answer is `200
+{status: "sent", …}` or `202 {status: "pending_approval", request_id,
+approval_url, message_id, chat}`; the approval URL is built as on the other
+gateways, from `SEND_APPROVAL_BASE_URL` and the `/sends/<slug>/<id>` segment
+(`SEND_APPROVAL_SLUG` overrides the slug, normally unset).
+
+A queued send **shows in its chat as a pending bubble** with its approval link,
+whoever queued it (composer, companion, `mail-push.py`), until it is sent,
+rejected or retracted; a new mail that exists only as a queued send is listed
+on the Chats page. Allow, Deny and a retract update the chat on its next poll.
+
+**What a send writes.** SMTP through `email_client.py`'s helpers, and a copy
+appended to the Sent folder (by the mirror loop, after the send has answered)
+unless `SMTP_SAVE_SENT=false` (Gmail files its own). The gateway writes the
+outbound record (`author` as given, the trimmed text the message itself) at
+once and tells the chats rail, so the bubble does not wait for the next poll;
+the Sent-folder pickup then finds the same `Message-ID` and writes nothing. Until that copy has had
+`MAIL_SENT_GRACE_SECONDS` (600) to appear, a record the gateway wrote for its
+own send is not treated as gone from the mailbox; with `SMTP_SAVE_SENT=false`
+and no copy ever appearing, it stays a live record — the mail was sent. The
+gateway never writes policy: sending to someone does not make them known to
+the gate (the e-mail whitelist and its auto-add on send are retired).
+
+### Two queues on /sends
+
+`/sends` lists both, and they are different things:
+
+| | the gateway's | `email_client.py`'s |
+|---|---|---|
+| Queued by | the composer, `mail-push.py`, a companion | `email_client.py send/reply/forward` under `verify` (or `trust` without `--user-approved`) |
+| Parked as | an entry in the gateway's pending store (`mail-data`, with `/pending-sends`) | a draft in the IMAP Drafts folder (`DRAFTS_FOLDER`) |
+| Approval URL | `/sends/mail-gateway/<id>` (the gateway's service name) | `/sends/<account>/<id>` |
+| Sent by | the gateway, once approved | the web gateway's e-mail backend |
+| Shown in the chat | as a pending bubble (a failed one stays, with its reason, until dismissed) | not until it is sent and in the Sent folder |
+| Taken back with | `mail-push.py --retract <id>` | `email_client.py retract --request-id <id>` |
+| Linked to a dashboard thread by | `--thread <id>` (the request's `thread`) | `RETINUE_THREAD_ID` |
+
+Both are governed by the same `EMAIL_SEND_POLICY`, and both end the same way:
+the mail goes out and appears in its chat. After an `email_client.py` send — direct, or an approved
+draft — the backend tells the gateway whose mail it was
+(`POST /outbound-note`, best-effort and never failing the send, only where
+`MAIL_GATEWAY_BASE_URL` is set and only for the account that gateway serves),
+so the bubble says *Ara* rather than *mail client*. A retraction of the wrong
+kind finds nothing: the id says which queue.
+
+### The model trim
+
+A mail the deterministic trim left `wanting` gets one router-tier turn the
+first time its bubble is viewed (`docs/mail-chats.md`, "The model trim"). The
+web gateway runs the turn; the gateway hands out what the model may choose
+from and writes back what the choice keeps, and is never handed text:
+
+| Gateway endpoint | Body | Answers |
+|---|---|---|
+| `POST /messages/trim-source` | `{chat, account, message_id}` | `200 {state: "wanting", lines, digest, subject, sender, is_reply, bulk}` — the trim's own lines, which must be the record's own text; `200 {state}` for a mail already settled; `200 {state: "deterministic", settled: "too_long" \| "source_differs"}` for one too long to hand over, or whose parts no longer give its text, settled there and then; `200 {state: "unread"}` for a placeholder (a mail not read yet: nothing to choose from, nothing settled) |
+| `POST /messages/trim-result` | `{chat, account, message_id, digest, keep: [[first, last], …]}` or `{…, digest, failed: "<reason>"}` (`unparseable`, `too_long`, `gave_up`: any reason settles alike) | `200 {state: "model" \| "deterministic", text}` — a valid choice is the text now, anything else settles the mail with its text unchanged; `409 {error: "stale", state}` when the mail is settled, the digest is not its source's, or the record was written again since (`state: "unread"` where it is a placeholder now) |
+
+Both take the bearer token and answer `404` for another account's mail, an
+unknown one or one not named by its chat (a chat merged into the mail's since
+counts as its own), `410` for a mail removed from the mailbox, and `503` when
+a part cannot be read (a body part or the header part) or the record lock is
+held past `EXCLUSIVE_SECONDS`. A result is written under the record lock, not
+the mirror's — a pass over the mailbox takes the record lock only around each
+record it writes (a record written again in its own place included), so a
+judgement never waits out a pass — with the record read again, and only the
+record's text and its trim change; its parts never do. The gateway reads no
+tunable of the feature: those are the web gateway's (`MAIL_MODEL_TRIM*`, on
+the `retinue` service).
+
+### The mailbox follows the chat
+
+| In the chat | In the mailbox | Gateway endpoint |
+|---|---|---|
+| Mark as read, a reply | `\Seen` on every mail of the thread in INBOX or the archive folder | `POST /chats/read` |
+| Archive | the thread's INBOX mails move to the archive folder (`MAIL_ARCHIVE_FOLDER`, created and subscribed if absent); un-archiving moves nothing back | `POST /chats/archive` |
+| Delete | every mail of the thread, in every mirrored folder, moves to the account's Trash (below), **then** the mirror is erased; nothing is expunged | `POST /chats/delete`, `X-Chat-Erase-Token` |
+
+All three take `{chat, account}`; the account must be the gateway's own (else
+`404`), and an unknown chat answers zero. The web gateway calls them after its
+own state change, best-effort: a failure is logged and retried on the next such
+action, and a gateway that answers `404`/`501` (a channel with no mailbox) is
+not an error. Read and archive carry the `message_ids` of the mails the action
+covers — for a read mark the chat's inbound mails up to the mark, for an archive
+the inbound mails present when it was archived — and the gateway acts on those
+mails only, so a mail that arrived after the user's action is neither marked
+nor moved. **Delete is the exception**: it is the whole thread, the gateway
+must succeed before the dashboard erases its own state, and if any move to the
+Trash fails, or a mail of the thread cannot be placed, nothing is erased and
+the answer reports `errors > 0`.
+
+The web gateway treats `POST /chats/<id>/read` and `POST /chats/<id>/flags` —
+the two endpoints whose effect now reaches the real mailbox — as the user's own
+act, exactly as it treats send, compose and delete: same-origin only, so a page
+on another site cannot mark mail read or archive it.
+
+**Folders.** The account's Trash is **never invented**: it is the folder the
+server marks `\Trash`, else the one `MAIL_TRASH_FOLDER` names; where neither
+exists Delete is refused (`errors > 0`, nothing erased) and `MAIL_TRASH_FOLDER`
+is the setting to fix. The **Junk** folder Spam moves a thread's inbound mails
+to is found the same way (`\Junk`, else `MAIL_JUNK_FOLDER`, default `Junk`)
+and is never invented either: without one, `POST /chats/spam` answers 502 with
+a sentence naming `MAIL_JUNK_FOLDER`, and the web gateway leaves the chat as it
+was. Spam exists for mail chats only — a messenger has no junk folder; mute
+the chat instead. The archive folder is created when it is missing, and
+a folder the gateway creates is **subscribed**, so a mail client lists it. A
+name set explicitly wins over the server's SPECIAL-USE marks: with
+`MAIL_ARCHIVE_FOLDER` or `MAIL_TRASH_FOLDER` set, that name is the folder; left
+unset, the server's own `\Archive` (else `\All`) or `\Trash` folder is used,
+else the default name. `CHAT_ERASE_TOKEN` is the same
+capability the messenger gateways demand — `503` while it is unset on the
+gateway, `403` on a mismatch — and sessions never hold it, so only the user's
+two-tap delete erases a chat. A mail that later turns up again in a mirrored
+folder (restored from the Trash) starts the chat anew.
+
+IMAP writes are `UID STORE` and `UID MOVE`; where the server has no `MOVE`
+the fallback is `UID COPY`, `\Deleted` and `UID EXPUNGE` of exactly those UIDs
+when `UIDPLUS` allows, else the `\Deleted` copy is left flagged and reported.
+Never a whole-folder `EXPUNGE`. A client's `\Seen` is still ignored by the
+mirror: the chat is the truth and the mailbox follows it.
+
+What it mirrors: **INBOX** (inbound records) and the **Sent** folder (outbound
+ones), polled every `MAIL_POLL_SECONDS`, and the **archive folder**, which it
+only follows — a mail moved there from INBOX is still that mail. A mail that
+is in none of them any more (deleted or moved away in a client) leaves a
+tombstone in its chat; a chat whose last mail went is archived. (The
+mirror's own moves are not that: an Archive from the chat moves mail between
+mirrored folders and leaves no tombstone.) Every MIME
+part is kept as a blob in the ledger's media store — plain text, HTML, the
+header block, attachments and inline images — and served only through the
+gateway's token-gated `GET /media/<id>`, which the web gateway proxies. A
+remote image is never fetched; a tracking pixel is dropped. A mail of a `news`
+sender or list (`triage_policy.py email-news-add`) starts no chat, unless its
+sender is a VIP or instructed: the gateway files it to the news feed ("The
+gate", above).
+
+**Configuration** — on the `mail-gateway` service, all named in
+`docker-compose.yml` (it loads no `env_file`):
+
+| Variable | Default | |
+|---|---|---|
+| `EMAIL_USER`, `EMAIL_PASS`, `IMAP_HOST`, `IMAP_PORT`, `SMTP_HOST`, `SMTP_PORT`, `SENT_FOLDER`, `EMAIL_FROM_NAME`, `SMTP_SAVE_SENT`, `DRAFTS_FOLDER` | as `email_client.py` | the default account — the same values `.env` already holds for it |
+| `MAIL_ACCOUNT_NAME` | *(empty)* | serve a named account: read the `_<NAME>`-suffixed set instead (below) |
+| `MESSENGER_BUILTIN_CHANNELS` | *(unset: all)* | as on `retinue`; set without `email`, the default account's gateway idles as not configured |
+| `MAIL_OWN_ADDRESSES` | *(empty)* | every address of the user's that may appear on this mailbox's mail, comma-separated: its aliases **and** the addresses of the user's other mirrored accounts. Never a participant, never a chat's peer; one value listing all of them serves every mail gateway |
+| `MAIL_ARCHIVE_FOLDER` | `Archive` | the archive folder the mirror follows, and where Archive moves a chat's INBOX mails. Unset: the server's `\Archive` (else `\All`) folder, else this name; set: always this name (created and subscribed if absent) |
+| `MAIL_TRASH_FOLDER` | `Trash` | where Delete moves a chat's mails. Unset: the server's `\Trash` folder, else this name; set: always this name. Never created: with neither, Delete is refused |
+| `MAIL_JUNK_FOLDER` | `Junk` | where Spam moves a chat's inbound mails (INBOX and the archive; never Sent, never the user's own). Unset: the server's `\Junk` folder, else this name; set: always this name. Never created: with neither, Spam is refused with a sentence naming this variable, and the chat stays as it was |
+| `MAIL_SENT_GRACE_SECONDS` | `600` | how long a record the gateway wrote for its own send waits for its Sent copy before it counts as gone from the mailbox |
+| `EMAIL_SEND_POLICY` | *(unset: `verify`)* | the send policy, keyed by the account's address — as `email_client.py` reads it, and the same `.env` value |
+| `SEND_APPROVAL_BASE_URL` | | public base of the approval links a queued send returns; unset, a relative path |
+| `SEND_APPROVAL_SLUG` | *(unset)* | overrides the `/sends/<slug>/<id>` segment; normally unset, the slug is the service name, as on the other gateways |
+| `CHAT_ERASE_TOKEN` | | the capability the user's delete presents (`X-Chat-Erase-Token`); unset, `/chats/delete` answers `503`. One value for `retinue` and every gateway |
+| `MAIL_POLL_SECONDS` | `60` | poll interval |
+| `MAIL_BACKFILL_DAYS` | `90` | how far back INBOX and Sent are mirrored on first run; `0` mirrors only new mail |
+| `MAIL_BACKFILL_BATCH` | `50` | mails per backfill batch |
+| `MAIL_BACKFILL_PAUSE_SECONDS` | `2` | pause between backfill batches |
+| `MAIL_IMAP_TIMEOUT` | `60` | IMAP socket timeout, seconds |
+| `MAIL_MAX_PART_BYTES` | 25 MiB | an attachment larger than this is not stored |
+| `MAIL_MAX_MAIL_BYTES` | 50 MiB | a larger mail keeps its text parts and no attachments |
+| `MAIL_READ_SECONDS` | `30` | how long reading one mail may take, plus a second for each megabyte of it, before the mail is mirrored as a placeholder (`docs/mail-chats.md`, *The mirror*); raise it on a very slow machine |
+| `MAIL_TRIM_WANTING_CHARS` | `2500` | the trim's "still long" threshold (`scripts/mail_trim.py`) |
+| `MAIL_POLICY_WAIT_SECONDS` | *(unset: no limit)* | a positive number: how long the mirror waits for the e-mail policy file before it starts as with no flags |
+| `MAIL_RECENT_CHATS_MAX` | `200` | how many chats `/recent-chats` answers at most |
+| `MAIL_RAIL_TIMEOUT` | `10` | timeout of the chats rail's POSTs, seconds (an offer that carries files is given at least 30) |
+| `MAIL_RAIL_FILE_BYTES` | 25 MiB | up to which size one attachment travels with the offer of a VIP's or an instructed sender's mail; keep it at or below the web gateway's `CONVERSATION_MAX_ATTACHMENT_BYTES` |
+| `MAIL_RAIL_JOB_TIMEOUT` | `3600` | how long the job of a turn that works a mail is waited for before the mail counts as not taken and is offered again |
+| `MAIL_UNREAD_OFFER_WAIT` | `600` | how long, in seconds, the mail of a VIP or an instructed sender that arrived unreadable waits for its reading before it is offered as the placeholder it is (`docs/mail-chats.md`, *The gate*, "As built"): read by then, it rings and is worked on its real text; not, the ring and the turn go out for the placeholder. `0`: offered at once |
+| `MAIL_NEWS_FOLDER` | *(unset: the archive folder)* | where a mail of a group that is both `news` and `ignored` is moved once the feed has it. Set and **empty**: marked read and left in the INBOX. A name: that folder (created and subscribed if absent). Was `TRIAGE_NEWS_FOLDER`, still read where this is not set |
+| `MAIL_NEWS_EXCERPT_CHARS` | `600` | how much of a news mail's text its feed item carries beside the subject. Was `TRIAGE_NEWS_EXCERPT_CHARS`, still read where this is not set |
+| `CHATS_INGEST_URL`, `CHATS_INGEST_TOKEN` | set by compose | the chats rail: where every arriving mail is offered, and (same host) where a turn's job is polled. Emptied, mail is mirrored and offered to nobody — written delivered, nothing rings, no turn. The token the rail is posted with is `CHATS_INGEST_TOKEN` where set (on both services), else `MAIL_GATEWAY_TOKEN` |
+| `NEWS_INGEST_URL`, `NEWS_INGEST_TOKEN` | set by compose | the news rail. Emptied, the `news` flag does nothing here and such mail is mirrored like any other |
+| `MAIL_GATEWAY_TOKEN` | | **required** — the opt-in (above) and the bearer token of its HTTP API; compose passes the one `.env` value to `retinue` too |
+
+**The retinue side** reads a few tunables of its own. The `retinue` service has
+no `env_file`, so each is named under its `environment:` in `docker-compose.yml`
+and a value in `.env` reaches it:
+
+| Variable | Default | Read by | |
+|---|---|---|---|
+| `MAIL_SEND_TIMEOUT` | `120` | the web gateway | how long its hop to the mail gateway's `/send` waits (an SMTP hand-over with a large attachment is slow); past it the answer is *unconfirmed*, not failed |
+| `MAIL_GATEWAY_TIMEOUT` | `120` | `mail-push.py` | how long the push CLI waits for `/send`; sessions inherit it (`_GATEWAY_TIMEOUT`) |
+| `CHAT_PENDING_TIMEOUT` | `4` | the web gateway | how long one look at a gateway's pending queue may take; it rides on a page's poll |
+| `CHAT_PENDING_RETRY_SECONDS` | `15` | the web gateway | how long a gateway that could not answer is left alone, the chat's copy standing in |
+| `CHAT_PENDING_SYNC_SECONDS` | `20` | the web gateway | how often the chat list has every mail gateway's queue read; `0` never does |
+| `MAIL_INSTRUCTION_TIMEOUT` | `600` | the web gateway | how long the ring of an instructed sender's **mail** waits for the verdict of the turn that works it (a messenger message waits `CHAT_INSTRUCTION_TIMEOUT`, 60): a turn that files a document needs minutes, and ten are a ring in time. Past it the mail rings by the failure rule |
+| `CHAT_ARRIVAL_RETRY_SECONDS` | `900` | the web gateway | how long the job handle of a mail's turn that **failed** is handed back to the mail gateway's next offer of the same mail; after that the offer starts the turn anew, so the work is done once an outage is over without a failing turn running once a poll |
+| `MAIL_ARRIVAL_TURN_ATTEMPTS` | `3` | the web gateway | how many turns one mail gets; after the last one fails the mail is accepted as it stands (it rang by the failure rule) and its thread's companion holds one note saying so |
+| `MIGRATE_TRIAGE_MIRROR_WAIT` | `21600` | `migrate-triage.py` | how long the one-time triage migration waits, once `MAIL_GATEWAY_TOKEN` is set, for the mirror's first backfill before it goes ahead without it (`docs/mail-chats.md`, "The migration") |
+| `MAILBOX_NONE_SECONDS` | `600` | the web gateway | how long a gateway that answered `404`/`501` to a mailbox call (no mailbox) is not asked again |
+| `MAILBOX_RETRY_SECONDS` | `120` | the web gateway | how often a mailbox call that failed (a read, an archive the mailbox still owes) is tried again |
+| `MAILBOX_OWED_KEEP_SECONDS` | `604800` | the web gateway | how long such an owed call is kept and retried before it is given up and logged |
+| `MAIL_ORIGINAL_MAX_BYTES` | 4 MiB | the web gateway | how much of each text part *Original* reads |
+| `MAIL_ORIGINAL_INLINE_MAX_BYTES` | 8 MiB | the web gateway | how many bytes of inline images one *Original* view inlines |
+
+`CHATS_INGEST_*`, `NEWS_INGEST_*` and `INBOUND_STORE_DIR` are wired by compose
+as on the other gateways. `EMAIL_SEND_POLICY` and `CHAT_ERASE_TOKEN` are named
+since the gateway sends and erases, and nothing else is: no other service's
+credential, and no address of the retinue gateway's `/message` — there is no
+triage forward for mail. The container that parses mail from strangers holds
+only what it uses. Volumes: `messenger-email` is
+the ledger (the gateway's `/inbound`, the retinue side's
+`chambers/_generated/messenger/email`, qlever-life read-only), `mail-data` its
+own state. Losing the thread index, the index of where each mail lives and
+the outbound notes costs a rescan — and the mails still owed to the rail are
+found again from the ledger's `delivered` flags; the **pending sends are
+data** — the mails waiting for approval with their attachments, and the
+journal of sends in flight — and recreating the volume drops them. (The queue
+of news mail not yet filed is on that volume too: a news mail that was waiting
+for the feed when the volume was lost is not filed.)
+
+**Backfill.** On first run the gateway mirrors INBOX and Sent for
+`MAIL_BACKFILL_DAYS`, merged and ingested oldest first so a reply finds its
+parent. Backfilled mail is never gated: it is written delivered, pushes
+nothing, starts no turn whoever sent it, is not filed to the news feed and does
+not wake an archived chat; a mail already read in a client (`\Seen`) starts
+read, so ninety days of mail do not arrive as ninety days of unread chats. From then on a
+client's `\Seen` is ignored. `/health.backfill` says how far it got
+(`{done, pending, days}`).
+
+**The e-mail policy file moved.** The group flags (`news` / `quieted` /
+`ignored`) live in one `.nt`, which
+the gateway must read at ingest — so it lives on the gateway's ledger volume
+now: `chambers/_generated/messenger/email/policy/email-policy.nt` on the
+retinue side, `/inbound/policy/email-policy.nt` in the gateway. (The sender
+policy — who is a VIP, who is instructed — is the file beside it,
+`policy.nt`, written by the address book's projection in the messengers'
+shape; the gateway reads it at `/inbound/policy/policy.nt` and does not wait
+for it: absent, nobody is special.) It used to be
+`chambers/_generated/triage/email-whitelist.nt`; the retinue entrypoint moves
+it (content and all) first thing at start, before the chamber clones and
+installs (`triage_policy.py place-email-policy`), the web gateway does again
+when it starts, and any retinue-side write of the policy moves it first. A
+deployment that pinned `TRIAGE_EMAIL_WHITELIST_PATH` keeps its path and is not
+moved, and must give the gateway the same file under its own mount. The mirror
+does not start until the file is there (`/health.error` says so meanwhile,
+with `blocked: "policy"`; after ten minutes also `connected: false`, as a
+matter of the deployment's setup — where to look is in the error — and not of
+the mailbox): its first backfill decides once, at ingest, which mail is news,
+so a backfill without the flags would make every newsletter of the window a
+chat for good.
+By default it waits as long as it takes; a positive
+`MAIL_POLICY_WAIT_SECONDS` makes it give up after that long and go on as with
+no flags. `python3 scripts/triage_policy.py place-email-policy` (or any other
+command of it) places the file too, and says if it left an old file that
+differs from the new one.
+
+**`/gateways`** shows the mail gateway as a card like a messenger's: whether
+it is connected and, if not, the reason its `/health` gives (whose `account`
+is the mailbox address) — the IMAP server refused the login, or cannot be
+reached. There is no
+QR code to scan: a mail gateway is fixed in the mailbox settings (host, port,
+user, an app password that was changed or revoked) or by waiting out the
+provider. The connection monitor words its notices for this case
+(`scripts/gateway-monitor.py`, `WORDING`). One reason is not the mailbox's at
+all: the mirror waiting for the e-mail policy file (`blocked: "policy"` in
+`/health`, above) — the card shows that reason, and the monitor's notice and
+reminders say "waiting for its setup" with it, never "check the login". Nor
+is a mirror that stopped on a fault of its own (`blocked: "mirror"` — it
+cannot read or write mail: a corrupt index, a full disk, a bug): the notice
+says "stopped on a fault of its own", with the gateway's reason, and the
+gateway's log has the rest.
+Unconfigured (`configured: false`) is intentional, never an outage.
+
+**A named account** (`EMAIL_USER_ARI`, …) is one more gateway: a service that
+`extends` `mail-gateway` with `MAIL_ACCOUNT_NAME=ARI`, that account's
+suffixed variables listed, the default account's password blanked, and its
+**own** `mail-data` volume — it shares the `messenger-email` ledger, whose
+records carry their account. Enrol it in `MESSENGER_GATEWAYS` with
+`"channel": "email"`, since its service name does not say which channel it
+serves. One thread reaching two of the user's accounts is two chats, one per
+account — and in each, the user's other account is the user, not a
+correspondent, only if `MAIL_OWN_ADDRESSES` lists it: let that one value
+(which `extends` hands every mail gateway) name every address of the user's.
+The full example is in `docker-compose.override.example.yml`.
+
 ## What an agent session can see
 
 The gateways are sidecars for credential isolation: the Signal keys, the
 WhatsApp session, the Telegram login and the CalDAV password live in their own
-containers, and an agent reaches each through a thin script that authenticates
+containers (the mailbox password, for now, in two: the mail gateway's and the
+`retinue` container's, see "E-mail (the mail gateway)"), and an agent reaches each through a thin script that authenticates
 with a **capability token** (`SIGNAL_GATEWAY_TOKEN`, `CALDAV_GATEWAY_TOKEN`, …)
 — a token buys one request behind the send policy, where a password would buy
 the account. Those tokens are also the *only* secrets a session inherits: every
@@ -343,14 +1019,33 @@ the `RETINUE_SESSION_ENV_EXTRA` escape hatch and the remaining gaps:
 ## Gateway connection monitoring
 
 Linked-device sessions (Signal, WhatsApp, Telegram) die silently — the phone
-unlinks the device, a session gets revoked. The framework watches for this
-itself: every gateway's `GET /health` reports its real link state, and
+unlinks the device, a session gets revoked — and so does a mailbox login (the
+mail gateway's IMAP server refuses a changed password, or is unreachable). The
+framework watches for this itself: every gateway's `GET /health` reports its real link state, and
 `scripts/gateway-monitor.py` (forked by the entrypoint) polls them once a
 minute. On a sustained failure it opens a dashboard conversation (which
 Web-Pushes the user like any incoming message) pointing at the dashboard's
 **`/gateways`** page, where the user sees each gateway's status and — for a
 disconnected one — the pairing QR code to scan (proxied from the gateway's
-token-gated `GET /qr`). Recovery is reported in the same thread. So: do **not**
+token-gated `GET /qr`). For the mail gateway the notice says what is wrong
+instead — the server refused the login or cannot be reached — and asks for
+no QR scan: there is no phone to re-pair (`gateway-monitor.py` words each
+notice by the registry entry's channel). A gateway whose `/health` names
+what holds it when that is not its link (`blocked` — the mail mirror waiting
+for the e-mail policy file) is reported as waiting for its setup, and one
+that names itself (`blocked: "mirror"`) as stopped on a fault of its own —
+with the gateway's own reason in the notice and in every reminder. A mail
+gateway that works and still cannot read some of its mail says so in
+`/health` (`placeholders`), as does one looking for mail whose records its
+ledger lost (`lost`, counted with them); when five or more such mails stand
+beyond those the user was last told of, the monitor opens a thread of its own
+for it — a notice of lower importance, at most one per reminder interval,
+never an outage (the mail is in the mailbox, and is read again). An outage
+that turns into one of another kind (the gateway that waited for its setup
+now cannot log in) is told in the same thread once as many checks in a row
+have seen it as open an outage (`GATEWAY_MONITOR_FAILURES`), in the new
+kind's words and with its reason, not at the next reminder. Recovery is
+reported in the same thread. So: do **not**
 build ad-hoc liveness checks for these channels; if a user reports a channel
 seems dead, check `/gateways` (or the gateways' `/health`) first, and treat a
 `SIGNAL_SEND_POLICY`-style unconfigured channel (`configured: false`) as
@@ -375,9 +1070,9 @@ in `docs/contributing.md`.
 **A deployment that doesn't use a given channel at all** — never runs its
 container, not even unpaired — must say so explicitly, or the monitor has no
 way to tell that apart from a real outage. The base `docker-compose.yml`
-always points the `retinue` service at the three always-on built-in gateways via
+always points the `retinue` service at the four always-on built-in gateways via
 `SIGNAL_GATEWAY_BASE_URL` / `WHATSAPP_GATEWAY_BASE_URL` /
-`TELEGRAM_GATEWAY_BASE_URL`; if the matching container is never started, the
+`TELEGRAM_GATEWAY_BASE_URL` / `MAIL_GATEWAY_BASE_URL`; if the matching container is never started, the
 monitor's health check fails DNS resolution — indistinguishable, from inside
 this container, from that same container having crashed — and it would open a
 "gateway disconnected" thread on every restart. There are two supported ways
@@ -391,7 +1086,7 @@ to avoid that, and they mean different things:
 - **Never run the container at all.** Then set `MESSENGER_BUILTIN_CHANNELS` on
   the `retinue` service in the deployment's `docker-compose.override.yml` (see
   `scripts/messenger_gateways.py` and the example there) to the comma-separated
-  subset of `signal`, `whatsapp`, `telegram`, `sms` this deployment actually
+  subset of `signal`, `whatsapp`, `telegram`, `sms`, `email` this deployment actually
   runs — e.g. `MESSENGER_BUILTIN_CHANNELS=signal` for a Signal-only deployment,
   or set it explicitly **empty** for none — *unset* means all of them (SMS
   still enrolling only where `SMS_GATEWAY_BASE_URL` is set). Naming a channel there is what enrols it into the
@@ -400,6 +1095,11 @@ to avoid that, and they mean different things:
   channel out drops it from all three at once, same as a chamber that was
   never mounted. One variable states the deployment's whole channel set, so it
   reads as a deliberate choice rather than a row of easy-to-forget blanks.
+  The mail gateway reads the variable too (from `.env`; a value set only on
+  the `retinue` service does not reach it) and idles where it leaves `email`
+  out; to keep its container from starting at all, also give `mail-gateway`
+  a profile nobody enables in the override (`profiles: ["off"]`). It then
+  holds no mailbox password either.
 
 `GATEWAY_MONITOR_IGNORE` (comma-separated slugs) is the narrower tool: it
 silences the monitor alone while leaving the channel enrolled everywhere else

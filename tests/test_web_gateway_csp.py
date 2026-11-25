@@ -20,7 +20,9 @@ image) carries no policy, and the policy itself is what the decision says:
 scripts from this origin only, no inline script, no eval, images from this
 origin, with blob: images (its own previews) on the chat page alone and
 data: images on /sparql alone, media from this origin on the chat page
-alone, frames of this origin on the file viewer alone, each
+alone, frames of this origin on the file viewer and the chat page alone (the
+viewer's a thread attachment, the chat page's a mail's sanitised HTML — which
+is served under a sandbox policy of its own, tests/test_chat_mail.py), each
 page getting its policy under each of its paths. A change of mode moves the
 service worker's shell hash, so installed clients pick it up.
 
@@ -178,8 +180,9 @@ def check_policy_text(cp) -> None:
     # any page but the chat page, no data: on any page but /sparql, and no
     # remote media: the chat page links a remote attachment rather than load
     # it. No page but the chat page plays media, and no page but the file
-    # viewer frames anything, so markup that slipped into another page
-    # cannot frame a page of this origin (an approval card) either.
+    # viewer and the chat page frames anything, so markup that slipped into
+    # another page cannot frame a page of this origin (an approval card)
+    # either.
     assert directives["img-src"] == ["'self'"], directives["img-src"]
     assert directives["media-src"] == ["'none'"], directives["media-src"]
     assert directives["font-src"] == ["'none'"]
@@ -188,9 +191,11 @@ def check_policy_text(cp) -> None:
     assert cp.policy("conversations.html") == cp.policy() == cp.policy(None)
     # Each page's differences from the policy every page has, by directive.
     expect = {
-        # Its previews of images about to be sent (blob: images), and the
-        # messenger media it plays.
-        "chat.html": {"img-src": ["'self'", "blob:"], "media-src": ["'self'"]},
+        # Its previews of images about to be sent (blob: images), the
+        # messenger media it plays, and the one thing it frames: a mail's
+        # HTML part, served by this origin as a sandboxed document.
+        "chat.html": {"img-src": ["'self'", "blob:"], "media-src": ["'self'"],
+                      "frame-src": ["'self'"]},
         # A thread attachment of this origin, in a frame.
         "viewer.html": {"frame-src": ["'self'"]},
         # YASGUI's stylesheet icons, data: images.
@@ -205,9 +210,15 @@ def check_policy_text(cp) -> None:
         rest = {name: sources for name, sources in directives.items()
                 if name not in differences}
         assert own == rest, f"{page}'s policy differs from the others in {sorted(differences)} alone"
+    # No frame source but this origin anywhere, and none at all on a page
+    # that is neither the file viewer nor the chat page.
+    for page in ("index.html", "chats.html", "conversations.html", "sparql.html"):
+        assert _directives(cp.policy(page))["frame-src"] == ["'none'"], page
+    for page in ("chat.html", "viewer.html"):
+        assert _directives(cp.policy(page))["frame-src"] == ["'self'"], page
     print("ok: blob: images on the chat page alone, data: images on /sparql alone, "
-          "media on the chat page alone, frames on the file viewer alone, "
-          "data: media and remote media nowhere")
+          "media on the chat page alone, frames on the file viewer and the chat "
+          "page alone, data: media and remote media nowhere")
 
 
 def main() -> int:

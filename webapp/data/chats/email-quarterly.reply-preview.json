@@ -1,0 +1,35 @@
+{
+ "all": {
+  "to": [
+   {
+    "address": "ann@example.com",
+    "name": "Ann Example",
+    "contact": "Ann Example"
+   }
+  ],
+  "cc": [
+   {
+    "address": "bob@builder.example",
+    "name": "Bob Builder",
+    "contact": null
+   },
+   {
+    "address": "carla@example.net",
+    "name": null,
+    "contact": null
+   }
+  ]
+ },
+ "sender": {
+  "to": [
+   {
+    "address": "ann@example.com",
+    "name": "Ann Example",
+    "contact": "Ann Example"
+   }
+  ],
+  "cc": []
+ },
+ "choice": true,
+ "subject": "Re: Quarterly numbers"
+}
