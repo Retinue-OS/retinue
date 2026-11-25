@@ -209,6 +209,36 @@ await ok('without a follow-up an action row opens on its messages, and the headi
   assert.ok(sectionOf(html(el2), 'action').includes('Action suggested — see Ara'));
 });
 
+await ok('a follow-up that left no note neither links to Ara nor heads the section with her', async () => {
+  for (const state of ['skipped', 'failed', 'interrupted']) {
+    const el = await mount(payload(LIST));
+    const gone = JSON.parse(JSON.stringify(DONE));
+    gone.entries.u1.followup = { state };
+    await openTriage(el, gone);
+    const action = sectionOf(html(el), 'action');
+    assert.ok(action.includes('href="/chat.html?id=u1"') && !action.includes('pane=ara'), `${state}: ${action}`);
+    assert.ok(!action.includes('see Ara'), state);
+  }
+});
+
+await ok('a row that leaves the delete section and comes back must be armed for again', async () => {
+  const el = await mount(payload(LIST));
+  await openTriage(el, DONE);
+  await el._triageAll('delete');
+  assert.equal(el._triArmed, 'delete');
+  // u3 is archived elsewhere: the section is gone…
+  const u3 = el._data.chats.find((c) => c.id === 'u3');
+  u3.archived = true; u3.list_group = 'archived';
+  el._rerender();
+  assert.ok(!html(el).includes('tri-sec delete'));
+  // …and its Undo brings it back: disarmed, one tap arms, nothing deleted.
+  u3.archived = false; u3.list_group = 'unread';
+  el._rerender();
+  assert.ok(sectionOf(html(el), 'delete').includes('>Delete all</button>'));
+  await el._triageAll('delete');
+  assert.ok(!wire.some((w) => w.url.endsWith('/delete')), 'the tap after the return only arms');
+});
+
 await ok('the armed Delete all says what happens to a mix of mails and messenger chats', async () => {
   const { deleteManyText } = await import('./chats.js');
   const mailChat = { channel: 'email' };

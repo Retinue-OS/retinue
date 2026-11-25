@@ -469,6 +469,11 @@ export function deleteManyText(chats) {
   return `Delete ${n} chat${n === 1 ? '' : 's'}? ${what}`;
 }
 
+// Whether Ara has a note on a row, or is writing one: a follow-up queued,
+// working or done — not one skipped, failed or cut off, which left none.
+const araWrites = (it) => !!(it.entry && it.entry.followup
+  && ['queued', 'working', 'done'].includes(it.entry.followup.state));
+
 // Which rows a section holds, as one key: what an armed Delete all was
 // armed over.
 const triKey = (items) => items.map((it) => it.chat.id).join('\n');
@@ -1107,6 +1112,9 @@ class RetinueChats extends RetinueCard {
     const shownIds = [];
     const all = [].concat(...TRIAGE_SECTIONS.map((sec) => secs[sec.id].map((it) => it.chat)));
     const accountsOf = accountsByName(all);
+    // An armed Delete all whose section is gone is disarmed too: a row that
+    // leaves (an archive) and comes back (its Undo) must be armed for again.
+    if (!secs.delete.length) this._triArmed = '';
     const body = TRIAGE_SECTIONS.map((sec) => {
       const items = secs[sec.id];
       if (!items.length) return '';
@@ -1125,10 +1133,10 @@ class RetinueChats extends RetinueCard {
       }
       // "see Ara" only where her follow-ups write notes (CHAT_TRIAGE_FOLLOWUPS;
       // off by default): an action row opens on her pane only when it has one.
-      const ara = sec.id === 'action' && items.some((it) => it.entry && it.entry.followup);
+      const ara = sec.id === 'action' && items.some(araWrites);
       const rows = items.map((it) => {
         shownIds.push(it.chat.id);
-        const href = sec.id === 'action' && it.entry && it.entry.followup
+        const href = sec.id === 'action' && araWrites(it)
           ? `/chat.html?id=${encodeURIComponent(it.chat.id)}&pane=ara` : '';
         return this._rowHtml(it.chat, listGroup(it.chat), accountsOf,
           { note: this._triageNoteHtml(it), href });
