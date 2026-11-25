@@ -217,6 +217,36 @@ def main() -> int:
         at(mod, datetime(2026, 11, 25, 10, 35, 5, tzinfo=ZRH))
         check("the new plan's next slot fires", (mod.due_slot(moved) or datetime.min).isoformat(),
               "2026-11-25T10:35:00+01:00")
+        print("a long job does not hold a reminder back")
+        slow = {"id": "slow", "prompt": "p", "interval_seconds": 60, "_source": "x"}
+        held = {"id": "app:health:hands:held", "kind": "reminder", "at": "11:00", "title": "t",
+                "registered_at": "2026-11-24T09:00:00+00:00", "_app": rem["_app"]}
+        held["_trigger"] = ct.parse(held, ZRH)
+        at(mod, datetime(2026, 11, 24, 11, 0, 5, tzinfo=ZRH))
+        mod.write_state("slow", "success")
+        real_last_run = mod.read_last_run
+        mod.read_last_run = lambda jid: 0.0   # the slow job is long overdue
+        release, fired, slow_started = threading.Event(), [], threading.Event()
+        real_run_job = mod.run_job
+
+        def run_job(job, slot=None):
+            if job["id"] == "slow":
+                slow_started.set()
+                release.wait(10)               # a prompt job still running
+            else:
+                fired.append(job["id"])
+        mod.run_job = run_job
+        main_pass = threading.Thread(target=mod.run_due, args=([slow, held], False))
+        main_pass.start()
+        slow_started.wait(5)
+        mod.run_due([slow, held], True)        # the reminders' own loop, meanwhile
+        check("the reminder fired while the job ran", (fired, main_pass.is_alive()),
+              (["app:health:hands:held"], True))
+        release.set()
+        main_pass.join(5)
+        check("the main loop never runs a reminder", fired, ["app:health:hands:held"])
+        mod.run_job = real_run_job
+        mod.read_last_run = real_last_run
         at(mod, datetime(2026, 11, 24, 10, 31, tzinfo=ZRH))
         rows = {r["id"]: r for r in mod.list_jobs()}
         check("--list owner", rows["app:health:hands:hand-1"]["owner"], "app health/hands")

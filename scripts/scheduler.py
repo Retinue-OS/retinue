@@ -94,7 +94,8 @@ gateway; they are loaded here beside the manifests, with ids
 `app:<chamber>:<app>:<id>`. An app job is either a prompt (`kind: "job"`) or
 a **reminder** (`kind: "reminder"`): a reminder runs no agent — firing it is
 one request to the gateway (`/internal/apps/reminders/fire`), which makes it
-an attention item. `python3 scheduler.py --list` shows every job, its trigger,
+an attention item. Reminders run on a loop of their own, so a long prompt or
+command job never holds one back past its lead. `python3 scheduler.py --list` shows every job, its trigger,
 its next run and who owns it.
 
 State files  (`$SCHEDULER_STATE_DIR/<job-id>.json`):
@@ -104,6 +105,7 @@ State files  (`$SCHEDULER_STATE_DIR/<job-id>.json`):
 
 Environment:
   SCHEDULER_TICK_SECONDS        loop granularity (default 30)
+  SCHEDULER_REMINDER_TICK_SECONDS  the app reminders' own loop (default 15)
   SCHEDULER_JOB_TIMEOUT         per-job timeout in seconds (default 900)
   SCHEDULER_KILL_GRACE_SECONDS  SIGTERM->SIGKILL grace period for a timed-out
                                  job's process group, in seconds (default 10)
@@ -122,6 +124,7 @@ import re
 import signal
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -142,6 +145,8 @@ CHAMBERS_DIR = Path(os.environ.get("CHAMBERS_DIR") or "/workspace/chambers")
 # self-review), not to any single chamber.
 BASE_SCHEDULE = Path(os.environ.get("BASE_SCHEDULE") or "/workspace/.schedule.json")
 TICK = int(os.environ.get("SCHEDULER_TICK_SECONDS", "30"))
+# Reminders tick on a thread of their own (run_due), so no long job delays one.
+REMINDER_TICK = int(os.environ.get("SCHEDULER_REMINDER_TICK_SECONDS", "15"))
 JOB_TIMEOUT = int(os.environ.get("SCHEDULER_JOB_TIMEOUT", "900"))
 # The exit code a command job uses for "done with this slice, more remains";
 # see the module docstring. sysexits' EX_TEMPFAIL, chosen because it already
@@ -664,20 +669,47 @@ def run_job(job: dict, slot: datetime | None = None) -> None:
         write_state(jid, "error", **slot_fields)
 
 
-def main() -> None:
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
-    log(f"scheduler started (tick={TICK}s, timeout={JOB_TIMEOUT}s, "
-        f"permission-mode={PERMISSION_MODE}, chambers={CHAMBERS_DIR})")
+def is_reminder(job: dict) -> bool:
+    """An app's reminder: fired by one request to the gateway, on its own thread."""
+    return job.get("kind") == "reminder" and bool(job.get("_app"))
+
+
+def run_due(jobs: list[dict], reminders: bool) -> None:
+    """Run what is due among ``jobs``: the reminders (``reminders`` true) or
+    everything else. The two kinds never share a loop: a prompt or command
+    job runs inline for as long as it takes (up to its timeout), and a
+    reminder queued behind it would pass its ``lead`` and be recorded as
+    missed while the container was up. Each job's state is written only by
+    the loop that runs its kind."""
+    for job in jobs:
+        if is_reminder(job) != reminders:
+            continue
+        if calendar_trigger.is_calendar(job):
+            slot = due_slot(job)
+            if slot is not None:
+                run_job(job, slot)
+        elif is_due(job):
+            run_job(job)
+
+
+def reminder_loop() -> None:
+    """The reminders' own clock, beside the main loop (see run_due)."""
     while True:
         try:
-            jobs = load_jobs()
-            for job in jobs:
-                if calendar_trigger.is_calendar(job):
-                    slot = due_slot(job)
-                    if slot is not None:
-                        run_job(job, slot)
-                elif is_due(job):
-                    run_job(job)
+            run_due(load_jobs(), reminders=True)
+        except Exception as e:  # keep the loop alive no matter what
+            log(f"[error] reminder loop: {e}")
+        time.sleep(REMINDER_TICK)
+
+
+def main() -> None:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    log(f"scheduler started (tick={TICK}s, reminder tick={REMINDER_TICK}s, timeout={JOB_TIMEOUT}s, "
+        f"permission-mode={PERMISSION_MODE}, chambers={CHAMBERS_DIR})")
+    threading.Thread(target=reminder_loop, name="reminders", daemon=True).start()
+    while True:
+        try:
+            run_due(load_jobs(), reminders=False)
         except Exception as e:  # keep the loop alive no matter what
             log(f"[error] scheduler loop: {e}")
         time.sleep(TICK)

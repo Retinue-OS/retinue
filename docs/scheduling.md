@@ -195,7 +195,10 @@ prompt jobs through the dashboard; each app's jobs live in
 ids `app:<chamber>:<app>:<id>`. A reminder runs no agent: firing it is one
 request to the gateway (`/internal/apps/reminders/fire`), which makes it an
 attention item; if the gateway does not take it, the slot is tried again
-while within its lead. App jobs never run a `command`.
+while within its lead. Reminders run on a loop of their own
+(`SCHEDULER_REMINDER_TICK_SECONDS`, default 15), beside the one that runs
+prompt and command jobs inline, so a long job never holds a reminder back
+past its lead. App jobs never run a `command`.
 `python3 /workspace/scripts/scheduler.py --list` prints every job — id,
 kind, trigger, next run, owner (`base`, `chamber <name>`, `app
 <chamber>/<app>`).
