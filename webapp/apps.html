@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
+  <meta name="color-scheme" content="dark">
+  <meta name="theme-color" content="#0b0d12">
+  <title>Retinue — Apps</title>
+
+  <link rel="manifest" href="/manifest.webmanifest">
+  <link rel="icon" href="/icons/icon-192.png">
+  <link rel="apple-touch-icon" href="/icons/icon-192.png">
+  <link rel="stylesheet" href="/styles.css">
+
+  <!-- The apps the mounted chambers ship (docs/chamber-apps.md), from
+       /apps/index.json. Each opens on its own page, /apps/<chamber>/<app>/,
+       and installs as a PWA of its own from there. -->
+  <script type="module" src="/components/apps.js"></script>
+  <script type="module" src="/components/nav.js"></script>
+  <script type="module" src="/components/shelf.js"></script>
+</head>
+<body>
+  <main>
+    <retinue-nav current="apps"></retinue-nav>
+    <retinue-apps></retinue-apps>
+    <retinue-shelf></retinue-shelf>
+  </main>
+
+  <script src="/sw-register.js"></script>
+</body>
+</html>

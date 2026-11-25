@@ -135,7 +135,11 @@ The same gateway also backs the conversation-tabs card with a small JSON API
 - `GET  /conversations`               — list of active threads (tabs). Edit-kind
   threads are excluded by default; `?kind=edit|all` includes them, and
   `?project=<uri>` narrows to one project's threads.
-- `GET  /conversations?archived=1`    — list of archived threads.
+- `GET  /conversations?archived=1`    — list of archived threads (every one).
+- `GET  /conversations?archived=1&limit=N&offset=M` — one page of them, starred
+  first, then newest: `{conversations, has_more, next_offset, source}`. What
+  the Threads page's Archived tab asks for (its "Load more" widens the window);
+  ordered by the life store's thread summaries — see `docs/dashboard.md`.
 - `GET  /conversations?all=1`         — list of all threads.
 - `GET  /conversations/<id>`          — one thread with its messages.
 - `POST /conversations`               — open a thread (`{"message": "..."}`,

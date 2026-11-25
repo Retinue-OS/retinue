@@ -1482,6 +1482,10 @@ services:
       - /chambers/_generated/messenger/telegram
       - /chambers/_generated/messenger/sms
       - /chambers/_generated/messenger/email
+      # The dashboard threads' life-store summaries (scripts/thread_index.py):
+      # created before qlever-life starts watching, so the first summary
+      # written into it is indexed (qlever-dir#10).
+      - /chambers/_generated/threads
     volumes:
       - chambers:/chambers
     network_mode: none
