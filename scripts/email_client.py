@@ -668,6 +668,24 @@ def _search_replies_to(M, message_id):
     return data[0].split()
 
 
+def _bare_mid(message_id):
+    """A Message-ID without surrounding whitespace and angle brackets."""
+    return (message_id or "").strip().strip("<>").strip()
+
+
+def _fetch_message_id(M, uid):
+    """The Message-ID header of *uid* in the selected folder ('' if unknown)."""
+    uid = uid.decode() if isinstance(uid, (bytes, bytearray)) else uid
+    try:
+        typ, data = M.uid("fetch", uid, "(BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)])")
+    except imaplib.IMAP4.error:
+        return ""
+    if typ != "OK" or not data:
+        return ""
+    header_bytes = next((it[1] for it in data if isinstance(it, tuple)), b"")
+    return _decode(_parse_message(header_bytes).get("Message-Id")) or ""
+
+
 def _search_by_message_id(M, message_id):
     q = _quote_mid(message_id)
     try:
@@ -1218,33 +1236,42 @@ def cmd_fetch_attachment(cfg, args):
     }, ensure_ascii=False))
 
 
+def _move_uid(M, uid, dest):
+    """Move *uid* from the selected folder to *dest*; return the method used.
+
+    Prefers MOVE (RFC 6851) and falls back to COPY + \\Deleted + EXPUNGE.
+    Raises EmailError unless the source copy is actually gone.
+    """
+    try:
+        typ, data = M.uid("move", uid, _quote(dest))
+        if typ != "OK":
+            raise imaplib.IMAP4.error(data)
+        return "MOVE"
+    except imaplib.IMAP4.error:
+        pass
+    typ, data = M.uid("copy", uid, _quote(dest))
+    if typ != "OK":
+        die(f"copy to {dest} failed: {data}")
+    # COPY alone is a *duplicate*, not a move. Report success only once the
+    # source copy is actually gone: a caller that records "this left the
+    # INBOX" on the strength of the COPY leaves the message sitting there,
+    # invisible to whatever bookkeeping now says it was filed.
+    typ, data = M.uid("store", uid, "+FLAGS", "(\\Deleted)")
+    if typ != "OK":
+        die(f"copied to {dest} but marking the source deleted failed: "
+            f"{data} (the message is now in both folders)")
+    typ, data = M.expunge()
+    if typ != "OK":
+        die(f"copied to {dest} and flagged, but expunge failed: {data} "
+            f"(the message is now in both folders)")
+    return "COPY+EXPUNGE"
+
+
 def cmd_move(cfg, args):
     M = imap_connect(cfg)
     imap_select(M, args.from_)
     uid = str(args.uid)
-    # Prefer MOVE (RFC 6851); fall back to COPY+delete.
-    try:
-        typ, data = M.uid("move", uid, _quote(args.to))
-        if typ != "OK":
-            raise imaplib.IMAP4.error(data)
-        moved_via = "MOVE"
-    except imaplib.IMAP4.error:
-        typ, data = M.uid("copy", uid, _quote(args.to))
-        if typ != "OK":
-            die(f"copy to {args.to} failed: {data}")
-        # COPY alone is a *duplicate*, not a move. Report success only once the
-        # source copy is actually gone: a caller that records "this left the
-        # INBOX" on the strength of the COPY leaves the message sitting there,
-        # invisible to whatever bookkeeping now says it was filed.
-        typ, data = M.uid("store", uid, "+FLAGS", "(\\Deleted)")
-        if typ != "OK":
-            die(f"copied to {args.to} but marking the source deleted failed: "
-                f"{data} (the message is now in both folders)")
-        typ, data = M.expunge()
-        if typ != "OK":
-            die(f"copied to {args.to} and flagged, but expunge failed: {data} "
-                f"(the message is now in both folders)")
-        moved_via = "COPY+EXPUNGE"
+    moved_via = _move_uid(M, uid, args.to)
     M.logout()
     print(json.dumps({"moved": uid, "from": args.from_, "to": args.to, "method": moved_via}))
 
@@ -1745,22 +1772,14 @@ def move_by_message_id(cfg, message_id, src, dest):
     M = imap_connect(cfg)
     try:
         imap_select(M, src)
-        uids = _search_by_message_id(M, message_id)
+        # HEADER search is a substring match ("1@host" also hits "<11@host>"):
+        # keep only the hits whose own Message-ID is exactly the wanted one.
+        uids = [u for u in _search_by_message_id(M, message_id)
+                if _bare_mid(_fetch_message_id(M, u)) == _bare_mid(message_id)]
         if not uids:
             return None
         uid = uids[-1].decode() if isinstance(uids[-1], (bytes, bytearray)) else uids[-1]
-        try:
-            typ, data = M.uid("move", uid, _quote(dest))
-            if typ != "OK":
-                raise imaplib.IMAP4.error(data)
-        except imaplib.IMAP4.error:
-            typ, data = M.uid("copy", uid, _quote(dest))
-            if typ != "OK":
-                die(f"copy to {dest} failed: {data}")
-            typ, data = M.uid("store", uid, "+FLAGS", "(\\Deleted)")
-            if typ != "OK":
-                die(f"copied to {dest} but marking the source deleted failed: {data}")
-            M.expunge()
+        _move_uid(M, uid, dest)
         return uid
     finally:
         M.logout()
