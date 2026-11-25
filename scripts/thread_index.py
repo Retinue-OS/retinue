@@ -20,14 +20,16 @@ Two things follow:
 
 What goes in, per thread (subject ``urn:retinue:thread:<id>``):
 
-    rdf:type kb:Thread ; dcterms:title ; dcterms:created ; dcterms:modified ;
-    kb:kind ; kb:initiator ; kb:archived ; kb:muted ; kb:starred ; kb:unread ;
+    rdf:type kb:Thread ; dcterms:created ; dcterms:modified ; kb:kind ;
+    kb:initiator ; kb:archived ; kb:muted ; kb:starred ; kb:unread ;
     kb:messageCount ; kb:project (when linked) ; kb:companionOf (a companion)
 
-What never goes in: message texts, previews (a preview is the start of the
-last message), attachments, shell actions, context notes, the model choice or
-the transient ``pending`` flag. The store is readable by every agent; a
-thread's words stay in its file.
+What never goes in: the title (a thread opened without one is titled with
+the start of its first message, and an agent's title is often a mail's
+subject), message texts, previews (a preview is the start of the last
+message), attachments, shell actions, context notes, the model choice or the
+transient ``pending`` flag. The store is readable by every agent; a thread's
+words stay in its file, and the list reads its titles from there.
 
 A deleted thread's file is removed, which drops its named graph: nothing about
 it remains in the store. The deletion tombstone stays the gateway's own.
@@ -112,7 +114,6 @@ def to_ntriples(conv: dict) -> str:
     s = f"<{subject(cid)}>"
     lines = [
         f"{s} <{RDF_TYPE}> <{KB}Thread> .",
-        f"{s} <{DCT}title> {_lit(conv.get('title') or '')} .",
         f"{s} <{KB}kind> {_lit(conv.get('kind') or 'chat')} .",
         f"{s} <{KB}initiator> {_lit(conv.get('initiator') or 'user')} .",
         f"{s} <{KB}messageCount> \"{len(conv.get('messages') or [])}\"^^<{XSD}integer> .",
@@ -199,16 +200,18 @@ def page_query(kind: str = "chat", limit: int = 50, offset: int = 0) -> str:
     )
 
 
-def page_ids(bindings: list[dict]) -> list[str]:
-    """Thread ids from page_query's result bindings, in order, deduplicated
-    (a thread the store briefly holds twice — mid-update — counts once)."""
+def page_ids(bindings: list[dict], unique: bool = True) -> list[str]:
+    """Thread ids from page_query's result bindings, in order. Deduplicated by
+    default (a thread the store briefly holds twice — mid-update — counts
+    once); `unique=False` keeps one id per row, for a caller that counts
+    store positions."""
     prefix = subject("")
     seen: set[str] = set()
     ids: list[str] = []
     for b in bindings:
         value = ((b or {}).get("t") or {}).get("value") or ""
         cid = value[len(prefix):] if value.startswith(prefix) else ""
-        if _ID_RE.fullmatch(cid) and cid not in seen:
+        if _ID_RE.fullmatch(cid) and (not unique or cid not in seen):
             seen.add(cid)
             ids.append(cid)
     return ids

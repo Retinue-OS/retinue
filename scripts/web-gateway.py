@@ -1451,6 +1451,9 @@ THREADS_EMIT_DIR = Path(os.environ.get(
 # default and the most one request may ask for.
 ARCHIVED_PAGE_DEFAULT = 50
 ARCHIVED_PAGE_MAX = 500
+# How many store reads one page may take when rows the store still lists turn
+# out deleted or restored (it is seconds behind at most, so one is the rule).
+_ARCHIVED_PAGE_ROUNDS = 5
 # Cap a single attachment's decoded size to keep memory and disk bounded.
 MAX_ATTACHMENT_BYTES = int(os.environ.get("CONVERSATION_MAX_ATTACHMENT_BYTES", str(25 * 1024 * 1024)))
 # Files forwarded with POST /message (e.g. an image received on a messenger
@@ -3041,29 +3044,60 @@ def _archived_page(kind: str = "chat", limit: int = ARCHIVED_PAGE_DEFAULT,
     When the store cannot answer, or answers with no archived thread at all
     on the first page (the summaries of a fresh deployment, still being
     indexed), the page comes from the files instead — slower, never wrong.
-    `source` says which ("store" or "files")."""
-    ids: list[str] | None = None
+    `source` says which ("store" or "files").
+
+    A store row whose thread no longer qualifies does not cost the page a
+    slot: the page reads on from the store until it holds `limit` rows, and
+    `next_offset` is the store position after the last row it read, so the
+    next page starts exactly there — nothing repeated, nothing skipped."""
+    chunk = limit + 1
+
+    def from_store(at: int) -> tuple[list[str], int]:
+        bindings = _sparql_bindings(thread_index.page_query(kind, chunk, at))
+        return thread_index.page_ids(bindings, unique=False), len(bindings)
+
     try:
-        ids = thread_index.page_ids(_sparql_bindings(
-            thread_index.page_query(kind, limit + 1, offset)))
+        ids, got = from_store(offset)
     except Exception as exc:  # noqa: BLE001 — store down: the files still answer
         print(f"[web-gateway] archived page from the files: {exc}", flush=True)
+        ids, got = None, 0
     if ids is None or (not ids and offset == 0):
         rows = sorted(_list_convs("archived", kind),
                       key=lambda t: not t.get("starred"))  # stable: newest first within
         return {"conversations": rows[offset:offset + limit],
                 "has_more": len(rows) > offset + limit,
                 "next_offset": offset + limit, "source": "files"}
-    rows = []
-    for cid in ids[:limit]:
-        conv = _load_conv(cid)
-        if conv is None or not conv.get("archived"):
-            continue
-        if kind != "all" and (conv.get("kind") or "chat") != kind:
-            continue
-        rows.append(_conv_summary(conv))
-    return {"conversations": rows, "has_more": len(ids) > limit,
-            "next_offset": offset + limit, "source": "store"}
+    rows: list[dict] = []
+    seen: set[str] = set()
+    pos = offset
+    has_more = False
+    for _round in range(_ARCHIVED_PAGE_ROUNDS):
+        for cid in ids:
+            if len(rows) == limit:
+                has_more = True
+                break
+            pos += 1
+            if cid in seen:  # mid-update the store may hold a thread twice
+                continue
+            seen.add(cid)
+            conv = _load_conv(cid)
+            if conv is None or not conv.get("archived"):
+                continue
+            if kind != "all" and (conv.get("kind") or "chat") != kind:
+                continue
+            rows.append(_conv_summary(conv))
+        if has_more or got < chunk:  # full with one to spare, or the store is through
+            break
+        try:
+            ids, got = from_store(pos)
+        except Exception as exc:  # noqa: BLE001 — what was read stands; more may follow
+            print(f"[web-gateway] archived page cut short: {exc}", flush=True)
+            has_more = True
+            break
+    else:
+        has_more = True  # rounds used up on rows the files dropped: more may follow
+    return {"conversations": rows, "has_more": has_more,
+            "next_offset": pos, "source": "store"}
 
 
 def _page_param(params: dict, name: str, default: int, low: int, high: int) -> int:

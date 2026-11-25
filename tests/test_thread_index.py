@@ -79,12 +79,11 @@ def test_summary(ti):
         ],
     }
     nt = ti.to_ntriples(conv)
-    for secret in ("MESSAGE-BODY", "CONTEXT-NOTE", "SHELL-TEXT", "secret-model-choice", "pending"):
+    for secret in ("MESSAGE-BODY", "CONTEXT-NOTE", "SHELL-TEXT", "secret-model-choice", "pending",
+                   "RSVP", "/title>"):
         check(f"no {secret} in the summary", secret not in nt, nt)
     s = f"<urn:retinue:thread:{cid}>"
     check("typed kb:Thread", f"{s} <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <https://w3id.org/retinue/kb#Thread> ." in nt)
-    check("the title is escaped onto one line",
-          '<http://purl.org/dc/terms/title> "Party \\"RSVP\\"\\\\ line\\nbreak" .' in nt, nt)
     check("modified is normalised to UTC",
           '<http://purl.org/dc/terms/modified> "2026-11-02T08:30:00Z"^^<http://www.w3.org/2001/XMLSchema#dateTime>' in nt)
     check("created too", '"2026-11-01T09:00:00Z"^^' in nt)
@@ -104,8 +103,10 @@ def test_summary(ti):
         g = rdflib.Graph()
         g.parse(data=nt, format="nt")
         check("rdflib parses it", len(g) == len(nt.strip().splitlines()), str(len(g)))
-        title = g.value(rdflib.URIRef(f"urn:retinue:thread:{cid}"), rdflib.URIRef("http://purl.org/dc/terms/title"))
-        check("…and reads the title back intact", str(title) == conv["title"], repr(title))
+        chat = g.value(rdflib.URIRef(f"urn:retinue:thread:{cid}"),
+                       rdflib.URIRef("https://w3id.org/retinue/kb#companionOf"))
+        check("…and reads the chat link back intact",
+              str(chat) == "urn:retinue:chat:signal:+41790000000", repr(chat))
 
     with tempfile.TemporaryDirectory() as tmp:
         out = Path(tmp) / "threads"
@@ -147,9 +148,11 @@ class Gateway:
         except urllib.error.HTTPError as e:
             return e.code, json.loads(e.read().decode() or "{}")
 
-    def open_thread(self, message):
-        status, body = self.call("POST", "/internal/conversations",
-                                 {"message": message, "title": message[:40]}, agent=True)
+    def open_thread(self, message, title=True):
+        payload = {"message": message}
+        if title:
+            payload["title"] = message[:40]
+        status, body = self.call("POST", "/internal/conversations", payload, agent=True)
         assert status == 201, (status, body)
         return body["id"]
 
@@ -215,13 +218,17 @@ class Store:
 def test_gateway(gw: Gateway, out: Path, store: Store):
     wg = gw.wg
     print("the gateway keeps the summaries")
-    # The title is the first 40 characters; the words past them are the
-    # message's alone.
-    a = gw.open_thread("Alpha: confirm the plumber on Thursday? SECRET-WORDS")
+    # No title given: the gateway titles the thread with the start of its
+    # first message, so the title is the message's words too.
+    a = gw.open_thread("SECRET-WORDS: confirm the plumber on Thursday?", title=False)
+    check("the gateway derived the title from the message",
+          "SECRET-WORDS" in (wg._load_conv(a) or {}).get("title", ""))
     summary = out / f"{a}.nt"
     check("opening a thread writes its summary", summary.exists())
     text = summary.read_text()
-    check("…without the message", "SECRET-WORDS" not in text, text)
+    check("…without the message, nor a title made of it", "SECRET-WORDS" not in text, text)
+    titled = gw.open_thread("An agent's thread", title=True)
+    check("…nor an explicit title", "An agent" not in (out / f"{titled}.nt").read_text())
     check("…not archived yet", '#archived> "false"' in text)
     gw.flags(a, archived=True)
     check("archiving rewrites it", '#archived> "true"' in summary.read_text())
@@ -277,6 +284,15 @@ def test_gateway(gw: Gateway, out: Path, store: Store):
     check("a deleted thread the store still lists is dropped", gone not in listed, str(listed))
     check("so is a restored one", restored not in listed, str(listed))
     check("the rest stay", set(listed) == set(ids) - {gone, restored}, str(listed))
+    # Store order: star, ids4, ids3 (restored), ids2 (deleted), ids0.
+    body = gw.page("archived=1&limit=2")
+    check("page one is full", [t["id"] for t in body["conversations"]] == [star, ids[4]]
+          and body["has_more"] is True and body["next_offset"] == 2, str(body))
+    body = gw.page("archived=1&limit=1&offset=2")
+    check("stale rows cost no slot: the page reads on to a live one",
+          [t["id"] for t in body["conversations"]] == [ids[0]], str(body))
+    check("…and the next page starts after what it read",
+          body["next_offset"] == 5 and body["has_more"] is False, str(body))
     store.frozen = None
 
     print("when the store cannot help")
