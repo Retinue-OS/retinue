@@ -130,6 +130,34 @@ export function domainCovers(spec) {
     : `every address @${spec}`;
 }
 
+// Whom a link asks the page to open (chats.js contactHref): `{contact}` for
+// an id, `{channel, handle}` for whoever holds a handle, or null. A channel
+// the page does not know is no handle it can file, so it is no ask.
+export function wantedFromQuery(search) {
+  const p = new URLSearchParams(String(search || ''));
+  const contact = (p.get('contact') || '').trim();
+  if (contact) return { contact };
+  const channel = (p.get('channel') || '').trim();
+  const handle = (p.get('handle') || '').trim();
+  return handle && CHANNELS.includes(channel) ? { channel, handle } : null;
+}
+
+// Whether a person holds a handle: an address in any case, a number in any
+// spelling of its digits — on the asked channel, or (a number) on any, as
+// the address book's own `phones` say one person is reached on several.
+export function holdsHandle(person, channel, handle) {
+  const digits = (s) => String(s || '').replace(/[^\d+]/g, '');
+  const want = String(handle || '').trim();
+  if (!want) return false;
+  if (channel === 'email') {
+    return (person.handles || []).some((h) => h.channel === 'email' && h.handle.toLowerCase() === want.toLowerCase());
+  }
+  if ((person.handles || []).some((h) => h.channel === channel && h.handle === want)) return true;
+  const n = digits(want);
+  return n.length > 4 && ((person.phones || []).concat((person.handles || [])
+    .filter((h) => h.channel !== 'email').map((h) => h.handle))).some((x) => digits(x) === n);
+}
+
 class RetinueContacts extends HTMLElement {
   constructor() {
     super();
@@ -140,6 +168,8 @@ class RetinueContacts extends HTMLElement {
     this._form = null;
     this._busy = false;
     this._error = '';
+    // Whom a link from a chat's avatar asks to open, read once per page load.
+    this._want = wantedFromQuery((globalThis.location && globalThis.location.search) || '');
   }
 
   connectedCallback() {
@@ -151,6 +181,32 @@ class RetinueContacts extends HTMLElement {
     }
     this.render();
     this.load();
+  }
+
+  // Open the person a link asked for, once, on the first address book that
+  // arrives: their editor, scrolled into view. A handle nobody holds starts a
+  // new contact with it filled in; an id the book no longer has says so.
+  _openWanted() {
+    const want = this._want;
+    if (!want || !this._data) return;
+    this._want = null;
+    const list = this._data.contacts || [];
+    let hit = null;
+    if (want.contact) hit = list.find((c) => c.id === want.contact) || null;
+    else hit = list.find((c) => holdsHandle(c, want.channel, want.handle)) || null;
+    if (hit) {
+      this._startEdit(hit.id);
+    } else if (want.handle) {
+      this._startEdit('new');
+      this._form.handles.push({ channel: want.channel, handle: want.handle });
+      this.render();
+    } else {
+      this._error = 'That contact is no longer in the address book.';
+      this.render();
+      return;
+    }
+    const ed = this.shadowRoot.querySelector('.editor');
+    if (ed && ed.scrollIntoView) ed.scrollIntoView({ block: 'start' });
   }
 
   async load() {
@@ -167,6 +223,7 @@ class RetinueContacts extends HTMLElement {
       this._error = `Could not load the address book (${String((err && err.message) || err)}).`;
     }
     this.render();
+    this._openWanted();
   }
 
   _contact(id) {

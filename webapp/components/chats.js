@@ -364,6 +364,39 @@ export function avatarHtml(chat) {
     `${esc(avatarInitials(chat))}${channelMarkHtml(chat.channel)}</span>`;
 }
 
+// Where a tap on a chat's avatar leads: the Contacts page with the person the
+// disc stands for open in its editor — the same card the address book lists.
+//
+//   - a mail thread: its peer (the person whose initials the disc shows), by
+//     the id the gateway resolved — the holder of the address, else the
+//     person whose e-mail domain covers it — else by the address itself;
+//   - a messenger chat with one peer: the person its contact card is filed
+//     under, else the handle the chat is with;
+//   - a messenger group: nobody — a group is a room, not a person (null).
+//
+// A link by handle asks the Contacts page to open whoever holds it, and to
+// start a new contact with it filled in when nobody does. An id is the
+// address book's (`contacts.py`'s key); it travels as a query parameter and
+// is never trusted as more than a lookup.
+export function contactHref(chat) {
+  const c = chat || {};
+  const q = (params) => `/contacts.html?${new URLSearchParams(params).toString()}`;
+  const id = (v) => (typeof v === 'string' && v.trim() ? v.trim() : '');
+  if (isMail(c)) {
+    const p = c.peer && typeof c.peer === 'object' ? c.peer : null;
+    if (!p) return null;
+    const who = id(p.contact) || id(p.by_domain && p.by_domain.contact);
+    if (who) return q({ contact: who });
+    const address = id(p.address);
+    return address ? q({ channel: 'email', handle: address }) : null;
+  }
+  if (c.group) return null;
+  const person = id(c.contact && c.contact.person);
+  if (person) return q({ contact: person });
+  const handle = id(c.key);
+  return handle && c.channel ? q({ channel: c.channel, handle }) : null;
+}
+
 // A mail chat's participants as one line of plain text (the caller escapes
 // it): each by the name the address book or the mail gave, else the address,
 // and "+n" for those the server's cap left out. '' for a chat that names

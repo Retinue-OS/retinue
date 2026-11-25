@@ -78,7 +78,7 @@ const take = (pred, what) => {
   return wire.splice(i, 1)[0];
 };
 
-const { domainSpec, domainCovers } = await import('./contacts.js');
+const { domainSpec, domainCovers, wantedFromQuery, holdsHandle } = await import('./contacts.js');
 const Page = registry.get('retinue-contacts');
 assert.ok(Page, 'the element registered itself');
 
@@ -298,6 +298,69 @@ await ok('the copy: no whitelist, e-mail reached by VIP and the instruction, dom
   assert.ok(/works each of their messages by this, on every channel above — a mail from one of their addresses or domains included/.test(h), h);
   assert.ok(!h.includes('every messenger channel above'), 'the instruction is not said to be messenger-only');
   assert.ok(h.includes('Writes e-mail from'));
+});
+
+await ok('a link names whom to open: an id, or a handle on a known channel', async () => {
+  assert.deepEqual(wantedFromQuery('?contact=mara'), { contact: 'mara' });
+  assert.deepEqual(wantedFromQuery('?channel=email&handle=a%40b.example'), { channel: 'email', handle: 'a@b.example' });
+  assert.equal(wantedFromQuery('?channel=fax&handle=123'), null, 'an unknown channel is no ask');
+  assert.equal(wantedFromQuery(''), null);
+  const mara = BOOK().contacts[1];
+  assert.ok(holdsHandle(mara, 'email', 'MARA@example.org'), 'an address in any case');
+  assert.ok(!holdsHandle(mara, 'email', 'other@example.org'));
+  assert.ok(holdsHandle(person('p', { phones: ['+41791234567'] }), 'signal', '+41 79 123 45 67'), 'a number in any spelling');
+});
+
+async function mountAt(search, book = BOOK()) {
+  globalThis.location = { search };
+  try { return await mount(book); } finally { delete globalThis.location; }
+}
+
+await ok('?contact=<id> opens that person in the editor', async () => {
+  const el = await mountAt('?contact=acme');
+  assert.equal(el._open, 'acme');
+  assert.ok(editor(el).includes('value="Acme Ltd"'), editor(el));
+});
+
+await ok('?channel=&handle= opens its holder, else a new contact with it filled in', async () => {
+  const held = await mountAt('?channel=email&handle=Mara%40example.org');
+  assert.equal(held._open, 'mara');
+  const fresh = await mountAt('?channel=email&handle=new%40example.org');
+  assert.equal(fresh._open, 'new');
+  assert.deepEqual(fresh._form.handles, [{ channel: 'email', handle: 'new@example.org' }]);
+  assert.ok(editor(fresh).includes('new@example.org'));
+});
+
+await ok('an id the book no longer has says so, and opens nothing', async () => {
+  const el = await mountAt('?contact=gone');
+  assert.equal(el._open, null);
+  assert.ok(html(el).includes('no longer in the address book'), html(el));
+});
+
+await ok('the ask is taken once: a reload of the list does not reopen a closed card', async () => {
+  const el = await mountAt('?contact=acme');
+  click(el, 'cancel');
+  el.load();
+  take((w) => w.url === '/contacts', 'GET /contacts').answer(BOOK());
+  await settle();
+  assert.equal(el._open, null);
+});
+
+await ok("a chat's avatar links to the person it stands for", async () => {
+  const { contactHref } = await import('./chats.js');
+  const u = (h) => h && Object.fromEntries(new URL(h, 'https://x.example').searchParams);
+  // A mail thread: the holder of the peer's address, else the domain's person, else the address.
+  assert.deepEqual(u(contactHref({ channel: 'email', peer: { address: 'n@github.example', contact: 'copilot' } })), { contact: 'copilot' });
+  assert.deepEqual(u(contactHref({ channel: 'email', peer: { address: 'x@github.example', contact: null,
+    by_domain: { contact: 'github', name: 'GitHub', domain: 'github.example' } } })), { contact: 'github' });
+  assert.deepEqual(u(contactHref({ channel: 'email', peer: { address: 'x@y.example', contact: null } })),
+    { channel: 'email', handle: 'x@y.example' });
+  assert.equal(contactHref({ channel: 'email' }), null, 'no peer, no person');
+  // A messenger chat: the card's person, else the handle; a group is nobody.
+  assert.deepEqual(u(contactHref({ channel: 'signal', key: '+41790000000', contact: { person: 'mara' } })), { contact: 'mara' });
+  assert.deepEqual(u(contactHref({ channel: 'signal', key: '+41790000000' })), { channel: 'signal', handle: '+41790000000' });
+  assert.equal(contactHref({ channel: 'whatsapp', key: 'g1', group: true }), null);
+  assert.ok(contactHref({ channel: 'email', peer: { address: 'a@b', contact: 'a&b"c' } }).startsWith('/contacts.html?contact=a%26b%22c'), 'the id is encoded');
 });
 
 console.log(`${passed} checks passed`);
