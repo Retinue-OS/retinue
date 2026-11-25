@@ -11827,7 +11827,9 @@ def _parse_triage_verdict(payload: dict) -> dict | None:
         return None
     if bucket not in chat_triage.BUCKETS:
         raise ValueError(f"triage is one of {', '.join(chat_triage.BUCKETS)}, not {bucket!r}")
-    note = payload.get("triage_note") or ""
+    # Absent is no note; anything given must be text (a false, a 0 or a
+    # list is no note to keep).
+    note = payload.get("triage_note", "")
     if not isinstance(note, str):
         raise ValueError("triage_note is text")
     return {"bucket": bucket, "note": " ".join(note.split())[:chat_triage.NOTE_CHARS]}
@@ -11837,14 +11839,29 @@ def _triage_from_arrival(chat_id: str, record: dict, reply: str | None) -> None:
     """Write a completed arrival turn's triage word into the triage store
     (docs/chat-triage.md, "Arrival turns"), for the message count it judged:
     the newest arrival it worked. A chat spoken in since reads as stale
-    there, and the next press sorts it as any other."""
+    there, and the next press sorts it as any other.
+
+    Where the worked messages stand in the count is read as the turn's
+    put-away reads it (_turn_put_away): by message id, since a merge while
+    the turn ran renumbers the count; by the place they had at the start
+    only where the chat was not merged. A message placed neither way leaves
+    no word — the next press judges the chat, rather than trusting a count
+    that may name another message."""
     triage = record.get("triage")
-    seqs = [s for s in record.get("seqs") or [] if isinstance(s, int) and not isinstance(s, bool)]
-    if not triage or not seqs:
+    if not triage:
+        return
+    doc = _CHAT_STATE.get(chat_id)
+    unmoved = chat_id in (record.get("names") or ())
+    places = [chat_state_mod.recent_place(doc, mid) if mid else None
+              for mid in record.get("mids") or []]
+    places = [p if isinstance(p, int) and not isinstance(p, bool)
+              else (s if unmoved and isinstance(s, int) and not isinstance(s, bool) else None)
+              for p, s in zip(places, record.get("seqs") or [])]
+    if not places or None in places:
         return
     try:
         _TRIAGE_STORE.put(chat_id, chat_triage.arrival_entry(
-            triage["bucket"], triage.get("note") or "", max(seqs),
+            triage["bucket"], triage.get("note") or "", max(places),
             attention_store.markup_words(reply) if reply else None))
     except OSError as exc:
         print(f"[web-gateway] chat triage: could not keep the arrival's word for "

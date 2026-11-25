@@ -219,7 +219,7 @@ def main() -> int:
             status, _ = mail._http(base, "POST", vurl, {"triage": "archive"}, agent)
             assert status == 409, "no turn running"
             record = {"chat": target, "jobs": {"j"}, "names": {target}, "token": "j",
-                      "mids": [], "seqs": [seq], "instructed": False, "verdict": None,
+                      "mids": ["m-worked"], "seqs": [seq], "instructed": False, "verdict": None,
                       "flags": set(), "asked": False, "epoch": None}
             wg._RUNNING_TURNS[target] = [record]
             try:
@@ -229,6 +229,10 @@ def main() -> int:
                 assert status == 409, "a VIP's turn gives no importance verdict"
                 status, body = mail._http(base, "POST", vurl, {}, agent)
                 assert status == 400, body
+                for bad in (False, 0, [], None):
+                    status, body = mail._http(base, "POST", vurl,
+                                              {"triage": "archive", "triage_note": bad}, agent)
+                    assert status == 400 and "triage_note" in body["error"], (bad, body)
                 status, body = mail._http(base, "POST", vurl,
                                           {"triage": "archive", "triage_note": " A  receipt. "}, agent)
                 assert status == 200 and body["triage"] == {"bucket": "archive", "note": "A receipt."}, body
@@ -238,6 +242,13 @@ def main() -> int:
             finally:
                 wg._RUNNING_TURNS.pop(target, None)
             record["instructed"] = False
+            # Merged away while the turn ran, and its message placed by no id:
+            # no word — the next press judges the chat rather than trusting a
+            # count that may now name another message.
+            moved = dict(record, names={"email:~gone"})
+            wg._triage_from_arrival(target, moved, "x")
+            assert target not in mail._http(base, "GET", "/chats/triage")[1]["entries"] or \
+                mail._http(base, "GET", "/chats/triage")[1]["entries"][target].get("source") != "arrival"
             wg._triage_from_arrival(target, record, "Ara's  note.")
             e = mail._http(base, "GET", "/chats/triage")[1]["entries"][target]
             assert e["source"] == "arrival" and e["seq"] == seq and e["bucket"] == "archive", e

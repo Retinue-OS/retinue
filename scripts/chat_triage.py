@@ -309,6 +309,18 @@ class TriageStore:
             self._doc["entries"][chat_id] = entry
             self._save()
 
+    def put_unless_arrival(self, chat_id: str, entry: dict) -> bool:
+        """A sorting's entry, unless an arrival turn's word for the same
+        message is there: the check and the write under one lock, so a word
+        that lands while a batch is out is never overwritten by it. True when
+        written."""
+        with self.lock:
+            if from_arrival(self._doc["entries"].get(chat_id), entry.get("seq")):
+                return False
+            self._doc["entries"][chat_id] = entry
+            self._save()
+            return True
+
     def update(self, chat_id: str, **fields) -> None:
         with self.lock:
             e = self._doc["entries"].get(chat_id)
@@ -513,7 +525,8 @@ class TriageRunner:
                      "seq": c.get("seq"), "at": _now(), "run": run_id}
             if from_arrival(self.store.entry(c["id"]), c.get("seq")):
                 # An arrival turn judged this very message while the batch ran:
-                # its word stands over the quick pass's.
+                # its word stands over the quick pass's (and the write below
+                # checks again, under the store's lock).
                 continue
             # followup_max 0 (the default, CHAT_TRIAGE_FOLLOWUPS): no follow-up
             # at all, and no "skipped" mark on the row either.
@@ -526,7 +539,11 @@ class TriageRunner:
                         counted["followups"] += 1
                 entry["followup"] = ({"state": "queued"} if follow
                                      else {"state": "skipped", "why": "over this run's limit"})
-            self.store.put(c["id"], entry)
+            if not self.store.put_unless_arrival(c["id"], entry):
+                if follow:
+                    with count_lock:
+                        counted["followups"] -= 1
+                continue
             with count_lock:
                 counted["sorted"] += 1
                 self.store.set_run(sorted=counted["sorted"])
@@ -536,8 +553,10 @@ class TriageRunner:
                 self._followups.submit(self._follow, c["id"], dict(entry))
 
     def _unsorted(self, run_id: str, c: dict, why: str, counted: dict, count_lock) -> None:
-        self.store.put(c["id"], {"bucket": None, "error": why, "seq": c.get("seq"),
-                                 "at": _now(), "run": run_id})
+        if not self.store.put_unless_arrival(c["id"], {"bucket": None, "error": why,
+                                                       "seq": c.get("seq"),
+                                                       "at": _now(), "run": run_id}):
+            return
         with count_lock:
             counted["failed"] += 1
             self.store.set_run(failed=counted["failed"])

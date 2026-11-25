@@ -419,6 +419,22 @@ def test_an_arrival_turns_word_stands_until_a_newer_message():
         assert store.snapshot()["entries"]["v"].get("source") is None
 
 
+def test_a_sorting_never_overwrites_an_arrival_word_in_one_write():
+    with tempfile.TemporaryDirectory() as d:
+        store = ct.TriageStore(Path(d) / "t.json")
+        store.put("a", ct.arrival_entry("action", "x", 3))
+        assert not store.put_unless_arrival("a", {"bucket": "delete", "seq": 3, "run": "r"})
+        assert store.entry("a")["source"] == "arrival"
+        assert store.put_unless_arrival("a", {"bucket": "delete", "seq": 4, "run": "r"}), \
+            "a newer message: the word is stale, the sorting writes"
+        assert store.entry("a")["bucket"] == "delete"
+        # An unsorted mark (a failed batch) does not overwrite it either.
+        store.put("b", ct.arrival_entry("archive", "y", 2))
+        r = ct.TriageRunner(store, classify=lambda p: None, digest=lambda c: digest(c, "t"))
+        r._unsorted("r", {"id": "b", "seq": 2}, "x", {"failed": 0}, __import__("threading").Lock())
+        assert store.entry("b")["source"] == "arrival"
+
+
 if __name__ == "__main__":
     t0 = time.time()
     test_prompt_numbers_and_escapes_every_chat()
@@ -438,4 +454,5 @@ if __name__ == "__main__":
     test_a_run_sorts_with_the_saved_notes()
     test_a_note_changed_mid_run_waits_for_the_next_run()
     test_an_arrival_turns_word_stands_until_a_newer_message()
+    test_a_sorting_never_overwrites_an_arrival_word_in_one_write()
     print(f"all chat-triage tests passed ({time.time() - t0:.1f}s)")

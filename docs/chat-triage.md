@@ -182,11 +182,15 @@ chat-verdict.py --chat <id> --triage <action|archive|delete> --triage-note "<one
   worked (`seq`), and with the turn's own reply in the companion as Ara's
   note on the row (`followup.state: done`), so an action row opens on her
   pane. A turn that fails leaves no word; the chat is sorted by the next
-  press as any other.
+  press as any other. Where the worked messages stand in the count is read
+  by message id, as the turn's own archive reads it, since a merge of the
+  chat while the turn ran renumbers the count; a message placed by no id in
+  a merged chat leaves no word either.
 - A sorting skips such a chat while its word is fresh — *Sort again* and
   feedback included: the arrival turn had more to go on than the quick pass.
   A newer message makes it stale, and the next press sorts the chat as any
-  other. A batch that was out when the word landed does not overwrite it.
+  other. A batch that was out when the word landed does not overwrite it:
+  the check and the write are one operation under the store's lock.
 
 ### Feedback
 
