@@ -265,7 +265,9 @@ showed, `POST …/<id>/delivered {"occurrence"}`, before or after the server
 fired it; a confirmed occurrence is never pushed by the server (it stays on
 the home list). With no confirmation in time the push goes out as usual. The
 notification's own *In 15 min* and *Skip today* post `snooze` (with the
-exact `at` the shell armed) and `skip`; tapping it opens the deep link in
+exact `at` the shell armed) and `skip` (with the `occurrence` skipped, so a
+skip sent late, after the phone was offline, skips that occurrence's day and
+clears only that day's item); tapping it opens the deep link in
 the shell's WebView. `Retinue.schedule` and its siblings call
 `RetinueShell.remindersChanged()` where the shell has it, so a changed plan
 is re-armed at once rather than on the next fetch.

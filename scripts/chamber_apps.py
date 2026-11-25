@@ -490,11 +490,19 @@ def snooze_job(job: dict, at: datetime, now: datetime) -> str:
     return key
 
 
-def skip_today(job: dict, now: datetime) -> str:
-    """Nothing more fires on today's local date (in the job's zone): the
-    snoozes of today go too. Returns the date skipped."""
+def skip_day(job: dict, at: datetime) -> str:
+    """The local date (in the job's zone) a skip names: the day of ``at``."""
     tz = calendar_trigger.zone_named(job.get("tz"), default_zone())
-    today = now.astimezone(tz).date()
+    return at.astimezone(tz).date().isoformat()
+
+
+def skip_today(job: dict, now: datetime, at: datetime | None = None) -> str:
+    """Nothing more fires on the local date (in the job's zone) of ``at`` —
+    the occurrence the user skipped, when the caller names it (a shell that
+    sends its skip late, after being offline), else now: the snoozes of that
+    day go too. Returns the date skipped."""
+    tz = calendar_trigger.zone_named(job.get("tz"), default_zone())
+    today = (at or now).astimezone(tz).date()
     _prune(job, now)
     job["skip_dates"] = sorted(set(job.get("skip_dates") or []) | {today.isoformat()})
     job["extra"] = [x for x in job.get("extra") or []

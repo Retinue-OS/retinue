@@ -452,6 +452,23 @@ def main() -> int:
             check("unscheduling clears its item", st == 200 and
                   all(i["source_id"] != "app:routines:routine:quiet" for i in open_reminders()))
 
+            print("a late skip names its day")
+            clock["now"] = datetime(2026, 12, 5, 10, 30, 5, tzinfo=ZRH)
+            req(port, "POST", fire, dict(body, occurrence="2026-12-05T09:30:00Z"), tok)
+            st, _, data = req(port, "POST", base + "/hand-1/skip", {"occurrence": "2026-12-04T09:30:00Z"})
+            got = jbody(data) or {}
+            job_now = wg.chamber_apps.get_job("routines", "routine", "hand-1")
+            check("yesterday's skip, sent today, skips yesterday", (st, got.get("date"), got.get("cleared")),
+                  (200, "2026-12-04", False))
+            check("and leaves today alone", "2026-12-05" not in (job_now.get("skip_dates") or [])
+                  and any(i["occurrence"] == "2026-12-05T09:30:00Z" for i in open_reminders()), job_now)
+            st, _, data = req(port, "POST", base + "/hand-1/skip", {"occurrence": "2026-12-05T09:30:00Z"})
+            check("today's skip clears today's item", jbody(data).get("cleared") is True
+                  and "2026-12-05" in wg.chamber_apps.get_job("routines", "routine", "hand-1").get("skip_dates", []))
+            for bad in ("soon", "2026-01-01T00:00:00Z"):
+                st, _, _ = req(port, "POST", base + "/hand-1/skip", {"occurrence": bad})
+                check(f"skip occurrence {bad!r} refused", st == 400)
+
             print("ask and sparql")
             st, _, data = req(port, "POST", "/apps/api/ask", {"agent": "coach", "text": "Plan next week.",
                                                              "app": {"chamber": "routines", "id": "routine"},

@@ -17170,10 +17170,23 @@ def _reminder_action(chamber: str, app: str, job_id: str, action: str, payload: 
             return 200, {"status": "done", "cleared": False, "skipped": key[0]}
         return 200, {"status": "done", "cleared": False}
     if action == "skip":
-        cleared = _reminder_settle(rid, "skipped")
-        day = []
-        chamber_apps.update_job(chamber, app, job_id, lambda j: day.append(chamber_apps.skip_today(j, now)))
-        return 200, {"status": "skipped", "cleared": cleared, "date": day[0] if day else None}
+        # "Not today" means the day of the occurrence the user skipped, not
+        # the day the request arrives: a phone that was offline sends its
+        # skip later (the Android shell names the occurrence).
+        at = calendar_trigger.parse_instant(payload.get("occurrence")) if payload.get("occurrence") else None
+        if payload.get("occurrence") and at is None:
+            return 400, {"error": "occurrence must be an ISO instant"}
+        if at is not None and not now - timedelta(days=7) <= at <= now + timedelta(days=2):
+            return 400, {"error": "occurrence is too far from now"}
+        day = chamber_apps.skip_day(job, at or now)
+        rec = _REMINDERS.get(rid) or {}
+        open_at = calendar_trigger.parse_instant(rec.get("occurrence"))
+        # Only the item of that day is cleared: a late skip of yesterday
+        # leaves today's reminder on the list.
+        cleared = (_reminder_settle(rid, "skipped")
+                   if open_at is None or chamber_apps.skip_day(job, open_at) == day else False)
+        chamber_apps.update_job(chamber, app, job_id, lambda j: chamber_apps.skip_today(j, now, at))
+        return 200, {"status": "skipped", "cleared": cleared, "date": day}
     if action == "snooze":
         when = calendar_trigger.parse_instant(payload.get("at")) if payload.get("at") else None
         if when is None:
