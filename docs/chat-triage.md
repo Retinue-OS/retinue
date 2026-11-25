@@ -50,6 +50,13 @@ for several dozen chats — while Ara's notes are still being written; the
 status line says how many are still on their way. A chat archived or deleted
 leaves the view; back (or *‹ Chats*) returns to the tabs.
 
+The view is in the URL (`chats.html#triage`): a chat opened from it and
+left again with back lands on the view as it was — the last run's lists,
+fetched with `GET /chats/triage`, with nothing sorted anew — and so does a
+reload. Only the Triage button and *Sort again* start a run. Opened cold on
+`#triage` (a link), closing the view drops the hash in place rather than
+leaving the app.
+
 Triage never acts on a chat by itself. Archive and delete are the user's
 presses; the follow-up turn is told to send nothing, change no flag and queue
 nothing.

@@ -45,6 +45,14 @@ def _list_harness() -> str:
 
 
 CHECKS = r"""
+// Every mount starts on a fresh history (a view an earlier check left open
+// would otherwise be restored), unless a check sets the history up itself.
+let keepHistory = false;
+const mountList = mount;
+mount = async (doc) => {
+  if (!keepHistory) history.stack = [null];
+  return mountList(doc);
+};
 const takeTri = (method, what) => take((w) => w.method === method && w.url === '/chats/triage', what);
 
 const LIST = [
@@ -348,6 +356,65 @@ await ok('the list refresh does not rebuild the view under typing in the feedbac
   takeList().answer(payload([...LIST, chat('u9', { unread: 1, list_group: 'unread', last: { ts: '2026-11-22T09:00:00Z', direction: 'in', text: 'new' } })]));
   await settle();
   assert.ok(ids(html(el)).includes('u9'), 'the next refresh shows it');
+});
+
+await ok('the view is in the URL: opening pushes #triage over the list\'s own entry', async () => {
+  history.stack = [null];
+  const urls = [];
+  const push = history.pushState;
+  history.pushState = function (st, _t, url) { urls.push(url); return push.call(this, st); };
+  const el = await mount(payload(LIST));
+  await openTriage(el, DONE);
+  history.pushState = push;
+  assert.deepEqual(urls, ['/chats.html#triage']);
+  assert.equal(history.state.triageEntry, true);
+});
+
+await ok('back from a chat opened in the view: restored from the last sorting, nothing pressed', async () => {
+  history.stack = [null, { chatsTriage: true, triageEntry: true }];
+  location.hash = '#triage';
+  keepHistory = true;
+  try {
+    const el = await mount(payload(LIST));
+    assert.equal(el._triage, true);
+    assert.ok(html(el).includes('Loading the last sorting…'), html(el));
+    takeTri('GET', 'the last sorting').answer(JSON.parse(JSON.stringify(DONE)));
+    await settle(); await settle();
+    assert.ok(!wire.some((w) => w.url === '/chats/triage' && w.method === 'POST'), 'no press');
+    assert.deepEqual(ids(sectionOf(html(el), 'archive')), ['u2']);
+    assert.ok(/Sorted .* ago/.test(html(el)), html(el));
+    // Close: the list's own entry lies below, so back.
+    el._closeTriage();
+    assert.equal(el._triage, false);
+    assert.equal(history.stack.length, 1);
+  } finally {
+    location.hash = '';
+    keepHistory = false;
+  }
+});
+
+await ok('opened cold on #triage: closing drops the hash in place instead of leaving the app', async () => {
+  history.stack = [null];
+  location.hash = '#triage';
+  const replaced = [];
+  const rep = history.replaceState;
+  history.replaceState = function (st, _t, url) { replaced.push([st, url]); this.stack[this.stack.length - 1] = st; };
+  keepHistory = true;
+  try {
+    const el = await mount(payload(LIST));
+    takeTri('GET', 'the last sorting').answer(JSON.parse(JSON.stringify(DONE)));
+    await settle(); await settle();
+    assert.equal(history.state.chatsTriage, true);
+    el._closeTriage();
+    assert.equal(history.stack.length, 1, 'no back out of the app');
+    const last = replaced[replaced.length - 1];
+    assert.equal(last[1], '/chats.html');
+    assert.ok(!last[0].chatsTriage);
+  } finally {
+    history.replaceState = rep;
+    location.hash = '';
+    keepHistory = false;
+  }
 });
 
 await ok('no multi-select in the view; Close and back return to the tabs', async () => {

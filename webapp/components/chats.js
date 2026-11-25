@@ -549,6 +549,8 @@ class RetinueChats extends RetinueCard {
     this._onPop = () => {
       if (this._selecting) this._exitSelect(false);
       else if (this._triage && !(history.state && history.state.chatsTriage)) this._closeTriage(false);
+      // The forward gesture back onto the view.
+      else if (!this._triage && history.state && history.state.chatsTriage) this._restoreTriage();
     };
     this._onKey = (e) => {
       if (e.key === 'Escape' && this._selecting) { e.preventDefault(); this._exitSelect(); }
@@ -569,6 +571,10 @@ class RetinueChats extends RetinueCard {
     this._timer = setInterval(() => this.load(), REFRESH_MS);
     // A Spam the chat page's menu handed over, with its Undo here.
     if (this._full) this._adoptHandoff();
+    // Back from a chat opened in the triage view (or a reload of it).
+    if (this._full && (location.hash === '#triage' || (history.state && history.state.chatsTriage))) {
+      this._restoreTriage();
+    }
   }
 
   // Take up what a chat page left (handOffChatAction): the row is hidden at
@@ -972,10 +978,36 @@ class RetinueChats extends RetinueCard {
     this._triage = true;
     this._triArmed = '';
     this._triMsg = '';
-    try { history.pushState({ ...(history.state || {}), chatsTriage: true }, ''); } catch (_e) { /* none */ }
+    // The view is in the URL (#triage), so it outlives the page: a chat
+    // opened from it and left again lands back on it (_restoreTriage), as
+    // does a reload. `triageEntry` says the list's own entry lies below it.
+    try {
+      history.pushState({ ...(history.state || {}), chatsTriage: true, triageEntry: true }, '',
+        `${location.pathname || ''}${location.search || ''}#triage`);
+    } catch (_e) { /* none */ }
     this._swipe.reset();
     this._rerender();
     this._startTriage(false);
+  }
+
+  // Back on the view without a press: the page was left for a chat (or
+  // reloaded) with #triage in its URL, or the forward gesture returned to
+  // it. It shows what the last run said (GET /chats/triage) and sorts
+  // nothing — a new run is the Triage or Sort again button's.
+  _restoreTriage() {
+    if (!this._full || this._triage) return;
+    this._triage = true;
+    this._triArmed = '';
+    this._triMsg = '';
+    try {
+      if (!(history.state && history.state.chatsTriage)) {
+        history.replaceState({ ...(history.state || {}), chatsTriage: true }, '');
+      }
+    } catch (_e) { /* none */ }
+    this._triRestoring = true;
+    this._swipe.reset();
+    this._rerender();
+    this._pollTriage().finally(() => { this._triRestoring = false; });
   }
 
   // `back`: take the view's history entry off too (not when the back
@@ -987,7 +1019,15 @@ class RetinueChats extends RetinueCard {
     if (this._triTimer) clearTimeout(this._triTimer);
     this._triTimer = null;
     try {
-      if (back && history.state && history.state.chatsTriage) history.back();
+      const st = history.state || {};
+      if (back && st.chatsTriage && st.triageEntry) {
+        history.back();
+      } else if (back && st.chatsTriage) {
+        // Opened cold on #triage (a link, a bookmark): no list entry below
+        // to go back to — the URL loses its #triage in place.
+        const { chatsTriage: _t, ...rest } = st;
+        history.replaceState(rest, '', `${location.pathname || ''}${location.search || ''}`);
+      }
     } catch (_e) { /* none */ }
     this._swipe.reset();
     this._rerender();
@@ -1149,7 +1189,7 @@ class RetinueChats extends RetinueCard {
   _triageStatus() {
     const t = this._tri;
     if (this._triMsg) return { text: this._triMsg, err: true };
-    if (!t) return { text: 'Starting…' };
+    if (!t) return { text: this._triRestoring ? 'Loading the last sorting…' : 'Starting…' };
     if (t.enabled === false) return { text: 'Triage is switched off on this deployment (CHAT_TRIAGE).', err: true };
     const run = t.run || {};
     const writing = Object.values(t.entries || {}).filter((e) =>
@@ -1246,7 +1286,8 @@ class RetinueChats extends RetinueCard {
     }).join('');
     this._shownIds = shownIds;
     const empty = !shownIds.length
-      ? `<p class="muted">${sorting || !this._tri ? 'Sorting your unread chats…' : 'Nothing left to triage.'}</p>` : '';
+      ? `<p class="muted">${!this._tri && this._triRestoring ? 'Loading…'
+        : sorting || !this._tri ? 'Sorting your unread chats…' : 'Nothing left to triage.'}</p>` : '';
     return head + body + empty;
   }
 
