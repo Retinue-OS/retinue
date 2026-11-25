@@ -99,6 +99,18 @@ Keep such a file to orchestrator-level facts, in `CLAUDE.md`'s voice:
 - **Branch policy for its paths** — which are Tier 1 (direct to `main`), which
   need in-conversation consent (Tier 2), which need a PR (Tier 3).
 
+## Chamber apps
+
+A chamber may ship Progressive Web Apps in
+`chambers/<name>/.retinue/apps/<app>/` (a `manifest.webmanifest` makes a
+directory an app). The dashboard serves each at `/apps/<name>/<app>/` and
+lists them on its *Apps* page and to the Android app; inside, an app finds
+`window.Retinue` for queries, files, threads, speech and server-fired
+reminders. An app has its chamber's trust and no permissions of its own, so
+the app directory is **Tier 3** in its chamber. Design, the client API and
+the reminders: [chamber-apps.md](chamber-apps.md); an example chamber:
+`examples/chamber-app/`.
+
 ## The letterbox and `.inbox.json`
 
 A chamber's `.inbox.json` declares its inboxes and filing destinations, and,

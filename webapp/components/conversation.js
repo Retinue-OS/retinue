@@ -131,7 +131,7 @@ import { shelf, goLive, takeRestore, threadFacts } from './shelf-store.js';
 import {
   isContinuous, setContinuous, touchContinuous, forgetContinuous, voiceTimeouts, Vad, VAD_DEFAULTS, LevelMeter,
   modeEntries, endedByAra, noteAraOff,
-  chime, primeAudio,
+  chime, primeAudio, cue, takeCue,
 } from './continuous.js';
 import {
   setVoiceActive, canPlaceCall, placeCall, onCall,
@@ -1162,6 +1162,7 @@ class RetinueConversation extends HTMLElement {
     this._vadLive = null;    // …which hears the stream (true), cannot (false), or is not up yet
     this._contTimers = [];   // the plain timers standing in for a meter that cannot hear
     this._recTouched = false; // the user has touched the recording row of this take
+    this._recByTouch = false; // this take was ended for review by the row's ✓
     this._listenOnOpen = false; // open the mic once the thread is read
     this._contArmed = false; // the next answer is to this element's own turn (see _contEngage)
     this._contPending = null; // {loop}: a listen asked for while the page was hidden
@@ -2344,11 +2345,13 @@ class RetinueConversation extends HTMLElement {
   // `call`, when given (null included), is the cancelled call this turn
   // carries, in place of whatever CANCELLED_CALLS holds for the thread —
   // which is then neither read nor spent (see sendMessage).
+  // Resolves true when the turn went out, false when it did not (kept in
+  // the box instead).
   async _send(text, { fromDraft = true, call } = {}) {
     const key = this._key();
     const d = draftOf(key);
     // A message needs text or at least one attachment.
-    if (!text.trim() && !(fromDraft && d.files.length)) return;
+    if (!text.trim() && !(fromDraft && d.files.length)) return false;
     // One send at a time. The host's controls stay live through it, so a
     // second ask arriving now is kept rather than dropped (see _keepUnsent) —
     // unless it is the very turn on the wire, pressed again: that one is
@@ -2356,7 +2359,7 @@ class RetinueConversation extends HTMLElement {
     if (this._busy) {
       const out = SENDS.get(key);
       if (!(out && out.text === text)) this._keepUnsent(key, text, fromDraft);
-      return;
+      return false;
     }
     const sent = { text, files: fromDraft ? d.files.slice() : [], fromDraft };
     // How often the thread held these words before they went: a send that
@@ -2457,6 +2460,7 @@ class RetinueConversation extends HTMLElement {
         el._schedulePoll();
       }
     }
+    return delivered;
   }
 
   // A first message opened a thread: go on as it, and the host hears of the
@@ -2767,6 +2771,8 @@ class RetinueConversation extends HTMLElement {
     this._recIntent = null;
     const aborted = this._recAborted;
     this._recAborted = false;
+    const byTouch = this._recByTouch;
+    this._recByTouch = false;
     // A take that cancelled a call and does not go out (✕, ✓, leaving):
     // nobody is told, and the call stays cancelled.
     if (aborted || intent !== 'send' || !chunks.length) CANCELLED_CALLS.delete(key);
@@ -2780,6 +2786,14 @@ class RetinueConversation extends HTMLElement {
     if (wasTake) {
       const goes = !aborted && intent === 'send' && chunks.length;
       const here = this.isConnected && this._key() === key;
+      // Heard, not seen: a whistle when it stopped without going and waits
+      // in the box (continuous.js, takeCue). A take meant to go gets its cue
+      // once the job below knows whether it went: the gong only for a send
+      // that went through, never on intent alone.
+      if (!goes) {
+        const kind = takeCue({ sent: false, kept: !aborted && !!chunks.length, byTouch });
+        if (kind) cue(kind);
+      }
       // A take sent by touch (➤) while a call waits is the user answering
       // it, heard by the detector or not: it cancels the call as speech
       // does, and its transcript decides, as for speech (an empty one lets
@@ -2810,6 +2824,8 @@ class RetinueConversation extends HTMLElement {
     if (live()) live().render();
     let toSend = '';
     let sentByWorker = false;
+    let sentByPage = false;  // the page's own send below went through
+    let transcribed = false; // a transcript landed in the box
     try {
       // The service worker transcribes (dictation.js): should this page be
       // left meanwhile, a dictation kept for review lands in this draft, and
@@ -2830,6 +2846,7 @@ class RetinueConversation extends HTMLElement {
         VOICE_ERRORS.delete(key);
       } else if (text) {
         appendToDraft(key, text);
+        transcribed = true;
         if (send && got.unsent) {
           // The worker could not send it (or may have): it waits in the box
           // for review, and like a take kept for review it tells nobody of
@@ -2878,7 +2895,7 @@ class RetinueConversation extends HTMLElement {
       if (live()) live().render();
       const el = live();
       if (!isNewKey(key) && el) {
-        await el._send(toSend, { call });
+        sentByPage = await el._send(toSend, { call });
       } else {
         // Off screen, or a first message: the send goes out with the context
         // captured when the recording started. The key names that context —
@@ -2918,6 +2935,7 @@ class RetinueConversation extends HTMLElement {
           const conv = await sendMessage(target, toSend, sentFiles, seed, model, out, isNewKey(key) ? null : call)
             .catch((err) => arrivedAnyway(err, target, toSend, before))
             .catch((err) => { VOICE_ERRORS.set(key, sendFailureNote(err)); throw err; });
+          sentByPage = true;
           draftOf(key).leftSend = null;
           clearSent(draftOf(key), toSend, sentFiles);
           const now = live();
@@ -2935,6 +2953,14 @@ class RetinueConversation extends HTMLElement {
     }
     VOICE_JOBS.delete(key);
     if (sentByWorker) refreshSent(key);
+    // The cue of a take of the loop meant to go: the gong once it went, the
+    // whistle when it did not (a send that turned back, a worker that could
+    // not send it) and its transcript waits in the box. A transcription that
+    // failed, or found no words, has nothing in the box: no cue.
+    if (wasTake && intent === 'send') {
+      const kind = takeCue({ sent: sentByWorker || sentByPage, kept: transcribed });
+      if (kind) cue(kind);
+    }
     keepDraft(key);  // as after _send: no turn of this job's is on the wire now
     const el = adopted || live();
     // The loop's take did not get through (nothing heard, a failed
@@ -3312,9 +3338,14 @@ class RetinueConversation extends HTMLElement {
       if (this._mediaRecorder !== mr || this._recTouched) return;
       this._finishRecording('review');
     }, noSpeechMs));
+    const { maxMs } = voiceTimeouts();
+    // As the detector does: no warning for a cap no longer than its lead.
+    if (maxMs > VAD_DEFAULTS.warnBeforeMs) this._contTimers.push(setTimeout(() => {
+      if (this._mediaRecorder === mr) cue('warn');
+    }, maxMs - VAD_DEFAULTS.warnBeforeMs));
     this._contTimers.push(setTimeout(() => {
       if (this._mediaRecorder === mr) this._finishRecording('review');
-    }, VAD_DEFAULTS.maxMs));
+    }, maxMs));
   }
 
   // Text or files waiting in this conversation's box.
@@ -3349,21 +3380,26 @@ class RetinueConversation extends HTMLElement {
     }
     // What began as speech was the room getting louder (continuous.js).
     else if (ev.type === 'noise') this._vadHeard = false;
+    // Half a minute to the length cap: tell the speaker by ear.
+    else if (ev.type === 'warn') cue('warn');
     // A pause after speech ends the take and sends it. Any other end goes
     // to the draft for the user to read first — one that ran to the length
-    // cap never fell silent (a voice that did not stop, or a room the
-    // detector could not tell from one), and one that ended 'unsure' had
+    // cap (Settings → Voice) is never sent unseen, voice or not: an open mic
+    // that caught a phone call or a talk in the room must not become a long
+    // turn for Ara to act on; and one that ended 'unsure' had
     // its speech taken back as the room, perhaps wrongly: nothing unheard
     // is sent on a guess, and nothing said is thrown away on one.
     // So does a take that would carry text or files the user put in the box
     // before it: the send takes the whole draft, which they have not seen
     // go together with what they said.
-    // A take that cancelled a call goes out whatever ended it, as only its
-    // transcript can tell whether the user meant to stop the call; but not
-    // with text or files in the box, which go to review as above.
+    // A take that cancelled a call goes out whatever ended it short of the
+    // cap, as only its transcript can tell whether the user meant to stop
+    // the call; but not at the cap, nor with text or files in the box,
+    // which go to review as above (the call staying cancelled).
     else if (ev.type === 'end') {
       const cancelled = CANCELLED_CALLS.has(this._key());
-      this._finishRecording((cancelled || ev.reason === 'silence') && !this._draftHasInput() ? 'send' : 'review');
+      const send = ev.reason === 'silence' || (cancelled && ev.reason !== 'max');
+      this._finishRecording(send && !this._draftHasInput() ? 'send' : 'review');
     }
     // Nobody spoke: the mic closes, the mode stays on, and nothing is sent
     // (no "no speech detected" note either — silence was the answer).
@@ -3646,7 +3682,7 @@ class RetinueConversation extends HTMLElement {
     const recAbort = root.querySelector('[data-rec-abort]');
     if (recAbort) recAbort.addEventListener('click', () => this._abortRecording());
     const recCheck = root.querySelector('[data-rec-check]');
-    if (recCheck) recCheck.addEventListener('click', () => this._finishRecording('review'));
+    if (recCheck) recCheck.addEventListener('click', () => { if (this._recState === 'recording' && !this._recIntent) this._recByTouch = true; this._finishRecording('review'); });
     const recSend = root.querySelector('[data-rec-send]');
     if (recSend) recSend.addEventListener('click', () => this._finishRecording('send'));
     const modelSel = root.querySelector('[data-model]');

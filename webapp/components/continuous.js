@@ -27,10 +27,23 @@ export const SILENCE_KEY = 'retinue-voice-silence-ms';
 export const NO_SPEECH_KEY = 'retinue-voice-nospeech-ms';
 export const DEFAULT_SILENCE_MS = 1500;
 export const DEFAULT_NO_SPEECH_MS = 8000;
+// How long one take may run at most (the detector's length cap). Long enough
+// for a thought spoken out in one go. It is a hard limit: a take that
+// reaches it is never sent unseen, whatever it sounded like — a phone call
+// or a conversation in the room, picked up by an open mic, must not turn
+// into a long, confusing turn for Ara to act on. Kept in this page's own storage, not in the app's device
+// store: an app that does not list the key would refuse it there.
+export const MAX_TAKE_KEY = 'retinue-voice-max-ms';
+export const DEFAULT_MAX_TAKE_MS = 4 * 60 * 1000;
+// This long before the cap a soft warning tone sounds (event `warn`), so a
+// speaker who is not looking can wrap up or pause before the take is cut
+// off and kept back.
+export const TAKE_WARN_BEFORE_MS = 30 * 1000;
 // Bounds, so a typo cannot cut every sentence in half or leave the mic open
 // for minutes.
 const SILENCE_RANGE = [500, 5000];
 const NO_SPEECH_RANGE = [2000, 30000];
+const MAX_TAKE_RANGE = [60 * 1000, 30 * 60 * 1000];
 
 function storage() {
   try { return typeof localStorage !== 'undefined' ? localStorage : null; } catch (_e) { return null; }
@@ -45,19 +58,25 @@ function clampMs(value, [lo, hi], fallback) {
 export function voiceTimeouts() {
   let silence = null;
   let noSpeech = null;
+  let maxTake = null;
   try {
     silence = deviceGet(SILENCE_KEY);
     noSpeech = deviceGet(NO_SPEECH_KEY);
   } catch (_e) { /* blocked storage: defaults */ }
+  try {
+    const ls = storage();
+    maxTake = ls ? ls.getItem(MAX_TAKE_KEY) : null;
+  } catch (_e) { /* blocked storage: default */ }
   return {
     silenceMs: clampMs(silence, SILENCE_RANGE, DEFAULT_SILENCE_MS),
     noSpeechMs: clampMs(noSpeech, NO_SPEECH_RANGE, DEFAULT_NO_SPEECH_MS),
+    maxMs: clampMs(maxTake, MAX_TAKE_RANGE, DEFAULT_MAX_TAKE_MS),
   };
 }
 
 // Store either timeout (milliseconds); returns what is in force afterwards,
 // clamped, so the settings field can show the value actually used.
-export function setVoiceTimeouts({ silenceMs, noSpeechMs } = {}) {
+export function setVoiceTimeouts({ silenceMs, noSpeechMs, maxMs } = {}) {
   try {
     if (silenceMs !== undefined) {
       deviceSet(SILENCE_KEY, String(clampMs(silenceMs, SILENCE_RANGE, DEFAULT_SILENCE_MS)));
@@ -66,6 +85,10 @@ export function setVoiceTimeouts({ silenceMs, noSpeechMs } = {}) {
       deviceSet(NO_SPEECH_KEY, String(clampMs(noSpeechMs, NO_SPEECH_RANGE, DEFAULT_NO_SPEECH_MS)));
     }
   } catch (_e) { /* not kept: the defaults go on applying */ }
+  try {
+    const ls = storage();
+    if (ls && maxMs !== undefined) ls.setItem(MAX_TAKE_KEY, String(clampMs(maxMs, MAX_TAKE_RANGE, DEFAULT_MAX_TAKE_MS)));
+  } catch (_e) { /* not kept: the default goes on applying */ }
   return voiceTimeouts();
 }
 
@@ -205,6 +228,8 @@ export function pickWakeThread(entries, now, windowMs = WAKE_WINDOW_MS) {
 // States: 'waiting' (mic open, no speech yet), 'speaking', 'done'. feed()
 // returns the event a frame caused, or null:
 //   {type: 'speech'}            speech began (once per take, unless retracted)
+//   {type: 'warn'}              the cap is TAKE_WARN_BEFORE_MS away (once
+//                               per take): play the warning tone
 //   {type: 'noise'}             what began as speech was the room getting
 //                               louder: back to waiting, nothing was heard
 //   {type: 'end', reason}       the take is over: 'silence' after speech;
@@ -229,7 +254,8 @@ export const VAD_DEFAULTS = {
   // phone's own speaker, a tap on the case is shorter.
   minSpeechMs: 120,
   // One take is at most this long, whatever the room does.
-  maxMs: 120000,
+  maxMs: DEFAULT_MAX_TAKE_MS,
+  warnBeforeMs: TAKE_WARN_BEFORE_MS,
   // Floor adaptation per frame: towards a quieter level quickly, towards a
   // louder (non-speech) level slowly.
   floorDown: 0.3,
@@ -258,6 +284,7 @@ export class Vad {
     this._runMax = null;     // …and its loudest
     this._retracted = false; // a run was taken back as the room in this take
     this._dipped = false;    // a frame fell below it since speech began
+    this._warned = false;    // the cap's warning has been given
   }
 
   threshold() {
@@ -276,6 +303,22 @@ export class Vad {
       return null;
     }
     if (this.floor == null) this.floor = lv;
+    // The length cap is decided first, before anything this frame heard: a
+    // take at or past it is never one to send unseen, even if it fell silent
+    // on this very frame, and a frame that arrives late (a throttled timer)
+    // must end the take rather than warn. Still waiting, no speech is in
+    // this take: it closes as the no-speech window would.
+    if (elapsed >= o.maxMs) {
+      if (this.state === 'speaking') return this._done({ type: 'end', reason: 'max' });
+      return this._waitedOut();
+    }
+    // The cap draws near. This frame only warns; the next one is judged as
+    // usual (nothing here depends on seeing every frame). A cap no longer
+    // than the lead gets no warning: it would sound at the start.
+    if (!this._warned && o.maxMs > o.warnBeforeMs && elapsed >= o.maxMs - o.warnBeforeMs) {
+      this._warned = true;
+      return { type: 'warn' };
+    }
     let above = lv > this.threshold();
     if (above) {
       if (this._aboveSince == null) this._startRun(now, lv);
@@ -335,7 +378,6 @@ export class Vad {
       this._learn(lv);
       if (now - this._lastVoice >= o.silenceMs) return this._done({ type: 'end', reason: 'silence' });
     }
-    if (elapsed >= o.maxMs) return this._done({ type: 'end', reason: 'max' });
     return null;
   }
 
@@ -419,6 +461,59 @@ export function chime() {
     });
   } catch (_e) { /* no chime is no reason to keep the mic shut */ }
   return new Promise((resolve) => setTimeout(resolve, 260));
+}
+
+// How a take of the loop ended, for the ear: the screen may be dark or out
+// of reach (a phone by the bed), and without a sound the user cannot tell a
+// take that went to Ara from one that was kept in the box for review and
+// will get no answer. Only these two get a cue: a take dropped because
+// nobody spoke stays silent, as silence was the answer.
+//   'sent' — a soft low gong: transcribed and sent to Ara (played once
+//            the send went through, never on intent alone).
+//   'warn' — three soft ticks: the length cap is half a minute away.
+//   'kept' — a short rising whistle: recording stopped, nothing was sent;
+//            the transcript waits in the box.
+export const TAKE_CUES = Object.freeze({
+  sent: [{ freq: 392, at: 0, peak: 0.22, decay: 0.9 }, { freq: 392 * 2.76, at: 0, peak: 0.05, decay: 0.5 }],
+  // Three soft, even ticks: the cap is half a minute away.
+  warn: [{ freq: 660, at: 0, peak: 0.1, decay: 0.08 }, { freq: 660, at: 0.18, peak: 0.1, decay: 0.08 }, { freq: 660, at: 0.36, peak: 0.1, decay: 0.08 }],
+  kept: [{ freq: 1100, to: 1900, at: 0, peak: 0.12, decay: 0.16 }, { freq: 1100, to: 1900, at: 0.2, peak: 0.12, decay: 0.16 }],
+});
+
+// Which cue, if any, a take of the loop gets once its fate is known:
+// `sent` it went to Ara (the send went through, not merely meant to go),
+// `kept` what it holds waits in the draft instead — audio of a take kept
+// for review, or the transcript of one whose send turned back — and
+// `byTouch` the user ended it for review on the row's ✓ (they see what
+// happened; ➤ still gets its cue).
+export function takeCue({ sent, kept, byTouch } = {}) {
+  if (sent) return 'sent';
+  if (kept && !byTouch) return 'kept';
+  return null;
+}
+
+// Plays a take cue (TAKE_CUES). Best effort: no Web Audio, no cue.
+export function cue(kind) {
+  const notes = TAKE_CUES[kind];
+  const ctx = notes ? audioContext() : null;
+  if (!ctx) return;
+  try {
+    if (ctx.state === 'suspended' && ctx.resume) ctx.resume().catch(() => {});
+    const t0 = ctx.currentTime + 0.02;
+    notes.forEach(({ freq, to, at, peak, decay }) => {
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = 'sine';
+      osc.frequency.setValueAtTime(freq, t0 + at);
+      if (to) osc.frequency.exponentialRampToValueAtTime(to, t0 + at + decay);
+      gain.gain.setValueAtTime(0.0001, t0 + at);
+      gain.gain.exponentialRampToValueAtTime(peak, t0 + at + 0.01);
+      gain.gain.exponentialRampToValueAtTime(0.0001, t0 + at + decay);
+      osc.connect(gain).connect(ctx.destination);
+      osc.start(t0 + at);
+      osc.stop(t0 + at + decay + 0.02);
+    });
+  } catch (_e) { /* a missing cue must not break the loop */ }
 }
 
 // Feeds a Vad from a live stream: an AnalyserNode over it, sampled on a

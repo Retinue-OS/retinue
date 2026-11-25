@@ -304,6 +304,20 @@ def test_user_thread_never_gated(base, wg):
     assert where == "next" and row["importance_from"] == "your thread", row
     status, _ = _http(base, "POST", f"/conversations/{conv['id']}/read")
     assert _find(_sections(base), "thread:" + conv["id"])[0] is None
+    # A thread the user opened about a running project stays after the read,
+    # in the project's sphere, until it is archived.
+    status, pconv = _http(base, "POST", "/conversations",
+                          {"message": "What is left on the VAT return?", "project": PROJECT})
+    assert status == 201
+    wg._conv_add_message(pconv["id"], "assistant", "Two receipts.", unread=True, pending=False)
+    _http(base, "POST", f"/conversations/{pconv['id']}/read")
+    _mode(base, "chores")
+    where, row = _find(_sections(base), "thread:" + pconv["id"])
+    assert where == "next" and row["sphere"] == "admin", (where, row)
+    assert _find(_sections(base), PROJECT)[0] is not None, "the project keeps its own row"
+    _http(base, "POST", f"/conversations/{pconv['id']}/archive")
+    assert _find(_sections(base), "thread:" + pconv["id"])[0] is None
+    _mode(base, "focused")
     print("ok test_user_thread_never_gated")
 
 
@@ -1369,6 +1383,61 @@ def test_declared_spheres_are_words(base, wg):
     print("ok test_declared_spheres_are_words")
 
 
+def test_own_project_thread_not_emitted(base, wg):
+    """The home keeps the user's read thread about a running project listed,
+    but nothing that acts on its own sees it: the life-store emit and the
+    tick's sweep get the items as thread_wants_attention has them, each
+    thread in its own sphere."""
+    emitted = Path(os.environ["CHAMBERS_DIR"]) / "_generated" / "attention" / "items.nt"
+    sphere = "<https://w3id.org/retinue/kb#sphere>"
+
+    def tick(minute):
+        wg._attention_tick_state.update(minute=None, emitted=False, ended=None)
+        return wg._attention_tick(datetime(2026, 9, 9, 10, minute, tzinfo=timezone.utc))
+    status, conv = _http(base, "POST", "/conversations",
+                         {"message": "Which receipts are missing?", "project": PROJECT})
+    assert status == 201
+    iri = f"<urn:retinue:thread:{conv['id']}>"
+    wg._conv_add_message(conv["id"], "assistant", "Two of them.", unread=True, pending=False)
+    own = wg.attention_store.thread_item(wg._load_conv(conv["id"]), wg._ATTENTION.profile())["sphere"]
+    # The project in a sphere the thread does not have of its own.
+    PROJECT_ROW["sphere"] = "customers"
+    try:
+        _check_own_project_thread(base, wg, conv, iri, own, emitted, sphere, tick)
+    finally:
+        PROJECT_ROW["sphere"] = "admin"
+        _http(base, "POST", f"/conversations/{conv['id']}/archive")
+        _mode(base, "focused")
+    print("ok test_own_project_thread_not_emitted")
+
+
+def _check_own_project_thread(base, wg, conv, iri, own, emitted, sphere, tick):
+    # Unread: listed in the project's sphere, emitted in its own, as before.
+    _mode(base, "chores")
+    assert _find(_sections(base), "thread:" + conv["id"])[1]["sphere"] == "customers"
+    tick(5)
+    lines = [ln for ln in emitted.read_text().splitlines() if ln.startswith(iri + " " + sphere)]
+    assert lines == [f"{iri} {sphere} <urn:retinue:sphere:{own}> ."], lines
+    # Read: still listed, but neither emitted nor seen by the sweep.
+    _http(base, "POST", f"/conversations/{conv['id']}/read")
+    assert _find(_sections(base), "thread:" + conv["id"])[0] is not None
+    swept = []
+    real = wg.attention_policy.sweep
+
+    def spy(items, *a, **k):
+        swept.extend(i["id"] for i in items)
+        return real(items, *a, **k)
+    wg.attention_policy.sweep = spy
+    try:
+        report = tick(30)
+    finally:
+        wg.attention_policy.sweep = real
+    assert "sweep" in report["events"] and swept, report
+    assert "thread:" + conv["id"] not in swept and PROJECT in swept, swept
+    text = emitted.read_text()
+    assert iri not in text and f"<{PROJECT}>" in text, text
+
+
 def test_broken_focus_document(base, wg):
     """A focus.json naming modes it does not define serves the list anyway."""
     path = wg.ATTENTION_DIR / "focus.json"
@@ -1704,6 +1773,7 @@ def main():
         test_append_reports_delivery(base, wg)
         test_unarchive_keeps_done(base, wg)
         test_declared_spheres_are_words(base, wg)
+        test_own_project_thread_not_emitted(base, wg)
         test_broken_focus_document(base, wg)
         test_project_frontmatter_moves(base, wg)
         test_tick_makes_up_what_it_missed(base, wg)

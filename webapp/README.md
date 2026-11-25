@@ -135,7 +135,11 @@ The same gateway also backs the conversation-tabs card with a small JSON API
 - `GET  /conversations`               — list of active threads (tabs). Edit-kind
   threads are excluded by default; `?kind=edit|all` includes them, and
   `?project=<uri>` narrows to one project's threads.
-- `GET  /conversations?archived=1`    — list of archived threads.
+- `GET  /conversations?archived=1`    — list of archived threads (every one).
+- `GET  /conversations?archived=1&limit=N&offset=M` — one page of them, starred
+  first, then newest: `{conversations, has_more, next_offset, source}`. What
+  the Threads page's Archived tab asks for (its "Load more" widens the window);
+  ordered by the life store's thread summaries — see `docs/dashboard.md`.
 - `GET  /conversations?all=1`         — list of all threads.
 - `GET  /conversations/<id>`          — one thread with its messages.
 - `POST /conversations`               — open a thread (`{"message": "..."}`,
@@ -1390,7 +1394,15 @@ Threads can be spoken as well as typed, with no streaming and split by direction
   the dictation's ➤ path (transcribe, send), the loop waits for the answer,
   and goes round again — only for an answer to its own turn: other messages
   pushed into the thread may be read, but do not open the mic. A take that
-  reaches the 120 s cap goes to the draft for review instead. No speech for
+  reaches the length cap (4 min by default, 1–30 min under Settings → Voice;
+  three soft ticks sound half a minute before it)
+  goes to the draft for review, never out — a hard limit, so an open mic that
+  catches a phone call or a talk in the room is not sent to Ara. Each take's
+  end is heard as well as seen (`continuous.js`, `takeCue`): a soft low gong
+  once its send to Ara went through, a short rising whistle when recording
+  stopped without sending (the cap, an unsure end, the page hidden) or the
+  send turned back, and the transcript waits in the box; a take dropped because nobody spoke, or ended by the row's ✓,
+  stays silent. No speech for
   about 8 s closes the mic with the mode left on — the mic button resumes;
   leaving the thread or hiding the page ends listening (a take with speech in
   it lands in the draft for review, as on leaving any dictation; one without

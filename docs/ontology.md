@@ -278,6 +278,23 @@ SELECT ?when ?actor ?content ?challengedBy WHERE {
 } ORDER BY DESC(?when) LIMIT 50
 ```
 
+```sparql
+PREFIX kb: <https://w3id.org/retinue/kb#>
+PREFIX dcterms: <http://purl.org/dc/terms/>
+
+# The dashboard's threads with Ara, newest first: their state and the project
+# each is about. Only state is in the store (scripts/thread_index.py) — no
+# title and nothing a thread says; the dashboard's Archived tab pages through
+# the same summaries.
+SELECT ?thread ?modified ?archived ?messages ?project WHERE {
+  ?thread a kb:Thread ;
+          dcterms:modified ?modified ;
+          kb:archived ?archived ;
+          kb:messageCount ?messages .
+  OPTIONAL { ?thread kb:project ?project }
+} ORDER BY DESC(?modified) LIMIT 50
+```
+
 The message ledger (`scripts/inbound_store.py`, one file per message under
 `_generated/messenger/<channel>/messages/`) is `kb:` too: `kb:InboundMessage`
 and `kb:OutboundMessage`, keyed by `kb:chat` and `kb:account`. A mail adds

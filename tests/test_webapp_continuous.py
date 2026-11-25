@@ -22,14 +22,16 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 CONTINUOUS_JS = os.path.join(HERE, "..", "webapp", "components", "continuous.js")
 # continuous.js keeps its per-device timeouts through the device store.
 DEVICE_STORE_JS = os.path.join(HERE, "..", "webapp", "components", "device-store.js")
+COMPONENTS = os.path.join(HERE, "..", "webapp", "components")
 
 HARNESS = r"""
 import assert from 'node:assert/strict';
 import {
   Vad, VAD_DEFAULTS, rms, pickWakeThread, WAKE_WINDOW_MS,
   modeEntries, isContinuous, setContinuous, touchContinuous, forgetContinuous, MODE_KEY,
-  voiceTimeouts, setVoiceTimeouts, DEFAULT_SILENCE_MS, DEFAULT_NO_SPEECH_MS,
+  voiceTimeouts, setVoiceTimeouts, DEFAULT_SILENCE_MS, DEFAULT_NO_SPEECH_MS, DEFAULT_MAX_TAKE_MS,
   endedByAra, noteAraOff, ARA_OFF_SKEW_MS,
+  takeCue, TAKE_CUES, TAKE_WARN_BEFORE_MS,
 } from './continuous.mjs';
 
 // ── A scripted localStorage ──────────────────────────────────────────────────
@@ -159,8 +161,77 @@ ok('a take that never falls silent ends at the length cap', () => {
   run(vad, 0, 500, QUIET);
   // Speech has gaps between words: 250 ms of voice, 100 ms between.
   const evs = run(vad, 500, 20000, (t) => ((t % 350) < 250 ? SPEECH : QUIET));
+  // (The default warning lead, 30 s, is not shorter than this cap: no
+  // warning, which would sound at the very start.)
   assert.deepEqual(evs.map((e) => [e.type, e.reason || '']), [['speech', ''], ['end', 'max']]);
   assert.equal(evs[1].t, 10000);
+});
+
+ok('a cap no longer than the warning lead gives no warning at all', () => {
+  for (const maxMs of [10000, 30000]) {
+    const vad = new Vad({ silenceMs: 1500, noSpeechMs: 8000, maxMs });
+    const evs = run(vad, 0, maxMs + 1000, (t) => (t >= 500 && (t % 350) < 250 ? SPEECH : QUIET));
+    assert.deepEqual(evs.map((e) => [e.type, e.reason || '']), [['speech', ''], ['end', 'max']], `cap ${maxMs}`);
+  }
+});
+
+ok('a pause that completes exactly at the cap ends the take at the cap, not as a pause', () => {
+  // Words until 8500 (last voiced frame 8450), then quiet: the pause of
+  // 1500 ms completes at 9950 — the cap's own frame with maxMs 9950.
+  const words = (t) => (t >= 500 && t < 8500 && (t % 350) < 250 ? SPEECH : QUIET);
+  const vad = new Vad({ silenceMs: 1500, noSpeechMs: 8000, maxMs: 9950 });
+  const evs = run(vad, 0, 12000, words);
+  assert.deepEqual(evs.map((e) => [e.type, e.reason || '']), [['speech', ''], ['end', 'max']]);
+  assert.equal(evs[1].t, 9950);
+  // One frame's worth more cap, and the same take ends on its pause.
+  const longer = new Vad({ silenceMs: 1500, noSpeechMs: 8000, maxMs: 10000 });
+  const more = run(longer, 0, 12000, words);
+  assert.deepEqual(more.map((e) => [e.type, e.reason || '', e.t]).slice(1), [['end', 'silence', 9950]]);
+});
+
+ok('a frame that comes late, far past the cap, ends the take there: no send, no warning', () => {
+  // A throttled timer: speech, then nothing until well past the cap — and
+  // that late frame is quiet, long after the last voice.
+  const vad = new Vad({ silenceMs: 1500, noSpeechMs: 8000, maxMs: 240000 });
+  const talk = (t) => (t >= 500 && (t % 350) < 250 ? SPEECH : QUIET);
+  let evs = run(vad, 0, 2000, talk);
+  assert.deepEqual(evs.map((e) => e.type), ['speech']);
+  assert.deepEqual(vad.feed(QUIET, 400000), { type: 'end', reason: 'max' });
+  assert.equal(vad.state, 'done');
+  // The same late frame after the warning was given: the end, all the same.
+  const w = new Vad({ silenceMs: 1500, noSpeechMs: 8000, maxMs: 240000 });
+  run(w, 0, 2000, talk);
+  evs = run(w, 2000, 215000, talk);
+  assert.deepEqual(evs.map((e) => e.type), ['warn']);
+  assert.deepEqual(w.feed(QUIET, 500000), { type: 'end', reason: 'max' });
+});
+
+ok('a frame past the cap before any speech closes the mic as the no-speech window does', () => {
+  const vad = new Vad({ silenceMs: 1500, noSpeechMs: 8000, maxMs: 240000 });
+  run(vad, 0, 400, QUIET);
+  assert.deepEqual(vad.feed(QUIET, 300000), { type: 'timeout' });
+});
+
+ok('the warning tone comes once, half a minute before the cap', () => {
+  const vad = new Vad({ silenceMs: 1500, noSpeechMs: 8000, maxMs: 240000 });
+  run(vad, 0, 500, QUIET);
+  const evs = run(vad, 500, 250000, (t) => ((t % 350) < 250 ? SPEECH : QUIET));
+  assert.deepEqual(evs.map((e) => [e.type, e.reason || '']), [['speech', ''], ['warn', ''], ['end', 'max']]);
+  assert.equal(evs[1].t, 210000);
+  assert.equal(evs[2].t, 240000);
+});
+
+ok('a take that ends on a pause before the warning hears no warning', () => {
+  const vad = new Vad({ silenceMs: 1500, noSpeechMs: 8000, maxMs: 240000 });
+  run(vad, 0, 500, QUIET);
+  const evs = run(vad, 500, 60000, (t) => (t < 20000 && (t % 350) < 250 ? SPEECH : QUIET));
+  assert.deepEqual(evs.map((e) => e.type), ['speech', 'end']);
+});
+
+ok('the default length cap is four minutes, the warning at three and a half', () => {
+  assert.equal(DEFAULT_MAX_TAKE_MS, 240000);
+  assert.equal(DEFAULT_MAX_TAKE_MS - TAKE_WARN_BEFORE_MS, 210000);
+  assert.equal(VAD_DEFAULTS.maxMs, DEFAULT_MAX_TAKE_MS);
 });
 
 ok('a room that gets louder for good is not speech, and no take ends in it', () => {
@@ -355,15 +426,21 @@ ok('a corrupt stored map reads as empty', () => {
 // ── Voice settings ───────────────────────────────────────────────────────────
 ok('voice timeouts default, store, and clamp', () => {
   store.clear();
-  assert.deepEqual(voiceTimeouts(), { silenceMs: DEFAULT_SILENCE_MS, noSpeechMs: DEFAULT_NO_SPEECH_MS });
+  assert.deepEqual(voiceTimeouts(), { silenceMs: DEFAULT_SILENCE_MS, noSpeechMs: DEFAULT_NO_SPEECH_MS, maxMs: DEFAULT_MAX_TAKE_MS });
   assert.equal(DEFAULT_SILENCE_MS, 1500);
   assert.equal(DEFAULT_NO_SPEECH_MS, 8000);
-  assert.deepEqual(setVoiceTimeouts({ silenceMs: 2000 }), { silenceMs: 2000, noSpeechMs: 8000 });
-  assert.deepEqual(setVoiceTimeouts({ noSpeechMs: 12000 }), { silenceMs: 2000, noSpeechMs: 12000 });
-  assert.deepEqual(setVoiceTimeouts({ silenceMs: 10, noSpeechMs: 999999 }), { silenceMs: 500, noSpeechMs: 30000 });
+  const M = DEFAULT_MAX_TAKE_MS;
+  assert.deepEqual(setVoiceTimeouts({ silenceMs: 2000 }), { silenceMs: 2000, noSpeechMs: 8000, maxMs: M });
+  assert.deepEqual(setVoiceTimeouts({ noSpeechMs: 12000 }), { silenceMs: 2000, noSpeechMs: 12000, maxMs: M });
+  assert.deepEqual(setVoiceTimeouts({ silenceMs: 10, noSpeechMs: 999999 }), { silenceMs: 500, noSpeechMs: 30000, maxMs: M });
+  // The length cap: minutes, from one to thirty.
+  assert.equal(setVoiceTimeouts({ maxMs: 300000 }).maxMs, 300000);
+  assert.equal(setVoiceTimeouts({ maxMs: 5000 }).maxMs, 60000);
+  assert.equal(setVoiceTimeouts({ maxMs: 99 * 60000 }).maxMs, 30 * 60000);
+  assert.equal(setVoiceTimeouts({ maxMs: NaN }).maxMs, M);
   // Nonsense falls back to the defaults rather than to zero.
   assert.deepEqual(setVoiceTimeouts({ silenceMs: NaN, noSpeechMs: -3 }),
-    { silenceMs: DEFAULT_SILENCE_MS, noSpeechMs: DEFAULT_NO_SPEECH_MS });
+    { silenceMs: DEFAULT_SILENCE_MS, noSpeechMs: DEFAULT_NO_SPEECH_MS, maxMs: DEFAULT_MAX_TAKE_MS });
   store.set('retinue-voice-silence-ms', 'abc');
   assert.equal(voiceTimeouts().silenceMs, DEFAULT_SILENCE_MS);
 });
@@ -375,7 +452,7 @@ ok('a blocked storage gives the defaults and never throws', () => {
     setItem() { throw new Error('blocked'); },
   };
   try {
-    assert.deepEqual(voiceTimeouts(), { silenceMs: DEFAULT_SILENCE_MS, noSpeechMs: DEFAULT_NO_SPEECH_MS });
+    assert.deepEqual(voiceTimeouts(), { silenceMs: DEFAULT_SILENCE_MS, noSpeechMs: DEFAULT_NO_SPEECH_MS, maxMs: DEFAULT_MAX_TAKE_MS });
     assert.deepEqual(modeEntries(), {});
     setContinuous('x', true);
     assert.equal(isContinuous('x'), false);
@@ -423,6 +500,218 @@ ok('no stamp, a bad stamp, or a thread not in the mode: nothing to end', () => {
   assert.equal(endedByAra(undefined, '2026-11-12T10:05:00+00:00'), false);
 });
 
+// ── Take cues: heard, not seen ───────────────────────────────────────────────
+ok('a take whose send went through to Ara gets the gong', () => {
+  assert.equal(takeCue({ sent: true, kept: true }), 'sent');
+  assert.equal(takeCue({ sent: true, kept: false }), 'sent');
+});
+
+ok('a take kept for review without a tap (length cap, unsure, page hidden) gets the whistle', () => {
+  assert.equal(takeCue({ sent: false, kept: true }), 'kept');
+});
+
+ok('a take meant to go whose send turned back, its transcript in the box, gets the whistle', () => {
+  assert.equal(takeCue({ sent: false, kept: true }), 'kept');
+  // …and one whose transcription failed, with nothing in the box, none.
+  assert.equal(takeCue({ sent: false, kept: false }), null);
+});
+
+ok('a take dropped (nobody spoke, ✕) or ended by ✓ gets no cue', () => {
+  assert.equal(takeCue({ sent: false, kept: false }), null);
+  assert.equal(takeCue({ sent: false, kept: true, byTouch: true }), null);
+  assert.equal(takeCue(), null);
+});
+
+ok('the two cues differ in pitch, so they are told apart by ear', () => {
+  assert.ok(TAKE_CUES.sent[0].freq < 500 && TAKE_CUES.kept[0].freq > 1000);
+  assert.ok(TAKE_CUES.kept.every((n) => n.to > n.freq), 'the whistle rises');
+});
+
+console.log(`${passed} checks passed`);
+process.exit(0);
+"""
+
+
+# A second harness drives the thread element itself (conversation.js), with a
+# scripted DOM and a Web Audio that notes which cue played: the gong comes
+# only once a take's send went through, never while it is on the wire, and a
+# take whose send turned back gets the whistle with its transcript kept.
+THREAD_HARNESS = r"""
+import assert from 'node:assert/strict';
+
+// ── A scripted DOM (as in test_webapp_send_deadline.py) ──────────────────────
+const registry = new Map();
+class FakeShadow {
+  constructor() { this.innerHTML = ''; this.activeElement = null; }
+  querySelector() { return null; }
+  querySelectorAll() { return []; }
+}
+class FakeElement {
+  constructor() { this._attrs = new Map(); this._l = new Map(); this.shadowRoot = null; this.isConnected = true; this.style = {}; }
+  attachShadow() { this.shadowRoot = new FakeShadow(); return this.shadowRoot; }
+  addEventListener(t, f) { if (!this._l.has(t)) this._l.set(t, []); this._l.get(t).push(f); }
+  removeEventListener(t, f) { this._l.set(t, (this._l.get(t) || []).filter((g) => g !== f)); }
+  dispatchEvent(ev) { for (const f of this._l.get(ev.type) || []) f(ev); return true; }
+  getAttribute(n) { return this._attrs.has(n) ? this._attrs.get(n) : null; }
+  setAttribute(n, v) {
+    const before = this.getAttribute(n);
+    this._attrs.set(n, String(v));
+    if (this.attributeChangedCallback) this.attributeChangedCallback(n, before, String(v));
+  }
+  hasAttribute(n) { return this._attrs.has(n); }
+  removeAttribute(n) { this._attrs.delete(n); }
+  toggleAttribute(n, on) {
+    const want = on === undefined ? !this.hasAttribute(n) : !!on;
+    if (want) this._attrs.set(n, ''); else this._attrs.delete(n);
+    return want;
+  }
+  querySelector() { return null; }
+  querySelectorAll() { return []; }
+}
+globalThis.HTMLElement = FakeElement;
+globalThis.customElements = { define: (n, c) => registry.set(n, c), get: (n) => registry.get(n) };
+globalThis.document = {
+  addEventListener() {}, removeEventListener() {}, createElement: () => new FakeElement(),
+  querySelector() { return null; }, getElementById() { return null; },
+  hidden: false, visibilityState: 'visible', body: { appendChild() {} },
+  documentElement: { dataset: {} },
+};
+globalThis.window = globalThis;
+globalThis.innerHeight = 800;
+globalThis.location = { hash: '', pathname: '/', search: '', href: 'http://dash/' };
+globalThis.addEventListener = () => {};
+globalThis.removeEventListener = () => {};
+globalThis.history = { length: 1, pushState() {}, replaceState() {}, back() {} };
+globalThis.matchMedia = () => ({ matches: false, addEventListener() {}, removeEventListener() {}, addListener() {}, removeListener() {} });
+globalThis.localStorage = { getItem() { return null; }, setItem() {}, removeItem() {} };
+globalThis.sessionStorage = { getItem() { return null; }, setItem() {}, removeItem() {} };
+Object.defineProperty(globalThis, 'navigator', { value: { userAgent: 'node', mediaDevices: null }, configurable: true });
+globalThis.CustomEvent = class { constructor(t, i = {}) { this.type = t; this.detail = i.detail; } };
+
+// ── Web Audio that notes which cue played, by its first note's pitch ────────
+const cues = [];
+const PITCH = { 392: 'sent', 1100: 'kept', 660: 'warn' };
+class FakeAudioContext {
+  constructor() { this.state = 'running'; this.currentTime = 0; this.destination = {}; }
+  resume() { return Promise.resolve(); }
+  createOscillator() {
+    return {
+      type: '',
+      frequency: {
+        // Each note's start: a cue's first note is at offset 0 (t0 = 0.02).
+        setValueAtTime(f, at) { if (Math.abs(at - 0.02) < 1e-9 && PITCH[f]) cues.push(PITCH[f]); },
+        exponentialRampToValueAtTime() {},
+      },
+      connect: (g) => g, start() {}, stop() {},
+    };
+  }
+  createGain() {
+    return { gain: { setValueAtTime() {}, exponentialRampToValueAtTime() {} }, connect: (d) => d };
+  }
+}
+globalThis.AudioContext = FakeAudioContext;
+
+const tick = () => new Promise((r) => setTimeout(r, 0));
+async function until(cond, what) {
+  for (let i = 0; i < 200 && !cond(); i++) await tick();
+  assert.ok(cond(), what);
+}
+
+// ── The gateway: a thread, transcription, and a reply POST held by the test ─
+const A = 'a'.repeat(32);
+const thread = { id: A, title: 'Loop', pending: false, model: '', messages: [
+  { role: 'user', text: 'Earlier', ts: '2026-11-20T10:00:00Z' },
+  { role: 'assistant', text: 'Answer', ts: '2026-11-20T10:00:05Z' },
+] };
+let transcript = 'Wie wird das Wetter morgen?';
+let transcribeFails = false;
+let postAnswer = null;   // settles the held POST: (ok: boolean) => void
+let posts = 0;
+const answer = (body) => Promise.resolve({ ok: true, status: 200, json: async () => JSON.parse(JSON.stringify(body)) });
+globalThis.fetch = (url, opts = {}) => {
+  const method = opts.method || 'GET';
+  if (url === `/conversations/${A}` && method === 'GET') return answer(thread);
+  if (url === `/conversations/${A}/messages` && method === 'POST') {
+    posts++;
+    const body = JSON.parse(opts.body);
+    return new Promise((resolve) => {
+      postAnswer = (good) => {
+        postAnswer = null;
+        if (!good) return resolve({ ok: false, status: 502, json: async () => ({}) });
+        thread.messages.push({ role: 'user', text: body.message.trim(), ts: new Date().toISOString() });
+        resolve({ ok: true, status: 200, json: async () => JSON.parse(JSON.stringify({ ...thread, pending: true })) });
+      };
+    });
+  }
+  if (url === '/conversation-models') return answer({ models: [] });
+  if (url.startsWith('/conversations/transcribe') && method === 'POST') {
+    if (transcribeFails) return Promise.resolve({ ok: false, status: 500, json: async () => ({}) });
+    return answer({ text: transcript });
+  }
+  return answer({});
+};
+
+await import('./conversation.js');
+const Conv = registry.get('retinue-conversation');
+const el = new Conv();
+el._attrs.set('conversation-id', A);
+el._attrs.set('no-autofocus', '');
+el.connectedCallback();
+await until(() => el.thread, 'the thread is read');
+const draftText = () => { el.render(); const m = el.shadowRoot.innerHTML.match(/<textarea[^>]*>([\s\S]*?)<\/textarea>/); return m ? m[1] : ''; };
+
+// One take of the loop ends with `intent` ('send': a pause; 'review': the cap).
+const take = (intent) => {
+  cues.length = 0;
+  el._contRec = true;
+  el._recChunks = [new Blob(['audio'], { type: 'audio/webm' })];
+  el._recIntent = intent;
+  return el._onRecordingStopped(A, null, '', null);
+};
+
+let passed = 0;
+async function ok(name, fn) { await fn(); passed++; console.log('  ok  ' + name); }
+
+await ok('the gong sounds once the send went through, not while it is on the wire', async () => {
+  const job = take('send');
+  await until(() => postAnswer, 'the take went on the wire');
+  assert.deepEqual(cues, [], 'no cue while transcribed but not yet sent');
+  postAnswer(true);
+  await job;
+  assert.deepEqual(cues, ['sent']);
+  assert.ok(!draftText().includes('Wetter'), 'nothing left in the box');
+});
+
+await ok('a send that turns back gets the whistle, its transcript kept in the box', async () => {
+  transcript = 'Und übermorgen?';
+  const job = take('send');
+  await until(() => postAnswer, 'the take went on the wire');
+  postAnswer(false);
+  await job;
+  assert.deepEqual(cues, ['kept'], 'never the gong for a take that did not go');
+  assert.ok(draftText().includes('Und übermorgen?'), 'the transcript waits in the box');
+  el.fill('');
+});
+
+await ok('a transcription that fails leaves nothing in the box, and no cue', async () => {
+  transcribeFails = true;
+  const n = posts;
+  await take('send');
+  transcribeFails = false;
+  assert.equal(posts, n, 'nothing was sent');
+  assert.deepEqual(cues, []);
+});
+
+await ok('a take kept for review (the length cap) gets the whistle at once', async () => {
+  transcript = 'Ein langer Monolog';
+  const n = posts;
+  const job = take('review');
+  assert.deepEqual(cues, ['kept'], 'played as the recording stops');
+  await job;
+  assert.equal(posts, n, 'never sent');
+  assert.deepEqual(cues, ['kept'], 'and only once');
+});
+
 console.log(`${passed} checks passed`);
 process.exit(0);
 """
@@ -447,6 +736,21 @@ def main() -> int:
         if proc.returncode != 0:
             sys.stderr.write(proc.stderr)
             print("FAIL: continuous.js behaviour test")
+            return 1
+    with tempfile.TemporaryDirectory() as tmp:
+        # The thread and every component it imports, by relative path.
+        for name in os.listdir(COMPONENTS):
+            if name.endswith(".js"):
+                shutil.copy(os.path.join(COMPONENTS, name), os.path.join(tmp, name))
+        with open(os.path.join(tmp, "package.json"), "w", encoding="utf-8") as fh:
+            fh.write('{"type":"module"}')
+        with open(os.path.join(tmp, "harness.mjs"), "w", encoding="utf-8") as fh:
+            fh.write(THREAD_HARNESS)
+        proc = subprocess.run([node, "harness.mjs"], cwd=tmp, capture_output=True, text=True)
+        sys.stdout.write(proc.stdout)
+        if proc.returncode != 0:
+            sys.stderr.write(proc.stderr)
+            print("FAIL: continuous take cues in the thread")
             return 1
     print("PASS: continuous.js behaviour test")
     return 0
