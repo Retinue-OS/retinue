@@ -961,13 +961,17 @@ def test_reply_is_queued_and_not_approved(base, wg):
     # The words are in the queue: the composer lets go of them.
     doc = wg._CHAT_STATE.get(CHAT_A)
     assert doc["draft"] is None and doc["cleared"] is None
-    # Nothing was replied: the read mark, the group and the mailbox stay.
-    assert doc["last_read"] == doc_before["last_read"] and doc["read_seq"] == doc_before["read_seq"]
+    # Writing the reply read the chat: it leaves Unread at the press, and
+    # the mailbox follows. But nothing was replied yet: the attention item
+    # stands.
+    assert doc["last_read"] != doc_before["last_read"] and doc["read_seq"] != doc_before["read_seq"]
     after = _chats(base)[CHAT_A]
-    assert after["unread"] == 1 and after["list_group"] == "unread"
+    assert after["unread"] == 0 and after["list_group"] == "read"
     assert after["pending"] == 1 and after["last"]["direction"] == "in"
+    assert (doc.get("attention") or {}).get("state", "open") == (
+        doc_before.get("attention") or {}).get("state", "open")
     _settle(wg)
-    assert _posts(GW, "/chats/read") == []
+    assert len(_posts(GW, "/chats/read")) == 1
     # It shows in the chat, and is no message.
     body = _messages(base, CHAT_A)
     assert body["pending"] == [p] and body["chat"]["pending"] == 1
@@ -1810,6 +1814,9 @@ def test_the_rail_settles_a_queued_send(base, wg):
     assert status == 202
     p = out["pending"]
     assert len(_queued(wg, CHAT_B)) == 1
+    # (Writing the reply read the chat, and the mailbox heard of it; that
+    # call is settled before the rail's are counted.)
+    _settle(wg)
     # The gateway still lists it — its answer lags the mail going out — and
     # announces the mail on the rail under the Message-ID it minted when it
     # queued the send.
@@ -2016,10 +2023,11 @@ def test_a_reply_that_may_have_gone_out(base, wg):
     # The words left the composer and are not handed back.
     doc = wg._CHAT_STATE.get(CHAT_A)
     assert doc["draft"] is None
-    # No reply is known to have been made: nothing is read, here or there.
-    assert doc["last_read"] == before["last_read"] and _chats(base)[CHAT_A]["unread"] >= 1
+    # Writing the reply read the chat, here and in the mailbox — though no
+    # reply is known to have been made.
+    assert doc["last_read"] != before["last_read"] and _chats(base)[CHAT_A]["unread"] == 0
     _settle(wg)
-    assert _posts(GW, "/chats/read") == []
+    assert _posts(GW, "/chats/read") == [hook_a]
     # The chat shows it as being sent — after a reload too — and no message
     # is made of a mail that is not known to have gone out.
     body = _messages(base, CHAT_A)
@@ -2034,7 +2042,8 @@ def test_a_reply_that_may_have_gone_out(base, wg):
     assert len(_posts(GW, "/send")) == 2 and len(GW["sent"]) == sent_before
     assert len([e for e in GW["pending"].values() if e.get("request_key") == "press-u1"]) == 1
     # It did go out (the Sent folder has it): the rail says so, the bubble
-    # gives way to the mail — once — and now the reply reads the chat.
+    # gives way to the mail — once — and the reply is noted: the mailbox
+    # hears of it as of any reply.
     GW["send"] = "ok"
     _sent_folder_says(GW, rid, True)
     sent = GW["sent"][-1]
@@ -2045,7 +2054,7 @@ def test_a_reply_that_may_have_gone_out(base, wg):
     assert [m["id"] for m in body["messages"]].count(sent["message_id"]) == 1
     assert _chats(base)[CHAT_A]["unread"] == 0
     _settle(wg)
-    assert _posts(GW, "/chats/read") == [hook_a]
+    assert _posts(GW, "/chats/read") == [hook_a, hook_a]
 
     # 2. Nobody will ever know: the send ends as failed, and says that the
     #    mail may have gone out all the same.

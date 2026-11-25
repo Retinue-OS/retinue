@@ -2384,6 +2384,9 @@ class RetinueChatPage extends HTMLElement {
   // unread, the Undo while one is offered, nothing otherwise.
   _markReadHtml() {
     if (!this._markReadAnchor()) return '';
+    // A reply on its way reads the chat (_readByReply): the button goes with
+    // the press, and comes back only if the reply certainly did not go.
+    if (this._isUnread() && this._sendingNow) return '';
     if (this._isUnread()) {
       return `<div class="mark-read-row" data-mark-read-row>` +
         `<button type="button" class="mark-read" data-mark-read ` +
@@ -5549,6 +5552,7 @@ class RetinueChatPage extends HTMLElement {
       sending.seen = press.seen;
     }
     this._sendingNow = sending;
+    this._placeMarkRead();
     if (images.length) {
       const ta = this.shadowRoot.querySelector('[data-composer="chat"] textarea');
       const hadFocus = !!ta && this.shadowRoot.activeElement === ta;
@@ -5709,6 +5713,8 @@ class RetinueChatPage extends HTMLElement {
     } finally {
       if (this._sendingNow === sending) this._sendingNow = null;
       if (images.length) this._keepImages();
+      // The button back where the reply did not go (and the chat is unread).
+      this._placeMarkRead();
     }
   }
 
@@ -5855,12 +5861,7 @@ class RetinueChatPage extends HTMLElement {
     // send would still say unread: the epoch makes it stand aside.
     this._draftSaved = '';
     this._keepLocal();
-    this._readEpoch += 1;
-    this._clearReadUndo();
-    if (this._chat) {
-      this._adoptRead(null, { unread: 0, listGroup: this._chat.archived ? 'archived' : 'read' });
-    }
-    this._placeMarkRead();
+    this._readByReply();
     if (mail) {
       // The user's own mail is the thread's latest now: whom the next reply
       // reaches is asked again.
@@ -5872,6 +5873,21 @@ class RetinueChatPage extends HTMLElement {
         this._showNote(`Sent &mdash; but the mail server refused ${esc(refused.join(', '))}.`, 'chat', LONG_NOTE_MS);
       }
     }
+  }
+
+  // A reply pressed here has read the chat — writing it was reading what it
+  // answers. The server marks it read with the press (a send, a queued one
+  // or one not confirmed yet alike; never on a repeat, which this page does
+  // not make a second bubble for), so nothing is posted for it here: the
+  // page mirrors it, and the button goes. A poll that left before the send
+  // would still say unread: the epoch makes it stand aside.
+  _readByReply() {
+    this._readEpoch += 1;
+    this._clearReadUndo();
+    if (this._chat) {
+      this._adoptRead(null, { unread: 0, listGroup: this._chat.archived ? 'archived' : 'read' });
+    }
+    this._placeMarkRead();
   }
 
   // A send the account's policy queued (202 `{pending}`): it is not a
@@ -5888,6 +5904,7 @@ class RetinueChatPage extends HTMLElement {
     this._revoke(images);
     this._draftSaved = '';
     this._keepLocal();
+    this._readByReply();
     // An answer that names no entry still means queued: the chat's own list
     // of pending sends, fetched now, has it.
     if (pending && typeof pending === 'object') this._addPending(pending, true);
@@ -5943,6 +5960,7 @@ class RetinueChatPage extends HTMLElement {
                 stale: false, tried: false };
     this._unconfirmed.push(u);
     this._keepUnsure();
+    this._readByReply();
     local.unconfirmed = true;
     this._unsureFlags(u, local);
     const node = this._localNode(local);

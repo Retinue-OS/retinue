@@ -551,6 +551,51 @@ await ok('a send reads the chat server-side: the page posts no read and drops th
   assert.ok(!el._thread.layout().includes('ROW'));
 });
 
+await ok('the button goes with the press, before the send is answered', async () => {
+  const el = await open({ unread: 1, list_group: 'unread' });
+  el._refreshChatComposer = () => {};
+  el._keepLocal = () => {};
+  const p = el._sendChat('on its way');
+  await settle();
+  assert.ok(!el._thread.layout().includes('ROW'), 'no button while the reply is out');
+  take((w) => w.method === 'POST' && w.url.endsWith('/send'), 'the send')
+    .answer({ id: 'm10', chat: ID, direction: 'out', author: 'user', text: 'on its way', ts: '2026-11-20T11:00:00Z' });
+  await p;
+  assert.ok(!el._thread.layout().includes('ROW'));
+  assert.deepEqual(reads(), []);
+});
+
+await ok('a reply the policy queued has read the chat too', async () => {
+  const el = await open({ unread: 1, list_group: 'unread' });
+  el._refreshChatComposer = () => {};
+  el._keepLocal = () => {};
+  el._addPending = () => {};
+  const p = el._sendChat('waits for approval');
+  await settle();
+  take((w) => w.method === 'POST' && w.url.endsWith('/send'), 'the send')
+    .answer({ pending: { request_id: 'r1', approval_url: '/sends/x/r1', text: 'waits for approval',
+                         ts: '2026-11-20T11:00:00Z', author: 'user' } }, 202);
+  await p;
+  assert.equal(el._chat.unread, 0);
+  assert.equal(el._chat.list_group, 'read');
+  assert.ok(!el._thread.layout().includes('ROW'));
+  assert.deepEqual(reads(), [], 'the server read it with the press');
+});
+
+await ok('a send that failed brings the button back', async () => {
+  const el = await open({ unread: 1, list_group: 'unread' });
+  el._refreshChatComposer = () => {};
+  el._keepLocal = () => {};
+  el._restoreComposer = () => {};
+  const p = el._sendChat('not this time');
+  await settle();
+  assert.ok(!el._thread.layout().includes('ROW'));
+  take((w) => w.method === 'POST' && w.url.endsWith('/send'), 'the send').answer({ error: 'down' }, 502);
+  await p;
+  assert.equal(el._chat.unread, 1);
+  assert.ok(el._thread.layout().includes('ROW'), 'the button is back');
+});
+
 console.log(`${passed} checks passed`);
 process.exit(0);
 """

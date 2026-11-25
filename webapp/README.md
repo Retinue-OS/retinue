@@ -400,7 +400,10 @@ docstring). Pieces:
   The open chat polls on the conversations cadence, appending only unseen
   messages. **Opening a chat, looking at it or scrolling it reads nothing.**
   A chat is read by a reply — a send from the composer (the server reads the
-  chat with it, so the page posts nothing for it), or, on Signal, WhatsApp
+  chat with it, so the page posts nothing for it; the Mark as read button
+  goes with the press, and comes back only where the send certainly did not
+  go. A mail the policy queues, or one not confirmed yet, has read the chat
+  all the same: writing the reply was reading it), or, on Signal, WhatsApp
   and Telegram, one from the phone or any other client, which the next poll
   shows (an SMS sent outside Retinue is never seen, so such a chat needs
   Mark as read) — or by **Mark as read**: the button under the latest

@@ -12651,6 +12651,22 @@ def _mail_not_sent(sent: dict, request_key: str | None) -> dict:
 _BY_DASHBOARD = {"by": "dashboard"}
 
 
+def _chat_read_by_press(chat_id: str, asked_at: float) -> None:
+    """Read the chat for a reply the user pressed send on whose mail has not
+    gone out yet — queued under the mailbox's send policy, or with its
+    outcome unknown. Writing a reply is having read what it answers, so the
+    chat leaves Unread at the press, as it does for a reply that went out;
+    what landed after the press stays unread. The read mark only: no reply
+    has been made, so the attention item stands and no reply is noted until
+    the mail goes out. The mailbox follows the chat where nothing is left
+    unread, as after *Mark as read*."""
+    doc = _CHAT_STATE.advance_last_read(chat_id, asked_at, everything=True)
+    _chats_cache_invalidate()
+    unread, _group = _chat_read_state(chat_id, doc)
+    if unread == 0:
+        _mailbox_follow_async(chat_id, "read")
+
+
 def _clear_pressed_draft(chat_id: str, text: str, repeat: bool) -> None:
     """The shared draft, once a press's mail is with its gateway (sent,
     queued, or on its way): cleared — the words left the composer.
@@ -19222,8 +19238,10 @@ class Handler(BaseHTTPRequestHandler):
         and a mail the mailbox's send policy queues all the same stays queued
         (see _chat_send_via_gateway). That answers 202 {"pending": Pending}:
         the words are in the queue, so the draft is cleared, and the chat
-        shows the send waiting with its approval link — but nothing was
-        replied yet, so nothing is marked read and the attention item stands.
+        shows the send waiting with its approval link. Writing a reply is
+        having read the chat, so it is marked read at the press
+        (_chat_read_by_press); but nothing was replied yet, so the attention
+        item stands.
         A mail that was sent is a reply like any other, and the mailbox is
         told of it (the thread's mails are seen — _mailbox_follow); the
         recipients the mail server refused, if any, are on the Message
@@ -19236,8 +19254,9 @@ class Handler(BaseHTTPRequestHandler):
         "since", "note"?}** and never a 5xx: it may have gone out
         (_mail_send). The words left the composer either way, so the draft
         is cleared, and the chat shows the send as being sent
-        (_answer_unconfirmed_mail); nothing is marked read, since no reply
-        is known to have been made — the rail says so when it was. `request_key` is the
+        (_answer_unconfirmed_mail); the chat is marked read at the press, as
+        for a queued one, but no reply is noted, since none is known to have
+        been made — the rail says so when it was. `request_key` is the
         press's idempotency key (body `request_key`, minted by the page):
         the same press, retried with it, sends nothing twice.
 
@@ -19364,8 +19383,8 @@ class Handler(BaseHTTPRequestHandler):
             if sent["outcome"] == "pending":
                 # Queued under the mailbox's send policy, and left queued.
                 # The words are in the queue now — the composer lets go of
-                # them — but no reply has been made: the read mark and the
-                # attention item stay as they are until the mail goes out.
+                # them — and writing them read the chat; but no reply has
+                # been made: the attention item stays until the mail goes out.
                 # (Whether the chat knew this send before, asked before it
                 # is noted anew.)
                 repeat = _mail_repeated(chat_id, sent, asked_at,
@@ -19383,6 +19402,8 @@ class Handler(BaseHTTPRequestHandler):
                 # again. A draft that still holds them goes; one written
                 # since stays: _clear_pressed_draft.)
                 _clear_pressed_draft(chat_id, text, repeat or again)
+                if not repeat:
+                    _chat_read_by_press(chat_id, asked_at)
                 print(f"[web-gateway] chat send to {chat_id} via {slug} waits for "
                       f"approval ({pending['request_id']})"
                       + (" — a repeat, answered from its entry" if repeat else ""), flush=True)
@@ -19544,9 +19565,10 @@ class Handler(BaseHTTPRequestHandler):
         repeat (``asked_at`` is when the /send was asked; _mail_repeated) —
         or where an earlier request of the press was made (``again``:
         _press_known) — only where it still holds this press's words, and a
-        draft written since stays (_clear_pressed_draft). Nothing is marked
-        read and no reply is noted: the rail does both when the mail goes
-        out, and neither if it never did."""
+        draft written since stays (_clear_pressed_draft). The chat is read at
+        the press (_chat_read_by_press: writing the reply was reading it),
+        except on a repeat; no reply is noted — the rail does that when the
+        mail goes out, and not if it never did."""
         message_id = sent.get("message_id")
         body = {"unconfirmed": True, "request_key": request_key, "since": since}
         if sent.get("note"):
@@ -19571,6 +19593,8 @@ class Handler(BaseHTTPRequestHandler):
                 if isinstance(mine.get("message_id"), str):
                     message_id = message_id or mine["message_id"]
             _clear_pressed_draft(chat_id, text, repeat or again)
+            if not repeat:
+                _chat_read_by_press(chat_id, asked_at)
             _chats_cache_invalidate()
             body["id"] = chat_id
         if message_id:
