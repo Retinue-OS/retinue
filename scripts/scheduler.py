@@ -266,10 +266,12 @@ def read_state(job_id: str) -> dict | None:
 
 
 def write_state(job_id: str, status: str, **fields) -> None:
-    """Record a run. The calendar's own keys (``since``, ``last_slot``) are
+    """Record a run. The calendar's own keys (``since``, ``last_slot``,
+    ``registered``: the app job's ``registered_at`` the clock belongs to) are
     kept from the previous state unless ``fields`` sets them."""
     STATE_DIR.mkdir(parents=True, exist_ok=True)
-    state = {k: v for k, v in (read_state(job_id) or {}).items() if k in ("since", "last_slot")}
+    state = {k: v for k, v in (read_state(job_id) or {}).items()
+             if k in ("since", "last_slot", "registered")}
     state.update({"last_run": datetime.now(timezone.utc).isoformat(timespec="seconds"),
                   "status": status})
     state.update(fields)
@@ -346,6 +348,10 @@ def load_app_jobs(seen: set[str]) -> list[dict]:
     and one written here by other means is skipped all the same."""
     jobs = []
     for chamber, app, path in chamber_apps.all_schedules():
+        # An app gone from its chamber (removed, or the chamber unmounted)
+        # runs nothing more, whatever its schedule file still holds.
+        if chamber_apps.app_dir(CHAMBERS_DIR, chamber, app) is None:
+            continue
         try:
             with open(path, encoding="utf-8") as fh:
                 data = json.load(fh)
@@ -421,10 +427,19 @@ def due_slot(job: dict, at: datetime | None = None) -> datetime | None:
     current = at or datetime.fromtimestamp(now(), timezone.utc)
     state = read_state(job["id"]) or {}
     since = calendar_trigger.parse_instant(state.get("since"))
-    if since is None:
-        registered = calendar_trigger.parse_instant(job.get("registered_at"))
+    registered_raw = job.get("registered_at")
+    # An app that re-declares a job (same id, new registered_at) planned
+    # afresh: the old plan's clock goes with it, so no slot from before the
+    # new declaration fires and none is skipped on the old plan's account.
+    replanned = bool(registered_raw) and state.get("registered") not in (None, registered_raw)
+    if since is None or replanned:
+        registered = calendar_trigger.parse_instant(registered_raw)
         since = min(registered, current) if registered else current
-        write_state(job["id"], "scheduled", since=since.isoformat(timespec="seconds"))
+        write_state(job["id"], "scheduled", since=since.isoformat(timespec="seconds"),
+                    registered=registered_raw, last_slot=None)
+        state = {}
+    elif registered_raw and state.get("registered") is None:
+        write_state(job["id"], state.get("status") or "scheduled", registered=registered_raw)
     floor = since
     last_slot = calendar_trigger.parse_instant(state.get("last_slot"))
     if last_slot is not None and last_slot > floor:

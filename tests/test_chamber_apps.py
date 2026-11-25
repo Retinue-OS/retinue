@@ -279,6 +279,20 @@ def main() -> int:
             st, h, data = req(port, "PUT", "/apps/api/files/routines/big.bin", b"x" * 11)
             check("too large: 413", st == 413)
             wg.APPS_FILE_MAX_BYTES = 1 << 20
+            import socket
+            with socket.create_connection(("127.0.0.1", port), timeout=10) as sock:
+                sock.sendall(b"PUT /apps/api/files/routines/cut.json HTTP/1.1\r\nHost: x\r\n"
+                             b"Content-Length: 100\r\n\r\n{\"half\":")
+                sock.shutdown(socket.SHUT_WR)
+                answer = sock.recv(4096)
+            check("a body cut short is not published", b" 400 " in answer.split(b"\r\n", 1)[0]
+                  and not (chambers / "routines" / "inbox" / "cut.json").exists()
+                  and not [p for p in (chambers / "routines" / "inbox").iterdir() if p.name.startswith(".upload-")],
+                  answer[:80])
+            st, h, data = req(port, "PUT", "/apps/api/files/routines/log.json", b'{"a":3}')
+            check("exclusive create keeps the existing file", st == 409
+                  and (chambers / "routines" / "inbox" / "log.json").read_text() == '{"a":2}')
+            wg.APPS_FILE_MAX_BYTES = 1 << 20
             st, h, data = req(port, "PUT", "/apps/api/files/routines/c.json", b"{}", {"Sec-Fetch-Site": "cross-site"})
             check("another site's page: 403", st == 403)
             (chambers / "routines" / ".inbox.json").unlink()
@@ -390,6 +404,8 @@ def main() -> int:
                   and not open_reminders())
 
             print("a shell's delivery confirmation")
+            req(port, "GET", "/apps/api/schedule?arm=1", headers={"Sec-Fetch-Site": "cross-site"})
+            check("another site's page cannot arm", wg._REMINDERS.shell_armed_at() is None)
             st, _, data = req(port, "GET", "/apps/api/schedule?arm=1")
             listing = jbody(data) or {}
             r = (listing.get("reminders") or [{}])[0]

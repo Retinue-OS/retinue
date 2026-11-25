@@ -174,7 +174,12 @@ def main() -> int:
             {"id": "noprompt", "kind": "job", "at": "10:00"},
             {"id": "bad", "kind": "reminder", "at": "nope", "title": "x"},
         ]})
-        (tmp / "chambers" / "health").mkdir()
+        app_root = tmp / "chambers" / "health" / ".retinue" / "apps" / "hands"
+        app_root.mkdir(parents=True)
+        (app_root / "manifest.webmanifest").write_text("{}")
+        # A schedule whose app is gone from its chamber: nothing of it runs.
+        chamber_apps.save_schedule("health", "gone", {"jobs": [
+            {"id": "ghost", "kind": "job", "prompt": "Still here?", "at": "10:00"}]})
         (tmp / "chambers" / "health" / ".schedule.json").write_text(json.dumps({"jobs": [
             {"id": "weekly", "prompt": "Weekly review.", "at": "08:40", "days": "mon"},
             {"id": "old", "command": "true", "interval_seconds": 60}]}))
@@ -196,6 +201,23 @@ def main() -> int:
             "/internal/apps/reminders/fire", "tok",
             {"chamber": "health", "app": "hands", "id": "hand-1", "occurrence": "2026-11-24T09:30:00Z"}))
         check("then handled", mod.due_slot(rem), None)
+        print("a re-declared job plans afresh")
+        replan = {"id": "app:health:hands:replan", "kind": "reminder", "at": "10:30", "title": "t",
+                  "registered_at": "2026-11-24T08:00:00+00:00", "_app": rem["_app"]}
+        replan["_trigger"] = ct.parse(replan, ZRH)
+        at(mod, datetime(2026, 11, 24, 10, 30, 5, tzinfo=ZRH))
+        mod.write_state(replan["id"], "success", last_slot=ct.occurrence_key(mod.due_slot(replan)))
+        at(mod, datetime(2026, 11, 24, 10, 40, tzinfo=ZRH))
+        moved = dict(replan, at="10:35", registered_at="2026-11-24T09:36:00+00:00")
+        moved["_trigger"] = ct.parse(moved, ZRH)
+        check("a slot from before the new declaration does not fire", mod.due_slot(moved), None)
+        check("the clock restarted at the declaration",
+              (mod.read_state(replan["id"])["since"], mod.read_state(replan["id"])["last_slot"]),
+              ("2026-11-24T09:36:00+00:00", None))
+        at(mod, datetime(2026, 11, 25, 10, 35, 5, tzinfo=ZRH))
+        check("the new plan's next slot fires", (mod.due_slot(moved) or datetime.min).isoformat(),
+              "2026-11-25T10:35:00+01:00")
+        at(mod, datetime(2026, 11, 24, 10, 31, tzinfo=ZRH))
         rows = {r["id"]: r for r in mod.list_jobs()}
         check("--list owner", rows["app:health:hands:hand-1"]["owner"], "app health/hands")
         check("--list kind", rows["app:health:hands:hand-1"]["kind"], "reminder")

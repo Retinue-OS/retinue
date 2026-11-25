@@ -127,8 +127,10 @@ apps, plugin and manifests — a file written there could become a script the
 dashboard serves; `.git/` likewise); `..`; a symlinked directory leading out
 of the chamber; a file name outside letters, digits and ` ._()+,=@-`. An
 existing file is replaced only with `{replace: true}` (`?replace=1`; else
-`409`); a body is limited to `APPS_FILE_MAX_BYTES` (25 MiB) and needs a
-`Content-Length`. A chamber without an inbox asks for a `dir` (`400`).
+`409`, decided by an exclusive create, so two uploads racing for a new name
+cannot both win); a body is limited to `APPS_FILE_MAX_BYTES` (25 MiB) and
+needs a `Content-Length`, and one that ends short of it is not written
+(`400`). A chamber without an inbox asks for a `dir` (`400`).
 
 **Ask.** The thread is the user's own — the app speaks for them as the
 composer does — with an agent-only note naming the app and the agent to
@@ -143,8 +145,9 @@ header and are not affected.
 ### Jobs
 
 `schedule(job)` registers a job, replacing one of the same `id` (its snoozes
-and skips go with it), so an app re-declares its whole plan whenever the plan
-changes. Two kinds:
+and skips go with it, and so does the scheduler's clock for it: no slot from
+before the new declaration fires), so an app re-declares its whole plan
+whenever the plan changes. Two kinds:
 
 ```js
 Retinue.schedule({
@@ -175,7 +178,9 @@ read by `scheduler.py` beside the chamber manifests; their ids are
 `app:<chamber>:<app>:<id>`, and `python3 scripts/scheduler.py --list` shows
 each job with its trigger, next run and owner (`app <chamber>/<app>`). A
 prompt job runs as a fresh `claude -p` like any scheduled prompt, its prompt
-prefixed with the app and job it comes from.
+prefixed with the app and job it comes from. The jobs of an app that is no
+longer in its chamber (removed, or the chamber unmounted) run no more,
+whatever its schedule file still holds.
 
 ## Reminders
 
@@ -252,7 +257,8 @@ An occurrence is named by its instant in UTC to the second with a `Z`
 (`calendar_trigger.occurrence_key`), the same spelling everywhere. `ring`
 says whether the occurrence would break through the focus mode scheduled for
 its time; the shell shows the others quietly. `arm=1` records that a shell
-arms reminders: for `APPS_SHELL_ARM_WINDOW_HOURS` (36) afterwards, a
+arms reminders (only from a native caller or this origin's own pages —
+another site's page, an `<img>` pointed here, records nothing): for `APPS_SHELL_ARM_WINDOW_HOURS` (36) afterwards, a
 reminder that is to ring waits `APPS_SHELL_GRACE_SECONDS` (90) before the
 server pushes it to the other devices. The shell confirms each occurrence it
 showed, `POST …/<id>/delivered {"occurrence"}`, before or after the server

@@ -11616,9 +11616,13 @@ class Handler(BaseHTTPRequestHandler):
             if path.rstrip("/") == "/apps/api/schedule":
                 params = urllib.parse.parse_qs(query)
                 now = _attention_now()
-                if (params.get("arm") or [""])[0] in ("1", "true"):
+                if (params.get("arm") or [""])[0] in ("1", "true") and self._claude_auth_same_origin():
                     # A shell (the Android app) arms these as local alarms:
                     # a reminder to ring now waits for its confirmation.
+                    # Recorded only from a native caller or this origin:
+                    # another site's page (an <img> pointed here) must not
+                    # hold every reminder push behind a shell that never
+                    # confirms.
                     _REMINDERS.mark_shell_armed(now)
                 try:
                     hours = float((params.get("hours") or ["48"])[0])
@@ -11760,15 +11764,36 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(409, {"error": "a file of that name exists (send ?replace=1 to replace it)"})
             return True
         data = self.rfile.read(length)
+        if len(data) != length:
+            # The client left mid-body: nothing is published.
+            self._send_json(400, {"error": "the body ended before its Content-Length"})
+            return True
+        tmp = None
         try:
             target.parent.mkdir(parents=True, exist_ok=True)
             fd, tmp = tempfile.mkstemp(prefix=".upload-", dir=str(target.parent))
             with os.fdopen(fd, "wb") as fh:
                 fh.write(data)
-            os.replace(tmp, target)
+            if replace:
+                os.replace(tmp, target)
+            else:
+                # Exclusive: a link fails if the name exists, so two uploads
+                # racing for the same new name cannot both succeed.
+                os.link(tmp, target)
+                os.unlink(tmp)
+            tmp = None
+        except FileExistsError:
+            self._send_json(409, {"error": "a file of that name exists (send ?replace=1 to replace it)"})
+            return True
         except OSError as exc:
             self._send_json(500, {"error": f"not written: {exc.strerror or exc}"})
             return True
+        finally:
+            if tmp is not None:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
         rel = target.relative_to(CHAMBERS_DIR / chamber).as_posix()
         print(f"[web-gateway] app file written: {chamber}/{rel} ({len(data)} bytes)", flush=True)
         self._send_json(201, {"status": "written", "chamber": chamber, "path": rel, "bytes": len(data)})
