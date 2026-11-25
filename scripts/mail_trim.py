@@ -3840,8 +3840,9 @@ def _cid_reference(value: str | None) -> str | None:
 
 
 class _Sanitizer(HTMLParser):
-    def __init__(self, cid_map=None):
+    def __init__(self, cid_map=None, link_target="_blank"):
         super().__init__(convert_charrefs=True)
+        self._link_target = link_target
         # Keyed and judged once for the whole mail: a mail of a thousand
         # images and a thousand parts is a thousand look-ups, and no image is
         # read through once per reference to it.
@@ -3956,8 +3957,8 @@ class _Sanitizer(HTMLParser):
         elif tag == "a":
             href = _safe_href(dict(attrs).get("href"))
             if href:
-                extra = (' href="%s" target="_blank" rel="noopener noreferrer"'
-                         % _html.escape(href, quote=True))
+                extra = (' href="%s" target="%s" rel="noopener noreferrer"'
+                         % (_html.escape(href, quote=True), self._link_target))
         self._out.append("<%s%s%s>" % (tag, extra, self._attrs(tag, attrs)))
         if tag not in _SAFE_VOID:
             self._open_at.setdefault(tag, []).append(len(self._open))
@@ -4128,7 +4129,11 @@ class _Sanitizer(HTMLParser):
         return "".join(self._out)
 
 
-def sanitize_html(html: str | None, cid_map: dict | None = None) -> str:
+LINK_TARGETS = ("_blank", "_top")
+
+
+def sanitize_html(html: str | None, cid_map: dict | None = None,
+                  link_target: str = "_blank") -> str:
     """The HTML part as a complete document that is safe to show.
 
     For the *Original* view, served under ``sandbox; default-src 'none';
@@ -4139,7 +4144,10 @@ def sanitize_html(html: str | None, cid_map: dict | None = None) -> str:
     attributes, inline styles and the mail's style rules with nothing in
     them that loads or runs (:func:`_clean_style`,
     :func:`_clean_stylesheet`), links to http(s) and mailto targets — each
-    forced to open in a new tab without an opener — and images whose ``src``
+    forced to open in a new tab without an opener (``link_target`` "_blank"),
+    or, for a viewer that opens no new windows (the Android app's WebView),
+    as a navigation of the top frame, which that viewer hands to the
+    browser (``link_target`` "_top") — and images whose ``src``
     is a ``cid:`` reference that `cid_map` (content-id → ``data:`` URL)
     resolves.
 
@@ -4158,7 +4166,9 @@ def sanitize_html(html: str | None, cid_map: dict | None = None) -> str:
     a minimal base style and the mail's cleaned rules, the mail's own
     ``<body>`` attributes where harmless), so the caller serves it as it is.
     """
-    sanitizer = _Sanitizer(cid_map)
+    if link_target not in LINK_TARGETS:
+        raise ValueError(f"link_target must be one of {LINK_TARGETS}")
+    sanitizer = _Sanitizer(cid_map, link_target)
     try:
         sanitizer.feed(html if isinstance(html, str) else "")
         body = sanitizer.finish()
