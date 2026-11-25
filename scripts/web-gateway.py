@@ -15259,18 +15259,33 @@ def _triage_payload() -> dict:
     doc = _TRIAGE_STORE.snapshot()
     return {"enabled": CHAT_TRIAGE, "running": _TRIAGE.running, "busy": _TRIAGE.busy,
             "model": CHAT_TRIAGE_MODEL, "run": doc.get("run"),
-            "entries": doc.get("entries") or {}}
+            "entries": doc.get("entries") or {}, "notes": doc.get("notes") or []}
 
 
-def _triage_start(again: bool) -> tuple[int, dict]:
+def _triage_start(again: bool, feedback=None) -> tuple[int, dict]:
     """Start a run over the unread chats (POST /chats/triage): 202 with the
-    run started, 200 while one is already running (that run's state)."""
+    run started, 200 while one is already running (that run's state).
+    ``feedback`` is a note from the user on how to sort: saved for every
+    run from now on, and the run it comes with sorts every unread chat again
+    (``again``) so the note applies to all of them. A note is saved even
+    while a run is busy; the answer then says no run started."""
     if not CHAT_TRIAGE:
         return 409, {"error": "chat triage is switched off (CHAT_TRIAGE)"}
+    if feedback is not None and not isinstance(feedback, str):
+        return 400, {"error": "feedback must be text"}
+    # The chats first: an answer that the press failed must mean the note
+    # was not saved either, or the page keeps the words and a second press
+    # saves the note twice.
     try:
         chats = _chats_payload()["chats"]
     except Exception as exc:  # noqa: BLE001 - the store is down
         return 502, {"error": "life store unreachable", "detail": str(exc)}
+    if feedback is not None:
+        try:
+            _TRIAGE_STORE.add_note(feedback)
+        except ValueError as exc:
+            return 400, {"error": str(exc)}
+        again = True
     if not _TRIAGE.running:
         _TRIAGE_STORE.prune({c["id"] for c in chats})
     scope = [{"id": c["id"], "seq": c.get("inbound_seq")}
@@ -18601,6 +18616,9 @@ class Handler(BaseHTTPRequestHandler):
         if self.path in ("/chats/triage", "/chats/triage/"):
             self._handle_chats_triage_start()
             return
+        if self.path in ("/chats/triage/notes", "/chats/triage/notes/"):
+            self._handle_chats_triage_notes()
+            return
         chat_flags_match = _CHAT_FLAGS_RE.match(self.path)
         if chat_flags_match:
             self._handle_chat_flags(chat_flags_match.group(1))
@@ -18970,7 +18988,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def _handle_chats_triage_start(self) -> None:
         """POST /chats/triage — the Triage button: sort the unread chats
-        (body ``{again?}``; ``again`` sorts those already sorted too). It
+        (body ``{again?, feedback?}``; ``again`` sorts those already sorted
+        too, and ``feedback`` saves a note on how to sort and sorts again). It
         spends model calls on the user's press, so a cross-site page may not
         press it for them."""
         if not self._user_act_same_origin():
@@ -18979,7 +18998,27 @@ class Handler(BaseHTTPRequestHandler):
         if body is None:
             self._send_json(400, {"error": "invalid JSON"})
             return
-        self._send_json(*_triage_start(body.get("again") is True))
+        # A `feedback` that is present must be text — an explicit null too,
+        # which .get() could not tell from an absent one and would take for
+        # a plain press that spends a run.
+        if "feedback" in body and not isinstance(body["feedback"], str):
+            self._send_json(400, {"error": "feedback must be text"})
+            return
+        self._send_json(*_triage_start(body.get("again") is True, body.get("feedback")))
+
+    def _handle_chats_triage_notes(self) -> None:
+        """POST /chats/triage/notes {remove: <id>} — take back a feedback
+        note. The user's act, like the press; it starts no run."""
+        if not self._user_act_same_origin():
+            return
+        body = self._read_json_body()
+        if body is None or not isinstance(body.get("remove"), str):
+            self._send_json(400, {"error": "body must be {remove: <note id>}"})
+            return
+        if not _TRIAGE_STORE.remove_note(body["remove"]):
+            self._send_json(404, {"error": "no such note"})
+            return
+        self._send_json(200, _triage_payload())
 
     def _read_json_body(self) -> dict | None:
         length = int(self.headers.get("Content-Length", 0))

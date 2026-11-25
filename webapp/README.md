@@ -348,6 +348,10 @@ docstring). Pieces:
   follow-up in the chat's companion ("Ara is looking at it…" until it lands);
   an action row with such a note opens the chat on Ara's pane
   (`chat.html?id=…&pane=ara`), any other on its messages.
+  **Feedback on the sorting** (a box under the status line) saves a note in
+  the user's words for every run from now on and sorts everything again
+  (`POST /chats/triage {feedback}`); saved notes are listed, each with ✕
+  (`POST /chats/triage/notes {remove}`).
   The view polls `GET /chats/triage` while a run sorts or a note is on its
   way, and is a history entry (back closes it); there is no multi-select
   inside it. A chat archived or deleted leaves the view.
