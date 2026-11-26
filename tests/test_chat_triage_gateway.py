@@ -90,6 +90,16 @@ def main() -> int:
         # Follow-ups are off by default; this test opts in to exercise them.
         assert wg.CHAT_TRIAGE_FOLLOWUPS == 0 and wg._TRIAGE.followup_max == 0
         wg._TRIAGE.followup_max = 20
+        # Only the user's own newest message (author user/device, not a
+        # failed send) makes a sorting stale; Ara's ("agent") does not.
+        ts = "2026-11-21T10:00:00Z"
+        out = lambda **kw: {"last": {"ts": ts, "direction": "out", **kw}}
+        assert wg._triage_replied(out(author="user")) == ts
+        assert wg._triage_replied(out(author="device")) == ts
+        assert wg._triage_replied(out(author="agent")) is None
+        assert wg._triage_replied(out(author="user", failed=True)) is None
+        assert wg._triage_replied({"last": {"ts": ts, "direction": "in"}}) is None
+        assert wg._triage_replied({"last": None}) is None
         wg.contacts_mod.commit = lambda *a, **k: None
         server = ThreadingHTTPServer(("127.0.0.1", 0), wg.Handler)
         threading.Thread(target=server.serve_forever, daemon=True).start()
