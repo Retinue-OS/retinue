@@ -437,26 +437,29 @@ await ok('a chat the user wrote in after the sorting leaves its bucket', async (
   const list = [
     // Answered after the sorting, and read since: no triage row at all.
     chat('d1', { unread: 0, list_group: 'read', inbound_seq: 5,
-      last: { ts: '2026-11-21T10:00:00Z', direction: 'out', text: 'Lieber Donat' } }),
+      last: { ts: '2026-11-21T10:00:00Z', direction: 'out', author: 'user', text: 'Lieber Donat' } }),
     // Answered after the sorting, still unread: not sorted, saying why.
     chat('d2', { unread: 1, list_group: 'unread', inbound_seq: 6,
-      last: { ts: '2026-11-21T10:00:00Z', direction: 'out', text: 'ok' } }),
+      last: { ts: '2026-11-21T10:00:00Z', direction: 'out', author: 'device', text: 'ok' } }),
     // Answered before the sorting: the sorting saw it, its word stands.
     chat('d3', { unread: 0, list_group: 'read', inbound_seq: 7,
-      last: { ts: '2026-11-21T08:00:00Z', direction: 'out', text: 'ok' } }),
+      last: { ts: '2026-11-21T08:00:00Z', direction: 'out', author: 'user', text: 'ok' } }),
     // A send that failed is no answer.
     chat('d4', { unread: 0, list_group: 'read', inbound_seq: 8,
-      last: { ts: '2026-11-21T10:00:00Z', direction: 'out', failed: true, text: 'ok' } }),
+      last: { ts: '2026-11-21T10:00:00Z', direction: 'out', author: 'user', failed: true, text: 'ok' } }),
+    // Ara's own message after the sorting is no answer of the user's.
+    chat('d5', { unread: 0, list_group: 'read', inbound_seq: 9,
+      last: { ts: '2026-11-21T10:00:00Z', direction: 'out', author: 'agent', text: 'Noted.' } }),
   ];
   const at = '2026-11-21T09:00:00Z';
   const el = await mount(payload(list));
   el._triage = true;
-  el._tri = { enabled: true, running: false, run: { state: 'done', total: 4, sorted: 4, failed: 0 }, notes: [],
-    entries: Object.fromEntries(['d1', 'd2', 'd3', 'd4'].map((id, i) =>
+  el._tri = { enabled: true, running: false, run: { state: 'done', total: 5, sorted: 5, failed: 0 }, notes: [],
+    entries: Object.fromEntries(['d1', 'd2', 'd3', 'd4', 'd5'].map((id, i) =>
       [id, { bucket: 'action', note: 'Answer.', reply: true, seq: 5 + i, at, run: 'r' }])) };
   el._rerender();
   const h = html(el);
-  assert.deepEqual(ids(sectionOf(h, 'action')), ['d4', 'd3'], h);
+  assert.deepEqual(ids(sectionOf(h, 'action')).sort(), ['d3', 'd4', 'd5'], h);
   const unsorted = sectionOf(h, 'unsorted');
   assert.deepEqual(ids(unsorted), ['d2'], unsorted);
   assert.ok(unsorted.includes('You wrote in it since it was sorted.'), unsorted);

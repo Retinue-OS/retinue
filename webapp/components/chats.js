@@ -479,11 +479,13 @@ const araWrites = (it) => !!(it.entry && it.entry.followup
 const triKey = (items) => items.map((it) => it.chat.id).join('\n');
 
 // Whether the user wrote in a chat after triage sorted it: their own message
-// (not a failed send) is the chat's newest, and later than the sorting.
+// (not a failed send, and not Ara's — author "agent"; only "user" and
+// "device" are the user's) is the chat's newest, and later than the sorting.
 // No message came in, so `inbound_seq` cannot tell (chat_triage.answered_since).
 export function answeredSince(chat, entry) {
   const last = (chat && chat.last) || {};
   if (last.direction !== 'out' || last.failed || !entry) return false;
+  if (last.author !== 'user' && last.author !== 'device') return false;
   const mine = Date.parse(last.ts || '');
   const sorted = Date.parse(entry.at || '');
   return Number.isFinite(mine) && Number.isFinite(sorted) && mine > sorted;

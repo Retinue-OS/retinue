@@ -15356,10 +15356,13 @@ def _triage_payload() -> dict:
 
 def _triage_replied(chat: dict) -> str | None:
     """The stamp of the user's own message where it is the chat's newest (a
-    send that failed is no answer): a sorting older than it no longer
-    describes the chat (chat_triage.answered_since)."""
+    send that failed is no answer, and neither is Ara's — an outbound message
+    authored "agent" — as the reply mark counts only "user" and "device"): a
+    sorting older than it no longer describes the chat
+    (chat_triage.answered_since)."""
     last = chat.get("last") or {}
-    if last.get("direction") != "out" or last.get("failed"):
+    if (last.get("direction") != "out" or last.get("failed")
+            or last.get("author") not in ("user", "device")):
         return None
     return last.get("ts") or None
 
