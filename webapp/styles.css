@@ -198,6 +198,9 @@ retinue-sparql-workbench .yasgui .controlbar { display: none; }
                       color: var(--fg); font: inherit; }
 .endpoint-pick select:disabled { opacity: .55; }
 .instance-name input[type="text"] { width: 60%; }
+/* The name's dictation box (components/dictate-field.js) takes the field's width. */
+.instance-name .dict-field { width: 60%; }
+.instance-name .dict-field input[type="text"] { width: 100%; max-width: none; }
 .instance-color input[type="color"] { width: 56px; min-height: 40px; padding: 2px; border-radius: 10px;
                                       border: 1px solid var(--line); background: var(--card-2); }
 .shell-actions { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 10px; }

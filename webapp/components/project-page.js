@@ -31,6 +31,7 @@ import { shelf, goLive, takeRestore } from './shelf-store.js';
 // when the user returns.
 import { loadDraft, saveDraft } from './drafts.js';
 import { transcribe, handOff, adopt } from './dictation.js';
+import { dictateButtonHtml, wireDictation, DICTATE_CSS } from './dictate-field.js';
 
 const APPLY_POLL_MS = 3000;
 // The recorder hands over its audio in slices this long, so a page left with
@@ -636,7 +637,7 @@ class RetinueProjectPage extends HTMLElement {
     // reader back to the top of the page.
     const prev = this.shadowRoot.querySelector('.scroll');
     const scrollTop = prev ? prev.scrollTop : 0;
-    this.shadowRoot.innerHTML = `<style>${CSS}${VOICE_CSS}${MD_CSS}</style>`
+    this.shadowRoot.innerHTML = `<style>${CSS}${VOICE_CSS}${MD_CSS}${DICTATE_CSS}</style>`
       + `<section class="card">${body}</section>`;
     const next = this.shadowRoot.querySelector('.scroll');
     if (next && scrollTop) next.scrollTop = scrollTop;
@@ -645,6 +646,7 @@ class RetinueProjectPage extends HTMLElement {
       this._shelfRestore = null;
     }
     this._wire();
+    wireDictation(this.shadowRoot);
   }
 
   // ── The shelf (shelf-store.js, issue #282) ─────────────────────────────────
@@ -810,7 +812,7 @@ class RetinueProjectPage extends HTMLElement {
     // Enter breaks the line; Cmd/Ctrl+Enter or the button sends.
     return `<div class="cmdbar">${err}<form class="row" data-cmd-form>`
       + this._micHtml()
-      + `<textarea rows="1" placeholder="Tell Ara what to change &#8230;" `
+      + `<textarea rows="1" data-dictate-own placeholder="Tell Ara what to change &#8230;" `
       + `aria-label="Tell Ara what to change" autocomplete="off" ${disabled}>${esc(this._cmd)}</textarea>`
       + `<button type="submit" title="Send" aria-label="Send" ${disabled}>&#10148;</button>`
       + `</form></div>`;
@@ -824,7 +826,9 @@ class RetinueProjectPage extends HTMLElement {
       + `<span class="bar-title">Editing</span>`
       + `<button class="save" data-save ${saving}>${this._saving ? 'Saving …' : 'Save'}</button>`
       + `</div>` + err
-      + `<textarea class="editor" spellcheck="false" ${saving}>${esc(this._draft)}</textarea>`;
+      + `<div class="dict-field editor-box"><textarea class="editor" spellcheck="false" `
+      + `data-dictate-field="${esc(this._editKey())}" ${saving}>${esc(this._draft)}</textarea>`
+      + `${dictateButtonHtml(this._editKey(), 'Dictate into the page')}</div>`;
   }
 
   _wire() {
@@ -999,6 +1003,7 @@ const CSS = `
 
   .save { flex: none; background: var(--accent, #6ea8fe); color: #0b0d12; border: 0;
           border-radius: 999px; padding: 7px 18px; font-weight: 650; cursor: pointer; }
+  .dict-field.editor-box { flex: 1; display: flex; flex-direction: column; }
   .editor { flex: 1; min-height: 55vh; width: 100%; margin-top: 10px; resize: none;
             background: var(--card-2, #1c2230); color: var(--fg, #e7ebf2); border: 0;
             border-radius: 12px; padding: 12px;

@@ -51,6 +51,7 @@ const SHELL_ASSETS = [
   '/components/clipboard.js',
   '/components/drafts.js',
   '/components/dictation.js',
+  '/components/dictate-field.js',
   '/components/conversation.js',
   '/components/conversations.js',
   '/components/projects.js',

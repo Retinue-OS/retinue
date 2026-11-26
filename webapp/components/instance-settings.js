@@ -12,7 +12,9 @@
 // in force. A card whose endpoint the gateway does not offer (an older one)
 // stays hidden.
 
-const TEMPLATE = `
+import { dictateButtonHtml, wireDictation, DICTATE_CSS } from './dictate-field.js';
+
+const TEMPLATE = `<style>${DICTATE_CSS}</style>
   <section class="scard" data-instance hidden>
     <h2>Name and colour</h2>
     <p class="hint">How this Retinue presents itself, on every device: a short
@@ -21,7 +23,8 @@ const TEMPLATE = `
       installed home-screen icon picks up a new name or colour when the
       browser next checks the manifest, about daily.</p>
     <label class="num-setting instance-name">Name
-      <input type="text" autocomplete="off" spellcheck="false" maxlength="40" data-instance-name>
+      <span class="dict-field line"><input type="text" autocomplete="off" spellcheck="false" maxlength="40"
+        data-instance-name data-dictate-field="instance-name">${dictateButtonHtml('instance-name', 'Dictate the name')}</span>
     </label>
     <label class="num-setting instance-color">Accent colour
       <input type="color" data-instance-color>
@@ -76,6 +79,7 @@ class RetinueInstanceSettings extends HTMLElement {
     if (this._wired) return;
     this._wired = true;
     this.innerHTML = TEMPLATE;
+    wireDictation(this);
     this._wireInstance();
     this._wireFocus();
     this._wireAgentModels();

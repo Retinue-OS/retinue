@@ -110,6 +110,7 @@ import {
 import { shelf } from './shelf-store.js';
 import { SwipeRows, SWIPE_CSS, STAR_MARK, offerUndo, showNotice, starButtonHtml, UNDO_MS } from './swipe-rows.js';
 import { openComposeSheet } from './compose-sheet.js';
+import { dictateButtonHtml, wireDictation, DICTATE_CSS } from './dictate-field.js';
 
 const LIST_URL = '/chats';
 // Triage (docs/chat-triage.md): what the last run said per chat, and the
@@ -705,6 +706,7 @@ class RetinueChats extends RetinueCard {
         if (send) send.disabled = !fb.value.trim();
       });
     }
+    wireDictation(this.shadowRoot);
     const fbBox = this.shadowRoot.querySelector('[data-tri-fb-box]');
     if (fbBox) fbBox.addEventListener('toggle', () => { this._triFbOpen = fbBox.open; });
     this.shadowRoot.querySelectorAll('[data-tri-all]').forEach((el) =>
@@ -1124,8 +1126,10 @@ class RetinueChats extends RetinueCard {
     return `<details class="tri-fb" data-tri-fb-box${this._triFbOpen ? ' open' : ''}>` +
       `<summary>Feedback on the sorting${notes.length ? ` <span class="tri-n">${notes.length}</span>` : ''}</summary>` +
       list +
-      `<textarea data-tri-fb rows="2" maxlength="400" aria-label="Feedback on the sorting" ` +
+      `<div class="dict-field"><textarea data-tri-fb data-dictate-field="triage-feedback" rows="2" maxlength="400" ` +
+      `aria-label="Feedback on the sorting" ` +
       `placeholder="Say what it got wrong — e.g. &quot;Mails from my bank are never to be deleted.&quot;">${esc(draft)}</textarea>` +
+      `${dictateButtonHtml('triage-feedback', 'Dictate feedback')}</div>` +
       // While a run is busy the note is still saved, and applies to the
       // next sort: the button says so rather than being shut.
       `<div class="tri-fb-row"><button type="button" class="tri-fb-send" data-triage="feedback"` +
@@ -1745,7 +1749,7 @@ class RetinueChats extends RetinueCard {
   }
 
   css() {
-    return `
+    return `${DICTATE_CSS}
       /* Chrome-less on phones, edge to edge under the navigation like the
          threads and projects pages; a framed card again on wide screens. */
       .card { background: transparent; padding: 2px; }

@@ -26,6 +26,7 @@ import {
 } from './base.js';
 import { renderMarkdown, MD_CSS } from './markdown.js';
 import { Reader, speechAvailable } from './speech.js';
+import { dictateButtonHtml, wireDictation, DICTATE_CSS } from './dictate-field.js';
 
 const SRC = '/news';
 const PREFS = '/news/preferences';
@@ -92,7 +93,8 @@ const CSS = `
        font-size: .86rem; background: var(--card-2, #1c2230); color: var(--fg, #e7ebf2);
        border: 1px solid var(--line, rgba(231, 235, 242, .12)); border-radius: 10px;
        padding: 8px 10px; }
-  input.note { flex: 1; min-width: 160px; font: inherit; font-size: .84rem;
+  .dict-field.note-box { flex: 1; min-width: 160px; }
+  input.note { width: 100%; font: inherit; font-size: .84rem;
        background: var(--card-2, #1c2230); color: var(--fg, #e7ebf2);
        border: 1px solid var(--line, rgba(231, 235, 242, .12)); border-radius: 8px;
        padding: 6px 9px; }
@@ -337,10 +339,11 @@ class RetinueNews extends HTMLElement {
     // The dedicated page's way home is the navigation row above the
     // component (components/nav.js).
     this.shadowRoot.innerHTML =
-      `<style>${CSS}${VIEW_TOGGLE_CSS}</style>` +
+      `<style>${CSS}${VIEW_TOGGLE_CSS}${DICTATE_CSS}</style>` +
       `<section class="card"><header><h2>${esc(this.heading)}</h2>` +
       `${viewToggleHtml(this._view)}${stamp}</header>` +
       `<div class="content">${inner}</div></section>`;
+    wireDictation(this.shadowRoot);
   }
 
   get _ulOpen() { return this._view === 'list' ? '<ul class="as-list">' : '<ul>'; }
@@ -391,7 +394,9 @@ class RetinueNews extends HTMLElement {
       : empty;
     const note =
       '<div class="bar" style="margin-top:12px">' +
-      '<input class="note" type="text" placeholder="Tell Herald what you want more or less of…">' +
+      '<div class="dict-field line note-box"><input class="note" type="text" data-dictate-field="news-note" ' +
+      'placeholder="Tell Herald what you want more or less of…">' +
+      `${dictateButtonHtml('news-note', 'Dictate a note to Herald')}</div>` +
       '<button data-act="note">Send</button></div>';
     return bar + list + note + this.prefsPanel();
   }
@@ -400,7 +405,8 @@ class RetinueNews extends HTMLElement {
     const p = this._prefs;
     if (!p) return '';
     const body = this._editing
-      ? `<textarea>${esc(p.markdown || '')}</textarea>` +
+      ? `<div class="dict-field"><textarea data-dictate-field="news-prefs">${esc(p.markdown || '')}</textarea>` +
+        `${dictateButtonHtml('news-prefs', 'Dictate into the taste profile')}</div>` +
         '<div class="bar" style="margin-top:8px">' +
         '<button data-act="save-prefs">Save</button>' +
         '<button data-act="cancel-prefs">Cancel</button></div>'

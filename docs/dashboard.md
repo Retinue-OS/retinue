@@ -2510,6 +2510,45 @@ The gateways are **clients** of it, so no ASR model is loaded anywhere else:
 - the **web-gateway** proxies dashboard voice input to it, exposing
   `POST /conversations/transcribe` to the PWA.
 
+### Every text field takes dictation
+
+**The rule: wherever the dashboard asks for words, they can be spoken
+instead of typed.** The user is often on the phone, often walking; a field
+that only takes typing is a field they skip. So every `<textarea>` and every
+text-kind `<input>` offers a microphone — the triage feedback, a contact's
+instruction, the note to Herald, a new mail's subject and body, a project's raw
+editor, a search box, a name.
+
+Two ways to satisfy it:
+
+- **A composer** (the conversation composer, a chat's composer, the project
+  command bar) has its own recording row — waveform, review ✓, send ➤ —
+  because what "send" means is its own (`voice.js`); its field is marked
+  `data-dictate-own`.
+- **Every other field** uses the shared button of
+  `webapp/components/dictate-field.js`: wrap the field in a `.dict-field` box
+  (`.dict-field line` for a one-line input), give it
+  `data-dictate-field="<key>"`, put `dictateButtonHtml(key, label)` beside it,
+  include `DICTATE_CSS` in the host's styles and call
+  `wireDictation(shadowRoot)` after each render. A 🎤 sits in the field's
+  corner; a tap records (■ with the time running, ✕ discards), a second tap
+  transcribes and puts the words at the caret the user left — or after what
+  the field holds — then fires the field's own `input` and `change` events, so
+  the host keeps its state exactly as for typing. A dictation never sends or
+  saves anything: the host's own button does. One-line fields lose the
+  transcriber's trailing full stop. The key should be unique per thing edited
+  (`contact-instruction:<id>`): the transcription runs in the service worker
+  (`dictation.js`), so a page left mid-transcription gets the words back into
+  that same field when it is shown again. State lives in the module, not the
+  host, so a host re-render mid-recording keeps the button as it is.
+
+The only exemption is a value with a machine format that speech does not
+produce — a messenger handle, an e-mail domain — marked
+`data-dictate-exempt="<why>"`. Number, date, colour and other non-text inputs
+are not text fields. `tests/test_webapp_dictation_everywhere.py` scans the
+webapp's markup and fails on any text field that carries none of the three
+marks, so a new field cannot forget it.
+
 ### The dictation vocabulary
 
 The words an ASR model mangles are the proper nouns — people, practices,

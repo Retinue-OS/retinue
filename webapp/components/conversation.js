@@ -2326,7 +2326,7 @@ class RetinueConversation extends HTMLElement {
     return `<div class="composer">` + chipRow + errRow + startRow +
       `<form class="row" data-form>` + micBtn +
       `<div class="field">` +
-      `<textarea rows="1" placeholder="${esc(placeholder)}" aria-label="${esc(placeholder)}" autocomplete="off" ${disabled}>` +
+      `<textarea rows="1" data-dictate-own placeholder="${esc(placeholder)}" aria-label="${esc(placeholder)}" autocomplete="off" ${disabled}>` +
       `${esc(d.text)}</textarea>` +
       `<label class="clip" title="Attach a file (or paste one into the box)" aria-label="Attach a file (or paste one into the box)">` +
       `<input type="file" multiple hidden data-file ${disabled}>` +
