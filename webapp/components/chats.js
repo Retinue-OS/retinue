@@ -624,7 +624,9 @@ class RetinueChats extends RetinueCard {
       // A rebuild under a finger mid-swipe would drop the row it is dragging,
       // and one under the open ＋ menu the item about to be pressed; the
       // next tick picks the change up.
-      if (this._swipe.dragging || this._newOpen) return;
+      // …and one under typing in triage's feedback field would drop its
+      // focus (its words are kept in _triFb either way).
+      if (this._swipe.dragging || this._newOpen || this._typingFeedback()) return;
       // A failed row whose chat the list no longer has is nothing to show.
       for (const id of [...this._failed.keys()]) {
         if (!(data.chats || []).some((c) => c.id === id)) this._failed.delete(id);
@@ -682,7 +684,23 @@ class RetinueChats extends RetinueCard {
         if (what === 'open') this._openTriage();
         else if (what === 'close') this._closeTriage();
         else if (what === 'again') this._startTriage(true);
+        else if (what === 'feedback') this._sendTriageFeedback();
       }));
+    this.shadowRoot.querySelectorAll('[data-tri-note-rm]').forEach((el) =>
+      el.addEventListener('click', (e) => {
+        e.preventDefault();
+        this._removeTriageNote(el.getAttribute('data-tri-note-rm'));
+      }));
+    const fb = this.shadowRoot.querySelector('[data-tri-fb]');
+    if (fb) {
+      fb.addEventListener('input', () => {
+        this._triFb = fb.value;
+        const send = this.shadowRoot.querySelector('[data-triage="feedback"]');
+        if (send) send.disabled = !fb.value.trim();
+      });
+    }
+    const fbBox = this.shadowRoot.querySelector('[data-tri-fb-box]');
+    if (fbBox) fbBox.addEventListener('toggle', () => { this._triFbOpen = fbBox.open; });
     this.shadowRoot.querySelectorAll('[data-tri-all]').forEach((el) =>
       el.addEventListener('click', (e) => {
         e.preventDefault();
@@ -999,6 +1017,83 @@ class RetinueChats extends RetinueCard {
     this._triageSchedule();
   }
 
+  // Feedback: a note on how to sort, saved for every run from now on, and
+  // a run that sorts every unread chat again with it (POST /chats/triage
+  // {feedback}). The note is kept while the press is refused (a run busy);
+  // the field is emptied once the server has it.
+  async _sendTriageFeedback() {
+    const text = String(this._triFb || '').trim();
+    if (!text || this._triSending) return;
+    this._triSending = true;
+    this._triMsg = '';
+    try {
+      const res = await fetch(TRIAGE_URL, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ feedback: text }),
+      });
+      const doc = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        this._triMsg = (doc && doc.error) ? `Feedback not saved: ${doc.error}.`
+          : `Feedback not saved (the server answered ${res.status}).`;
+      } else {
+        this._tri = doc;
+        this._triFb = '';
+        if (doc.started === false) this._triMsg = 'Feedback saved — it applies once the current run is done; press Sort again then.';
+      }
+    } catch (_err) {
+      this._triMsg = 'Feedback not saved: the dashboard is offline.';
+    } finally {
+      this._triSending = false;
+    }
+    if (this._triage) this._rerender();
+    this._triageSchedule();
+  }
+
+  // Whether the user is typing in triage's feedback field: no rebuild then.
+  _typingFeedback() {
+    const a = this.shadowRoot && this.shadowRoot.activeElement;
+    return !!(a && a.matches && a.matches('[data-tri-fb]'));
+  }
+
+  // Take a note back (POST /chats/triage/notes {remove}); it starts no run.
+  async _removeTriageNote(id) {
+    if (!id) return;
+    try {
+      const res = await fetch(`${TRIAGE_URL}/notes`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ remove: id }),
+      });
+      if (res.ok) this._tri = await res.json();
+      else this._triMsg = `Feedback not removed (the server answered ${res.status}).`;
+    } catch (_err) {
+      this._triMsg = 'Feedback not removed: the dashboard is offline.';
+    }
+    if (this._triage) this._rerender();
+  }
+
+  // The feedback box: the saved notes, each with ✕, and a field whose words
+  // become one more and sort everything again.
+  _triageFeedbackHtml(busy) {
+    const notes = (this._tri && Array.isArray(this._tri.notes)) ? this._tri.notes : [];
+    const draft = String(this._triFb || '');
+    const list = notes.length
+      ? `<ul class="tri-notes">${notes.map((n) =>
+        `<li><span>${esc(n.text)}</span><button type="button" class="tri-note-rm" data-tri-note-rm="${esc(n.id)}" ` +
+        `title="Take this note back" aria-label="Remove note">&#10005;</button></li>`).join('')}</ul>`
+      : '';
+    return `<details class="tri-fb" data-tri-fb-box${this._triFbOpen ? ' open' : ''}>` +
+      `<summary>Feedback on the sorting${notes.length ? ` <span class="tri-n">${notes.length}</span>` : ''}</summary>` +
+      list +
+      `<textarea data-tri-fb rows="2" maxlength="400" aria-label="Feedback on the sorting" ` +
+      `placeholder="Say what it got wrong — e.g. &quot;Mails from my bank are never to be deleted.&quot;">${esc(draft)}</textarea>` +
+      // While a run is busy the note is still saved, and applies to the
+      // next sort: the button says so rather than being shut.
+      `<div class="tri-fb-row"><button type="button" class="tri-fb-send" data-triage="feedback"` +
+      `${!draft.trim() ? ' disabled' : ''}>${busy ? 'Save for the next sort' : 'Save and sort again'}</button>` +
+      `<span class="tri-fb-hint">Notes apply to every sorting from now on.</span></div>` +
+      `</details>`;
+  }
+
   async _pollTriage() {
     this._triTimer = null;
     if (!this._triage) return;
@@ -1013,7 +1108,9 @@ class RetinueChats extends RetinueCard {
     // Sorting done or a note landed: the list too (a staged draft shows on
     // the row).
     if (wasRunning && !triageBusy(this._tri)) this.load();
-    if (!this._swipe.dragging) this._rerender();
+    // Not under a finger or under typing: the feedback field would lose
+    // its focus (its words are kept either way).
+    if (!this._swipe.dragging && !this._typingFeedback()) this._rerender();
     this._triageSchedule();
   }
 
@@ -1108,7 +1205,8 @@ class RetinueChats extends RetinueCard {
       '<h2 class="tri-title">Triage</h2>' +
       `<button type="button" class="tri-again" data-triage="again"${busy ? ' disabled' : ''} ` +
       'title="Sort every unread chat again, also those sorted before">Sort again</button></div>' +
-      `<p class="tri-status${st.err ? ' err' : ''}${st.busy ? ' busy' : ''}" role="status">${esc(st.text)}</p>`;
+      `<p class="tri-status${st.err ? ' err' : ''}${st.busy ? ' busy' : ''}" role="status">${esc(st.text)}</p>` +
+      this._triageFeedbackHtml(busy);
     const shownIds = [];
     const all = [].concat(...TRIAGE_SECTIONS.map((sec) => secs[sec.id].map((it) => it.chat)));
     const accountsOf = accountsByName(all);
@@ -1744,6 +1842,25 @@ class RetinueChats extends RetinueCard {
                  font-size: .76rem; font-weight: 600; background: var(--card-2, #1c2230); color: var(--fg, #e7ebf2); }
       .tri-all.delete { background: #d0564f; color: #fff; }
       .tri-all.delete.confirm { background: #a8322c; }
+      /* Feedback on the sorting: saved notes, a field, a send. */
+      .tri-fb { margin: 0 0 12px; padding: 8px 10px; border-radius: 12px; background: var(--card-2, #1c2230); }
+      .tri-fb summary { cursor: pointer; font-size: .82rem; color: var(--accent, #6ea8fe); }
+      .tri-fb summary:focus-visible { outline: 2px solid var(--fg, #e7ebf2); outline-offset: 2px; }
+      .tri-notes { list-style: none; margin: 8px 0 0; padding: 0; display: flex; flex-direction: column; gap: 4px; }
+      .tri-notes li { display: flex; align-items: flex-start; gap: 6px; font-size: .8rem; }
+      .tri-notes li span { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+      .tri-note-rm { flex: none; background: transparent; border: 0; color: var(--muted, #8b93a3); cursor: pointer;
+                     font: inherit; padding: 0 4px; }
+      .tri-note-rm:focus-visible { outline: 2px solid var(--fg, #e7ebf2); }
+      .tri-fb textarea { box-sizing: border-box; width: 100%; margin-top: 8px; resize: vertical; min-height: 44px;
+                         border-radius: 8px; border: 1px solid var(--line, rgba(231, 235, 242, .12));
+                         background: var(--card, #151922); color: var(--fg, #e7ebf2); font: inherit; font-size: .85rem;
+                         padding: 6px 8px; }
+      .tri-fb-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 6px; }
+      .tri-fb-send { border: 0; border-radius: 8px; padding: 6px 10px; cursor: pointer; font: inherit; font-size: .78rem;
+                     font-weight: 600; background: var(--accent, #6ea8fe); color: #0b0d12; }
+      .tri-fb-send:disabled { opacity: .45; cursor: default; }
+      .tri-fb-hint { font-size: .72rem; color: var(--muted, #8b93a3); }
       /* The note under a triage row: what the sorting said, then Ara's. */
       .tnote { grid-column: 2 / 4; display: flex; flex-direction: column; gap: 2px; margin-top: 3px;
                font-size: .78rem; line-height: 1.35; white-space: normal; min-width: 0; }
