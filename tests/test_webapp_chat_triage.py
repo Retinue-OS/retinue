@@ -117,7 +117,8 @@ await ok('opening it presses: the sections, the notes and the status while it so
   assert.ok(action.includes('Ara is looking at it…'));
   const unsorted = sectionOf(h, 'unsorted');
   assert.deepEqual(ids(unsorted), ['u2', 'u3', 'u4'], 'unread chats with no word yet');
-  assert.ok(unsorted.includes('Came in after the sorting.'));
+  assert.ok(unsorted.includes('Not sorted yet.'), 'still sorting: not "came in after"');
+  assert.ok(!unsorted.includes('Came in after the sorting.'));
   assert.ok(!ids(h).includes('r1'), 'a read chat with no word is no triage row');
   assert.ok(!ids(h).includes('a1'));
   assert.ok(h.includes('data-triage="again" disabled'), 'no second press while it sorts');
@@ -412,6 +413,23 @@ await ok('a restore whose answer fails says so and asks again', async () => {
   } finally {
     location.hash = '';
     keepHistory = false;
+  }
+});
+
+await ok('an unread chat with no word came in after the sorting only where a sorting finished', async () => {
+  const el = await mount(payload(LIST));
+  const cases = [
+    [{ enabled: true, running: false, run: null, entries: {}, notes: [] }, 'Not sorted yet.'],
+    [{ enabled: true, running: false, run: { state: 'interrupted' }, entries: {}, notes: [] }, 'Not sorted yet.'],
+    [{ enabled: true, running: false, run: { state: 'done', total: 0, sorted: 0, failed: 0 }, entries: {}, notes: [] },
+      'Came in after the sorting.'],
+  ];
+  el._triage = true;
+  for (const [doc, line] of cases) {
+    el._tri = doc;
+    el._rerender();
+    const unsorted = sectionOf(html(el), 'unsorted');
+    assert.ok(unsorted.includes(line), `${doc.run && doc.run.state}: ${unsorted}`);
   }
 });
 

@@ -1173,11 +1173,16 @@ class RetinueChats extends RetinueCard {
     const all = (Array.isArray(d.chats) ? d.chats : []).filter((c) => !this._pending.has(c.id));
     all.sort((a, b) => String((b.last || {}).ts || '').localeCompare(String((a.last || {}).ts || '')));
     const out = { action: [], archive: [], delete: [], unsorted: [] };
+    // An unread chat with no word: it came in after the sorting only where a
+    // sorting finished — not before any ran (a cold #triage, a lost store),
+    // after one that was cut off, or while one still works its way to it.
+    const done = !!(this._tri && this._tri.run && this._tri.run.state === 'done');
+    const noWord = done ? 'Came in after the sorting.' : 'Not sorted yet.';
     for (const c of all) {
       if (listGroup(c) === 'archived') continue;
       const e = entries[c.id];
       if (!e) {
-        if (listGroup(c) === 'unread') out.unsorted.push({ chat: c, entry: null, why: 'Came in after the sorting.' });
+        if (listGroup(c) === 'unread') out.unsorted.push({ chat: c, entry: null, why: noWord });
         continue;
       }
       if (!['action', 'archive', 'delete'].includes(e.bucket)) {
