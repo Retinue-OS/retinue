@@ -831,7 +831,8 @@ class RetinueChatPage extends HTMLElement {
     // The keys of every such mail this page has held, kept or let go: what
     // the device keeps beside them is another tab's (_keepUnsure).
     this._unsureHeld = new Set();
-    // Sends queued under the account's send policy (a mail under `verify`),
+    // Sends queued under the account's send policy (an agent's mail under
+    // `verify`, or a press whose release failed),
     // each shown as a pending bubble at the thread's end until it is sent,
     // rejected or retracted: {p: the server's Pending entry, seq}. `seq` is
     // the _pendSeq a 202 from here gave it (0 for one the server listed), so
@@ -3542,7 +3543,7 @@ class RetinueChatPage extends HTMLElement {
 
   // ── Sends waiting for approval ─────────────────────────────────────────────
   // A send the account's policy queued (a mail under `verify`, whoever wrote
-  // it — the composer here, the companion, mail-push.py) is not a message
+  // it — the companion, mail-push.py, a press here whose release failed) is not a message
   // yet: it is the user's words with a link to where they release or drop
   // them. The bubble says so in words — "Waiting for approval" is its visible
   // state and part of its accessible name, never only a colour — and keeps
@@ -5470,9 +5471,10 @@ class RetinueChatPage extends HTMLElement {
   // Live send: an optimistic bubble goes up at once — staged images showing
   // their local previews in the same reserved boxes the server's dimensions
   // will confirm — then is reconciled with the Message the server returns
-  // (POST /chats/<id>/send — the gateway records author `user`; on a
-  // messenger no policy category queues it: the user's send press IS the
-  // approval `verify` exists for). On failure the bubble comes back down and
+  // (POST /chats/<id>/send — the gateway records author `user`; on every
+  // channel, e-mail included, what a policy queues is released by the
+  // server in the same request: the user's send press IS the approval
+  // `verify` exists for). On failure the bubble comes back down and
   // the words AND the staged images return to the composer for retry.
   //
   // A mail is sent in the user's name to whoever the gateway addresses, and

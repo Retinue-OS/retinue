@@ -937,18 +937,16 @@ the chat surface maps onto them rather than around them:
   user-send path, origins recorded on every outbound message) and adds no new
   bypass.
 
-**E-mail** is the one channel where the first point does not hold
-([mail-chats.md](mail-chats.md), Decisions): a send from the composer goes
-through `EMAIL_SEND_POLICY` like anyone's. The press is passed to the mail
-gateway as `user_approved`, so under `trust` and `allow` it sends; under
-`verify` the mail is queued although the user typed it, and the web-gateway
-does not release it — `_chat_send_via_gateway` approves a queued send for
-the messengers only; a mail goes through `_mail_send`. The send answers
-`202` with the pending send, the chat shows it as a pending bubble with its
-approval link, and `/sends` is where it is allowed, with recipients, subject
-and text on one card. So for mail the draft area does not replace `/sends`;
-the two meet in the chat, which lists every send of its thread that is not
-over, whoever made it — waiting, being sent, or failed with its reason. The
+**E-mail** follows the first point too ([mail-chats.md](mail-chats.md),
+Decisions): a send from the composer goes through `EMAIL_SEND_POLICY` like
+anyone's, the press passed on as `user_approved` (so `trust` and `allow`
+send), and a mail `verify` queues is released in the same request —
+`_mail_send_pressed`, the mail counterpart of `_chat_send_via_gateway`.
+Only a press whose release fails leaves a pending bubble with its approval
+link. An agent's mail under `verify` still waits on `/sends`, with
+recipients, subject and text on one card; the chat lists every send of its
+thread that is not over, whoever made it — waiting, being sent, or failed
+with its reason. The
 companion of a mail thread stages drafts like any companion and, unlike a
 messenger chat's, has a send path that is the thread's own:
 `scripts/mail-push.py`, under the same policy, when the user asks for it

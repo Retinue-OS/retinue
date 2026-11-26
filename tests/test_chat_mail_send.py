@@ -153,6 +153,9 @@ def _gateway_state(account: str) -> dict:
             # `hold` it has not ended when the next request arrives
             # (_carry_out ends it).
             "hold": False,
+            # An HTTP status the approval of a send answers instead (a
+            # gateway that will not release it), or None.
+            "approve_refused": None,
             # Whether an answer given from an earlier entry says so
             # ("repeat": true), and whether a key whose send failed for
             # certain is tried afresh — both as scripts/mail-gateway.py
@@ -533,6 +536,8 @@ def _mail_gateway(gw: dict):
                                      "is " + entry["status"], "status": entry["status"]})
                     # (Dismissed twice: answered as it is.)
                     return self._json(200, _public(_dismiss_entry(gw, m.group(1))))
+                if verb == "approve" and gw["approve_refused"]:
+                    return self._json(gw["approve_refused"], {"error": "not now"})
                 if entry["status"] != "pending":
                     return self._json(200, _public(entry))   # decided already: as it is
                 if verb != "approve":
@@ -3528,6 +3533,92 @@ def test_spam_goes_through_the_gateway_first(base, wg):
     print("PASS test_spam_goes_through_the_gateway_first")
 
 
+# ── The press is the approval, on e-mail too ──────────────────────────────────
+
+def test_the_press_releases_a_queued_reply(base, wg):
+    """Under `verify` the gateway queues the user's reply like anyone's; the
+    press releases it in the same request, as on the messengers — the mail
+    goes out, and the chat shows it sent, not waiting for an approval."""
+    GW.update(policy="verify", send="ok", hold=False, refuse=[], approve_refused=None)
+    GW["requests"].clear()
+    sent_before = len(GW["sent"])
+    status, msg = _send(base, CHAT_C, {"text": "Gladly, Dora."})
+    assert status == 200 and msg["text"] == "Gladly, Dora.", (status, msg)
+    rid = next(r for r, e in GW["pending"].items() if e["message"] == "Gladly, Dora.")
+    posts = [path for path, _b in _posts(GW) if not path.startswith("/chats/")]
+    assert posts == ["/send", f"/pending-sends/{rid}/approve"], posts
+    assert GW["pending"][rid]["status"] == "approved"
+    assert len(GW["sent"]) == sent_before + 1 and GW["sent"][-1]["to"] == [DORA]
+    assert msg["id"] == GW["pending"][rid]["message_id"]
+    body = _messages(base, CHAT_C)
+    assert body["pending"] == [] and _chats(base)[CHAT_C]["pending"] == 0
+    _settle(wg)
+    print("PASS test_the_press_releases_a_queued_reply")
+
+
+def test_the_press_releases_a_queued_new_mail(base, wg):
+    GW.update(policy="verify", send="ok", hold=False, refuse=[], approve_refused=None)
+    sent_before = len(GW["sent"])
+    status, out = _compose(base, {"channel": "email", "to": ["yan@q.org"],
+                                  "subject": "Hello", "text": "Hello Yan"})
+    assert status == 200 and "pending" not in out, (status, out)
+    assert len(GW["sent"]) == sent_before + 1 and GW["sent"][-1]["to"] == ["yan@q.org"]
+    assert _chats(base)[out["id"]]["pending"] == 0
+    _settle(wg)
+    print("PASS test_the_press_releases_a_queued_new_mail")
+
+
+def test_a_press_the_gateway_will_not_release_stays_queued(base, wg):
+    """The honest fallback: the mail waits, with its approval link."""
+    GW.update(policy="verify", send="ok", hold=False, refuse=[], approve_refused=503)
+    sent_before = len(GW["sent"])
+    try:
+        status, out = _send(base, CHAT_C, {"text": "Second thought"})
+    finally:
+        GW["approve_refused"] = None
+    assert status == 202 and set(out) == {"pending"}, (status, out)
+    rid = out["pending"]["request_id"]
+    assert out["pending"]["approval_url"] == f"/sends/{MAIL_SLUG}/{rid}"
+    assert GW["pending"][rid]["status"] == "pending" and len(GW["sent"]) == sent_before
+    _post_plain(base, f"/sends/{MAIL_SLUG}/{rid}/reject")
+    _settle(wg)
+    print("PASS test_a_press_the_gateway_will_not_release_stays_queued")
+
+
+def test_a_released_mail_the_server_refuses_is_not_sent(base, wg):
+    """Released, and the SMTP server says no: the press ends as a send that
+    certainly failed (the words go back), and its entry is dismissed so the
+    chat does not show it failed a second time."""
+    GW.update(policy="verify", send="refused", hold=False, refuse=[], approve_refused=None)
+    try:
+        status, out = _send(base, CHAT_C, {"text": "Third try"})
+    finally:
+        GW["send"] = "ok"
+    assert status == wg.MAIL_SEND_FAILED_STATUS and out["sent"] is False, (status, out)
+    assert out["by"] == "gateway" and SMTP_REFUSAL in out["error"], out
+    assert not [e for e in GW["pending"].values() if e["message"] == "Third try"]
+    assert _messages(base, CHAT_C)["pending"] == []
+    _settle(wg)
+    print("PASS test_a_released_mail_the_server_refuses_is_not_sent")
+
+
+def test_a_release_still_sending_is_unconfirmed(base, wg):
+    """Released, and the mail is still with the SMTP server when the wait
+    ends: it may have gone out, so it is never reported as not sent."""
+    GW.update(policy="verify", send="ok", hold=True, refuse=[], approve_refused=None)
+    saved, wg.MAIL_SEND_TIMEOUT = wg.MAIL_SEND_TIMEOUT, 0.3
+    try:
+        status, out = _send(base, CHAT_C, {"text": "Fourth"})
+    finally:
+        wg.MAIL_SEND_TIMEOUT = saved
+        GW["hold"] = False
+    assert status == 202 and out.get("unconfirmed") is True, (status, out)
+    rid = next(r for r, e in GW["pending"].items() if e["message"] == "Fourth")
+    _carry_out(GW, GW["pending"][rid])
+    _settle(wg)
+    print("PASS test_a_release_still_sending_is_unconfirmed")
+
+
 def main():
     sparql = mail._serve(mail._MockSparql)
     gw_main = mail._serve(_mail_gateway(GW))
@@ -3566,6 +3657,12 @@ def main():
               ts=T0 + 30, text="hoi")
         test_can_send_states(base, wg)
         test_reply_is_sent(base, wg)
+        # From here on these tests are about a queued send as the chat and
+        # /sends show it: what an agent's send is, and what the user's
+        # press leaves where its release cannot be given. So the press's
+        # release is off (_mail_send_pressed is _mail_send without it)
+        # until the tests of the release itself, at the end.
+        pressed, wg._mail_send_pressed = wg._mail_send_pressed, wg._mail_send
         test_reply_is_queued_and_not_approved(base, wg)
         test_messenger_press_still_releases(base, wg)
         test_pending_follows_the_gateways_queue(base, wg)
@@ -3593,6 +3690,12 @@ def main():
         test_an_unsent_chat_is_forgotten_with_its_send(base, wg)
         test_delete_goes_through_the_gateway_first(base, wg, work_url)
         test_spam_goes_through_the_gateway_first(base, wg)
+        wg._mail_send_pressed = pressed
+        test_the_press_releases_a_queued_reply(base, wg)
+        test_the_press_releases_a_queued_new_mail(base, wg)
+        test_a_press_the_gateway_will_not_release_stays_queued(base, wg)
+        test_a_released_mail_the_server_refuses_is_not_sent(base, wg)
+        test_a_release_still_sending_is_unconfirmed(base, wg)
         # Every mail here arrives held (mail.GATE): the gate's own tests are
         # tests/test_chat_mail_gate.py.
         assert not mail.TURNS, "a model turn ran for a mail that is neither a VIP's nor instructed"

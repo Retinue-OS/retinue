@@ -88,10 +88,18 @@ Further decisions the build had to take:
   in a client before the mirror first saw it starts read; without that, a
   mailbox of ninety days would arrive as ninety days of unread chats. From
   then on the mailbox follows the chat and a client's `\Seen` is ignored.
-- **A send from the composer goes through the send policy too.** On the
-  messengers the user's send press is the approval. On e-mail a send under
-  `verify` queues even when the user typed it, and the chat shows it pending
-  with its approval link; under `trust` and `allow` the user's press sends.
+- **The user's send press is the approval, on e-mail as on the messengers.**
+  A send from the composer or the compose sheet goes through the send policy
+  like anyone's — under `trust` and `allow` the press (`user_approved`)
+  sends, under `verify` the gateway queues it — and the web gateway releases
+  the queued mail in the same request through `/pending-sends/<id>/approve`
+  (`_mail_send_pressed`), so the approval stands on the entry and the press
+  completes in one action. Only where that release cannot be given does the
+  mail stay queued, with its approval link. An agent's send (`mail-push.py`,
+  a companion) is not released: under `verify` it waits for the user on
+  `/sends`. (This replaces an earlier decision that left the user's own mail
+  queued under `verify`: it made the user approve what they had just typed
+  and sent, which is no safeguard.)
 - **A `news` mail that continues a mirrored thread joins it.** A `news` sender
   or list never *starts* a chat. A list mail whose `References` reach a chat
   that already exists — normally because the user wrote in that thread — is
@@ -1065,9 +1073,11 @@ the chat, never the reverse").
   (`/sends/<slug>/<id>`), is listed on `/sends` through the gateway's
   `/pending-sends`, and **shows in the chat as a pending bubble with its
   approval link** until it is sent, rejected or retracted — whoever queued it:
-  the composer, the companion or `mail-push.py`. The web gateway does not
-  approve a queued mail on the user's behalf (the messengers keep their
-  queue-then-approve behaviour). A `400` answers no recipient, an unknown chat
+  the companion, `mail-push.py`, or a press whose release failed. The web
+  gateway approves a queued mail only for the user's own press, at once, as
+  it does on the messengers; it then reads the entry until the mail is out
+  (`approved` → sent), failed for certain (→ not sent, the entry dismissed),
+  or still open after `MAIL_SEND_TIMEOUT` (→ unconfirmed, never "not sent"). A `400` answers no recipient, an unknown chat
   or an address that does not parse; a `409` a chat with no live mail.
 - **A mail that may have gone out is never reported as not sent.** `/send`
   answers as soon as the SMTP server has taken the mail; the Sent copy is filed
