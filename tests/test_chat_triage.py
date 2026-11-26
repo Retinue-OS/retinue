@@ -381,6 +381,71 @@ def test_a_note_changed_mid_run_waits_for_the_next_run():
         assert "- new note" in prompts[0] and "old note" not in prompts[0]
 
 
+def test_an_arrival_turns_word_stands_until_a_newer_message():
+    """A VIP's or instructed sender's turn already judged the message: no
+    press sorts it again — Sort again and feedback included — until a newer
+    message makes its word stale; and a batch that was running when the
+    turn wrote does not overwrite it."""
+    with tempfile.TemporaryDirectory() as d:
+        store = ct.TriageStore(Path(d) / "t.json")
+        e = ct.arrival_entry("action", "  Confirm   Monday 08:00. ", 4, "Ara:  I staged a reply.")
+        assert e["source"] == "arrival" and e["note"] == "Confirm Monday 08:00." and e["seq"] == 4
+        assert e["followup"]["state"] == "done" and e["followup"]["text"] == "Ara: I staged a reply."
+        assert "followup" not in ct.arrival_entry("archive", "x", 1, ""), "no reply, no note"
+        store.put("v", e)
+        prompts = []
+
+        def classify(prompt):
+            prompts.append(prompt)
+            if '<chat n="1"' in prompt and 'name="w"' in prompt:
+                # The arrival turn for w lands while its batch is out.
+                store.put("w", ct.arrival_entry("delete", "ad", 2))
+            n = prompt.count("<chat n=")
+            return json.dumps({"chats": [{"n": i + 1, "bucket": "archive", "note": "q"}
+                                         for i in range(n)]})
+
+        r = ct.TriageRunner(store, classify=classify, digest=lambda c: digest(c, "t"))
+        out = r.start([{"id": "v", "seq": 4}, {"id": "w", "seq": 2}], again=True)
+        assert out["total"] == 1 and out["skipped"] == 1, out
+        r.join(10)
+        snap = store.snapshot()["entries"]
+        assert snap["v"]["source"] == "arrival", "again leaves the arrival's word alone"
+        assert snap["w"]["source"] == "arrival" and snap["w"]["bucket"] == "delete", \
+            "the quick pass does not overwrite a word that landed while it ran"
+        # A newer message: the word is stale, and the next press sorts it.
+        out = r.start([{"id": "v", "seq": 5}])
+        assert out["total"] == 1, out
+        r.join(10)
+        assert store.snapshot()["entries"]["v"].get("source") is None
+
+
+def test_a_sorting_never_overwrites_an_arrival_word_in_one_write():
+    with tempfile.TemporaryDirectory() as d:
+        store = ct.TriageStore(Path(d) / "t.json")
+        store.put("a", ct.arrival_entry("action", "x", 3))
+        assert not store.put_unless_arrival("a", {"bucket": "delete", "seq": 3, "run": "r"})
+        assert store.entry("a")["source"] == "arrival"
+        assert store.put_unless_arrival("a", {"bucket": "delete", "seq": 4, "run": "r"}), \
+            "a newer message: the word is stale, the sorting writes"
+        assert store.entry("a")["bucket"] == "delete"
+        # An unsorted mark (a failed batch) does not overwrite it either.
+        store.put("b", ct.arrival_entry("archive", "y", 2))
+        r = ct.TriageRunner(store, classify=lambda p: None, digest=lambda c: digest(c, "t"))
+        r._unsorted("r", {"id": "b", "seq": 2}, "x", {"failed": 0}, __import__("threading").Lock())
+        assert store.entry("b")["source"] == "arrival"
+
+
+def test_an_arrival_word_never_replaces_an_entry_for_a_newer_message():
+    with tempfile.TemporaryDirectory() as d:
+        store = ct.TriageStore(Path(d) / "t.json")
+        store.put("a", {"bucket": "archive", "seq": 6, "run": "r"})
+        assert not store.put_arrival("a", ct.arrival_entry("delete", "old", 5))
+        assert store.entry("a")["seq"] == 6 and store.entry("a").get("source") is None
+        assert store.put_arrival("a", ct.arrival_entry("action", "same", 6)), "the same message: the word wins"
+        assert store.entry("a")["source"] == "arrival"
+        assert store.put_arrival("b", ct.arrival_entry("archive", "new chat", 1))
+
+
 if __name__ == "__main__":
     t0 = time.time()
     test_prompt_numbers_and_escapes_every_chat()
@@ -399,4 +464,7 @@ if __name__ == "__main__":
     test_feedback_notes_are_kept_and_quoted_as_the_persons_guidance()
     test_a_run_sorts_with_the_saved_notes()
     test_a_note_changed_mid_run_waits_for_the_next_run()
+    test_an_arrival_turns_word_stands_until_a_newer_message()
+    test_a_sorting_never_overwrites_an_arrival_word_in_one_write()
+    test_an_arrival_word_never_replaces_an_entry_for_a_newer_message()
     print(f"all chat-triage tests passed ({time.time() - t0:.1f}s)")

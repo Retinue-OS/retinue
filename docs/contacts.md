@@ -343,8 +343,11 @@ that turn's verdict. When a message arrives from a person with an instruction:
    Secretary, never sent), passes what the system knows (agenda, facts) to the
    Secretary for it, adds a calendar event, flags something to the user.
 3. **The turn's verdict sets attention through the attention model.** It ends
-   with `scripts/chat-verdict.py --chat <id> --importance <0–5> [--due …]
-   [--action …] [--flag …]`. Importance and deadline are all it sets; whether
+   with `scripts/chat-verdict.py --chat <id> --importance <0–5> --triage
+   <action|archive|delete> --triage-note … [--due …] [--action …] [--flag …]`
+   (the triage word is how the Chats page's Triage lists the chat, so the
+   next press does not judge it again: docs/chat-triage.md, "Arrival
+   turns"). Importance and deadline are all it sets for attention; whether
    the message then rings now, waits for the digest or is only listed is the
    attention model's decision in the Focus mode in force, as for any message
    (docs/attention-model.md). There is no delivery path of the instruction's
