@@ -352,6 +352,8 @@ docstring). Pieces:
   the user's words for every run from now on and sorts everything again
   (`POST /chats/triage {feedback}`); saved notes are listed, each with ✕
   (`POST /chats/triage/notes {remove}`).
+  The view lives at `chats.html#triage`: back from a chat opened in it (or a
+  reload) restores it from `GET /chats/triage`, sorting nothing anew.
   The view polls `GET /chats/triage` while a run sorts or a note is on its
   way, and is a history entry (back closes it); there is no multi-select
   inside it. A chat archived or deleted leaves the view.
