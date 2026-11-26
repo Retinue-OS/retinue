@@ -68,8 +68,9 @@ sorting (an arrival turn that runs anyway leaves its own word: *Arrival
 turns* below). Opening
 the view is the press: `POST /chats/triage {}` sorts every chat on the
 *Unread* tab that has no fresh word — a chat sorted before and not spoken in
-since (same `inbound_seq`) is not sorted again, so pressing twice spends
-nothing the second time. **Sort again** (`{again: true}`) sorts them all,
+since (same `inbound_seq`, and no message of the user's own newer than the
+sorting) is not sorted again, so pressing twice spends nothing the second
+time. **Sort again** (`{again: true}`) sorts them all,
 except a chat an arrival turn judged and nobody has spoken in since.
 One run at a time, and a run lasts until its follow-ups are over too: a
 press while one sorts or while Ara's notes are still on their way starts
@@ -242,7 +243,11 @@ follow-up writes only onto the entry of its own run.
 - `GET /chats/triage` → `{enabled, running, busy, model, run, entries, notes}`
   (`running`: sorting; `busy`: sorting or a follow-up still open). Which
   entries are shown is the page's to decide against its list (archived chats
-  and chats with a newer `inbound_seq` are not in a bucket).
+  and chats with a newer `inbound_seq` are not in a bucket; nor is a chat
+  whose newest message is the user's own, sent after the sorting — the
+  action it suggested was most likely taken, and no message came in to
+  change `inbound_seq`: still unread, it shows as not sorted, read, it
+  leaves the view).
 - `POST /chats/triage` (body `{again?, feedback?}`; `feedback` saves a note
   and implies `again`, `400` for one empty or over 400 characters) → `202 {started: true, total,
   skipped, …payload}` for a run started (`total` 0: nothing new to sort),

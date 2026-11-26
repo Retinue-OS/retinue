@@ -15354,6 +15354,16 @@ def _triage_payload() -> dict:
             "entries": doc.get("entries") or {}, "notes": doc.get("notes") or []}
 
 
+def _triage_replied(chat: dict) -> str | None:
+    """The stamp of the user's own message where it is the chat's newest (a
+    send that failed is no answer): a sorting older than it no longer
+    describes the chat (chat_triage.answered_since)."""
+    last = chat.get("last") or {}
+    if last.get("direction") != "out" or last.get("failed"):
+        return None
+    return last.get("ts") or None
+
+
 def _triage_start(again: bool, feedback=None) -> tuple[int, dict]:
     """Start a run over the unread chats (POST /chats/triage): 202 with the
     run started, 200 while one is already running (that run's state).
@@ -15381,7 +15391,7 @@ def _triage_start(again: bool, feedback=None) -> tuple[int, dict]:
         again = True
     if not _TRIAGE.running:
         _TRIAGE_STORE.prune({c["id"] for c in chats})
-    scope = [{"id": c["id"], "seq": c.get("inbound_seq")}
+    scope = [{"id": c["id"], "seq": c.get("inbound_seq"), "replied": _triage_replied(c)}
              for c in chats if c.get("list_group") == "unread"]
     started = _TRIAGE.start(scope, again=again)
     return (202 if started.get("started") else 200), {**started, **_triage_payload()}

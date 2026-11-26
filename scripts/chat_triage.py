@@ -385,11 +385,37 @@ def arrival_entry(bucket: str, note: str, seq: int, reply: str | None = None) ->
     return entry
 
 
-def is_fresh(entry: dict | None, seq) -> bool:
-    """Whether a stored result still describes the chat: sorted, and no
-    message has come in since (the chat's ``inbound_seq`` is the same)."""
+def _epoch(ts) -> float | None:
+    """An ISO timestamp as seconds, or None for one that is not."""
+    text = str(ts or "").strip()
+    if not text:
+        return None
+    try:
+        when = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    return when.timestamp()
+
+
+def answered_since(entry: dict | None, replied) -> bool:
+    """Whether the user wrote in the chat after it was sorted: ``replied`` is
+    the stamp of their own newest message where it is the chat's newest. Such
+    an entry no longer describes the chat — an *action* it suggested has
+    likely been taken — although no message came in."""
+    if not isinstance(entry, dict):
+        return False
+    mine, sorted_at = _epoch(replied), _epoch(entry.get("at"))
+    return mine is not None and sorted_at is not None and mine > sorted_at
+
+
+def is_fresh(entry: dict | None, seq, replied=None) -> bool:
+    """Whether a stored result still describes the chat: sorted, no message
+    has come in since (the chat's ``inbound_seq`` is the same), and the user
+    has not written in it since (``replied``, see ``answered_since``)."""
     return (isinstance(entry, dict) and entry.get("bucket") in BUCKETS
-            and entry.get("seq") == seq)
+            and entry.get("seq") == seq and not answered_since(entry, replied))
 
 
 class TriageRunner:
@@ -438,8 +464,9 @@ class TriageRunner:
             return self._running or self._open > 0
 
     def start(self, chats: list[dict], *, again: bool = False) -> dict:
-        """Start a run over ``chats`` (``[{id, seq}]``, the chats in scope,
-        newest first). A chat whose stored result is fresh is skipped unless
+        """Start a run over ``chats`` (``[{id, seq, replied?}]``, the chats in
+        scope, newest first; ``replied``: the stamp of the user's own message
+        where it is the chat's newest). A chat whose stored result is fresh is skipped unless
         ``again``. Returns ``{started, total, skipped}``; ``started`` False
         while a run is sorting or its follow-ups still work (the caller
         shows that run)."""
@@ -451,7 +478,8 @@ class TriageRunner:
             # sender's instruction and the tools, and stands until a newer
             # message makes it stale.
             todo = [c for c in chats
-                    if not is_fresh(e := self.store.entry(c["id"]), c.get("seq"))
+                    if not is_fresh(e := self.store.entry(c["id"]), c.get("seq"),
+                                    c.get("replied"))
                     or (again and e.get("source") != "arrival")]
             run_id = f"{int(time.time() * 1000):x}"
             self.store.set_run(id=run_id, state="running", started=_now(), finished=None,

@@ -478,6 +478,17 @@ const araWrites = (it) => !!(it.entry && it.entry.followup
 // armed over.
 const triKey = (items) => items.map((it) => it.chat.id).join('\n');
 
+// Whether the user wrote in a chat after triage sorted it: their own message
+// (not a failed send) is the chat's newest, and later than the sorting.
+// No message came in, so `inbound_seq` cannot tell (chat_triage.answered_since).
+export function answeredSince(chat, entry) {
+  const last = (chat && chat.last) || {};
+  if (last.direction !== 'out' || last.failed || !entry) return false;
+  const mine = Date.parse(last.ts || '');
+  const sorted = Date.parse(entry.at || '');
+  return Number.isFinite(mine) && Number.isFinite(sorted) && mine > sorted;
+}
+
 // Whether triage has work open: a run sorting, or a note Ara still writes.
 export function triageBusy(doc) {
   if (!doc) return false;
@@ -1189,6 +1200,12 @@ class RetinueChats extends RetinueCard {
         out.unsorted.push({ chat: c, entry: e, why: e.error ? `Not sorted: ${e.error}.` : 'Not sorted.' });
       } else if (Number.isInteger(c.inbound_seq) && Number.isInteger(e.seq) && c.inbound_seq !== e.seq) {
         out.unsorted.push({ chat: c, entry: e, why: 'A new message came in since it was sorted.' });
+      } else if (answeredSince(c, e)) {
+        // The user wrote in it after the sorting: its word (an action, most
+        // likely taken) no longer describes the chat. Read now, it leaves
+        // the view like any read chat never sorted; still unread, the next
+        // press sorts it again.
+        if (listGroup(c) === 'unread') out.unsorted.push({ chat: c, entry: e, why: 'You wrote in it since it was sorted.' });
       } else {
         out[e.bucket].push({ chat: c, entry: e });
       }
