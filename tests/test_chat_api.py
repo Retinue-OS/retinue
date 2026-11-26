@@ -628,6 +628,75 @@ def test_chat_list_contract(base, wg):
     print("PASS test_chat_list_contract")
 
 
+def test_contact_chats(base, wg):
+    """GET /contacts/chats: what a tap on a handle of the Contacts page opens.
+
+    A messenger handle finds the 1:1 chat whose peer it is, however the
+    number was typed — never a group — and offers a new chat under each
+    inbox account, account and all, so the reply lands in the chat the page
+    opened. A channel with no inbox gateway starts nothing. An e-mail address
+    finds every mail thread it is a participant of, and a new mail only where
+    a mailbox can send. A handle that is none is a 400."""
+    (Path(wg._CONTACTS.chambers_dir) / "private").mkdir(parents=True, exist_ok=True)
+    mara = wg._CONTACTS.create("private", "Mara Tap", [("signal", MARA)])
+    try:
+        q = urllib.parse.urlencode({"channel": "signal", "handle": "+41 79 445 63 12",
+                                    "person": mara["key"]})
+        status, body = _http(base, "GET", "/contacts/chats?" + q)
+        assert status == 200, body
+        assert body["handle"] == {"channel": "signal", "handle": MARA}, body
+        assert [c["id"] for c in body["chats"]] == [CHAT1], body
+        chat = body["chats"][0]
+        assert chat["channel"] == "signal" and chat["group"] is False and chat["ts"] == TS3, chat
+        assert body["new"] == [{"id": wg.chat_state_mod.make_chat_id("signal", MARA, ACCT_A),
+                                "account": ACCT_A}], body["new"]
+        # Another number: no chat yet, and a new one to start.
+        q = urllib.parse.urlencode({"channel": "signal", "handle": "+41790009999"})
+        status, body = _http(base, "GET", "/contacts/chats?" + q)
+        assert status == 200 and body["chats"] == [], body
+        assert body["new"][0]["id"].endswith(":+41790009999"), body
+        # The chat page opens on it before anything was ever said there.
+        status, page = _http(base, "GET", "/chats/" + _quote(body["new"][0]["id"]) + "/messages")
+        assert status == 200 and page["messages"] == [], page
+        # WhatsApp has no gateway here: nothing to list, nothing to start —
+        # and the group chat on it is nobody's 1:1.
+        q = urllib.parse.urlencode({"channel": "whatsapp", "handle": MARA})
+        status, body = _http(base, "GET", "/contacts/chats?" + q)
+        assert status == 200 and body["chats"] == [] and body["new"] == [], body
+        # An SMS sender id cannot be written to.
+        assert wg._new_chat_key("sms", "HBL", None) is None
+        assert wg._new_chat_key("whatsapp", MARA, None) == MARA.lstrip("+") + "@s.whatsapp.net"
+        assert wg._new_chat_key("whatsapp", "12345@lid", None) == "12345@lid"
+        assert wg._new_chat_key("telegram", "@mara", {"handles": [
+            {"channel": "telegram", "handle": "@mara"}, {"channel": "telegram", "handle": "777"}]}) == "777"
+        assert wg._new_chat_key("telegram", "@mara", None) is None
+        # E-mail: every thread the address is in, whoever else is on it.
+        mail_a, mail_b = "email:~me%40example.org:<a@x>", "email:~me%40example.org:<b@x>"
+        wg._CHAT_STATE.note_message(mail_a, participants=[{"address": "Mara@Example.org"}, {"address": "z@y.org"}])
+        wg._CHAT_STATE.note_message(mail_b, participants=[{"address": "z@y.org"}])
+        real = wg._chats_payload
+        wg._chats_payload = lambda: {"chats": [
+            {"id": mail_a, "channel": "email", "account": "me@example.org", "name": "Dinner",
+             "group": True, "last": {"ts": TS1}, "list_group": "read"},
+            {"id": mail_b, "channel": "email", "account": "me@example.org", "name": "Other",
+             "group": False, "last": {"ts": TS2}, "list_group": "read"}]}
+        try:
+            q = urllib.parse.urlencode({"channel": "email", "handle": "MARA@example.org"})
+            status, body = _http(base, "GET", "/contacts/chats?" + q)
+        finally:
+            wg._chats_payload = real
+        assert status == 200, body
+        assert [c["id"] for c in body["chats"]] == [mail_a], body
+        assert body["new"] == [], "no mail gateway here: no new mail offered"
+        status, body = _http(base, "GET", "/contacts/chats?channel=email&handle=nope")
+        assert status == 400, body
+        status, body = _http(base, "GET", "/contacts/chats?channel=signal")
+        assert status == 400, body
+    finally:
+        wg._CONTACTS.delete(mara["key"])
+    print("PASS test_contact_chats")
+
+
 def test_chat_list_shows_media_preview(base, wg):
     """A picture-only last message previews as an image in the chat list.
 
@@ -2733,6 +2802,7 @@ def main():
         assert att.get("type") == "image/jpeg" and att.get("size") == 717
         assert att.get("width") == 320 and att.get("height") == 420
         test_chat_list_shows_media_preview(base, wg)
+        test_contact_chats(base, wg)
         test_chat_messages_contract(base, wg)
         test_messages_before_paging(base, wg)
         test_read_watermark(base, wg)

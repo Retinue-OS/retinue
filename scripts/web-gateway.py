@@ -340,6 +340,12 @@ Messenger chats (the deterministic chat mirror; see scripts/chat_state.py):
                                          ?q=<text> searches names and e-mail
                                          addresses; ?channel=&handle= looks
                                          a handle up (email, sms, signal, …).
+  GET  /contacts/chats?channel=&handle=[&person=]
+                                      -> the chats one handle is in and how a
+                                         new one is started: {handle, chats:
+                                         [{id, channel, account, name, group,
+                                         ts, list_group}], new: [{id, account}
+                                         | {compose: true, accounts}]}.
   POST /contacts                      -> create a contact: {chamber, name,
                                          handles: [{channel, handle}],
                                          sphere?, tags?, importance?,
@@ -16356,6 +16362,114 @@ def _contact_brief(record: dict) -> dict:
     return out
 
 
+def _new_chat_key(channel: str, handle: str, person: dict | None) -> str | None:
+    """The chat key a first message to ``handle`` goes out under — the
+    recipient string the channel's own send path takes, which is also the key
+    the channel files the conversation under (docs/messenger-chats.md,
+    "Identity") — or None where no new chat can be started from the handle.
+
+    - WhatsApp: a phone number is the phone-number JID; a LID (``…@lid``) is
+      itself.
+    - Signal: the number, or the account's UUID, as filed.
+    - Telegram: the numeric user id — a message is delivered under nothing
+      else. A username or a phone is the person's one filed id beside it;
+      none, or several, and no chat is offered from it.
+    - SMS: a phone number. A sender id or short code cannot be written back.
+    E-mail is no key: a new mail is the compose sheet's."""
+    if channel == "whatsapp":
+        if _CONTACT_PHONE_RE.match(handle):
+            return handle.lstrip("+") + "@s.whatsapp.net"
+        return handle if handle.endswith("@lid") else None
+    if channel == "signal":
+        return handle
+    if channel == "telegram":
+        if re.fullmatch(r"[0-9]+", handle):
+            return handle
+        ids = [h["handle"] for h in (person or {}).get("handles") or []
+               if h.get("channel") == "telegram" and re.fullmatch(r"[0-9]+", str(h.get("handle") or ""))]
+        return ids[0] if len(ids) == 1 else None
+    if channel == "sms":
+        return handle if _CONTACT_PHONE_RE.match(handle) else None
+    return None
+
+
+_CONTACT_PHONE_RE = re.compile(r"^\+[0-9]{6,20}$")
+
+
+def _contact_chats(channel: str, handle: str, person_key: str | None = None) -> dict:
+    """The GET /contacts/chats body: the chats one handle of the address book
+    is in, and how a new one is started (docs/contacts.md, "The dashboard").
+
+    ``chats`` — the 1:1 messenger chats whose peer is the handle (its
+    normalized form, as the autolink compares it: _chat_handle), and for an
+    e-mail address every mail thread it is a participant of; a Telegram
+    username or phone also finds the chats of the person's numeric id (the
+    key Telegram delivers under). Each ``{id, channel, account, name, group,
+    ts, list_group}``, newest first. Groups are not listed for a messenger
+    handle: the person is one of many there, and a tap on their number means
+    the conversation with them.
+
+    ``new`` — how a conversation is started where none is wanted from the
+    list: for a messenger, one ``{id, account}`` per inbox account of the
+    channel whose identity is known (the id is what the first send goes out
+    under, account and all, so the chat the reply lands in is the one the
+    page opened); for e-mail ``{"compose": true, "accounts"}``, the mailboxes
+    a new mail can leave from, where there is one.
+    Empty where nothing can be started."""
+    channel, handle = contacts_mod.normalize_handle(channel, handle)
+    record = _CONTACTS.get(person_key) if person_key else None
+    person = contacts_mod.public(record) if record else None
+    wanted = {handle}
+    if channel == "telegram" and person and not re.fullmatch(r"[0-9]+", handle):
+        wanted |= {h["handle"] for h in person.get("handles") or []
+                   if h.get("channel") == "telegram" and re.fullmatch(r"[0-9]+", str(h.get("handle") or ""))}
+    mail = _is_mail(channel)
+    found = []
+    for row in _chats_payload().get("chats") or []:
+        if row.get("channel") != channel:
+            continue
+        chat_id = row.get("id") or ""
+        doc = _CHAT_STATE.get(chat_id)
+        if mail:
+            parties = list(doc.get("participants") or []) + [doc.get("peer")]
+            addresses = set()
+            for party in parties:
+                clean = chat_state_mod.clean_party(party) if party else None
+                if clean:
+                    addresses.add(clean["address"].lower())
+            if handle not in addresses:
+                continue
+        else:
+            if row.get("group") or _chat_handle(chat_id, doc) not in {(channel, h) for h in wanted}:
+                continue
+        found.append({"id": chat_id, "channel": channel, "account": row.get("account"),
+                      "name": row.get("name"), "group": bool(row.get("group")),
+                      "ts": (row.get("last") or {}).get("ts") or "",
+                      "list_group": row.get("list_group")})
+    found.sort(key=lambda c: c["ts"], reverse=True)
+    new: list = []
+    if mail:
+        # The mailboxes a new mail can leave from, as GET /chats/compose
+        # offers them: the compose sheet is opened with them.
+        accounts = []
+        for slug, gw in _inbox_gateways(MAIL_CHANNEL):
+            identity = _gateway_identity(slug, gw)
+            account = identity.get("account")
+            if account and _mail_gateway_sends(identity) and account not in accounts:
+                accounts.append(account)
+        if accounts:
+            new = [{"compose": True, "accounts": accounts}]
+    else:
+        key = _new_chat_key(channel, handle, person)
+        if key:
+            for slug, gw in _inbox_gateways(channel):
+                account = _gateway_identity(slug, gw).get("account")
+                if account:
+                    new.append({"id": chat_state_mod.make_chat_id(channel, key, account),
+                                "account": account})
+    return {"handle": {"channel": channel, "handle": handle}, "chats": found, "new": new}
+
+
 def _contact_book_for(item: dict) -> dict:
     """What the contact card needs beyond the item: where a new contact can be
     stored, which chamber is pre-selected, and who this handle may belong to."""
@@ -20074,6 +20188,26 @@ class Handler(BaseHTTPRequestHandler):
             "contacts": [_contact_brief(r) for r in records],
         })
 
+    def _handle_contact_chats(self, query: str) -> None:
+        """GET /contacts/chats?channel=&handle=[&person=] — the chats one of
+        a person's handles is in, and how a new one is started
+        (_contact_chats): what a tap on a handle of the Contacts page opens.
+        A handle that does not parse answers 400; the life store down, 502."""
+        params = urllib.parse.parse_qs(query or "")
+        first = lambda k: (params.get(k) or [""])[0].strip()  # noqa: E731
+        if not first("channel") or not first("handle"):
+            self._send_json(400, {"error": "channel and handle are required"})
+            return
+        try:
+            body = _contact_chats(first("channel"), first("handle"), first("person") or None)
+        except contacts_mod.ContactError as exc:
+            self._send_json(400, {"error": str(exc)})
+            return
+        except Exception as exc:  # noqa: BLE001 - the store, as for GET /chats
+            self._send_json(502, {"error": "life store unreachable", "detail": str(exc)})
+            return
+        self._send_json(200, body, {"Cache-Control": "no-store"})
+
     def _handle_contact_write(self, key: str | None) -> None:
         """Create a contact (POST /contacts: {chamber, name, handles, sphere?,
         tags?, domains?}) or change one (POST /contacts/<id>: {name?, sphere?,
@@ -23191,6 +23325,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if conv_path in ("/contacts", "/contacts/"):
             self._handle_contacts_get(conv_query)
+            return
+        if conv_path in ("/contacts/chats", "/contacts/chats/"):
+            self._handle_contact_chats(conv_query)
             return
         chat_media_match = _CHAT_MEDIA_RE.match(conv_path)
         if chat_media_match:
