@@ -193,8 +193,10 @@ For each file in a declared inbox:
    delegate) into a sibling `.nt`.
 4. If no destination fits, or the file cannot be read, **leave it in the inbox**
    and say so in your reply, with what you would need to file it. That is the
-   one legitimate leftover; the sweep will not re-dispatch you for it until the
-   inbox changes.
+   one legitimate leftover; the sweep will not hand it to you again while it
+   lies there unchanged. Whoever asks the user about it does so in one thread
+   per file, opened under the file's `thread_key` from the sweep's listing
+   (`conversation-push.py --key`), which the sweep closes once the file is gone.
 5. Commit the destination files, any converter changes and the inbox deletions
    **together**, in one commit per chamber, and push. Never leave an inbox
    non-empty on the remote after a push, except for the files from step 4.

@@ -182,7 +182,7 @@ def test_killed_session(mod, tmp: Path):
     except Killed:
         pass
     check("the attempt was recorded as a failure",
-          json.loads(mod.STATE_PATH.read_text()).get("failures"), 1)
+          json.loads(mod.STATE_PATH.read_text())["pending"].get("failures"), 1)
     h.now += 60
     check("the next tick does not spawn again at once", h.tick(), False)
     h.now += 3600
@@ -392,8 +392,79 @@ def test_letterbox_quarantine(mod, tmp: Path):
           (True, True, False))
 
 
+def test_one_thread_per_document(mod, tmp: Path):
+    print("a document left behind is handed over once, and its thread settles")
+    h = Harness(mod, tmp)
+    settled_keys = []
+    mod.settle_thread = settled_keys.append
+    box = h.chamber("inbox", {"inboxes": [{"id": "letterbox", "path": "."}],
+                              "destinations": []})
+    mod.letterbox.LETTERBOX_DIR = box
+    docs = h.chamber("docs", inbox_manifest())
+    (docs / "inbox").mkdir()
+    letter = box / "scan.pdf"
+    letter.write_bytes(b"letter")
+    check("the letter is handed over", h.tick(), True)
+    listing = json.loads(h.spawns[-1].split("```json\n", 1)[1].split("\n```", 1)[0])
+    key = listing[0]["thread_keys"].get("scan.pdf", "")
+    check("…with a content key for its thread", key.startswith("inbox-doc:"), True)
+    check("…and the prompt says to open its thread under that key",
+          "--key" in h.spawns[-1], True)
+    check("left behind and unchanged: nothing spawned", h.tick(), False)
+
+    # The case that raised a second thread: an arrival elsewhere.
+    (docs / "inbox" / "food.md").write_text("x")
+    check("an arrival in another inbox spawns", h.tick(), True)
+    check("…but hands over only the new file",
+          ("food.md" in h.spawns[-1], "scan.pdf" in h.spawns[-1]), (True, False))
+    (docs / "inbox" / "food.md").unlink()
+
+    (box / "other.pdf").write_bytes(b"other")
+    h.tick()
+    check("an arrival beside it does not hand it over again",
+          "scan.pdf" in h.spawns[-1], False)
+    (box / "other.pdf").unlink()
+    h.tick()
+    check("another file leaving settles not the letter's thread",
+          key in settled_keys, False)
+
+    renamed = box / "scan-again.pdf"
+    renamed.write_bytes(b"letter")
+    h.tick()
+    got = json.loads(h.spawns[-1].split("```json\n", 1)[1].split("\n```", 1)[0])
+    check("a re-dropped copy gets the same key, so the same thread",
+          got[0]["thread_keys"].get("scan-again.pdf"), key)
+    renamed.unlink()
+    h.tick()
+
+    letter.unlink()
+    h.tick()
+    check("once the letter is gone, its thread is marked done",
+          settled_keys.count(key) >= 1, True)
+    n = len(settled_keys)
+    h.tick()
+    check("…once only", len(settled_keys), n)
+
+
+def test_state_migration(mod, tmp: Path):
+    print("the old whole-listing guard is taken over without a re-run")
+    h = Harness(mod, tmp)
+    c = h.chamber("docs", inbox_manifest())
+    (c / "inbox").mkdir()
+    f = c / "inbox" / "a.pdf"
+    f.write_text("1")
+    st = f.stat()
+    mod.STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    mod.STATE_PATH.write_text(json.dumps(
+        {"signature": {"docs:inbox": {"a.pdf": [st.st_size, st.st_mtime_ns]}}}))
+    check("a file the old guard had settled is not handed over again",
+          h.tick(), False)
+    check("…and is now settled per file",
+          list(json.loads(mod.STATE_PATH.read_text())["settled"]), ["docs:inbox/a.pdf"])
+
+
 def main():
-    for test in (test_letterbox, test_letterbox_quarantine, test_gate, test_duplicate_ids, test_state_write,
+    for test in (test_one_thread_per_document, test_state_migration,test_letterbox, test_letterbox_quarantine, test_gate, test_duplicate_ids, test_state_write,
                  test_failed_session, test_killed_session,
                  test_manifests, test_nowhere_to_file, test_prompt_escaping,
                  test_symlinks,
