@@ -46,6 +46,11 @@ id the turn's prompt names: should the mail thread have been folded into
 another while the turn worked, the verdict is applied to the chat it is part
 of now, and the answer's `id` names that one.
 
+Only the frontier tier may give a verdict that rings (importance 3.5+): below
+it the call is refused with exit 3 and the advice to escalate, or lowered to 3
+where the turn cannot (scripts/ring_guard.py). A junior turn that is refused
+must escalate, not end without a verdict — a missing verdict rings.
+
 How long the ring waits for the verdict: a mail's `MAIL_INSTRUCTION_TIMEOUT`
 (600 s by default), any other message's `CHAT_INSTRUCTION_TIMEOUT` (60 s).
 
@@ -64,6 +69,10 @@ import sys
 import urllib.error
 import urllib.parse
 import urllib.request
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import ring_guard  # noqa: E402
 
 _PORT = os.environ.get("WEB_GATEWAY_PORT", "8080")
 DEFAULT_URL = os.environ.get(
@@ -109,6 +118,10 @@ def main() -> int:
     if args.importance is not None and not 0 <= args.importance <= 5:
         print(f"chat-verdict: importance is 0–5, not {args.importance:g}", file=sys.stderr)
         return 2
+    # Only the frontier tier may make something ring (scripts/ring_guard.py).
+    stop, args.importance, _ = ring_guard.check("chat-verdict", args.importance, None)
+    if stop is not None:
+        return stop
     if ":" not in args.chat:
         print(f"chat-verdict: not a chat id (want <channel>:<chat-key>): {args.chat}",
               file=sys.stderr)

@@ -96,6 +96,11 @@ mid importance and no deadline — listed, never pushed:
     --critical (rings in every mode; declare, never infer) · --actor NAME (parked
     on someone: listed under Waiting, not pushed)
 
+Only the frontier tier may make something ring: from a model session below it,
+--critical or an importance of 3.5+ is refused with exit 3 and the advice to
+escalate (RETINUE_ESCALATE_FILE), or — where the session cannot escalate —
+lowered so the thread waits for the digest (scripts/ring_guard.py).
+
 The reply reports the decision (`attention.delivery`: push / hold / list /
 waiting, with the reason and, for a hold, until when) — relay it honestly when
 the user would otherwise assume they were notified.
@@ -130,6 +135,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import attention_cli  # noqa: E402
+import ring_guard  # noqa: E402
 
 _PORT = os.environ.get("WEB_GATEWAY_PORT", "8080")
 DEFAULT_URL = os.environ.get(
@@ -406,10 +412,15 @@ def main() -> int:
         if args.project_title:
             payload["project_title"] = args.project_title
     attention = {}
+    if args.importance is not None and not 0 <= args.importance <= 5:
+        print("conversation-push: --importance must be between 0 and 5", file=sys.stderr)
+        return 2
+    # Only the frontier tier may make something ring (scripts/ring_guard.py).
+    stop, args.importance, args.critical = ring_guard.check(
+        "conversation-push", args.importance, args.critical)
+    if stop is not None:
+        return stop
     if args.importance is not None:
-        if not 0 <= args.importance <= 5:
-            print("conversation-push: --importance must be between 0 and 5", file=sys.stderr)
-            return 2
         attention["importance"] = args.importance
     if args.due:
         attention["due"] = args.due

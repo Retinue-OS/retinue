@@ -16,8 +16,10 @@ Read-only by intent
 -------------------
 The tools answer questions and read project files. None of them sends a message,
 commits, or edits anything: an outside client can learn what Retinue knows, not
-act as it. The one thing that leaves a mark is ``tell_ara``, which drops a note
-into the dashboard for the user to read.
+act as it. The things that leave a mark are ``tell_ara``, which drops a note
+into the dashboard for the user to read, and ``handle_notices``, which marks a
+group of the notice board handled (docs/notices.md) — one narrow write, done
+by this server itself through notices.py, never by the answering session.
 
 What a client *states* is a different matter from what it asks. A cowork session
 that has just filed a tax return, and says so, carries a fact Retinue should
@@ -104,6 +106,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import agent_models  # noqa: E402
 import claude_auth  # noqa: E402
 import instance_branding  # noqa: E402
+import notices  # noqa: E402
 import session_env  # noqa: E402
 
 
@@ -206,7 +209,10 @@ def _instructions(identity: str | None = None, scope: str | None = None) -> str:
         "project files directly — cheaper and more precise than asking when you "
         "already know which project you mean. `tell_ara` leaves the user a note "
         "in their dashboard; use it to report something worth their attention "
-        "rather than to ask a question.",
+        "rather than to ask a question. `list_notices` shows the notice board "
+        "(portal notifications that can wait, grouped by source and account), "
+        "and `handle_notices` marks a group handled once the user has dealt "
+        "with it — only on the user's word.",
 
         "When something has happened in your work that the user's records "
         "should reflect — a form filed, a decision taken, a date moved — say "
@@ -317,6 +323,44 @@ def _tools(name: str) -> list:
                 "required": ["note"],
             },
             "annotations": {"readOnlyHint": False, "destructiveHint": False},
+        },
+        {
+            "name": "list_notices",
+            "title": "Read the notice board",
+            "description": (
+                "List the open groups of the user's notice board: portal "
+                "notifications that can wait (new documents, logged hours, "
+                "statements), one group per source and account, with how many "
+                "are waiting since when and any deadline. Cheap and immediate."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "group": {"type": "string",
+                              "description": "Only this group, as list_notices names it."},
+                },
+            },
+            "annotations": {"readOnlyHint": True},
+        },
+        {
+            "name": "handle_notices",
+            "title": "Mark notices handled",
+            "description": (
+                "Mark one group of the notice board handled, up to now — what "
+                "the user does after reading the portal or checking the hours. "
+                "Notices arriving later open the group again. Call it only when "
+                "the user says they have dealt with the group."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "group": {"type": "string",
+                              "description": "The group key, as list_notices names it."},
+                },
+                "required": ["group"],
+            },
+            "annotations": {"readOnlyHint": False, "destructiveHint": False,
+                            "idempotentHint": True},
         },
     ]
 
@@ -820,12 +864,38 @@ def _tool_tell_ara(args: dict) -> dict:
             "url": body.get("url", "")}
 
 
+def _notice_summary(groups: list) -> list:
+    return [{k: g.get(k) for k in ("group", "source", "account", "count", "since",
+                                   "latest", "next_due", "urgent", "unsure")}
+            | {"notices": [{k: n.get(k) for k in ("id", "content", "arrivedAt", "due")}
+                           for n in g["notices"]]}
+            for g in groups]
+
+
+def _tool_list_notices(args: dict) -> dict:
+    group = (args.get("group") or "").strip() or None
+    return {"groups": _notice_summary(notices.board(group))}
+
+
+def _tool_handle_notices(args: dict) -> dict:
+    group = (args.get("group") or "").strip()
+    if not group:
+        return {"error": "group is required"}
+    try:
+        result = notices.handle(group=group, actor="cowork")
+    except LookupError as exc:
+        return {"error": str(exc)}
+    return {"status": "handled", "group": group, "handled": result["handled"]}
+
+
 TOOL_IMPL = {
     "ask_ara": _tool_ask_ara,
     "get_answer": _tool_get_answer,
     "list_projects": _tool_list_projects,
     "get_project": _tool_get_project,
     "tell_ara": _tool_tell_ara,
+    "list_notices": _tool_list_notices,
+    "handle_notices": _tool_handle_notices,
 }
 
 

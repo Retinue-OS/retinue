@@ -407,6 +407,21 @@ Each thread has a model picker (senior/junior tiers and escalation:
 project pages, voice input: `docs/dashboard.md`. Changes to `webapp/` and the
 gateway's serving logic are **Tier 3**.
 
+## Notice board
+
+Portal notices that can wait ("a new document is in your portal", logged
+hours, a statement is ready) go on the **notice board**, not into a thread:
+`scripts/notices.py add --source … --account … --text … --ref <chat id>`, one
+line per notice, grouped by source and account. The user clears a group with
+`notices.py handle <group>` (or `handle_notices` over Ask-Ara). A notice is
+**urgent** only when you can quote from the message both a deadline
+(`--due`) and a consequence (`--consequence`). Then `add` also opens a thread
+that rings. When even you, on the frontier tier, cannot tell, use `--unsure`,
+which waits for the digest. **Only the frontier tier may make anything ring**
+(`--critical`, or importance 3.5+ on `conversation-push.py`,
+`attention-set.py`, `chat-verdict.py`). Below it those CLIs exit 3: escalate,
+don't work around it. Design and rules: `docs/notices.md`.
+
 ## News feed
 
 Broadcast-style inbound (channel posts, newsletters, RSS) belongs in the news
@@ -494,6 +509,7 @@ variable a session needs is named in `RETINUE_SESSION_ENV_EXTRA`
 | webapp/gateway changes, attachments, push, voice input | `docs/dashboard.md` |
 | chamber apps: `window.Retinue`, `/apps/api/`, app reminders | `docs/chamber-apps.md` |
 | importance, urgency, focus modes, the digest — the attention model | `docs/attention-model.md`, `docs/attention-migration.md` |
+| the notice board, urgent notices, the ring guard | `docs/notices.md` |
 | news ranking/ingestion/learning changes | `docs/news.md` |
 | the Ask-Ara connector | `docs/ask-ara.md` |
 | opening a framework PR, self-update, sign-in issues | `docs/contributing.md` |

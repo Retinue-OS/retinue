@@ -138,16 +138,18 @@ def test_ping_and_unknown_method():
 
 
 def test_tools_list_is_read_only():
-    """No tool may send, commit, or edit. tell_ara writes a note, and is the
-    only one that leaves a mark — it must not claim to be read-only."""
+    """No tool may send, commit, or edit. tell_ara writes a note and
+    handle_notices closes a notice-board group; they are the only ones that
+    leave a mark, and must not claim to be read-only."""
     names = [t["name"] for t in call("tools/list")["result"]["tools"]]
     assert names == ["ask_ara", "get_answer", "list_projects",
-                     "get_project", "tell_ara"], names
+                     "get_project", "tell_ara", "list_notices",
+                     "handle_notices"], names
     for t in call("tools/list")["result"]["tools"]:
         assert t["description"] and t["inputSchema"]["type"] == "object"
-        expected = t["name"] != "tell_ara"
+        expected = t["name"] not in ("tell_ara", "handle_notices")
         assert t["annotations"]["readOnlyHint"] is expected, t["name"]
-    print("ok: the tool list is the read-only set, tell_ara flagged correctly")
+    print("ok: the tool list is the read-only set, the two writers flagged correctly")
 
 
 def _capture_session(prompt):

@@ -30,6 +30,10 @@ a raised importance can ring, and the reply says what was decided. A sphere
 or tag must be one of the deployment's spheres (attention-spheres.py lists
 them); an unknown one is refused before anything is sent.
 
+Only the frontier tier may raise an item to where it rings (--critical, or
+importance 3.5+): a model session below it is refused with exit 3 and told to
+escalate, or lowered where it cannot (scripts/ring_guard.py).
+
 Configuration (environment): CONVERSATION_BACKEND_URL / _TOKEN as for
 conversation-push.py — the endpoint is the same token-gated internal API.
 """
@@ -44,6 +48,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import attention  # noqa: E402
 import attention_cli  # noqa: E402
+import ring_guard  # noqa: E402
 
 _PORT = os.environ.get("WEB_GATEWAY_PORT", "8080")
 _BASE = os.environ.get(
@@ -83,10 +88,18 @@ def main() -> int:
         print("attention-set: CONVERSATION_BACKEND_TOKEN is not set", file=sys.stderr)
         return 2
     payload: dict = {"id": args.id}
+    if args.importance is not None and not 0 <= args.importance <= 5:
+        print("attention-set: --importance must be between 0 and 5", file=sys.stderr)
+        return 2
+    # Only the frontier tier may make something ring (scripts/ring_guard.py).
+    # --not-critical (False) passes untouched: lowering is always allowed.
+    stop, args.importance, critical = ring_guard.check(
+        "attention-set", args.importance, args.critical or None)
+    if stop is not None:
+        return stop
+    if args.critical and not critical:
+        args.critical = None
     if args.importance is not None:
-        if not 0 <= args.importance <= 5:
-            print("attention-set: --importance must be between 0 and 5", file=sys.stderr)
-            return 2
         payload["importance"] = args.importance
     if args.due is not None:
         payload["due"] = None if args.due.lower() == "none" else args.due
