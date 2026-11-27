@@ -39,6 +39,7 @@ class FakeNotifier:
         self.opened = []    # (title, message)
         self.appended = []  # (thread_id, message)
         self.quiet_flags = []  # one per append, in order
+        self.flagged = []   # (thread_id, flags)
         self._next_id = 0
 
     def open_thread(self, title, message, attention=None):
@@ -54,6 +55,12 @@ class FakeNotifier:
         self.appended.append((thread_id, message))
         self.quiet_flags.append(quiet)
         return True
+
+    def set_flags(self, thread_id, **flags):
+        if self.fail:
+            return None
+        self.flagged.append((thread_id, flags))
+        return {"id": thread_id}
 
 
 # ── classify_health ───────────────────────────────────────────────────────────
@@ -123,7 +130,25 @@ def test_recovery_reports_in_same_thread():
     # The all-clear is a record, not news: no push, and an archived thread
     # stays archived.
     assert n.quiet_flags == [True]
+    # The alert is obsolete: archived for good, unless the user starred it.
+    assert n.flagged == [("thread1", {"archived": True, "muted": True,
+                                      "unless_starred": True})]
     assert e.state["telegram"]["status"] == "up"
+    # The next outage opens a thread of its own.
+    e.step("telegram", "Telegram", "down", "session revoked", now=2000)
+    assert len(n.opened) == 2 and e.state["telegram"]["thread_id"] == "thread2"
+
+
+def test_blip_below_default_threshold_never_notifies():
+    """At the default debounce a link that heals within a few minutes never
+    reaches the user."""
+    n = FakeNotifier()
+    e = gm.MonitorEngine(n, remind_seconds=3600)
+    assert gm.FAIL_THRESHOLD >= 5
+    for i in range(gm.FAIL_THRESHOLD - 1):
+        e.step("signal", "Signal", "down", "connection lost", now=1000 + 60 * i)
+    e.step("signal", "Signal", "up", None, now=1000 + 60 * gm.FAIL_THRESHOLD)
+    assert n.opened == [] and n.appended == [] and n.flagged == []
 
 
 def test_reminder_cadence():

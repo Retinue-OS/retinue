@@ -22844,10 +22844,27 @@ class Handler(BaseHTTPRequestHandler):
         if not flags:
             self._send_json(400, {"error": "no flags given"})
             return
+        # `unless_starred`: a monitor tidying up its own alert (the outage
+        # that healed) leaves a thread the user starred where it is — the
+        # star is the user's word that they want it in view. Checked
+        # just before (a star set in the same instant may lose; the user
+        # then restores the thread).
+        if payload.get("unless_starred") is True:
+            current = _load_conv(cid)
+            if current is not None and current.get("starred"):
+                for key in ("archived", "muted"):
+                    flags.pop(key, None)
+                if not flags:
+                    self._send_json(200, _conv_summary(current))
+                    return
         conv = _conv_set_flags(cid, **flags)
         if conv is None:
             self._send_conv_missing(cid)
             return
+        # Archiving settles the thread's attention item, as the user's own
+        # archive does; un-archiving reopens what archiving settled.
+        if "archived" in flags:
+            _conv_archive_attention(cid, conv, flags["archived"])
         self._send_json(200, _conv_summary(conv))
 
     def _handle_agent_conversation_redact(self, cid: str) -> None:

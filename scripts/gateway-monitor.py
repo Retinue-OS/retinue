@@ -10,8 +10,8 @@ complains that their messages go unanswered. This daemon closes that gap:
   * Every GATEWAY_MONITOR_INTERVAL seconds (default 60) it polls the /health
     endpoint of every configured channel gateway — the same registry the
     web-gateway uses for /sends and /gateways (see messenger_gateways.py).
-  * After GATEWAY_MONITOR_FAILURES consecutive bad checks (default 2, debouncing
-    restarts and transient blips) it notifies the user through the existing
+  * After GATEWAY_MONITOR_FAILURES consecutive bad checks (default 5, about
+    five minutes, debouncing restarts and transient blips) it notifies the user through the existing
     inbound-message mechanism: it opens a dashboard conversation via the
     token-gated /internal/conversations endpoint, which fans out a Web Push
     notification to the user's devices — exactly like a new incoming message.
@@ -25,8 +25,9 @@ complains that their messages go unanswered. This daemon closes that gap:
     mail), is reported as that, never as a lost connection.
   * While a gateway stays down it re-reminds in the same thread every
     GATEWAY_MONITOR_REMIND_SECONDS (default 6 h); when the link comes back it
-    records the recovery in that thread quietly — no push, no unread badge,
-    and an archived thread stays archived. An outage that turns into one of
+    records the recovery in that thread quietly — no push, no unread badge —
+    and archives and mutes it, the alert being obsolete (a thread the user
+    starred is left where it is); a later outage opens a thread of its own. An outage that turns into one of
     another kind — the gateway that waited for its setup now cannot log in —
     is a second fault, and is told in that thread when it is seen (debounced
     like the first), not at the next reminder.
@@ -78,8 +79,10 @@ UNREAD_ATTENTION = {"importance": 3, "sphere": "system", "kind": "system notice"
 
 
 INTERVAL = float(os.environ.get("GATEWAY_MONITOR_INTERVAL", "") or "60")
-# Consecutive failed checks before the user is notified (debounce).
-FAIL_THRESHOLD = int(os.environ.get("GATEWAY_MONITOR_FAILURES", "") or "2")
+# Consecutive failed checks before the user is notified (debounce). Five at
+# the default interval: a link that heals within about five minutes — a
+# gateway restart, a phone briefly offline — never reaches the user.
+FAIL_THRESHOLD = int(os.environ.get("GATEWAY_MONITOR_FAILURES", "") or "5")
 # While a gateway stays down, re-remind in the incident thread this often.
 REMIND_SECONDS = float(os.environ.get("GATEWAY_MONITOR_REMIND_SECONDS", "") or str(6 * 3600))
 HEALTH_TIMEOUT = float(os.environ.get("GATEWAY_MONITOR_HEALTH_TIMEOUT", "") or "10")
@@ -422,6 +425,12 @@ class MonitorEngine:
                         entry["thread_id"],
                         recovery_message(label, channel, blocked=entry.get("told")),
                         quiet=True)
+                    # The alert is obsolete: archive it for good (muted, so
+                    # nothing wakes it) and settle its attention item. A
+                    # later outage opens a thread of its own. A thread the
+                    # user starred stays where they put it.
+                    self.notifier.set_flags(entry["thread_id"], archived=True,
+                                            muted=True, unless_starred=True)
                 print(f"{LOG} {slug}: recovered", flush=True)
             self.state[slug] = {"status": "up", "fails": 0,
                                 **({"unread": entry["unread"]} if entry.get("unread") else {})}

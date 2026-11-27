@@ -90,3 +90,13 @@ class ConversationNotifier:
         if body is not None and body.get("deleted") is True:
             return DELETED
         return body is not None
+
+    def set_flags(self, thread_id: str, **flags) -> dict | str | None:
+        """Set a thread's flags (archived, muted, …, and ``unless_starred``:
+        leave a thread the user starred where it is). Returns the thread's
+        summary, DELETED when the user deleted it, None when the backend is
+        unreachable."""
+        body = self._post(f"{self.base_url}/{thread_id}/flags", dict(flags))
+        if body is not None and body.get("deleted") is True:
+            return DELETED
+        return body
