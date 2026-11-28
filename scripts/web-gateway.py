@@ -4242,11 +4242,20 @@ def _conv_archive_attention(cid: str, conv: dict, archived: bool) -> None:
             _attention_mark(f"thread:{cid}", "open", "archived")
 
 
-def _conv_set_flags(cid: str, **flags) -> dict | None:
+def _conv_set_flags(cid: str, unless_starred: bool = False, **flags) -> dict | None:
+    """Set a thread's flags under the conversations lock; None when there is
+    no such thread. ``unless_starred`` leaves a starred thread where it is:
+    ``archived``/``muted`` are dropped when the thread carries the user's
+    star, decided inside the lock so a star set at the same instant wins."""
     with _conversations_lock:
         conv = _load_conv(cid)
         if conv is None:
             return None
+        if unless_starred and conv.get("starred"):
+            for key in ("archived", "muted"):
+                flags.pop(key, None)
+            if not flags:
+                return conv
         if flags.get("pending") is True:
             now = datetime.now(timezone.utc).isoformat()
             flags.setdefault("pending_since", now)
@@ -22846,21 +22855,16 @@ class Handler(BaseHTTPRequestHandler):
             return
         # `unless_starred`: a monitor tidying up its own alert (the outage
         # that healed) leaves a thread the user starred where it is — the
-        # star is the user's word that they want it in view. Checked
-        # just before (a star set in the same instant may lose; the user
-        # then restores the thread).
-        if payload.get("unless_starred") is True:
-            current = _load_conv(cid)
-            if current is not None and current.get("starred"):
-                for key in ("archived", "muted"):
-                    flags.pop(key, None)
-                if not flags:
-                    self._send_json(200, _conv_summary(current))
-                    return
-        conv = _conv_set_flags(cid, **flags)
+        # star is the user's word that they want it in view. Decided under
+        # the conversations lock, so a star set at the same instant wins.
+        unless_starred = payload.get("unless_starred") is True
+        conv = _conv_set_flags(cid, unless_starred=unless_starred, **dict(flags))
         if conv is None:
             self._send_conv_missing(cid)
             return
+        if unless_starred and conv.get("starred"):
+            flags.pop("archived", None)
+            flags.pop("muted", None)
         # Archiving settles the thread's attention item, as the user's own
         # archive does; un-archiving reopens what archiving settled.
         if "archived" in flags:

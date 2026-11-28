@@ -366,6 +366,8 @@ class MonitorEngine:
       unread      what the user was told of mail the gateway cannot read (see
                   ``_note_unread``): ``told`` such mails, at ``last_notice``,
                   in ``thread_id``. Kept across outages: it is no part of one.
+      cleanup     threads of healed outages still to archive and mute (the
+                  call failed); retried every tick, kept across outages
     """
 
     def __init__(self, notifier, state: dict | None = None,
@@ -409,14 +411,38 @@ class MonitorEngine:
             seen.update(told=standing, last_notice=now)
         # else: backend unreachable — retry on the next tick
 
+    def _tidy(self, slug: str) -> None:
+        """Archive and mute the threads of healed outages (``cleanup``): the
+        alert is obsolete, muted so nothing wakes it, and archiving settles
+        its attention item. A thread the user starred stays where they put
+        it. A thread that is gone (deleted, 404) is done; a call that fails
+        is retried on the next tick, whatever that tick's verdict — a new
+        outage has a thread of its own and leaves these untouched."""
+        entry = self.state.get(slug) or {}
+        pending = entry.get("cleanup")
+        if not pending:
+            return
+        left = [tid for tid in pending
+                if self.notifier.set_flags(tid, archived=True, muted=True,
+                                           unless_starred=True) is None]
+        if left:
+            entry["cleanup"] = left
+        else:
+            entry.pop("cleanup", None)
+
     def step(self, slug: str, label: str, verdict: str, reason: str | None,
              now: float | None = None, channel: str | None = None,
              unread: dict | None = None) -> None:
         if verdict == "unconfigured":
-            self.state.pop(slug, None)
+            left = self.state.pop(slug, None) or {}
+            if left.get("cleanup"):
+                # A healed outage's thread still to archive: kept, retried.
+                self.state[slug] = {"status": "up", "fails": 0, "cleanup": left["cleanup"]}
+                self._tidy(slug)
             return
         now = time.time() if now is None else now
         entry = self.state.setdefault(slug, {"status": "up", "fails": 0})
+        self._tidy(slug)
 
         if verdict == "up":
             if entry.get("status") == "down":
@@ -425,15 +451,17 @@ class MonitorEngine:
                         entry["thread_id"],
                         recovery_message(label, channel, blocked=entry.get("told")),
                         quiet=True)
-                    # The alert is obsolete: archive it for good (muted, so
-                    # nothing wakes it) and settle its attention item. A
-                    # later outage opens a thread of its own. A thread the
-                    # user starred stays where they put it.
-                    self.notifier.set_flags(entry["thread_id"], archived=True,
-                                            muted=True, unless_starred=True)
+                    # The alert is obsolete: archive it for good (see
+                    # _tidy). A later outage opens a thread of its own.
+                    cleanup = list(entry.get("cleanup") or [])
+                    if entry["thread_id"] not in cleanup:
+                        cleanup.append(entry["thread_id"])
+                    entry["cleanup"] = cleanup
                 print(f"{LOG} {slug}: recovered", flush=True)
             self.state[slug] = {"status": "up", "fails": 0,
-                                **({"unread": entry["unread"]} if entry.get("unread") else {})}
+                                **({"unread": entry["unread"]} if entry.get("unread") else {}),
+                                **({"cleanup": entry["cleanup"]} if entry.get("cleanup") else {})}
+            self._tidy(slug)
             self._note_unread(slug, label, unread, now, channel)
             return
 

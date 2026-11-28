@@ -139,6 +139,55 @@ def test_recovery_reports_in_same_thread():
     assert len(n.opened) == 2 and e.state["telegram"]["thread_id"] == "thread2"
 
 
+def test_failed_archive_is_retried():
+    """A healed outage's thread whose archive call failed is retried on the
+    next ticks until it lands; a new outage meanwhile keeps the marker and
+    its own thread stays out of it until it heals too."""
+    n = FakeNotifier()
+    e = gm.MonitorEngine(n, fail_threshold=1, remind_seconds=3600)
+    e.step("signal", "Signal", "down", "lost", now=1000)
+    calls = []
+    answers = iter([None, None])   # the first two archive calls fail
+
+    def flaky(thread_id, **flags):
+        calls.append(thread_id)
+        result = next(answers, {"id": thread_id})
+        if result is not None:
+            n.flagged.append((thread_id, flags))
+        return result
+
+    n.set_flags = flaky
+    e.step("signal", "Signal", "up", None, now=1060)
+    assert calls == ["thread1"] and n.flagged == []
+    assert e.state["signal"]["status"] == "up"
+    assert e.state["signal"]["cleanup"] == ["thread1"]
+    # A new outage meanwhile: the retry fails again, the marker survives and
+    # names only the healed thread.
+    e.step("signal", "Signal", "down", "lost", now=1120)
+    assert e.state["signal"]["thread_id"] == "thread2"
+    assert e.state["signal"]["cleanup"] == ["thread1"]
+    assert calls == ["thread1", "thread1"] and n.flagged == []
+    # The next tick archives the old thread; the open outage's is untouched.
+    e.step("signal", "Signal", "down", "lost", now=1180)
+    assert n.flagged == [("thread1", {"archived": True, "muted": True,
+                                      "unless_starred": True})]
+    assert "cleanup" not in e.state["signal"]
+    # When the second outage heals, its own thread is archived.
+    e.step("signal", "Signal", "up", None, now=1240)
+    assert [tid for tid, _ in n.flagged] == ["thread1", "thread2"]
+    assert "cleanup" not in e.state["signal"]
+
+
+def test_gone_thread_ends_the_cleanup():
+    """A thread the user deleted (or that is gone) needs no archiving."""
+    n = FakeNotifier()
+    e = gm.MonitorEngine(n, fail_threshold=1, remind_seconds=3600)
+    e.step("signal", "Signal", "down", "lost", now=1000)
+    n.set_flags = lambda thread_id, **flags: gm.conversation_notify.DELETED
+    e.step("signal", "Signal", "up", None, now=1060)
+    assert "cleanup" not in e.state["signal"]
+
+
 def test_blip_below_default_threshold_never_notifies():
     """At the default debounce a link that heals within a few minutes never
     reaches the user."""
