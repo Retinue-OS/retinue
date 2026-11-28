@@ -219,20 +219,79 @@ export function wantedFromQuery(search) {
   return handle && CHANNELS.includes(channel) ? { channel, handle } : null;
 }
 
-// Whether a person holds a handle: an address in any case, a number in any
-// spelling of its digits — on the asked channel, or (a number) on any, as
-// the address book's own `phones` say one person is reached on several.
-export function holdsHandle(person, channel, handle) {
-  const digits = (s) => String(s || '').replace(/[^\d+]/g, '');
-  const want = String(handle || '').trim();
-  if (!want) return false;
-  if (channel === 'email') {
-    return (person.handles || []).some((h) => h.channel === 'email' && h.handle.toLowerCase() === want.toLowerCase());
+// A handle as the address book compares it (contacts.py `_canonical` and
+// `_match_key`, mirrored rule for rule): an e-mail address lowercased; a
+// number without punctuation, `00` read as `+` (E.164); a WhatsApp
+// phone-number JID (a chat key, `41…@s.whatsapp.net`) as its number; a
+// Telegram username lowercased with its `@`; an SMS sender id ("HBL") with
+// its spaces collapsed and case-folded. A handle none of the rules fits is
+// compared as given, as the address book does with one that no longer
+// normalizes.
+const PHONE_RE = /^\+[0-9]{6,20}$/;
+const PHONE_PUNCT_RE = /[\s\-(). /]/g;
+const TG_ID_RE = /^-?[0-9]+$/;
+const TG_USERNAME_RE = /^[A-Za-z][A-Za-z0-9_]{3,31}$/;
+const SMS_SENDER_ID_RE = /^(?=.*[A-Za-z])[A-Za-z0-9 ._&-]{1,16}$/;
+const SMS_SHORT_CODE_RE = /^[0-9]{3,6}$/;
+const WA_PN_SUFFIX = '@s.whatsapp.net';
+
+export function normalizePhone(value) {
+  let raw = String(value || '').trim();
+  if (raw.toLowerCase().startsWith('tel:')) raw = raw.slice(4);
+  let compact = raw.replace(PHONE_PUNCT_RE, '');
+  if (compact.startsWith('00')) compact = `+${compact.slice(2)}`;
+  return PHONE_RE.test(compact) ? compact : raw;
+}
+
+function smsSenderId(value) {
+  return SMS_SENDER_ID_RE.test(value) || SMS_SHORT_CODE_RE.test(value);
+}
+
+export function canonicalHandle(channel, handle) {
+  const ch = String(channel || '').trim().toLowerCase();
+  const given = String(handle || '').trim();
+  let value = given;
+  if (ch === 'email') {
+    if (value.toLowerCase().startsWith('mailto:')) value = value.slice(7);
+    return value.toLowerCase();
   }
-  if ((person.handles || []).some((h) => h.channel === channel && h.handle === want)) return true;
-  const n = digits(want);
-  return n.length > 4 && ((person.phones || []).concat((person.handles || [])
-    .filter((h) => h.channel !== 'email').map((h) => h.handle))).some((x) => digits(x) === n);
+  if (ch === 'sms') {
+    value = normalizePhone(value);
+    if (PHONE_RE.test(value)) return value;
+    value = value.split(/\s+/).filter(Boolean).join(' ');
+    return smsSenderId(value) ? value : given;
+  }
+  if (ch === 'telegram' && !TG_ID_RE.test(value) && !PHONE_RE.test(normalizePhone(value))) {
+    const name = value.startsWith('@') ? value.slice(1) : value;
+    return TG_USERNAME_RE.test(name) ? `@${name.toLowerCase()}` : given;
+  }
+  if (ch === 'whatsapp' && value.toLowerCase().endsWith(WA_PN_SUFFIX)) {
+    value = `+${value.slice(0, -WA_PN_SUFFIX.length).replace(/^\++/, '')}`;
+  }
+  const maybe = normalizePhone(value);
+  return PHONE_RE.test(maybe) ? maybe : value;
+}
+
+// What two handles on one channel are compared by: the canonical spelling,
+// and an SMS sender id case-folded, as the delivery gate matches it.
+export function handleMatchKey(channel, handle) {
+  const value = canonicalHandle(channel, handle);
+  return channel === 'sms' && !PHONE_RE.test(value) && smsSenderId(value) ? value.toLowerCase() : value;
+}
+
+// Whether a person holds a handle: one of theirs on the asked channel that
+// the address book takes for the same (handleMatchKey); or, for a number,
+// that number on any channel or among their phones, as the address book's
+// own `phones` say one person is reached on several.
+export function holdsHandle(person, channel, handle) {
+  if (!String(handle || '').trim()) return false;
+  const handles = (person && person.handles) || [];
+  const want = handleMatchKey(channel, handle);
+  if (handles.some((h) => h && h.channel === channel && handleMatchKey(channel, h.handle) === want)) return true;
+  if (channel === 'email' || !PHONE_RE.test(want)) return false;
+  const numbers = ((person && person.phones) || []).map(normalizePhone)
+    .concat(handles.filter((h) => h && h.channel !== 'email').map((h) => canonicalHandle(h.channel, h.handle)));
+  return numbers.includes(want);
 }
 
 class RetinueContacts extends HTMLElement {
@@ -281,7 +340,8 @@ class RetinueContacts extends HTMLElement {
       this._startEdit(hit.id);
     } else if (want.handle) {
       this._startEdit('new');
-      this._form.handles.push({ channel: want.channel, handle: want.handle });
+      // Filed as the address book spells it: a chat key's JID as its number.
+      this._form.handles.push({ channel: want.channel, handle: canonicalHandle(want.channel, want.handle) });
       this.render();
     } else {
       this._error = 'That contact is no longer in the address book.';

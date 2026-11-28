@@ -804,8 +804,13 @@ handles, domains, VIP flag and instruction. The link (`chats.js`
   filed under, else its handle;
 - a **group** has no person: its disc is not a link.
 
-A link by handle opens whoever holds it (an address in any case, a number in
-any spelling), and otherwise starts a new contact with the handle filled in.
+A link by handle opens whoever holds it, compared as the address book
+compares handles (`contacts.py` `_canonical`/`_match_key`, mirrored in
+`contacts.js` `handleMatchKey`): an address in any case, a number in any
+spelling with `00` read as `+`, a WhatsApp chat key's phone-number JID as its
+number, a Telegram username and an SMS sender id in any case — and a number
+on any of the person's channels or phones. Otherwise it starts a new contact
+with the handle filled in, spelled as the address book files it.
 An id the book no longer has is said so, and nothing opens. The page takes
 the ask once per load; the service worker serves the cached shell for any
 query string, so the link opens offline too. The attention sheet's

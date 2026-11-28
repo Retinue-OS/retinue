@@ -79,7 +79,7 @@ const take = (pred, what) => {
   return wire.splice(i, 1)[0];
 };
 
-const { domainSpec, domainCovers, handleTarget, wantedFromQuery, holdsHandle } = await import('./contacts.js');
+const { domainSpec, domainCovers, handleTarget, wantedFromQuery, holdsHandle, canonicalHandle } = await import('./contacts.js');
 const Page = registry.get('retinue-contacts');
 assert.ok(Page, 'the element registered itself');
 
@@ -433,6 +433,31 @@ await ok('a link names whom to open: an id, or a handle on a known channel', asy
   assert.ok(holdsHandle(person('p', { phones: ['+41791234567'] }), 'signal', '+41 79 123 45 67'), 'a number in any spelling');
 });
 
+await ok('a handle is matched as the address book spells it (contacts.py _canonical/_match_key)', async () => {
+  const p = person('p', { handles: [
+    { channel: 'whatsapp', handle: '+41794456312' },
+    { channel: 'sms', handle: 'HBL' },
+    { channel: 'telegram', handle: '@mara_k' },
+  ], phones: ['+41794456312'] });
+  // A WhatsApp chat's key is a phone-number JID: the number itself.
+  assert.ok(holdsHandle(p, 'whatsapp', '41794456312@s.whatsapp.net'), 'a JID');
+  assert.ok(holdsHandle(p, 'signal', '41794456312@s.whatsapp.net') === false, 'a JID is a number on WhatsApp only');
+  // 00 is +.
+  assert.ok(holdsHandle(p, 'signal', '0041794456312'), '00 for +');
+  assert.ok(holdsHandle(p, 'whatsapp', '0041 79 445 63 12'), '00 and spaces');
+  // An SMS sender id and a Telegram username in any case.
+  assert.ok(holdsHandle(p, 'sms', 'hbl'), 'a sender id case-folded');
+  assert.ok(holdsHandle(p, 'telegram', 'Mara_K'), 'a username without its @, in any case');
+  // Not loosened beyond the rules: a different number, a WhatsApp LID, a bare prefix.
+  assert.ok(!holdsHandle(p, 'signal', '+41794456313'));
+  assert.ok(!holdsHandle(p, 'whatsapp', '41794456312@lid'));
+  assert.ok(!holdsHandle(p, 'signal', '41794456312'), 'digits without + or 00 are no E.164 number');
+  assert.equal(canonicalHandle('whatsapp', '41794456312@s.whatsapp.net'), '+41794456312');
+  assert.equal(canonicalHandle('sms', '0041 79 445 63 12'), '+41794456312');
+  assert.equal(canonicalHandle('telegram', 'Mara_K'), '@mara_k');
+  assert.equal(canonicalHandle('email', 'mailto:Mara@Example.org'), 'mara@example.org');
+});
+
 async function mountAt(search, book = BOOK()) {
   const prev = globalThis.location;
   globalThis.location = { href: '/contacts.html', search };
@@ -452,6 +477,14 @@ await ok('?channel=&handle= opens its holder, else a new contact with it filled 
   assert.equal(fresh._open, 'new');
   assert.deepEqual(fresh._form.handles, [{ channel: 'email', handle: 'new@example.org' }]);
   assert.ok(editor(fresh).includes('new@example.org'));
+  // A chat key nobody holds is filed as the address book spells it.
+  const jid = await mountAt('?channel=whatsapp&handle=41790009999%40s.whatsapp.net');
+  assert.equal(jid._open, 'new');
+  assert.deepEqual(jid._form.handles, [{ channel: 'whatsapp', handle: '+41790009999' }]);
+  // ...and one somebody holds opens them, in any spelling.
+  const held2 = await mountAt('?channel=whatsapp&handle=41794456312%40s.whatsapp.net',
+    { ...BOOK(), contacts: BOOK().contacts.concat([person('wa', { name: 'Wa', handles: [{ channel: 'whatsapp', handle: '+41794456312' }] })]) });
+  assert.equal(held2._open, 'wa');
 });
 
 await ok('an id the book no longer has says so, and opens nothing', async () => {
