@@ -35,14 +35,19 @@ def seed(mod, n: int) -> None:
     mod.store.save_items(items)
 
 
-def run(mod, score: bool):
+def run(mod, score: bool, tap: bool = False):
+    """One curation run with the session faked: ``score`` has the "Herald"
+    score an item; ``tap`` has the user's up/down tap set an importance on
+    the first item while the run is under way, the Herald scoring nothing."""
     calls = []
 
     def fake_run(cmd, cwd=None, env=None):
         calls.append(cmd)
-        if score:
+        if score or tap:
             items = mod.store.load_items()
             items[0]["importance"] = 3.0
+            if score:  # news-score.py stamps what it scores; a tap does not
+                items[0]["scored_at"] = mod.store.iso(mod.store.now())
             mod.store.save_items(items)
         return SimpleNamespace(returncode=0)
 
@@ -67,6 +72,23 @@ def main() -> int:
         if rc == 0:
             print("FAIL: a clean exit that scored nothing returned 0")
             failures += 1
+        # The prompt must follow "--": --add-dir takes several directories
+        # and would swallow it, and the CLI would then exit with no input.
+        if cmd[-2] != "--" or not cmd[-1].strip() or "--" in cmd[:-2]:
+            print(f"FAIL: the prompt does not follow a single '--': {cmd[-3:]!r}")
+            failures += 1
+        if cmd.index("--") < i:
+            print("FAIL: --add-dir after the '--'")
+            failures += 1
+
+        # A tap of the user's during the run is no scoring by the Herald.
+        seed(mod, 3)
+        rc, _ = run(mod, score=False, tap=True)
+        if rc == 0:
+            print("FAIL: a run whose only importance came from a tap returned 0")
+            failures += 1
+
+        seed(mod, 3)
 
         rc, _ = run(mod, score=True)
         if rc != 0:

@@ -61,13 +61,22 @@ def unscored_items(limit: int) -> list[dict]:
     return pending[:limit]
 
 
-def count_scored(ids: list[str]) -> int:
-    """How many of the given items carry an importance now — read back from the
-    store after the session, since a clean exit says nothing about scoring."""
+def score_stamps(ids: list[str]) -> dict:
+    """The ``scored_at`` stamp of each given item now (None where unscored).
+    news-score.py stamps every score it writes; a user's up/down tap changes
+    ``importance`` but never ``scored_at``."""
     wanted = set(ids)
-    return sum(1 for i in store.load_items()
-               if i.get("id") in wanted
-               and isinstance(i.get("importance"), (int, float)))
+    return {i.get("id"): i.get("scored_at") for i in store.load_items()
+            if i.get("id") in wanted}
+
+
+def count_scored(ids: list[str], before: dict) -> int:
+    """How many of the given items the session scored: their ``scored_at``
+    is set and differs from ``before`` (score_stamps taken before the run) —
+    read back from the store after the session, since a clean exit says
+    nothing about scoring, and an importance alone may be the user's tap."""
+    after = score_stamps(ids)
+    return sum(1 for k in ids if after.get(k) and after.get(k) != before.get(k))
 
 
 def build_payload(items: list[dict], feedback: list[dict]) -> dict:
@@ -139,13 +148,20 @@ def main() -> int:
     # from Claude Code 2.1.317 on.
     cmd = ["claude", "-p", "--output-format=json",
            "--permission-mode", PERMISSION_MODE,
-           "--add-dir", str(store.NEWS_DIR),
-           build_prompt(path, len(items), len(feedback))]
+           "--add-dir", str(store.NEWS_DIR)]
     if CLAUDE_MODEL:
         cmd[2:2] = ["--model", CLAUDE_MODEL]
     # Per-agent model overrides for the Herald this session dispatches
     # (scripts/agent_models.py); [] when none is set.
-    cmd[-1:-1] = agent_models.cli_args()
+    cmd += agent_models.cli_args()
+    # The prompt after "--": --add-dir takes any number of directories and
+    # would otherwise read the prompt as one more, leaving the session with
+    # no input at all (as web-gateway.py builds its own commands).
+    cmd += ["--", build_prompt(path, len(items), len(feedback))]
+    # The handed-over items' score stamps before the run: what changes them is
+    # the session's scoring, never the user's up/down tap meanwhile.
+    handed = [i["id"] for i in items]
+    before = score_stamps(handed)
     # The allowlisted environment (scripts/session_env.py), never a copy of
     # this process's own: under the scheduler that is already clean, but run
     # by hand from a session it would not be. It also stamps the session's
@@ -162,13 +178,13 @@ def main() -> int:
     # A clean exit is not success: a session whose Herald could not read the
     # payload exits 0 too. Items were handed over, so some must come back
     # scored; otherwise the run fails, and the scheduler shows it.
-    if items:
-        scored = count_scored([i["id"] for i in items])
+    if handed:
+        scored = count_scored(handed, before)
         if scored == 0:
-            log(f"curation session exited 0 but scored none of {len(items)} "
+            log(f"curation session exited 0 but scored none of {len(handed)} "
                 "item(s); feedback left pending")
             return 1
-        log(f"scored {scored} of {len(items)} item(s)")
+        log(f"scored {scored} of {len(handed)} item(s)")
     # Only advance the cursor on a successful run: a failed session must see
     # the same feedback again rather than lose it.
     store.ack_feedback(cursor)
