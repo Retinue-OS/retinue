@@ -464,6 +464,8 @@ dashboard, or from the phone on the channels that echo it — not SMS), *Mark
 handled*, *Mark as read* or archiving the chat settles it. Undoing a *Mark as
 read* reopens the item only where that mark settled it.
 The chat page carries **Archive** and **Mute** switches in its header's ⋮ menu
+— buttons in the header itself where it is wide enough, next to Spam and
+Delete; Star is the star before the chat's name —
 (`POST /chats/<id>/flags {archived?, muted?}`), with the thread flags'
 meaning: an archived chat leaves the chats list and comes back when a
 message arrives unless it is muted, and muted also silences its push;
@@ -1094,6 +1096,15 @@ The Chats page (`chats.html`) sorts every messenger chat into three groups,
 `GET /chats` carries `list_group`, `unread` and `inbound_seq` (the count of
 arrivals the summary includes), and the payload `counts` — chats per group,
 for the tabs. (`group` on a chat is the boolean "a group chat", as before.)
+
+Within each group (starred chats first) the list is ordered by **last
+activity**, newest first: the summary's `active`, the later of the chat's own
+last message — inbound or outbound, the user's or a send of Ara's — and the
+user's exchange with Ara in its companion thread: the user's messages there
+and Ara's replies to them. Ara's unprompted companion turns (the note on an
+arrival, a triage follow-up; marked `arrival`) and the thread's opening line
+do not count, so neither a Triage press nor opening the pane reorders the
+list. `last` still says what the row previews and when.
 
 Beside the tabs, **Triage** sorts the *Unread* tab on the user's press into
 action (see Ara), proposed archive and proposed delete, with *Archive all* /

@@ -533,7 +533,7 @@ async function expand(el, mid, doc) {
 await ok('the header: subject, participants and account — never the Message-ID', async () => {
   const el = await open();
   const h = el._headHtml();
-  assert.ok(h.includes('<div class="head-name">Quarterly numbers</div>'), h);
+  assert.ok(h.includes('<span class="head-title">Quarterly numbers</span></div>'), h);
   assert.ok(h.includes('<small class="head-sub" title="Ann Example, Bob Builder">Ann Example, Bob Builder</small>'), h);
   assert.ok(h.includes('<small class="head-sub head-acct">via me@example.org</small>'), h);
   assert.ok(!h.includes('root@mail.example.com'), 'no key');
@@ -1167,7 +1167,7 @@ await ok('the chat page\'s menu: Spam (mail only) hands over to the list; Delete
   const m = el._menuHtml();
   const acts = [...m.matchAll(/data-chat-act="([a-z]+)"/g)].map((x) => x[1]);
   assert.deepEqual(acts, ['spam', 'delete'], m);
-  assert.ok(m.indexOf('data-flag="muted"') < m.indexOf('data-chat-act="spam"'), 'under Star, Archive, Mute');
+  assert.ok(m.indexOf('data-flag="muted"') < m.indexOf('data-chat-act="spam"'), 'under Archive, Mute');
   assert.ok(m.includes(`title="Moves the thread's mails to the Junk folder of me@example.org, then mutes and archives the chat">Spam</button>`), m);
   assert.ok(m.includes(`title="Moves the thread's mails to the Trash of me@example.org, then erases the chat here">Delete</button>`), m);
   // A messenger chat: no Spam.
