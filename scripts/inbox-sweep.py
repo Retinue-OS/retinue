@@ -20,10 +20,19 @@ handed the already-scanned listing so the agent does not re-scan.
 Re-spawn guard: the Archivist deliberately leaves a file it cannot classify in
 the inbox and reports it (archivist.md, "Processing an inbox", step 4). Without a
 guard that one file would spawn a session on every tick forever. So the sweep
-records the listing it last spawned for and stays quiet while the inbox is
-unchanged -- any added, removed or modified file makes it due again. The
-guard only settles after a session that exited cleanly; a failed one is
+remembers, per file, what a clean session has already seen ("settled") and
+hands a session only the files that are new or changed since. A file left
+behind stays settled for as long as it lies there unchanged: an arrival in
+another inbox, or beside it, does not hand it over again -- which used to
+raise a second dashboard thread about the same document. A failed session is
 retried with exponential backoff instead of being written off.
+
+One thread per document: every file handed over carries a `thread_key`
+derived from its content, and the session opens any thread about it under
+that key (conversation-push.py --key), so a repeat lands in the thread already
+open. Once a file that was left behind is gone from its inbox -- filed by the
+user, or by the Archivist after their answer -- the sweep marks that thread
+done (POST /internal/attention/set by `thread_key`).
 
 The manifest is untrusted input: every inbox and destination path must stay
 inside its chamber (a chamber with one bad path is skipped whole), an inbox
@@ -33,11 +42,14 @@ on as documents.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -77,6 +89,16 @@ def is_hidden(name: str) -> bool:
 # rather than one an hour.
 RETRY_BASE_SECONDS = 3600
 RETRY_MAX_SECONDS = 24 * 3600
+
+# Where the thread about a document is marked done once the document is gone:
+# the gateway's token-gated attention endpoint, beside /internal/conversations
+# (the same derivation as attention-set.py).
+_CONV_BASE = os.environ.get(
+    "CONVERSATION_BACKEND_URL",
+    f"http://localhost:{os.environ.get('WEB_GATEWAY_PORT', '8080')}/internal/conversations",
+).rstrip("/")
+ATTENTION_SET_URL = os.environ.get(
+    "ATTENTION_BACKEND_URL", _CONV_BASE.rsplit("/", 1)[0] + "/attention/set")
 
 # The acceptance policies a destination may declare (archivist.md, "The
 # `.inbox.json` contract"). Anything else would make the destination
@@ -304,6 +326,89 @@ def signature(scan: list[dict]) -> dict:
     return sig
 
 
+def file_entries(scan: list[dict]) -> dict[str, dict]:
+    """Every pending file by a stable id (inbox key + path in the inbox),
+    with its stat and where it lies -- the unit the guard settles."""
+    out: dict[str, dict] = {}
+    for item_key, files in signature(scan).items():
+        for rel, stat in files.items():
+            out[f"{item_key}/{rel}"] = {"stat": stat, "inbox": item_key,
+                                         "rel": rel}
+    return out
+
+
+def thread_key(path: Path) -> str | None:
+    """The identity a thread about this document is opened under: its
+    content, so a renamed or re-dropped copy of the same scan lands in the
+    thread already open, while an edited one is a new document."""
+    h = hashlib.sha256()
+    try:
+        with path.open("rb") as fh:
+            for chunk in iter(lambda: fh.read(1 << 20), b""):
+                h.update(chunk)
+    except OSError:
+        return None
+    return "inbox-doc:" + h.hexdigest()
+
+
+def settle_thread(key: str) -> bool:
+    """Mark the thread opened under `key` done: its document has left the
+    inbox, so the question it asked is answered. True once that is settled
+    -- marked done (2xx), never opened because the Archivist needed no
+    decision (404), or deleted by the user (410, their answer). False when
+    it could not be told (no token, gateway down, any other error): the
+    caller keeps the key and tries again next tick, so an outage such as a
+    self-update never leaves a thread open for good."""
+    token = os.environ.get("CONVERSATION_BACKEND_TOKEN", "").strip()
+    if not token:
+        print(f"[inbox-sweep] cannot settle thread {key}: no "
+              "CONVERSATION_BACKEND_TOKEN", file=sys.stderr)
+        return False
+    req = urllib.request.Request(
+        ATTENTION_SET_URL,
+        data=json.dumps({"key": key, "state": "done"}).encode("utf-8"),
+        headers={"Content-Type": "application/json",
+                 "X-Conversation-Backend-Token": token},
+        method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=30):
+            print(f"[inbox-sweep] document gone; its thread is done ({key})",
+                  file=sys.stderr)
+            return True
+    except urllib.error.HTTPError as e:
+        if e.code in (404, 410):
+            return True
+        print(f"[inbox-sweep] could not settle thread {key}: HTTP {e.code}",
+              file=sys.stderr)
+    except (urllib.error.URLError, OSError) as e:
+        print(f"[inbox-sweep] could not settle thread {key}: {e}",
+              file=sys.stderr)
+    return False
+
+
+def settled_from(state: dict, current: dict[str, dict],
+                 paths: dict[str, Path]) -> dict[str, dict]:
+    """The settled files on record, migrating the old whole-listing guard.
+
+    Before per-file settling the state held one `signature` of the whole
+    listing, settled when it carried no failures. Its files are taken over
+    as settled where they still lie unchanged, so the upgrade itself does
+    not hand the Archivist every file it already left behind."""
+    if "settled" in state:
+        return dict(state.get("settled") or {})
+    old = state.get("signature")
+    if not isinstance(old, dict) or state.get("failures"):
+        return {}
+    out: dict[str, dict] = {}
+    for item_key, files in old.items():
+        for rel, stat in (files or {}).items():
+            fid = f"{item_key}/{rel}"
+            if fid in current and current[fid]["stat"] == stat:
+                out[fid] = {"stat": stat, "key": thread_key(paths[fid]),
+                            "path": str(paths[fid])}
+    return out
+
+
 def load_state() -> dict:
     try:
         return json.loads(STATE_PATH.read_text(encoding="utf-8"))
@@ -343,15 +448,20 @@ def listing_json(scan: list[dict]) -> str:
     dropped the file, so they travel as data: JSON string escaping turns a
     newline into `\\n`, ASCII-only output does the same for look-alike
     characters, and a backtick is escaped too so nothing can close the fence.
+    `thread_keys` maps each file to the key a thread about it is opened under.
     """
-    data = [{
-        "chamber": item["chamber"],
-        "inbox": item["rel"],
-        "description": item["description"],
-        "path": str(item["path"]),
-        "files": [f.relative_to(item["path"]).as_posix()
-                  for f in item["files"]],
-    } for item in scan]
+    data = []
+    for item in scan:
+        names = [f.relative_to(item["path"]).as_posix() for f in item["files"]]
+        keys = item.get("keys") or {}
+        data.append({
+            "chamber": item["chamber"],
+            "inbox": item["rel"],
+            "description": item["description"],
+            "path": str(item["path"]),
+            "files": names,
+            "thread_keys": {n: keys[n] for n in names if keys.get(n)},
+        })
     text = json.dumps(data, indent=2, ensure_ascii=True)
     return text.replace("`", "\\u0060")
 
@@ -388,6 +498,15 @@ def build_prompt(scan: list[dict]) -> str:
         "flagged -- that is correct, not a failure. Report what was filed and "
         "what was left behind; only open a dashboard conversation if "
         "something needs the user's decision.",
+        "",
+        "One thread per document: open each such conversation about one "
+        "file, with `conversation-push.py --key <its thread_key>` from the "
+        "listing, verbatim -- never one thread for several files, never one "
+        "without the key. If the key already has a thread, the push lands "
+        "there; if the user deleted it, that was their answer: do not reopen "
+        "it. The sweep marks the thread done once the file leaves the inbox. "
+        "Files left behind earlier and unchanged are not listed: they are "
+        "already asked about.",
         "",
         "Pending inboxes (JSON):",
         "",
@@ -448,35 +567,120 @@ def main() -> int:
         if files:
             scan.append({**inbox, "files": files})
 
+    current = file_entries(scan)
+    paths = {}
+    for item in scan:
+        item_key = f"{item['chamber']}:{Path(item['rel']).as_posix()}"
+        for f in item["files"]:
+            paths[f"{item_key}/{f.relative_to(item['path'])}"] = f
+    state = load_state()
+    settled = settled_from(state, current, paths)
+    pending = state.get("pending") or {}
+
+    # The content key of every file lying in an inbox now (a settled file
+    # unchanged keeps the key on record, so only new or changed files are
+    # hashed), plus the keys of files left behind in an inbox not scanned
+    # this tick. A key some file still carries is not gone, whichever file
+    # it was first asked about: a renamed copy, or the same content in
+    # another inbox, keeps its thread open.
+    keys: dict[str, str | None] = {}
+    for fid, e in current.items():
+        rec = settled.get(fid)
+        if rec and rec.get("stat") == e["stat"] and rec.get("key"):
+            keys[fid] = rec["key"]
+        else:
+            keys[fid] = thread_key(paths[fid])
+    present = {k for k in keys.values() if k}
+
+    def lies_unscanned(fid: str, path: str | None) -> bool:
+        return fid not in current and bool(path) and os.path.lexists(path)
+
+    for fid, rec in settled.items():
+        if rec.get("key") and lies_unscanned(fid, rec.get("path")):
+            present.add(rec["key"])
+
+    # Keys whose thread is to be marked done: those a failed attempt left
+    # over, plus every key whose file is gone from its inbox (filed by the
+    # user, or by the Archivist after their reply) or now carries other
+    # content (edited: a new document under a new key). Checked on disk, not
+    # against the scan -- an inbox skipped this tick (a bad manifest, a
+    # letterbox not dispatched) has not been emptied.
+    to_settle = set(state.get("unsettled") or [])
+    for fid, rec in list(settled.items()):
+        if fid in current and current[fid]["stat"] == rec.get("stat"):
+            continue
+        if lies_unscanned(fid, rec.get("path")):
+            continue
+        # Changed in place (handed over again below) or gone: either way no
+        # longer settled; its old key is done unless the file still has it.
+        del settled[fid]
+        if rec.get("key") and keys.get(fid) != rec["key"]:
+            to_settle.add(rec["key"])
+    # A session that failed or was killed may have opened threads for the
+    # files it was handed: settle those whose file is gone or changed since.
+    for fid, rec in (pending.get("keys") or {}).items():
+        key = rec.get("key") if isinstance(rec, dict) else None
+        if not key or lies_unscanned(fid, rec.get("path")):
+            continue
+        if keys.get(fid) != key:
+            to_settle.add(key)
+    unsettled = sorted(k for k in to_settle - present if not settle_thread(k))
+
+    def save(**extra) -> None:
+        out = dict(extra)
+        if settled:
+            out["settled"] = settled
+        if unsettled:
+            out["unsettled"] = unsettled
+        save_state(out)
+
     if not scan:
-        # Nothing pending anywhere: forget the guard so the next arrival, even
-        # of a file that was stuck before, spawns a session again.
-        if STATE_PATH.exists():
-            save_state({})
+        # Nothing pending anywhere: the guard is empty (files left behind in
+        # an inbox skipped this tick excepted), so the next arrival, even of
+        # a file that was stuck before, spawns a session again.
+        if STATE_PATH.exists() or unsettled:
+            save()
         print("[inbox-sweep] all declared inboxes empty; nothing spawned",
               file=sys.stderr)
         return 0
 
-    current = signature(scan)
-    state = load_state()
+    todo = {fid: e for fid, e in current.items() if fid not in settled}
+    if not todo:
+        save()
+        print("[inbox-sweep] only files already handed over and left behind "
+              "(the Archivist could not classify them); nothing spawned",
+              file=sys.stderr)
+        return 0
+
+    todo_sig = {fid: e["stat"] for fid, e in todo.items()}
     now = time.time()
-    if state.get("signature") == current:
-        if not state.get("failures"):
-            print("[inbox-sweep] inbox contents unchanged since last sweep "
-                  "(likely files the Archivist could not classify); "
-                  "nothing spawned", file=sys.stderr)
-            return 0
-        if not retry_due(state, now):
+    if pending.get("signature") == todo_sig and pending.get("failures"):
+        if not retry_due(pending, now):
             print(f"[inbox-sweep] last session failed "
-                  f"({state['failures']}x); backing off", file=sys.stderr)
+                  f"({pending['failures']}x); backing off", file=sys.stderr)
+            save(pending=pending)
             return 0
 
-    total = sum(len(i["files"]) for i in scan)
-    print(f"[inbox-sweep] {total} file(s) pending across {len(scan)} inbox(es); "
+    # Hand over only the new or changed files, each with the key its thread
+    # is opened under.
+    handed = []
+    for item in scan:
+        item_key = f"{item['chamber']}:{Path(item['rel']).as_posix()}"
+        files, item_keys = [], {}
+        for f in item["files"]:
+            fid = f"{item_key}/{f.relative_to(item['path'])}"
+            if fid in todo:
+                files.append(f)
+                item_keys[f.relative_to(item["path"]).as_posix()] = keys[fid]
+        if files:
+            handed.append({**item, "files": files, "keys": item_keys})
+
+    total = sum(len(i["files"]) for i in handed)
+    print(f"[inbox-sweep] {total} new file(s) across {len(handed)} inbox(es); "
           "spawning session", file=sys.stderr)
 
     cmd = ["claude", "-p", "--output-format=json",
-           "--permission-mode", PERMISSION_MODE, build_prompt(scan)]
+           "--permission-mode", PERMISSION_MODE, build_prompt(handed)]
     if CLAUDE_MODEL:
         cmd[2:2] = ["--model", CLAUDE_MODEL]
     # Per-agent model overrides for the Archivist this session dispatches
@@ -490,15 +694,30 @@ def main() -> int:
     # scheduler kills this whole process group, so nothing after
     # subprocess.run() would get to write it -- and the next tick would spawn
     # again at once instead of backing off. A clean exit overwrites it below.
-    failures = (int(state.get("failures") or 0) + 1
-                if state.get("signature") == current else 1)
-    save_state({"signature": current, "failures": failures,
-                "attempted_at": now})
+    failures = (int(pending.get("failures") or 0) + 1
+                if pending.get("signature") == todo_sig else 1)
+    # The keys travel with it: should the session have opened a thread and
+    # the file leave during the backoff, the next tick still settles it.
+    save(pending={"signature": todo_sig, "failures": failures,
+                  "attempted_at": now,
+                  "keys": {fid: {"key": keys[fid], "path": str(paths[fid])}
+                           for fid in todo if keys[fid]}})
     result = subprocess.run(cmd, cwd="/workspace", env=env)
 
     if result.returncode == 0:
-        # Settled: whatever is still lying there was left on purpose.
-        save_state({"signature": current})
+        # Settled: whatever of it is still lying there unchanged was left on
+        # purpose, and a thread about it (if one was needed) is open under
+        # its key. What was filed is simply gone.
+        for fid, e in todo.items():
+            p = paths[fid]
+            try:
+                st = p.stat()
+            except OSError:
+                continue
+            if [st.st_size, st.st_mtime_ns] == e["stat"]:
+                settled[fid] = {"stat": e["stat"], "key": keys[fid],
+                                "path": str(p)}
+        save()
     else:
         # A failed session (API or auth hiccup) has not looked at the files;
         # the pre-recorded failure retries the same listing later, backing

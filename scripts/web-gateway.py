@@ -22417,6 +22417,26 @@ class Handler(BaseHTTPRequestHandler):
         if payload is None:
             return
         item_id = str(payload.get("id") or "").strip()
+        key = str(payload.get("key") or "").strip()
+        if key and not item_id:
+            # A thread named by the key it was opened under
+            # (conversation-push.py --key): the inbox sweep settles the
+            # thread about a document once the document is gone, knowing
+            # only the document. A key with no live thread is 404, as is
+            # an unknown id; one whose thread the user deleted is 410.
+            if len(key) > _CONV_KEY_MAX:
+                self._send_json(400, {"error": "key too long"})
+                return
+            with _conv_keys_lock:
+                cid = _conv_for_key(key)
+                gone = _deleted_conv_for_key(key) if cid is None else None
+            if gone is not None:
+                self._send_conv_missing(gone)
+                return
+            if cid is None:
+                self._send_json(404, {"error": "no thread under this key"})
+                return
+            item_id = f"thread:{cid}"
         now = _attention_now()
         with _attention_lock:
             focus = _ATTENTION.focus()

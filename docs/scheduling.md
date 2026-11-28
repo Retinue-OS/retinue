@@ -393,21 +393,34 @@ still worth emptying.
 *leave* a file it cannot classify in the inbox and report it. That is correct
 behaviour, but it means a naive gate would find the same file every hour and
 spawn a session every hour, forever — a slow credit leak with no end state. So
-the sweep records the listing it last spawned for (name, size and mtime per
-file, in `/root/.retinue/inbox-sweep/state.json`, outside the chambers like the
-scheduler's own state) and stays quiet while that listing is unchanged. Adding,
-removing, or overwriting a file makes the inbox due again; so does draining it
-completely, which clears the guard so a stuck file gets a fresh attempt the next
-time anything arrives. The guard only settles after a session that exited
-cleanly: a session that fails outright (an API or sign-in hiccup) has not looked
-at the files, so the same listing is retried with exponential backoff — the next
-tick, then after two, four, … hours, capped at a day. The job has a
-`timeout_seconds` of an hour, since one session may work through dozens of
-files; a run killed by it counts as failed, and whatever it already filed is
-gone from the listing on the retry. Because the scheduler's timeout kills the
-sweep's whole process group, the attempt is recorded as failed *before* the
-session starts and only overwritten by a clean exit, so a killed run backs off
-like any other failure.
+the sweep records, **per file**, what a session that exited cleanly has already
+seen (name, size and mtime, in `/root/.retinue/inbox-sweep/state.json`, outside
+the chambers like the scheduler's own state), and hands a session only the files
+that are new or changed since. A file left behind stays settled while it lies
+there unchanged: an arrival in another inbox, or right beside it, spawns a
+session for the newcomer alone. (The guard used to be one fingerprint of the
+whole listing, so any arrival anywhere handed every leftover over again — and
+each such session raised another dashboard thread about the same document.)
+Overwriting a file makes it new work; draining every inbox clears the guard. A
+session that fails outright (an API or sign-in hiccup) has not looked at the
+files, so the same files are retried with exponential backoff — the next tick,
+then after two, four, … hours, capped at a day. The job has a `timeout_seconds`
+of an hour, since one session may work through dozens of files; a run killed by
+it counts as failed, and whatever it already filed is gone from the listing on
+the retry. Because the scheduler's timeout kills the sweep's whole process group,
+the attempt is recorded as failed *before* the session starts and only
+overwritten by a clean exit, so a killed run backs off like any other failure.
+
+**One thread per document.** Each file handed over carries a `thread_key`
+(`inbox-doc:<sha256 of its content>`), and the session opens any dashboard
+thread about that file with `conversation-push.py --key <thread_key>` — one
+thread per file. A repeat under the key lands in the thread already open; a
+renamed or re-dropped copy of the same scan has the same key; a thread the user
+deleted is not reopened (the key answers 410). Once a file that was left behind
+is gone from its inbox — filed by the user, or by the Archivist after their
+answer — the sweep marks its thread done (`POST /internal/attention/set` with
+`{key, state: "done"}`); a key that never opened a thread (no decision was
+needed) answers 404 and is ignored.
 
 The manifest, the files and their names are all treated as untrusted:
 
