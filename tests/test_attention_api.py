@@ -1369,6 +1369,26 @@ def test_unarchive_keeps_done(base, wg):
     print("ok test_unarchive_keeps_done")
 
 
+def test_agent_archive_settles_and_spares_a_star(base, wg):
+    """An agent archiving a thread (/internal/…/flags) settles its attention
+    item as the user's archive does; with `unless_starred` — the gateway
+    monitor tidying a healed outage — a starred thread stays put."""
+    _mode(base, "chores")
+    alert = _open(base, "Signal disconnected", "Lost the link.", {"importance": 5, "sphere": "system"})
+    assert _find(_sections(base), "thread:" + alert["id"])[0] is not None
+    status, out = _http(base, "POST", f"/internal/conversations/{alert['id']}/flags",
+                        {"archived": True, "muted": True, "unless_starred": True}, AGENT)
+    assert status == 200 and out["archived"] and out["muted"], (status, out)
+    assert _find(_sections(base), "thread:" + alert["id"])[0] is None, "archiving settled it"
+    kept = _open(base, "Signal disconnected", "Lost the link.", {"importance": 5, "sphere": "system"})
+    _http(base, "POST", f"/conversations/{kept['id']}/flags", {"starred": True})
+    status, out = _http(base, "POST", f"/internal/conversations/{kept['id']}/flags",
+                        {"archived": True, "muted": True, "unless_starred": True}, AGENT)
+    assert status == 200 and not out["archived"] and not out["muted"], (status, out)
+    assert _find(_sections(base), "thread:" + kept["id"])[0] is not None, "a starred thread stays"
+    print("ok test_agent_archive_settles_and_spares_a_star")
+
+
 def test_declared_spheres_are_words(base, wg):
     """A sphere or tag an agent declares is normalised to the word the rules
     use, and the emit stays loadable N-Triples."""
@@ -1772,6 +1792,7 @@ def main():
         test_week_and_holidays(base, wg)
         test_append_reports_delivery(base, wg)
         test_unarchive_keeps_done(base, wg)
+        test_agent_archive_settles_and_spares_a_star(base, wg)
         test_declared_spheres_are_words(base, wg)
         test_own_project_thread_not_emitted(base, wg)
         test_broken_focus_document(base, wg)
