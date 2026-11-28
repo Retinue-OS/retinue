@@ -20,11 +20,15 @@ Protocol: MCP over Streamable HTTP, `POST /mcp`, stateless (no session id), plus
 clients inject into their system context — that text is what actually retrains
 the client to consult Ara before the user, so treat it as the load-bearing part.
 
-Five tools, all read-only bar the last: `ask_ara(question, context?)` (runs one
+Seven tools, all read-only bar `tell_ara` and `handle_notices`: `ask_ara(question, context?)` (runs one
 `claude -p` here and answers; slow answers hand back a job id for `get_answer`),
 `list_projects()` and `get_project(id)` (proxy the gateway's `/projects` and
 `/projects/item`, so there is no second copy of the SPARQL), and `tell_ara(note)`
-(opens a dashboard thread). The answering session runs with `Write`, `Edit` and
+(opens a dashboard thread), and the notice board's `list_notices(group?)` and
+`handle_notices(group)` (docs/notices.md) — the latter the connector's one data
+write, done by the server itself through `notices.py`, so a client can clear a
+group the user has dealt with while the answering session stays without Write.
+The answering session runs with `Write`, `Edit` and
 `NotebookEdit` removed and in the CLI's default permission mode, where `claude -p`
 auto-denies anything the settings allowlist does not already permit. `Bash` stays
 — without it the session cannot query the life store — so the boundary is the
