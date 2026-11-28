@@ -1045,7 +1045,14 @@ that turns into one of another kind (the gateway that waited for its setup
 now cannot log in) is told in the same thread once as many checks in a row
 have seen it as open an outage (`GATEWAY_MONITOR_FAILURES`), in the new
 kind's words and with its reason, not at the next reminder. Recovery is
-reported in the same thread. So: do **not**
+reported in the same thread, which is then archived and muted (unless the
+user starred it): the alert is obsolete, and a later outage opens its own.
+An archive call that fails is retried on every following check until it
+lands (a thread that is gone counts as done). The archive goes through
+`POST /internal/conversations/<id>/flags` with `unless_starred`, which —
+for every caller, `conversation-push.py --archive` included — settles the
+thread's attention item on archive and reopens it on unarchive
+(`docs/dashboard.md`, "Agents set the flags"). So: do **not**
 build ad-hoc liveness checks for these channels; if a user reports a channel
 seems dead, check `/gateways` (or the gateways' `/health`) first, and treat a
 `SIGNAL_SEND_POLICY`-style unconfigured channel (`configured: false`) as

@@ -627,12 +627,12 @@ that gap:
   `MESSENGER_BUILTIN_CHANNELS` leaves out `email`, its `/health` saying which.
 - **The monitor.** `scripts/gateway-monitor.py` (forked by the entrypoint in
   the `retinue` container) polls every configured gateway's `/health` once a
-  minute. After two consecutive failures it notifies the user through the
+  minute. After five consecutive failures (about five minutes) it notifies the user through the
   existing inbound-message mechanism — a dashboard conversation, which Web-
   Pushes the user's devices like any incoming message — linking to the
   re-pairing page. It reminds every 6 h while the outage lasts and records the
-  recovery in the same thread quietly (no push, no unread badge; an archived
-  thread stays archived). Tunables (all optional):
+  recovery in the same thread quietly (no push, no unread badge), then
+  archives and mutes that thread — it is obsolete — unless the user starred it. Tunables (all optional):
   `GATEWAY_MONITOR_INTERVAL`, `GATEWAY_MONITOR_FAILURES`,
   `GATEWAY_MONITOR_REMIND_SECONDS`, `GATEWAY_MONITOR_IGNORE` (comma-separated
   slugs to skip, e.g. a deliberately unlinked channel). It watches the same

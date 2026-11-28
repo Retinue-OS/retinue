@@ -2371,6 +2371,15 @@ python3 /workspace/scripts/conversation-push.py --thread <id> --archive --mute
 # flags are their own call, never mixed with a message. There is no --delete.
 ```
 
+Every archive through this door settles the thread's attention item, as the
+user's own Archive does, and every unarchive reopens what archiving settled —
+`conversation-push.py --archive`/`--unarchive` included, whoever calls it.
+The body may also carry **`unless_starred: true`**: then `archived` and
+`muted` are dropped if the thread carries the user's star (decided under the
+conversations lock, so a star set in the same instant wins). It is how the
+gateway monitor archives a healed outage's alert (see `docs/messaging.md`):
+an agent never archives a starred thread on its own initiative.
+
 A **chat's** flags have the same door for agents, `POST
 /internal/chats/<id>/flags`, with the semantics of the user's own endpoint —
 muting archives, an archive settles the attention item, and a mail thread's
