@@ -1936,19 +1936,20 @@ every chat read. A mail's Message carries `reply_to`, the addresses of its
 `Reply-To` header (`[]` without one): why a reply may go to somebody the mail
 is not from.
 
-**The send press is not the approval here.** On the messengers a send the
-policy queues is released by the web gateway in the same request: the press
-*is* the approval `verify` exists for. On e-mail it is not
-(mail-chats.md, Decisions). The press is passed on as `user_approved`, which
-is what `trust` asks for; under `verify` the mail is queued even though the
-user typed it, and the web gateway leaves it queued — it never calls
-`approve` for a mail. So the endpoint has three answers that are no error:
+**The send press is the approval here too.** As on the messengers, a send
+the policy queues is released by the web gateway in the same request: the
+press *is* the approval `verify` exists for (mail-chats.md, Decisions). The
+press is passed on as `user_approved`, which is what `trust` asks for; under
+`verify` the gateway queues the mail and the web gateway approves it at once
+(`_mail_send_pressed`) and reads the entry until it is out. So the endpoint
+has three answers that are no error:
 
 - **sent** → `200` and the Message, as on every chat: the overlay has it,
   the draft is cleared, the chat is read, its attention item settled. Where
   the mail server took the mail for some recipients and refused others, the
   Message carries `refused`, the addresses it did not reach;
-- **queued** → `202 {"pending": Pending}`. The draft is cleared — the words
+- **queued** → `202 {"pending": Pending}`, only where the press's release
+  could not be given. The draft is cleared — the words
   are in the queue — and nothing else moves: no reply has been made, so the
   chat is not read and its attention item stands;
 - **not known** → `202 {"unconfirmed": true, "request_key", "since",

@@ -721,10 +721,11 @@ out; refused recipients are named on the bubble.
 (`email_client.resolve_category`; the same JSON array `email_client.py` reads,
 now also on the `mail-gateway` service): `verify` queues, `trust` sends when
 the request carries `user_approved` and queues otherwise, `allow` sends.
-`author: "user"` grants nothing by itself. So the user's own press in the
-composer sends under `trust` and `allow`, **and queues under `verify`** — on
-the messengers a press is the approval, on e-mail it is not — and the web
-gateway never approves a queued mail on the user's behalf. The answer is `200
+`author: "user"` grants nothing by itself. The user's own press in the
+composer sends under `trust` and `allow`; under `verify` the gateway queues
+it and the web gateway releases it at once through
+`/pending-sends/<id>/approve` — the press is the approval, on e-mail as on
+the messengers. An agent's mail under `verify` waits for the user. The answer is `200
 {status: "sent", …}` or `202 {status: "pending_approval", request_id,
 approval_url, message_id, chat}`; the approval URL is built as on the other
 gateways, from `SEND_APPROVAL_BASE_URL` and the `/sends/<slug>/<id>` segment
