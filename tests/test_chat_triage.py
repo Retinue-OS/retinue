@@ -114,6 +114,16 @@ def test_freshness_is_the_inbound_seq():
     assert not ct.is_fresh(None, 4)
 
 
+def test_a_reply_of_the_users_after_the_sorting_makes_it_stale():
+    e = {"bucket": "action", "seq": 4, "at": "2026-11-21T09:00:00Z"}
+    assert ct.is_fresh(e, 4, None)
+    assert ct.is_fresh(e, 4, "2026-11-21T08:59:59Z"), "a reply the sorting saw"
+    assert not ct.is_fresh(e, 4, "2026-11-21T09:00:01.500Z")
+    assert not ct.is_fresh(e, 4, "2026-11-21T10:00:01+01:00"), "offsets compare as instants"
+    assert ct.is_fresh(e, 4, "not a time"), "an unreadable stamp changes nothing"
+    assert ct.is_fresh({"bucket": "action", "seq": 4}, 4, "2026-11-21T09:00:01Z"), "no `at`: as before"
+
+
 def _runner(store, answers, *, followup=None, **kw):
     """A runner whose model answers by chat name: ``answers[name] = bucket``
     (a missing name: the answer leaves the chat out; "FAIL" in a batch: the
@@ -176,6 +186,13 @@ def test_a_run_sorts_in_batches_and_skips_fresh_chats():
         # Nothing to sort: a run that is done at once.
         assert r.start([{"id": "old", "seq": 2}]) == {"started": True, "total": 0, "skipped": 1}
         assert store.snapshot()["run"]["state"] == "done"
+        # The user wrote in it after the sorting: no longer fresh.
+        answers["old"] = "archive"
+        at = store.entry("old")["at"]
+        replied = ct.datetime.fromtimestamp(ct._epoch(at) + 5, ct.timezone.utc).isoformat()
+        assert r.start([{"id": "old", "seq": 2, "replied": replied}])["total"] == 1
+        r.join(10)
+        assert store.snapshot()["entries"]["old"]["bucket"] == "archive"
 
 
 def test_a_failed_batch_leaves_its_chats_unsorted():

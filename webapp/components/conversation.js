@@ -1765,8 +1765,9 @@ class RetinueConversation extends HTMLElement {
     const archiveBtn = t.archived
       ? '<button class="pill" data-unarchive>Unarchive</button>'
       : '<button class="pill" data-archive>Archive</button>';
-    // The user's mark: the thread leads the Threads list while it is on.
-    const starBtn = `<button class="iconbtn star-btn${t.starred ? ' on' : ''}" data-star ` +
+    // The user's mark: the thread leads the Threads list while it is on. It
+    // sits before the title, hollow or full, as on the chat page's header.
+    const starBtn = `<button class="star-btn${t.starred ? ' on' : ''}" data-star ` +
       `aria-pressed="${!!t.starred}" aria-label="Star" ` +
       `title="${t.starred ? 'Starred — first in the Threads list. Tap to unstar' : 'Star: keep it at the top of the Threads list'}">` +
       `${t.starred ? '&#9733;' : '&#9734;'}</button>`;
@@ -1799,8 +1800,8 @@ class RetinueConversation extends HTMLElement {
     // The DOM follows that phone order, so a screen reader and the tab key
     // meet them right after the title they belong to.
     return `<div class="thread-bar">${back}` +
-      `<span class="bar-title" data-title>${esc(t.title || 'Conversation')}</span>` +
-      `<span class="bar-thread" role="group" aria-label="Conversation">${starBtn}${archiveBtn}${minBtn}</span>` +
+      `${starBtn}<span class="bar-title" data-title>${esc(t.title || 'Conversation')}</span>` +
+      `<span class="bar-thread" role="group" aria-label="Conversation">${archiveBtn}${minBtn}</span>` +
       `<span class="bar-actions" role="group" aria-label="Conversation settings">` +
       `<span data-picker>${this._modelPickerHtml()}</span>` +
       `${attentionBtn}${this._contBtnHtml()}${autoBtn}</span></div>`;
@@ -4028,8 +4029,13 @@ const CSS = `
   .iconbtn.on { background: var(--accent, #6ea8fe); border-color: var(--accent, #6ea8fe);
                 color: #0b0d12; }
   .iconbtn.on:hover { filter: brightness(1.08); }
-  .iconbtn.star-btn.on { background: transparent; border-color: #e3b341; color: #e3b341; }
-  .iconbtn.star-btn.on:hover { filter: none; }
+  /* The star before the title: hollow, or full and gold once starred. The
+     negative margin takes back most of the bar's gap towards the title. */
+  .star-btn { flex: none; border: 0; background: transparent; color: var(--muted, #8b93a3);
+              font: inherit; font-size: 1.05rem; line-height: 1; padding: 4px; margin: 0 -6px 0 -4px;
+              border-radius: 50%; cursor: pointer; -webkit-tap-highlight-color: transparent; }
+  .star-btn:hover { background: var(--card-2, #1c2230); }
+  .star-btn.on { color: #e3b341; }
   .pill { background: transparent; border: 1px solid var(--line, rgba(231, 235, 242, .08));
           border-radius: 999px; color: var(--muted, #8b93a3); cursor: pointer;
           padding: 6px 12px; font-size: .78rem; white-space: nowrap; }

@@ -629,6 +629,19 @@ domains, spheres, importance prior, the modes they may interrupt, VIP, the
 instruction (with *Copy instruction from…* to give a team the same one).
 *+ New contact* names the chamber first.
 
+**A handle leads to the conversation.** Every handle a person has on file —
+in their row and in their editor — is a link. A messenger handle (WhatsApp,
+Signal, Telegram, a phone number for SMS) opens the 1:1 chat with them on
+that channel; where there is none yet it opens a new one, under the
+channel's inbox account, and the first message sent there starts it. Where
+several chats or accounts would do, a short list asks which. An e-mail
+address always asks, unless there is nothing to choose: each mail thread the
+address is a participant of, newest first, and *New e-mail*, which opens the
+compose sheet addressed to them (a mail kept in the sheet from earlier is
+not readdressed; the sheet says the address is not in it). A handle nothing
+can be sent to (an SMS sender id, a channel with no inbox gateway) says so.
+A handle added in the editor and not saved yet is no link.
+
 The **contact card** on a chat's attention sheet (`docs/dashboard.md`) files
 the chat's peer:
 
@@ -676,6 +689,19 @@ The HTTP API behind it, for the dashboard and anything on the edge:
   `{contact, name, domain}` of the person whose domain covers an address nobody
   holds, beside the address's own `name` and `contact` (null for such an
   address) — see docs/dashboard.md, "A name that is a subject".
+- `GET /contacts/chats?channel=&handle=[&person=]` is what a tap on a handle
+  asks: `{handle, chats, new}`. `handle` is the handle as filed (normalized).
+  `chats` are `{id, channel, account, name, group, ts, list_group}`, newest
+  first: for a messenger handle the 1:1 chats whose peer it is (never a
+  group), for an e-mail address every mail thread it is a participant of. A
+  Telegram username or phone with `person` also finds the chats of that
+  person's numeric Telegram id, the key Telegram delivers under. `new` is how
+  a conversation is started: for a messenger, `{id, account}` per inbox
+  account with a known identity — the id carries the account, so the reply
+  lands in the chat the page opened (the key is the WhatsApp phone JID, the
+  Signal number or UUID, the Telegram user id, the SMS number); for e-mail
+  `{compose: true, accounts}`, the mailboxes a new mail can leave from.
+  Empty where nothing can be started. A handle that does not parse is a 400.
 - `POST /contacts` with `{chamber, name, handles: [{channel, handle}], sphere?,
   tags?, importance?, permits?, vip?, instruction?, domains?: [domain]}`
   creates a person and answers 201.

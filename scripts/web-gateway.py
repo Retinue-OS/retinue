@@ -340,6 +340,12 @@ Messenger chats (the deterministic chat mirror; see scripts/chat_state.py):
                                          ?q=<text> searches names and e-mail
                                          addresses; ?channel=&handle= looks
                                          a handle up (email, sms, signal, …).
+  GET  /contacts/chats?channel=&handle=[&person=]
+                                      -> the chats one handle is in and how a
+                                         new one is started: {handle, chats:
+                                         [{id, channel, account, name, group,
+                                         ts, list_group}], new: [{id, account}
+                                         | {compose: true, accounts}]}.
   POST /contacts                      -> create a contact: {chamber, name,
                                          handles: [{channel, handle}],
                                          sphere?, tags?, importance?,
@@ -9438,6 +9444,64 @@ def _schedule_chat_name_backfill(chat_ids) -> None:
     threading.Thread(target=run, name="chat-name-backfill", daemon=True).start()
 
 
+# When the user and Ara last spoke in a chat's companion thread, for the
+# list's order (_chats_payload, "active"). Only the user's own messages and
+# Ara's replies to them count: the fixed opening line (role "agent") and
+# Ara's unprompted turns — the note on a message's arrival and the triage
+# follow-up, both marked "arrival" — do not, so neither opening the pane nor
+# a Triage press moves a chat up. Cached per thread file by mtime and size, since the
+# list is rebuilt on every poll.
+_companion_active_cache: dict[str, tuple[tuple[int, int], str]] = {}
+_companion_active_lock = threading.Lock()
+
+
+def _utc_stamp(value: str) -> str:
+    """An ISO 8601 moment as ``YYYY-MM-DDTHH:MM:SSZ`` (UTC), or "" when it
+    is none. The chat records' stamps and the threads' differ in form
+    (``Z`` against ``+00:00``, fractions or not), so they are only compared
+    once they are in this one."""
+    raw = (value or "").strip()
+    if not raw:
+        return ""
+    try:
+        moment = datetime.fromisoformat(raw[:-1] + "+00:00" if raw.endswith("Z") else raw)
+    except ValueError:
+        return ""
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    return moment.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _companion_active(cid) -> str:
+    """The newest message of the user's, or of Ara's in reply, in companion
+    thread `cid`, as a _utc_stamp; "" for none or no such thread."""
+    if not cid or not _CONV_ID_RE.fullmatch(str(cid)):
+        return ""
+    cid = str(cid)
+    try:
+        st = os.stat(os.path.join(CONVERSATIONS_DIR, f"{cid}.json"))
+    except OSError:
+        return ""
+    # Size as well as the mtime: two writes can land in one tick of a coarse
+    # clock, and every write that adds a message makes the file longer.
+    mtime = (st.st_mtime_ns, st.st_size)
+    with _companion_active_lock:
+        hit = _companion_active_cache.get(cid)
+    if hit is not None and hit[0] == mtime:
+        return hit[1]
+    conv = _load_conv_raw(cid) or {}
+    newest = ""
+    for m in conv.get("messages") or []:
+        if not isinstance(m, dict):
+            continue
+        role = m.get("role")
+        if role == "user" or (role == "assistant" and not m.get("arrival")):
+            newest = max(newest, _utc_stamp(str(m.get("ts") or "")))
+    with _companion_active_lock:
+        _companion_active_cache[cid] = (mtime, newest)
+    return newest
+
+
 # The SPARQL-derived skeleton (chat list + unread counts) reused between
 # dashboard polls; state and overlay are merged fresh on every request. Any
 # write that changes the skeleton's truth expires it early — expires, not
@@ -10023,9 +10087,15 @@ def _chats_payload() -> dict:
             # being, or was, worked — see _instructed_note — or null.
             "instructed": doc.get("instructed") or None,
             "messages": _chat_messages_url(chat_id),
+            # What the list is ordered by: the newest of the chat's own last
+            # message (either direction) and the user's exchange with Ara in
+            # its companion (_companion_active), as a UTC stamp. `last` still
+            # says what the row previews and when that was.
+            "active": max(_utc_stamp(last.get("ts") or ""),
+                          _companion_active(doc.get("companion"))) or (last.get("ts") or ""),
             **people,
         })
-    chats.sort(key=lambda c: c["last"]["ts"], reverse=True)
+    chats.sort(key=lambda c: c["active"], reverse=True)
     _schedule_chat_name_backfill(nameless)
     _schedule_pending_sync()
     counts = {"unread": 0, "read": 0, "archived": 0}
@@ -15434,6 +15504,19 @@ def _triage_payload() -> dict:
             "entries": doc.get("entries") or {}, "notes": doc.get("notes") or []}
 
 
+def _triage_replied(chat: dict) -> str | None:
+    """The stamp of the user's own message where it is the chat's newest (a
+    send that failed is no answer, and neither is Ara's — an outbound message
+    authored "agent" — as the reply mark counts only "user" and "device"): a
+    sorting older than it no longer describes the chat
+    (chat_triage.answered_since)."""
+    last = chat.get("last") or {}
+    if (last.get("direction") != "out" or last.get("failed")
+            or last.get("author") not in ("user", "device")):
+        return None
+    return last.get("ts") or None
+
+
 def _triage_start(again: bool, feedback=None) -> tuple[int, dict]:
     """Start a run over the unread chats (POST /chats/triage): 202 with the
     run started, 200 while one is already running (that run's state).
@@ -15461,7 +15544,7 @@ def _triage_start(again: bool, feedback=None) -> tuple[int, dict]:
         again = True
     if not _TRIAGE.running:
         _TRIAGE_STORE.prune({c["id"] for c in chats})
-    scope = [{"id": c["id"], "seq": c.get("inbound_seq")}
+    scope = [{"id": c["id"], "seq": c.get("inbound_seq"), "replied": _triage_replied(c)}
              for c in chats if c.get("list_group") == "unread"]
     started = _TRIAGE.start(scope, again=again)
     return (202 if started.get("started") else 200), {**started, **_triage_payload()}
@@ -16434,6 +16517,114 @@ def _contact_brief(record: dict) -> dict:
         out["match"] = record["match"]
         out["match_domain"] = record.get("match_domain")
     return out
+
+
+def _new_chat_key(channel: str, handle: str, person: dict | None) -> str | None:
+    """The chat key a first message to ``handle`` goes out under — the
+    recipient string the channel's own send path takes, which is also the key
+    the channel files the conversation under (docs/messenger-chats.md,
+    "Identity") — or None where no new chat can be started from the handle.
+
+    - WhatsApp: a phone number is the phone-number JID; a LID (``…@lid``) is
+      itself.
+    - Signal: the number, or the account's UUID, as filed.
+    - Telegram: the numeric user id — a message is delivered under nothing
+      else. A username or a phone is the person's one filed id beside it;
+      none, or several, and no chat is offered from it.
+    - SMS: a phone number. A sender id or short code cannot be written back.
+    E-mail is no key: a new mail is the compose sheet's."""
+    if channel == "whatsapp":
+        if _CONTACT_PHONE_RE.match(handle):
+            return handle.lstrip("+") + "@s.whatsapp.net"
+        return handle if handle.endswith("@lid") else None
+    if channel == "signal":
+        return handle
+    if channel == "telegram":
+        if re.fullmatch(r"[0-9]+", handle):
+            return handle
+        ids = [h["handle"] for h in (person or {}).get("handles") or []
+               if h.get("channel") == "telegram" and re.fullmatch(r"[0-9]+", str(h.get("handle") or ""))]
+        return ids[0] if len(ids) == 1 else None
+    if channel == "sms":
+        return handle if _CONTACT_PHONE_RE.match(handle) else None
+    return None
+
+
+_CONTACT_PHONE_RE = re.compile(r"^\+[0-9]{6,20}$")
+
+
+def _contact_chats(channel: str, handle: str, person_key: str | None = None) -> dict:
+    """The GET /contacts/chats body: the chats one handle of the address book
+    is in, and how a new one is started (docs/contacts.md, "The dashboard").
+
+    ``chats`` — the 1:1 messenger chats whose peer is the handle (its
+    normalized form, as the autolink compares it: _chat_handle), and for an
+    e-mail address every mail thread it is a participant of; a Telegram
+    username or phone also finds the chats of the person's numeric id (the
+    key Telegram delivers under). Each ``{id, channel, account, name, group,
+    ts, list_group}``, newest first. Groups are not listed for a messenger
+    handle: the person is one of many there, and a tap on their number means
+    the conversation with them.
+
+    ``new`` — how a conversation is started where none is wanted from the
+    list: for a messenger, one ``{id, account}`` per inbox account of the
+    channel whose identity is known (the id is what the first send goes out
+    under, account and all, so the chat the reply lands in is the one the
+    page opened); for e-mail ``{"compose": true, "accounts"}``, the mailboxes
+    a new mail can leave from, where there is one.
+    Empty where nothing can be started."""
+    channel, handle = contacts_mod.normalize_handle(channel, handle)
+    record = _CONTACTS.get(person_key) if person_key else None
+    person = contacts_mod.public(record) if record else None
+    wanted = {handle}
+    if channel == "telegram" and person and not re.fullmatch(r"[0-9]+", handle):
+        wanted |= {h["handle"] for h in person.get("handles") or []
+                   if h.get("channel") == "telegram" and re.fullmatch(r"[0-9]+", str(h.get("handle") or ""))}
+    mail = _is_mail(channel)
+    found = []
+    for row in _chats_payload().get("chats") or []:
+        if row.get("channel") != channel:
+            continue
+        chat_id = row.get("id") or ""
+        doc = _CHAT_STATE.get(chat_id)
+        if mail:
+            parties = list(doc.get("participants") or []) + [doc.get("peer")]
+            addresses = set()
+            for party in parties:
+                clean = chat_state_mod.clean_party(party) if party else None
+                if clean:
+                    addresses.add(clean["address"].lower())
+            if handle not in addresses:
+                continue
+        else:
+            if row.get("group") or _chat_handle(chat_id, doc) not in {(channel, h) for h in wanted}:
+                continue
+        found.append({"id": chat_id, "channel": channel, "account": row.get("account"),
+                      "name": row.get("name"), "group": bool(row.get("group")),
+                      "ts": (row.get("last") or {}).get("ts") or "",
+                      "list_group": row.get("list_group")})
+    found.sort(key=lambda c: c["ts"], reverse=True)
+    new: list = []
+    if mail:
+        # The mailboxes a new mail can leave from, as GET /chats/compose
+        # offers them: the compose sheet is opened with them.
+        accounts = []
+        for slug, gw in _inbox_gateways(MAIL_CHANNEL):
+            identity = _gateway_identity(slug, gw)
+            account = identity.get("account")
+            if account and _mail_gateway_sends(identity) and account not in accounts:
+                accounts.append(account)
+        if accounts:
+            new = [{"compose": True, "accounts": accounts}]
+    else:
+        key = _new_chat_key(channel, handle, person)
+        if key:
+            for slug, gw in _inbox_gateways(channel):
+                account = _gateway_identity(slug, gw).get("account")
+                if account:
+                    new.append({"id": chat_state_mod.make_chat_id(channel, key, account),
+                                "account": account})
+    return {"handle": {"channel": channel, "handle": handle}, "chats": found, "new": new}
 
 
 def _contact_book_for(item: dict) -> dict:
@@ -20154,6 +20345,26 @@ class Handler(BaseHTTPRequestHandler):
             "contacts": [_contact_brief(r) for r in records],
         })
 
+    def _handle_contact_chats(self, query: str) -> None:
+        """GET /contacts/chats?channel=&handle=[&person=] — the chats one of
+        a person's handles is in, and how a new one is started
+        (_contact_chats): what a tap on a handle of the Contacts page opens.
+        A handle that does not parse answers 400; the life store down, 502."""
+        params = urllib.parse.parse_qs(query or "")
+        first = lambda k: (params.get(k) or [""])[0].strip()  # noqa: E731
+        if not first("channel") or not first("handle"):
+            self._send_json(400, {"error": "channel and handle are required"})
+            return
+        try:
+            body = _contact_chats(first("channel"), first("handle"), first("person") or None)
+        except contacts_mod.ContactError as exc:
+            self._send_json(400, {"error": str(exc)})
+            return
+        except Exception as exc:  # noqa: BLE001 - the store, as for GET /chats
+            self._send_json(502, {"error": "life store unreachable", "detail": str(exc)})
+            return
+        self._send_json(200, body, {"Cache-Control": "no-store"})
+
     def _handle_contact_write(self, key: str | None) -> None:
         """Create a contact (POST /contacts: {chamber, name, handles, sphere?,
         tags?, domains?}) or change one (POST /contacts/<id>: {name?, sphere?,
@@ -23273,6 +23484,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if conv_path in ("/contacts", "/contacts/"):
             self._handle_contacts_get(conv_query)
+            return
+        if conv_path in ("/contacts/chats", "/contacts/chats/"):
+            self._handle_contact_chats(conv_query)
             return
         chat_media_match = _CHAT_MEDIA_RE.match(conv_path)
         if chat_media_match:

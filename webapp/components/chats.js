@@ -112,6 +112,15 @@ import { SwipeRows, SWIPE_CSS, STAR_MARK, offerUndo, showNotice, starButtonHtml,
 import { openComposeSheet } from './compose-sheet.js';
 
 const LIST_URL = '/chats';
+// The list's order, newest first: the summary's `active` — the chat's last
+// message in either direction, or the user's exchange with Ara in its
+// companion if that is newer — else, from an older gateway, its last message.
+// Compared as moments, not strings: the two stamps may differ in form.
+const activeAt = (c) => {
+  const t = Date.parse((c && (c.active || (c.last || {}).ts)) || '');
+  return Number.isFinite(t) ? t : 0;
+};
+const byActivity = (a, b) => activeAt(b) - activeAt(a);
 // Triage (docs/chat-triage.md): what the last run said per chat, and the
 // press that starts one. While a run sorts or Ara still writes her notes,
 // the open view asks again this often.
@@ -477,6 +486,19 @@ const araWrites = (it) => !!(it.entry && it.entry.followup
 // Which rows a section holds, as one key: what an armed Delete all was
 // armed over.
 const triKey = (items) => items.map((it) => it.chat.id).join('\n');
+
+// Whether the user wrote in a chat after triage sorted it: their own message
+// (not a failed send, and not Ara's — author "agent"; only "user" and
+// "device" are the user's) is the chat's newest, and later than the sorting.
+// No message came in, so `inbound_seq` cannot tell (chat_triage.answered_since).
+export function answeredSince(chat, entry) {
+  const last = (chat && chat.last) || {};
+  if (last.direction !== 'out' || last.failed || !entry) return false;
+  if (last.author !== 'user' && last.author !== 'device') return false;
+  const mine = Date.parse(last.ts || '');
+  const sorted = Date.parse(entry.at || '');
+  return Number.isFinite(mine) && Number.isFinite(sorted) && mine > sorted;
+}
 
 // Whether triage has work open: a run sorting, or a note Ara still writes.
 export function triageBusy(doc) {
@@ -1171,7 +1193,7 @@ class RetinueChats extends RetinueCard {
   _triageSections(d) {
     const entries = (this._tri && this._tri.entries) || {};
     const all = (Array.isArray(d.chats) ? d.chats : []).filter((c) => !this._pending.has(c.id));
-    all.sort((a, b) => String((b.last || {}).ts || '').localeCompare(String((a.last || {}).ts || '')));
+    all.sort(byActivity);
     const out = { action: [], archive: [], delete: [], unsorted: [] };
     // An unread chat with no word: it came in after the sorting only where a
     // sorting finished — not before any ran (a cold #triage, a lost store),
@@ -1189,6 +1211,12 @@ class RetinueChats extends RetinueCard {
         out.unsorted.push({ chat: c, entry: e, why: e.error ? `Not sorted: ${e.error}.` : 'Not sorted.' });
       } else if (Number.isInteger(c.inbound_seq) && Number.isInteger(e.seq) && c.inbound_seq !== e.seq) {
         out.unsorted.push({ chat: c, entry: e, why: 'A new message came in since it was sorted.' });
+      } else if (answeredSince(c, e)) {
+        // The user wrote in it after the sorting: its word (an action, most
+        // likely taken) no longer describes the chat. Read now, it leaves
+        // the view like any read chat never sorted; still unread, the next
+        // press sorts it again.
+        if (listGroup(c) === 'unread') out.unsorted.push({ chat: c, entry: e, why: 'You wrote in it since it was sorted.' });
       } else {
         out[e.bucket].push({ chat: c, entry: e });
       }
@@ -2084,7 +2112,7 @@ class RetinueChats extends RetinueCard {
     const all = (Array.isArray(d.chats) ? d.chats : []).filter((c) => !(this._pending && this._pending.has(c.id)));
     // The API contract returns the list ordered by last activity; keep that
     // guarantee client-side too, so a hand-edited fixture cannot scramble it.
-    all.sort((a, b) => String((b.last || {}).ts || '').localeCompare(String((a.last || {}).ts || '')));
+    all.sort(byActivity);
     // The full page shows one tab's chats; the dashboard card shows every chat
     // that is not archived. The Archived tab is where archived chats remain
     // reachable — and where Restore puts them back.
