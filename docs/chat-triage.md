@@ -50,17 +50,28 @@ for several dozen chats — while Ara's notes are still being written; the
 status line says how many are still on their way. A chat archived or deleted
 leaves the view; back (or *‹ Chats*) returns to the tabs.
 
+The view is in the URL (`chats.html#triage`): a chat opened from it and
+left again with back lands on the view as it was — the last run's lists,
+fetched with `GET /chats/triage`, with nothing sorted anew — and so does a
+reload. Only the Triage button and *Sort again* start a run. Opened cold on
+`#triage` (a link), closing the view drops the hash in place rather than
+leaving the app.
+
 Triage never acts on a chat by itself. Archive and delete are the user's
 presses; the follow-up turn is told to send nothing, change no flag and queue
 nothing.
 
 ## When it runs
 
-**Only on the press** — there is no schedule and no arrival hook. Opening
+**Only on the press** — there is no schedule, and an arrival never starts a
+sorting (an arrival turn that runs anyway leaves its own word: *Arrival
+turns* below). Opening
 the view is the press: `POST /chats/triage {}` sorts every chat on the
 *Unread* tab that has no fresh word — a chat sorted before and not spoken in
-since (same `inbound_seq`) is not sorted again, so pressing twice spends
-nothing the second time. **Sort again** (`{again: true}`) sorts them all.
+since (same `inbound_seq`, and no message of the user's own newer than the
+sorting) is not sorted again, so pressing twice spends nothing the second
+time. **Sort again** (`{again: true}`) sorts them all,
+except a chat an arrival turn judged and nobody has spoken in since.
 One run at a time, and a run lasts until its follow-ups are over too: a
 press while one sorts or while Ara's notes are still on their way starts
 nothing and shows that run (`busy`; *Sort again* is disabled meanwhile), so
@@ -154,6 +165,48 @@ prompt forbids. Follow-ups become the default once the backend enforces a
 triage-turn capability that refuses those calls; until then a deployment
 that accepts the exposure opts in with a number.
 
+### Arrival turns
+
+A message from a VIP or from a sender with a standing instruction already
+buys a model turn on arrival, in the chat's companion, with the sender's
+instruction, the chat and the tools ([messenger-chats.md](messenger-chats.md),
+*Inbound flow*; [contacts.md](contacts.md), "The instruction"). That turn
+also says how triage lists the chat, so the next press spends no second,
+weaker judgement on it:
+
+```
+chat-verdict.py --chat <id> --triage <action|archive|delete> --triage-note "<one sentence>"
+```
+
+- An instructed turn adds `--triage` and `--triage-note` to the verdict it
+  sets anyway (`--importance …`); a VIP's turn, which sets no importance,
+  gives the triage word alone, as the last step of its prompt. The endpoint
+  (`POST /internal/chats/<id>/verdict`) takes the triage word from any
+  running arrival turn, and the importance verdict, as before, only from an
+  instructed one (`409` for a VIP's; `400` for an instructed turn without
+  importance).
+- The word is kept when the turn **completes** — not when it is given — as
+  an entry with `source: "arrival"` for the newest message count the turn
+  worked (`seq`), and with the turn's own reply in the companion as Ara's
+  note on the row (`followup.state: done`), so an action row opens on her
+  pane. A turn that fails leaves no word; the chat is sorted by the next
+  press as any other. Where the worked messages stand in the count is read
+  by message id, as the turn's own archive reads it, since a merge of the
+  chat while the turn ran renumbers the count; a message placed by no id in
+  a merged chat leaves no word either.
+- A sorting skips such a chat while its word is fresh — *Sort again* and
+  feedback included: the arrival turn had more to go on than the quick pass.
+  A newer message makes it stale, and the next press sorts the chat as any
+  other. A batch that was out when the word landed does not overwrite it:
+  the check and the write are one operation under the store's lock.
+- A word never replaces an entry for a **newer** message — a sorting that
+  ran while the turn did, a later turn's word — the same compare-and-write.
+- A mail batch too big to quote whole is worked in turns (the newest mails
+  first, the older ones deferred to a turn of their own). No one of those
+  turns has seen every mail, so **none leaves a word**: a first turn's
+  `archive` must not cover an older mail it was told to leave alone. The
+  next press judges the thread.
+
 ### Feedback
 
 Under the status line the view has **Feedback on the sorting**: a field for
@@ -161,7 +214,8 @@ what the sorting got wrong, in the user's own words ("Mails from my bank
 are never to be deleted", "a school newsletter is action"), and the notes
 saved so far, each with ✕ to take it back. **Save and sort again** keeps the
 note for every run from now on and sorts every unread chat again with it
-(`again`), so the correction applies to the whole list at once. While a run
+(`again`) — but one an arrival turn judged and nobody has spoken in since
+(*Arrival turns*) — so the correction applies to the whole list at once. While a run
 is busy the note is still saved, and the next press uses it.
 
 The notes reach the sorting pass as a `<guidance>` block between the
@@ -189,13 +243,20 @@ follow-up writes only onto the entry of its own run.
 - `GET /chats/triage` → `{enabled, running, busy, model, run, entries, notes}`
   (`running`: sorting; `busy`: sorting or a follow-up still open). Which
   entries are shown is the page's to decide against its list (archived chats
-  and chats with a newer `inbound_seq` are not in a bucket).
+  and chats with a newer `inbound_seq` are not in a bucket; nor is a chat
+  whose newest message is the user's own, sent after the sorting — the
+  action it suggested was most likely taken, and no message came in to
+  change `inbound_seq`: still unread, it shows as not sorted, read, it
+  leaves the view).
 - `POST /chats/triage` (body `{again?, feedback?}`; `feedback` saves a note
   and implies `again`, `400` for one empty or over 400 characters) → `202 {started: true, total,
   skipped, …payload}` for a run started (`total` 0: nothing new to sort),
   `200 {started: false, busy: true, …}` while one sorts or its follow-ups work, `409` with
   `CHAT_TRIAGE` off, `502` with the life store down, `403` cross-site (the
   press spends model calls on the user's behalf).
+- `POST /internal/chats/<id>/verdict` (the agent token; `chat-verdict.py`)
+  also takes `{triage, triage_note}` from a running arrival turn — *Arrival
+  turns*.
 - `POST /chats/triage/notes` (body `{remove: <note id>}`) → `200` with the
   payload, `404` for no such note, `403` cross-site. It starts no run.
 

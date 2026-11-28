@@ -15,6 +15,10 @@
 //   Text      the mail, in lines: Enter breaks one; the button or Ctrl/⌘+Enter
 //             sends
 //
+// The Contacts page opens it too, for an address tapped there (`offer.to`):
+// an empty form takes the address as its To; a mail kept from earlier is
+// never readdressed, and the sheet says the address is not in it.
+//
 // Sending is POST /chats/compose `{channel, account, to, cc, subject, text,
 // request_key}`. The gateway mints the mail's Message-ID, which becomes the
 // new chat's key, and answers `{id, message}` (sent) or `{id, pending}`
@@ -356,7 +360,28 @@ class RetinueComposeSheet extends HTMLElement {
       if (v) saveDraft(k, v);
     }
     this._said = '';
+    this._prefill(o.to);
     this._show();
+  }
+
+  // A recipient the sheet was opened for (an address tapped on the Contacts
+  // page: `offer.to`, `{address, name}` or a bare address). An empty form
+  // takes it as its To. A mail kept from earlier is never readdressed
+  // unseen — one press would send it to someone it was not written for — so
+  // the address is left out of it, and the sheet says so.
+  _prefill(to) {
+    const raw = to && typeof to === 'object' ? to : { address: to, name: '' };
+    const address = typeof raw.address === 'string' ? raw.address.trim() : '';
+    if (!isAddress(address)) return;
+    const name = typeof raw.name === 'string' ? raw.name.trim() : '';
+    const has = (list) => list.some((c) => c.address.toLowerCase() === address.toLowerCase());
+    if (has(this._chips.to) || has(this._chips.cc)) return;
+    if (this._empty()) {
+      this._chips.to = [{ address, name }];
+      return;
+    }
+    this._said = `The mail you started earlier is back, and ${address} is not added to it: ` +
+      'add the address yourself, or discard that mail to start a new one.';
   }
 
   _show() {

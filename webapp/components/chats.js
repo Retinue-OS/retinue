@@ -112,6 +112,15 @@ import { SwipeRows, SWIPE_CSS, STAR_MARK, offerUndo, showNotice, starButtonHtml,
 import { openComposeSheet } from './compose-sheet.js';
 
 const LIST_URL = '/chats';
+// The list's order, newest first: the summary's `active` — the chat's last
+// message in either direction, or the user's exchange with Ara in its
+// companion if that is newer — else, from an older gateway, its last message.
+// Compared as moments, not strings: the two stamps may differ in form.
+const activeAt = (c) => {
+  const t = Date.parse((c && (c.active || (c.last || {}).ts)) || '');
+  return Number.isFinite(t) ? t : 0;
+};
+const byActivity = (a, b) => activeAt(b) - activeAt(a);
 // Triage (docs/chat-triage.md): what the last run said per chat, and the
 // press that starts one. While a run sorts or Ara still writes her notes,
 // the open view asks again this often.
@@ -511,6 +520,19 @@ const araWrites = (it) => !!(it.entry && it.entry.followup
 // armed over.
 const triKey = (items) => items.map((it) => it.chat.id).join('\n');
 
+// Whether the user wrote in a chat after triage sorted it: their own message
+// (not a failed send, and not Ara's — author "agent"; only "user" and
+// "device" are the user's) is the chat's newest, and later than the sorting.
+// No message came in, so `inbound_seq` cannot tell (chat_triage.answered_since).
+export function answeredSince(chat, entry) {
+  const last = (chat && chat.last) || {};
+  if (last.direction !== 'out' || last.failed || !entry) return false;
+  if (last.author !== 'user' && last.author !== 'device') return false;
+  const mine = Date.parse(last.ts || '');
+  const sorted = Date.parse(entry.at || '');
+  return Number.isFinite(mine) && Number.isFinite(sorted) && mine > sorted;
+}
+
 // Whether triage has work open: a run sorting, or a note Ara still writes.
 export function triageBusy(doc) {
   if (!doc) return false;
@@ -582,6 +604,8 @@ class RetinueChats extends RetinueCard {
     this._onPop = () => {
       if (this._selecting) this._exitSelect(false);
       else if (this._triage && !(history.state && history.state.chatsTriage)) this._closeTriage(false);
+      // The forward gesture back onto the view.
+      else if (!this._triage && history.state && history.state.chatsTriage) this._restoreTriage();
     };
     this._onKey = (e) => {
       if (e.key === 'Escape' && this._selecting) { e.preventDefault(); this._exitSelect(); }
@@ -602,6 +626,10 @@ class RetinueChats extends RetinueCard {
     this._timer = setInterval(() => this.load(), REFRESH_MS);
     // A Spam the chat page's menu handed over, with its Undo here.
     if (this._full) this._adoptHandoff();
+    // Back from a chat opened in the triage view (or a reload of it).
+    if (this._full && (location.hash === '#triage' || (history.state && history.state.chatsTriage))) {
+      this._restoreTriage();
+    }
   }
 
   // Take up what a chat page left (handOffChatAction): the row is hidden at
@@ -1005,10 +1033,36 @@ class RetinueChats extends RetinueCard {
     this._triage = true;
     this._triArmed = '';
     this._triMsg = '';
-    try { history.pushState({ ...(history.state || {}), chatsTriage: true }, ''); } catch (_e) { /* none */ }
+    // The view is in the URL (#triage), so it outlives the page: a chat
+    // opened from it and left again lands back on it (_restoreTriage), as
+    // does a reload. `triageEntry` says the list's own entry lies below it.
+    try {
+      history.pushState({ ...(history.state || {}), chatsTriage: true, triageEntry: true }, '',
+        `${location.pathname || ''}${location.search || ''}#triage`);
+    } catch (_e) { /* none */ }
     this._swipe.reset();
     this._rerender();
     this._startTriage(false);
+  }
+
+  // Back on the view without a press: the page was left for a chat (or
+  // reloaded) with #triage in its URL, or the forward gesture returned to
+  // it. It shows what the last run said (GET /chats/triage) and sorts
+  // nothing — a new run is the Triage or Sort again button's.
+  _restoreTriage() {
+    if (!this._full || this._triage) return;
+    this._triage = true;
+    this._triArmed = '';
+    this._triMsg = '';
+    try {
+      if (!(history.state && history.state.chatsTriage)) {
+        history.replaceState({ ...(history.state || {}), chatsTriage: true }, '');
+      }
+    } catch (_e) { /* none */ }
+    this._triRestoring = true;
+    this._swipe.reset();
+    this._rerender();
+    this._pollTriage().finally(() => { this._triRestoring = false; });
   }
 
   // `back`: take the view's history entry off too (not when the back
@@ -1020,7 +1074,15 @@ class RetinueChats extends RetinueCard {
     if (this._triTimer) clearTimeout(this._triTimer);
     this._triTimer = null;
     try {
-      if (back && history.state && history.state.chatsTriage) history.back();
+      const st = history.state || {};
+      if (back && st.chatsTriage && st.triageEntry) {
+        history.back();
+      } else if (back && st.chatsTriage) {
+        // Opened cold on #triage (a link, a bookmark): no list entry below
+        // to go back to — the URL loses its #triage in place.
+        const { chatsTriage: _t, ...rest } = st;
+        history.replaceState(rest, '', `${location.pathname || ''}${location.search || ''}`);
+      }
     } catch (_e) { /* none */ }
     this._swipe.reset();
     this._rerender();
@@ -1131,12 +1193,16 @@ class RetinueChats extends RetinueCard {
     this._triTimer = null;
     if (!this._triage) return;
     const wasRunning = triageBusy(this._tri);
+    let got = false;
     try {
       const res = await fetch(TRIAGE_URL, { cache: 'no-store' });
-      if (res.ok) this._tri = await res.json();
+      if (res.ok) { this._tri = await res.json(); got = true; }
     } catch (_err) {
       // The next poll asks again.
     }
+    // A view with nothing yet to show (a restore whose answer failed) says so
+    // and asks again (_triageSchedule), rather than sitting empty.
+    this._triLoadFailed = !got && !this._tri;
     if (!this._triage) return;
     // Sorting done or a note landed: the list too (a staged draft shows on
     // the row).
@@ -1148,7 +1214,9 @@ class RetinueChats extends RetinueCard {
   }
 
   _triageSchedule() {
-    if (this._triTimer || !this._triage || !triageBusy(this._tri)) return;
+    // While a run sorts or a note is on its way — or while the view still
+    // has nothing to show because its last ask failed.
+    if (this._triTimer || !this._triage || !(triageBusy(this._tri) || this._triLoadFailed)) return;
     this._triTimer = setTimeout(() => this._pollTriage(), TRIAGE_POLL_MS);
   }
 
@@ -1158,19 +1226,30 @@ class RetinueChats extends RetinueCard {
   _triageSections(d) {
     const entries = (this._tri && this._tri.entries) || {};
     const all = (Array.isArray(d.chats) ? d.chats : []).filter((c) => !this._pending.has(c.id));
-    all.sort((a, b) => String((b.last || {}).ts || '').localeCompare(String((a.last || {}).ts || '')));
+    all.sort(byActivity);
     const out = { action: [], archive: [], delete: [], unsorted: [] };
+    // An unread chat with no word: it came in after the sorting only where a
+    // sorting finished — not before any ran (a cold #triage, a lost store),
+    // after one that was cut off, or while one still works its way to it.
+    const done = !!(this._tri && this._tri.run && this._tri.run.state === 'done');
+    const noWord = done ? 'Came in after the sorting.' : 'Not sorted yet.';
     for (const c of all) {
       if (listGroup(c) === 'archived') continue;
       const e = entries[c.id];
       if (!e) {
-        if (listGroup(c) === 'unread') out.unsorted.push({ chat: c, entry: null, why: 'Came in after the sorting.' });
+        if (listGroup(c) === 'unread') out.unsorted.push({ chat: c, entry: null, why: noWord });
         continue;
       }
       if (!['action', 'archive', 'delete'].includes(e.bucket)) {
         out.unsorted.push({ chat: c, entry: e, why: e.error ? `Not sorted: ${e.error}.` : 'Not sorted.' });
       } else if (Number.isInteger(c.inbound_seq) && Number.isInteger(e.seq) && c.inbound_seq !== e.seq) {
         out.unsorted.push({ chat: c, entry: e, why: 'A new message came in since it was sorted.' });
+      } else if (answeredSince(c, e)) {
+        // The user wrote in it after the sorting: its word (an action, most
+        // likely taken) no longer describes the chat. Read now, it leaves
+        // the view like any read chat never sorted; still unread, the next
+        // press sorts it again.
+        if (listGroup(c) === 'unread') out.unsorted.push({ chat: c, entry: e, why: 'You wrote in it since it was sorted.' });
       } else {
         out[e.bucket].push({ chat: c, entry: e });
       }
@@ -1182,7 +1261,8 @@ class RetinueChats extends RetinueCard {
   _triageStatus() {
     const t = this._tri;
     if (this._triMsg) return { text: this._triMsg, err: true };
-    if (!t) return { text: 'Starting…' };
+    if (!t && this._triLoadFailed) return { text: 'The last sorting could not be loaded — trying again…', err: true };
+    if (!t) return { text: this._triRestoring ? 'Loading the last sorting…' : 'Starting…' };
     if (t.enabled === false) return { text: 'Triage is switched off on this deployment (CHAT_TRIAGE).', err: true };
     const run = t.run || {};
     const writing = Object.values(t.entries || {}).filter((e) =>
@@ -1279,7 +1359,8 @@ class RetinueChats extends RetinueCard {
     }).join('');
     this._shownIds = shownIds;
     const empty = !shownIds.length
-      ? `<p class="muted">${sorting || !this._tri ? 'Sorting your unread chats…' : 'Nothing left to triage.'}</p>` : '';
+      ? `<p class="muted">${!this._tri && this._triRestoring ? 'Loading…'
+        : sorting || !this._tri ? 'Sorting your unread chats…' : 'Nothing left to triage.'}</p>` : '';
     return head + body + empty;
   }
 
@@ -2064,7 +2145,7 @@ class RetinueChats extends RetinueCard {
     const all = (Array.isArray(d.chats) ? d.chats : []).filter((c) => !(this._pending && this._pending.has(c.id)));
     // The API contract returns the list ordered by last activity; keep that
     // guarantee client-side too, so a hand-edited fixture cannot scramble it.
-    all.sort((a, b) => String((b.last || {}).ts || '').localeCompare(String((a.last || {}).ts || '')));
+    all.sort(byActivity);
     // The full page shows one tab's chats; the dashboard card shows every chat
     // that is not archived. The Archived tab is where archived chats remain
     // reachable — and where Restore puts them back.

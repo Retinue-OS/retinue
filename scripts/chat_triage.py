@@ -309,6 +309,33 @@ class TriageStore:
             self._doc["entries"][chat_id] = entry
             self._save()
 
+    def put_arrival(self, chat_id: str, entry: dict) -> bool:
+        """An arrival turn's word, unless the entry there describes a newer
+        message (a sorting that ran while the turn did, a later turn's
+        word): the check and the write under one lock. True when written."""
+        seq = entry.get("seq")
+        with self.lock:
+            cur = self._doc["entries"].get(chat_id)
+            have = cur.get("seq") if isinstance(cur, dict) else None
+            if (isinstance(have, int) and not isinstance(have, bool)
+                    and isinstance(seq, int) and have > seq):
+                return False
+            self._doc["entries"][chat_id] = entry
+            self._save()
+            return True
+
+    def put_unless_arrival(self, chat_id: str, entry: dict) -> bool:
+        """A sorting's entry, unless an arrival turn's word for the same
+        message is there: the check and the write under one lock, so a word
+        that lands while a batch is out is never overwritten by it. True when
+        written."""
+        with self.lock:
+            if from_arrival(self._doc["entries"].get(chat_id), entry.get("seq")):
+                return False
+            self._doc["entries"][chat_id] = entry
+            self._save()
+            return True
+
     def update(self, chat_id: str, **fields) -> None:
         with self.lock:
             e = self._doc["entries"].get(chat_id)
@@ -340,11 +367,55 @@ class TriageStore:
                 self._save()
 
 
-def is_fresh(entry: dict | None, seq) -> bool:
-    """Whether a stored result still describes the chat: sorted, and no
-    message has come in since (the chat's ``inbound_seq`` is the same)."""
+def from_arrival(entry: dict | None, seq) -> bool:
+    """Whether an arrival turn's own judgement describes the chat as it is."""
+    return is_fresh(entry, seq) and entry.get("source") == "arrival"
+
+
+def arrival_entry(bucket: str, note: str, seq: int, reply: str | None = None) -> dict:
+    """The entry an arrival turn's triage verdict leaves (docs/chat-triage.md,
+    "Arrival turns"): its bucket and note for the message count it judged, and
+    the turn's own reply in the companion as Ara's note on the row."""
+    entry = {"bucket": bucket, "note": _cut(" ".join(str(note or "").split()), NOTE_CHARS)[0],
+             "reply": False, "seq": seq, "at": _now(), "run": "arrival", "source": "arrival"}
+    words = " ".join(str(reply or "").split())
+    if words:
+        entry["followup"] = {"state": "done", "finished": entry["at"],
+                             "text": _cut(words, FOLLOWUP_CHARS)[0]}
+    return entry
+
+
+def _epoch(ts) -> float | None:
+    """An ISO timestamp as seconds, or None for one that is not."""
+    text = str(ts or "").strip()
+    if not text:
+        return None
+    try:
+        when = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    return when.timestamp()
+
+
+def answered_since(entry: dict | None, replied) -> bool:
+    """Whether the user wrote in the chat after it was sorted: ``replied`` is
+    the stamp of their own newest message where it is the chat's newest. Such
+    an entry no longer describes the chat — an *action* it suggested has
+    likely been taken — although no message came in."""
+    if not isinstance(entry, dict):
+        return False
+    mine, sorted_at = _epoch(replied), _epoch(entry.get("at"))
+    return mine is not None and sorted_at is not None and mine > sorted_at
+
+
+def is_fresh(entry: dict | None, seq, replied=None) -> bool:
+    """Whether a stored result still describes the chat: sorted, no message
+    has come in since (the chat's ``inbound_seq`` is the same), and the user
+    has not written in it since (``replied``, see ``answered_since``)."""
     return (isinstance(entry, dict) and entry.get("bucket") in BUCKETS
-            and entry.get("seq") == seq)
+            and entry.get("seq") == seq and not answered_since(entry, replied))
 
 
 class TriageRunner:
@@ -393,16 +464,23 @@ class TriageRunner:
             return self._running or self._open > 0
 
     def start(self, chats: list[dict], *, again: bool = False) -> dict:
-        """Start a run over ``chats`` (``[{id, seq}]``, the chats in scope,
-        newest first). A chat whose stored result is fresh is skipped unless
+        """Start a run over ``chats`` (``[{id, seq, replied?}]``, the chats in
+        scope, newest first; ``replied``: the stamp of the user's own message
+        where it is the chat's newest). A chat whose stored result is fresh is skipped unless
         ``again``. Returns ``{started, total, skipped}``; ``started`` False
         while a run is sorting or its follow-ups still work (the caller
         shows that run)."""
         with self._lock:
             if self._running or self._open > 0:
                 return {"started": False, "running": self._running, "busy": True}
+            # `again` sorts the fresh ones too — but never one an arrival
+            # turn judged (source "arrival"): that judgement had the chat, the
+            # sender's instruction and the tools, and stands until a newer
+            # message makes it stale.
             todo = [c for c in chats
-                    if again or not is_fresh(self.store.entry(c["id"]), c.get("seq"))]
+                    if not is_fresh(e := self.store.entry(c["id"]), c.get("seq"),
+                                    c.get("replied"))
+                    or (again and e.get("source") != "arrival")]
             run_id = f"{int(time.time() * 1000):x}"
             self.store.set_run(id=run_id, state="running", started=_now(), finished=None,
                                total=len(todo), sorted=0, failed=0,
@@ -488,6 +566,11 @@ class TriageRunner:
                 continue
             entry = {"bucket": v["bucket"], "note": v["note"], "reply": v["reply"],
                      "seq": c.get("seq"), "at": _now(), "run": run_id}
+            if from_arrival(self.store.entry(c["id"]), c.get("seq")):
+                # An arrival turn judged this very message while the batch ran:
+                # its word stands over the quick pass's (and the write below
+                # checks again, under the store's lock).
+                continue
             # followup_max 0 (the default, CHAT_TRIAGE_FOLLOWUPS): no follow-up
             # at all, and no "skipped" mark on the row either.
             follow = (v["bucket"] == "action" and self.followup is not None
@@ -499,7 +582,11 @@ class TriageRunner:
                         counted["followups"] += 1
                 entry["followup"] = ({"state": "queued"} if follow
                                      else {"state": "skipped", "why": "over this run's limit"})
-            self.store.put(c["id"], entry)
+            if not self.store.put_unless_arrival(c["id"], entry):
+                if follow:
+                    with count_lock:
+                        counted["followups"] -= 1
+                continue
             with count_lock:
                 counted["sorted"] += 1
                 self.store.set_run(sorted=counted["sorted"])
@@ -509,8 +596,10 @@ class TriageRunner:
                 self._followups.submit(self._follow, c["id"], dict(entry))
 
     def _unsorted(self, run_id: str, c: dict, why: str, counted: dict, count_lock) -> None:
-        self.store.put(c["id"], {"bucket": None, "error": why, "seq": c.get("seq"),
-                                 "at": _now(), "run": run_id})
+        if not self.store.put_unless_arrival(c["id"], {"bucket": None, "error": why,
+                                                       "seq": c.get("seq"),
+                                                       "at": _now(), "run": run_id}):
+            return
         with count_lock:
             counted["failed"] += 1
             self.store.set_run(failed=counted["failed"])

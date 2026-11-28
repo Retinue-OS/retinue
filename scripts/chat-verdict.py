@@ -21,6 +21,13 @@ and, where it carries one, its deadline — and what it did and flags:
         --importance 1 --action "filed the invoice with the Archivist" \
         --action "archived the mail"
 
+Every arrival turn — a VIP's too, whose verdict is only this — also says how
+the Chats page's Triage lists the chat (docs/chat-triage.md, "Arrival
+turns"), so a later press spends no second judgement on it:
+
+    chat-verdict.py --chat "signal:+41791234567" --triage action \
+        --triage-note "Mara asks whether you come on Saturday — answer her."
+
 A mail thread is a chat like any other here (docs/mail-chats.md, "The gate"):
 a mail from an instructed sender is worked by the same kind of turn, which
 ends with the same verdict. What that turn archived (chat-flags.py) it names
@@ -73,7 +80,7 @@ def main() -> int:
     parser.add_argument("--chat", required=True, metavar="ID",
                         help="the chat id, <channel>:<chat-key> (e.g. signal:+41791234567, "
                              "or a mail thread's email:~<account>:<message-id>)")
-    parser.add_argument("--importance", required=True, type=float,
+    parser.add_argument("--importance", type=float, default=None,
                         help="0–5: 0–1 trivial (listed), 2–3 ordinary (next digest), "
                              "4–5 important (rings where the Focus mode admits the sender)")
     parser.add_argument("--due", metavar="WHEN",
@@ -84,12 +91,22 @@ def main() -> int:
     parser.add_argument("--flag", action="append", default=[],
                         help="one thing the user must look at (repeatable): a sensitive "
                              "request kept out of the draft, a conflict, a doubt")
+    parser.add_argument("--triage", choices=("action", "archive", "delete"),
+                        help="how the Chats page's Triage lists the chat (docs/chat-triage.md, "
+                             "\"Arrival turns\"): action, archive or delete")
+    parser.add_argument("--triage-note", default=None, metavar="TEXT",
+                        help="one short sentence for the triage row: what it is and, for "
+                             "action, what the user should do")
     parser.add_argument("--url", default=None, help=f"endpoint base URL (default {DEFAULT_URL})")
     parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT,
                         help="HTTP timeout in seconds")
     args = parser.parse_args()
 
-    if not 0 <= args.importance <= 5:
+    if args.importance is None and not args.triage:
+        print("chat-verdict: give --importance (an instructed turn's verdict) and/or "
+              "--triage (every arrival turn's)", file=sys.stderr)
+        return 2
+    if args.importance is not None and not 0 <= args.importance <= 5:
         print(f"chat-verdict: importance is 0–5, not {args.importance:g}", file=sys.stderr)
         return 2
     if ":" not in args.chat:
@@ -102,10 +119,15 @@ def main() -> int:
 
     base = (args.url or DEFAULT_URL).rstrip("/")
     url = f"{base}/{urllib.parse.quote(args.chat, safe='')}/verdict"
-    payload: dict = {"importance": args.importance, "actions": args.action,
-                     "flags": args.flag}
+    payload: dict = {"actions": args.action, "flags": args.flag}
+    if args.importance is not None:
+        payload["importance"] = args.importance
     if args.due:
         payload["due"] = args.due
+    if args.triage:
+        payload["triage"] = args.triage
+        if args.triage_note:
+            payload["triage_note"] = args.triage_note
 
     req = urllib.request.Request(
         url,
@@ -122,8 +144,8 @@ def main() -> int:
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")
         if exc.code == 409:
-            print("chat-verdict: refused — no turn is working on this chat by a standing "
-                  f"instruction: {detail}", file=sys.stderr)
+            print("chat-verdict: refused — no arrival turn is working on this chat: "
+                  f"{detail}", file=sys.stderr)
         else:
             print(f"chat-verdict: HTTP {exc.code}: {detail}", file=sys.stderr)
         return 1

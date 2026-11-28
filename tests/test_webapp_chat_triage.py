@@ -45,6 +45,14 @@ def _list_harness() -> str:
 
 
 CHECKS = r"""
+// Every mount starts on a fresh history (a view an earlier check left open
+// would otherwise be restored), unless a check sets the history up itself.
+let keepHistory = false;
+const mountList = mount;
+mount = async (doc) => {
+  if (!keepHistory) history.stack = [null];
+  return mountList(doc);
+};
 const takeTri = (method, what) => take((w) => w.method === method && w.url === '/chats/triage', what);
 
 const LIST = [
@@ -109,7 +117,8 @@ await ok('opening it presses: the sections, the notes and the status while it so
   assert.ok(action.includes('Ara is looking at it…'));
   const unsorted = sectionOf(h, 'unsorted');
   assert.deepEqual(ids(unsorted), ['u2', 'u3', 'u4'], 'unread chats with no word yet');
-  assert.ok(unsorted.includes('Came in after the sorting.'));
+  assert.ok(unsorted.includes('Not sorted yet.'), 'still sorting: not "came in after"');
+  assert.ok(!unsorted.includes('Came in after the sorting.'));
   assert.ok(!ids(h).includes('r1'), 'a read chat with no word is no triage row');
   assert.ok(!ids(h).includes('a1'));
   assert.ok(h.includes('data-triage="again" disabled'), 'no second press while it sorts');
@@ -348,6 +357,137 @@ await ok('the list refresh does not rebuild the view under typing in the feedbac
   takeList().answer(payload([...LIST, chat('u9', { unread: 1, list_group: 'unread', last: { ts: '2026-11-22T09:00:00Z', direction: 'in', text: 'new' } })]));
   await settle();
   assert.ok(ids(html(el)).includes('u9'), 'the next refresh shows it');
+});
+
+await ok('the view is in the URL: opening pushes #triage over the list\'s own entry', async () => {
+  history.stack = [null];
+  const urls = [];
+  const push = history.pushState;
+  history.pushState = function (st, _t, url) { urls.push(url); return push.call(this, st); };
+  const el = await mount(payload(LIST));
+  await openTriage(el, DONE);
+  history.pushState = push;
+  assert.deepEqual(urls, ['/chats.html#triage']);
+  assert.equal(history.state.triageEntry, true);
+});
+
+await ok('back from a chat opened in the view: restored from the last sorting, nothing pressed', async () => {
+  history.stack = [null, { chatsTriage: true, triageEntry: true }];
+  location.hash = '#triage';
+  keepHistory = true;
+  try {
+    const el = await mount(payload(LIST));
+    assert.equal(el._triage, true);
+    assert.ok(html(el).includes('Loading the last sorting…'), html(el));
+    takeTri('GET', 'the last sorting').answer(JSON.parse(JSON.stringify(DONE)));
+    await settle(); await settle();
+    assert.ok(!wire.some((w) => w.url === '/chats/triage' && w.method === 'POST'), 'no press');
+    assert.deepEqual(ids(sectionOf(html(el), 'archive')), ['u2']);
+    assert.ok(/Sorted .* ago/.test(html(el)), html(el));
+    // Close: the list's own entry lies below, so back.
+    el._closeTriage();
+    assert.equal(el._triage, false);
+    assert.equal(history.stack.length, 1);
+  } finally {
+    location.hash = '';
+    keepHistory = false;
+  }
+});
+
+await ok('a restore whose answer fails says so and asks again', async () => {
+  history.stack = [null, { chatsTriage: true, triageEntry: true }];
+  location.hash = '#triage';
+  keepHistory = true;
+  try {
+    const el = await mount(payload(LIST));
+    takeTri('GET', 'the restore').answer({ error: 'down' }, 502);
+    await settle(); await settle();
+    assert.ok(html(el).includes('The last sorting could not be loaded — trying again…'), html(el));
+    assert.ok(el._triTimer, 'another ask is scheduled');
+    clearTimeout(el._triTimer); el._triTimer = null;
+    el._pollTriage();
+    takeTri('GET', 'the retry').answer(JSON.parse(JSON.stringify(DONE)));
+    await settle(); await settle();
+    assert.deepEqual(ids(sectionOf(html(el), 'archive')), ['u2']);
+    assert.equal(el._triTimer, null, 'loaded and nothing open: no further ask');
+  } finally {
+    location.hash = '';
+    keepHistory = false;
+  }
+});
+
+await ok('an unread chat with no word came in after the sorting only where a sorting finished', async () => {
+  const el = await mount(payload(LIST));
+  const cases = [
+    [{ enabled: true, running: false, run: null, entries: {}, notes: [] }, 'Not sorted yet.'],
+    [{ enabled: true, running: false, run: { state: 'interrupted' }, entries: {}, notes: [] }, 'Not sorted yet.'],
+    [{ enabled: true, running: false, run: { state: 'done', total: 0, sorted: 0, failed: 0 }, entries: {}, notes: [] },
+      'Came in after the sorting.'],
+  ];
+  el._triage = true;
+  for (const [doc, line] of cases) {
+    el._tri = doc;
+    el._rerender();
+    const unsorted = sectionOf(html(el), 'unsorted');
+    assert.ok(unsorted.includes(line), `${doc.run && doc.run.state}: ${unsorted}`);
+  }
+});
+
+await ok('a chat the user wrote in after the sorting leaves its bucket', async () => {
+  const list = [
+    // Answered after the sorting, and read since: no triage row at all.
+    chat('d1', { unread: 0, list_group: 'read', inbound_seq: 5,
+      last: { ts: '2026-11-21T10:00:00Z', direction: 'out', author: 'user', text: 'Lieber Donat' } }),
+    // Answered after the sorting, still unread: not sorted, saying why.
+    chat('d2', { unread: 1, list_group: 'unread', inbound_seq: 6,
+      last: { ts: '2026-11-21T10:00:00Z', direction: 'out', author: 'device', text: 'ok' } }),
+    // Answered before the sorting: the sorting saw it, its word stands.
+    chat('d3', { unread: 0, list_group: 'read', inbound_seq: 7,
+      last: { ts: '2026-11-21T08:00:00Z', direction: 'out', author: 'user', text: 'ok' } }),
+    // A send that failed is no answer.
+    chat('d4', { unread: 0, list_group: 'read', inbound_seq: 8,
+      last: { ts: '2026-11-21T10:00:00Z', direction: 'out', author: 'user', failed: true, text: 'ok' } }),
+    // Ara's own message after the sorting is no answer of the user's.
+    chat('d5', { unread: 0, list_group: 'read', inbound_seq: 9,
+      last: { ts: '2026-11-21T10:00:00Z', direction: 'out', author: 'agent', text: 'Noted.' } }),
+  ];
+  const at = '2026-11-21T09:00:00Z';
+  const el = await mount(payload(list));
+  el._triage = true;
+  el._tri = { enabled: true, running: false, run: { state: 'done', total: 5, sorted: 5, failed: 0 }, notes: [],
+    entries: Object.fromEntries(['d1', 'd2', 'd3', 'd4', 'd5'].map((id, i) =>
+      [id, { bucket: 'action', note: 'Answer.', reply: true, seq: 5 + i, at, run: 'r' }])) };
+  el._rerender();
+  const h = html(el);
+  assert.deepEqual(ids(sectionOf(h, 'action')).sort(), ['d3', 'd4', 'd5'], h);
+  const unsorted = sectionOf(h, 'unsorted');
+  assert.deepEqual(ids(unsorted), ['d2'], unsorted);
+  assert.ok(unsorted.includes('You wrote in it since it was sorted.'), unsorted);
+  assert.ok(!ids(h).includes('d1'));
+});
+
+await ok('opened cold on #triage: closing drops the hash in place instead of leaving the app', async () => {
+  history.stack = [null];
+  location.hash = '#triage';
+  const replaced = [];
+  const rep = history.replaceState;
+  history.replaceState = function (st, _t, url) { replaced.push([st, url]); this.stack[this.stack.length - 1] = st; };
+  keepHistory = true;
+  try {
+    const el = await mount(payload(LIST));
+    takeTri('GET', 'the last sorting').answer(JSON.parse(JSON.stringify(DONE)));
+    await settle(); await settle();
+    assert.equal(history.state.chatsTriage, true);
+    el._closeTriage();
+    assert.equal(history.stack.length, 1, 'no back out of the app');
+    const last = replaced[replaced.length - 1];
+    assert.equal(last[1], '/chats.html');
+    assert.ok(!last[0].chatsTriage);
+  } finally {
+    history.replaceState = rep;
+    location.hash = '';
+    keepHistory = false;
+  }
 });
 
 await ok('no multi-select in the view; Close and back return to the tabs', async () => {

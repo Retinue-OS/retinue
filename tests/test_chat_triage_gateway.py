@@ -90,6 +90,16 @@ def main() -> int:
         # Follow-ups are off by default; this test opts in to exercise them.
         assert wg.CHAT_TRIAGE_FOLLOWUPS == 0 and wg._TRIAGE.followup_max == 0
         wg._TRIAGE.followup_max = 20
+        # Only the user's own newest message (author user/device, not a
+        # failed send) makes a sorting stale; Ara's ("agent") does not.
+        ts = "2026-11-21T10:00:00Z"
+        out = lambda **kw: {"last": {"ts": ts, "direction": "out", **kw}}
+        assert wg._triage_replied(out(author="user")) == ts
+        assert wg._triage_replied(out(author="device")) == ts
+        assert wg._triage_replied(out(author="agent")) is None
+        assert wg._triage_replied(out(author="user", failed=True)) is None
+        assert wg._triage_replied({"last": {"ts": ts, "direction": "in"}}) is None
+        assert wg._triage_replied({"last": None}) is None
         wg.contacts_mod.commit = lambda *a, **k: None
         server = ThreadingHTTPServer(("127.0.0.1", 0), wg.Handler)
         threading.Thread(target=server.serve_forever, daemon=True).start()
@@ -206,6 +216,69 @@ def main() -> int:
             assert status == 200 and doc["notes"] == [], doc
             wait_for(lambda: not mail._http(base, "GET", "/chats/triage")[1]["busy"],
                      "the follow-ups to be over")
+
+            # An arrival turn's triage word (docs/chat-triage.md, "Arrival
+            # turns"): any arrival turn may give it, the importance verdict
+            # stays an instructed turn's; the word is written when the turn
+            # completes, for the message count it judged, and no press sorts
+            # that chat again until a newer message arrives.
+            target = next(iter(unread))
+            seq = unread[target]["inbound_seq"]
+            vurl = "/internal/chats/" + mail._quote(target) + "/verdict"
+            agent = {"X-Conversation-Backend-Token": "agent-token"}
+            status, _ = mail._http(base, "POST", vurl, {"triage": "archive"}, agent)
+            assert status == 409, "no turn running"
+            record = {"chat": target, "jobs": {"j"}, "names": {target}, "token": "j",
+                      "mids": ["m-worked"], "seqs": [seq], "instructed": False, "verdict": None,
+                      "flags": set(), "asked": False, "epoch": None}
+            wg._RUNNING_TURNS[target] = [record]
+            try:
+                status, body = mail._http(base, "POST", vurl, {"triage": "nope"}, agent)
+                assert status == 400, body
+                status, body = mail._http(base, "POST", vurl, {"importance": 3}, agent)
+                assert status == 409, "a VIP's turn gives no importance verdict"
+                status, body = mail._http(base, "POST", vurl, {}, agent)
+                assert status == 400, body
+                for bad in (False, 0, [], None):
+                    status, body = mail._http(base, "POST", vurl,
+                                              {"triage": "archive", "triage_note": bad}, agent)
+                    assert status == 400 and "triage_note" in body["error"], (bad, body)
+                status, body = mail._http(base, "POST", vurl,
+                                          {"triage": "archive", "triage_note": " A  receipt. "}, agent)
+                assert status == 200 and body["triage"] == {"bucket": "archive", "note": "A receipt."}, body
+                record["instructed"] = True
+                status, body = mail._http(base, "POST", vurl, {"triage": "action"}, agent)
+                assert status == 400 and "importance" in body["error"], body
+            finally:
+                wg._RUNNING_TURNS.pop(target, None)
+            record["instructed"] = False
+            # Merged away while the turn ran, and its message placed by no id:
+            # no word — the next press judges the chat rather than trusting a
+            # count that may now name another message.
+            moved = dict(record, names={"email:~gone"})
+            wg._triage_from_arrival(target, moved, "x")
+            assert target not in mail._http(base, "GET", "/chats/triage")[1]["entries"] or \
+                mail._http(base, "GET", "/chats/triage")[1]["entries"][target].get("source") != "arrival"
+            # Part of a batch too big to quote whole: no word.
+            wg._triage_from_arrival(target, record, "x", partial=True)
+            got = mail._http(base, "GET", "/chats/triage")[1]["entries"].get(target) or {}
+            assert got.get("source") != "arrival", got
+            wg._triage_from_arrival(target, record, "Ara's  note.")
+            e = mail._http(base, "GET", "/chats/triage")[1]["entries"][target]
+            assert e["source"] == "arrival" and e["seq"] == seq and e["bucket"] == "archive", e
+            assert e["followup"]["text"] == "Ara's note.", e
+            # An older turn's word (an earlier message) does not replace it.
+            older = dict(record, seqs=[seq - 1], triage={"bucket": "delete", "note": "old"})
+            wg._triage_from_arrival(target, older, "y")
+            assert mail._http(base, "GET", "/chats/triage")[1]["entries"][target]["bucket"] == "archive"
+            calls_before = len(CALLS)
+            wait_for(lambda: not mail._http(base, "GET", "/chats/triage")[1]["busy"], "idle")
+            status, doc = mail._http(base, "POST", "/chats/triage", {"again": True})
+            assert status == 202 and doc["total"] == len(unread) - 1, doc
+            wg._TRIAGE.join(15)
+            assert mail._http(base, "GET", "/chats/triage")[1]["entries"][target]["source"] == "arrival"
+            assert len(CALLS) == calls_before + (1 if len(unread) > 1 else 0)
+            wait_for(lambda: not mail._http(base, "GET", "/chats/triage")[1]["busy"], "idle")
 
             # Off is off.
             wg.CHAT_TRIAGE = False

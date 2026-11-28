@@ -352,6 +352,8 @@ docstring). Pieces:
   the user's words for every run from now on and sorts everything again
   (`POST /chats/triage {feedback}`); saved notes are listed, each with ✕
   (`POST /chats/triage/notes {remove}`).
+  The view lives at `chats.html#triage`: back from a chat opened in it (or a
+  reload) restores it from `GET /chats/triage`, sorting nothing anew.
   The view polls `GET /chats/triage` while a run sorts or a note is on its
   way, and is a history entry (back closes it); there is no multi-select
   inside it. A chat archived or deleted leaves the view.
@@ -386,10 +388,13 @@ docstring). Pieces:
   the chat is a row of — for a chat opened cold (a notification, a
   bookmark). The header's ⋮ menu holds
   *Attention details* — the chat's attention sheet, with the contact card —
-  and the **Star** / **Archive** / **Mute** switches, the same
-  `POST /chats/<id>/flags` the list's swipe actions use; a starred chat's
-  name carries a ★, and a dot on the ⋮ shows an archived or muted chat with
-  the menu shut. What the companion pane does sits behind a **?**
+  the **Archive** / **Mute** switches — the same
+  `POST /chats/<id>/flags` the list's swipe actions use — then **Spam** (mail
+  only) and **Delete**; a dot on the ⋮ shows an archived or muted chat with
+  the menu shut. A header at least 820px wide (a container query, so the
+  header's own width decides) shows those items as a row of buttons instead
+  of the ⋮. **Star** is the star before the chat's name, in every width:
+  hollow (☆) to star, full (★) to unstar. What the companion pane does sits behind a **?**
   in its bar rather than on a row of its own. While the phone keyboard is up —
   `data-keyboard` on `<html>`, which `viewport.js` sets when a text field
   has focus and the visible frame is well short of its keyboard-less height
