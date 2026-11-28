@@ -316,6 +316,34 @@ def test_stated_type_is_one_media_type(wg):
     print("PASS test_stated_type_is_one_media_type")
 
 
+def test_companion_activity_orders_the_list(wg):
+    """A chat's place in the list counts the user's exchange with Ara in its
+    companion — their messages and her replies — but not the opening line
+    nor her unprompted turns (an arrival note, a triage follow-up)."""
+    _serve(wg, MESSAGES)
+    other = "signal:+41785550000"
+    cid, _ = wg._chat_companion(other)
+    # Only the opening line, written by the gateway: no activity.
+    assert wg._companion_active(cid) == "", wg._load_conv(cid)["messages"]
+    wg._conv_add_message(cid, "assistant", "Mara asks about Saturday.", arrival=True)
+    assert wg._companion_active(cid) == "", "an arrival note moved the chat"
+    wg._conv_add_message(cid, "user", "Draft a yes")
+    mine = wg._companion_active(cid)
+    assert mine and mine.endswith("Z"), mine
+    wg._conv_add_message(cid, "assistant", "Drafted.")
+    reply = wg._companion_active(cid)
+    assert reply >= mine, (reply, mine)
+    wg._conv_add_message(cid, "assistant", "Triage: reply to Mara.", arrival=True)
+    assert wg._companion_active(cid) == reply, "a follow-up moved the chat"
+    assert wg._companion_active(None) == "" and wg._companion_active("../x") == ""
+    # Stamps of both forms compare as moments.
+    assert wg._utc_stamp("2026-11-27T14:40:26.613024+00:00") == "2026-11-27T14:40:26Z"
+    assert wg._utc_stamp("2026-11-27T15:40:26+01:00") == "2026-11-27T14:40:26Z"
+    assert wg._utc_stamp("2026-11-27T14:40:26Z") == "2026-11-27T14:40:26Z"
+    assert wg._utc_stamp("nonsense") == ""
+    print("PASS test_companion_activity_orders_the_list")
+
+
 def main():
     with tempfile.TemporaryDirectory() as tmp:
         wg = _load_gateway(Path(tmp))
@@ -330,6 +358,7 @@ def main():
         test_reply_lands_like_any_thread(wg)
         test_arrival_reply_is_marked(wg)
         test_stated_type_is_one_media_type(wg)
+        test_companion_activity_orders_the_list(wg)
     print("all companion-thread tests passed")
 
 

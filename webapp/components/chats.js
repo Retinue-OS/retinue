@@ -112,6 +112,15 @@ import { SwipeRows, SWIPE_CSS, STAR_MARK, offerUndo, showNotice, starButtonHtml,
 import { openComposeSheet } from './compose-sheet.js';
 
 const LIST_URL = '/chats';
+// The list's order, newest first: the summary's `active` — the chat's last
+// message in either direction, or the user's exchange with Ara in its
+// companion if that is newer — else, from an older gateway, its last message.
+// Compared as moments, not strings: the two stamps may differ in form.
+const activeAt = (c) => {
+  const t = Date.parse((c && (c.active || (c.last || {}).ts)) || '');
+  return Number.isFinite(t) ? t : 0;
+};
+const byActivity = (a, b) => activeAt(b) - activeAt(a);
 // Triage (docs/chat-triage.md): what the last run said per chat, and the
 // press that starts one. While a run sorts or Ara still writes her notes,
 // the open view asks again this often.
@@ -1184,7 +1193,7 @@ class RetinueChats extends RetinueCard {
   _triageSections(d) {
     const entries = (this._tri && this._tri.entries) || {};
     const all = (Array.isArray(d.chats) ? d.chats : []).filter((c) => !this._pending.has(c.id));
-    all.sort((a, b) => String((b.last || {}).ts || '').localeCompare(String((a.last || {}).ts || '')));
+    all.sort(byActivity);
     const out = { action: [], archive: [], delete: [], unsorted: [] };
     // An unread chat with no word: it came in after the sorting only where a
     // sorting finished — not before any ran (a cold #triage, a lost store),
@@ -2103,7 +2112,7 @@ class RetinueChats extends RetinueCard {
     const all = (Array.isArray(d.chats) ? d.chats : []).filter((c) => !(this._pending && this._pending.has(c.id)));
     // The API contract returns the list ordered by last activity; keep that
     // guarantee client-side too, so a hand-edited fixture cannot scramble it.
-    all.sort((a, b) => String((b.last || {}).ts || '').localeCompare(String((a.last || {}).ts || '')));
+    all.sort(byActivity);
     // The full page shows one tab's chats; the dashboard card shows every chat
     // that is not archived. The Archived tab is where archived chats remain
     // reachable — and where Restore puts them back.

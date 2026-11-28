@@ -1097,6 +1097,15 @@ The Chats page (`chats.html`) sorts every messenger chat into three groups,
 arrivals the summary includes), and the payload `counts` — chats per group,
 for the tabs. (`group` on a chat is the boolean "a group chat", as before.)
 
+Within each group (starred chats first) the list is ordered by **last
+activity**, newest first: the summary's `active`, the later of the chat's own
+last message — inbound or outbound, the user's or a send of Ara's — and the
+user's exchange with Ara in its companion thread: the user's messages there
+and Ara's replies to them. Ara's unprompted companion turns (the note on an
+arrival, a triage follow-up; marked `arrival`) and the thread's opening line
+do not count, so neither a Triage press nor opening the pane reorders the
+list. `last` still says what the row previews and when.
+
 Beside the tabs, **Triage** sorts the *Unread* tab on the user's press into
 action (see Ara), proposed archive and proposed delete, with *Archive all* /
 *Delete all* per section and, where follow-ups are switched on

@@ -9444,6 +9444,64 @@ def _schedule_chat_name_backfill(chat_ids) -> None:
     threading.Thread(target=run, name="chat-name-backfill", daemon=True).start()
 
 
+# When the user and Ara last spoke in a chat's companion thread, for the
+# list's order (_chats_payload, "active"). Only the user's own messages and
+# Ara's replies to them count: the fixed opening line (role "agent") and
+# Ara's unprompted turns — the note on a message's arrival and the triage
+# follow-up, both marked "arrival" — do not, so neither opening the pane nor
+# a Triage press moves a chat up. Cached per thread file by mtime and size, since the
+# list is rebuilt on every poll.
+_companion_active_cache: dict[str, tuple[tuple[int, int], str]] = {}
+_companion_active_lock = threading.Lock()
+
+
+def _utc_stamp(value: str) -> str:
+    """An ISO 8601 moment as ``YYYY-MM-DDTHH:MM:SSZ`` (UTC), or "" when it
+    is none. The chat records' stamps and the threads' differ in form
+    (``Z`` against ``+00:00``, fractions or not), so they are only compared
+    once they are in this one."""
+    raw = (value or "").strip()
+    if not raw:
+        return ""
+    try:
+        moment = datetime.fromisoformat(raw[:-1] + "+00:00" if raw.endswith("Z") else raw)
+    except ValueError:
+        return ""
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    return moment.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _companion_active(cid) -> str:
+    """The newest message of the user's, or of Ara's in reply, in companion
+    thread `cid`, as a _utc_stamp; "" for none or no such thread."""
+    if not cid or not _CONV_ID_RE.fullmatch(str(cid)):
+        return ""
+    cid = str(cid)
+    try:
+        st = os.stat(os.path.join(CONVERSATIONS_DIR, f"{cid}.json"))
+    except OSError:
+        return ""
+    # Size as well as the mtime: two writes can land in one tick of a coarse
+    # clock, and every write that adds a message makes the file longer.
+    mtime = (st.st_mtime_ns, st.st_size)
+    with _companion_active_lock:
+        hit = _companion_active_cache.get(cid)
+    if hit is not None and hit[0] == mtime:
+        return hit[1]
+    conv = _load_conv_raw(cid) or {}
+    newest = ""
+    for m in conv.get("messages") or []:
+        if not isinstance(m, dict):
+            continue
+        role = m.get("role")
+        if role == "user" or (role == "assistant" and not m.get("arrival")):
+            newest = max(newest, _utc_stamp(str(m.get("ts") or "")))
+    with _companion_active_lock:
+        _companion_active_cache[cid] = (mtime, newest)
+    return newest
+
+
 # The SPARQL-derived skeleton (chat list + unread counts) reused between
 # dashboard polls; state and overlay are merged fresh on every request. Any
 # write that changes the skeleton's truth expires it early — expires, not
@@ -10029,9 +10087,15 @@ def _chats_payload() -> dict:
             # being, or was, worked — see _instructed_note — or null.
             "instructed": doc.get("instructed") or None,
             "messages": _chat_messages_url(chat_id),
+            # What the list is ordered by: the newest of the chat's own last
+            # message (either direction) and the user's exchange with Ara in
+            # its companion (_companion_active), as a UTC stamp. `last` still
+            # says what the row previews and when that was.
+            "active": max(_utc_stamp(last.get("ts") or ""),
+                          _companion_active(doc.get("companion"))) or (last.get("ts") or ""),
             **people,
         })
-    chats.sort(key=lambda c: c["last"]["ts"], reverse=True)
+    chats.sort(key=lambda c: c["active"], reverse=True)
     _schedule_chat_name_backfill(nameless)
     _schedule_pending_sync()
     counts = {"unread": 0, "read": 0, "archived": 0}
