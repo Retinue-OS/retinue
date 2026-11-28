@@ -19,8 +19,18 @@
 //     message and how loudly it rings. One can be copied from another person
 //     (a team).
 //
+// A person's handles lead to their conversations. A tap on a messenger handle
+// (WhatsApp, Signal, Telegram, a phone for SMS) opens the chat with them on
+// that channel — or, where there is none yet, a new one, the first message of
+// which starts it; where several accounts or chats would do, a short list
+// asks which. A tap on an e-mail address always asks: each mail thread the
+// address is in, newest first, and *New e-mail* (the compose sheet, addressed
+// to them). The server says what there is (GET /contacts/chats).
+//
 // Live endpoints, never cached by the service worker:
 //   GET  /contacts[?q=]         -> { locations, default, contacts }
+//   GET  /contacts/chats?channel=&handle=&person=
+//                               -> { handle, chats, new } for one handle
 //   POST /contacts              -> create (needs `chamber`; `domains`)
 //   POST /contacts/<id>         -> change (`add_domains` / `remove_domains`)
 //   GET  /attention/profile     -> { focus: { spheres, modes } } for the choices
@@ -95,6 +105,34 @@ const CSS = `
   .add input { flex: 1 1 160px; }
   .actions { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
   input[data-set="name"] { width: 100%; font-weight: 600; }
+  /* A row is a card: the button opens the editor, the handles under it each
+     lead to their conversation. */
+  li.card { padding: 0; border-radius: 12px; background: var(--card-2, #1c2230); }
+  @media (hover: hover) { li.card:hover { outline: 1px solid var(--accent, #6ea8fe); } }
+  li.card > button.row { background: none; padding-bottom: 4px; }
+  @media (hover: hover) { li.card > button.row:hover { outline: none; } }
+  .reach { display: flex; flex-wrap: wrap; gap: 2px 10px; padding: 0 12px 10px; font-size: .76rem;
+           color: var(--muted, #8b93a3); min-width: 0; }
+  .reach > span { overflow-wrap: anywhere; }
+  button.go { all: unset; cursor: pointer; color: var(--accent, #6ea8fe); overflow-wrap: anywhere;
+              -webkit-tap-highlight-color: transparent; }
+  button.go:focus-visible { outline: 2px solid var(--accent, #6ea8fe); outline-offset: 2px; border-radius: 4px; }
+  button.go .via { color: var(--muted, #8b93a3); }
+  .handle button.go { font-size: .86rem; }
+  /* What a tap on a handle can open, when there is more than one thing. */
+  .scrim { position: fixed; inset: 0; background: rgba(0, 0, 0, .5); z-index: 50;
+           display: flex; align-items: flex-end; justify-content: center; }
+  .pick { width: min(100%, 520px); max-height: 80vh; overflow: auto; background: var(--card, #151922);
+          border: 1px solid var(--line, rgba(231, 235, 242, .12)); border-radius: 16px 16px 0 0;
+          padding: 14px 16px calc(14px + env(safe-area-inset-bottom, 0px)); display: grid; gap: 8px; }
+  @media (min-width: 640px) { .scrim { align-items: center; } .pick { border-radius: 16px; } }
+  .pick h3 { margin: 0; font-size: .95rem; overflow-wrap: anywhere; }
+  .pick .opt { all: unset; display: block; box-sizing: border-box; cursor: pointer; padding: 10px 12px;
+               border-radius: 12px; background: var(--card-2, #1c2230); }
+  .pick .opt:focus-visible { outline: 2px solid var(--accent, #6ea8fe); }
+  @media (hover: hover) { .pick .opt:hover { outline: 1px solid var(--accent, #6ea8fe); } }
+  .pick .opt.new { color: var(--accent, #6ea8fe); font-weight: 600; }
+  .pick .opt .meta { white-space: normal; }
 `;
 
 function sphereList(p) {
@@ -130,6 +168,45 @@ export function domainCovers(spec) {
     : `every address @${spec}`;
 }
 
+// The channels a tap on a handle leads to a conversation on: the ones that
+// have chats (an SMS sender id is no number and cannot be written to, which
+// the server says when asked).
+const CHATTABLE = new Set(CHANNELS);
+
+// A chat's last message time, short: today's as a time, older ones as a date.
+function when(ts) {
+  const d = new Date(ts);
+  if (!ts || Number.isNaN(d.getTime())) return '';
+  const now = new Date();
+  return d.toDateString() === now.toDateString()
+    ? d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+    : d.toLocaleDateString([], { day: 'numeric', month: 'short', year: d.getFullYear() === now.getFullYear() ? undefined : 'numeric' });
+}
+
+// What a tap on a handle does, from GET /contacts/chats: go straight to the
+// one place it can only mean, or ask. → {go: chat id} | {compose: offer} |
+// {ask: true} | {none: sentence}.
+export function handleTarget(answer, channel) {
+  const chats = Array.isArray(answer && answer.chats) ? answer.chats.filter((c) => c && c.id) : [];
+  const fresh = Array.isArray(answer && answer.new) ? answer.new.filter((n) => n && (n.id || n.compose)) : [];
+  if (channel === 'email') {
+    if (chats.length) return { ask: true };
+    const compose = fresh.find((n) => n.compose);
+    return compose ? { compose } : { none: 'No mailbox can send a new e-mail from here right now.' };
+  }
+  if (chats.length === 1) return { go: chats[0].id };
+  if (chats.length > 1) return { ask: true };
+  if (fresh.length === 1) return { go: fresh[0].id };
+  if (fresh.length > 1) return { ask: true };
+  const label = CHANNEL_LABEL[channel] || channel;
+  return { none: `There is no chat on ${label} with them yet, and none can be started from here: ` +
+    `no ${label} account is set up for chats, or this handle is not one a message can be sent to.` };
+}
+
+export function chatUrl(id) {
+  return `/chat.html?id=${encodeURIComponent(id)}`;
+}
+
 class RetinueContacts extends HTMLElement {
   constructor() {
     super();
@@ -140,6 +217,9 @@ class RetinueContacts extends HTMLElement {
     this._form = null;
     this._busy = false;
     this._error = '';
+    // A tap on a handle: {person, name, channel, handle, busy, answer, error}
+    // while it is being looked up or its choices are shown.
+    this._pick = null;
   }
 
   connectedCallback() {
@@ -148,6 +228,9 @@ class RetinueContacts extends HTMLElement {
       this.shadowRoot.addEventListener('click', (e) => this._onClick(e));
       this.shadowRoot.addEventListener('input', (e) => this._onInput(e));
       this.shadowRoot.addEventListener('change', (e) => this._onInput(e));
+      this.shadowRoot.addEventListener('keydown', (e) => {
+        if (e.key === 'Escape' && this._pick) { e.preventDefault(); this._closePick(); }
+      });
     }
     this.render();
     this.load();
@@ -219,8 +302,19 @@ class RetinueContacts extends HTMLElement {
 
   _onClick(e) {
     const el = e.target.closest('[data-act]');
-    if (!el || this._busy) return;
+    if (!el) return;
     const act = el.getAttribute('data-act');
+    // The choices of a handle: a press on the scrim itself (not the sheet on
+    // it) shuts them.
+    if (act === 'pick-close') { if (e.target === el) this._closePick(); return; }
+    if (act === 'pick-dismiss') { this._closePick(); return; }
+    if (act === 'pick-chat') { this._leave(chatUrl(el.getAttribute('data-id'))); return; }
+    if (act === 'pick-compose') { this._compose(); return; }
+    if (act === 'go') {
+      this._go(el.getAttribute('data-id'), el.getAttribute('data-ch'), el.getAttribute('data-h'));
+      return;
+    }
+    if (this._busy) return;
     const f = this._form;
     const arg = el.getAttribute('data-v');
     switch (act) {
@@ -238,6 +332,109 @@ class RetinueContacts extends HTMLElement {
       case 'save': this._save(); break;
       default: break;
     }
+  }
+
+  // A handle tapped: ask the server what it leads to, then go — or show the
+  // choices.
+  async _go(person, channel, handle) {
+    if (!channel || !handle || (this._pick && this._pick.busy)) return;
+    const c = this._contact(person);
+    const pick = { person, name: (c && c.name) || '', channel, handle, busy: true, answer: null, error: '' };
+    this._pick = pick;
+    this.render();
+    try {
+      const q = new URLSearchParams({ channel, handle });
+      if (person) q.set('person', person);
+      const res = await fetch(`/contacts/chats?${q}`, { cache: 'no-store' });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+      if (this._pick !== pick) return;
+      pick.answer = data;
+      pick.busy = false;
+      const t = handleTarget(data, channel);
+      if (t.go) { this._leave(chatUrl(t.go)); return; }
+      if (t.compose) { this._compose(); return; }
+      if (t.none) pick.error = t.none;
+    } catch (err) {
+      if (this._pick !== pick) return;
+      pick.busy = false;
+      pick.error = `Could not look up their chats (${String((err && err.message) || err)}).`;
+    }
+    this.render();
+  }
+
+  _closePick() {
+    if (!this._pick) return;
+    this._pick = null;
+    this.render();
+  }
+
+  _leave(url) {
+    this._pick = null;
+    this.render();
+    window.location.href = url;
+  }
+
+  // A new mail to the tapped address: the compose sheet, From the mailboxes
+  // the server named and To the person. Loaded only when asked for.
+  async _compose() {
+    const p = this._pick;
+    const offer = p && p.answer && (p.answer.new || []).find((n) => n && n.compose);
+    if (!offer) return;
+    const handle = (p.answer.handle && p.answer.handle.handle) || p.handle;
+    this._pick = null;
+    this.render();
+    const { openComposeSheet } = await import('./compose-sheet.js');
+    openComposeSheet({ channel: 'email', label: 'E-mail', accounts: offer.accounts || [],
+      to: { address: handle, name: p.name } });
+  }
+
+  // A handle as a link to its conversation, or as text where it leads none.
+  _handleLink(person, h, withChannel) {
+    const text = withChannel ? `${CHANNEL_LABEL[h.channel] || h.channel} ${h.handle}` : h.handle;
+    if (!person || !CHATTABLE.has(h.channel)) return `<span>${esc(text)}</span>`;
+    const label = h.channel === 'email' ? `Mail threads with ${h.handle}` : `Chat with ${h.handle} on ${CHANNEL_LABEL[h.channel] || h.channel}`;
+    return `<button type="button" class="go" data-act="go" data-id="${esc(person)}" data-ch="${esc(h.channel)}" ` +
+      `data-h="${esc(h.handle)}" aria-label="${esc(label)}">` +
+      (withChannel ? `<span class="via">${esc(CHANNEL_LABEL[h.channel] || h.channel)}</span> ` : '') +
+      `${esc(h.handle)}</button>`;
+  }
+
+  // The choices for a handle: its chats, and a new one.
+  _pickHtml() {
+    const p = this._pick;
+    if (!p) return '';
+    const label = CHANNEL_LABEL[p.channel] || p.channel;
+    const mail = p.channel === 'email';
+    let body;
+    if (p.busy) body = '<p class="muted">Looking up their chats…</p>';
+    else if (p.error) body = `<div class="err">${esc(p.error)}</div>`;
+    else {
+      const a = p.answer || {};
+      const several = new Set((a.chats || []).map((c) => c.account).filter(Boolean)).size > 1
+        || (a.new || []).filter((n) => n.id).length > 1;
+      const chats = (a.chats || []).map((c) =>
+        `<button type="button" class="opt" data-act="pick-chat" data-id="${esc(c.id)}">` +
+        `<div class="name">${esc(c.name || p.handle)}</div>` +
+        `<div class="meta">${[c.group ? 'group' : '', several && c.account ? `as ${c.account}` : '',
+          c.list_group === 'archived' ? 'archived' : '', when(c.ts)].filter(Boolean).map(esc).join(' · ')}</div>` +
+        `</button>`).join('');
+      const fresh = (a.new || []).map((n) => (n.compose
+        ? `<button type="button" class="opt new" data-act="pick-compose">New e-mail</button>`
+        : `<button type="button" class="opt new" data-act="pick-chat" data-id="${esc(n.id)}">` +
+          `New ${esc(label)} chat${several ? ` <span class="meta">as ${esc(n.account)}</span>` : ''}</button>`));
+      // A messenger chat that exists already is the one to write in: a new
+      // one is offered only from an account that has none with them.
+      const have = new Set((a.chats || []).map((c) => c.account));
+      const offered = mail ? fresh : fresh.filter((_, i) => !have.has(a.new[i].account));
+      body = chats + offered.join('') || '<p class="muted">Nothing to open.</p>';
+    }
+    const title = mail ? `Mail with ${p.handle}` : `${label} · ${p.handle}`;
+    return `<div class="scrim" data-act="pick-close">` +
+      `<div class="pick" role="dialog" aria-modal="true" aria-label="${esc(title)}">` +
+      `<h3>${esc(title)}</h3>${body}` +
+      `<div class="actions"><button type="button" class="btn" data-act="pick-dismiss">Close</button></div>` +
+      `</div></div>`;
   }
 
   _addHandle() {
@@ -317,16 +514,17 @@ class RetinueContacts extends HTMLElement {
   }
 
   _row(c) {
-    // A domain reads as "anyone at": @example.org, @*.example.org.
-    const handles = (c.handles || []).map((h) => h.handle)
-      .concat((c.domains || []).map((d) => `@${d}`)).join(' · ') || 'no handles';
+    // A domain reads as "anyone at": @example.org, @*.example.org. Each
+    // handle leads to the conversation with them on its channel; the row
+    // itself opens the editor.
+    const reach = (c.handles || []).map((h) => this._handleLink(c.id, h, true))
+      .concat((c.domains || []).map((d) => `<span>${esc(`@${d}`)}</span>`));
     const spheres = sphereList(c);
-    return `<li><button class="row" data-act="open" data-id="${esc(c.id)}">` +
+    return `<li class="card"><button class="row" data-act="open" data-id="${esc(c.id)}">` +
       `<div class="name">${esc(c.name)}${c.vip ? '<span class="vip">VIP</span>' : ''}` +
       `${c.instruction ? '<span class="brief" title="Their messages are worked by your instruction">BRIEF</span>' : ''}</div>` +
-      `<div class="meta">${esc(handles)}</div>` +
       `<div class="meta">${spheres.length ? esc(spheres.join(', ')) + ' · ' : ''}${esc(c.chamber)}</div>` +
-      `</button></li>`;
+      `</button><div class="reach">${reach.join('') || '<span>no handles</span>'}</div></li>`;
   }
 
   _editor() {
@@ -345,9 +543,14 @@ class RetinueContacts extends HTMLElement {
           `<option value="${esc(c)}"${f.chamber === c ? ' selected' : ''}>${esc(c)}</option>`).join('')}</select>`
         : '<span class="note">No chamber keeps contacts — each opts out in chambers.json, or none is mounted.</span>'}</div>`
       : `<div class="note">Kept in ${esc(f.chamber)}.</div>`;
+    // A handle the contact has on file leads to its conversation; one added
+    // in this form is not saved yet, so there is nothing to look up.
+    const saved = new Set(((!isNew && this._contact(this._open)) || { handles: [] }).handles
+      .map((h) => `${h.channel}:${h.handle}`));
     const handles = f.handles.map((h, i) =>
       `<div class="handle"><span class="ch">${esc(CHANNEL_LABEL[h.channel] || h.channel)}</span>` +
-      `<span>${esc(h.handle)}</span><button class="x" data-act="drop-handle" data-v="${i}" aria-label="Remove">✕</button></div>`).join('');
+      this._handleLink(saved.has(`${h.channel}:${h.handle}`) ? this._open : null, h, false) +
+      `<button class="x" data-act="drop-handle" data-v="${i}" aria-label="Remove">✕</button></div>`).join('');
     const domains = f.domains.map((d, i) =>
       `<div class="handle domain"><span class="ch">Domain</span><span>${esc(d)}</span>` +
       `<span class="covers">${esc(domainCovers(d))}</span>` +
@@ -427,11 +630,16 @@ class RetinueContacts extends HTMLElement {
       `<header><h2>Contacts${list.length ? ` · ${list.length}` : ''}</h2>` +
       `<button class="btn tiny" data-act="new"${this._busy ? ' disabled' : ''}>+ New contact</button></header>` +
       `<input type="search" data-set="q" value="${esc(this._q)}" placeholder="Search names, e-mail addresses and domains" autocomplete="off">` +
-      (this._error && !this._form ? `<div class="err">${esc(this._error)}</div>` : '') + body;
+      (this._error && !this._form ? `<div class="err">${esc(this._error)}</div>` : '') + body +
+      this._pickHtml();
     if (active) {
       const q = root.querySelector('[data-set="q"]');
       q.focus();
       q.setSelectionRange(q.value.length, q.value.length);
+    }
+    if (this._pick && !this._pick.busy) {
+      const first = root.querySelector('.pick .opt, .pick .btn');
+      if (first && typeof first.focus === 'function') first.focus();
     }
   }
 }

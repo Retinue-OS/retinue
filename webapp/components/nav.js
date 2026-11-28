@@ -22,7 +22,7 @@
 //   <retinue-nav current="chats"></retinue-nav>
 //   <retinue-nav back current="chats"></retinue-nav>   (a drill-down)
 //
-// `current` names the page (home · chats · threads · projects · news ·
+// `current` names the page (home · chats · threads · projects · news · apps ·
 // contacts · sends · settings); without it the page is recognised by its
 // path. `back` may come and go (the thread viewer on the home sets it while a
 // thread is open). Plain links, so the row works offline from the service
@@ -56,6 +56,9 @@ const PAGES = [
   { id: 'threads', href: '/conversations.html', label: 'Threads', paths: ['/conversations.html'] },
   { id: 'projects', href: '/projects.html', label: 'Projects', paths: ['/projects.html', '/project.html'] },
   { id: 'news', href: '/news.html', label: 'News', paths: ['/news.html'] },
+  // The chambers' own apps (docs/chamber-apps.md): the list is a page of
+  // the dashboard; an app opens on its own page, /apps/<chamber>/<app>/.
+  { id: 'apps', href: '/apps.html', label: 'Apps', paths: ['/apps.html'] },
   { id: 'contacts', href: '/contacts.html', label: 'Contacts', paths: ['/contacts.html'] },
 ];
 // The icons at the right end: the outbox, then the gear.
@@ -76,7 +79,7 @@ const CSS = `
   /* Text tabs with an accent rule under the page you are on: they read as
      places, not as a filter — the segmented Active/Archived controls on the
      list pages below are filters, and two filled bars stacked would blur the
-     difference. A phone narrower than the six labels scrolls the row
+     difference. A phone narrower than the seven labels scrolls the row
      sideways rather than truncating a word. */
   .tabs { flex: 1; min-width: 0; display: flex; gap: 2px; overflow-x: auto;
           scrollbar-width: none; -webkit-overflow-scrolling: touch; }

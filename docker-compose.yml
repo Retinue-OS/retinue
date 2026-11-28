@@ -496,6 +496,18 @@ services:
       - MAIL_MODEL_TRIM_QUEUE
       - MAIL_MODEL_TRIM_RETRY_SECONDS
       - MAIL_MODEL_TRIM_ATTEMPTS
+      # Chat triage, the Chats page's Triage button (docs/chat-triage.md):
+      # on/off, the sorting model (else the router tier) and the follow-up's
+      # (else the frontier tier), chats per call, calls at once, a call's
+      # timeout, follow-ups per press and at once.
+      - CHAT_TRIAGE
+      - CHAT_TRIAGE_MODEL
+      - CHAT_TRIAGE_FOLLOWUP_MODEL
+      - CHAT_TRIAGE_BATCH
+      - CHAT_TRIAGE_CONCURRENCY
+      - CHAT_TRIAGE_TIMEOUT
+      - CHAT_TRIAGE_FOLLOWUPS
+      - CHAT_TRIAGE_FOLLOWUP_CONCURRENCY
       - GATEWAY_HEALTH_TIMEOUT
       # Gateway auth (scripts/gateway_auth.py) beyond the three above.
       - GATEWAY_BASIC_AUTH_USERS
@@ -1482,6 +1494,10 @@ services:
       - /chambers/_generated/messenger/telegram
       - /chambers/_generated/messenger/sms
       - /chambers/_generated/messenger/email
+      # The dashboard threads' life-store summaries (scripts/thread_index.py):
+      # created before qlever-life starts watching, so the first summary
+      # written into it is indexed (qlever-dir#10).
+      - /chambers/_generated/threads
     volumes:
       - chambers:/chambers
     network_mode: none

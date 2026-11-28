@@ -200,6 +200,10 @@ def check_policy_text(cp) -> None:
         "viewer.html": {"frame-src": ["'self'"]},
         # YASGUI's stylesheet icons, data: images.
         "sparql.html": {"img-src": ["'self'", "data:"]},
+        # Every chamber app page (/apps/<chamber>/<app>/): sounds from its
+        # own files, images it draws itself. Sent enforced in report mode
+        # too (content_policy.app_headers; tests/test_chamber_apps.py).
+        cp.CHAMBER_APP_PAGE: {"img-src": ["'self'", "blob:"], "media-src": ["'self'"]},
     }
     assert set(expect) == set(cp.PAGE_SOURCES), sorted(cp.PAGE_SOURCES)
     for page, differences in expect.items():
@@ -216,8 +220,8 @@ def check_policy_text(cp) -> None:
         assert _directives(cp.policy(page))["frame-src"] == ["'none'"], page
     for page in ("chat.html", "viewer.html"):
         assert _directives(cp.policy(page))["frame-src"] == ["'self'"], page
-    print("ok: blob: images on the chat page alone, data: images on /sparql alone, "
-          "media on the chat page alone, frames on the file viewer and the chat "
+    print("ok: blob: images on the chat page and app pages alone, data: images on /sparql alone, "
+          "media on the chat page and app pages alone, frames on the file viewer and the chat "
           "page alone, data: media and remote media nowhere")
 
 

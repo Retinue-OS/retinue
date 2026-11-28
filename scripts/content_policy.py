@@ -116,6 +116,10 @@ DIRECTIVES = (
     ("manifest-src", ("'self'",)),
 )
 
+# The PAGE_SOURCES key every chamber app page is served under (no file of
+# webapp/ has this name).
+CHAMBER_APP_PAGE = "chamber-app"
+
 # What a single page needs beyond DIRECTIVES, by the file of webapp/ it is,
 # for that page alone, so the others do not carry it. A source named here is
 # added to the directive's sources above; where those are 'none', it takes
@@ -147,6 +151,13 @@ PAGE_SOURCES = {
     # of the vendored YASGUI (scripts/vendor-yasgui.sh) carries its icons as
     # data: images.
     "sparql.html": {"img-src": ("data:",)},
+    # Every page of a chamber app (/apps/<chamber>/<app>/…, docs/chamber-apps.md),
+    # under this one key rather than a file of webapp/: the same policy as the
+    # dashboard's pages — script from this origin only, no inline script — plus
+    # the two things a guided routine needs from its own files, a sound
+    # (media-src 'self') and an image it draws itself (blob:). Nothing from
+    # another origin.
+    CHAMBER_APP_PAGE: {"img-src": ("blob:",), "media-src": ("'self'",)},
 }
 
 _warned: set = set()
@@ -204,6 +215,19 @@ def headers(page: str | None = None) -> list[tuple[str, str]]:
     if name is None:
         return []
     return [(name, policy(page))]
+
+
+def app_headers() -> list[tuple[str, str]]:
+    """The headers of a chamber app page: the policy for CHAMBER_APP_PAGE,
+    **enforced** unless the mode is off. Report mode exists so that the
+    dashboard's own pages could move to the policy without breaking; an app
+    is new, is written against the policy from its first line, and shows
+    whatever its chamber's data holds, so it gets the policy as a rule from
+    the start (docs/chamber-apps.md, "Trust"). ``off`` stays the rollback for
+    every page alike."""
+    if mode() == "off":
+        return []
+    return [("Content-Security-Policy", policy(CHAMBER_APP_PAGE))]
 
 
 def signature() -> str:

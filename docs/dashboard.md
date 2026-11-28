@@ -37,7 +37,7 @@ lives in `webapp/` (baked into the image):
 
 **Navigation is one row at the top of every page**
 (`webapp/components/nav.js`): *Home · Chats · Threads · Projects · News ·
-Contacts*, then an outbox icon for the pending sends (`/sends`, the approval
+Apps · Contacts*, (*Apps*: the chambers' own apps, `docs/chamber-apps.md`) then an outbox icon for the pending sends (`/sends`, the approval
 queue — a queue that wants action, one tap away) and the settings gear, with
 the page you are on underlined. It is the first thing
 on the home, the list pages and settings, and it stays pinned while a list
@@ -149,6 +149,11 @@ shows in a frame; it and the chat page are the only pages that frame
 anything. `/sparql` (also served as
 `/sparql.html`) adds `data:` to `img-src`, for the icons in YASGUI's
 stylesheet. It needs nothing else: the vendored YASGUI compiles no strings.
+Every page of a **chamber app** (`/apps/<chamber>/<app>/`, see
+`docs/chamber-apps.md`) gets the same directives under the key `chamber-app`,
+plus `media-src 'self'` and `blob:` images, and gets them **enforced** in
+report mode too (`content_policy.app_headers`): an app is new and written
+against the policy, so it needs no migration period; only `off` drops it.
 Two other policies stay as they were, separate and always enforced:
 `/settings-instance.html`'s `frame-ancestors` (who may frame it, see "The
 settings page") and the file viewer's own `frame-src 'self'`. Inside the
@@ -300,7 +305,11 @@ attachments, messenger media through `/chats/media`, the life store's results
 on `/sparql` and the pairing-code proxy answer a script type as
 `application/octet-stream` (`_served_media_type` in the gateway); the
 letterbox share serves every file as a download anyway; `/data/` answers JSON
-and any other file as a download. `tests/test_web_gateway_no_script_types.py`
+and any other file as a download. Scripts are served as scripts outside
+`webapp/` in one place only, a chamber app's own directory
+(`/apps/<chamber>/<app>/`, the chamber's reviewed code), and nothing from
+outside can land there: `Retinue.submit` refuses every dot path,
+`.retinue/` included (`tests/test_chamber_apps.py`). `tests/test_web_gateway_no_script_types.py`
 asks each of them for every script type a sender might state.
 
 **Other services on the dashboard's host.** The policy reaches what the
@@ -455,6 +464,8 @@ dashboard, or from the phone on the channels that echo it — not SMS), *Mark
 handled*, *Mark as read* or archiving the chat settles it. Undoing a *Mark as
 read* reopens the item only where that mark settled it.
 The chat page carries **Archive** and **Mute** switches in its header's ⋮ menu
+— buttons in the header itself where it is wide enough, next to Spam and
+Delete; Star is the star before the chat's name —
 (`POST /chats/<id>/flags {archived?, muted?}`), with the thread flags'
 meaning: an archived chat leaves the chats list and comes back when a
 message arrives unless it is muted, and muted also silences its push;
@@ -478,6 +489,12 @@ alert).
 `_push_conv_notification` and `_chat_push_notification` are called only when
 the decision is *push* (`Urgency: high`); a held item badges the dashboard but
 stays quiet. The user's own threads with Ara are never gated — they asked.
+Such a thread is listed while Ara's reply lies unread; one the user opened
+about a project (from its page, or linked to it) stays listed for as long as
+that project is, read or not, until it is archived or marked done. Once read
+it takes the project's spheres (unless it declared its own), so a Focused
+scope shows or folds it exactly as it does the project
+(`attention_store.own_project_thread`, `fold_projects`).
 Breakpoints — the day plan's digest times (08:00, 12:00, 17:00, 21:00 on a
 shipped workday, 09:00 and 18:00 on a day off) and the scheduled mode changes
 (leaving *Rest* excepted: the morning digest opens the day) —
@@ -655,6 +672,36 @@ the e-mail backend and `signal-push.py`. Threads persist under
 `CONVERSATIONS_DIR`, which the deployment pins to the persistent `/root`
 volume (`/root/.retinue/conversations`) so threads survive container
 recreation.
+
+**Each thread's summary is also in the life store**
+(`scripts/thread_index.py`): one N-Triples file per thread,
+`chambers/_generated/threads/<id>.nt`, subject `urn:retinue:thread:<id>` (the
+attention emit's subject too) — `kb:Thread` with
+`dcterms:created`/`dcterms:modified`, `kb:kind`, `kb:initiator`, the
+`kb:archived`/`kb:muted`/`kb:starred`/`kb:unread` flags, `kb:messageCount`,
+and `kb:project` / `kb:companionOf` (the chat's `urn:retinue:chat:<id>`) where
+linked. Never the title — a thread opened without one is titled with the
+start of its first message, and an agent's title is often a mail's subject —
+nor a message text, a preview, an attachment or a shell action: the store is
+readable by every agent, and a thread's words stay in its file.
+`_save_conv` rewrites the summary when it changed; a delete removes the file,
+so the thread's named graph — everything the store knew of it — leaves with
+it (the tombstone stays the gateway's own); at startup the gateway writes any
+missing summary and removes any whose thread is gone. The thread files remain
+the truth.
+
+The full page's **Archived** tab is what this is for. It grew with every
+archived thread, and listing it parsed every thread file on every four-second
+poll. Now it asks `GET /conversations?archived=1&limit=50`: the order (starred
+first, then newest) is a SPARQL `ORDER BY … LIMIT … OFFSET` over the summaries,
+and only that page's files are read to build its rows — so a thread the store
+has not caught up with yet (deleted or restored seconds ago) is dropped there
+without costing the page a slot (it reads on, and `next_offset` is where it
+stopped), and one archived seconds ago joins on a later poll. "Load more" at the end
+widens the window by another page. The tab polls every 30 s rather than every
+4 s; a change made on it refreshes at once. When the store cannot answer, or
+knows no archived thread at all (a fresh deployment's summaries still being
+indexed), the page is built from the files as before (`source: "files"`).
 
 **Opening a thread is a side effect, so it takes an idempotency key.** The
 same turn can legitimately run twice — the escalation re-run replays a junior
@@ -1015,6 +1062,10 @@ opens that thread. This is automatic — there is no separate step after
 posting to a conversation. Pushes carry the RFC 8030 headers the model uses:
 `Urgency: high` on a breakthrough, `Urgency: normal` and `Topic: digest` on
 the digest, so an undelivered digest is replaced rather than stacked.
+A chamber app's **reminder** (`docs/chamber-apps.md`, "Reminders") is pushed
+the same way, but opens the app's deep link instead of a thread and carries
+two actions, *In 15 min* and *Skip today*, which `sw.js` posts to the
+reminder's `/apps/api/schedule/…` path without opening anything.
 
 The plumbing lives in `scripts/push_notify.py` (VAPID keypair, one file per
 device subscription, both persisted under `PUSH_DIR` — by default a sibling of
@@ -1045,6 +1096,21 @@ The Chats page (`chats.html`) sorts every messenger chat into three groups,
 `GET /chats` carries `list_group`, `unread` and `inbound_seq` (the count of
 arrivals the summary includes), and the payload `counts` — chats per group,
 for the tabs. (`group` on a chat is the boolean "a group chat", as before.)
+
+Within each group (starred chats first) the list is ordered by **last
+activity**, newest first: the summary's `active`, the later of the chat's own
+last message — inbound or outbound, the user's or a send of Ara's — and the
+user's exchange with Ara in its companion thread: the user's messages there
+and Ara's replies to them. Ara's unprompted companion turns (the note on an
+arrival, a triage follow-up; marked `arrival`) and the thread's opening line
+do not count, so neither a Triage press nor opening the pane reorders the
+list. `last` still says what the row previews and when.
+
+Beside the tabs, **Triage** sorts the *Unread* tab on the user's press into
+action (see Ara), proposed archive and proposed delete, with *Archive all* /
+*Delete all* per section and, where follow-ups are switched on
+(`CHAT_TRIAGE_FOLLOWUPS`, off by default), Ara's note on each action chat
+from a follow-up in its companion — [chat-triage.md](chat-triage.md).
 
 - A chat is **unread** while its latest inbound message has neither been
   replied to nor marked read, and **read** once it has — by a reply from the
@@ -2534,8 +2600,15 @@ threshold with no dip, but a voice still swings: the floor jumps to it, and
 if it was all the take had heard, the take goes back to waiting. Only a take
 that ends on a pause after speech is transcribed and sent, on the same path
 as ➤; the loop waits for the answer, and repeats. Every other end goes to the
-draft for review, never out: a take that runs to the 120 s cap without
-falling silent, and one whose no-speech window closes after a run was taken
+draft for review, never out — and the two are told apart by ear: a soft
+low gong once a take's send went through (one whose send turns back, its
+transcript left in the box, gets the whistle instead), a
+short rising whistle for one kept for
+review without a tap (`takeCue`; a dropped take and ✓ stay silent): a take that runs to the length
+cap (default 4 min, 1–30 min per device under Settings → Voice, kept in the
+page's own storage; three soft ticks half a minute before it, `warn`) without falling silent — a hard limit, voice or not, so an
+open mic that catches a phone call or a talk in the room never becomes a long
+turn for Ara to act on (a take that cancelled a call included), and one whose no-speech window closes after a run was taken
 back as the room (it may have been a voice). No speech within the no-speech timeout (default 8 s)
 closes the mic with the mode kept on (the mic button resumes); leaving the
 thread or hiding the page ends listening. Where the page cannot hear the
@@ -2550,7 +2623,7 @@ while the loop reads its answer ends the loop (the mode stays on), as the
 bar's ✕ does. An engaged loop that has nothing going on for 90 s — no mic,
 no take on its way, no answer awaited or playing — lets go, and so does one
 whose thread turns out deleted (which also drops it from the wake's
-choice). Both timeouts are
+choice). The timeouts are
 per device (Settings → Voice). Only an answer to the element's own turn
 carries the loop on: another message pushed into a thread in the mode may be
 read aloud, but never opens the mic. A mic the loop wants while the page is
@@ -2566,7 +2639,7 @@ call's wait (a mic that fails to open leaves the call to go ahead). Where the
 mic would not open because the user is writing, no call is placed either: the
 loop stops as it does there, and the directive stays a link. Speech (the
 detector's `speech`, so in any language) cancels the call, and the take goes
-on to Ara as the next turn, whatever ends it, carrying `cancelled_call: {number, name}`, from which the gateway writes a
+on to Ara as the next turn, whatever ends it short of the length cap (that one goes to review, the call staying cancelled), carrying `cancelled_call: {number, name}`, from which the gateway writes a
 fixed agent-only note (`_cancelled_call_context`): the call was not made;
 unless the words mean to stop it, place it again as a second attempt with
 `no-voice-cancel`. A cancelling take whose transcript is empty is no turn:
@@ -2767,7 +2840,7 @@ The contract the two sides share (web side: `webapp/components/shell.js`):
 
 | Direction | What |
 |---|---|
-| User agent | ` RetinueShell/6 (Android)` appended (` RetinueShell/5` before `placeCall`, ` RetinueShell/4` before the keyboard members, ` RetinueShell/3` before the app's own settings page and the per-device preferences, `/2` before the endpoint members, `/1` before the Health Connect members; the page feature-detects every member rather than parsing the version). |
+| User agent | ` RetinueShell/7 (Android)` appended (` RetinueShell/6` before the chamber-app members, ` RetinueShell/5` before `placeCall`, ` RetinueShell/4` before the keyboard members, ` RetinueShell/3` before the app's own settings page and the per-device preferences, `/2` before the endpoint members, `/1` before the Health Connect members; the page feature-detects every member rather than parsing the version). |
 | `window.RetinueShell` | Installed at document start, configured origin only: `platform`, `version`, `setVoiceActive(bool)` and `openSettings(section?)`, which opens the app's settings: from RetinueShell/4 its own page (the gear calls it when `settingsPage` is true), before that the native screens behind Settings → Phone shell (shown only when the object exists; the card is the first on the page there). `setVoiceActive(true)` means *a voice conversation is engaged: keep the screen on and pause the wake phrase*. The page asserts it before it asks for the mic (the wake detector must release it first) and keeps it asserted for as long as a continuous conversation is going — through transcription, Ara's answer and its reading, not only while the mic is open — and sends `false` once the loop stops (mode off, no speech, leaving the thread, an error). Wake detection being paused for the whole conversation is intended. |
 | Endpoints (RetinueShell/3) | The shell holds a list of Retinue servers (address, client certificate, sign-in, health switch) and shows one; the app's settings page lists, edits and switches them (RetinueShell/3: the Settings page's Phone shell card lists them in a menu and switches between them). `endpoints()` → a JSON string `[{"id": str, "label": str, "current": bool}]` — the label is the instance's own name, the manifest `short_name` the shell fetched with that endpoint's certificate or password (the host while it is unknown; the host appended when two names collide); no URLs, the other servers being none of the current page's business. `selectEndpoint(id)` asks the shell to show that server (it loads that dashboard's start page, so the page is left). `openSettings("endpoints")` opens the app's settings at the endpoint list, or at the editor straight away with one endpoint. The page may ask; it can never write an address, certificate or password — whatever origin the shell is pointed at receives its bridge, microphone, certificate and password, so that stays in the app. An `endpoints` event (`detail.type`) says the list changed while a page is open; the card re-renders. The shell's one base URL of earlier builds is the first endpoint after an update. |
 | Health Connect (RetinueShell/2) | Further members on `window.RetinueShell`: `healthConnectAvailable()` → `"true"`/`"false"`; `healthSync()` — a deliberate sync now, returns at once (a deliberate sync always runs, whatever the interval); `healthSyncStatus()` → a JSON string `{"available": bool, "permissions": "granted"\|"partial"\|"none", "last_sync_at": ISO\|null, "last_result": "ok"\|"error"\|"skipped"\|null, "last_error": str\|null, "last_count": int\|null, "min_interval_minutes": int, "auto_on_resume": bool, "enabled": bool}` (`enabled`, RetinueShell/3: the current endpoint's own health switch, set in the shell's editor — off, nothing is read or sent for that server, a sync asked for is `skipped` with reason `disabled`, and the card shows one line and *Edit endpoint* instead of the controls; an older shell omits the field and uploads for its one server); `setHealthSyncInterval(minutes)`; `setHealthAutoSync(bool)`. The shell reads the phone's Health Connect store through its Changes API and uploads what it returns, unaltered, as one JSON file per delivery by **WebDAV `PUT` to `/inbox/<name>`** — the letterbox share below, with the WebView's own client certificate and cookies — where a chamber that declares the file type in its `accepts` takes it (docs/scheduling.md); the framework knows nothing about the data. On resume the shell syncs on its own at most every `min_interval_minutes` (default 5) while `auto_on_resume` holds. From RetinueShell/4 the app's settings page has these controls, beside the endpoint's switch, and the dashboard shows none; with RetinueShell/3, Settings → Phone shell shows, only where `healthConnectAvailable()` is true, "Update health data now", the last sync (from `healthSyncStatus()` and the events), the auto-sync toggle and the interval. Every member is feature-detected (`webapp/components/shell.js`): an older shell simply shows none of it. |
@@ -2779,6 +2852,7 @@ The contract the two sides share (web side: `webapp/components/shell.js`):
 | Cold wake | With no page loaded the shell loads `/?wake=1`; the home treats it as a wake and drops the flag from the address. A wake should reach the page once it is resumed; one that arrives while the page is hidden still waits (up to 60 s) for it to come to the front before the mic opens. |
 | Speech output | A `speechSynthesis` / `SpeechSynthesisUtterance` stand-in over the native TTS when the WebView has none; `webapp/components/speech.js` is unchanged. |
 | Phone calls (RetinueShell/6) | `placeCall(number)` on `window.RetinueShell`: the shell calls the number without a tap (`ACTION_CALL`, on speakerphone — the user may not be holding the phone) when *Call directly by voice* is on for the endpoint (a switch per endpoint, in the app's settings under *This app with <endpoint>* → *Phone calls*, off for a new endpoint), Android's phone-call permission is granted, and a voice conversation is engaged (`setVoiceActive(true)`) — never outside one, so no page can dial behind the user's back. The shell normalises the number (separators, a leading `tel:` and the `(0)` of `+44 (0)20` dropped); it must then be an optional `+` followed by digits, `*` and `#`, with 3 to 20 digits and at most 32 characters. It answers with a `retinue-shell` event `{type: "call", state, reason?, number?}`: `placed` (with `number`); `dialer` — the dialer opened with the number instead (with `number`), for an emergency number (Android lets no app call those directly; `reason: "emergency"`), a service code — any number with `*` or `#`, which always opens the dialer (`service-code`) —, with the switch off (`disabled`) or without the permission (`no-permission`); or `refused` (`invalid-number`, `not-in-voice`, `no-telephony`, or `failed` with `number`). An empty string is answered `refused` / `invalid-number`; `placeCall()` and `placeCall(null)` send nothing. The web side (`shell.js`: `canPlaceCall`, `placeCall`, `onCall`) uses it only for the call directive of the continuous loop's own answer (above), and lets the voice flag go on any answer, whatever its state. |
+| Chamber apps (RetinueShell/7) | The shell lists the endpoint's chamber apps (`GET /apps/index.json`) on a screen of its own and opens one in its WebView, the dashboard a tap away (`docs/chamber-apps.md`). On `window.RetinueShell`: `speak(text, lang, id)` — native text-to-speech, answered by a `retinue-shell` event `{type: "speak", id, state: "done" \| "error"}`; `notify(title, body)` — an immediate notification while the page is open; `remindersChanged()` — the app changed its reminders, so the shell fetches `GET /apps/api/schedule?arm=1` again and re-arms its local alarms. The shell arms each reminder occurrence as an Android alarm, shows it with *In 15 min* and *Skip today*, confirms it (`POST …/delivered`) so the server does not push it a second time, and opens the app's deep link on a tap. `webapp/apps/retinue.js` feature-detects every member; the dashboard's own pages use none of them. |
 | Files | A file the WebView cannot show (a PDF, anything served as `attachment`) reaches the shell's download listener, which follows the `Content-Disposition` as a browser does. `inline` — a PDF row's name link (`?inline=1`; images and text open in the dashboard's file viewer, see "Attachments") — means *view*: the shell opens it in the phone's app for the type from a private copy, so no copy lands in Downloads (none installed: it saves it there and says so). Anything else — the ↓ link — is saved to Downloads. The name is the header's (`filename*`, then `filename`); the attachment URL ends in it too (see "Attachments"). |
 
 ### Shell actions: typing on a paired device

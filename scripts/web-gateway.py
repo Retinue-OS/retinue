@@ -27,6 +27,14 @@ Conversation tabs (dashboard chat threads, distinct from the per-day log):
                                          and messenger-companion threads are
                                          hidden from normal lists) and
                                          ?project=<uri>.
+  GET  /conversations?archived=1&limit=N[&offset=M]
+                                      -> one page of archived threads, starred
+                                         first, then newest: {conversations,
+                                         has_more, next_offset, source}. Ordered
+                                         by the life store's thread summaries
+                                         (thread_index.py), rows built from the
+                                         thread files; the files alone when the
+                                         store cannot answer.
   GET  /conversations/<id>            -> full thread {id,title,messages,...}
   POST /conversations                 -> open a new thread (body {message};
                                          optional kind: "chat"|"edit", project:
@@ -332,6 +340,12 @@ Messenger chats (the deterministic chat mirror; see scripts/chat_state.py):
                                          ?q=<text> searches names and e-mail
                                          addresses; ?channel=&handle= looks
                                          a handle up (email, sms, signal, …).
+  GET  /contacts/chats?channel=&handle=[&person=]
+                                      -> the chats one handle is in and how a
+                                         new one is started: {handle, chats:
+                                         [{id, channel, account, name, group,
+                                         ts, list_group}], new: [{id, account}
+                                         | {compose: true, accounts}]}.
   POST /contacts                      -> create a contact: {chamber, name,
                                          handles: [{channel, handle}],
                                          sphere?, tags?, importance?,
@@ -520,10 +534,13 @@ from requester_identity import normalize_requester_identity
 import attention as attention_policy
 import attention_store
 import build_stamp
+import calendar_trigger
+import chamber_apps
 import claude_auth
 import agent_models
 import content_policy
 import chat_state as chat_state_mod
+import chat_triage
 import contacts as contacts_mod
 import dictation_vocabulary
 import email_client as ec
@@ -531,6 +548,7 @@ import send_origin
 import inbound_store
 import session_env
 import shell_actions
+import thread_index
 import gateway_auth
 import instance_branding
 import letterbox
@@ -1432,6 +1450,22 @@ CONVERSATIONS_DIR.mkdir(parents=True, exist_ok=True)
 # the thread JSON on the same persistent volume so downloads survive restarts.
 CONVERSATION_ATTACHMENTS_DIR = CONVERSATIONS_DIR / "attachments"
 CONVERSATION_ATTACHMENTS_DIR.mkdir(parents=True, exist_ok=True)
+# Each thread's summary in the life store (scripts/thread_index.py): one
+# N-Triples file per thread, rewritten by _save_conv and removed with the
+# thread, so the Archived list is a paged SPARQL query instead of a parse of
+# every thread file. Only list fields go there — no message text.
+THREADS_EMIT_DIR = Path(os.environ.get(
+    "THREADS_EMIT_DIR", str(CHAMBERS_DIR / "_generated" / "threads")))
+# One page of the Archived list (GET /conversations?archived=1&limit=N). No
+# upper bound on `limit`: the Threads page's "Load more" widens one window
+# from the top (limit 50, 100, …) rather than fetching further offsets, so a
+# cap would leave every archived thread past it unreachable — the unpaged
+# list this replaced returned them all. A request costs what it asks for: one
+# store query and the files of the rows it returns.
+ARCHIVED_PAGE_DEFAULT = 50
+# How many store reads one page may take when rows the store still lists turn
+# out deleted or restored (it is seconds behind at most, so one is the rule).
+_ARCHIVED_PAGE_ROUNDS = 5
 # Cap a single attachment's decoded size to keep memory and disk bounded.
 MAX_ATTACHMENT_BYTES = int(os.environ.get("CONVERSATION_MAX_ATTACHMENT_BYTES", str(25 * 1024 * 1024)))
 # Files forwarded with POST /message (e.g. an image received on a messenger
@@ -2872,6 +2906,52 @@ def _save_conv(conv: dict) -> None:
     with open(tmp, "w") as f:
         json.dump(conv, f, ensure_ascii=False)
     os.replace(tmp, path)
+    _thread_index_write(conv)
+
+
+_thread_index_warned = False
+
+
+def _thread_index_write(conv: dict) -> None:
+    """Bring the thread's life-store summary up to date. Best-effort: the
+    thread file is what counts, and the startup reconcile repairs a miss.
+    A directory that cannot be written is said once, not on every save."""
+    global _thread_index_warned
+    try:
+        thread_index.write(THREADS_EMIT_DIR, conv)
+    except Exception as exc:  # noqa: BLE001
+        if not _thread_index_warned:
+            _thread_index_warned = True
+            print(f"[web-gateway] thread summaries not written ({THREADS_EMIT_DIR}): {exc}", flush=True)
+
+
+def _thread_index_reconcile() -> tuple[int, int]:
+    """Make the summaries match the threads: write the missing or outdated
+    ones, remove those whose thread is gone. Returns (written, removed)."""
+    written = 0
+    live: set[str] = set()
+    for path in sorted(CONVERSATIONS_DIR.glob("*.json")):
+        if not _CONV_ID_RE.fullmatch(path.stem):
+            continue
+        # Under the lock every thread write takes, so a save racing the scan
+        # cannot have its fresher summary overwritten by this older read.
+        with _conversations_lock:
+            conv = _load_conv_raw(path.stem)
+            if conv is None:
+                continue
+            live.add(path.stem)
+            try:
+                written += thread_index.write(THREADS_EMIT_DIR, conv)
+            except OSError as exc:
+                print(f"[web-gateway] thread summary not written for {path.stem}: {exc}", flush=True)
+    removed = 0
+    for cid in thread_index.stale_ids(THREADS_EMIT_DIR, live):
+        # Re-checked under the lock: a thread created since the scan is live.
+        with _conversations_lock:
+            if (CONVERSATIONS_DIR / f"{cid}.json").exists():
+                continue
+            removed += thread_index.remove(THREADS_EMIT_DIR, cid)
+    return written, removed
 
 
 def _conv_summary(conv: dict) -> dict:
@@ -2960,6 +3040,84 @@ def _list_convs(scope: str = "active", kind: str = "chat",
         summaries.append(_conv_summary(conv))
     summaries.sort(key=lambda s: s.get("updated") or "", reverse=True)
     return summaries
+
+
+def _archived_page(kind: str = "chat", limit: int = ARCHIVED_PAGE_DEFAULT,
+                   offset: int = 0) -> dict:
+    """One page of the Archived list, starred first, then newest first.
+
+    The order comes from the life store (thread_index.page_query), which
+    selects ids only; each row is built from the thread's own file, which
+    stays the truth. So a thread the store has not caught up with yet — deleted
+    or restored a moment ago — is dropped here rather than shown as it was.
+    The store is a few seconds behind at most: a thread archived just now
+    joins the page on a later poll.
+
+    When the store cannot answer, or answers with no archived thread at all
+    on the first page (the summaries of a fresh deployment, still being
+    indexed), the page comes from the files instead — slower, never wrong.
+    `source` says which ("store" or "files").
+
+    A store row whose thread no longer qualifies does not cost the page a
+    slot: the page reads on from the store until it holds `limit` rows, and
+    `next_offset` is the store position after the last row it read, so the
+    next page starts exactly there — nothing repeated, nothing skipped."""
+    chunk = limit + 1
+
+    def from_store(at: int) -> tuple[list[str], int]:
+        bindings = _sparql_bindings(thread_index.page_query(kind, chunk, at))
+        return thread_index.page_ids(bindings, unique=False), len(bindings)
+
+    try:
+        ids, got = from_store(offset)
+    except Exception as exc:  # noqa: BLE001 — store down: the files still answer
+        print(f"[web-gateway] archived page from the files: {exc}", flush=True)
+        ids, got = None, 0
+    if ids is None or (not ids and offset == 0):
+        rows = sorted(_list_convs("archived", kind),
+                      key=lambda t: not t.get("starred"))  # stable: newest first within
+        return {"conversations": rows[offset:offset + limit],
+                "has_more": len(rows) > offset + limit,
+                "next_offset": offset + limit, "source": "files"}
+    rows: list[dict] = []
+    seen: set[str] = set()
+    pos = offset
+    has_more = False
+    for _round in range(_ARCHIVED_PAGE_ROUNDS):
+        for cid in ids:
+            if len(rows) == limit:
+                has_more = True
+                break
+            pos += 1
+            if cid in seen:  # mid-update the store may hold a thread twice
+                continue
+            seen.add(cid)
+            conv = _load_conv(cid)
+            if conv is None or not conv.get("archived"):
+                continue
+            if kind != "all" and (conv.get("kind") or "chat") != kind:
+                continue
+            rows.append(_conv_summary(conv))
+        if has_more or got < chunk:  # full with one to spare, or the store is through
+            break
+        try:
+            ids, got = from_store(pos)
+        except Exception as exc:  # noqa: BLE001 — what was read stands; more may follow
+            print(f"[web-gateway] archived page cut short: {exc}", flush=True)
+            has_more = True
+            break
+    else:
+        has_more = True  # rounds used up on rows the files dropped: more may follow
+    return {"conversations": rows, "has_more": has_more,
+            "next_offset": pos, "source": "store"}
+
+
+def _page_param(params: dict, name: str, default: int, low: int, high: int) -> int:
+    try:
+        value = int((params.get(name) or [str(default)])[0])
+    except ValueError:
+        value = default
+    return max(low, min(high, value))
 
 
 def _store_attachments(cid: str, raw_atts) -> list[dict]:
@@ -5087,13 +5245,18 @@ _conv_pending_lock = threading.Lock()
 
 def _conv_worker(cid: str, session_key: str, *, arrival: str | None = None,
                  push: bool = True, error_reply: bool = True,
-                 arrival_turn: str | None = None) -> bool:
+                 arrival_turn: str | None = None, model: str | None = None,
+                 reply_sink: list | None = None) -> bool:
     """Background worker: ask Ara for the next turn in a thread and store it.
 
     `arrival` runs the turn on a chat message instead of on something the user
     wrote (see _chat_arrival_worker); `push` is False there because the arrival
     itself already notified the user's devices, and a second push for the same
-    message would say the same thing twice. `error_reply` False stores nothing
+    message would say the same thing twice. `model` runs this one turn on the
+    model named, whatever the thread's own choice (chat triage's follow-up
+    asks for the frontier tier: docs/chat-triage.md), and `reply_sink` gets
+    the reply this turn stored — its own, never another turn's that landed in
+    the thread meanwhile. `error_reply` False stores nothing
     for a turn that failed (a mail's arrival turn, which is retried by design).
     `arrival_turn` is that turn's token (send_message). A turn without
     `arrival` is the user's own conversation with Ara: its sessions are
@@ -5136,7 +5299,7 @@ def _conv_worker(cid: str, session_key: str, *, arrival: str | None = None,
         # thread default applies — the dashboard's own tier where the
         # deployment configures one, else the router tier send_message()
         # would have picked anyway.
-        chosen = _conv_model(conv)
+        chosen = model or _conv_model(conv)
         if chosen is None and conv.get("escalated") and FRONTIER_MODEL:
             chosen = FRONTIER_MODEL
         elif chosen is None and DASHBOARD_MODEL:
@@ -5320,6 +5483,8 @@ def _conv_worker(cid: str, session_key: str, *, arrival: str | None = None,
         # this turn. Saying otherwise would let a gateway mark an inbound
         # message delivered against a reply that does not exist.
         return False
+    if reply_sink is not None:
+        reply_sink.append(reply)
     if push:
         # A reply that is only shell actions still says something: a fixed
         # phrase, never the text to type, which may be a sensitive one and must
@@ -9279,6 +9444,64 @@ def _schedule_chat_name_backfill(chat_ids) -> None:
     threading.Thread(target=run, name="chat-name-backfill", daemon=True).start()
 
 
+# When the user and Ara last spoke in a chat's companion thread, for the
+# list's order (_chats_payload, "active"). Only the user's own messages and
+# Ara's replies to them count: the fixed opening line (role "agent") and
+# Ara's unprompted turns — the note on a message's arrival and the triage
+# follow-up, both marked "arrival" — do not, so neither opening the pane nor
+# a Triage press moves a chat up. Cached per thread file by mtime and size, since the
+# list is rebuilt on every poll.
+_companion_active_cache: dict[str, tuple[tuple[int, int], str]] = {}
+_companion_active_lock = threading.Lock()
+
+
+def _utc_stamp(value: str) -> str:
+    """An ISO 8601 moment as ``YYYY-MM-DDTHH:MM:SSZ`` (UTC), or "" when it
+    is none. The chat records' stamps and the threads' differ in form
+    (``Z`` against ``+00:00``, fractions or not), so they are only compared
+    once they are in this one."""
+    raw = (value or "").strip()
+    if not raw:
+        return ""
+    try:
+        moment = datetime.fromisoformat(raw[:-1] + "+00:00" if raw.endswith("Z") else raw)
+    except ValueError:
+        return ""
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    return moment.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _companion_active(cid) -> str:
+    """The newest message of the user's, or of Ara's in reply, in companion
+    thread `cid`, as a _utc_stamp; "" for none or no such thread."""
+    if not cid or not _CONV_ID_RE.fullmatch(str(cid)):
+        return ""
+    cid = str(cid)
+    try:
+        st = os.stat(os.path.join(CONVERSATIONS_DIR, f"{cid}.json"))
+    except OSError:
+        return ""
+    # Size as well as the mtime: two writes can land in one tick of a coarse
+    # clock, and every write that adds a message makes the file longer.
+    mtime = (st.st_mtime_ns, st.st_size)
+    with _companion_active_lock:
+        hit = _companion_active_cache.get(cid)
+    if hit is not None and hit[0] == mtime:
+        return hit[1]
+    conv = _load_conv_raw(cid) or {}
+    newest = ""
+    for m in conv.get("messages") or []:
+        if not isinstance(m, dict):
+            continue
+        role = m.get("role")
+        if role == "user" or (role == "assistant" and not m.get("arrival")):
+            newest = max(newest, _utc_stamp(str(m.get("ts") or "")))
+    with _companion_active_lock:
+        _companion_active_cache[cid] = (mtime, newest)
+    return newest
+
+
 # The SPARQL-derived skeleton (chat list + unread counts) reused between
 # dashboard polls; state and overlay are merged fresh on every request. Any
 # write that changes the skeleton's truth expires it early — expires, not
@@ -9864,9 +10087,15 @@ def _chats_payload() -> dict:
             # being, or was, worked — see _instructed_note — or null.
             "instructed": doc.get("instructed") or None,
             "messages": _chat_messages_url(chat_id),
+            # What the list is ordered by: the newest of the chat's own last
+            # message (either direction) and the user's exchange with Ara in
+            # its companion (_companion_active), as a UTC stamp. `last` still
+            # says what the row previews and when that was.
+            "active": max(_utc_stamp(last.get("ts") or ""),
+                          _companion_active(doc.get("companion"))) or (last.get("ts") or ""),
             **people,
         })
-    chats.sort(key=lambda c: c["last"]["ts"], reverse=True)
+    chats.sort(key=lambda c: c["active"], reverse=True)
     _schedule_chat_name_backfill(nameless)
     _schedule_pending_sync()
     counts = {"unread": 0, "read": 0, "archived": 0}
@@ -10251,18 +10480,42 @@ def _instruction_brief(briefed: list[dict], chat_id: str, mail: bool = False) ->
         "3. Set the verdict, once, as the last thing you do:\n"
         "  python3 /workspace/scripts/chat-verdict.py --chat "
         f"{shlex.quote(chat_id or '<chat id>')} --importance <0-5> "
+        "--triage <action|archive|delete> --triage-note '<one sentence>' "
         "[--due <when>] [--action '<what you did>' ...] "
         "[--flag '<what the user must look at>']\n"
         + _VERDICT_SCALE + "Give "
         "--due only for a real deadline the message carries (an ISO "
         "date-time, or YYYY-MM-DD). Name each thing you did as an --action "
         "(\"staged a reply\", \"added the visit on Friday 10:00 to the "
-        "calendar\") and each thing the user must look at as a --flag. " + ring,
+        "calendar\") and each thing the user must look at as a --flag. " + ring + " " + _TRIAGE_SCALE,
         "4. Open a dashboard conversation (conversation-push.py) only for "
         "something that needs the user's decision and is not \"send this "
         "reply\". A flag belongs in the verdict, not in a thread.",
     ]
     return lines
+
+
+# What the triage word every arrival turn gives means (docs/chat-triage.md,
+# "Arrival turns"): the Chats page's Triage lists the chat by it and spends
+# no second judgement on it until a newer message arrives.
+_TRIAGE_SCALE = (
+    "The triage word says how the Chats page's Triage lists this chat, so "
+    "the user's next sort spends no second judgement on it: `action` — the "
+    "user should do or decide something (answer, pay, sign, confirm, meet a "
+    "deadline; also when you staged a reply that still needs their send "
+    "press); `archive` — nothing to do, worth keeping; `delete` — nothing to "
+    "do, nothing worth keeping. The --triage-note is one short sentence for "
+    "the row, in the language of the chat: what it is and, for action, what "
+    "the user should do. ")
+
+
+def _triage_step(chat_id: str, n: int) -> str:
+    """The last step of a VIP's turn: its triage word, alone."""
+    return (f"{n}. Say how the user's triage should list it, as the last thing "
+            "you do:\n"
+            f"  python3 /workspace/scripts/chat-verdict.py --chat "
+            f"{shlex.quote(chat_id or '<chat id>')} --triage <action|archive|delete> "
+            "--triage-note '<one sentence>'\n" + _TRIAGE_SCALE)
 
 
 # What a verdict's importance means, as every instructed turn is told it.
@@ -10408,13 +10661,14 @@ def _mail_instruction_steps(chat_id: str, recall: str, ring: str) -> list[str]:
         "mail more important by saying so.",
         "3. Set the verdict, once, as the last thing you do:\n"
         f"  python3 /workspace/scripts/chat-verdict.py --chat {quoted} "
-        "--importance <0-5> [--due <when>] [--action '<what you did>' ...] "
+        "--importance <0-5> --triage <action|archive|delete> "
+        "--triage-note '<one sentence>' [--due <when>] [--action '<what you did>' ...] "
         "[--flag '<what the user must look at>']\n"
         + _VERDICT_SCALE + "Give --due only for a real deadline the mail "
         "carries (an ISO date-time, or YYYY-MM-DD). Name each thing you did "
         "as an --action (\"linked it to the tax project\", \"filed the "
         "invoice with the Archivist\", \"archived the mail\") and each thing "
-        "the user must look at as a --flag. " + ring,
+        "the user must look at as a --flag. " + ring + " " + _TRIAGE_SCALE,
         "4. Open a dashboard conversation (conversation-push.py) only for "
         "something that needs the user's decision and is not \"send this "
         "reply\". A flag belongs in the verdict, not in a thread.",
@@ -10621,6 +10875,7 @@ def _mail_arrival_prompt(arrivals: list[dict], chat_id: str = "", deferred: int 
         "question you cannot answer from what you know. Never open one to "
         "announce a draft you staged or a memory you stored: the thread is "
         "where the user sees that.",
+        _triage_step(chat_id, 5),
     ]
     lines.append(
         "Then answer here in one or two sentences: what arrived, what you "
@@ -10737,6 +10992,7 @@ def _chat_arrival_prompt(arrivals: list[dict], chat_id: str = "", deferred: int 
         "announce a draft you staged or a memory you stored: the chat is where "
         "the user sees that, and a thread per message is exactly what this "
         "replaced.",
+        _triage_step(chat_id, 5),
     ]
     lines.append(
         "Then answer here in one or two sentences: what arrived, what you "
@@ -11225,9 +11481,11 @@ def _chat_arrival_worker(chat_id: str, cid: str, worker: object = None) -> None:
             prompt += _message_files_note(stored)
         ok = False
         error = "the chat's companion turn did not complete"
+        replies: list = []
         try:
             ok = _conv_worker(cid, f"conv:{cid}", arrival=prompt, push=False,
-                              error_reply=not mail, arrival_turn=record["token"])
+                              error_reply=not mail, arrival_turn=record["token"],
+                              reply_sink=replies)
         except Exception as exc:  # noqa: BLE001 - a failed turn is a job result
             print(f"[web-gateway] companion turn for {key} failed: {exc!r}",
                   flush=True)
@@ -11255,6 +11513,14 @@ def _chat_arrival_worker(chat_id: str, cid: str, worker: object = None) -> None:
                         _instructed_ring_fire(arrival["ring"], None,
                                               "the turn's outcome could not be applied")
         if ok:
+            # The turn's word for the Chats page's Triage (its --triage), so a
+            # later press spends no second judgement on these messages.
+            # A batch too big to quote whole is worked in turns, and no one of
+            # them has seen every mail: none leaves a word, and the next press
+            # judges the thread (a turn's "archive" must not cover a mail it
+            # was told to leave for another turn).
+            _triage_from_arrival(live, record, replies[-1] if replies else None,
+                                 partial=bool(deferred) or any(a.get("deferred") for a in arrivals))
             # Durably: a mail whose turn completed is worked, also for the
             # process that comes after this one (_start_chat_arrival_turn).
             with _chat_turns_lock:
@@ -11626,6 +11892,61 @@ def _parse_verdict(payload: dict) -> dict:
 
     return {"importance": importance, "due": due, "actions": lines("actions"),
             "flags": lines("flags"), "at": chat_state_mod.iso_z()}
+
+
+def _parse_triage_verdict(payload: dict) -> dict | None:
+    """The triage word an arrival turn gives (chat-verdict.py --triage):
+    ``{bucket, note}`` or None when it gives none. Raises ValueError."""
+    bucket = payload.get("triage")
+    if bucket in (None, ""):
+        return None
+    if bucket not in chat_triage.BUCKETS:
+        raise ValueError(f"triage is one of {', '.join(chat_triage.BUCKETS)}, not {bucket!r}")
+    # Absent is no note; anything given must be text (a false, a 0 or a
+    # list is no note to keep).
+    note = payload.get("triage_note", "")
+    if not isinstance(note, str):
+        raise ValueError("triage_note is text")
+    return {"bucket": bucket, "note": " ".join(note.split())[:chat_triage.NOTE_CHARS]}
+
+
+def _triage_from_arrival(chat_id: str, record: dict, reply: str | None, *,
+                         partial: bool = False) -> None:
+    """Write a completed arrival turn's triage word into the triage store
+    (docs/chat-triage.md, "Arrival turns"), for the message count it judged:
+    the newest arrival it worked. A chat spoken in since reads as stale
+    there, and the next press sorts it as any other.
+
+    Where the worked messages stand in the count is read as the turn's
+    put-away reads it (_turn_put_away): by message id, since a merge while
+    the turn ran renumbers the count; by the place they had at the start
+    only where the chat was not merged. A message placed neither way leaves
+    no word — the next press judges the chat, rather than trusting a count
+    that may name another message.
+
+    ``partial``: the turn worked part of a batch too big to quote whole (the
+    newest mails, or the older ones deferred to it) — it leaves no word. And
+    a word never replaces an entry for a newer message (put_arrival): a
+    sorting that ran meanwhile, or a later turn's word."""
+    triage = record.get("triage")
+    if not triage or partial:
+        return
+    doc = _CHAT_STATE.get(chat_id)
+    unmoved = chat_id in (record.get("names") or ())
+    places = [chat_state_mod.recent_place(doc, mid) if mid else None
+              for mid in record.get("mids") or []]
+    places = [p if isinstance(p, int) and not isinstance(p, bool)
+              else (s if unmoved and isinstance(s, int) and not isinstance(s, bool) else None)
+              for p, s in zip(places, record.get("seqs") or [])]
+    if not places or None in places:
+        return
+    try:
+        _TRIAGE_STORE.put_arrival(chat_id, chat_triage.arrival_entry(
+            triage["bucket"], triage.get("note") or "", max(places),
+            attention_store.markup_words(reply) if reply else None))
+    except OSError as exc:
+        print(f"[web-gateway] chat triage: could not keep the arrival's word for "
+              f"{chat_id} ({exc})", flush=True)
 
 
 # How long to wait for a gateway to report back what an approved send actually
@@ -12016,6 +12337,10 @@ def _delete_conversation(cid: str, *, by_user: bool = False) -> bool:
         if by_user:
             _conv_write_tombstone(cid)
         path.unlink(missing_ok=True)
+        try:
+            thread_index.remove(THREADS_EMIT_DIR, cid)
+        except OSError as exc:  # the startup reconcile removes it then
+            print(f"[web-gateway] thread summary not removed for {cid}: {exc}", flush=True)
     shutil.rmtree(CONVERSATION_ATTACHMENTS_DIR / cid, ignore_errors=True)
     with _conv_keys_lock:
         try:
@@ -14967,6 +15292,200 @@ def _mail_trim_parse(answer: str) -> list | None:
     return keep
 
 
+# ── Chat triage (docs/chat-triage.md) ─────────────────────────────────────────
+# The Chats page's Triage button sorts the unread chats into "action", "no
+# action — archive" and "no action — delete". Only the user's press starts a
+# run: there is no schedule, and an arrival never spends a turn on it. Many
+# chats go into one call of a fast model (the router tier unless one is named)
+# — that is where the saving is, against a turn per message. Each chat put
+# under action is then handed to a follow-up turn in its companion thread, on
+# the frontier tier, which writes Ara's note and stages a reply where one is
+# wanted; the sorted lists are shown while those still work. The pass itself
+# is tool-less, like the mail trim: what a correspondent wrote can at worst
+# mis-sort its own chat. The follow-up is the companion's "Propose" chip, run
+# for the user, and is told to send, archive and queue nothing.
+CHAT_TRIAGE = os.environ.get("CHAT_TRIAGE", "1").strip().lower() not in (
+    "0", "false", "no", "off")
+CHAT_TRIAGE_MODEL = (os.environ.get("CHAT_TRIAGE_MODEL", "").strip()
+                     or ROUTER_MODEL or CLAUDE_MODEL or "haiku")
+# Empty (and no frontier tier): the companion thread's own model.
+CHAT_TRIAGE_FOLLOWUP_MODEL = (os.environ.get("CHAT_TRIAGE_FOLLOWUP_MODEL", "").strip()
+                              or FRONTIER_MODEL)
+CHAT_TRIAGE_BATCH = max(1, int(os.environ.get("CHAT_TRIAGE_BATCH", "12")))
+CHAT_TRIAGE_CONCURRENCY = max(1, int(os.environ.get("CHAT_TRIAGE_CONCURRENCY", "4")))
+CHAT_TRIAGE_TIMEOUT = float(os.environ.get("CHAT_TRIAGE_TIMEOUT", "180"))
+# Off by default (0): a follow-up is a full-tool turn on a correspondent's
+# words, and nothing in the backend yet holds that turn to "send nothing,
+# change no flag" — only its prompt does (docs/chat-triage.md, "Follow-ups
+# are off by default"). A deployment that accepts that sets a number here.
+CHAT_TRIAGE_FOLLOWUPS = max(0, int(os.environ.get("CHAT_TRIAGE_FOLLOWUPS", "0")))
+CHAT_TRIAGE_FOLLOWUP_CONCURRENCY = max(1, int(os.environ.get(
+    "CHAT_TRIAGE_FOLLOWUP_CONCURRENCY", "2")))
+
+
+def _triage_classify(prompt: str) -> str | None:
+    """One batch through the fast model: its answer text, or None for a
+    call that gave none. Spawned as the mail trim's turn is — no tools, no
+    MCP server, no session kept, away from /workspace — since every word of
+    the prompt but the instruction is a correspondent's."""
+    cmd = [
+        "claude", "-p", "--output-format=json",
+        "--model", CHAT_TRIAGE_MODEL,
+        "--no-session-persistence",
+        "--allowed-tools", "",
+        "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}',
+        "--exclude-dynamic-system-prompt-sections",
+        "--system-prompt", chat_triage.SYSTEM_PROMPT,
+        "--", prompt,
+    ]
+    try:
+        result = _run_claude(
+            cmd, capture_output=True, text=True, timeout=CHAT_TRIAGE_TIMEOUT,
+            cwd=tempfile.gettempdir(),  # away from /workspace: no CLAUDE.md
+            env=session_env.build(model=CHAT_TRIAGE_MODEL),
+        )
+    except subprocess.TimeoutExpired:
+        print("[web-gateway] chat triage: a batch ran out of time", flush=True)
+        return None
+    except OSError as exc:
+        print(f"[web-gateway] chat triage: the call could not start ({type(exc).__name__})",
+              flush=True)
+        return None
+    try:
+        body = json.loads(result.stdout or "")
+    except ValueError:
+        body = None
+    if (result.returncode != 0 or not isinstance(body, dict) or body.get("is_error")
+            or body.get("subtype") not in (None, "success")):
+        print(f"[web-gateway] chat triage: a batch failed (exit {result.returncode})",
+              flush=True)
+        return None
+    answer = body.get("result")
+    return answer if isinstance(answer, str) else None
+
+
+def _triage_digest(chat_id: str) -> dict | None:
+    """A chat as the sorting pass reads it: what it is, and its newest
+    messages — the user's own last one and everything since where there is
+    one, else the last few — with who wrote each."""
+    parts = chat_state_mod.split_chat_id(chat_id)
+    channel, key = parts if parts else ("", chat_id)
+    doc = _CHAT_STATE.get(chat_id)
+    name = _chat_display_name(doc, channel, key)
+    mail = _is_mail(channel)
+    try:
+        messages = _chat_messages_payload(chat_id)["messages"]
+    except Exception as exc:  # noqa: BLE001 - this chat stays unsorted
+        print(f"[web-gateway] chat triage: no messages for {chat_id} ({exc})", flush=True)
+        return None
+    last_out = max((i for i, m in enumerate(messages) if m.get("direction") == "out"),
+                   default=-1)
+    since = messages[last_out + 1:]
+    if not since:
+        shown = messages[-3:]
+    elif last_out >= 0:
+        shown = [messages[last_out], *since]
+    else:
+        shown = since
+    out = []
+    for m in shown:
+        text = "" if (mail and m.get("removed")) else str(m.get("text") or "")
+        out.append({
+            "at": m.get("ts") or "",
+            "from": "me" if m.get("direction") == "out" else _companion_speaker(m, name, mail),
+            "text": text,
+            "files": len(m.get("attachments") or []),
+        })
+    kind = ("mail thread" if mail
+            else "group chat" if _chat_group(doc, channel, key) else "chat")
+    return {"channel": channel, "kind": kind, "name": name, "messages": out}
+
+
+def _triage_followup(chat_id: str, entry: dict) -> str | None:
+    """The higher tier's turn for one action chat, in its companion: Ara's
+    note (her reply there, as words), or None for a turn that failed."""
+    try:
+        cid, _created = _chat_companion(chat_id)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[web-gateway] chat triage: no companion for {chat_id} ({exc})", flush=True)
+        return None
+    stored: list = []
+    ok = _conv_worker(cid, f"conv:{cid}", arrival=chat_triage.followup_prompt(entry),
+                      push=False, model=CHAT_TRIAGE_FOLLOWUP_MODEL or None,
+                      reply_sink=stored)
+    if not ok:
+        return None
+    # This turn's own reply, as words; none (a turn another one covered).
+    return attention_store.markup_words(str(stored[-1] or "")) if stored else ""
+
+
+_TRIAGE_STORE = chat_triage.TriageStore(CHAT_STATE_DIR / "triage.json")
+_TRIAGE = chat_triage.TriageRunner(
+    _TRIAGE_STORE, classify=lambda p: _triage_classify(p),
+    digest=lambda c: _triage_digest(c),
+    followup=lambda c, e: _triage_followup(c, e), batch_size=CHAT_TRIAGE_BATCH,
+    concurrency=CHAT_TRIAGE_CONCURRENCY,
+    followup_concurrency=CHAT_TRIAGE_FOLLOWUP_CONCURRENCY,
+    followup_max=CHAT_TRIAGE_FOLLOWUPS,
+    log=lambda m: print(f"[web-gateway] {m}", flush=True))
+
+
+def _triage_payload() -> dict:
+    """The GET /chats/triage body: whether triage is on, the last run, and
+    what it said per chat. Which of those chats are still to be shown (not
+    archived, no newer message) is the page's to decide against its list."""
+    doc = _TRIAGE_STORE.snapshot()
+    return {"enabled": CHAT_TRIAGE, "running": _TRIAGE.running, "busy": _TRIAGE.busy,
+            "model": CHAT_TRIAGE_MODEL, "run": doc.get("run"),
+            "entries": doc.get("entries") or {}, "notes": doc.get("notes") or []}
+
+
+def _triage_replied(chat: dict) -> str | None:
+    """The stamp of the user's own message where it is the chat's newest (a
+    send that failed is no answer, and neither is Ara's — an outbound message
+    authored "agent" — as the reply mark counts only "user" and "device"): a
+    sorting older than it no longer describes the chat
+    (chat_triage.answered_since)."""
+    last = chat.get("last") or {}
+    if (last.get("direction") != "out" or last.get("failed")
+            or last.get("author") not in ("user", "device")):
+        return None
+    return last.get("ts") or None
+
+
+def _triage_start(again: bool, feedback=None) -> tuple[int, dict]:
+    """Start a run over the unread chats (POST /chats/triage): 202 with the
+    run started, 200 while one is already running (that run's state).
+    ``feedback`` is a note from the user on how to sort: saved for every
+    run from now on, and the run it comes with sorts every unread chat again
+    (``again``) — but one an arrival turn judged — so the note applies to
+    all of them. A note is saved even
+    while a run is busy; the answer then says no run started."""
+    if not CHAT_TRIAGE:
+        return 409, {"error": "chat triage is switched off (CHAT_TRIAGE)"}
+    if feedback is not None and not isinstance(feedback, str):
+        return 400, {"error": "feedback must be text"}
+    # The chats first: an answer that the press failed must mean the note
+    # was not saved either, or the page keeps the words and a second press
+    # saves the note twice.
+    try:
+        chats = _chats_payload()["chats"]
+    except Exception as exc:  # noqa: BLE001 - the store is down
+        return 502, {"error": "life store unreachable", "detail": str(exc)}
+    if feedback is not None:
+        try:
+            _TRIAGE_STORE.add_note(feedback)
+        except ValueError as exc:
+            return 400, {"error": str(exc)}
+        again = True
+    if not _TRIAGE.running:
+        _TRIAGE_STORE.prune({c["id"] for c in chats})
+    scope = [{"id": c["id"], "seq": c.get("inbound_seq"), "replied": _triage_replied(c)}
+             for c in chats if c.get("list_group") == "unread"]
+    started = _TRIAGE.start(scope, again=again)
+    return (202 if started.get("started") else 200), {**started, **_triage_payload()}
+
+
 def _chat_messages_payload(chat_id: str, before: str | None = None) -> dict:
     """The GET /chats/<id>/messages body. Raises on store errors (→ 502)."""
     channel, account, key = chat_state_mod.split_chat_ref(chat_id)
@@ -15936,6 +16455,114 @@ def _contact_brief(record: dict) -> dict:
     return out
 
 
+def _new_chat_key(channel: str, handle: str, person: dict | None) -> str | None:
+    """The chat key a first message to ``handle`` goes out under — the
+    recipient string the channel's own send path takes, which is also the key
+    the channel files the conversation under (docs/messenger-chats.md,
+    "Identity") — or None where no new chat can be started from the handle.
+
+    - WhatsApp: a phone number is the phone-number JID; a LID (``…@lid``) is
+      itself.
+    - Signal: the number, or the account's UUID, as filed.
+    - Telegram: the numeric user id — a message is delivered under nothing
+      else. A username or a phone is the person's one filed id beside it;
+      none, or several, and no chat is offered from it.
+    - SMS: a phone number. A sender id or short code cannot be written back.
+    E-mail is no key: a new mail is the compose sheet's."""
+    if channel == "whatsapp":
+        if _CONTACT_PHONE_RE.match(handle):
+            return handle.lstrip("+") + "@s.whatsapp.net"
+        return handle if handle.endswith("@lid") else None
+    if channel == "signal":
+        return handle
+    if channel == "telegram":
+        if re.fullmatch(r"[0-9]+", handle):
+            return handle
+        ids = [h["handle"] for h in (person or {}).get("handles") or []
+               if h.get("channel") == "telegram" and re.fullmatch(r"[0-9]+", str(h.get("handle") or ""))]
+        return ids[0] if len(ids) == 1 else None
+    if channel == "sms":
+        return handle if _CONTACT_PHONE_RE.match(handle) else None
+    return None
+
+
+_CONTACT_PHONE_RE = re.compile(r"^\+[0-9]{6,20}$")
+
+
+def _contact_chats(channel: str, handle: str, person_key: str | None = None) -> dict:
+    """The GET /contacts/chats body: the chats one handle of the address book
+    is in, and how a new one is started (docs/contacts.md, "The dashboard").
+
+    ``chats`` — the 1:1 messenger chats whose peer is the handle (its
+    normalized form, as the autolink compares it: _chat_handle), and for an
+    e-mail address every mail thread it is a participant of; a Telegram
+    username or phone also finds the chats of the person's numeric id (the
+    key Telegram delivers under). Each ``{id, channel, account, name, group,
+    ts, list_group}``, newest first. Groups are not listed for a messenger
+    handle: the person is one of many there, and a tap on their number means
+    the conversation with them.
+
+    ``new`` — how a conversation is started where none is wanted from the
+    list: for a messenger, one ``{id, account}`` per inbox account of the
+    channel whose identity is known (the id is what the first send goes out
+    under, account and all, so the chat the reply lands in is the one the
+    page opened); for e-mail ``{"compose": true, "accounts"}``, the mailboxes
+    a new mail can leave from, where there is one.
+    Empty where nothing can be started."""
+    channel, handle = contacts_mod.normalize_handle(channel, handle)
+    record = _CONTACTS.get(person_key) if person_key else None
+    person = contacts_mod.public(record) if record else None
+    wanted = {handle}
+    if channel == "telegram" and person and not re.fullmatch(r"[0-9]+", handle):
+        wanted |= {h["handle"] for h in person.get("handles") or []
+                   if h.get("channel") == "telegram" and re.fullmatch(r"[0-9]+", str(h.get("handle") or ""))}
+    mail = _is_mail(channel)
+    found = []
+    for row in _chats_payload().get("chats") or []:
+        if row.get("channel") != channel:
+            continue
+        chat_id = row.get("id") or ""
+        doc = _CHAT_STATE.get(chat_id)
+        if mail:
+            parties = list(doc.get("participants") or []) + [doc.get("peer")]
+            addresses = set()
+            for party in parties:
+                clean = chat_state_mod.clean_party(party) if party else None
+                if clean:
+                    addresses.add(clean["address"].lower())
+            if handle not in addresses:
+                continue
+        else:
+            if row.get("group") or _chat_handle(chat_id, doc) not in {(channel, h) for h in wanted}:
+                continue
+        found.append({"id": chat_id, "channel": channel, "account": row.get("account"),
+                      "name": row.get("name"), "group": bool(row.get("group")),
+                      "ts": (row.get("last") or {}).get("ts") or "",
+                      "list_group": row.get("list_group")})
+    found.sort(key=lambda c: c["ts"], reverse=True)
+    new: list = []
+    if mail:
+        # The mailboxes a new mail can leave from, as GET /chats/compose
+        # offers them: the compose sheet is opened with them.
+        accounts = []
+        for slug, gw in _inbox_gateways(MAIL_CHANNEL):
+            identity = _gateway_identity(slug, gw)
+            account = identity.get("account")
+            if account and _mail_gateway_sends(identity) and account not in accounts:
+                accounts.append(account)
+        if accounts:
+            new = [{"compose": True, "accounts": accounts}]
+    else:
+        key = _new_chat_key(channel, handle, person)
+        if key:
+            for slug, gw in _inbox_gateways(channel):
+                account = _gateway_identity(slug, gw).get("account")
+                if account:
+                    new.append({"id": chat_state_mod.make_chat_id(channel, key, account),
+                                "account": account})
+    return {"handle": {"channel": channel, "handle": handle}, "chats": found, "new": new}
+
+
 def _contact_book_for(item: dict) -> dict:
     """What the contact card needs beyond the item: where a new contact can be
     stored, which chamber is pre-selected, and who this handle may belong to."""
@@ -16187,9 +16814,14 @@ def _attention_thread_items(profile: dict) -> list[dict]:
         if not _CONV_ID_RE.match(path.stem):
             continue
         conv = _load_conv(path.stem)
-        if conv is None or not attention_store.thread_wants_attention(conv):
+        if conv is None:
             continue
-        items.append(attention_store.thread_item(conv, profile))
+        if attention_store.thread_wants_attention(conv):
+            items.append(attention_store.thread_item(conv, profile))
+        elif attention_store.own_project_thread(conv):
+            # Listed beside its project on the home only: never pushed,
+            # digested or emitted (attention_store.fold_projects).
+            items.append(dict(attention_store.thread_item(conv, profile), listed_for_project=True))
     return items
 
 
@@ -16238,11 +16870,15 @@ def _attention_project_items(profile: dict, now: datetime) -> list[dict]:
             for row in _attention_project_rows()]
 
 
-def _attention_items(profile: dict, now: datetime) -> tuple[list[dict], list[str]]:
+def _attention_items(profile: dict, now: datetime,
+                     listing: bool = True) -> tuple[list[dict], list[str]]:
     """Every item from the three sources, plus the names of the sources that
     could not be read (the store down): the list is served with what there
-    is and says so, rather than failing whole."""
-    items = _attention_thread_items(profile)
+    is and says so, rather than failing whole. ``listing`` False is what
+    pushes, digests and the life-store emit act on: without the user's read
+    project threads the home keeps listed, and with every thread in its own
+    spheres (attention_store.fold_projects)."""
+    items = _attention_thread_items(profile) + _reminders_open_items(profile)
     degraded = []
     for name, fetch in (("chats", lambda: _attention_chat_items(profile)),
                         ("projects", lambda: _attention_project_items(profile, now))):
@@ -16251,7 +16887,8 @@ def _attention_items(profile: dict, now: datetime) -> tuple[list[dict], list[str
         except Exception as exc:  # noqa: BLE001 - transport/parse: degrade, do not fail
             print(f"[web-gateway] attention: {name} unavailable ({exc})", flush=True)
             degraded.append(name)
-    return attention_store.fold_projects(items), degraded
+    return attention_store.fold_projects(items, projects_known="projects" not in degraded,
+                                         listing=listing), degraded
 
 
 def _attention_chat_row_from_state(chat_id: str, state: dict,
@@ -16281,6 +16918,12 @@ def _attention_item(item_id: str, profile: dict, now: datetime) -> dict | None:
         if conv is None or (conv.get("kind") or "chat") != "chat":
             return None
         return attention_store.thread_item(conv, profile)
+    if item_id.startswith("reminder:"):
+        rid = item_id[len("reminder:"):]
+        rec = _REMINDERS.get(rid)
+        if not rec or not rec.get("occurrence"):
+            return None
+        return _reminder_item(rid, rec, profile)
     if item_id.startswith("chat:"):
         chat_id = item_id[len("chat:"):]
         state = _CHAT_STATE.get(chat_id)
@@ -16322,6 +16965,8 @@ def _attention_persist(item: dict, attended: int | None = None) -> None:
     elif kind == "chat":
         _CHAT_STATE.set_attention(item["source_id"], block, attended=attended)
         _chats_cache_invalidate()
+    elif kind == "reminder":
+        _REMINDERS.update(item["source_id"], lambda rec: rec.update(attention=block))
     else:
         _ATTENTION.save_project(item["source_id"], block)
 
@@ -16705,6 +17350,8 @@ def _attention_push_item(item: dict, reason: str = "") -> int:
     if kind == "thread":
         conv = _load_conv(item["source_id"])
         return _push_conv_notification(conv, item.get("preview") or item["title"], urgency="high") if conv else 0
+    if kind == "reminder":
+        return _reminder_push(item)
     title = item["title"]
     body = " ".join(str(item.get("preview") or reason or "").split())[:160]
     tag = item["source_id"]
@@ -16893,7 +17540,7 @@ def _attention_tick(now: datetime | None = None) -> dict:
             _attention_tick_state["minute"] = stamp
             return {}
         key = stamp.strftime("%Y-%m-%d %H:%M")
-        items, _degraded = _attention_items(profile, now)
+        items, _degraded = _attention_items(profile, now, listing=False)
         report: dict = {"at": key, "events": sorted(events), "pushed": [], "digest": 0,
                         "expired": expired}
         if events & {"digest", "mode", "break", "end"}:
@@ -16924,12 +17571,383 @@ def _attention_tick_loop() -> None:
             _attention_tick()
         except Exception as exc:  # noqa: BLE001 - the loop must survive a bad minute
             print(f"[web-gateway] attention tick failed: {exc!r}", flush=True)
+        try:
+            _reminders_tick()
+        except Exception as exc:  # noqa: BLE001
+            print(f"[web-gateway] reminder tick failed: {exc!r}", flush=True)
         _contacts_sync_policy()
         try:
             _chats_autolink(force=False)
         except Exception as exc:  # noqa: BLE001 - the loop must survive
             print(f"[web-gateway] contacts: autolink failed ({exc})", flush=True)
         time.sleep(ATTENTION_TICK_SECONDS)
+
+
+# ── Chamber apps (docs/chamber-apps.md) ──────────────────────────────────────
+# A chamber ships Progressive Web Apps in <chamber>/.retinue/apps/<app>/; the
+# gateway serves them at /apps/<chamber>/<app>/ under the dashboard's policy,
+# lists them at /apps/index.json, and answers the small client API under
+# /apps/api/ that webapp/apps/retinue.js wraps. What the gateway and the
+# scheduler share — discovery, schedule files, job checks — is
+# scripts/chamber_apps.py. A reminder an app declares is fired by the
+# scheduler (a calendar trigger) through /internal/apps/reminders/fire and
+# becomes an attention item of kind "reminder", one per reminder: its latest
+# occurrence, replaced by the next one, cleared when it is opened, done,
+# skipped or snoozed.
+
+_REMINDERS = chamber_apps.ReminderStore(ATTENTION_DIR / "reminders.json")
+# A shell that arms reminders as local alarms (the Android app, which Web
+# Push does not reach) says so when it fetches them; for this long after, a
+# reminder that is to ring waits APPS_SHELL_GRACE_SECONDS for the shell's
+# delivery confirmation before the server pushes it to the other devices.
+APPS_SHELL_ARM_WINDOW = timedelta(hours=float(os.environ.get("APPS_SHELL_ARM_WINDOW_HOURS", "36")))
+APPS_SHELL_GRACE_SECONDS = float(os.environ.get("APPS_SHELL_GRACE_SECONDS", "90"))
+# What Retinue.submit may write in one file.
+APPS_FILE_MAX_BYTES = int(os.environ.get("APPS_FILE_MAX_BYTES", str(25 * 1024 * 1024)))
+APPS_SNOOZE_DEFAULT_MINUTES = 15
+# What an app directory answers with. Its files are the chamber's code,
+# reviewed with it (Tier 3 there), so scripts are served as scripts — only
+# from inside an app directory; nothing a sender chose ever lands there
+# (Retinue.submit refuses every dot path, .retinue/ included). Any other
+# suffix is a download, as on /data/.
+_APP_CONTENT_TYPES = dict(_STATIC_CONTENT_TYPES, **{
+    ".mjs": "text/javascript; charset=utf-8",
+    ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".webp": "image/webp", ".gif": "image/gif",
+    ".mp3": "audio/mpeg", ".ogg": "audio/ogg", ".wav": "audio/wav", ".m4a": "audio/mp4",
+    ".txt": "text/plain; charset=utf-8", ".csv": "text/csv; charset=utf-8",
+})
+_APPS_SCHEDULE_RE = re.compile(
+    r"^/apps/api/schedule/([^/?#]+)/([^/?#]+)/?(?:([^/?#]+)/?(?:(opened|done|skip|snooze|delivered)/?)?)?$")
+_APPS_FILES_PREFIX = "/apps/api/files/"
+_AGENT_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+
+
+def _app_sphere(chamber: str, app: str) -> str | None:
+    directory = chamber_apps.app_dir(CHAMBERS_DIR, chamber, app)
+    if directory is None:
+        return None
+    return chamber_apps.index_entry({"chamber": chamber, "id": app, "dir": directory,
+                                     "manifest": chamber_apps.read_manifest(directory)})["sphere"]
+
+
+def _app_name(chamber: str, app: str) -> str:
+    directory = chamber_apps.app_dir(CHAMBERS_DIR, chamber, app)
+    if directory is None:
+        return app
+    return chamber_apps.index_entry({"chamber": chamber, "id": app, "dir": directory,
+                                     "manifest": chamber_apps.read_manifest(directory)})["short_name"]
+
+
+def _reminder_item(rid: str, rec: dict, profile: dict) -> dict:
+    """A reminder record as a policy item, display fields included."""
+    doc = {"id": f"reminder:{rid}", "title": rec.get("title") or "Reminder",
+           "attention": dict(rec.get("attention") or {})}
+    item = attention_policy.item_from_doc(doc, "reminder", profile)
+    item.update({
+        "source_id": rid, "own": False, "project": None, "project_title": None,
+        "project_href": None, "preview": rec.get("body") or "",
+        "agent": rec.get("app_name") or rec.get("app"), "unread": True, "pending": False,
+        "count": 1, "href": rec.get("href") or "/apps.html", "channel": None,
+        "occurrence": rec.get("occurrence"),
+        "app": {"chamber": rec.get("chamber"), "id": rec.get("app"), "job": rec.get("job_id")},
+    })
+    return item
+
+
+def _reminder_block(job: dict, occurrence: datetime, sphere: str | None) -> dict:
+    """The attention block of a fresh occurrence: what the app declared,
+    with the deadline its lead sets (the slot plus the lead: the item climbs
+    as the lead runs out, which is how the lead bounds a hold)."""
+    trigger = chamber_apps.trigger_of(job)
+    lead = trigger.lead if trigger else timedelta(minutes=calendar_trigger.DEFAULT_LEAD_MINUTES)
+    block = {"kind": "reminder", "state": "open", "released": False,
+             "due": (occurrence + lead).isoformat(), "lead": lead.total_seconds() / 60,
+             "lead_from": "app", "tags": list(job.get("tags") or []),
+             "sphere": job.get("sphere") or sphere or "admin",
+             "sphere_from": "app"}
+    if job.get("importance") is not None:
+        block["importance"] = float(job["importance"])
+        block["importance_from"] = "app"
+    return block
+
+
+def _reminders_open_items(profile: dict) -> list[dict]:
+    items = []
+    for rid, rec in _REMINDERS.all().items():
+        if not rec.get("occurrence"):
+            continue  # a confirmation that arrived before its occurrence fired
+        item = _reminder_item(rid, rec, profile)
+        if item.get("state", "open") == "open":
+            items.append(item)
+    return items
+
+
+def _reminder_push(item: dict) -> int:
+    """Push one reminder: it opens the app's deep link, and carries the two
+    actions the dashboard's service worker posts without opening anything."""
+    if not push_notify.enabled():
+        return 0
+    app = item.get("app") or {}
+    api = (f"/apps/api/schedule/{app.get('chamber')}/{app.get('id')}/{app.get('job')}"
+           if app.get("job") else None)
+    extra = {"kind": "reminder"}
+    if api:
+        extra.update(api=api, occurrence=item.get("occurrence"),
+                     actions=[{"action": "snooze", "title": f"In {APPS_SNOOZE_DEFAULT_MINUTES} min"},
+                              {"action": "skip", "title": "Skip today"}])
+    body = " ".join(str(item.get("preview") or "").split())[:160]
+    push_notify.notify_async(item["title"], body or "Reminder", url=item["href"], tag=item["id"],
+                             urgency="high", extra=extra)
+    return push_notify.subscription_count()
+
+
+def _reminder_fire(chamber: str, app: str, job_id: str, occurrence: datetime) -> tuple[int, dict]:
+    """The scheduler fired one occurrence: make it the reminder's item,
+    replacing the one before, and deliver it by the attention model. Firing
+    the same occurrence twice changes nothing."""
+    job = chamber_apps.get_job(chamber, app, job_id)
+    if job is None or job.get("kind", "reminder") != "reminder" \
+            or chamber_apps.app_dir(CHAMBERS_DIR, chamber, app) is None:
+        return 404, {"error": "no such reminder"}
+    rid = chamber_apps.full_id(chamber, app, job_id)
+    key = calendar_trigger.occurrence_key(occurrence)
+    push_now = None
+    with _attention_lock:
+        now = _attention_now()
+        focus = _ATTENTION.focus()
+        profile = _ATTENTION.profile()
+        prev = _REMINDERS.get(rid) or {}
+        if prev.get("occurrence") == key:
+            return 200, {"status": "already fired", "id": f"reminder:{rid}"}
+        rec = {"chamber": chamber, "app": app, "job_id": job_id, "app_name": _app_name(chamber, app),
+               "title": job.get("title") or "Reminder", "body": job.get("body") or "",
+               "href": chamber_apps.deep_link(chamber, app, job), "occurrence": key,
+               "fired_at": now.isoformat(), "delivered": list(prev.get("delivered") or []),
+               "attention": _reminder_block(job, occurrence, _app_sphere(chamber, app))}
+        if prev.get("occurrence") and (prev.get("attention") or {}).get("state", "open") == "open":
+            rec["replaced"] = prev["occurrence"]
+        item = _reminder_item(rid, rec, profile)
+        decision = attention_policy.on_arrival(item, focus, profile, now)
+        if decision["deliver"] == "push":
+            armed = _REMINDERS.shell_armed_at()
+            if key in rec["delivered"]:
+                decision["reason"] += "; a shell showed it already"
+            elif armed is not None and now - armed <= APPS_SHELL_ARM_WINDOW \
+                    and APPS_SHELL_GRACE_SECONDS > 0:
+                rec["push_pending_until"] = (now + timedelta(seconds=APPS_SHELL_GRACE_SECONDS)).isoformat()
+                decision["reason"] += "; waiting for the shell's confirmation first"
+            else:
+                push_now = item
+        rec["attention"] = attention_store.block_for(item)
+        _REMINDERS.put(rid, rec)
+    if push_now is not None:
+        _reminder_push(push_now)
+    body = _attention_decision_body(decision, item)
+    print(f"[web-gateway] reminder {rid} {key}: {decision['deliver']} — {decision.get('reason', '')}", flush=True)
+    return 200, body
+
+
+def _reminders_tick(now: datetime | None = None) -> list[str]:
+    """Push the reminders whose wait for a shell's confirmation ran out."""
+    now = now or _attention_now()
+    due = []
+    with _attention_lock:
+        for rid, rec in _REMINDERS.all().items():
+            until = attention_policy.parse_dt(rec.get("push_pending_until"))
+            if until is None or until > now:
+                continue
+            def clear(r):
+                r.pop("push_pending_until", None)
+            rec = _REMINDERS.update(rid, clear) or rec
+            if rec.get("occurrence") in (rec.get("delivered") or []):
+                continue
+            item = _reminder_item(rid, rec, _ATTENTION.profile())
+            if item.get("state", "open") == "open":
+                due.append(item)
+    for item in due:
+        _reminder_push(item)
+        print(f"[web-gateway] reminder {item['source_id']}: no shell confirmed it, pushed", flush=True)
+    return [i["source_id"] for i in due]
+
+
+def _reminder_settle(rid: str, how: str) -> bool:
+    """Clear a reminder's open item (opened, done, skipped, snoozed,
+    unscheduled). False when nothing was open."""
+    with _attention_lock:
+        rec = _REMINDERS.get(rid)
+        if not rec or not rec.get("occurrence"):
+            return False
+        item = _reminder_item(rid, rec, _ATTENTION.profile())
+        if item.get("state", "open") != "open":
+            return False
+        item["state"] = "done"
+        item["done_at"] = _attention_now().isoformat()
+        item["done_how"] = how
+
+        def change(r):
+            r["attention"] = attention_store.block_for(item)
+            r.pop("push_pending_until", None)
+        _REMINDERS.update(rid, change)
+        return True
+
+
+def _reminder_action(chamber: str, app: str, job_id: str, action: str, payload: dict) -> tuple[int, dict]:
+    """What the app, the service worker or the shell reports of a reminder:
+
+    - ``opened``: the user opened it — the item is cleared;
+    - ``done``: the session is done — the item is cleared, or, when none is
+      open, the next occurrence is skipped if it falls today (done ahead);
+    - ``skip``: not today — the item is cleared and nothing more fires today;
+    - ``snooze``: once more in ``minutes`` (default 15) or ``at`` — an extra
+      one-off occurrence; the item is cleared until it fires;
+    - ``delivered``: a shell showed ``occurrence`` — it is not pushed again.
+    """
+    job = chamber_apps.get_job(chamber, app, job_id)
+    rid = chamber_apps.full_id(chamber, app, job_id)
+    if job is None or job.get("kind", "reminder") != "reminder":
+        return 404, {"error": "no such reminder"}
+    now = _attention_now()
+    if action == "opened":
+        return 200, {"status": "opened", "cleared": _reminder_settle(rid, "opened")}
+    if action == "done":
+        if _reminder_settle(rid, "done"):
+            return 200, {"status": "done", "cleared": True}
+        trigger = chamber_apps.trigger_of(job)
+        nxt = trigger.next_after(now, horizon=timedelta(days=1)) if trigger else None
+        if nxt is not None and nxt.astimezone(trigger.tz).date() == now.astimezone(trigger.tz).date():
+            key = []
+            chamber_apps.update_job(chamber, app, job_id,
+                                    lambda j: key.append(chamber_apps.skip_slot(j, nxt, now)))
+            return 200, {"status": "done", "cleared": False, "skipped": key[0]}
+        return 200, {"status": "done", "cleared": False}
+    if action == "skip":
+        # "Not today" means the day of the occurrence the user skipped, not
+        # the day the request arrives: a phone that was offline sends its
+        # skip later (the Android shell names the occurrence).
+        at = calendar_trigger.parse_instant(payload.get("occurrence")) if payload.get("occurrence") else None
+        if payload.get("occurrence") and at is None:
+            return 400, {"error": "occurrence must be an ISO instant"}
+        if at is not None and not now - timedelta(days=7) <= at <= now + timedelta(days=2):
+            return 400, {"error": "occurrence is too far from now"}
+        day = chamber_apps.skip_day(job, at or now)
+        rec = _REMINDERS.get(rid) or {}
+        open_at = calendar_trigger.parse_instant(rec.get("occurrence"))
+        # Only the item of that day is cleared: a late skip of yesterday
+        # leaves today's reminder on the list.
+        cleared = (_reminder_settle(rid, "skipped")
+                   if open_at is None or chamber_apps.skip_day(job, open_at) == day else False)
+        chamber_apps.update_job(chamber, app, job_id, lambda j: chamber_apps.skip_today(j, now, at))
+        return 200, {"status": "skipped", "cleared": cleared, "date": day}
+    if action == "snooze":
+        when = calendar_trigger.parse_instant(payload.get("at")) if payload.get("at") else None
+        if when is None:
+            try:
+                minutes = float(payload.get("minutes") or APPS_SNOOZE_DEFAULT_MINUTES)
+            except (TypeError, ValueError):
+                return 400, {"error": "minutes must be a number"}
+            if not 1 <= minutes <= 24 * 60:
+                return 400, {"error": "minutes must be between 1 and 1440"}
+            when = now + timedelta(minutes=minutes)
+        elif not now - timedelta(minutes=1) <= when <= now + timedelta(days=1):
+            return 400, {"error": "at must lie within the next 24 hours"}
+        cleared = _reminder_settle(rid, "snoozed")
+        key = []
+        chamber_apps.update_job(chamber, app, job_id, lambda j: key.append(chamber_apps.snooze_job(j, when, now)))
+        return 200, {"status": "snoozed", "cleared": cleared, "occurrence": key[0] if key else None}
+    if action == "delivered":
+        occ = calendar_trigger.parse_instant(payload.get("occurrence"))
+        if occ is None:
+            return 400, {"error": "occurrence must be an ISO instant"}
+        key = calendar_trigger.occurrence_key(occ)
+        with _attention_lock:
+            rec = _REMINDERS.get(rid)
+            if rec is None:
+                # Confirmed before the server fired it: the fire sees this.
+                _REMINDERS.put(rid, {"chamber": chamber, "app": app, "job_id": job_id,
+                                     "delivered": [key]})
+                return 200, {"status": "delivered", "occurrence": key}
+
+            def change(r):
+                if key not in (r.get("delivered") or []):
+                    r.setdefault("delivered", []).append(key)
+                if r.get("occurrence") == key and r.get("push_pending_until"):
+                    r.pop("push_pending_until", None)
+                    block = r.setdefault("attention", {})
+                    block.setdefault("pushed", []).append(now.isoformat())
+            _REMINDERS.update(rid, change)
+        return 200, {"status": "delivered", "occurrence": key}
+    return 404, {"error": "unknown action"}
+
+
+def _reminders_for_shell(now: datetime, horizon_hours: float = 48) -> dict:
+    """Every app reminder with its next occurrences, for a shell that arms
+    them as local alarms. ``ring`` says whether the occurrence would break
+    through the focus mode scheduled for its time (a shell shows the others
+    quietly); ``open`` names an occurrence whose item is open now."""
+    focus = _ATTENTION.focus()
+    profile = _ATTENTION.profile()
+    horizon = timedelta(hours=max(1.0, min(horizon_hours, 24 * 7)))
+    out = []
+    records = _REMINDERS.all()
+    for chamber, app, _path in chamber_apps.all_schedules():
+        if chamber_apps.app_dir(CHAMBERS_DIR, chamber, app) is None:
+            continue
+        sphere = _app_sphere(chamber, app)
+        for job in chamber_apps.load_schedule(chamber, app)["jobs"]:
+            if job.get("kind", "reminder") != "reminder" or job.get("enabled") is False:
+                continue
+            trigger = chamber_apps.trigger_of(job)
+            if trigger is None:
+                continue
+            rid = chamber_apps.full_id(chamber, app, job["id"])
+            rec = records.get(rid) or {}
+            occurrences = []
+            for when in trigger.upcoming(now, horizon=horizon, limit=20):
+                probe = {"title": job.get("title"), "attention": _reminder_block(job, when, sphere)}
+                item = _reminder_item(rid, probe, profile)
+                ring = attention_policy.breaks_through(
+                    item, attention_policy.mode_at(focus, when), profile, when)
+                occurrences.append({"at": calendar_trigger.occurrence_key(when), "ring": bool(ring)})
+            open_item = None
+            if rec.get("occurrence"):
+                if _reminder_item(rid, rec, profile).get("state", "open") == "open":
+                    open_item = rec["occurrence"]
+            out.append({"id": rid, "chamber": chamber, "app": app, "job": job["id"],
+                        "title": job.get("title") or "Reminder", "body": job.get("body") or "",
+                        "url": chamber_apps.deep_link(chamber, app, job),
+                        "importance": job.get("importance"), "sphere": job.get("sphere") or sphere,
+                        "occurrences": occurrences, "open": open_item,
+                        "delivered": list(rec.get("delivered") or [])[-10:]})
+    return {"now": calendar_trigger.occurrence_key(now), "horizon_hours": horizon.total_seconds() / 3600,
+            "snooze_minutes": APPS_SNOOZE_DEFAULT_MINUTES, "reminders": out}
+
+
+def _app_jobs_payload(chamber: str, app: str, now: datetime) -> dict:
+    records = _REMINDERS.all()
+    jobs = []
+    for job in chamber_apps.load_schedule(chamber, app)["jobs"]:
+        rid = chamber_apps.full_id(chamber, app, job["id"])
+        trigger = chamber_apps.trigger_of(job)
+        nxt = trigger.next_after(now) if trigger else None
+        rec = records.get(rid) or {}
+        is_open = bool(rec.get("occurrence")) and \
+            (rec.get("attention") or {}).get("state", "open") == "open"
+        jobs.append(dict({k: v for k, v in job.items() if not k.startswith("_")},
+                         full_id=rid, next=nxt.isoformat() if nxt else None,
+                         open=rec.get("occurrence") if is_open else None))
+    return {"jobs": jobs}
+
+
+def _sparql_endpoint_url(name: str) -> str | None:
+    """The store an app names: ``life`` (the framework's) or a deployment's
+    SPARQL_ENDPOINT_<NAME>."""
+    name = (name or "life").strip()
+    if name.lower() == "life":
+        return QLEVER_LIFE_URL
+    if not re.fullmatch(r"[A-Za-z0-9_]{1,40}", name):
+        return None
+    url = os.environ.get(f"SPARQL_ENDPOINT_{name.upper()}", "").strip()
+    return url or None
 
 
 def _attention_row(item: dict, focus: dict, profile: dict, now: datetime) -> dict:
@@ -17112,9 +18130,10 @@ class Handler(BaseHTTPRequestHandler):
     def end_headers(self):
         self._ended_headers = True  # an answer is under way (_handle_chats_inbound)
         page, self._csp_for = getattr(self, "_csp_for", None), None
+        app, self._csp_app = getattr(self, "_csp_app", False), False
         if getattr(self, "_csp_page", False):
             self._csp_page = False
-            for name, value in content_policy.headers(page):
+            for name, value in (content_policy.app_headers() if app else content_policy.headers(page)):
                 super().send_header(name, value)
         super().end_headers()
 
@@ -17163,7 +18182,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def _serve_static_file(self, path: Path, base: Path, cache: str = "no-cache",
                            transform=None, headers: dict | None = None,
-                           types: dict | None = None) -> bool:
+                           types: dict | None = None, csp_app: bool = False) -> bool:
         """Serve a file from within ``base``, guarding against path traversal.
 
         ``transform`` rewrites the bytes on the response only (the instance
@@ -17187,8 +18206,10 @@ class Handler(BaseHTTPRequestHandler):
             return False
         if transform is not None:
             data = transform(data)
-        # Which page of webapp/ this is, for its policy (end_headers).
+        # Which page of webapp/ this is, for its policy (end_headers); a
+        # chamber app's page has the apps' own (content_policy.app_headers).
         self._csp_for = full.name if full.parent == WEBAPP_DIR.resolve() else None
+        self._csp_app = csp_app
         headers = dict(headers or {})
         if types is None:
             ctype = _STATIC_CONTENT_TYPES.get(full.suffix.lower(), "application/octet-stream")
@@ -17450,6 +18471,307 @@ class Handler(BaseHTTPRequestHandler):
     # built-in letterbox (scripts/letterbox.py). Behind the same edge auth as
     # the rest of the dashboard; the share adds no login of its own.
 
+    # ── Chamber apps (docs/chamber-apps.md) ────────────────────────────────
+    # /apps/<chamber>/<app>/… are the apps' own files; /apps/index.json the
+    # list; /apps/retinue.js the client; /apps/api/… the client's API. Behind
+    # the dashboard's sign-in like every path; there is no token and no
+    # per-app permission. Every call that changes something refuses another
+    # site's page (Sec-Fetch-Site), as the conversation endpoints do.
+
+    def _serve_apps_get(self) -> bool:
+        path, _, query = self.path.partition("?")
+        if path != "/apps" and not path.startswith("/apps/"):
+            return False
+        if path in ("/apps", "/apps/"):
+            self._redirect("/apps.html")
+            return True
+        if path == "/apps/index.json":
+            self._send_json(200, chamber_apps.index(CHAMBERS_DIR), {"Cache-Control": "no-store"})
+            return True
+        if path == "/apps/retinue.js":
+            if not self._serve_static_file(WEBAPP_DIR / "apps" / "retinue.js", WEBAPP_DIR):
+                self._send_json(404, {"error": "not found"})
+            return True
+        if path.startswith("/apps/api/"):
+            if path.rstrip("/") == "/apps/api/schedule":
+                params = urllib.parse.parse_qs(query)
+                now = _attention_now()
+                if (params.get("arm") or [""])[0] in ("1", "true") and self._claude_auth_same_origin():
+                    # A shell (the Android app) arms these as local alarms:
+                    # a reminder to ring now waits for its confirmation.
+                    # Recorded only from a native caller or this origin:
+                    # another site's page (an <img> pointed here) must not
+                    # hold every reminder push behind a shell that never
+                    # confirms.
+                    _REMINDERS.mark_shell_armed(now)
+                try:
+                    hours = float((params.get("hours") or ["48"])[0])
+                except ValueError:
+                    hours = 48.0
+                self._send_json(200, _reminders_for_shell(now, hours), {"Cache-Control": "no-store"})
+                return True
+            m = _APPS_SCHEDULE_RE.match(path)
+            if m and not m.group(3):
+                if chamber_apps.app_dir(CHAMBERS_DIR, m.group(1), m.group(2)) is None:
+                    self._send_json(404, {"error": "no such app"})
+                else:
+                    self._send_json(200, _app_jobs_payload(m.group(1), m.group(2), _attention_now()),
+                                    {"Cache-Control": "no-store"})
+                return True
+            self._send_json(405 if m else 404, {"error": "not found" if not m else "method not allowed"})
+            return True
+        parts = path[len("/apps/"):].split("/", 2)
+        if len(parts) < 2 or not parts[1]:
+            self._send_json(404, {"error": "not found"})
+            return True
+        chamber, app = urllib.parse.unquote(parts[0]), urllib.parse.unquote(parts[1])
+        if chamber_apps.app_dir(CHAMBERS_DIR, chamber, app) is None:
+            self._send_json(404, {"error": "no such app"})
+            return True
+        if len(parts) == 2:
+            # The app's own relative links need its directory as the base.
+            self._redirect(f"/apps/{chamber}/{app}/" + (f"?{query}" if query else ""))
+            return True
+        rel = urllib.parse.unquote(parts[2])
+        target = chamber_apps.app_file(CHAMBERS_DIR, chamber, app, rel)
+        base = chamber_apps.app_dir(CHAMBERS_DIR, chamber, app)
+        if target is None or not self._serve_static_file(
+                target, base, types=_APP_CONTENT_TYPES, csp_app=True):
+            self._send_json(404, {"error": "not found"})
+        return True
+
+    def _apps_refuse_cross_site(self) -> bool:
+        if self._claude_auth_same_origin():
+            return False
+        self._send_json(403, {"error": "cross-site request rejected"})
+        return True
+
+    def _handle_apps_post(self) -> bool:
+        path = self.path.split("?", 1)[0]
+        if not path.startswith("/apps/api/"):
+            return False
+        if self._apps_refuse_cross_site():
+            return True
+        if path.rstrip("/") == "/apps/api/sparql":
+            self._handle_apps_sparql()
+            return True
+        if path.rstrip("/") == "/apps/api/ask":
+            self._handle_apps_ask()
+            return True
+        m = _APPS_SCHEDULE_RE.match(path)
+        if not m:
+            self._send_json(404, {"error": "not found"})
+            return True
+        chamber, app, job_id, action = m.groups()
+        if chamber_apps.app_dir(CHAMBERS_DIR, chamber, app) is None:
+            self._send_json(404, {"error": "no such app"})
+            return True
+        payload = self._read_json_body()
+        if payload is None:
+            self._send_json(400, {"error": "invalid JSON"})
+            return True
+        if job_id is None:
+            now = _attention_now()
+            try:
+                job = chamber_apps.normalize_job(payload, now)
+                chamber_apps.put_job(chamber, app, job)
+            except ValueError as exc:
+                self._send_json(400, {"error": str(exc)})
+                return True
+            trigger = chamber_apps.trigger_of(job)
+            nxt = trigger.next_after(now) if trigger else None
+            self._send_json(201, {"job": job, "full_id": chamber_apps.full_id(chamber, app, job["id"]),
+                                  "next": nxt.isoformat() if nxt else None})
+            return True
+        if not action:
+            self._send_json(405, {"error": "method not allowed"})
+            return True
+        status, body = _reminder_action(chamber, app, job_id, action, payload)
+        self._send_json(status, body)
+        return True
+
+    def _handle_apps_delete(self) -> bool:
+        path = self.path.split("?", 1)[0]
+        if not path.startswith("/apps/api/"):
+            return False
+        if self._apps_refuse_cross_site():
+            return True
+        m = _APPS_SCHEDULE_RE.match(path)
+        if not m or not m.group(3) or m.group(4):
+            self._send_json(404, {"error": "not found"})
+            return True
+        chamber, app, job_id, _ = m.groups()
+        if not chamber_apps.remove_job(chamber, app, job_id):
+            self._send_json(404, {"error": "no such job"})
+            return True
+        rid = chamber_apps.full_id(chamber, app, job_id)
+        _reminder_settle(rid, "unscheduled")
+        self._send_json(200, {"status": "removed", "id": rid})
+        return True
+
+    def _handle_apps_put(self) -> bool:
+        """PUT /apps/api/files/<chamber>/[<dir>/…]<name>: Retinue.submit. One
+        segment writes into the chamber's inbox; an existing file is
+        replaced only with ?replace=1. See chamber_apps.submit_target for
+        what is refused."""
+        path, _, query = self.path.partition("?")
+        if not path.startswith(_APPS_FILES_PREFIX):
+            if path.startswith("/apps/"):
+                self._send_json(405, {"error": "method not allowed"})
+                return True
+            return False
+        if self._apps_refuse_cross_site():
+            return True
+        segments = path[len(_APPS_FILES_PREFIX):].split("/")
+        chamber = urllib.parse.unquote(segments[0]) if segments else ""
+        target, why = chamber_apps.submit_target(CHAMBERS_DIR, chamber, segments[1:])
+        if target is None:
+            self._send_json(404 if why == "unknown chamber" else 400, {"error": why})
+            return True
+        if self.headers.get("Transfer-Encoding"):
+            self._send_json(411, {"error": "send the file with a Content-Length"})
+            return True
+        raw_length = (self.headers.get("Content-Length") or "").strip()
+        if not raw_length.isascii() or not raw_length.isdigit():
+            self._send_json(411, {"error": "send the file with a Content-Length"})
+            return True
+        length = int(raw_length) if len(raw_length) <= 18 else APPS_FILE_MAX_BYTES + 1
+        if length > APPS_FILE_MAX_BYTES:
+            self._send_json(413, {"error": f"larger than {APPS_FILE_MAX_BYTES} bytes"})
+            return True
+        replace = (urllib.parse.parse_qs(query).get("replace") or [""])[0] in ("1", "true")
+        if target.exists() and not replace:
+            self._send_json(409, {"error": "a file of that name exists (send ?replace=1 to replace it)"})
+            return True
+        data = self.rfile.read(length)
+        if len(data) != length:
+            # The client left mid-body: nothing is published.
+            self._send_json(400, {"error": "the body ended before its Content-Length"})
+            return True
+        tmp = None
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            fd, tmp = tempfile.mkstemp(prefix=".upload-", dir=str(target.parent))
+            with os.fdopen(fd, "wb") as fh:
+                fh.write(data)
+            if replace:
+                os.replace(tmp, target)
+            else:
+                # Exclusive: a link fails if the name exists, so two uploads
+                # racing for the same new name cannot both succeed.
+                os.link(tmp, target)
+                os.unlink(tmp)
+            tmp = None
+        except FileExistsError:
+            self._send_json(409, {"error": "a file of that name exists (send ?replace=1 to replace it)"})
+            return True
+        except OSError as exc:
+            self._send_json(500, {"error": f"not written: {exc.strerror or exc}"})
+            return True
+        finally:
+            if tmp is not None:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+        rel = target.relative_to(CHAMBERS_DIR / chamber).as_posix()
+        print(f"[web-gateway] app file written: {chamber}/{rel} ({len(data)} bytes)", flush=True)
+        self._send_json(201, {"status": "written", "chamber": chamber, "path": rel, "bytes": len(data)})
+        return True
+
+    def _handle_apps_sparql(self) -> None:
+        """POST /apps/api/sparql {"query", "endpoint"}: one read-only query,
+        answered as SPARQL JSON results. The same refusals as /sparql:
+        updates, SERVICE and another site's request."""
+        payload = self._read_json_body()
+        if payload is None or not isinstance(payload.get("query"), str):
+            self._send_json(400, {"error": "send {\"query\": \"…\"}"})
+            return
+        query = payload["query"]
+        if not query.strip() or len(query) > SPARQL_MAX_BODY:
+            self._send_json(400, {"error": "the query is empty or too long"})
+            return
+        if _sparql_cross_site(self.headers):
+            self._send_json(403, {"error": "a query sent from another site is not run"})
+            return
+        if _sparql_calls_out(query):
+            self._send_json(403, {"error": "federated queries (SERVICE) are not allowed"})
+            return
+        url = _sparql_endpoint_url(str(payload.get("endpoint") or "life"))
+        if url is None:
+            self._send_json(404, {"error": "no such endpoint"})
+            return
+        req = urllib.request.Request(
+            url, data=urllib.parse.urlencode({"query": query}).encode("utf-8"),
+            headers={"Accept": "application/sparql-results+json",
+                     "Content-Type": "application/x-www-form-urlencoded"}, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=SPARQL_PROXY_TIMEOUT) as resp:
+                body = resp.read(16 * 1024 * 1024 + 1)
+                status = resp.getcode()
+        except urllib.error.HTTPError as exc:
+            self._send_json(exc.code if 400 <= exc.code < 600 else 502,
+                            {"error": "the store refused the query",
+                             "detail": exc.read(2000).decode("utf-8", "replace")})
+            return
+        except (urllib.error.URLError, OSError, ValueError) as exc:
+            self._send_json(502, {"error": "store unreachable", "detail": str(exc)})
+            return
+        try:
+            result = json.loads(body)
+        except ValueError:
+            self._send_json(502, {"error": "the store did not answer JSON"})
+            return
+        self._send_json(status, result if isinstance(result, dict) else {"result": result},
+                        {"Cache-Control": "private, no-store"})
+
+    def _handle_apps_ask(self) -> None:
+        """POST /apps/api/ask: open or continue a dashboard thread addressed
+        to an agent. Body {"agent", "text", "thread"?, "title"?, "app":
+        {"chamber", "id"}?, attention fields (importance, due, lead, sphere,
+        tags, kind)}. The thread is the user's own (the app speaks for them,
+        as the composer does), with a note to Ara naming the app and the
+        agent to route to; it is never via the edge, so no turn it starts
+        may type on the paired device."""
+        payload = self._read_json_body()
+        if payload is None:
+            self._send_json(400, {"error": "invalid JSON"})
+            return
+        agent = str(payload.get("agent") or "ara").strip()
+        text = str(payload.get("text") or "").strip()
+        if not _AGENT_NAME_RE.match(agent):
+            self._send_json(400, {"error": "agent must be an agent's name"})
+            return
+        if not text or len(text) > 20000:
+            self._send_json(400, {"error": "text is empty or too long"})
+            return
+        app = payload.get("app") if isinstance(payload.get("app"), dict) else {}
+        chamber, app_id = str(app.get("chamber") or ""), str(app.get("id") or "")
+        source = (f"the chamber app {chamber}/{app_id}"
+                  if chamber_apps.app_dir(CHAMBERS_DIR, chamber, app_id) else "a chamber app")
+        context = (f"Sent from {source} on the user's behalf, addressed to the agent "
+                   f"'{agent}'. Route it to that agent (or answer as Ara when it is 'ara').")
+        spec = {k: payload[k] for k in ("importance", "due", "lead", "sphere", "tags", "kind")
+                if k in payload}
+        thread = str(payload.get("thread") or "").strip()
+        if thread:
+            if not _CONV_ID_RE.match(thread):
+                self._send_json(400, {"error": "invalid thread"})
+                return
+            conv = _conv_add_message(thread, "user", text, unread=False, context=context)
+            if conv is None:
+                self._send_conv_missing(thread)
+                return
+        else:
+            title = str(payload.get("title") or "").strip()[:120] or None
+            conv = _new_conv("user", DEFAULT_SESSION_KEY, title, "user", text, context=context)
+        if spec:
+            _attention_arrive_thread(conv, spec)
+        _start_conv_turn(conv["id"])
+        _conv_set_flags(conv["id"], pending=True)
+        self._send_json(201 if not thread else 200, {"thread": conv["id"],
+                                                     "href": f"/#conversation-{conv['id']}"})
+
     def _serve_inbox(self) -> bool:
         if not webdav_share.handles(self.path):
             return False
@@ -17457,10 +18779,14 @@ class Handler(BaseHTTPRequestHandler):
         return True
 
     def do_PUT(self):
+        if self._handle_apps_put():
+            return
         if not self._serve_inbox():
             self._send_json(405, {"error": "method not allowed"})
 
     def do_DELETE(self):
+        if self._handle_apps_delete():
+            return
         if not self._serve_inbox():
             self._send_json(405, {"error": "method not allowed"})
 
@@ -17530,6 +18856,11 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         if self._serve_inbox():
             return
+        if self.path.split("?", 1)[0].rstrip("/") == "/internal/apps/reminders/fire":
+            self._handle_internal_reminder_fire()
+            return
+        if self._handle_apps_post():
+            return
         if self.path.split("?", 1)[0] == content_policy.REPORT_PATH:
             self._handle_csp_report()
             return
@@ -17581,6 +18912,12 @@ class Handler(BaseHTTPRequestHandler):
         chat_trim_match = _CHAT_TRIM_RE.match(self.path)
         if chat_trim_match:
             self._handle_chat_trim(chat_trim_match.group(1), chat_trim_match.group(2))
+            return
+        if self.path in ("/chats/triage", "/chats/triage/"):
+            self._handle_chats_triage_start()
+            return
+        if self.path in ("/chats/triage/notes", "/chats/triage/notes/"):
+            self._handle_chats_triage_notes()
             return
         chat_flags_match = _CHAT_FLAGS_RE.match(self.path)
         if chat_flags_match:
@@ -17948,6 +19285,40 @@ class Handler(BaseHTTPRequestHandler):
         self._send_json(status, result)
 
     # ── Conversation tabs ─────────────────────────────────────────────────────
+
+    def _handle_chats_triage_start(self) -> None:
+        """POST /chats/triage — the Triage button: sort the unread chats
+        (body ``{again?, feedback?}``; ``again`` sorts those already sorted
+        too, and ``feedback`` saves a note on how to sort and sorts again). It
+        spends model calls on the user's press, so a cross-site page may not
+        press it for them."""
+        if not self._user_act_same_origin():
+            return
+        body = self._read_json_body()
+        if body is None:
+            self._send_json(400, {"error": "invalid JSON"})
+            return
+        # A `feedback` that is present must be text — an explicit null too,
+        # which .get() could not tell from an absent one and would take for
+        # a plain press that spends a run.
+        if "feedback" in body and not isinstance(body["feedback"], str):
+            self._send_json(400, {"error": "feedback must be text"})
+            return
+        self._send_json(*_triage_start(body.get("again") is True, body.get("feedback")))
+
+    def _handle_chats_triage_notes(self) -> None:
+        """POST /chats/triage/notes {remove: <id>} — take back a feedback
+        note. The user's act, like the press; it starts no run."""
+        if not self._user_act_same_origin():
+            return
+        body = self._read_json_body()
+        if body is None or not isinstance(body.get("remove"), str):
+            self._send_json(400, {"error": "body must be {remove: <note id>}"})
+            return
+        if not _TRIAGE_STORE.remove_note(body["remove"]):
+            self._send_json(404, {"error": "no such note"})
+            return
+        self._send_json(200, _triage_payload())
 
     def _read_json_body(self) -> dict | None:
         length = int(self.headers.get("Content-Length", 0))
@@ -18910,6 +20281,26 @@ class Handler(BaseHTTPRequestHandler):
             "contacts": [_contact_brief(r) for r in records],
         })
 
+    def _handle_contact_chats(self, query: str) -> None:
+        """GET /contacts/chats?channel=&handle=[&person=] — the chats one of
+        a person's handles is in, and how a new one is started
+        (_contact_chats): what a tap on a handle of the Contacts page opens.
+        A handle that does not parse answers 400; the life store down, 502."""
+        params = urllib.parse.parse_qs(query or "")
+        first = lambda k: (params.get(k) or [""])[0].strip()  # noqa: E731
+        if not first("channel") or not first("handle"):
+            self._send_json(400, {"error": "channel and handle are required"})
+            return
+        try:
+            body = _contact_chats(first("channel"), first("handle"), first("person") or None)
+        except contacts_mod.ContactError as exc:
+            self._send_json(400, {"error": str(exc)})
+            return
+        except Exception as exc:  # noqa: BLE001 - the store, as for GET /chats
+            self._send_json(502, {"error": "life store unreachable", "detail": str(exc)})
+            return
+        self._send_json(200, body, {"Cache-Control": "no-store"})
+
     def _handle_contact_write(self, key: str | None) -> None:
         """Create a contact (POST /contacts: {chamber, name, handles, sphere?,
         tags?, domains?}) or change one (POST /contacts/<id>: {name?, sphere?,
@@ -19166,26 +20557,48 @@ class Handler(BaseHTTPRequestHandler):
         payload = self._agent_conversation_payload()
         if payload is None:
             return
+        # What the payload says is checked first, whoever may set it.
         try:
-            verdict = _parse_verdict(payload)
+            triage = _parse_triage_verdict(payload)
+            verdict = (_parse_verdict(payload)
+                       if payload.get("importance") is not None else None)
         except ValueError as exc:
             self._send_json(400, {"error": str(exc)})
             return
         # The turn calls with the id its prompt named; a merge may have folded
         # that chat into another since, and the verdict is the turn's all the
-        # same, applied to the chat it is part of now (_turn_record).
+        # same, applied to the chat it is part of now (_turn_record). Any
+        # arrival turn may give the triage word (a VIP's turn gives only
+        # that); the importance verdict is an instructed turn's alone.
         with _chat_turns_lock:
-            record = _turn_record(chat_id, instructed=True)
-            if record is not None:
-                record["verdict"] = verdict
-                batch, live = set(record["jobs"]), record["chat"]
+            record = _turn_record(chat_id)
+            instructed = bool(record and record["instructed"])
         if record is None:
             self._send_json(409, {
-                "error": "no turn working on this chat by a standing instruction: "
-                         "a verdict belongs to that turn alone"})
+                "error": "no arrival turn working on this chat: a verdict belongs "
+                         "to that turn alone"})
             return
-        _instructed_note(live, jobs=batch, verdict=verdict)
-        self._send_json(200, {"id": live, "verdict": verdict})
+        if verdict is not None and not instructed:
+            self._send_json(409, {
+                "error": "no turn working on this chat by a standing instruction: "
+                         "an importance verdict belongs to that turn alone — "
+                         "give only --triage"})
+            return
+        if instructed and verdict is None:
+            self._send_json(400, {"error": "importance (0–5) is required"})
+            return
+        if verdict is None and triage is None:
+            self._send_json(400, {"error": "give the triage word (--triage)"})
+            return
+        with _chat_turns_lock:
+            if verdict is not None:
+                record["verdict"] = verdict
+            if triage is not None:
+                record["triage"] = triage
+            batch, live = set(record["jobs"]), record["chat"]
+        if verdict is not None:
+            _instructed_note(live, jobs=batch, verdict=verdict)
+        self._send_json(200, {"id": live, "verdict": verdict, "triage": triage})
 
     def _handle_chat_companion(self, raw_id: str) -> None:
         """Open (or re-open) this chat's companion conversation.
@@ -20861,8 +22274,9 @@ class Handler(BaseHTTPRequestHandler):
                                                     breaks=None if breaks is None else bool(breaks))
         _ATTENTION.save_focus(focus)
         if is_breakpoint:
-            items, degraded = _attention_items(profile, now)
+            items, _degraded = _attention_items(profile, now, listing=False)
             _attention_breakpoint(items, focus, now, "the mode change")
+            items, degraded = _attention_items(profile, now)
         else:
             # Into Focused: no digest. What the focus lets through rings; the
             # rest stays held for the focus's breaks, its end, or a change.
@@ -20875,7 +22289,7 @@ class Handler(BaseHTTPRequestHandler):
         """After a rule change, push what it releases; returns their ids.
         ``skip``: items a digest has just carried, which must not ring again
         one by one."""
-        items, _degraded = _attention_items(profile, now)
+        items, _degraded = _attention_items(profile, now, listing=False)
         pushed = []
         for item in items:
             if skip and item["id"] in skip:
@@ -20932,7 +22346,7 @@ class Handler(BaseHTTPRequestHandler):
             if payload.get("enabled") is not None and any(c.startswith("focus modes ") for c in changes):
                 # Focus turned on or off is a change of mode like any other:
                 # a breakpoint, what was held arriving as one digest.
-                items, _degraded = _attention_items(profile, now)
+                items, _degraded = _attention_items(profile, now, listing=False)
                 digest = _attention_breakpoint(items, focus, now, "focus turned " + ("on" if payload["enabled"] else "off"))
                 carried = {i["id"] for i in (digest or {}).get("items") or []}
             else:
@@ -21545,6 +22959,22 @@ class Handler(BaseHTTPRequestHandler):
             return
         self._send_json(200, {"status": "redacted", "message_id": mid})
 
+    def _handle_internal_reminder_fire(self) -> None:
+        """The scheduler fires a reminder occurrence (scripts/scheduler.py,
+        fire_reminder). Token-gated like the agent conversation calls. Body
+        {"chamber", "app", "id", "occurrence"}."""
+        payload = self._agent_conversation_payload()
+        if payload is None:
+            return
+        occ = calendar_trigger.parse_instant(payload.get("occurrence"))
+        chamber, app, job_id = (str(payload.get(k) or "") for k in ("chamber", "app", "id"))
+        if occ is None or not (chamber_apps.NAME_RE.match(chamber) and chamber_apps.NAME_RE.match(app)
+                               and chamber_apps.JOB_ID_RE.match(job_id)):
+            self._send_json(400, {"error": "send chamber, app, id and an ISO occurrence"})
+            return
+        status, body = _reminder_fire(chamber, app, job_id, occ)
+        self._send_json(status, body)
+
     def _send_conv_missing(self, cid: str) -> None:
         """The answer for a thread that is not there: 410 Gone when the user
         deleted it (see _conv_deleted_at), 404 when it never was. The
@@ -21848,6 +23278,8 @@ class Handler(BaseHTTPRequestHandler):
             return
         if self._serve_inbox():
             return
+        if self._serve_apps_get():
+            return
         if self.path == "/health":
             state = _load_state()
             sessions = {
@@ -21907,6 +23339,12 @@ class Handler(BaseHTTPRequestHandler):
             if kind not in ("chat", "edit", "cowork", "companion", "all"):
                 kind = "chat"
             project = (params.get("project") or [None])[0]
+            if scope == "archived" and "limit" in params and not project:
+                # The Archived page, a page at a time (see _archived_page).
+                limit = _page_param(params, "limit", ARCHIVED_PAGE_DEFAULT, 1, 10 ** 9)
+                offset = _page_param(params, "offset", 0, 0, 10 ** 9)
+                self._send_json(200, _archived_page(kind, limit, offset))
+                return
             self._send_json(200, {"conversations": _list_convs(scope, kind, project)})
             return
         if conv_path in ("/projects/item", "/projects/item/"):
@@ -21983,8 +23421,14 @@ class Handler(BaseHTTPRequestHandler):
         if conv_path in ("/chats/compose", "/chats/compose/"):
             self._handle_chats_compose_options()
             return
+        if conv_path in ("/chats/triage", "/chats/triage/"):
+            self._send_json(200, _triage_payload())
+            return
         if conv_path in ("/contacts", "/contacts/"):
             self._handle_contacts_get(conv_query)
+            return
+        if conv_path in ("/contacts/chats", "/contacts/chats/"):
+            self._handle_contact_chats(conv_query)
             return
         chat_media_match = _CHAT_MEDIA_RE.match(conv_path)
         if chat_media_match:
@@ -22432,6 +23876,18 @@ if __name__ == "__main__":
         except Exception as exc:  # noqa: BLE001
             print(f"[web-gateway] sensitive-text sweep skipped: {exc}", flush=True)
     threading.Thread(target=_sweep_sensitive, name="sensitive-sweep", daemon=True).start()
+    # The threads' life-store summaries (scripts/thread_index.py): written for
+    # every thread that predates them or changed while the gateway was down,
+    # removed for every thread that is gone. In the background, like the sweep.
+    def _reconcile_thread_index() -> None:
+        try:
+            written, removed = _thread_index_reconcile()
+            if written or removed:
+                print(f"[web-gateway] thread summaries: {written} written, "
+                      f"{removed} removed", flush=True)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[web-gateway] thread summary reconcile skipped: {exc}", flush=True)
+    threading.Thread(target=_reconcile_thread_index, name="thread-index", daemon=True).start()
     # Before serving, so it never meets a manifest of a turn of this process.
     try:
         _sweep_stale_shell_manifests()

@@ -980,6 +980,10 @@ class RetinueChatPage extends HTMLElement {
   connectedCallback() {
     if (!this.shadowRoot) this.attachShadow({ mode: 'open' });
     this._id = new URLSearchParams(location.search).get('id') || '';
+    // Opened from triage's "Action suggested" list (chats.js): on the phone,
+    // straight onto Ara's pane, where her note on the chat is. A shelf
+    // restore (a page brought back from the shelf) still says where it was.
+    if (new URLSearchParams(location.search).get('pane') === 'ara') this._pane = 'companion';
     // Leaving with input in the composer: the words not yet saved go to the
     // server as the page unloads, and stay on the device in case they do not
     // get there (_keepLocal); a live recording is handed on to be transcribed
@@ -3199,7 +3203,8 @@ class RetinueChatPage extends HTMLElement {
     }
     return `<header class="chat-head">` +
       avatarHtml(c) +
-      `<div class="head-txt"><div class="head-name">${this._starHtml()}${esc(c.name)}</div>` +
+      `<div class="head-txt"><div class="head-name">${this._starHtml()}` +
+      `<span class="head-title">${esc(c.name)}</span></div>` +
       `${sub}</div>` +
       `<nav class="pane-tabs" role="tablist" aria-label="Pane">` +
       `<button role="tab" data-pane-tab="chat" aria-selected="true">Chat</button>` +
@@ -3211,17 +3216,24 @@ class RetinueChatPage extends HTMLElement {
       this._menuHtml() + `</header>`;
   }
 
-  // The star in front of a starred chat's name: the mark the chat list shows.
+  // The star in front of the chat's name, hollow or full: the switch itself,
+  // as on a thread's bar, and full the mark the chat list shows.
   _starHtml() {
-    return (this._chat || {}).starred
-      ? '<span class="star-mark" role="img" aria-label="Starred" title="Starred">&#9733;</span> ' : '';
+    const on = !!(this._chat || {}).starred;
+    return `<button class="star-btn${on ? ' on' : ''}" data-flag="starred" data-on="${on ? '0' : '1'}" ` +
+      `aria-pressed="${on}" aria-label="Star" ` +
+      `title="${on ? 'Starred — first in the chat list. Tap to unstar' : 'Star: keep it at the top of the chat list'}">` +
+      `${on ? '&#9733;' : '&#9734;'}</button>`;
   }
 
-  // The chat's menu, at the header's right end: the attention sheet, Star,
-  // Archive and Mute, then Spam (mail threads only) and Delete (_actionsHtml). They used to take a ⓘ in the header and a row of switches under
-  // it — a whole row on a phone for two controls that are rarely touched. The
-  // button carries a dot while the chat is archived or muted, so the state
-  // stays visible with the menu shut.
+  // The chat's menu, at the header's right end: the attention sheet, Archive
+  // and Mute, then Spam (mail threads only) and Delete (_actionsHtml). They
+  // used to take a ⓘ in the header and a row of switches under it — a whole
+  // row on a phone for controls that are rarely touched. The button carries a
+  // dot while the chat is archived or muted, so the state stays visible with
+  // the menu shut. A header with the room for them (the CSS's container
+  // query) shows the same items as a row of buttons instead, and no ⋮: the
+  // list is then always on show, whatever its `hidden` says.
   _menuHtml() {
     // A disclosure, not an ARIA menu: a button that shows and hides a short
     // list of ordinary buttons, reached with Tab like the rest of the page.
@@ -3266,15 +3278,20 @@ class RetinueChatPage extends HTMLElement {
       this._menuAway = null;
     }
     // Shut, the menu forgets an armed Delete: the next opening asks again.
+    if (!show && this._armAway) {
+      this._armAway();
+      this._armAway = null;
+    }
     if (!show && this._deleteArmed) {
       this._deleteArmed = false;
       this._refreshActionsUi();
     }
   }
 
-  // The menu's switches, under Attention details: Star, Archive and Mute.
-  // Each shows the state it is in and offers the other:
-  // "Archive" / "Archived · Unarchive". The flags mean what they mean on
+  // The menu's switches, under Attention details: Archive and Mute (Star is
+  // the star before the name, _starHtml). Each shows the state it is in and
+  // offers the other: "Archive" / "Archived · Unarchive" — as a button in a
+  // wide header just the offer, "Unarchive". The flags mean what they mean on
   // threads — a starred chat leads the chat list and nothing else; an
   // archived chat comes back when a message arrives unless it is muted;
   // muting archives too and silences its push — and POST /chats/<id>/flags
@@ -3284,9 +3301,9 @@ class RetinueChatPage extends HTMLElement {
     const sw = (flag, on, offLabel, onLabel, hint) =>
       `<button class="item${on ? ' on' : ''}" data-flag="${flag}" data-on="${on ? '0' : '1'}" ` +
       `title="${esc(hint)}">` +
-      (on ? `<b>${esc(onLabel)}</b> · Un${esc(offLabel.toLowerCase())}` : esc(offLabel)) + `</button>`;
+      (on ? `<b>${esc(onLabel)}</b><span class="sep"> · </span>Un${esc(offLabel.toLowerCase())}` : esc(offLabel)) +
+      `</button>`;
     return `<div class="items" data-flags>` +
-      sw('starred', !!c.starred, 'Star', 'Starred', 'Keeps the chat at the top of the chat list') +
       sw('archived', !!c.archived, 'Archive', 'Archived',
          'Leaves the chat list; comes back when a message arrives, unless muted') +
       sw('muted', !!c.muted, 'Mute', 'Muted', 'Archived, no push, and a new message does not bring it back') +
@@ -3361,9 +3378,24 @@ class RetinueChatPage extends HTMLElement {
     if (!this._deleteArmed) {
       this._deleteArmed = true;
       this._refreshActionsUi();
+      // As a button in a wide header there is no menu to shut: a press
+      // anywhere else, or Esc, takes the question back the same way.
+      const root = this.shadowRoot;
+      const menu = root && root.querySelector('[data-menu]');
+      const box = root && root.querySelector('[data-chat-acts]');
+      if (menu && menu.hidden && box && !this._armAway) {
+        const onKey = (e) => { if (e.key === 'Escape') this._toggleMenu(false); };
+        const offPress = onPressOutside(box, () => this._toggleMenu(false), { capture: true });
+        document.addEventListener('keydown', onKey);
+        this._armAway = () => { offPress(); document.removeEventListener('keydown', onKey); };
+      }
       return;
     }
     this._deleteArmed = false;
+    if (this._armAway) {
+      this._armAway();
+      this._armAway = null;
+    }
     this._acting = true;
     try {
       const out = await commitChatAction(this._id, 'delete');
@@ -3417,14 +3449,14 @@ class RetinueChatPage extends HTMLElement {
   _refreshFlagsUi(flag = '') {
     const root = this.shadowRoot;
     if (!root || !this._chat) return;
-    const name = root.querySelector('.head-name');
-    if (name) name.innerHTML = this._starHtml() + esc(this._chat.name);
+    const star = root.querySelector('.star-btn');
     const row = root.querySelector('[data-flags]');
-    if (row) {
+    if (star || row) {
       const active = deepActiveElement();
-      const had = row.contains(active);
+      const had = !!active && (active === star || (!!row && row.contains(active)));
       const which = flag || (had && active.getAttribute && active.getAttribute('data-flag')) || '';
-      row.outerHTML = this._switchesHtml();
+      if (star) star.outerHTML = this._starHtml();
+      if (row) row.outerHTML = this._switchesHtml();
       this._bindSwitches();
       const again = had && which && root.querySelector(`[data-flag="${which}"]`);
       if (again) again.focus();
@@ -6237,6 +6269,7 @@ const CSS = `
 
   /* ── Header ──────────────────────────────────────────────────────────────── */
   .chat-head { flex: none; display: flex; align-items: center; gap: 10px; padding: 2px 0 10px;
+               container: chat-head / inline-size;
                border-bottom: 1px solid var(--line, rgba(231, 235, 242, .08)); }
   .av { flex: none; position: relative; width: 40px; height: 40px; border-radius: 50%;
         display: inline-flex; align-items: center; justify-content: center;
@@ -6246,8 +6279,14 @@ const CSS = `
         font-size: .58rem; font-weight: 800; color: #fff;
         border: 2px solid var(--bg, #0b0d12); box-sizing: content-box; }
   .head-txt { flex: 1; min-width: 0; }
-  .head-name { font-weight: 650; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .head-name .star-mark { color: #e3b341; font-size: .9em; }
+  .head-name { font-weight: 650; display: flex; align-items: center; gap: 4px; min-width: 0; }
+  .head-title { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  /* The star before the name: hollow, or full and gold once starred. */
+  .star-btn { flex: none; border: 0; background: transparent; color: var(--muted, #8b93a3);
+              font: inherit; font-size: 1.05rem; line-height: 1; padding: 4px; margin: -4px 0 -4px -4px;
+              border-radius: 50%; cursor: pointer; -webkit-tap-highlight-color: transparent; }
+  .star-btn:hover { background: var(--card-2, #1c2230); }
+  .star-btn.on { color: #e3b341; }
   .head-sub { display: block; color: var(--muted, #8b93a3); font-size: .74rem;
               overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .pane-tabs { flex: none; display: flex; background: var(--card-2, #1c2230);
@@ -6282,6 +6321,24 @@ const CSS = `
   .item.danger { color: #ff8a80; }
   .item.danger.confirm { background: #a8322c; color: #fff; }
   .item-note { margin: 2px 12px 8px; font-size: .76rem; color: #ff8a80; max-width: 260px; }
+  /* A header with the room: the menu's items as a row of buttons, and no ⋮. */
+  @container chat-head (min-width: 820px) {
+    [data-menu-btn] { display: none; }
+    [data-minimize] { order: 1; }
+    .menu, .menu[hidden] { display: block; position: static; min-width: 0; background: transparent;
+                           border: 0; border-radius: 0; padding: 0; box-shadow: none; }
+    .items { flex-direction: row; align-items: center; gap: 6px; }
+    .item { border: 1px solid var(--line, rgba(231, 235, 242, .08)); border-radius: 999px;
+            padding: 6px 12px; font-size: .8rem; white-space: nowrap; }
+    .item.on { color: var(--accent, #6ea8fe); border-color: currentColor; }
+    .item.on b, .item.on .sep { display: none; }
+    .item.danger { border-color: rgba(255, 138, 128, .35); }
+    [data-chat-acts] { position: relative; border-top: 0; margin-top: 0; padding-top: 0; }
+    .item-note { position: absolute; right: 0; top: calc(100% + 6px); z-index: 30; margin: 0;
+                 width: max-content; padding: 8px 12px; border-radius: 10px;
+                 background: var(--card-2, #1c2230);
+                 border: 1px solid var(--line, rgba(231, 235, 242, .08)); }
+  }
 
   /* Typing mode (phone keyboard up, see _watchKeyboard): the header and the
      companion's bar give their rows to the thread and the field. */

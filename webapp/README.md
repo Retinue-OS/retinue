@@ -135,7 +135,11 @@ The same gateway also backs the conversation-tabs card with a small JSON API
 - `GET  /conversations`               — list of active threads (tabs). Edit-kind
   threads are excluded by default; `?kind=edit|all` includes them, and
   `?project=<uri>` narrows to one project's threads.
-- `GET  /conversations?archived=1`    — list of archived threads.
+- `GET  /conversations?archived=1`    — list of archived threads (every one).
+- `GET  /conversations?archived=1&limit=N&offset=M` — one page of them, starred
+  first, then newest: `{conversations, has_more, next_offset, source}`. What
+  the Threads page's Archived tab asks for (its "Load more" widens the window);
+  ordered by the life store's thread summaries — see `docs/dashboard.md`.
 - `GET  /conversations?all=1`         — list of all threads.
 - `GET  /conversations/<id>`          — one thread with its messages.
 - `POST /conversations`               — open a thread (`{"message": "..."}`,
@@ -328,6 +332,31 @@ docstring). Pieces:
   (arrow keys move between them); the choice holds across refreshes and
   writes, and a fresh page opens on *Unread*. The list refreshes on an
   ambient cadence and keeps its last rendered state over a failed fetch.
+
+  **Triage** (beside the tabs; [docs/chat-triage.md](../docs/chat-triage.md))
+  opens a view of the chats sorted three ways: *Action suggested* (*— see Ara* where follow-ups run),
+  *No action — proposed archive* (with **Archive all**, one Undo for the
+  section) and *No action — proposed delete* (with **Delete all**, two taps,
+  no Undo; armed for the rows it was armed over — a poll that changes them
+  disarms it), then *Not sorted* (an unread chat with no word yet, one whose
+  sorting failed, one spoken in since it was sorted). Opening the view is the
+  press: `POST /chats/triage {}` sorts the unread chats that have no fresh
+  word, and **Sort again** posts `{again: true}`. Every row is the list's own
+  row — it opens the chat, swipes and has the tray as on its tab — with the
+  sorting's one-line note under it, and on an action chat — where follow-ups
+  are switched on (`CHAT_TRIAGE_FOLLOWUPS`, off by default) — Ara's note from her
+  follow-up in the chat's companion ("Ara is looking at it…" until it lands);
+  an action row with such a note opens the chat on Ara's pane
+  (`chat.html?id=…&pane=ara`), any other on its messages.
+  **Feedback on the sorting** (a box under the status line) saves a note in
+  the user's words for every run from now on and sorts everything again
+  (`POST /chats/triage {feedback}`); saved notes are listed, each with ✕
+  (`POST /chats/triage/notes {remove}`).
+  The view lives at `chats.html#triage`: back from a chat opened in it (or a
+  reload) restores it from `GET /chats/triage`, sorting nothing anew.
+  The view polls `GET /chats/triage` while a run sorts or a note is on its
+  way, and is a history entry (back closes it); there is no multi-select
+  inside it. A chat archived or deleted leaves the view.
 - `chat.html?id=<chat id>` (`components/chat-page.js`) — one chat: bubbles
   with day separators and a "new" waterline (before the first message that
   was unread when the chat was opened — the last `unread` inbound messages of
@@ -359,10 +388,13 @@ docstring). Pieces:
   the chat is a row of — for a chat opened cold (a notification, a
   bookmark). The header's ⋮ menu holds
   *Attention details* — the chat's attention sheet, with the contact card —
-  and the **Star** / **Archive** / **Mute** switches, the same
-  `POST /chats/<id>/flags` the list's swipe actions use; a starred chat's
-  name carries a ★, and a dot on the ⋮ shows an archived or muted chat with
-  the menu shut. What the companion pane does sits behind a **?**
+  the **Archive** / **Mute** switches — the same
+  `POST /chats/<id>/flags` the list's swipe actions use — then **Spam** (mail
+  only) and **Delete**; a dot on the ⋮ shows an archived or muted chat with
+  the menu shut. A header at least 820px wide (a container query, so the
+  header's own width decides) shows those items as a row of buttons instead
+  of the ⋮. **Star** is the star before the chat's name, in every width:
+  hollow (☆) to star, full (★) to unstar. What the companion pane does sits behind a **?**
   in its bar rather than on a row of its own. While the phone keyboard is up —
   `data-keyboard` on `<html>`, which `viewport.js` sets when a text field
   has focus and the visible frame is well short of its keyboard-less height
@@ -1374,7 +1406,15 @@ Threads can be spoken as well as typed, with no streaming and split by direction
   the dictation's ➤ path (transcribe, send), the loop waits for the answer,
   and goes round again — only for an answer to its own turn: other messages
   pushed into the thread may be read, but do not open the mic. A take that
-  reaches the 120 s cap goes to the draft for review instead. No speech for
+  reaches the length cap (4 min by default, 1–30 min under Settings → Voice;
+  three soft ticks sound half a minute before it)
+  goes to the draft for review, never out — a hard limit, so an open mic that
+  catches a phone call or a talk in the room is not sent to Ara. Each take's
+  end is heard as well as seen (`continuous.js`, `takeCue`): a soft low gong
+  once its send to Ara went through, a short rising whistle when recording
+  stopped without sending (the cap, an unsure end, the page hidden) or the
+  send turned back, and the transcript waits in the box; a take dropped because nobody spoke, or ended by the row's ✓,
+  stays silent. No speech for
   about 8 s closes the mic with the mode left on — the mic button resumes;
   leaving the thread or hiding the page ends listening (a take with speech in
   it lands in the draft for review, as on leaving any dictation; one without

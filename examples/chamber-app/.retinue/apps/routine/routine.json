@@ -1,0 +1,11 @@
+{
+  "id": "stretch",
+  "title": "Morning stretch",
+  "lang": "en",
+  "steps": [
+    {"say": "Roll your shoulders", "seconds": 30},
+    {"say": "Reach up and hold", "seconds": 20},
+    {"say": "Rest", "seconds": 10},
+    {"say": "Touch your toes and hold", "seconds": 20}
+  ]
+}
