@@ -2544,19 +2544,29 @@ Two ways to satisfy it:
   `wireDictation(shadowRoot)` after each render. A 🎤 sits in the field's
   corner; a tap records (■ with the time running, ✕ discards), a second tap
   transcribes and puts the words at the caret the user left — or after what
-  the field holds — then fires the field's own `input` and `change` events, so
-  the host keeps its state exactly as for typing. A dictation never sends or
-  saves anything: the host's own button does. One-line fields lose the
-  transcriber's trailing full stop. The key should be unique per thing edited
+  the field holds — then fires the field's own `input` event, so the host
+  keeps its state exactly as for typing. A dictation never sends or saves
+  anything: the host's own button does. No `change` fires — that is a
+  commit, and a host that saves on it would write a transcript the user has
+  not read. The words go where the user's caret or selection was; a
+  selection is replaced, also one that reaches the end of the field. The key
+  of a mail being written names its mailbox's slot, so a transcription still
+  running when From changes cannot land in another mailbox's mail. Leaving
+  the page mid-take stops the recorder and hands the whole take — its last
+  slice included — to the worker; leaving while the microphone is still
+  being asked for cancels the take, and the microphone goes off. One-line
+  fields lose the transcriber's trailing full stop. The key should be unique per thing edited
   (`contact-instruction:<id>`): the transcription runs in the service worker
   (`dictation.js`), so a page left mid-transcription gets the words back into
   that same field when it is shown again. State lives in the module, not the
   host, so a host re-render mid-recording keeps the button as it is.
 
-The only exemption is a value with a machine format that speech does not
-produce — a messenger handle, an e-mail domain — marked
-`data-dictate-exempt="<why>"`. Number, date, colour and other non-text inputs
-are not text fields. `tests/test_webapp_dictation_everywhere.py` scans the
+Two kinds of field are exempt, marked `data-dictate-exempt="<why>"`: a
+value with a machine format that speech does not produce — a messenger
+handle, an e-mail domain (`address`) — and a field that saves the moment it
+changes, with no button of its own to confirm it — the instance name, a new
+sphere (`saves-on-change`): a dictation there would be a write the user never
+saw. Number, date, colour and other non-text inputs are not text fields. `tests/test_webapp_dictation_everywhere.py` scans the
 webapp's markup and fails on any text field that carries none of the three
 marks, so a new field cannot forget it.
 

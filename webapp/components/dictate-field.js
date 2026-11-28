@@ -9,7 +9,10 @@
 // ✕ beside it throws the take away); tap ■ and the words are transcribed and
 // appended to what the field already holds, as if typed — the field's own
 // `input` event fires, so the host keeps its state exactly as for typing.
-// Nothing is ever sent by a dictation here: the host's own button does that.
+// Nothing is ever sent or saved by a dictation here: the host's own button
+// does that. So no `change` fires: a host that saves the moment a field
+// changes would otherwise write a transcript the user has not read — such a
+// field is exempt instead (data-dictate-exempt).
 //
 // What a host does:
 //   - put the field and the button in a `.dict-field` box:
@@ -51,7 +54,11 @@ const ADOPTED = new Set();
 // key -> {start, end, value}: where the caret was when the field was left
 // (for the mic, most often), so a dictation goes where the user was writing.
 const CARET = new Map();
-let rec = null;   // the one live recording: {key, mr, stream, chunks, aborted, timer, tick}
+// The one live recording: {key, mr, stream, chunks, aborted, cancelled,
+// leaving, timer, tick}. `cancelled`: the page was left while the microphone
+// was still being asked for; `leaving`: it was left while recording, and the
+// take goes to the worker once the recorder has handed over its last slice.
+let rec = null;
 
 function esc(s) {
   return String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -145,7 +152,10 @@ function insert(key, text) {
   CARET.delete(key);
   let head = value.replace(/\s*$/, '');
   let tail = '';
-  if (c && c.value === value && Number.isInteger(c.start) && Number.isInteger(c.end) && c.end < value.length) {
+  // A caret or selection anywhere in the value, its end included: a selection
+  // reaching the end (or spanning all of it) is replaced like any other.
+  if (c && c.value === value && Number.isInteger(c.start) && Number.isInteger(c.end)
+      && c.start >= 0 && c.start <= c.end && c.end <= value.length) {
     head = value.slice(0, c.start);
     tail = value.slice(c.end);
   }
@@ -157,9 +167,9 @@ function insert(key, text) {
   f.value = next;
   const at = Math.min(next.length, head.length + lead.length + t.length);
   try { f.setSelectionRange(at, at); } catch (_e) { /* not a text input */ }
+  // Only `input`: the host updates its state as for typing. No `change` —
+  // that is a commit, and committing what was transcribed is the user's call.
   f.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
-  // What a typed field fires when it is left: hosts that save on it hear it.
-  f.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
 }
 
 function settle(key, promise) {
@@ -176,15 +186,21 @@ function settle(key, promise) {
 async function start(key) {
   if (rec) return;
   if (!canRecord()) { setState(key, { msg: 'Recording is not supported on this device.' }); return; }
-  const own = { key, mr: null, stream: null, chunks: [], aborted: false, timer: null, tick: null };
+  const own = {
+    key, mr: null, stream: null, chunks: [], aborted: false, cancelled: false, leaving: false, timer: null, tick: null,
+  };
   rec = own;
   try {
     own.stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    // The page was left while the microphone was being asked for (pagehide,
+    // below): no take was begun, so none starts now — the microphone goes
+    // straight off again, also on a page kept in the back-forward cache.
+    if (own.cancelled) { stopStream(own); return; }
     own.mr = new MediaRecorder(own.stream);
   } catch (err) {
     stopStream(own);
-    rec = null;
-    setState(key, { phase: 'idle', msg: micErrorText(err) });
+    if (rec === own) rec = null;
+    if (!own.cancelled) setState(key, { phase: 'idle', msg: micErrorText(err) });
     return;
   }
   own.mr.addEventListener('dataavailable', (e) => { if (e.data && e.data.size) own.chunks.push(e.data); });
@@ -219,22 +235,39 @@ function blobOf(own) {
 }
 
 function stopped(own) {
+  // Once per take: a stop the user pressed just before leaving can reach here
+  // both from the recorder's `stop` and from pagehide.
+  if (own.done) return;
+  own.done = true;
   stopStream(own);
   if (rec === own) rec = null;
+  if (own.leaving) {
+    // Left mid-take: every slice is in now (the recorder's last
+    // `dataavailable` comes before its `stop`), so the whole take goes to the
+    // worker, and its text waits for this field's place (adopt, below).
+    if (own.chunks.length) handOff(own.key, blobOf(own), TRANSCRIBE_URL);
+    setState(own.key, { phase: 'idle' });
+    return;
+  }
   if (own.aborted || !own.chunks.length) { setState(own.key, { phase: 'idle' }); return; }
   settle(own.key, transcribe(own.key, blobOf(own), TRANSCRIBE_URL));
 }
 
-// Leaving with the mic live: the take so far goes to the worker, and its text
-// waits for this field's place (adopt, below).
+// Leaving with the mic live: the recorder is stopped, and the take goes to
+// the worker from its `stop` (stopped, above) — after the slice still in the
+// recorder has arrived, so a take shorter than one slice is not lost either.
+// Leaving while the microphone is still being asked for cancels the take.
 if (typeof addEventListener === 'function') addEventListener('pagehide', () => {
-  if (!rec || !rec.mr) return;
+  if (!rec) return;
   const own = rec;
   rec = null;
-  own.aborted = true;
-  try { if (own.mr.state !== 'inactive') own.mr.requestData(); } catch (_e) { /* ignore */ }
-  if (own.chunks.length) handOff(own.key, blobOf(own), TRANSCRIBE_URL);
-  stopStream(own);
+  if (!own.mr) { own.cancelled = true; return; }
+  own.leaving = true;
+  let stopping = false;
+  try {
+    if (own.mr.state !== 'inactive') { own.mr.stop(); stopping = true; }
+  } catch (_e) { /* stopped already */ }
+  if (!stopping) stopped(own);
 });
 
 // After every render of a host: the buttons work, a field that came back on
@@ -288,7 +321,6 @@ export const DICTATE_CSS = `
           pointer-events: none; }
   .dict-field:not(.line) > textarea + .dict { right: 14px; }
   .dict-field.line .dict { bottom: auto; top: 50%; transform: translateY(-50%); }
-  .dict-field.inline { display: inline-block; vertical-align: middle; }
   .dict > * { pointer-events: auto; }
   .dict-btn { display: inline-flex; align-items: center; justify-content: center; width: 30px; height: 30px;
               flex: none; border-radius: 50%; border: 0; padding: 0; cursor: pointer; font-size: .9rem;

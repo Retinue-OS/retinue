@@ -617,9 +617,8 @@ class RetinueAttentionSheet extends HTMLElement {
       `<div class="f-note">The sphere decides which modes let them through.</div></div>` +
       `<div><div class="f-k">also</div><div class="chips">${choices.filter((s) => s !== form.sphere).map(tag).join('')}` +
       (this._newSphere === 'contact'
-        ? `<span class="dict-field line inline"><input class="sphere-new" type="text" data-set="contact-sphere-new" ` +
-          `data-dictate-field="sheet-contact-sphere:${esc(this._id)}" placeholder="new sphere" autocomplete="off" autofocus>` +
-          `${dictateButtonHtml(`sheet-contact-sphere:${this._id}`, 'Dictate the sphere')}</span>`
+        ? `<input class="sphere-new" type="text" data-set="contact-sphere-new" data-dictate-exempt="saves-on-change" ` +
+          `placeholder="new sphere" autocomplete="off" autofocus>`
         : `<button class="btn tiny" data-act="contact-new-sphere"${busy}>+ new</button>`) +
       `</div><div class="f-note">Further spheres — each counts for a mode like the first. A sphere is a word: add one here.</div></div>` +
       `<div class="f-ctl"><button class="btn tiny${form.permit ? ' on' : ''}" data-act="contact-permit"${busy}>` +
@@ -741,9 +740,8 @@ class RetinueAttentionSheet extends HTMLElement {
           `<span class="f-note">${item.kind_label ? `the lead corrects every “${esc(item.kind_label)}”` : 'this item only — no kind declared'}</span>`;
       const spheres = (d.spheres || Object.keys(SPHERE_COLORS));
       const sphereSel = (this._newSphere === 'item'
-        ? `<span class="dict-field line inline"><input class="sphere-new" type="text" data-set="sphere-new" ` +
-          `data-dictate-field="sheet-sphere:${esc(this._id)}" placeholder="new sphere" autocomplete="off" autofocus>` +
-          `${dictateButtonHtml(`sheet-sphere:${this._id}`, 'Dictate the sphere')}</span>`
+        ? `<input class="sphere-new" type="text" data-set="sphere-new" data-dictate-exempt="saves-on-change" ` +
+          `placeholder="new sphere" autocomplete="off" autofocus>`
         : `<select class="select" data-set="sphere"${busy}>` +
           spheres.map((s) => `<option value="${esc(s)}"${s === item.sphere ? ' selected' : ''}>${esc(s)}</option>`).join('') +
           (spheres.includes(item.sphere) ? '' : `<option value="${esc(item.sphere)}" selected>${esc(item.sphere)}</option>`) +

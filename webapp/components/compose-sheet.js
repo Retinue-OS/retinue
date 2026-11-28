@@ -297,6 +297,13 @@ class RetinueComposeSheet extends HTMLElement {
   }
 
   _slotKey(account) { return `${this._indexKey}:${String(account || '').toLowerCase()}`; }
+  // The dictation keys' base (dictate-field.js): the mail being written, not
+  // just the channel — a transcription still running when From moves to a
+  // mailbox with a kept mail of its own goes back into the mail it was spoken
+  // for (when that mailbox is chosen again), never into the other one. When
+  // the mail itself goes with From (_switchAccount's first case) the fields
+  // keep their keys, and a pending dictation follows the mail.
+  get _dictKey() { return this._slotKey(this._account); }
 
   get _key() { return this._slotKey(this._account); }
 
@@ -558,13 +565,13 @@ class RetinueComposeSheet extends HTMLElement {
       this._recipHtml('to', 'To') + this._recipHtml('cc', 'Cc') +
       `<div class="row-f"><label class="lbl" for="compose-subject">Subject</label>` +
       `<div class="dict-field line"><input id="compose-subject" data-subject type="text" autocomplete="off" ` +
-      `data-dictate-field="${esc(this._indexKey)}:subject" value="${esc(this._subject)}">` +
-      `${dictateButtonHtml(`${this._indexKey}:subject`, 'Dictate the subject')}</div></div>` +
+      `data-dictate-field="${esc(this._dictKey)}:subject" value="${esc(this._subject)}">` +
+      `${dictateButtonHtml(`${this._dictKey}:subject`, 'Dictate the subject')}</div></div>` +
       `<div class="row-f"><label class="lbl" for="compose-text">Message</label>` +
       `<div class="dict-field"><textarea id="compose-text" data-text rows="8" enterkeyhint="enter" ` +
-      `data-dictate-field="${esc(this._indexKey)}:text" ` +
+      `data-dictate-field="${esc(this._dictKey)}:text" ` +
       `aria-describedby="err-text compose-hint">${esc(this._text)}</textarea>` +
-      `${dictateButtonHtml(`${this._indexKey}:text`, 'Dictate the message')}</div>` +
+      `${dictateButtonHtml(`${this._dictKey}:text`, 'Dictate the message')}</div>` +
       `<p class="err" id="err-text" data-err="text" hidden></p></div>` +
       `<p class="hint" id="compose-hint">Enter starts a new line; Ctrl+Enter or &#8984;+Enter sends. ` +
       `Under the mailbox&rsquo;s send policy the mail may wait for your approval before it goes out.</p>` +
@@ -606,11 +613,11 @@ class RetinueComposeSheet extends HTMLElement {
       `<div class="chips-in">` +
       `<ul class="chips" data-chips="${f}" aria-label="${label}: the recipients so far"></ul>` +
       `<span class="dict-field line recip-box"><input id="compose-${f}" data-input="${f}" type="text" inputmode="email" autocomplete="off" ` +
-      `data-dictate-field="${esc(this._indexKey)}:${f}" ` +
+      `data-dictate-field="${esc(this._dictKey)}:${f}" ` +
       `autocapitalize="off" spellcheck="false" role="combobox" aria-autocomplete="list" ` +
       `aria-expanded="false" aria-controls="sugg-${f}" aria-describedby="err-${f}" ` +
       `placeholder="${f === 'to' ? 'Name or address' : 'Copy to …'}" value="${esc(this._typed[f])}">` +
-      `${dictateButtonHtml(`${this._indexKey}:${f}`, f === 'to' ? 'Dictate a name' : 'Dictate a name to copy to')}</span>` +
+      `${dictateButtonHtml(`${this._dictKey}:${f}`, f === 'to' ? 'Dictate a name' : 'Dictate a name to copy to')}</span>` +
       `</div>` +
       `<ul class="sugg" id="sugg-${f}" role="listbox" aria-label="Suggestions from the address book" ` +
       `data-sugg="${f}" hidden></ul>` +

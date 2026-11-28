@@ -10,7 +10,10 @@ kind) and requires it to say how it is dictated into:
   data-dictate-own             a composer with its own recording row
                                (conversation, chat, project command bar);
   data-dictate-exempt="<why>"  a value with a machine format that speech does
-                               not produce (a handle, an e-mail domain).
+                               not produce (a handle, an e-mail domain), or a
+                               field that saves the moment it changes (the
+                               instance name, a new sphere), where a dictation
+                               would be a write the user never saw.
 
 A new field without one of them fails here, so the rule cannot be forgotten.
 Standalone like the rest of the suite.
