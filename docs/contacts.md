@@ -787,6 +787,35 @@ The migration is idempotent. A deployment in which no chamber keeps contacts —
 every one opts out, or none is mounted — keeps its old cards, and the old
 file, until one does.
 
+## From a chat to its person
+
+Tapping the **avatar in a chat's header** opens the Contacts page with that
+person's editor already open — the same card the list shows, with their
+handles, domains, VIP flag and instruction. The link (`chats.js`
+`contactHref`) is `/contacts.html?contact=<id>` for a known person, or
+`/contacts.html?channel=<channel>&handle=<handle>` when nobody is filed yet:
+
+- a **mail thread** opens its peer — the person whose initials the disc
+  shows — by the id the gateway resolved for the peer's address: its holder,
+  else the person whose e-mail domain covers it (so a GitHub notification
+  opens whoever holds `notifications@…`, or the domain contact); else by the
+  address;
+- a **messenger chat** with one peer opens the person its contact card is
+  filed under, else its handle;
+- a **group** has no person: its disc is not a link.
+
+A link by handle opens whoever holds it, compared as the address book
+compares handles (`contacts.py` `_canonical`/`_match_key`, mirrored in
+`contacts.js` `handleMatchKey`): an address in any case, a number in any
+spelling with `00` read as `+`, a WhatsApp chat key's phone-number JID as its
+number, a Telegram username and an SMS sender id in any case — and a number
+on any of the person's channels or phones. Otherwise it starts a new contact
+with the handle filled in, spelled as the address book files it.
+An id the book no longer has is said so, and nothing opens. The page takes
+the ask once per load; the service worker serves the cached shell for any
+query string, so the link opens offline too. The attention sheet's
+"address book" link on a messenger chat's card opens the same editor.
+
 ## Not yet
 
 - **Two persons with the same name share attention facts**, because the
@@ -795,5 +824,6 @@ file, until one does.
 - **Contacts outside the address-book directories** (a person described in some
   other file of a chamber) are in the life store but not in the card's
   suggestions. A SPARQL-backed lookup could cover them.
-- **E-mail and SMS threads have no contact card** of their own; their people
-  are edited on the Contacts page.
+- **E-mail and SMS threads have no contact card** of their own on the
+  attention sheet; their people are edited on the Contacts page, which the
+  chat header's avatar opens (below).

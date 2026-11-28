@@ -139,7 +139,7 @@ import { deviceGet, deviceSet } from './device-store.js';
 import { canRecord, micErrorText, recordingRowHtml, statusRowHtml, Waveform, VOICE_CSS } from './voice.js';
 import { pastedFiles, pastedText } from './clipboard.js';
 import {
-  avatarHtml, avatarInitials, avatarKey, colorFor, CHANNELS, isMail, participantsText,
+  avatarHtml, avatarInitials, avatarKey, colorFor, CHANNELS, contactHref, isMail, participantsText,
   handOffChatAction, commitChatAction,
 } from './chats.js';
 import { openAttentionSheet, instructedSummary } from './attention-sheet.js';
@@ -3199,8 +3199,17 @@ class RetinueChatPage extends HTMLElement {
           ? `${ch} group${c.members ? ` &middot; ${Number(c.members)} members` : ''}`
           : `${ch} &middot; ${esc(key)}`)}</small>`;
     }
+    // The avatar opens the person it stands for on the Contacts page — their
+    // name, handles, VIP flag and instruction — where one can be told
+    // (contactHref); a group's disc stays a picture.
+    const href = contactHref(c);
+    const who = isMail(c) ? ((c.peer && (c.peer.name || c.peer.address)) || '') : (c.name || '');
+    const av = href
+      ? `<a class="av-link" href="${esc(href)}" title="Open the contact" ` +
+        `aria-label="${esc(who ? `Contact: ${who}` : 'Open the contact')}">${avatarHtml(c)}</a>`
+      : avatarHtml(c);
     return `<header class="chat-head">` +
-      avatarHtml(c) +
+      av +
       `<div class="head-txt"><div class="head-name">${this._starHtml()}` +
       `<span class="head-title">${esc(c.name)}</span></div>` +
       `${sub}</div>` +
@@ -6258,6 +6267,9 @@ const CSS = `
   .av { flex: none; position: relative; width: 40px; height: 40px; border-radius: 50%;
         display: inline-flex; align-items: center; justify-content: center;
         color: rgba(255, 255, 255, .92); font-size: .85rem; font-weight: 700; }
+  .av-link { flex: none; display: inline-flex; border-radius: 50%; text-decoration: none; color: inherit;
+             -webkit-tap-highlight-color: transparent; }
+  .av-link:focus-visible { outline: 2px solid var(--accent, #6ea8fe); outline-offset: 2px; }
   .ch { position: absolute; right: -3px; bottom: -3px; width: 16px; height: 16px;
         border-radius: 50%; display: inline-flex; align-items: center; justify-content: center;
         font-size: .58rem; font-weight: 800; color: #fff;

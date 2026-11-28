@@ -209,6 +209,93 @@ export function chatUrl(id) {
   return `/chat.html?id=${encodeURIComponent(id)}`;
 }
 
+// Whom a link asks the page to open (chats.js contactHref): `{contact}` for
+// an id, `{channel, handle}` for whoever holds a handle, or null. A channel
+// the page does not know is no handle it can file, so it is no ask.
+export function wantedFromQuery(search) {
+  const p = new URLSearchParams(String(search || ''));
+  const contact = (p.get('contact') || '').trim();
+  if (contact) return { contact };
+  const channel = (p.get('channel') || '').trim();
+  const handle = (p.get('handle') || '').trim();
+  return handle && CHANNELS.includes(channel) ? { channel, handle } : null;
+}
+
+// A handle as the address book compares it (contacts.py `_canonical` and
+// `_match_key`, mirrored rule for rule): an e-mail address lowercased; a
+// number without punctuation, `00` read as `+` (E.164); a WhatsApp
+// phone-number JID (a chat key, `41…@s.whatsapp.net`) as its number; a
+// Telegram username lowercased with its `@`; an SMS sender id ("HBL") with
+// its spaces collapsed and case-folded. A handle none of the rules fits is
+// compared as given, as the address book does with one that no longer
+// normalizes.
+const PHONE_RE = /^\+[0-9]{6,20}$/;
+const PHONE_PUNCT_RE = /[\s\-(). /]/g;
+const TG_ID_RE = /^-?[0-9]+$/;
+const TG_USERNAME_RE = /^[A-Za-z][A-Za-z0-9_]{3,31}$/;
+const SMS_SENDER_ID_RE = /^(?=.*[A-Za-z])[A-Za-z0-9 ._&-]{1,16}$/;
+const SMS_SHORT_CODE_RE = /^[0-9]{3,6}$/;
+const WA_PN_SUFFIX = '@s.whatsapp.net';
+
+export function normalizePhone(value) {
+  let raw = String(value || '').trim();
+  if (raw.toLowerCase().startsWith('tel:')) raw = raw.slice(4);
+  let compact = raw.replace(PHONE_PUNCT_RE, '');
+  if (compact.startsWith('00')) compact = `+${compact.slice(2)}`;
+  return PHONE_RE.test(compact) ? compact : raw;
+}
+
+function smsSenderId(value) {
+  return SMS_SENDER_ID_RE.test(value) || SMS_SHORT_CODE_RE.test(value);
+}
+
+export function canonicalHandle(channel, handle) {
+  const ch = String(channel || '').trim().toLowerCase();
+  const given = String(handle || '').trim();
+  let value = given;
+  if (ch === 'email') {
+    if (value.toLowerCase().startsWith('mailto:')) value = value.slice(7);
+    return value.toLowerCase();
+  }
+  if (ch === 'sms') {
+    value = normalizePhone(value);
+    if (PHONE_RE.test(value)) return value;
+    value = value.split(/\s+/).filter(Boolean).join(' ');
+    return smsSenderId(value) ? value : given;
+  }
+  if (ch === 'telegram' && !TG_ID_RE.test(value) && !PHONE_RE.test(normalizePhone(value))) {
+    const name = value.startsWith('@') ? value.slice(1) : value;
+    return TG_USERNAME_RE.test(name) ? `@${name.toLowerCase()}` : given;
+  }
+  if (ch === 'whatsapp' && value.toLowerCase().endsWith(WA_PN_SUFFIX)) {
+    value = `+${value.slice(0, -WA_PN_SUFFIX.length).replace(/^\++/, '')}`;
+  }
+  const maybe = normalizePhone(value);
+  return PHONE_RE.test(maybe) ? maybe : value;
+}
+
+// What two handles on one channel are compared by: the canonical spelling,
+// and an SMS sender id case-folded, as the delivery gate matches it.
+export function handleMatchKey(channel, handle) {
+  const value = canonicalHandle(channel, handle);
+  return channel === 'sms' && !PHONE_RE.test(value) && smsSenderId(value) ? value.toLowerCase() : value;
+}
+
+// Whether a person holds a handle: one of theirs on the asked channel that
+// the address book takes for the same (handleMatchKey); or, for a number,
+// that number on any channel or among their phones, as the address book's
+// own `phones` say one person is reached on several.
+export function holdsHandle(person, channel, handle) {
+  if (!String(handle || '').trim()) return false;
+  const handles = (person && person.handles) || [];
+  const want = handleMatchKey(channel, handle);
+  if (handles.some((h) => h && h.channel === channel && handleMatchKey(channel, h.handle) === want)) return true;
+  if (channel === 'email' || !PHONE_RE.test(want)) return false;
+  const numbers = ((person && person.phones) || []).map(normalizePhone)
+    .concat(handles.filter((h) => h && h.channel !== 'email').map((h) => canonicalHandle(h.channel, h.handle)));
+  return numbers.includes(want);
+}
+
 class RetinueContacts extends HTMLElement {
   constructor() {
     super();
@@ -222,6 +309,8 @@ class RetinueContacts extends HTMLElement {
     // A tap on a handle: {person, name, channel, handle, busy, answer, error}
     // while it is being looked up or its choices are shown.
     this._pick = null;
+    // Whom a link from a chat's avatar asks to open, read once per page load.
+    this._want = wantedFromQuery((globalThis.location && globalThis.location.search) || '');
   }
 
   connectedCallback() {
@@ -238,6 +327,33 @@ class RetinueContacts extends HTMLElement {
     this.load();
   }
 
+  // Open the person a link asked for, once, on the first address book that
+  // arrives: their editor, scrolled into view. A handle nobody holds starts a
+  // new contact with it filled in; an id the book no longer has says so.
+  _openWanted() {
+    const want = this._want;
+    if (!want || !this._data) return;
+    this._want = null;
+    const list = this._data.contacts || [];
+    let hit = null;
+    if (want.contact) hit = list.find((c) => c.id === want.contact) || null;
+    else hit = list.find((c) => holdsHandle(c, want.channel, want.handle)) || null;
+    if (hit) {
+      this._startEdit(hit.id);
+    } else if (want.handle) {
+      this._startEdit('new');
+      // Filed as the address book spells it: a chat key's JID as its number.
+      this._form.handles.push({ channel: want.channel, handle: canonicalHandle(want.channel, want.handle) });
+      this.render();
+    } else {
+      this._error = 'That contact is no longer in the address book.';
+      this.render();
+      return;
+    }
+    const ed = this.shadowRoot.querySelector('.editor');
+    if (ed && ed.scrollIntoView) ed.scrollIntoView({ block: 'start' });
+  }
+
   async load() {
     try {
       const [book, prof] = await Promise.all([
@@ -252,6 +368,7 @@ class RetinueContacts extends HTMLElement {
       this._error = `Could not load the address book (${String((err && err.message) || err)}).`;
     }
     this.render();
+    this._openWanted();
   }
 
   _contact(id) {

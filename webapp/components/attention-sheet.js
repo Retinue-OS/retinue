@@ -577,7 +577,7 @@ class RetinueAttentionSheet extends HTMLElement {
           `${book.person && book.person.vip ? ' <span class="f-note">· VIP</span>' : ''}` +
           `${book.person && book.person.instruction ? ' <span class="f-note">· has an instruction</span>' : ''}` +
           `${card.chamber ? ` <span class="f-note">· in ${esc(card.chamber)}</span>` : ''}` +
-          ` <a class="f-note" href="/contacts.html">address book</a></div>`
+          ` <a class="f-note" href="${card.person ? `/contacts.html?contact=${encodeURIComponent(card.person)}` : '/contacts.html'}">address book</a></div>`
         : item.unknown_sender
           ? `<div class="f-value">${esc(item.handle || item.sender || '')} — nobody has this number yet.</div>` +
             `<div class="f-note">Screened: their message is listed and carried by the next digest, but no mode admits ` +
