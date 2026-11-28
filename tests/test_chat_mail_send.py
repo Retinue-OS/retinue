@@ -179,6 +179,9 @@ def _gateway_state(account: str) -> dict:
             # sent it is answered, which is when the real gateway's rail
             # announces a direct send.
             "on_sent": None,
+            # Called as a /send is taken, before it is answered: what lands
+            # while the press waits for its gateway.
+            "on_send": None,
             # What /health adds (a gateway that reports its send policy).
             "health": {}}
 
@@ -520,6 +523,8 @@ def _mail_gateway(gw: dict):
             if not self._gate():
                 return None
             if self.path == "/send":
+                if gw["on_send"]:
+                    gw["on_send"]()
                 answer = _gw_send(gw, body, self._caller_waits)
                 if gw["drop"]:
                     # The request was read and worked; the answer never
@@ -975,18 +980,48 @@ def test_reply_is_queued_and_not_approved(base, wg):
     # The words are in the queue: the composer lets go of them.
     doc = wg._CHAT_STATE.get(CHAT_A)
     assert doc["draft"] is None and doc["cleared"] is None
-    # Nothing was replied: the read mark, the group and the mailbox stay.
-    assert doc["last_read"] == doc_before["last_read"] and doc["read_seq"] == doc_before["read_seq"]
+    # Writing the reply read the chat: it leaves Unread at the press, and
+    # the mailbox follows. But nothing was replied yet: the attention item
+    # stands.
+    assert doc["last_read"] != doc_before["last_read"] and doc["read_seq"] != doc_before["read_seq"]
     after = _chats(base)[CHAT_A]
-    assert after["unread"] == 1 and after["list_group"] == "unread"
+    assert after["unread"] == 0 and after["list_group"] == "read"
     assert after["pending"] == 1 and after["last"]["direction"] == "in"
+    assert (doc.get("attention") or {}).get("state", "open") == (
+        doc_before.get("attention") or {}).get("state", "open")
     _settle(wg)
-    assert _posts(GW, "/chats/read") == []
+    assert len(_posts(GW, "/chats/read")) == 1
     # It shows in the chat, and is no message.
     body = _messages(base, CHAT_A)
     assert body["pending"] == [p] and body["chat"]["pending"] == 1
     assert "Dear Ann,\nyes." not in [m["text"] for m in body["messages"]]
     print("PASS test_reply_is_queued_and_not_approved")
+
+
+def test_a_mail_that_lands_during_the_press_stays_unread(base, wg):
+    """The read a queued reply makes is the press's: a mail that comes in
+    while the send waits for its gateway — dated before the press, as a
+    mail's Date often is — is not covered by it, stays unread, and the
+    mailbox is not told the thread is seen."""
+    GW["policy"] = "verify"
+    assert _chats(base)[CHAT_A]["unread"] == 0
+    GW["on_send"] = lambda: _rail(
+        base, chat=ROOT_A, sender=ANN, sender_name="Ann Example",
+        message_id="a-during@x.org", ts=time.time() - 60, text="One more thing",
+        **A_PARTY)
+    GW["requests"].clear()
+    try:
+        status, out = _send(base, CHAT_A, {"text": "Noted."})
+    finally:
+        GW["on_send"] = None
+    assert status == 202 and "pending" in out, (status, out)
+    after = _chats(base)[CHAT_A]
+    assert after["unread"] == 1 and after["list_group"] == "unread", after
+    _settle(wg)
+    assert _posts(GW, "/chats/read") == []
+    _post_plain(base, f"/sends/{MAIL_SLUG}/{out['pending']['request_id']}/reject")
+    _settle(wg)
+    print("PASS test_a_mail_that_lands_during_the_press_stays_unread")
 
 
 def test_messenger_press_still_releases(base, wg):
@@ -1824,6 +1859,9 @@ def test_the_rail_settles_a_queued_send(base, wg):
     assert status == 202
     p = out["pending"]
     assert len(_queued(wg, CHAT_B)) == 1
+    # (Writing the reply read the chat, and the mailbox heard of it; that
+    # call is settled before the rail's are counted.)
+    _settle(wg)
     # The gateway still lists it — its answer lags the mail going out — and
     # announces the mail on the rail under the Message-ID it minted when it
     # queued the send.
@@ -2030,10 +2068,11 @@ def test_a_reply_that_may_have_gone_out(base, wg):
     # The words left the composer and are not handed back.
     doc = wg._CHAT_STATE.get(CHAT_A)
     assert doc["draft"] is None
-    # No reply is known to have been made: nothing is read, here or there.
-    assert doc["last_read"] == before["last_read"] and _chats(base)[CHAT_A]["unread"] >= 1
+    # Writing the reply read the chat, here and in the mailbox — though no
+    # reply is known to have been made.
+    assert doc["last_read"] != before["last_read"] and _chats(base)[CHAT_A]["unread"] == 0
     _settle(wg)
-    assert _posts(GW, "/chats/read") == []
+    assert _posts(GW, "/chats/read") == [hook_a]
     # The chat shows it as being sent — after a reload too — and no message
     # is made of a mail that is not known to have gone out.
     body = _messages(base, CHAT_A)
@@ -2048,7 +2087,8 @@ def test_a_reply_that_may_have_gone_out(base, wg):
     assert len(_posts(GW, "/send")) == 2 and len(GW["sent"]) == sent_before
     assert len([e for e in GW["pending"].values() if e.get("request_key") == "press-u1"]) == 1
     # It did go out (the Sent folder has it): the rail says so, the bubble
-    # gives way to the mail — once — and now the reply reads the chat.
+    # gives way to the mail — once — and the reply is noted: the mailbox
+    # hears of it as of any reply.
     GW["send"] = "ok"
     _sent_folder_says(GW, rid, True)
     sent = GW["sent"][-1]
@@ -2059,7 +2099,7 @@ def test_a_reply_that_may_have_gone_out(base, wg):
     assert [m["id"] for m in body["messages"]].count(sent["message_id"]) == 1
     assert _chats(base)[CHAT_A]["unread"] == 0
     _settle(wg)
-    assert _posts(GW, "/chats/read") == [hook_a]
+    assert _posts(GW, "/chats/read") == [hook_a, hook_a]
 
     # 2. Nobody will ever know: the send ends as failed, and says that the
     #    mail may have gone out all the same.
@@ -3565,6 +3605,32 @@ def test_the_press_releases_a_queued_reply(base, wg):
     print("PASS test_the_press_releases_a_queued_reply")
 
 
+def test_a_mail_that_lands_during_a_release_stays_unread(base, wg):
+    """Released and sent: the reply reads the chat as it stood at the press.
+    A mail that came in while the release was waited for — dated before
+    the press — stays unread, and the mailbox's read does not reach it."""
+    GW.update(policy="verify", send="ok", hold=False, refuse=[], approve_refused=None)
+    _mark(base, CHAT_A)
+    _settle(wg)
+    assert _chats(base)[CHAT_A]["unread"] == 0
+    GW["on_send"] = lambda: _rail(
+        base, chat=ROOT_A, sender=ANN, sender_name="Ann Example",
+        message_id="a-during-release@x.org", ts=time.time() - 60,
+        text="And the slides?", **A_PARTY)
+    GW["requests"].clear()
+    try:
+        status, msg = _send(base, CHAT_A, {"text": "Released."})
+    finally:
+        GW["on_send"] = None
+    assert status == 200 and msg["text"] == "Released.", (status, msg)
+    after = _chats(base)[CHAT_A]
+    assert after["unread"] == 1 and after["list_group"] == "unread", after
+    _settle(wg)
+    scopes = _scopes(GW, "/chats/read")
+    assert scopes and all(ids and "a-during-release@x.org" not in ids for ids in scopes), scopes
+    print("PASS test_a_mail_that_lands_during_a_release_stays_unread")
+
+
 def test_the_press_releases_a_queued_new_mail(base, wg):
     GW.update(policy="verify", send="ok", hold=False, refuse=[], approve_refused=None)
     sent_before = len(GW["sent"])
@@ -3666,8 +3732,8 @@ def test_the_request_that_releases_a_queued_press_is_its_reply(base, wg):
     """A press whose first request left its mail queued (the release could
     not be given), pressed again under the same key: the gateway answers
     from that entry ("repeat"), and the chat knew it — but this request is
-    the one that releases the mail, so it is the reply: the chat is read,
-    and the mailbox told."""
+    the one that releases the mail, so it is the reply: what landed before
+    it is read (a repeat reads nothing), and the mailbox told."""
     _rail(base, chat=ROOT_C, sender=DORA, chat_name="", group=False,
           message_id="c-release@w.org", ts=time.time(), text="Are you coming?",
           participants=[DORA_PARTY], peer=DORA_PARTY)
@@ -3680,8 +3746,13 @@ def test_the_request_that_releases_a_queued_press_is_its_reply(base, wg):
     assert status == 202 and set(out) == {"pending"}, (status, out)
     rid = out["pending"]["request_id"]
     assert rid in [p["request_id"] for p in _queued(wg, CHAT_C)], "the chat noted it"
-    assert _chats(base)[CHAT_C]["unread"] == 1, "queued is no reply"
+    assert _chats(base)[CHAT_C]["unread"] == 0, "writing the reply read the chat"
     _settle(wg)
+    # Something more lands before the press is made again.
+    _rail(base, chat=ROOT_C, sender=DORA, chat_name="", group=False,
+          message_id="c-release-2@w.org", ts=time.time(), text="Bring wine",
+          participants=[DORA_PARTY], peer=DORA_PARTY)
+    assert _chats(base)[CHAT_C]["unread"] == 1
     GW["requests"].clear()
     sent_before = len(GW["sent"])
     status, msg = _send(base, CHAT_C, {"text": "On my way", "request_key": "rel-1"})
@@ -3740,6 +3811,7 @@ def main():
         # until the tests of the release itself, at the end.
         pressed, wg._mail_send_pressed = wg._mail_send_pressed, wg._mail_send
         test_reply_is_queued_and_not_approved(base, wg)
+        test_a_mail_that_lands_during_the_press_stays_unread(base, wg)
         test_messenger_press_still_releases(base, wg)
         test_pending_follows_the_gateways_queue(base, wg)
         test_a_queued_new_mail_is_listed(base, wg)
@@ -3768,6 +3840,7 @@ def main():
         test_spam_goes_through_the_gateway_first(base, wg)
         wg._mail_send_pressed = pressed
         test_the_press_releases_a_queued_reply(base, wg)
+        test_a_mail_that_lands_during_a_release_stays_unread(base, wg)
         test_the_press_releases_a_queued_new_mail(base, wg)
         test_a_press_the_gateway_will_not_release_stays_queued(base, wg)
         test_a_released_mail_the_server_refuses_is_not_sent(base, wg)

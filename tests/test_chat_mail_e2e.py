@@ -401,11 +401,11 @@ def _lost_answer_then_ann_replies(r: Rig, root: str, key: str) -> dict:
             assert r.draft(root) is None, "not handed back for a second send"
             assert [(q["status"], q["request_key"]) for q in r.messages(root)["pending"]] == [
                 ("sending", key)]
-            assert r.listed(root)["unread"] == 1, "no reply is known to have been made"
+            assert r.listed(root)["unread"] == 0, "writing the reply read the chat"
     finally:
         r.wg.MAIL_SEND_TIMEOUT = saved
     # It goes out, and the rail announces it: the bubble gives way to the
-    # mail, and now the reply reads the chat — here and in the mailbox.
+    # mail, and the chat stays read — here and in the mailbox.
     assert _wait_for(lambda: (r.gw.SENDS.get(entry["id"]) or {}).get("status") == "approved")
     # "approved" is set during the SMTP session, before the send's record —
     # and the rail's event — are written: wait for the mail itself, letting
@@ -524,7 +524,10 @@ def test_an_outcome_the_gateway_cannot_know_is_not_a_failure(r: Rig):
     assert [(q["status"], q["outcome_unknown"], q["text"]) for q in pending] == [
         ("failed", True, "Did it go?")], pending
     assert UNKNOWN in pending[0]["error"]
-    assert not r.seen(root), "nothing is marked read for a mail nobody knows of"
+    # Writing the reply read the chat, and the mailbox follows — though
+    # nobody knows of the mail.
+    assert r.listed(root)["unread"] == 0
+    assert _wait_for(lambda: r.settle() or r.seen(root))
     # The list says the same of it, and the companion is not told "failed".
     assert r.listed(root)["pending"] == 1
     note = "\n".join(r.wg._conv_mail_send_note(r.chat(root), r.wg._CHAT_STATE.get(r.chat(root))))

@@ -2389,6 +2389,9 @@ class RetinueChatPage extends HTMLElement {
   // unread, the Undo while one is offered, nothing otherwise.
   _markReadHtml() {
     if (!this._markReadAnchor()) return '';
+    // A reply on its way reads the chat (_readByReply): the button goes with
+    // the press, and comes back only if the reply certainly did not go.
+    if (this._isUnread() && this._sendingNow) return '';
     if (this._isUnread()) {
       return `<div class="mark-read-row" data-mark-read-row>` +
         `<button type="button" class="mark-read" data-mark-read ` +
@@ -5585,6 +5588,9 @@ class RetinueChatPage extends HTMLElement {
     const keepalive = !images.length && text.length * 3 <= KEEPALIVE_BYTES;
     const sending = { text, at: new Date().toISOString(), keepalive, images, key, reply: mail ? mode : '' };
     sending.seen = this._sentLike(sending);
+    // The arrivals this page had shown at the press: what the reply read
+    // (_readByReply) — a message that lands while it is on its way is not.
+    sending.inbound = this._chat.inbound_seq;
     // A press made again is measured from the first time it was made: its
     // mail, if it went out, went out then.
     if (press.again) {
@@ -5592,6 +5598,7 @@ class RetinueChatPage extends HTMLElement {
       sending.seen = press.seen;
     }
     this._sendingNow = sending;
+    this._placeMarkRead();
     if (images.length) {
       const ta = this.shadowRoot.querySelector('[data-composer="chat"] textarea');
       const hadFocus = !!ta && this.shadowRoot.activeElement === ta;
@@ -5671,13 +5678,14 @@ class RetinueChatPage extends HTMLElement {
       if (!msg || typeof msg !== 'object') throw new Error('answer');
       if (res.status === 202) {
         if (mail && msg.unconfirmed === true && !msg.pending) {
-          this._unconfirmedMail(local, msg, { key, bodyJson, images, mode, shown, at: press.at });
+          this._unconfirmedMail(local, msg, { key, bodyJson, images, mode, shown, at: press.at,
+                                              inbound: sending.inbound });
         } else {
-          this._queued(local, msg.pending, images);
+          this._queued(local, msg.pending, images, sending.inbound);
         }
         return;
       }
-      this._sent(local, msg, images, mail, press.again && !press.sure);
+      this._sent(local, msg, images, mail, press.again && !press.sure, sending.inbound);
     } catch (err) {
       // No mail the server may have taken is called "not sent" here: only
       // one that never left the page, or that the server refused.
@@ -5752,6 +5760,8 @@ class RetinueChatPage extends HTMLElement {
     } finally {
       if (this._sendingNow === sending) this._sendingNow = null;
       if (images.length) this._keepImages();
+      // The button back where the reply did not go (and the chat is unread).
+      this._placeMarkRead();
     }
   }
 
@@ -5865,7 +5875,7 @@ class RetinueChatPage extends HTMLElement {
   // bubble wholesale — same renderer, so nothing moves except the media
   // sources, now the proxied URLs (the reserved boxes match by
   // construction), and the poll's de-dup knows the message.
-  _sent(local, msg, images, mail, again = false) {
+  _sent(local, msg, images, mail, again = false, inbound = undefined) {
     if (msg.id && this._seen.has(msg.id)) {
       // The mail is in the thread already, and the optimistic bubble only
       // leaves: a poll was quicker than the answer — or this was a press
@@ -5898,12 +5908,7 @@ class RetinueChatPage extends HTMLElement {
     // send would still say unread: the epoch makes it stand aside.
     this._draftSaved = '';
     this._keepLocal();
-    this._readEpoch += 1;
-    this._clearReadUndo();
-    if (this._chat) {
-      this._adoptRead(null, { unread: 0, listGroup: this._chat.archived ? 'archived' : 'read' });
-    }
-    this._placeMarkRead();
+    this._readByReply(inbound);
     if (mail) {
       // The user's own mail is the thread's latest now: whom the next reply
       // reaches is asked again.
@@ -5917,6 +5922,31 @@ class RetinueChatPage extends HTMLElement {
     }
   }
 
+  // A reply pressed here has read the chat — writing it was reading what it
+  // answers. The server marks it read with the press (a send, a queued one
+  // or one not confirmed yet alike; never on a repeat, which this page does
+  // not make a second bubble for), so nothing is posted for it here: the
+  // page mirrors it, and the button goes. A poll that left before the send
+  // would still say unread: the epoch makes it stand aside.
+  //
+  // Read as of the press, that is: `inbound` is the arrival count the page
+  // had shown when it was made. A message a poll brought while the send was
+  // on its way is past it and stays unread, with the button under it, as
+  // the server keeps it; one no poll has brought yet comes with the next.
+  // Without a count (a server older than the field) the chat is read whole.
+  _readByReply(inbound) {
+    this._readEpoch += 1;
+    this._clearReadUndo();
+    const c = this._chat;
+    if (c) {
+      const later = Number.isInteger(inbound) && Number.isInteger(c.inbound_seq)
+        ? Math.max(0, c.inbound_seq - inbound) : 0;
+      this._adoptRead(null, { unread: later,
+                              listGroup: c.archived ? 'archived' : (later ? 'unread' : 'read') });
+    }
+    this._placeMarkRead();
+  }
+
   // A send the account's policy queued (202 `{pending}`): it is not a
   // message, so the optimistic bubble `local` comes down and the pending
   // bubble goes up in its place at the thread's end, with its approval link;
@@ -5926,11 +5956,12 @@ class RetinueChatPage extends HTMLElement {
   // the box stays empty and the shared draft is spent, as after any send.
   // The chat is not taken as read here — nothing has gone out yet; the poll
   // brings the server's word on that.
-  _queued(local, pending, images) {
+  _queued(local, pending, images, inbound = undefined) {
     const had = this._takeDown(local, false);
     this._revoke(images);
     this._draftSaved = '';
     this._keepLocal();
+    this._readByReply(inbound);
     // An answer that names no entry still means queued: the chat's own list
     // of pending sends, fetched now, has it.
     if (pending && typeof pending === 'object') this._addPending(pending, true);
@@ -5970,7 +6001,8 @@ class RetinueChatPage extends HTMLElement {
   // `mode`, `shown` and `at`: the choice the press was made under, the
   // recipients its line named (sideSig) and when — what asking again is
   // held to.
-  _unconfirmedMail(local, doc, { key, bodyJson, images, mode = 'all', shown = '', at = Date.now() }) {
+  _unconfirmedMail(local, doc, { key, bodyJson, images, mode = 'all', shown = '', at = Date.now(),
+                                 inbound = undefined }) {
     const messageId = typeof doc.message_id === 'string' ? doc.message_id.slice(0, 998) : '';
     this._draftSaved = '';
     this._keepLocal();
@@ -5986,6 +6018,7 @@ class RetinueChatPage extends HTMLElement {
                 stale: false, tried: false };
     this._unconfirmed.push(u);
     this._keepUnsure();
+    this._readByReply(inbound);
     local.unconfirmed = true;
     this._unsureFlags(u, local);
     const node = this._localNode(local);
@@ -6073,6 +6106,8 @@ class RetinueChatPage extends HTMLElement {
       return;
     }
     u.busy = true;
+    // What had landed when this was asked (_readByReply).
+    const inbound = this._chat ? this._chat.inbound_seq : undefined;
     let res = null;
     let doc = null;
     let block = '';
@@ -6114,11 +6149,11 @@ class RetinueChatPage extends HTMLElement {
     if (res && res.status === 200 && answer && !answer.unconfirmed) {
       this._unconfirmed = this._unconfirmed.filter((x) => x !== u);
       this._keepUnsure();
-      this._sent(local, answer, u.images, true);
+      this._sent(local, answer, u.images, true, inbound);
     } else if (res && res.status === 202 && answer && answer.pending && typeof answer.pending === 'object') {
       this._unconfirmed = this._unconfirmed.filter((x) => x !== u);
       this._keepUnsure();
-      this._queued(local, answer.pending, u.images);
+      this._queued(local, answer.pending, u.images, inbound);
     } else if (gone) {
       // The gateway's word on this press: it did not go, and why.
       const had = this._dropUnconfirmed(u, false);

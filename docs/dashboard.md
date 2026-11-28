@@ -1949,9 +1949,9 @@ has three answers that are no error:
   the mail server took the mail for some recipients and refused others, the
   Message carries `refused`, the addresses it did not reach;
 - **queued** → `202 {"pending": Pending}`, only where the press's release
-  could not be given. The draft is cleared — the words
-  are in the queue — and nothing else moves: no reply has been made, so the
-  chat is not read and its attention item stands;
+  could not be given. The draft is cleared — the words are in the queue — and
+  the chat is read, here and in the mailbox: writing a reply is having read
+  what it answers. But no reply has been made, so its attention item stands;
 - **not known** → `202 {"unconfirmed": true, "request_key", "since",
   "message_id"?, "id", "note"?}` (below).
 
@@ -2034,8 +2034,9 @@ press's key (`_settle_failed_new_mail`), which is then forgotten with the
 send.
 
 An error answer leaves the draft in the composer. An unconfirmed one clears
-it — the words are with the gateway — and marks nothing read: no reply is
-known to have been made, and the rail does that when the mail goes out. No
+it — the words are with the gateway — and reads the chat, as a queued one
+does (writing the reply was reading it); no reply is noted, since none is
+known to have been made — the rail does that when the mail goes out. No
 message is made of it either (a mail not known to have gone out is no entry
 of the thread). Instead the gateway's queue is asked once for the send — by
 the key of the press, or the `Message-ID` the gateway named — and its entry
