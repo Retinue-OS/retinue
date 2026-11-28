@@ -12976,16 +12976,20 @@ def _mail_not_sent(sent: dict, request_key: str | None) -> dict:
 _BY_DASHBOARD = {"by": "dashboard"}
 
 
-def _chat_read_by_press(chat_id: str, asked_at: float) -> None:
+def _chat_read_by_press(chat_id: str, asked_at: float, seen: int | None) -> None:
     """Read the chat for a reply the user pressed send on whose mail has not
     gone out yet — queued under the mailbox's send policy, or with its
     outcome unknown. Writing a reply is having read what it answers, so the
     chat leaves Unread at the press, as it does for a reply that went out;
-    what landed after the press stays unread. The read mark only: no reply
-    has been made, so the attention item stands and no reply is noted until
-    the mail goes out. The mailbox follows the chat where nothing is left
-    unread, as after *Mark as read*."""
-    doc = _CHAT_STATE.advance_last_read(chat_id, asked_at, everything=True)
+    what landed after the press stays unread. The read is applied when the
+    gateway has answered, which can be up to MAIL_SEND_TIMEOUT later, so it
+    is capped by ``seen``, the chat's arrival count (``inbound_seq``) taken
+    at the press: a mail that came in during the wait — whatever its Date
+    says — is not covered, and keeps the mailbox from being told the thread
+    is seen. The read mark only: no reply has been made, so the attention
+    item stands and no reply is noted until the mail goes out. The mailbox
+    follows the chat where nothing is left unread, as after *Mark as read*."""
+    doc = _CHAT_STATE.advance_last_read(chat_id, asked_at, everything=True, seen=seen)
     _chats_cache_invalidate()
     unread, _group = _chat_read_state(chat_id, doc)
     if unread == 0:
@@ -20647,11 +20651,10 @@ class Handler(BaseHTTPRequestHandler):
         the same endpoint, with two differences. The body may say `reply`:
         "all" or "sender" — to whom the gateway addresses the mail it builds
         from its own records of the thread; this side names no recipient. And
-        the press is not the approval: it is passed on as `user_approved`,
-        and a mail the mailbox's send policy queues all the same stays queued
-        (see _chat_send_via_gateway). That answers 202 {"pending": Pending}:
-        the words are in the queue, so the draft is cleared, and the chat
-        shows the send waiting with its approval link. Writing a reply is
+        the press is passed on as `user_approved`. A send the gateway queued
+        answers 202 {"pending": Pending}: the words are in the queue, so the
+        draft is cleared, and the chat shows the send waiting with its
+        approval link. Writing a reply is
         having read the chat, so it is marked read at the press
         (_chat_read_by_press); but nothing was replied yet, so the attention
         item stands.
@@ -20757,7 +20760,7 @@ class Handler(BaseHTTPRequestHandler):
         }
         if mail:
             # That this is the user's own press, which is what `trust` asks
-            # for; `verify` queues regardless, and this side leaves it queued.
+            # for; `verify` queues regardless.
             send_payload["user_approved"] = True
             send_payload["request_key"] = request_key
             if reply is not None:
@@ -20777,6 +20780,9 @@ class Handler(BaseHTTPRequestHandler):
             # (Whether this press was made before, for the draft: asked now,
             # before the send is noted anew.)
             again = _press_known(chat_id, request_key)
+            # What had landed at the press: a read made for it once the
+            # gateway has answered covers no more (_chat_read_by_press).
+            seen = int(_CHAT_STATE.get(chat_id).get("inbound_seq") or 0)
             sent = _mail_send(gw, send_payload)
             if sent["outcome"] == "failed":
                 # Nothing left (_mail_send): the gateway's own refusal — the
@@ -20794,7 +20800,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json(sent["status"], _mail_not_sent(sent, request_key))
                 return
             if sent["outcome"] == "pending":
-                # Queued under the mailbox's send policy, and left queued.
+                # A send the gateway queued under the mailbox's send policy.
                 # The words are in the queue now — the composer lets go of
                 # them — and writing them read the chat; but no reply has
                 # been made: the attention item stays until the mail goes out.
@@ -20816,7 +20822,7 @@ class Handler(BaseHTTPRequestHandler):
                 # since stays: _clear_pressed_draft.)
                 _clear_pressed_draft(chat_id, text, repeat or again)
                 if not repeat:
-                    _chat_read_by_press(chat_id, asked_at)
+                    _chat_read_by_press(chat_id, asked_at, seen)
                 print(f"[web-gateway] chat send to {chat_id} via {slug} waits for "
                       f"approval ({pending['request_id']})"
                       + (" — a repeat, answered from its entry" if repeat else ""), flush=True)
@@ -20825,7 +20831,7 @@ class Handler(BaseHTTPRequestHandler):
             if sent["outcome"] == "unconfirmed":
                 self._answer_unconfirmed_mail(chat_id, slug, gw, sent, text=text,
                                               request_key=request_key, since=since,
-                                              asked_at=asked_at, again=again)
+                                              asked_at=asked_at, again=again, seen=seen)
                 return
             result = {"message_id": sent["answer"].get("message_id"),
                       "ts": sent["answer"].get("ts"),
@@ -20952,7 +20958,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def _answer_unconfirmed_mail(self, chat_id: str | None, slug: str, gw: dict,
                                  sent: dict, *, text: str, request_key: str,
-                                 since: str, asked_at: float, again: bool = False) -> None:
+                                 since: str, asked_at: float, again: bool = False,
+                                 seen: int | None = None) -> None:
         """Answer a mail send whose outcome nobody knows (_mail_send):
         **202 {"unconfirmed": true, "request_key", "since", "message_id"?,
         "id"?, "note"?}** — never an error, which would hand the words back
@@ -21007,7 +21014,7 @@ class Handler(BaseHTTPRequestHandler):
                     message_id = message_id or mine["message_id"]
             _clear_pressed_draft(chat_id, text, repeat or again)
             if not repeat:
-                _chat_read_by_press(chat_id, asked_at)
+                _chat_read_by_press(chat_id, asked_at, seen)
             _chats_cache_invalidate()
             body["id"] = chat_id
         if message_id:

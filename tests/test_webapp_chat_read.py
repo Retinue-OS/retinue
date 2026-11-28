@@ -582,6 +582,34 @@ await ok('a reply the policy queued has read the chat too', async () => {
   assert.deepEqual(reads(), [], 'the server read it with the press');
 });
 
+await ok('a message that lands while the reply is on its way stays unread', async () => {
+  for (const pend of [false, true]) {
+    const el = await open({ unread: 1, list_group: 'unread', inbound_seq: 3 });
+    el._refreshChatComposer = () => {};
+    el._keepLocal = () => {};
+    el._addPending = () => {};
+    const p = el._sendChat('reply');
+    await settle();
+    const send = take((w) => w.method === 'POST' && w.url.endsWith('/send'), 'the send');
+    // A poll while the send waits for its gateway brings a new message.
+    await poll(el, { unread: 2, list_group: 'unread', inbound_seq: 4 },
+      [...BASE, msg('m7', 'in', '2026-11-20T11:00:30Z')]);
+    if (pend) {
+      send.answer({ pending: { request_id: 'r2', approval_url: '/sends/x/r2', text: 'reply',
+                               ts: '2026-11-20T11:00:00Z', author: 'user' } }, 202);
+    } else {
+      send.answer({ id: 'm9', chat: ID, direction: 'out', author: 'user', text: 'reply',
+                    ts: '2026-11-20T11:00:00Z' });
+    }
+    await p;
+    assert.equal(el._chat.unread, 1, 'the arrival during the send is not read by it');
+    assert.equal(el._chat.list_group, 'unread');
+    const layout = el._thread.layout();
+    assert.equal(layout[layout.indexOf('m7') + 1], 'ROW', `the button under it: ${layout}`);
+    assert.deepEqual(reads(), []);
+  }
+});
+
 await ok('a send that failed brings the button back', async () => {
   const el = await open({ unread: 1, list_group: 'unread' });
   el._refreshChatComposer = () => {};

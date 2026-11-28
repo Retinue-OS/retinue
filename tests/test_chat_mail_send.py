@@ -172,6 +172,9 @@ def _gateway_state(account: str) -> dict:
             # sent it is answered, which is when the real gateway's rail
             # announces a direct send.
             "on_sent": None,
+            # Called as a /send is taken, before it is answered: what lands
+            # while the press waits for its gateway.
+            "on_send": None,
             # What /health adds (a gateway that reports its send policy).
             "health": {}}
 
@@ -511,6 +514,8 @@ def _mail_gateway(gw: dict):
             if not self._gate():
                 return None
             if self.path == "/send":
+                if gw["on_send"]:
+                    gw["on_send"]()
                 answer = _gw_send(gw, body, self._caller_waits)
                 if gw["drop"]:
                     # The request was read and worked; the answer never
@@ -977,6 +982,32 @@ def test_reply_is_queued_and_not_approved(base, wg):
     assert body["pending"] == [p] and body["chat"]["pending"] == 1
     assert "Dear Ann,\nyes." not in [m["text"] for m in body["messages"]]
     print("PASS test_reply_is_queued_and_not_approved")
+
+
+def test_a_mail_that_lands_during_the_press_stays_unread(base, wg):
+    """The read a queued reply makes is the press's: a mail that comes in
+    while the send waits for its gateway — dated before the press, as a
+    mail's Date often is — is not covered by it, stays unread, and the
+    mailbox is not told the thread is seen."""
+    GW["policy"] = "verify"
+    assert _chats(base)[CHAT_A]["unread"] == 0
+    GW["on_send"] = lambda: _rail(
+        base, chat=ROOT_A, sender=ANN, sender_name="Ann Example",
+        message_id="a-during@x.org", ts=time.time() - 60, text="One more thing",
+        **A_PARTY)
+    GW["requests"].clear()
+    try:
+        status, out = _send(base, CHAT_A, {"text": "Noted."})
+    finally:
+        GW["on_send"] = None
+    assert status == 202 and "pending" in out, (status, out)
+    after = _chats(base)[CHAT_A]
+    assert after["unread"] == 1 and after["list_group"] == "unread", after
+    _settle(wg)
+    assert _posts(GW, "/chats/read") == []
+    _post_plain(base, f"/sends/{MAIL_SLUG}/{out['pending']['request_id']}/reject")
+    _settle(wg)
+    print("PASS test_a_mail_that_lands_during_the_press_stays_unread")
 
 
 def test_messenger_press_still_releases(base, wg):
@@ -3576,6 +3607,7 @@ def main():
         test_can_send_states(base, wg)
         test_reply_is_sent(base, wg)
         test_reply_is_queued_and_not_approved(base, wg)
+        test_a_mail_that_lands_during_the_press_stays_unread(base, wg)
         test_messenger_press_still_releases(base, wg)
         test_pending_follows_the_gateways_queue(base, wg)
         test_a_queued_new_mail_is_listed(base, wg)

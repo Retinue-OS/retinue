@@ -1503,7 +1503,7 @@ class ChatStateStore:
             return doc, True
 
     def advance_last_read(self, chat_id: str, ts: str | float | None, *,
-                          everything: bool = False) -> dict:
+                          everything: bool = False, seen: int | None = None) -> dict:
         """Advance the read mark for the user's own reply — forward only, so
         a stale client (or an out-of-order echo) can never resurrect
         already-read messages.
@@ -1515,17 +1515,22 @@ class ChatStateStore:
         answers every message that has landed, whatever clock stamped it. An
         echo from the user's device is taken by its stamp instead — see
         :meth:`_read_up_to`. No undo reaches behind a reply, so the record
-        of the newest mark's undo is dropped."""
+        of the newest mark's undo is dropped.
+
+        ``seen`` is the arrival count (``inbound_seq``) as it stood when the
+        reply was written, for a caller that applies the read later (a send
+        that waited for its gateway): what was counted after it landed
+        while the reply was on its way, and stays unread whatever its stamp."""
         with self._lock:
             doc = self._read(chat_id)
-            if self._read_up_to(doc, iso_z(ts), everything=everything):
+            if self._read_up_to(doc, iso_z(ts), everything=everything, seen=seen):
                 doc["read_undo"] = None
             self._write(doc)
             return doc
 
     @staticmethod
     def _read_up_to(doc: dict, instant: str, *, everything: bool,
-                    cap: str | None = None) -> bool:
+                    cap: str | None = None, seen: int | None = None) -> bool:
         """One read, applied to ``doc``: the mark moves forward to
         ``instant`` (never back, and no further than ``cap`` where one is
         given), the read is counted, and — where this read covers the
@@ -1547,17 +1552,24 @@ class ChatStateStore:
         instant: the stamp where the instant is not short of it (a caller
         naming the stamp of the message it showed, which the mark itself is
         not lifted to), and otherwise ``read_ahead`` stays as it was found.
-        Either way it is dropped once the mark has passed it."""
+        Either way it is dropped once the mark has passed it.
+
+        ``seen`` caps what the read covers by the arrival count: ``read_inbound``
+        takes no more than it (and never moves back), and an arrival stamped
+        ahead is not reached — the read was made before anything later landed."""
         previous = doc["last_read"]
         mark = instant if cap is None else min(instant, cap)
         if previous is None or mark > previous:
             doc["last_read"] = mark
         doc["read_seq"] = int(doc.get("read_seq") or 0) + 1
         covers = everything or previous is None or instant >= previous
-        if covers:
-            doc["read_inbound"] = int(doc.get("inbound_seq") or 0)
+        landed = int(doc.get("inbound_seq") or 0)
+        if covers and seen is not None and int(seen) < landed:
+            doc["read_inbound"] = max(int(doc.get("read_inbound") or 0), int(seen))
+        elif covers:
+            doc["read_inbound"] = landed
         ahead = doc.get("inbound_ahead") or ""
-        if everything or ahead <= instant:
+        if (everything and (seen is None or int(seen) >= landed)) or ahead <= instant:
             doc["read_ahead"] = ahead or None
         if (doc.get("read_ahead") or "") <= doc["last_read"]:
             doc["read_ahead"] = None
