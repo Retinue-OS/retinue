@@ -12978,7 +12978,21 @@ def _mail_send_pressed(gw: dict, send_payload: dict) -> dict:
       never reported as not sent;
     - an approval the gateway would not give, or could not be asked for, →
       the ``pending`` it was: queued, with its approval link, which is the
-      honest fallback rather than a failure.
+      honest fallback rather than a failure;
+    - an approval asked for whose answer was lost (a timeout, a dropped
+      connection — anything after the request was written) → the entry is
+      read back (GET /pending-sends/<id>) and mapped as above; where that
+      cannot be read either, ``unconfirmed`` — never ``pending``, which
+      would show an approval bubble beside a mail the gateway may be
+      sending. Only a request that never left (``URLError``) is ``pending``.
+
+    Where this approval released the mail — the entry, pending when /send
+    answered, is ``sending`` or ``approved`` after it — the result carries
+    ``released: True`` and ``repeat: False``, whatever /send said: that
+    answer may have come from an earlier request of the press that queued
+    the mail, but this request is the one that made it go, and the reply
+    is its own (the read mark, the attention item, the mailbox). The
+    handler then does not ask _mail_repeated about it.
 
     Never raises."""
     sent = _mail_send(gw, send_payload)
@@ -12990,14 +13004,27 @@ def _mail_send_pressed(gw: dict, send_payload: dict) -> dict:
         return sent
     try:
         status, entry = _gateway_hop(gw, f"/pending-sends/{request_id}/approve")
-    except Exception as exc:  # noqa: BLE001 - left queued: the user can still allow it
+    except urllib.error.URLError as exc:
+        # Before the request was written: nothing was asked, it waits.
         print(f"[web-gateway] could not release queued mail {request_id} "
-              f"({type(exc).__name__}: {exc}); it waits for approval", flush=True)
+              f"({exc.reason}); it waits for approval", flush=True)
         return sent
-    if status != 200 or not isinstance(entry, dict):
-        print(f"[web-gateway] the mail gateway would not release queued mail "
-              f"{request_id} (HTTP {status}); it waits for approval", flush=True)
-        return sent
+    except Exception as exc:  # noqa: BLE001 - asked, and the answer lost: read the entry
+        print(f"[web-gateway] the answer to releasing queued mail {request_id} was lost "
+              f"({type(exc).__name__}: {exc}); asking the gateway how it stands", flush=True)
+        try:
+            status, entry = _gateway_hop(gw, f"/pending-sends/{request_id}", method="GET")
+        except Exception:  # noqa: BLE001 - nobody can say: it may be on its way
+            status, entry = 0, None
+        if status != 200 or not isinstance(entry, dict):
+            entry = {"status": "unknown"}
+    else:
+        if status != 200 or not isinstance(entry, dict):
+            print(f"[web-gateway] the mail gateway would not release queued mail "
+                  f"{request_id} (HTTP {status}); it waits for approval", flush=True)
+            return sent
+    # Pending when /send answered, and on its way now: this request let it go.
+    released = entry.get("status") in ("sending", "approved")
     deadline = time.time() + MAIL_SEND_TIMEOUT
     while entry.get("status") == "sending" and time.time() < deadline:
         time.sleep(CHAT_SEND_CONFIRM_INTERVAL)
@@ -13008,12 +13035,13 @@ def _mail_send_pressed(gw: dict, send_payload: dict) -> dict:
         if status == 200 and isinstance(polled, dict):
             entry = polled
     state = entry.get("status")
-    repeat = sent.get("repeat") is True
+    repeat = sent.get("repeat") is True and not released
+    mark = {"released": True} if released else {}
     ids = {"message_id": entry.get("message_id") or answer.get("message_id"),
            "chat": entry.get("chat") or answer.get("chat")}
     if state == "approved":
         told = {key: entry[key] for key in ("refused", "skipped") if entry.get(key)}
-        return {"outcome": "sent", "repeat": repeat,
+        return {"outcome": "sent", "repeat": repeat, **mark,
                 "answer": {"status": "sent", **ids, "ts": entry.get("sent_at"),
                            "attachments": entry.get("attachments") or [], **told}}
     if state == "pending":
@@ -13033,7 +13061,7 @@ def _mail_send_pressed(gw: dict, send_payload: dict) -> dict:
     mid, chat = ids["message_id"], ids["chat"]
     print(f"[web-gateway] released mail {request_id} not confirmed "
           f"(status {state!r}); reported as unconfirmed, never as failed", flush=True)
-    return {"outcome": "unconfirmed", "repeat": repeat,
+    return {"outcome": "unconfirmed", "repeat": repeat, **mark,
             "message_id": mid.strip() or None if isinstance(mid, str) else None,
             "chat": chat.strip() or None if isinstance(chat, str) else None,
             "note": _one_line(entry.get("error"))}
@@ -13110,8 +13138,12 @@ def _mail_repeated(chat_id: str | None, sent: dict, asked_at: float, *,
     send of the same key — a repeat, which is reconciled and nothing more
     (see above) — and not by a mail made for this request.
 
-    The gateway's own word where it gives it (``repeat``). For one that
-    does not, what its answer proves:
+    Never where this request released a queued mail itself (``released``,
+    _mail_send_pressed): the /send may have been answered from the entry an
+    earlier request of the press made, and the chat may have noted that
+    entry, but the mail went because of this request. Otherwise the
+    gateway's own word where it gives it (``repeat``). For one that does
+    not, what its answer proves:
 
     - ``instant``, the time it gives for the mail — when it was sent, or
       when its entry was made — lies before this request began;
@@ -13120,6 +13152,9 @@ def _mail_repeated(chat_id: str | None, sent: dict, asked_at: float, *,
       queue (by when that was noted). *Before* is the point: the rail may
       announce a mail, and a page's poll may list its send, while the
       request that made it is still waiting for its answer."""
+    if sent.get("released") is True:
+        # This request released the mail (_mail_send_pressed): its own.
+        return False
     if sent.get("repeat") is True:
         return True
     when = _epoch(instant)

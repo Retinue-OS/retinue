@@ -156,6 +156,10 @@ def _gateway_state(account: str) -> dict:
             # An HTTP status the approval of a send answers instead (a
             # gateway that will not release it), or None.
             "approve_refused": None,
+            # `approve_drop`: the approval is given and carried out, and its
+            # answer never leaves (the connection closes). `entry_down`: GET
+            # /pending-sends/<id> answers 500 (the entry cannot be read).
+            "approve_drop": False, "entry_down": False,
             # Whether an answer given from an earlier entry says so
             # ("repeat": true), and whether a key whose send failed for
             # certain is tried afresh — both as scripts/mail-gateway.py
@@ -488,6 +492,8 @@ def _mail_gateway(gw: dict):
                 # and not dismissed.
                 return self._json(200, {"pending": [_public(e) for e in _listed(gw, chat)]})
             m = _PENDING_RE.match(path)
+            if m and not m.group(2) and gw["entry_down"]:
+                return self._json(500, {"error": "the queue cannot be read"})
             if m and not m.group(2):
                 # By id, every entry the gateway still holds answers — a
                 # dismissed one of unknown outcome too ({status: "error",
@@ -550,6 +556,9 @@ def _mail_gateway(gw: dict):
                 answer = _public(entry)
                 if not gw["hold"]:
                     _carry_out(gw, entry)
+                if gw["approve_drop"]:
+                    self.close_connection = True
+                    return None
                 return self._json(200, answer)
             if self.path in ("/chats/read", "/chats/archive"):
                 what = self.path.rsplit("/", 1)[1]
@@ -3619,6 +3628,73 @@ def test_a_release_still_sending_is_unconfirmed(base, wg):
     print("PASS test_a_release_still_sending_is_unconfirmed")
 
 
+def test_a_release_whose_answer_is_lost_is_read_back(base, wg):
+    """The approval was asked for and its answer lost (the connection closed
+    after the gateway took it): the entry is read back, and the mail that
+    went is reported sent — not left showing as waiting for an approval.
+    Where the entry cannot be read either, the press is unconfirmed, never
+    pending."""
+    GW.update(policy="verify", send="ok", hold=False, refuse=[], approve_refused=None,
+              approve_drop=True)
+    sent_before = len(GW["sent"])
+    try:
+        status, msg = _send(base, CHAT_C, {"text": "Lost answer"})
+    finally:
+        GW["approve_drop"] = False
+    assert status == 200 and msg["text"] == "Lost answer", (status, msg)
+    rid = next(r for r, e in GW["pending"].items() if e["message"] == "Lost answer")
+    assert GW["pending"][rid]["status"] == "approved"
+    assert len(GW["sent"]) == sent_before + 1 and msg["id"] == GW["pending"][rid]["message_id"]
+    assert f"/pending-sends/{rid}" in _gets(GW, "/pending-sends/")
+    assert _messages(base, CHAT_C)["pending"] == []
+    _settle(wg)
+
+    GW.update(approve_drop=True, entry_down=True, hold=True)
+    try:
+        status, out = _send(base, CHAT_C, {"text": "Lost twice"})
+    finally:
+        GW.update(approve_drop=False, entry_down=False, hold=False)
+    assert status == 202 and out.get("unconfirmed") is True and "pending" not in out, out
+    rid = next(r for r, e in GW["pending"].items() if e["message"] == "Lost twice")
+    assert GW["pending"][rid]["status"] == "sending"
+    _carry_out(GW, GW["pending"][rid])
+    _settle(wg)
+    print("PASS test_a_release_whose_answer_is_lost_is_read_back")
+
+
+def test_the_request_that_releases_a_queued_press_is_its_reply(base, wg):
+    """A press whose first request left its mail queued (the release could
+    not be given), pressed again under the same key: the gateway answers
+    from that entry ("repeat"), and the chat knew it — but this request is
+    the one that releases the mail, so it is the reply: the chat is read,
+    and the mailbox told."""
+    _rail(base, chat=ROOT_C, sender=DORA, chat_name="", group=False,
+          message_id="c-release@w.org", ts=time.time(), text="Are you coming?",
+          participants=[DORA_PARTY], peer=DORA_PARTY)
+    assert _chats(base)[CHAT_C]["unread"] == 1
+    GW.update(policy="verify", send="ok", hold=False, refuse=[], approve_refused=503)
+    try:
+        status, out = _send(base, CHAT_C, {"text": "On my way", "request_key": "rel-1"})
+    finally:
+        GW["approve_refused"] = None
+    assert status == 202 and set(out) == {"pending"}, (status, out)
+    rid = out["pending"]["request_id"]
+    assert rid in [p["request_id"] for p in _queued(wg, CHAT_C)], "the chat noted it"
+    assert _chats(base)[CHAT_C]["unread"] == 1, "queued is no reply"
+    _settle(wg)
+    GW["requests"].clear()
+    sent_before = len(GW["sent"])
+    status, msg = _send(base, CHAT_C, {"text": "On my way", "request_key": "rel-1"})
+    assert status == 200 and msg["id"] == GW["pending"][rid]["message_id"], (status, msg)
+    assert len(GW["sent"]) == sent_before + 1 and GW["pending"][rid]["status"] == "approved"
+    after = _chats(base)[CHAT_C]
+    assert after["unread"] == 0 and after["list_group"] == "read", after
+    assert rid not in [p["request_id"] for p in _queued(wg, CHAT_C)]
+    _settle(wg)
+    assert _posts(GW, "/chats/read") == [{"chat": ROOT_C, "account": ACCOUNT}]
+    print("PASS test_the_request_that_releases_a_queued_press_is_its_reply")
+
+
 def main():
     sparql = mail._serve(mail._MockSparql)
     gw_main = mail._serve(_mail_gateway(GW))
@@ -3696,6 +3772,8 @@ def main():
         test_a_press_the_gateway_will_not_release_stays_queued(base, wg)
         test_a_released_mail_the_server_refuses_is_not_sent(base, wg)
         test_a_release_still_sending_is_unconfirmed(base, wg)
+        test_a_release_whose_answer_is_lost_is_read_back(base, wg)
+        test_the_request_that_releases_a_queued_press_is_its_reply(base, wg)
         # Every mail here arrives held (mail.GATE): the gate's own tests are
         # tests/test_chat_mail_gate.py.
         assert not mail.TURNS, "a model turn ran for a mail that is neither a VIP's nor instructed"
