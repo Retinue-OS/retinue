@@ -419,10 +419,12 @@ def session_tier(env: Mapping[str, str]) -> str:
     model, and a session with no stamp at all are LOWER: unknown is not
     trusted. The frontier tier falls back to RETINUE_CLAUDE_MODEL exactly as
     the spawners resolve it (docs/model-routing.md). Only the environment's
-    RETINUE_SESSION_MODEL counts, which the spawner sets and the session
-    cannot change; `--model` adjusts the recorded stamp and nothing else, or
-    a lower-tier session could name the frontier model and pass its own
-    guards.
+    RETINUE_SESSION_MODEL counts, which the spawner sets; `--model` adjusts
+    the recorded stamp and nothing else, so naming the frontier model on the
+    command line does not pass a guard. This is not a security boundary: a
+    session can still prefix a command with its own RETINUE_SESSION_MODEL,
+    and the gateway does not enforce the tier. The guards built on it catch a
+    prompt that forgot the rule, not a session working around it on purpose.
     """
     frontier_var = env.get("RETINUE_FRONTIER_MODEL", "").strip()
     router_var = env.get("RETINUE_ROUTER_MODEL", "").strip()

@@ -36,7 +36,8 @@ Ringing is the frontier tier's decision (scripts/ring_guard.py): the thread is
 opened through conversation-push.py, whose guard refuses a lower tier with
 exit 3, which `add` passes on — escalate and the turn is re-run. `add` is
 idempotent per source and `--ref`, so the re-run finds the notice already
-filed rather than filing it twice.
+filed rather than filing it twice — but its own --due/--consequence/--unsure
+replace the stored ones, and only they decide whether a thread opens.
 
 Storage: one N-Triples file per notice, and one per handling, in
 ``$CHAMBERS_DIR/_generated/notices/`` (override: RETINUE_NOTICES_DIR) — the
@@ -58,6 +59,7 @@ Design and the rules sessions follow: docs/notices.md.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import re
@@ -68,6 +70,11 @@ import unicodedata
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+try:
+    import fcntl
+except ImportError:  # a development host without fcntl: no lock
+    fcntl = None
+
 SCRIPTS_DIR = Path(__file__).resolve().parent
 KB = "https://w3id.org/retinue/kb#"
 RDF_TYPE = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
@@ -75,6 +82,7 @@ XSD_DT = "http://www.w3.org/2001/XMLSchema#dateTime"
 URGENT_IMPORTANCE = 4.5
 UNSURE_IMPORTANCE = 3.0
 CRITICAL_WITHIN = timedelta(hours=24)
+LOCK_FILE = ".notices.lock"
 
 
 def notices_dir() -> Path:
@@ -141,8 +149,10 @@ _TRIPLE = re.compile(r'^<([^>]+)> <([^>]+)> (?:<([^>]+)>|"((?:[^"\\]|\\.)*)"(?:\
 def read_file(path: Path) -> dict:
     """Our own files back into {"uri": …, property: value | [values]}."""
     rec: dict = {}
-    for line in path.read_text(encoding="utf-8").splitlines():
-        m = _TRIPLE.match(line.strip())
+    # split("\n"), not splitlines(): that also splits on U+2028/2029, \x0b,
+    # \x0c and \x85, which _lit leaves unescaped inside a literal.
+    for line in path.read_text(encoding="utf-8").split("\n"):
+        m = _TRIPLE.match(line.rstrip("\r").strip(" \t"))
         if not m:
             continue
         subj, pred, obj_uri, obj_lit = m.groups()
@@ -172,6 +182,24 @@ def write_record(kind: str, rec_id: str, fields: list[tuple[str, str, str]]) -> 
     tmp.write_text("\n".join(lines) + "\n", encoding="utf-8")
     os.replace(tmp, path)
     return path
+
+
+@contextlib.contextmanager
+def _dir_lock():
+    """One writer at a time for every check-then-write on the board: two
+    calls with the same --ref would otherwise both miss the other's file and
+    file the notice twice. The lock file is not `.nt`, so the store ignores
+    it. It is never held across a subprocess or network call."""
+    d = notices_dir()
+    d.mkdir(parents=True, exist_ok=True)
+    with (d / LOCK_FILE).open("a", encoding="utf-8") as fh:
+        if fcntl is not None:
+            fcntl.flock(fh, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            if fcntl is not None:
+                fcntl.flock(fh, fcntl.LOCK_UN)
 
 
 def new_id(at: datetime) -> str:
@@ -280,50 +308,82 @@ def handle(group: str | None = None, notice_id: str | None = None, actor: str = 
             "notices": [n["id"] for n in closed]}
 
 
+def urgency_of(due: datetime | None, consequence: str | None, unsure: bool) -> str | None:
+    if due is not None and unsure:
+        return "unsure"
+    if due is not None and consequence:
+        return "urgent"
+    return None
+
+
+def _notice_fields(rec: dict) -> list[tuple[str, str, str]]:
+    fields = [("source", rec["source"], "lit"), ("group", rec["group"], "lit"),
+              ("content", rec.get("content") or "", "lit"), ("arrivedAt", rec["arrivedAt"], "dt")]
+    for prop, typ in (("account", "lit"), ("ref", "lit"), ("due", "dt"),
+                      ("consequence", "lit"), ("urgency", "lit"), ("thread", "lit")):
+        if rec.get(prop):
+            fields.append((prop, rec[prop], typ))
+    return fields
+
+
 def add(source: str, text: str, account: str | None = None, ref: str | None = None,
         at: datetime | None = None, due: datetime | None = None,
         consequence: str | None = None, unsure: bool = False) -> tuple[dict, bool]:
-    """File one notice; returns (record, created). Idempotent per source+ref."""
+    """File one notice; returns (record, created). Idempotent per source+ref.
+
+    On a repeat of a known --ref (an escalated re-run) the current call's
+    judgement wins: its deadline, consequence and urgency replace the stored
+    ones, and the record is rewritten when they changed, so the frontier tier
+    can overrule a lower tier's urgency either way. ``rec["previous_urgency"]``
+    says what was stored before."""
     at = at or now_utc()
     key = group_key(source, account)
-    if ref:
-        notices, _ = load()
-        for n in notices:
-            if n.get("group") == key and n.get("ref") == ref:
-                return n, False
-    rec_id = new_id(at)
-    urgency = None
-    if due is not None and unsure:
-        urgency = "unsure"
-    elif due is not None and consequence:
-        urgency = "urgent"
-    fields = [("source", source, "lit"), ("group", key, "lit"), ("content", text, "lit"),
-              ("arrivedAt", iso(at), "dt")]
-    if account:
-        fields.append(("account", account, "lit"))
-    if ref:
-        fields.append(("ref", ref, "lit"))
-    if due is not None:
-        fields.append(("due", iso(due), "dt"))
-    if consequence:
-        fields.append(("consequence", consequence, "lit"))
-    if urgency:
-        fields.append(("urgency", urgency, "lit"))
-    write_record("notice", rec_id, fields)
-    rec = {"id": rec_id, "uri": f"urn:retinue:notice:{rec_id}", "group": key, "source": source,
-           "account": account, "content": text, "arrivedAt": iso(at), "ref": ref,
-           "due": iso(due) if due else None, "consequence": consequence, "urgency": urgency}
+    urgency = urgency_of(due, consequence, unsure)
+    with _dir_lock():
+        if ref:
+            notices, _ = load()
+            for n in notices:
+                if n.get("group") == key and n.get("ref") == ref:
+                    before = (n.get("due"), n.get("consequence"), n.get("urgency"))
+                    after = (iso(due) if due else None, consequence or None, urgency)
+                    for prop, value in zip(("due", "consequence", "urgency"), after):
+                        n[prop] = value
+                    if after != before:
+                        write_record("notice", n["id"], _notice_fields(n))
+                    n.setdefault("account", None)
+                    n.setdefault("thread", None)
+                    n["previous_urgency"] = before[2]
+                    return n, False
+        rec_id = new_id(at)
+        rec = {"id": rec_id, "uri": f"urn:retinue:notice:{rec_id}", "group": key, "source": source,
+               "account": account, "content": text, "arrivedAt": iso(at), "ref": ref,
+               "due": iso(due) if due else None, "consequence": consequence, "urgency": urgency}
+        write_record("notice", rec_id, _notice_fields(rec))
     return rec, True
 
 
 def set_thread(rec: dict, thread_id: str) -> None:
     """Record the thread an urgent notice opened, rewriting its own file."""
-    path = notices_dir() / f"{rec['id']}.nt"
-    text = path.read_text(encoding="utf-8")
-    line = f"<{rec['uri']}> <{KB}thread> {_lit(thread_id)} .\n"
-    tmp = path.with_suffix(".nt.tmp")
-    tmp.write_text(text + line, encoding="utf-8")
-    os.replace(tmp, path)
+    with _dir_lock():
+        stored = read_file(notices_dir() / f"{rec['id']}.nt")
+        stored["thread"] = thread_id
+        write_record("notice", rec["id"], _notice_fields(stored))
+
+
+def revise_thread(rec: dict, now: datetime) -> int:
+    """A re-run changed the urgency of a notice whose thread already exists:
+    revise that thread's declaration (attention-set.py, ring-guarded too)."""
+    cmd = [sys.executable, str(SCRIPTS_DIR / "attention-set.py"), f"thread:{rec['thread']}"]
+    if rec.get("urgency") == "urgent":
+        due = datetime.fromisoformat(rec["due"].replace("Z", "+00:00"))
+        cmd += ["--importance", str(URGENT_IMPORTANCE), "--due", rec["due"],
+                "--critical" if due - now <= CRITICAL_WITHIN else "--not-critical"]
+    else:
+        # Unsure, or no longer urgent: held for the digest, never ringing.
+        cmd += ["--importance", str(UNSURE_IMPORTANCE), "--not-critical"]
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    sys.stderr.write(proc.stderr)
+    return proc.returncode
 
 
 def open_thread(rec: dict, sphere: str | None, now: datetime) -> tuple[int, str | None]:
@@ -433,12 +493,17 @@ def main(argv: list[str] | None = None) -> int:
     rec, created = add(args.source, args.text, args.account, args.ref, at, due,
                        args.consequence, args.unsure)
     code = 0
+    # The thread follows this call's judgement, not the stored one: on an
+    # escalated re-run the frontier tier decides afresh (docs/notices.md).
     if rec.get("urgency") and not rec.get("thread"):
-        # Also on a re-run (escalation): the first attempt may have been refused.
+        # Also on a re-run: the first attempt may have been refused.
         code, thread_id = open_thread(rec, args.sphere, now_utc())
         if thread_id:
             set_thread(rec, thread_id)
             rec["thread"] = thread_id
+    elif rec.get("thread") and not created and rec.get("urgency") != rec.get("previous_urgency"):
+        code = revise_thread(rec, now_utc())
+    rec.pop("previous_urgency", None)
     if args.json:
         print(json.dumps({"created": created, **rec}, ensure_ascii=False))
     else:

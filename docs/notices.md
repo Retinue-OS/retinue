@@ -76,8 +76,10 @@ either. Every unneeded ring makes the next one worth less.
    `conversation-push.py`, whose ring guard refuses a session below the
    frontier tier (below). `add` passes the refusal on as exit 3, and the turn
    escalates. The notice is already filed, and the frontier re-run finds it
-   (same `--ref`) and only opens the thread, after judging afresh whether it
-   should.
+   (same `--ref`) and judges afresh: the re-run's own `--due`,
+   `--consequence` and `--unsure` replace what the first attempt stored, and
+   only they decide whether the thread opens. Leaving them out files the
+   notice as one that can wait, and nothing rings.
 4. **If even the frontier tier cannot tell, nothing rings.** `--unsure` keeps
    the deadline but opens the thread at importance 3: it waits for the next
    digest, and the board marks the group "deadline?".
@@ -108,7 +110,9 @@ anything interrupts the user, the best available model decides.**
   findings must be able to ring pins the frontier model.
 
 Like the memory guards, this catches a prompt that forgot the rule, not a
-session working around it on purpose.
+session working around it on purpose. It is not a security boundary: the tier
+is read from the session's environment, which a command can override, and the
+gateway does not enforce it.
 
 ## Handling
 

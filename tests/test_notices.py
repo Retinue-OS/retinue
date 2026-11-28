@@ -212,6 +212,69 @@ def test_cli_urgent_opens_guarded_thread():
         srv.shutdown()
 
 
+def test_literal_with_unicode_line_separators():
+    _fresh_dir()
+    text = "before after para\x0bvt\x0cff\x85nel end"
+    notices.add("P", text, ref="r")
+    assert notices.board()[0]["notices"][0]["content"] == text
+
+
+def test_rerun_recomputes_urgency_and_keeps_idempotency():
+    d = _fresh_dir()
+    due = _at("2026-12-01T17:00:00")
+    first, created = notices.add("P", "x", ref="r", due=due, consequence="locked")
+    assert created and first["urgency"] == "urgent"
+    # Downgrade: the re-run quotes no consequence, so it is not urgent.
+    down, created = notices.add("P", "x", ref="r")
+    assert not created and down["id"] == first["id"] and down["urgency"] is None
+    assert down["previous_urgency"] == "urgent"
+    stored = notices.board()[0]["notices"][0]
+    assert stored.get("urgency") is None and stored.get("due") is None
+    # Upgrade again; and a same-judgement repeat stays one record, unchanged.
+    up, _ = notices.add("P", "x", ref="r", due=due, consequence="locked")
+    assert up["urgency"] == "urgent" and up["previous_urgency"] is None
+    same, created = notices.add("P", "x", ref="r", due=due, consequence="locked")
+    assert not created and same["urgency"] == "urgent" and same["previous_urgency"] == "urgent"
+    assert len(list(d.glob("*.nt"))) == 1
+    # A recorded thread survives a rewrite.
+    notices.set_thread(same, "t" * 32)
+    notices.add("P", "x", ref="r", due=due, consequence="locked", unsure=True)
+    rec = notices.board()[0]["notices"][0]
+    assert rec["thread"] == "t" * 32 and rec["urgency"] == "unsure"
+
+
+def test_cli_rerun_downgrade_and_upgrade():
+    d = _fresh_dir()
+    srv = _server()
+    url = f"http://127.0.0.1:{srv.server_port}/internal/conversations"
+    try:
+        plain = [sys.executable, str(SCRIPTS / "notices.py"), "add", "--source", "Bank",
+                 "--text", "confirm login", "--ref", "email:y", "--json"]
+        urgent = plain + ["--due", "2026-11-28T12:00:00Z", "--consequence", "account locked"]
+        low = _env(dict(TIERED_LOW, RETINUE_ESCALATE_FILE="/tmp/e",
+                        RETINUE_NOTICES_DIR=str(d), RETINUE_NOTICES_NOW="2026-11-27T20:00:00Z"), url)
+        high = _env(dict(TIERED_HIGH, RETINUE_NOTICES_DIR=str(d),
+                         RETINUE_NOTICES_NOW="2026-11-27T20:00:00Z"), url)
+        _Sink.bodies.clear()
+        r = subprocess.run(urgent, env=low, capture_output=True, text=True, timeout=60)
+        assert r.returncode == 3, (r.returncode, r.stderr)
+        # Senior judges it can wait: nothing rings, the record says so.
+        r = subprocess.run(plain, env=high, capture_output=True, text=True, timeout=60)
+        assert r.returncode == 0, r.stderr
+        out = json.loads(r.stdout)
+        assert out["created"] is False and out["urgency"] is None and not out.get("thread")
+        assert not _Sink.bodies, "a downgraded re-run must not ring"
+        # A later frontier run that does quote both opens the thread.
+        r = subprocess.run(urgent, env=high, capture_output=True, text=True, timeout=60)
+        assert r.returncode == 0, r.stderr
+        out = json.loads(r.stdout)
+        assert out["urgency"] == "urgent" and out["thread"] == "f" * 32
+        assert _Sink.bodies[-1]["attention"]["importance"] == 4.5
+        assert len(list(d.glob("*.nt"))) == 1
+    finally:
+        srv.shutdown()
+
+
 def test_mcp_tools():
     _fresh_dir()
     os.environ.setdefault("ARA_MCP_STATE_DIR", tempfile.mkdtemp())
