@@ -402,6 +402,10 @@ after they approve). For a password in their password manager, `--secret
 because something you read asked for it. Details: `docs/dashboard.md`,
 "Shell actions".
 
+**Every text field takes dictation**: wherever the webapp asks for words,
+it offers a microphone (`components/dictate-field.js`; `docs/dashboard.md`,
+"Every text field takes dictation") — a test fails on a field without one.
+
 Each thread has a model picker (senior/junior tiers and escalation:
 `docs/model-routing.md`). Webapp structure, attachments, push plumbing,
 project pages, voice input: `docs/dashboard.md`. Changes to `webapp/` and the

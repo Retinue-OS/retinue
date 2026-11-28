@@ -21,7 +21,8 @@ const TEMPLATE = `
       installed home-screen icon picks up a new name or colour when the
       browser next checks the manifest, about daily.</p>
     <label class="num-setting instance-name">Name
-      <input type="text" autocomplete="off" spellcheck="false" maxlength="40" data-instance-name>
+      <input type="text" autocomplete="off" spellcheck="false" maxlength="40" data-instance-name
+        data-dictate-exempt="saves-on-change">
     </label>
     <label class="num-setting instance-color">Accent colour
       <input type="color" data-instance-color>

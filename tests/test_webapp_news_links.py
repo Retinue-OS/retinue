@@ -178,7 +178,7 @@ def main() -> int:
         print("SKIP: node is not installed; the news link test needs it for the page")
         return 0
     with tempfile.TemporaryDirectory() as tmp:
-        for name in ("base.js", "device-store.js", "markdown.js", "speech.js", "news.js"):
+        for name in ("base.js", "device-store.js", "markdown.js", "speech.js", "voice.js", "dictation.js", "dictate-field.js", "news.js"):
             shutil.copy(os.path.join(COMPONENTS, name), os.path.join(tmp, name))
         with open(os.path.join(tmp, "package.json"), "w", encoding="utf-8") as fh:
             fh.write('{"type":"module"}')

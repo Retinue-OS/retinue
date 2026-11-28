@@ -4676,7 +4676,7 @@ class RetinueChatPage extends HTMLElement {
     const mail = isChat && isMail(this._chat);
     const label = mail ? 'Your reply — Enter starts a new line, Ctrl+Enter or ⌘+Enter sends' : placeholder;
     const field = `<div class="${fieldCls}" data-field>` +
-      `<textarea rows="1" placeholder="${esc(placeholder)}" aria-label="${esc(label)}" ` +
+      `<textarea rows="1" data-dictate-own placeholder="${esc(placeholder)}" aria-label="${esc(label)}" ` +
       `${mail ? 'enterkeyhint="enter" ' : ''}autocomplete="off">${esc(value)}</textarea>` + inField + `</div>`;
     return `<form class="row" data-composer="${target}">` +
       micBtn + field + sendBtn + `</form>`;

@@ -39,6 +39,7 @@
 // default — the chamber the last contact was created in — is pre-selected.
 
 import { esc } from './base.js';
+import { dictateButtonHtml, wireDictation, DICTATE_CSS } from './dictate-field.js';
 
 const CHANNELS = ['email', 'sms', 'signal', 'whatsapp', 'telegram'];
 const CHANNEL_LABEL = { email: 'E-mail', sms: 'Phone', signal: 'Signal', whatsapp: 'WhatsApp', telegram: 'Telegram' };
@@ -60,7 +61,8 @@ const CSS = `
   /* A select is as wide as its longest option (a contact's name in "Copy
      instruction from…"): never wider than the card. */
   select { max-width: 100%; }
-  input[type=search] { width: 100%; margin-bottom: 10px; }
+  input[type=search] { width: 100%; }
+  .dict-field.q { margin-bottom: 10px; }
   .btn { font: inherit; font-size: .84rem; color: var(--fg, #e7ebf2); background: var(--card-2, #1c2230);
          border: 1px solid var(--line, rgba(231, 235, 242, .12)); border-radius: 999px; padding: 6px 12px; cursor: pointer; }
   .btn.primary { background: var(--accent, #6ea8fe); color: #0b0d12; border-color: transparent; font-weight: 600; }
@@ -556,15 +558,17 @@ class RetinueContacts extends HTMLElement {
       `<span class="covers">${esc(domainCovers(d))}</span>` +
       `<button class="x" data-act="drop-domain" data-v="${i}" aria-label="Remove the domain ${esc(d)}">✕</button></div>`).join('');
     return `<div class="editor">` +
-      `<input type="text" data-set="name" value="${esc(f.name)}" placeholder="Their name" autocomplete="off">` +
+      `<div class="dict-field line"><input type="text" data-set="name" data-dictate-field="contact-name:${esc(this._open)}" ` +
+      `value="${esc(f.name)}" placeholder="Their name" autocomplete="off">` +
+      `${dictateButtonHtml(`contact-name:${this._open}`, 'Dictate the name')}</div>` +
       where +
       `<div><div class="k">Reached by</div>${handles || '<div class="note">No handle yet.</div>'}` +
       `<div class="add" style="margin-top:6px"><select data-set="add-channel">` +
       CHANNELS.map((c) => `<option value="${c}"${f.add.channel === c ? ' selected' : ''}>${CHANNEL_LABEL[c]}</option>`).join('') +
-      `</select><input type="text" data-set="add-handle" value="${esc(f.add.handle)}" placeholder="address, +41 …, @name" autocomplete="off">` +
+      `</select><input type="text" data-dictate-exempt="address" data-set="add-handle" value="${esc(f.add.handle)}" placeholder="address, +41 …, @name" autocomplete="off">` +
       `<button class="btn tiny" data-act="add-handle"${busy}>Add</button></div></div>` +
       `<div><div class="k">Writes e-mail from</div>${domains || '<div class="note">No domain. Most people need none: their addresses above are enough.</div>'}` +
-      `<div class="add" style="margin-top:6px"><input type="text" data-set="add-domain" value="${esc(f.add.domain)}" ` +
+      `<div class="add" style="margin-top:6px"><input type="text" data-dictate-exempt="address" data-set="add-domain" value="${esc(f.add.domain)}" ` +
       `placeholder="example.org, or *.example.org" aria-label="An e-mail domain they write from" autocomplete="off" autocapitalize="off" spellcheck="false">` +
       `<button class="btn tiny" data-act="add-domain"${busy}>Add</button></div>` +
       `<div class="note">For an organisation that writes from many addresses: a mail from anyone at the domain is theirs, ` +
@@ -600,9 +604,11 @@ class RetinueContacts extends HTMLElement {
         others.map((c) => `<option value="${esc(c.id)}">${esc(c.name)}</option>`).join('') + `</select>`
       : '';
     return `<div><div class="k">Instruction</div>` +
-      `<textarea data-set="instruction" rows="3" maxlength="2000"${busy} ` +
+      `<div class="dict-field"><textarea data-set="instruction" data-dictate-field="contact-instruction:${esc(this._open)}" ` +
+      `rows="3" maxlength="2000"${busy} ` +
       `placeholder="e.g. Draft a reply to every message. When a visit moves, add it to the calendar — you have my approval for that. Ring me only if it is about today or tomorrow.">` +
       `${esc(f.instruction || '')}</textarea>` +
+      `${dictateButtonHtml(`contact-instruction:${this._open}`, 'Dictate the instruction')}</div>` +
       (copy ? `<div class="chips" style="margin-top:6px">${copy}</div>` : '') +
       `<div class="note">A model works each of their messages by this, on every channel above — a mail from one of ` +
       `their addresses or domains included: it stages a ` +
@@ -626,12 +632,15 @@ class RetinueContacts extends HTMLElement {
       body = (this._open === 'new' ? `<ul style="margin-bottom:10px"><li>${this._editor()}</li></ul>` : '') +
         (rows ? `<ul>${rows}</ul>` : `<p class="muted">${this._q ? 'Nobody matches.' : 'Nobody in the address book yet.'}</p>`);
     }
-    root.innerHTML = `<style>${CSS}</style>` +
+    root.innerHTML = `<style>${CSS}${DICTATE_CSS}</style>` +
       `<header><h2>Contacts${list.length ? ` · ${list.length}` : ''}</h2>` +
       `<button class="btn tiny" data-act="new"${this._busy ? ' disabled' : ''}>+ New contact</button></header>` +
-      `<input type="search" data-set="q" value="${esc(this._q)}" placeholder="Search names, e-mail addresses and domains" autocomplete="off">` +
+      `<div class="dict-field line q"><input type="search" data-set="q" data-dictate-field="contacts-search" value="${esc(this._q)}" ` +
+      `placeholder="Search names, e-mail addresses and domains" autocomplete="off">` +
+      `${dictateButtonHtml('contacts-search', 'Dictate a search')}</div>` +
       (this._error && !this._form ? `<div class="err">${esc(this._error)}</div>` : '') + body +
       this._pickHtml();
+    wireDictation(root);
     if (active) {
       const q = root.querySelector('[data-set="q"]');
       q.focus();

@@ -76,6 +76,7 @@
 
 import { esc } from './base.js';
 import { loadDraft, saveDraft } from './drafts.js';
+import { dictateButtonHtml, wireDictation, DICTATE_CSS } from './dictate-field.js';
 
 const COMPOSE_URL = '/chats/compose';
 const CONTACTS_URL = '/contacts';
@@ -296,6 +297,13 @@ class RetinueComposeSheet extends HTMLElement {
   }
 
   _slotKey(account) { return `${this._indexKey}:${String(account || '').toLowerCase()}`; }
+  // The dictation keys' base (dictate-field.js): the mail being written, not
+  // just the channel — a transcription still running when From moves to a
+  // mailbox with a kept mail of its own goes back into the mail it was spoken
+  // for (when that mailbox is chosen again), never into the other one. When
+  // the mail itself goes with From (_switchAccount's first case) the fields
+  // keep their keys, and a pending dictation follows the mail.
+  get _dictKey() { return this._slotKey(this._account); }
 
   get _key() { return this._slotKey(this._account); }
 
@@ -547,7 +555,7 @@ class RetinueComposeSheet extends HTMLElement {
           : 'Choose that mailbox under From to go on with it.') + '</p>';
       if (waits) restored += this._waitingHtml(a);
     }
-    this.shadowRoot.innerHTML = `<style>${CSS}</style>` +
+    this.shadowRoot.innerHTML = `<style>${CSS}${DICTATE_CSS}</style>` +
       `<div class="overlay" data-overlay>` +
       `<form class="sheet" role="dialog" aria-modal="true" aria-labelledby="compose-title" data-form novalidate>` +
       `<div class="head"><h2 id="compose-title">New ${esc(/^e-mail$/i.test(o.label) ? 'e-mail' : o.label)}</h2>` +
@@ -556,10 +564,14 @@ class RetinueComposeSheet extends HTMLElement {
       restored + from +
       this._recipHtml('to', 'To') + this._recipHtml('cc', 'Cc') +
       `<div class="row-f"><label class="lbl" for="compose-subject">Subject</label>` +
-      `<input id="compose-subject" data-subject type="text" autocomplete="off" value="${esc(this._subject)}"></div>` +
+      `<div class="dict-field line"><input id="compose-subject" data-subject type="text" autocomplete="off" ` +
+      `data-dictate-field="${esc(this._dictKey)}:subject" value="${esc(this._subject)}">` +
+      `${dictateButtonHtml(`${this._dictKey}:subject`, 'Dictate the subject')}</div></div>` +
       `<div class="row-f"><label class="lbl" for="compose-text">Message</label>` +
-      `<textarea id="compose-text" data-text rows="8" enterkeyhint="enter" ` +
+      `<div class="dict-field"><textarea id="compose-text" data-text rows="8" enterkeyhint="enter" ` +
+      `data-dictate-field="${esc(this._dictKey)}:text" ` +
       `aria-describedby="err-text compose-hint">${esc(this._text)}</textarea>` +
+      `${dictateButtonHtml(`${this._dictKey}:text`, 'Dictate the message')}</div>` +
       `<p class="err" id="err-text" data-err="text" hidden></p></div>` +
       `<p class="hint" id="compose-hint">Enter starts a new line; Ctrl+Enter or &#8984;+Enter sends. ` +
       `Under the mailbox&rsquo;s send policy the mail may wait for your approval before it goes out.</p>` +
@@ -571,6 +583,7 @@ class RetinueComposeSheet extends HTMLElement {
     for (const f of FIELDS) this._paintChips(f);
     this._paintErrors();
     this._paintBusy();
+    wireDictation(this.shadowRoot);
   }
 
   // A mail kept for a mailbox that is not offered, shown as text: whom it
@@ -599,10 +612,12 @@ class RetinueComposeSheet extends HTMLElement {
       `<label class="lbl" for="compose-${f}">${label}</label>` +
       `<div class="chips-in">` +
       `<ul class="chips" data-chips="${f}" aria-label="${label}: the recipients so far"></ul>` +
-      `<input id="compose-${f}" data-input="${f}" type="text" inputmode="email" autocomplete="off" ` +
+      `<span class="dict-field line recip-box"><input id="compose-${f}" data-input="${f}" type="text" inputmode="email" autocomplete="off" ` +
+      `data-dictate-field="${esc(this._dictKey)}:${f}" ` +
       `autocapitalize="off" spellcheck="false" role="combobox" aria-autocomplete="list" ` +
       `aria-expanded="false" aria-controls="sugg-${f}" aria-describedby="err-${f}" ` +
       `placeholder="${f === 'to' ? 'Name or address' : 'Copy to …'}" value="${esc(this._typed[f])}">` +
+      `${dictateButtonHtml(`${this._dictKey}:${f}`, f === 'to' ? 'Dictate a name' : 'Dictate a name to copy to')}</span>` +
       `</div>` +
       `<ul class="sugg" id="sugg-${f}" role="listbox" aria-label="Suggestions from the address book" ` +
       `data-sugg="${f}" hidden></ul>` +
@@ -1229,7 +1244,8 @@ const CSS = `
               background: var(--bg, #0b0d12); border: 1px solid var(--line, rgba(231, 235, 242, .14));
               border-radius: 10px; padding: 4px; }
   .chips-in:focus-within { outline: 2px solid var(--outbound, #f0b45e); }
-  .chips-in input[type="text"] { flex: 1 1 10em; min-width: 8em; border: 0; padding: 4px 6px;
+  .chips-in .recip-box { flex: 1 1 10em; min-width: 8em; }
+  .chips-in input[type="text"] { width: 100%; border: 0; padding: 4px 6px;
                                  background: transparent; }
   .chips-in input[type="text"]:focus-visible { outline: none; }
   .chips { display: contents; list-style: none; margin: 0; padding: 0; }

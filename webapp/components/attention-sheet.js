@@ -21,6 +21,7 @@
 // dispatches `retinue-attention-change` on window, so an open list refreshes.
 
 import { esc } from './base.js';
+import { dictateButtonHtml, wireDictation, DICTATE_CSS } from './dictate-field.js';
 
 export const LEVEL_COLORS = {
   critical: '#ff5d5d', 'time-sensitive': '#e08a2e', active: '#4fb3b9', passive: '#4a5563',
@@ -608,13 +609,16 @@ class RetinueAttentionSheet extends HTMLElement {
     return `<div class="field screened"><div class="f-label">${card ? 'Contact' : 'New contact'}</div>` +
       `<div class="card-form">` +
       (form.person ? '' : suggest) +
-      `<input type="text" data-set="contact-name" value="${esc(form.name)}" placeholder="Their name" autocomplete="off">` +
+      `<div class="dict-field line"><input type="text" data-set="contact-name" data-dictate-field="sheet-contact-name:${esc(this._id)}" ` +
+      `value="${esc(form.name)}" placeholder="Their name" autocomplete="off">` +
+      `${dictateButtonHtml(`sheet-contact-name:${this._id}`, 'Dictate the name')}</div>` +
       where +
       `<div><div class="f-k">belongs to</div><div class="chips">${choices.map(pick).join('')}</div>` +
       `<div class="f-note">The sphere decides which modes let them through.</div></div>` +
       `<div><div class="f-k">also</div><div class="chips">${choices.filter((s) => s !== form.sphere).map(tag).join('')}` +
       (this._newSphere === 'contact'
-        ? `<input class="sphere-new" type="text" data-set="contact-sphere-new" placeholder="new sphere" autocomplete="off" autofocus>`
+        ? `<input class="sphere-new" type="text" data-set="contact-sphere-new" data-dictate-exempt="saves-on-change" ` +
+          `placeholder="new sphere" autocomplete="off" autofocus>`
         : `<button class="btn tiny" data-act="contact-new-sphere"${busy}>+ new</button>`) +
       `</div><div class="f-note">Further spheres — each counts for a mode like the first. A sphere is a word: add one here.</div></div>` +
       `<div class="f-ctl"><button class="btn tiny${form.permit ? ' on' : ''}" data-act="contact-permit"${busy}>` +
@@ -637,9 +641,11 @@ class RetinueAttentionSheet extends HTMLElement {
         others.map((p) => `<option value="${esc(p.id)}">${esc(p.name)}</option>`).join('') + `</select>`
       : '';
     return `<div><div class="f-k">instruction</div>` +
-      `<textarea data-set="contact-instruction" rows="3" maxlength="2000"${busy} ` +
+      `<div class="dict-field"><textarea data-set="contact-instruction" data-dictate-field="sheet-contact-instruction:${esc(this._id)}" ` +
+      `rows="3" maxlength="2000"${busy} ` +
       `placeholder="How their messages are to be handled — e.g. draft a reply; add a moved visit to the calendar; ring me only if it is about today.">` +
       `${esc(form.instruction || '')}</textarea>` +
+      `${dictateButtonHtml(`sheet-contact-instruction:${this._id}`, 'Dictate the instruction')}</div>` +
       (copy ? `<div class="f-ctl" style="margin-top:4px">${copy}</div>` : '') +
       `<div class="f-note">A model works each of their messages by this — a reply staged in the draft, never sent; ` +
       `the actions you name — and sets how important it is, which decides whether it rings once the work is done ` +
@@ -734,7 +740,8 @@ class RetinueAttentionSheet extends HTMLElement {
           `<span class="f-note">${item.kind_label ? `the lead corrects every “${esc(item.kind_label)}”` : 'this item only — no kind declared'}</span>`;
       const spheres = (d.spheres || Object.keys(SPHERE_COLORS));
       const sphereSel = (this._newSphere === 'item'
-        ? `<input class="sphere-new" type="text" data-set="sphere-new" placeholder="new sphere" autocomplete="off" autofocus>`
+        ? `<input class="sphere-new" type="text" data-set="sphere-new" data-dictate-exempt="saves-on-change" ` +
+          `placeholder="new sphere" autocomplete="off" autofocus>`
         : `<select class="select" data-set="sphere"${busy}>` +
           spheres.map((s) => `<option value="${esc(s)}"${s === item.sphere ? ' selected' : ''}>${esc(s)}</option>`).join('') +
           (spheres.includes(item.sphere) ? '' : `<option value="${esc(item.sphere)}" selected>${esc(item.sphere)}</option>`) +
@@ -830,7 +837,8 @@ class RetinueAttentionSheet extends HTMLElement {
         `</div>${actions}${learned}${effect}` +
         (this._error ? `<div class="err">${esc(this._error)}</div>` : '');
     }
-    root.innerHTML = `<style>${CSS}</style><div class="overlay"><div class="sheet" role="dialog" aria-modal="true">${inner}</div></div>`;
+    root.innerHTML = `<style>${CSS}${DICTATE_CSS}</style><div class="overlay"><div class="sheet" role="dialog" aria-modal="true">${inner}</div></div>`;
+    wireDictation(root);
   }
 }
 
