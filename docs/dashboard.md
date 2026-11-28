@@ -464,6 +464,8 @@ dashboard, or from the phone on the channels that echo it — not SMS), *Mark
 handled*, *Mark as read* or archiving the chat settles it. Undoing a *Mark as
 read* reopens the item only where that mark settled it.
 The chat page carries **Archive** and **Mute** switches in its header's ⋮ menu
+— buttons in the header itself where it is wide enough, next to Spam and
+Delete; Star is the star before the chat's name —
 (`POST /chats/<id>/flags {archived?, muted?}`), with the thread flags'
 meaning: an archived chat leaves the chats list and comes back when a
 message arrives unless it is muted, and muted also silences its push;
