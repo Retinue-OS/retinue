@@ -351,14 +351,19 @@ def thread_key(path: Path) -> str | None:
     return "inbox-doc:" + h.hexdigest()
 
 
-def settle_thread(key: str) -> None:
+def settle_thread(key: str) -> bool:
     """Mark the thread opened under `key` done: its document has left the
-    inbox, so the question it asked is answered. Best-effort -- a thread
-    never opened (the Archivist needed no decision) answers 404, and a
-    gateway that is down costs a stale list entry, never a sweep."""
+    inbox, so the question it asked is answered. True once that is settled
+    -- marked done (2xx), never opened because the Archivist needed no
+    decision (404), or deleted by the user (410, their answer). False when
+    it could not be told (no token, gateway down, any other error): the
+    caller keeps the key and tries again next tick, so an outage such as a
+    self-update never leaves a thread open for good."""
     token = os.environ.get("CONVERSATION_BACKEND_TOKEN", "").strip()
     if not token:
-        return
+        print(f"[inbox-sweep] cannot settle thread {key}: no "
+              "CONVERSATION_BACKEND_TOKEN", file=sys.stderr)
+        return False
     req = urllib.request.Request(
         ATTENTION_SET_URL,
         data=json.dumps({"key": key, "state": "done"}).encode("utf-8"),
@@ -369,13 +374,16 @@ def settle_thread(key: str) -> None:
         with urllib.request.urlopen(req, timeout=30):
             print(f"[inbox-sweep] document gone; its thread is done ({key})",
                   file=sys.stderr)
+            return True
     except urllib.error.HTTPError as e:
-        if e.code not in (404, 410):
-            print(f"[inbox-sweep] could not settle thread {key}: HTTP {e.code}",
-                  file=sys.stderr)
+        if e.code in (404, 410):
+            return True
+        print(f"[inbox-sweep] could not settle thread {key}: HTTP {e.code}",
+              file=sys.stderr)
     except (urllib.error.URLError, OSError) as e:
         print(f"[inbox-sweep] could not settle thread {key}: {e}",
               file=sys.stderr)
+    return False
 
 
 def settled_from(state: dict, current: dict[str, dict],
@@ -567,54 +575,94 @@ def main() -> int:
             paths[f"{item_key}/{f.relative_to(item['path'])}"] = f
     state = load_state()
     settled = settled_from(state, current, paths)
+    pending = state.get("pending") or {}
 
-    # A file left behind and since gone: its question is answered (filed by
-    # the user, or by the Archivist after their reply), so its thread is
-    # done. Checked on disk, not against the scan -- an inbox skipped this
-    # tick (a bad manifest, a letterbox not dispatched) has not been emptied.
+    # The content key of every file lying in an inbox now (a settled file
+    # unchanged keeps the key on record, so only new or changed files are
+    # hashed), plus the keys of files left behind in an inbox not scanned
+    # this tick. A key some file still carries is not gone, whichever file
+    # it was first asked about: a renamed copy, or the same content in
+    # another inbox, keeps its thread open.
+    keys: dict[str, str | None] = {}
+    for fid, e in current.items():
+        rec = settled.get(fid)
+        if rec and rec.get("stat") == e["stat"] and rec.get("key"):
+            keys[fid] = rec["key"]
+        else:
+            keys[fid] = thread_key(paths[fid])
+    present = {k for k in keys.values() if k}
+
+    def lies_unscanned(fid: str, path: str | None) -> bool:
+        return fid not in current and bool(path) and os.path.lexists(path)
+
+    for fid, rec in settled.items():
+        if rec.get("key") and lies_unscanned(fid, rec.get("path")):
+            present.add(rec["key"])
+
+    # Keys whose thread is to be marked done: those a failed attempt left
+    # over, plus every key whose file is gone from its inbox (filed by the
+    # user, or by the Archivist after their reply) or now carries other
+    # content (edited: a new document under a new key). Checked on disk, not
+    # against the scan -- an inbox skipped this tick (a bad manifest, a
+    # letterbox not dispatched) has not been emptied.
+    to_settle = set(state.get("unsettled") or [])
     for fid, rec in list(settled.items()):
         if fid in current and current[fid]["stat"] == rec.get("stat"):
             continue
-        gone = fid not in current and not (
-            rec.get("path") and os.path.lexists(rec["path"]))
-        if fid in current or gone:
-            # Changed in place: a new document, handed over again below.
-            # Gone: settle its thread. Either way no longer settled.
-            del settled[fid]
-            if gone and rec.get("key"):
-                settle_thread(rec["key"])
+        if lies_unscanned(fid, rec.get("path")):
+            continue
+        # Changed in place (handed over again below) or gone: either way no
+        # longer settled; its old key is done unless the file still has it.
+        del settled[fid]
+        if rec.get("key") and keys.get(fid) != rec["key"]:
+            to_settle.add(rec["key"])
+    # A session that failed or was killed may have opened threads for the
+    # files it was handed: settle those whose file is gone or changed since.
+    for fid, rec in (pending.get("keys") or {}).items():
+        key = rec.get("key") if isinstance(rec, dict) else None
+        if not key or lies_unscanned(fid, rec.get("path")):
+            continue
+        if keys.get(fid) != key:
+            to_settle.add(key)
+    unsettled = sorted(k for k in to_settle - present if not settle_thread(k))
+
+    def save(**extra) -> None:
+        out = dict(extra)
+        if settled:
+            out["settled"] = settled
+        if unsettled:
+            out["unsettled"] = unsettled
+        save_state(out)
 
     if not scan:
         # Nothing pending anywhere: the guard is empty (files left behind in
         # an inbox skipped this tick excepted), so the next arrival, even of
         # a file that was stuck before, spawns a session again.
-        if STATE_PATH.exists():
-            save_state({"settled": settled} if settled else {})
+        if STATE_PATH.exists() or unsettled:
+            save()
         print("[inbox-sweep] all declared inboxes empty; nothing spawned",
               file=sys.stderr)
         return 0
 
     todo = {fid: e for fid, e in current.items() if fid not in settled}
     if not todo:
-        save_state({"settled": settled})
+        save()
         print("[inbox-sweep] only files already handed over and left behind "
               "(the Archivist could not classify them); nothing spawned",
               file=sys.stderr)
         return 0
 
     todo_sig = {fid: e["stat"] for fid, e in todo.items()}
-    pending = state.get("pending") or {}
     now = time.time()
     if pending.get("signature") == todo_sig and pending.get("failures"):
         if not retry_due(pending, now):
             print(f"[inbox-sweep] last session failed "
                   f"({pending['failures']}x); backing off", file=sys.stderr)
-            save_state({"settled": settled, "pending": pending})
+            save(pending=pending)
             return 0
 
     # Hand over only the new or changed files, each with the key its thread
     # is opened under.
-    keys = {fid: thread_key(paths[fid]) for fid in todo}
     handed = []
     for item in scan:
         item_key = f"{item['chamber']}:{Path(item['rel']).as_posix()}"
@@ -648,9 +696,12 @@ def main() -> int:
     # again at once instead of backing off. A clean exit overwrites it below.
     failures = (int(pending.get("failures") or 0) + 1
                 if pending.get("signature") == todo_sig else 1)
-    save_state({"settled": settled,
-                "pending": {"signature": todo_sig, "failures": failures,
-                            "attempted_at": now}})
+    # The keys travel with it: should the session have opened a thread and
+    # the file leave during the backoff, the next tick still settles it.
+    save(pending={"signature": todo_sig, "failures": failures,
+                  "attempted_at": now,
+                  "keys": {fid: {"key": keys[fid], "path": str(paths[fid])}
+                           for fid in todo if keys[fid]}})
     result = subprocess.run(cmd, cwd="/workspace", env=env)
 
     if result.returncode == 0:
@@ -666,7 +717,7 @@ def main() -> int:
             if [st.st_size, st.st_mtime_ns] == e["stat"]:
                 settled[fid] = {"stat": e["stat"], "key": keys[fid],
                                 "path": str(p)}
-        save_state({"settled": settled})
+        save()
     else:
         # A failed session (API or auth hiccup) has not looked at the files;
         # the pre-recorded failure retries the same listing later, backing
@@ -674,6 +725,7 @@ def main() -> int:
         print(f"[inbox-sweep] session exited {result.returncode}; will retry "
               f"with backoff (failure {failures})", file=sys.stderr)
     return result.returncode
+
 
 if __name__ == "__main__":
     raise SystemExit(main())
