@@ -61,6 +61,17 @@ class Harness:
 
         mod.subprocess = types.SimpleNamespace(run=fake_run)
 
+        # The gateway that marks a thread done: records every attempt, and
+        # answers as `gateway_up` says (False: an outage, the key is kept).
+        self.settle_calls = []
+        self.gateway_up = True
+
+        def fake_settle(key):
+            self.settle_calls.append(key)
+            return self.gateway_up
+
+        mod.settle_thread = fake_settle
+
     def chamber(self, name, manifest):
         c = self.chambers / name
         c.mkdir()
@@ -182,7 +193,7 @@ def test_killed_session(mod, tmp: Path):
     except Killed:
         pass
     check("the attempt was recorded as a failure",
-          json.loads(mod.STATE_PATH.read_text()).get("failures"), 1)
+          json.loads(mod.STATE_PATH.read_text())["pending"].get("failures"), 1)
     h.now += 60
     check("the next tick does not spawn again at once", h.tick(), False)
     h.now += 3600
@@ -392,8 +403,185 @@ def test_letterbox_quarantine(mod, tmp: Path):
           (True, True, False))
 
 
+def test_one_thread_per_document(mod, tmp: Path):
+    print("a document left behind is handed over once, and its thread settles")
+    h = Harness(mod, tmp)
+    settled_keys = h.settle_calls
+    box = h.chamber("inbox", {"inboxes": [{"id": "letterbox", "path": "."}],
+                              "destinations": []})
+    mod.letterbox.LETTERBOX_DIR = box
+    docs = h.chamber("docs", inbox_manifest())
+    (docs / "inbox").mkdir()
+    letter = box / "scan.pdf"
+    letter.write_bytes(b"letter")
+    check("the letter is handed over", h.tick(), True)
+    listing = json.loads(h.spawns[-1].split("```json\n", 1)[1].split("\n```", 1)[0])
+    key = listing[0]["thread_keys"].get("scan.pdf", "")
+    check("…with a content key for its thread", key.startswith("inbox-doc:"), True)
+    check("…and the prompt says to open its thread under that key",
+          "--key" in h.spawns[-1], True)
+    check("left behind and unchanged: nothing spawned", h.tick(), False)
+
+    # The case that raised a second thread: an arrival elsewhere.
+    (docs / "inbox" / "food.md").write_text("x")
+    check("an arrival in another inbox spawns", h.tick(), True)
+    check("…but hands over only the new file",
+          ("food.md" in h.spawns[-1], "scan.pdf" in h.spawns[-1]), (True, False))
+    (docs / "inbox" / "food.md").unlink()
+
+    (box / "other.pdf").write_bytes(b"other")
+    h.tick()
+    check("an arrival beside it does not hand it over again",
+          "scan.pdf" in h.spawns[-1], False)
+    (box / "other.pdf").unlink()
+    h.tick()
+    check("another file leaving settles not the letter's thread",
+          key in settled_keys, False)
+
+    renamed = box / "scan-again.pdf"
+    renamed.write_bytes(b"letter")
+    h.tick()
+    got = json.loads(h.spawns[-1].split("```json\n", 1)[1].split("\n```", 1)[0])
+    check("a re-dropped copy gets the same key, so the same thread",
+          got[0]["thread_keys"].get("scan-again.pdf"), key)
+    renamed.unlink()
+    h.tick()
+
+    letter.unlink()
+    h.tick()
+    check("once the letter is gone, its thread is marked done",
+          settled_keys.count(key) >= 1, True)
+    n = len(settled_keys)
+    h.tick()
+    check("…once only", len(settled_keys), n)
+
+
+def test_state_migration(mod, tmp: Path):
+    print("the old whole-listing guard is taken over without a re-run")
+    h = Harness(mod, tmp)
+    c = h.chamber("docs", inbox_manifest())
+    (c / "inbox").mkdir()
+    f = c / "inbox" / "a.pdf"
+    f.write_text("1")
+    st = f.stat()
+    mod.STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    mod.STATE_PATH.write_text(json.dumps(
+        {"signature": {"docs:inbox": {"a.pdf": [st.st_size, st.st_mtime_ns]}}}))
+    check("a file the old guard had settled is not handed over again",
+          h.tick(), False)
+    check("…and is now settled per file",
+          list(json.loads(mod.STATE_PATH.read_text())["settled"]), ["docs:inbox/a.pdf"])
+
+
+def listing(h):
+    return json.loads(h.spawns[-1].split("```json\n", 1)[1].split("\n```", 1)[0])
+
+
+def test_settle_retried(mod, tmp: Path):
+    print("a gateway outage does not lose the thread to settle")
+    h = Harness(mod, tmp)
+    c = h.chamber("docs", inbox_manifest())
+    (c / "inbox").mkdir()
+    f = c / "inbox" / "a.pdf"
+    f.write_bytes(b"a")
+    h.tick()
+    key = listing(h)[0]["thread_keys"]["a.pdf"]
+    f.unlink()
+    h.gateway_up = False
+    h.tick()
+    check("the failed settle is tried", h.settle_calls, [key])
+    check("…and kept for later",
+          json.loads(mod.STATE_PATH.read_text()).get("unsettled"), [key])
+    h.tick()
+    check("tried again next tick", h.settle_calls, [key, key])
+    h.gateway_up = True
+    h.tick()
+    check("settled once the gateway answers", h.settle_calls, [key] * 3)
+    h.tick()
+    check("…and then forgotten", (h.settle_calls, json.loads(
+        mod.STATE_PATH.read_text())), ([key] * 3, {}))
+
+
+def test_settle_after_failed_session(mod, tmp: Path):
+    print("a thread a failed session opened settles once its file is gone")
+    h = Harness(mod, tmp)
+    c = h.chamber("docs", inbox_manifest())
+    (c / "inbox").mkdir()
+    f = c / "inbox" / "a.pdf"
+    f.write_bytes(b"a")
+    h.exit_code = 1
+    h.tick()
+    key = listing(h)[0]["thread_keys"]["a.pdf"]
+    check("the pending record carries the key",
+          json.loads(mod.STATE_PATH.read_text())["pending"]["keys"]
+          ["docs:inbox/a.pdf"]["key"], key)
+    h.now += 60
+    check("backing off", h.tick(), False)
+    check("…settles nothing while the file lies there", h.settle_calls, [])
+    f.unlink()
+    h.tick()
+    check("moved away during the backoff: its thread is done",
+          h.settle_calls, [key])
+    h.tick()
+    check("…once only", h.settle_calls, [key])
+
+
+def test_rename_edit_duplicate(mod, tmp: Path):
+    print("a key is settled only once no file carries it")
+    h = Harness(mod, tmp)
+    c = h.chamber("docs", {**inbox_manifest(),
+                           "inboxes": [{"id": "a", "path": "a"},
+                                       {"id": "b", "path": "b"}]})
+    (c / "a").mkdir()
+    (c / "b").mkdir()
+
+    # Rename: same content under a new name keeps its thread open.
+    f = c / "a" / "scan.pdf"
+    f.write_bytes(b"scan")
+    h.tick()
+    key = listing(h)[0]["thread_keys"]["scan.pdf"]
+    g = c / "a" / "renamed.pdf"
+    f.rename(g)
+    check("a renamed file is handed over again", h.tick(), True)
+    check("…under the same key", listing(h)[0]["thread_keys"]["renamed.pdf"], key)
+    check("…and its thread is not marked done", h.settle_calls, [])
+    g.unlink()
+    h.tick()
+    check("gone for good: done", h.settle_calls, [key])
+
+    # Edit: new content under the same name closes the old thread.
+    h.settle_calls.clear()
+    f.write_bytes(b"first")
+    h.tick()
+    old = listing(h)[0]["thread_keys"]["scan.pdf"]
+    f.write_bytes(b"second, edited")
+    check("an edited file is handed over again", h.tick(), True)
+    new = listing(h)[0]["thread_keys"]["scan.pdf"]
+    check("…under a new key", new != old, True)
+    check("…and the old document's thread is done", h.settle_calls, [old])
+    f.unlink()
+    h.tick()
+    h.settle_calls.clear()
+
+    # Duplicate: identical content in two inboxes shares one key.
+    one, two = c / "a" / "x.pdf", c / "b" / "x.pdf"
+    one.write_bytes(b"same")
+    two.write_bytes(b"same")
+    h.tick()
+    keys = {i["inbox"]: i["thread_keys"]["x.pdf"] for i in listing(h)}
+    check("both copies share one key", keys["a"] == keys["b"], True)
+    one.unlink()
+    h.tick()
+    check("one copy gone, the other still there: not done", h.settle_calls, [])
+    two.unlink()
+    h.tick()
+    check("both gone: done", h.settle_calls, [keys["a"]])
+
+
 def main():
-    for test in (test_letterbox, test_letterbox_quarantine, test_gate, test_duplicate_ids, test_state_write,
+    for test in (test_one_thread_per_document, test_state_migration,
+                 test_settle_retried, test_settle_after_failed_session,
+                 test_rename_edit_duplicate, test_letterbox, test_letterbox_quarantine, test_gate, test_duplicate_ids, test_state_write,
                  test_failed_session, test_killed_session,
                  test_manifests, test_nowhere_to_file, test_prompt_escaping,
                  test_symlinks,

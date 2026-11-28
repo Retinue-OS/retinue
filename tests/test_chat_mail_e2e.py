@@ -288,6 +288,34 @@ def test_a_reply_is_sent(r: Rig):
     assert body["pending"] == []
 
 
+def test_the_press_sends_under_verify(r: Rig):
+    """The press is the approval on e-mail as on the messengers: under
+    `verify` the real gateway queues the user's reply, the press releases it
+    at once, and the mail goes out — no approval link, nothing on /sends."""
+    r.arrives("pv@x.org", day=1)
+    r.policy("verify")
+    try:
+        key = KEY.format(60)
+        mails = len(r.smtp.mails)
+        status, msg = r.send("pv@x.org", {"text": "Yes, on my way.", "request_key": key})
+        assert status == 200 and msg["text"] == "Yes, on my way.", msg
+        assert "unconfirmed" not in msg and len(r.smtp.mails) == mails + 1
+        (entry,) = r.entries(key)
+        assert entry["status"] == "approved" and msg["id"] == entry["message_id"], entry
+        assert r.draft("pv@x.org") is None and r.listed("pv@x.org")["unread"] == 0
+        assert r.messages("pv@x.org")["pending"] == []
+        # An agent's mail to the same thread still waits for the user.
+        status, queued = r.gateway("POST", "/send", {
+            "recipient": "pv@x.org", "message": "From Ara", "author": "agent",
+            "user_approved": True})
+        assert status == 202 and queued["status"] == "pending_approval", queued
+        assert len(r.smtp.mails) == mails + 1
+        r.gateway("POST", f"/pending-sends/{queued['request_id']}/retract")
+    finally:
+        r.policy("trust")
+    r.settle()
+
+
 # ── A send that certainly failed ends its press (decision E) ─────────────────
 
 def test_a_refused_send_ends_its_press(r: Rig):
@@ -746,8 +774,11 @@ def test_a_repeat_clears_the_draft_it_repeats(r: Rig):
     assert r.send("i@x.org", {"text": words, "request_key": key})[0] == 200
     assert r.draft("i@x.org") == "Something else"
     r.wg._CHAT_STATE.clear_draft(cid)
-    # Queued: answered 202 {pending} from the send that waits.
+    # Queued: answered 202 {pending} from the send that waits — what a
+    # press leaves where its release cannot be given (_mail_send_pressed,
+    # left out here to make one).
     r.policy("verify")
+    pressed, r.wg._mail_send_pressed = r.wg._mail_send_pressed, r.wg._mail_send
     try:
         key = KEY.format(47)
         status, out = r.send("i@x.org", {"text": "Queued words", "request_key": key})
@@ -758,6 +789,7 @@ def test_a_repeat_clears_the_draft_it_repeats(r: Rig):
         assert r.draft("i@x.org") is None, "the queued mail is not left as the draft"
         r.gateway("POST", f"/pending-sends/{out['pending']['request_id']}/retract")
     finally:
+        r.wg._mail_send_pressed = pressed
         r.policy("trust")
     # Not confirmed: answered 202 {unconfirmed} from the send nobody knows of.
     key = KEY.format(48)
@@ -812,6 +844,8 @@ def test_a_new_attempt_under_a_kept_key_leaves_a_draft_typed_since(r: Rig):
 def test_an_allowed_mail_whose_answer_was_lost_is_not_worded_as_failed(r: Rig):
     r.arrives("f@x.org", day=1)
     r.policy("verify")
+    # (A press whose release could not be given: _mail_send_pressed left out.)
+    pressed, r.wg._mail_send_pressed = r.wg._mail_send_pressed, r.wg._mail_send
     try:
         # The user's own reply, queued under the policy ...
         status, out = r.send("f@x.org", {"text": "Queued reply", "request_key": KEY.format(12)})
@@ -834,6 +868,7 @@ def test_an_allowed_mail_whose_answer_was_lost_is_not_worded_as_failed(r: Rig):
             r.smtp.drop, r.smtp.takes = None, True
         assert len(r.smtp.mails) == mails
     finally:
+        r.wg._mail_send_pressed = pressed
         r.policy("trust")
     status, entry = r.gateway("GET", f"/pending-sends/{rid}")
     assert (entry["status"], entry["outcome_unknown"]) == ("error", True), entry

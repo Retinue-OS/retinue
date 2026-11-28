@@ -378,10 +378,10 @@ Messenger chats (the deterministic chat mirror; see scripts/chat_state.py):
                                          approval `verify` exists for). Returns
                                          the sent Message. A mail chat takes
                                          `reply`: "all" | "sender", and is
-                                         the exception: the press is passed
-                                         on as `user_approved` and a mail
-                                         the policy still queues stays
-                                         queued — 202 {pending}. A mail
+                                         sent the same way: a mail the
+                                         policy queues is released by the
+                                         press (202 {pending} only where
+                                         that release fails). A mail
                                          whose outcome is not known (a slow
                                          or lost answer of its gateway, an
                                          SMTP answer nobody saw) is 202
@@ -4242,11 +4242,20 @@ def _conv_archive_attention(cid: str, conv: dict, archived: bool) -> None:
             _attention_mark(f"thread:{cid}", "open", "archived")
 
 
-def _conv_set_flags(cid: str, **flags) -> dict | None:
+def _conv_set_flags(cid: str, unless_starred: bool = False, **flags) -> dict | None:
+    """Set a thread's flags under the conversations lock; None when there is
+    no such thread. ``unless_starred`` leaves a starred thread where it is:
+    ``archived``/``muted`` are dropped when the thread carries the user's
+    star, decided inside the lock so a star set at the same instant wins."""
     with _conversations_lock:
         conv = _load_conv(cid)
         if conv is None:
             return None
+        if unless_starred and conv.get("starred"):
+            for key in ("archived", "muted"):
+                flags.pop(key, None)
+            if not flags:
+                return conv
         if flags.get("pending") is True:
             now = datetime.now(timezone.utc).isoformat()
             flags.setdefault("pending_since", now)
@@ -12707,14 +12716,9 @@ def _chat_send_via_gateway(gw: dict, send_payload: dict) -> tuple[dict, str]:
     recorded in the pending store *with* its approval rather than going around
     the mechanism, and the dashboard press still completes in one action.
 
-    Not for e-mail, which is sent by _mail_send (docs/mail-chats.md,
-    Decisions: "A send from the composer goes through the send policy too").
-    On the messengers the user's send press is the approval, so a queued
-    message is released here. On e-mail it is not: the press reaches the
-    gateway as ``user_approved``, which is what `trust` asks for, and under
-    `verify` a mail queues even though the user typed it — its approval is
-    given on /sends, where the recipients the gateway built from the thread,
-    the subject and the text stand together.
+    Not for e-mail, which is sent by _mail_send_pressed: the same rule —
+    the user's send press is the approval, so a queued mail is released
+    there too — with a mail's own outcomes (docs/mail-chats.md, Decisions).
 
     That is the whole difference between the user's press and an agent: an
     agent that calls /send gets a queued message somebody still has to release.
@@ -12783,7 +12787,8 @@ def _chat_send_via_gateway(gw: dict, send_payload: dict) -> tuple[dict, str]:
 # same hop: POST <mail gateway>/send. Three things hold for it that do not
 # for a messenger's send.
 #
-# It is left queued where the policy queues it (see _chat_send_via_gateway).
+# Where the policy queues it, the user's press releases it at once
+# (_mail_send_pressed, below); an agent's send stays queued.
 #
 # It is slow: under `allow`, or `trust` with the user's press, the gateway
 # answers only when the SMTP server has taken the mail, attachments and all.
@@ -12959,6 +12964,118 @@ def _mail_send(gw: dict, send_payload: dict) -> dict:
     return unconfirmed(answer, f"an answer nobody planned for, HTTP {status}")
 
 
+def _mail_send_pressed(gw: dict, send_payload: dict) -> dict:
+    """The user's own press of Send on a mail — a reply from the composer or
+    a new mail from the compose sheet: _mail_send, and where the mailbox's
+    policy queues the mail (`verify`, or anything stricter than the press),
+    the queued mail is released at once through the gateway's own
+    /pending-sends/<id>/approve, as _chat_send_via_gateway does for the
+    messengers. The press is the approval on every channel
+    (docs/mail-chats.md, Decisions); an agent's send (`mail-push.py`) still
+    queues and waits for the user on /sends.
+
+    The approval is recorded on the entry like one given on /sends, and the
+    mail is carried out by the gateway off that request, so its end is read
+    off the entry and answered in _mail_send's terms:
+
+    - ``approved`` → ``sent``, with what the gateway's own 200 would carry;
+    - an ``error`` that left nothing → ``failed`` (424, by the gateway), the
+      entry dismissed — as a direct send's is — so the chat does not show it
+      failed a second time beside the words back in the composer;
+    - an ``error`` whose outcome is open, or still ``sending`` after
+      MAIL_SEND_TIMEOUT → ``unconfirmed``: a mail that may have gone out is
+      never reported as not sent;
+    - an approval the gateway would not give, or could not be asked for, →
+      the ``pending`` it was: queued, with its approval link, which is the
+      honest fallback rather than a failure;
+    - an approval asked for whose answer was lost (a timeout, a dropped
+      connection — anything after the request was written) → the entry is
+      read back (GET /pending-sends/<id>) and mapped as above; where that
+      cannot be read either, ``unconfirmed`` — never ``pending``, which
+      would show an approval bubble beside a mail the gateway may be
+      sending. Only a request that never left (``URLError``) is ``pending``.
+
+    Where this approval released the mail — the entry, pending when /send
+    answered, is ``sending`` or ``approved`` after it — the result carries
+    ``released: True`` and ``repeat: False``, whatever /send said: that
+    answer may have come from an earlier request of the press that queued
+    the mail, but this request is the one that made it go, and the reply
+    is its own (the read mark, the attention item, the mailbox). The
+    handler then does not ask _mail_repeated about it.
+
+    Never raises."""
+    sent = _mail_send(gw, send_payload)
+    if sent["outcome"] != "pending":
+        return sent
+    answer = sent.get("answer") or {}
+    request_id = str(answer.get("request_id") or "").strip()
+    if not re.fullmatch(r"[0-9a-f]{32}", request_id):
+        return sent
+    try:
+        status, entry = _gateway_hop(gw, f"/pending-sends/{request_id}/approve")
+    except urllib.error.URLError as exc:
+        # Before the request was written: nothing was asked, it waits.
+        print(f"[web-gateway] could not release queued mail {request_id} "
+              f"({exc.reason}); it waits for approval", flush=True)
+        return sent
+    except Exception as exc:  # noqa: BLE001 - asked, and the answer lost: read the entry
+        print(f"[web-gateway] the answer to releasing queued mail {request_id} was lost "
+              f"({type(exc).__name__}: {exc}); asking the gateway how it stands", flush=True)
+        try:
+            status, entry = _gateway_hop(gw, f"/pending-sends/{request_id}", method="GET")
+        except Exception:  # noqa: BLE001 - nobody can say: it may be on its way
+            status, entry = 0, None
+        if status != 200 or not isinstance(entry, dict):
+            entry = {"status": "unknown"}
+    else:
+        if status != 200 or not isinstance(entry, dict):
+            print(f"[web-gateway] the mail gateway would not release queued mail "
+                  f"{request_id} (HTTP {status}); it waits for approval", flush=True)
+            return sent
+    # Pending when /send answered, and on its way now: this request let it go.
+    released = entry.get("status") in ("sending", "approved")
+    deadline = time.time() + MAIL_SEND_TIMEOUT
+    while entry.get("status") == "sending" and time.time() < deadline:
+        time.sleep(CHAT_SEND_CONFIRM_INTERVAL)
+        try:
+            status, polled = _gateway_hop(gw, f"/pending-sends/{request_id}", method="GET")
+        except Exception:  # noqa: BLE001 - a lost poll says nothing of the send
+            continue
+        if status == 200 and isinstance(polled, dict):
+            entry = polled
+    state = entry.get("status")
+    repeat = sent.get("repeat") is True and not released
+    mark = {"released": True} if released else {}
+    ids = {"message_id": entry.get("message_id") or answer.get("message_id"),
+           "chat": entry.get("chat") or answer.get("chat")}
+    if state == "approved":
+        told = {key: entry[key] for key in ("refused", "skipped") if entry.get(key)}
+        return {"outcome": "sent", "repeat": repeat, **mark,
+                "answer": {"status": "sent", **ids, "ts": entry.get("sent_at"),
+                           "attachments": entry.get("attachments") or [], **told}}
+    if state == "pending":
+        # (Not decided by this approval — nothing was released.)
+        return sent
+    if state == "error" and entry.get("outcome_unknown") is False:
+        try:
+            _gateway_hop(gw, f"/pending-sends/{request_id}/dismiss")
+        except Exception:  # noqa: BLE001 - the chat then shows it failed, too
+            pass
+        return {"outcome": "failed", "by": "gateway", "status": MAIL_SEND_FAILED_STATUS,
+                "error": _one_line(entry.get("error"))
+                or "The mail server did not take the mail; nothing was sent."}
+    if state in ("rejected", "retracted"):
+        return {"outcome": "failed", "by": "gateway", "status": 409,
+                "error": f"This mail was {state} before it went out; nothing was sent."}
+    mid, chat = ids["message_id"], ids["chat"]
+    print(f"[web-gateway] released mail {request_id} not confirmed "
+          f"(status {state!r}); reported as unconfirmed, never as failed", flush=True)
+    return {"outcome": "unconfirmed", "repeat": repeat, **mark,
+            "message_id": mid.strip() or None if isinstance(mid, str) else None,
+            "chat": chat.strip() or None if isinstance(chat, str) else None,
+            "note": _one_line(entry.get("error"))}
+
+
 def _mail_not_sent(sent: dict, request_key: str | None) -> dict:
     """The body a mail that certainly did not go is answered with (_mail_send's
     "failed"): the sentence, ``"sent": false``, who said so (``by``) and the
@@ -13050,8 +13167,12 @@ def _mail_repeated(chat_id: str | None, sent: dict, asked_at: float, *,
     send of the same key — a repeat, which is reconciled and nothing more
     (see above) — and not by a mail made for this request.
 
-    The gateway's own word where it gives it (``repeat``). For one that
-    does not, what its answer proves:
+    Never where this request released a queued mail itself (``released``,
+    _mail_send_pressed): the /send may have been answered from the entry an
+    earlier request of the press made, and the chat may have noted that
+    entry, but the mail went because of this request. Otherwise the
+    gateway's own word where it gives it (``repeat``). For one that does
+    not, what its answer proves:
 
     - ``instant``, the time it gives for the mail — when it was sent, or
       when its entry was made — lies before this request began;
@@ -13060,6 +13181,9 @@ def _mail_repeated(chat_id: str | None, sent: dict, asked_at: float, *,
       queue (by when that was noted). *Before* is the point: the rail may
       announce a mail, and a page's poll may list its send, while the
       request that made it is still waiting for its answer."""
+    if sent.get("released") is True:
+        # This request released the mail (_mail_send_pressed): its own.
+        return False
     if sent.get("repeat") is True:
         return True
     when = _epoch(instant)
@@ -20651,10 +20775,12 @@ class Handler(BaseHTTPRequestHandler):
         the same endpoint, with two differences. The body may say `reply`:
         "all" or "sender" — to whom the gateway addresses the mail it builds
         from its own records of the thread; this side names no recipient. And
-        the press is passed on as `user_approved`. A send the gateway queued
-        answers 202 {"pending": Pending}: the words are in the queue, so the
-        draft is cleared, and the chat shows the send waiting with its
-        approval link. Writing a reply is
+        the press is the approval, as on the messengers: a mail the
+        mailbox's send policy queues is released at once
+        (_mail_send_pressed). Only where that release cannot be given does
+        the mail stay queued, and that answers 202 {"pending": Pending}:
+        the words are in the queue, so the draft is cleared, and the chat
+        shows the send waiting with its approval link. Writing a reply is
         having read the chat, so it is marked read at the press
         (_chat_read_by_press); but nothing was replied yet, so the attention
         item stands.
@@ -20760,7 +20886,7 @@ class Handler(BaseHTTPRequestHandler):
         }
         if mail:
             # That this is the user's own press, which is what `trust` asks
-            # for; `verify` queues regardless.
+            # for; where `verify` queues it, _mail_send_pressed releases it.
             send_payload["user_approved"] = True
             send_payload["request_key"] = request_key
             if reply is not None:
@@ -20783,7 +20909,7 @@ class Handler(BaseHTTPRequestHandler):
             # What had landed at the press: a read made for it once the
             # gateway has answered covers no more (_chat_read_by_press).
             seen = int(_CHAT_STATE.get(chat_id).get("inbound_seq") or 0)
-            sent = _mail_send(gw, send_payload)
+            sent = _mail_send_pressed(gw, send_payload)
             if sent["outcome"] == "failed":
                 # Nothing left (_mail_send): the gateway's own refusal — the
                 # thread has no mail left to reply to, it cannot send, the
@@ -20800,7 +20926,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json(sent["status"], _mail_not_sent(sent, request_key))
                 return
             if sent["outcome"] == "pending":
-                # A send the gateway queued under the mailbox's send policy.
+                # Queued under the mailbox's send policy, and the press's
+                # release could not be given (_mail_send_pressed).
                 # The words are in the queue now — the composer lets go of
                 # them — and writing them read the chat; but no reply has
                 # been made: the attention item stays until the mail goes out.
@@ -20856,6 +20983,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json(502, {"error": send_error})
                 return
             repeat = again = False
+            # (A messenger's send is answered within seconds: read whole.)
+            seen = None
         message_id = (str(result.get("message_id") or "").strip() or None)
         unconfirmed = bool(result.get("unconfirmed"))
         # With no confirmation there is no channel instant either, so this is
@@ -20938,8 +21067,11 @@ class Handler(BaseHTTPRequestHandler):
         # where an earlier request of this press was made — _press_known.)
         _clear_pressed_draft(chat_id, text, again)
         # Written here and now, in answer to everything the chat held —
-        # whatever instant the channel stamps the send with.
-        _CHAT_STATE.advance_last_read(chat_id, ts, everything=True)
+        # whatever instant the channel stamps the send with. A mail's
+        # answer can come long after the press (a release waited for), so
+        # its read covers what had landed at the press and no more
+        # (``seen``); the mailbox's read below is scoped by that cover.
+        _CHAT_STATE.advance_last_read(chat_id, ts, everything=True, seen=seen)
         # The reply is what the chat waited for: its attention item is handled.
         _attention_mark(f"chat:{chat_id}", "done", "replied")
         # And the mailbox follows the chat: a reply reads the thread there
@@ -21235,7 +21367,7 @@ class Handler(BaseHTTPRequestHandler):
         if images:
             send_payload["images"] = images
         asked_at = time.time()
-        sent = _mail_send(gw, send_payload)
+        sent = _mail_send_pressed(gw, send_payload)
         if sent["outcome"] == "failed":
             # Nothing left, and no chat appears: the gateway's word on what
             # was typed (an address that does not parse, no recipient left),
@@ -22439,6 +22571,26 @@ class Handler(BaseHTTPRequestHandler):
         if payload is None:
             return
         item_id = str(payload.get("id") or "").strip()
+        key = str(payload.get("key") or "").strip()
+        if key and not item_id:
+            # A thread named by the key it was opened under
+            # (conversation-push.py --key): the inbox sweep settles the
+            # thread about a document once the document is gone, knowing
+            # only the document. A key with no live thread is 404, as is
+            # an unknown id; one whose thread the user deleted is 410.
+            if len(key) > _CONV_KEY_MAX:
+                self._send_json(400, {"error": "key too long"})
+                return
+            with _conv_keys_lock:
+                cid = _conv_for_key(key)
+                gone = _deleted_conv_for_key(key) if cid is None else None
+            if gone is not None:
+                self._send_conv_missing(gone)
+                return
+            if cid is None:
+                self._send_json(404, {"error": "no thread under this key"})
+                return
+            item_id = f"thread:{cid}"
         now = _attention_now()
         with _attention_lock:
             focus = _ATTENTION.focus()
@@ -22939,10 +23091,22 @@ class Handler(BaseHTTPRequestHandler):
         if not flags:
             self._send_json(400, {"error": "no flags given"})
             return
-        conv = _conv_set_flags(cid, **flags)
+        # `unless_starred`: a monitor tidying up its own alert (the outage
+        # that healed) leaves a thread the user starred where it is — the
+        # star is the user's word that they want it in view. Decided under
+        # the conversations lock, so a star set at the same instant wins.
+        unless_starred = payload.get("unless_starred") is True
+        conv = _conv_set_flags(cid, unless_starred=unless_starred, **dict(flags))
         if conv is None:
             self._send_conv_missing(cid)
             return
+        if unless_starred and conv.get("starred"):
+            flags.pop("archived", None)
+            flags.pop("muted", None)
+        # Archiving settles the thread's attention item, as the user's own
+        # archive does; un-archiving reopens what archiving settled.
+        if "archived" in flags:
+            _conv_archive_attention(cid, conv, flags["archived"])
         self._send_json(200, _conv_summary(conv))
 
     def _handle_agent_conversation_redact(self, cid: str) -> None:

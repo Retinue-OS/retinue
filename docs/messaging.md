@@ -721,10 +721,11 @@ out; refused recipients are named on the bubble.
 (`email_client.resolve_category`; the same JSON array `email_client.py` reads,
 now also on the `mail-gateway` service): `verify` queues, `trust` sends when
 the request carries `user_approved` and queues otherwise, `allow` sends.
-`author: "user"` grants nothing by itself. So the user's own press in the
-composer sends under `trust` and `allow`, **and queues under `verify`** — on
-the messengers a press is the approval, on e-mail it is not — and the web
-gateway never approves a queued mail on the user's behalf. The answer is `200
+`author: "user"` grants nothing by itself. The user's own press in the
+composer sends under `trust` and `allow`; under `verify` the gateway queues
+it and the web gateway releases it at once through
+`/pending-sends/<id>/approve` — the press is the approval, on e-mail as on
+the messengers. An agent's mail under `verify` waits for the user. The answer is `200
 {status: "sent", …}` or `202 {status: "pending_approval", request_id,
 approval_url, message_id, chat}`; the approval URL is built as on the other
 gateways, from `SEND_APPROVAL_BASE_URL` and the `/sends/<slug>/<id>` segment
@@ -1045,7 +1046,14 @@ that turns into one of another kind (the gateway that waited for its setup
 now cannot log in) is told in the same thread once as many checks in a row
 have seen it as open an outage (`GATEWAY_MONITOR_FAILURES`), in the new
 kind's words and with its reason, not at the next reminder. Recovery is
-reported in the same thread. So: do **not**
+reported in the same thread, which is then archived and muted (unless the
+user starred it): the alert is obsolete, and a later outage opens its own.
+An archive call that fails is retried on every following check until it
+lands (a thread that is gone counts as done). The archive goes through
+`POST /internal/conversations/<id>/flags` with `unless_starred`, which —
+for every caller, `conversation-push.py --archive` included — settles the
+thread's attention item on archive and reopens it on unarchive
+(`docs/dashboard.md`, "Agents set the flags"). So: do **not**
 build ad-hoc liveness checks for these channels; if a user reports a channel
 seems dead, check `/gateways` (or the gateways' `/health`) first, and treat a
 `SIGNAL_SEND_POLICY`-style unconfigured channel (`configured: false`) as

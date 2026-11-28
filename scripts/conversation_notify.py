@@ -43,7 +43,9 @@ class ConversationNotifier:
         self.timeout = timeout
         self.log_prefix = log_prefix
 
-    def _post(self, url: str, payload: dict) -> dict | None:
+    def _post(self, url: str, payload: dict, missing: dict | None = None) -> dict | None:
+        # missing: what a 404 (no such thread) answers; None (a failure) unless
+        # the caller says the thread being gone settles its request.
         data = json.dumps(payload).encode("utf-8")
         req = urllib.request.Request(url, data=data, headers={
             "Content-Type": "application/json",
@@ -59,6 +61,9 @@ class ConversationNotifier:
                 print(f"{self.log_prefix} the user deleted that thread; nothing written",
                       flush=True)
                 return {"deleted": True}
+            if exc.code == 404 and missing is not None:
+                print(f"{self.log_prefix} that thread is gone; nothing written", flush=True)
+                return dict(missing)
             print(f"{self.log_prefix} conversation post failed: {exc}", flush=True)
             return None
         except Exception as exc:  # noqa: BLE001 - callers retry on the next tick
@@ -90,3 +95,15 @@ class ConversationNotifier:
         if body is not None and body.get("deleted") is True:
             return DELETED
         return body is not None
+
+    def set_flags(self, thread_id: str, **flags) -> dict | str | None:
+        """Set a thread's flags (archived, muted, …, and ``unless_starred``:
+        leave a thread the user starred where it is). Returns the thread's
+        summary, DELETED when the user deleted it or it is gone (404: there
+        is nothing left to flag), None when the backend is unreachable or
+        refused — the caller retries."""
+        body = self._post(f"{self.base_url}/{thread_id}/flags", dict(flags),
+                          missing={"deleted": True})
+        if body is not None and body.get("deleted") is True:
+            return DELETED
+        return body

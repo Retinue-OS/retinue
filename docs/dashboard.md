@@ -1936,22 +1936,22 @@ every chat read. A mail's Message carries `reply_to`, the addresses of its
 `Reply-To` header (`[]` without one): why a reply may go to somebody the mail
 is not from.
 
-**The send press is not the approval here.** On the messengers a send the
-policy queues is released by the web gateway in the same request: the press
-*is* the approval `verify` exists for. On e-mail it is not
-(mail-chats.md, Decisions). The press is passed on as `user_approved`, which
-is what `trust` asks for; under `verify` the mail is queued even though the
-user typed it, and the web gateway leaves it queued — it never calls
-`approve` for a mail. So the endpoint has three answers that are no error:
+**The send press is the approval here too.** As on the messengers, a send
+the policy queues is released by the web gateway in the same request: the
+press *is* the approval `verify` exists for (mail-chats.md, Decisions). The
+press is passed on as `user_approved`, which is what `trust` asks for; under
+`verify` the gateway queues the mail and the web gateway approves it at once
+(`_mail_send_pressed`) and reads the entry until it is out. So the endpoint
+has three answers that are no error:
 
 - **sent** → `200` and the Message, as on every chat: the overlay has it,
   the draft is cleared, the chat is read, its attention item settled. Where
   the mail server took the mail for some recipients and refused others, the
   Message carries `refused`, the addresses it did not reach;
-- **queued** → `202 {"pending": Pending}`. The draft is cleared — the words
-  are in the queue — and the chat is read, here and in the mailbox: writing
-  a reply is having read what it answers. But no reply has been made, so
-  its attention item stands;
+- **queued** → `202 {"pending": Pending}`, only where the press's release
+  could not be given. The draft is cleared — the words are in the queue — and
+  the chat is read, here and in the mailbox: writing a reply is having read
+  what it answers. But no reply has been made, so its attention item stands;
 - **not known** → `202 {"unconfirmed": true, "request_key", "since",
   "message_id"?, "id", "note"?}` (below).
 
@@ -2372,6 +2372,15 @@ python3 /workspace/scripts/conversation-push.py --thread <id> --archive --mute
 # also: --unarchive, --unmute, --star/--unstar (only on the user's word);
 # flags are their own call, never mixed with a message. There is no --delete.
 ```
+
+Every archive through this door settles the thread's attention item, as the
+user's own Archive does, and every unarchive reopens what archiving settled —
+`conversation-push.py --archive`/`--unarchive` included, whoever calls it.
+The body may also carry **`unless_starred: true`**: then `archived` and
+`muted` are dropped if the thread carries the user's star (decided under the
+conversations lock, so a star set in the same instant wins). It is how the
+gateway monitor archives a healed outage's alert (see `docs/messaging.md`):
+an agent never archives a starred thread on its own initiative.
 
 A **chat's** flags have the same door for agents, `POST
 /internal/chats/<id>/flags`, with the semantics of the user's own endpoint —

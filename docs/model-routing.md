@@ -126,6 +126,13 @@ separate actors would let a project parked on a misspelled variant silently
 drop out of the self-review sweep. Signature is presentation; the actor URI is
 workflow; the model stamp (phase 2) is the ground truth beneath both.
 
+**Only senior may ring.** The decision that something interrupts the user is
+the frontier tier's: a model session below it that declares `--critical` or
+an importance of 3.5+ (`conversation-push.py`, `attention-set.py`,
+`chat-verdict.py`) is refused with exit 3 and escalates, or, with no
+escalation path, has the declaration lowered to wait for the digest
+(`scripts/ring_guard.py`, docs/notices.md, "The ring guard").
+
 ## Phases
 
 ### Phase 1 — tier variables and identity (this document's PR)

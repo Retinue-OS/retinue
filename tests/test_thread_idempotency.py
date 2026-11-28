@@ -213,6 +213,31 @@ def test_gateway_dedupe():
         s7, _ = create("x", key="k" * 500)
         check("an oversized key is rejected", s7 == 400, str(s7))
 
+        # The inbox sweep settles a document's thread by the key alone.
+        def attention_set(body):
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{port}/internal/attention/set",
+                data=json.dumps(body).encode(),
+                headers={"Content-Type": "application/json",
+                         "X-Conversation-Backend-Token": "test-token"},
+                method="POST")
+            try:
+                with urllib.request.urlopen(req, timeout=10) as r:
+                    return r.status, json.loads(r.read().decode())
+            except urllib.error.HTTPError as e:
+                return e.code, json.loads(e.read().decode() or "{}")
+
+        DOC = "inbox-doc:" + "ab" * 32
+        _, bd = create("Where should this letter go?", key=DOC, title="Letter")
+        sd, body = attention_set({"key": DOC, "state": "done"})
+        check("a thread can be settled by its key", sd == 200, f"{sd} {body}")
+        check("…and is then done",
+              (get_conv(bd["id"]).get("attention") or {}).get("state") == "done")
+        sn, _ = attention_set({"key": "inbox-doc:" + "cd" * 32, "state": "done"})
+        check("a key with no thread is 404", sn == 404, str(sn))
+        sl, _ = attention_set({"key": "k" * 500, "state": "done"})
+        check("an oversized key is refused there too", sl == 400, str(sl))
+
         # The escalation re-run and a redelivery are both "the same key twice,
         # close together" — including genuinely concurrent.
         results = []

@@ -39,6 +39,7 @@ class FakeNotifier:
         self.opened = []    # (title, message)
         self.appended = []  # (thread_id, message)
         self.quiet_flags = []  # one per append, in order
+        self.flagged = []   # (thread_id, flags)
         self._next_id = 0
 
     def open_thread(self, title, message, attention=None):
@@ -54,6 +55,12 @@ class FakeNotifier:
         self.appended.append((thread_id, message))
         self.quiet_flags.append(quiet)
         return True
+
+    def set_flags(self, thread_id, **flags):
+        if self.fail:
+            return None
+        self.flagged.append((thread_id, flags))
+        return {"id": thread_id}
 
 
 # ── classify_health ───────────────────────────────────────────────────────────
@@ -123,7 +130,74 @@ def test_recovery_reports_in_same_thread():
     # The all-clear is a record, not news: no push, and an archived thread
     # stays archived.
     assert n.quiet_flags == [True]
+    # The alert is obsolete: archived for good, unless the user starred it.
+    assert n.flagged == [("thread1", {"archived": True, "muted": True,
+                                      "unless_starred": True})]
     assert e.state["telegram"]["status"] == "up"
+    # The next outage opens a thread of its own.
+    e.step("telegram", "Telegram", "down", "session revoked", now=2000)
+    assert len(n.opened) == 2 and e.state["telegram"]["thread_id"] == "thread2"
+
+
+def test_failed_archive_is_retried():
+    """A healed outage's thread whose archive call failed is retried on the
+    next ticks until it lands; a new outage meanwhile keeps the marker and
+    its own thread stays out of it until it heals too."""
+    n = FakeNotifier()
+    e = gm.MonitorEngine(n, fail_threshold=1, remind_seconds=3600)
+    e.step("signal", "Signal", "down", "lost", now=1000)
+    calls = []
+    answers = iter([None, None])   # the first two archive calls fail
+
+    def flaky(thread_id, **flags):
+        calls.append(thread_id)
+        result = next(answers, {"id": thread_id})
+        if result is not None:
+            n.flagged.append((thread_id, flags))
+        return result
+
+    n.set_flags = flaky
+    e.step("signal", "Signal", "up", None, now=1060)
+    assert calls == ["thread1"] and n.flagged == []
+    assert e.state["signal"]["status"] == "up"
+    assert e.state["signal"]["cleanup"] == ["thread1"]
+    # A new outage meanwhile: the retry fails again, the marker survives and
+    # names only the healed thread.
+    e.step("signal", "Signal", "down", "lost", now=1120)
+    assert e.state["signal"]["thread_id"] == "thread2"
+    assert e.state["signal"]["cleanup"] == ["thread1"]
+    assert calls == ["thread1", "thread1"] and n.flagged == []
+    # The next tick archives the old thread; the open outage's is untouched.
+    e.step("signal", "Signal", "down", "lost", now=1180)
+    assert n.flagged == [("thread1", {"archived": True, "muted": True,
+                                      "unless_starred": True})]
+    assert "cleanup" not in e.state["signal"]
+    # When the second outage heals, its own thread is archived.
+    e.step("signal", "Signal", "up", None, now=1240)
+    assert [tid for tid, _ in n.flagged] == ["thread1", "thread2"]
+    assert "cleanup" not in e.state["signal"]
+
+
+def test_gone_thread_ends_the_cleanup():
+    """A thread the user deleted (or that is gone) needs no archiving."""
+    n = FakeNotifier()
+    e = gm.MonitorEngine(n, fail_threshold=1, remind_seconds=3600)
+    e.step("signal", "Signal", "down", "lost", now=1000)
+    n.set_flags = lambda thread_id, **flags: gm.conversation_notify.DELETED
+    e.step("signal", "Signal", "up", None, now=1060)
+    assert "cleanup" not in e.state["signal"]
+
+
+def test_blip_below_default_threshold_never_notifies():
+    """At the default debounce a link that heals within a few minutes never
+    reaches the user."""
+    n = FakeNotifier()
+    e = gm.MonitorEngine(n, remind_seconds=3600)
+    assert gm.FAIL_THRESHOLD >= 5
+    for i in range(gm.FAIL_THRESHOLD - 1):
+        e.step("signal", "Signal", "down", "connection lost", now=1000 + 60 * i)
+    e.step("signal", "Signal", "up", None, now=1000 + 60 * gm.FAIL_THRESHOLD)
+    assert n.opened == [] and n.appended == [] and n.flagged == []
 
 
 def test_reminder_cadence():
